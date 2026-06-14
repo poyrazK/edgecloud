@@ -2,33 +2,67 @@ image: rust:1.86
 
 stages:
   - check
+  - test
   - build
 
 variables:
   CARGO_TARGET_DIR: ${CI_PROJECT_DIR}/target
+  CARGO_TERM_COLOR: always
 
 rustfmt:
   stage: check
-  script:
+  before_script:
     - rustup component add rustfmt
+  script:
     - cargo fmt --check --manifest-path edge-runtime/Cargo.toml
   cache:
-    key: cargo-registry
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
-      - ~/.cargo/registry/index/
-      - ~/.cargo/registry/cache/
+      - ~/.cargo/bin/
+      - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 clippy:
   stage: check
-  script:
+  before_script:
     - rustup component add clippy
+  script:
     - cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
   cache:
-    key: cargo-target-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
+      - ~/.cargo/bin/
+      - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+audit:
+  stage: check
+  before_script:
+    - rustup component add rust-src
+    - cargo install cargo-audit || true
+  script:
+    - cargo audit --manifest-path edge-runtime/Cargo.toml || true
+  cache:
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    paths:
+      - ~/.cargo/bin/
+      - target/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+test:
+  stage: test
+  script:
+    - cargo test --manifest-path edge-runtime/Cargo.toml
+  cache:
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
+    paths:
+      - ~/.cargo/bin/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -40,8 +74,9 @@ build:
     - cargo build --manifest-path edge-runtime/Cargo.toml
     - cargo build --manifest-path edge-runtime/Cargo.toml --release
   cache:
-    key: cargo-target-${CI_COMMIT_REF_SLUG}
+    key: cargo-lock-${CI_COMMIT_REF_SLUG}
     paths:
+      - ~/.cargo/bin/
       - target/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
