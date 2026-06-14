@@ -1,15 +1,17 @@
 //! Root runtime state implementing all WIT Host traits.
 
-use crate::interfaces::{http_client, kv_store, cache, observe, time, scheduling, process, networking, http_server};
+use crate::edge::cloud::cache::Host as CacheHost;
 use crate::edge::cloud::http_client::{Host as HttpClientHost, Request, Response};
-use crate::edge::cloud::kv_store::{Host as KvStoreHost};
-use crate::edge::cloud::cache::{Host as CacheHost};
-use crate::edge::cloud::observe::{Host as ObserveHost};
-use crate::edge::cloud::time::{Host as TimeHost};
-use crate::edge::cloud::scheduling::{Host as SchedulingHost};
-use crate::edge::cloud::process::{Host as ProcessHost};
-use crate::edge::cloud::networking::{Host as NetworkingHost};
 use crate::edge::cloud::http_server::{Host as HttpServerHost, IncomingRequest};
+use crate::edge::cloud::kv_store::Host as KvStoreHost;
+use crate::edge::cloud::networking::Host as NetworkingHost;
+use crate::edge::cloud::observe::Host as ObserveHost;
+use crate::edge::cloud::process::Host as ProcessHost;
+use crate::edge::cloud::scheduling::Host as SchedulingHost;
+use crate::edge::cloud::time::Host as TimeHost;
+use crate::interfaces::{
+    cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
+};
 
 /// Root state for a wasmtime Store — implements all WIT Host traits.
 pub struct RuntimeState {
@@ -182,13 +184,7 @@ impl HttpServerHost for RuntimeState {
         })
     }
 
-    fn respond(
-        &mut self,
-        req_id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    ) {
+    fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         let _ = self.http_server.respond(req_id, status, headers, body);
     }
 }
