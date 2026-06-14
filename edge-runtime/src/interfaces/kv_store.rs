@@ -1,7 +1,7 @@
 //! `edge:kv-store` — durable key-value persistence.
 
-use std::sync::RwLock;
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct KvEntry {
@@ -60,6 +60,9 @@ impl KvStore {
 
     pub fn list_keys(&self, prefix: &str) -> Vec<String> {
         let data = self.data.read().unwrap();
-        data.keys().filter(|k| k.starts_with(prefix)).cloned().collect()
+        data.keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 }

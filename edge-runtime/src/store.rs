@@ -1,6 +1,6 @@
 //! wasmtime Store creation.
 
-use wasmtime::{Store, Engine};
+use wasmtime::{Engine, Store};
 
 /// Create a wasmtime Store.
 ///

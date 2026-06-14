@@ -1,10 +1,10 @@
 //! Linker setup for both core wasm and component model.
 
-use anyhow::Result;
-use wasmtime::{Linker, Engine};
-use wasmtime::component::Linker as ComponentLinker;
-use crate::RuntimeState;
 use crate::EdgeRuntime;
+use crate::RuntimeState;
+use anyhow::Result;
+use wasmtime::component::Linker as ComponentLinker;
+use wasmtime::{Engine, Linker};
 
 /// Create a linker for core wasm modules (WASI Preview 1).
 pub fn create_linker(engine: &Engine) -> Result<Linker<()>> {

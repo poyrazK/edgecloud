@@ -14,9 +14,7 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(max_entries: u32) -> Self {
-        let lru = lru::LruCache::new(
-            std::num::NonZeroUsize::new(max_entries as usize).unwrap(),
-        );
+        let lru = lru::LruCache::new(std::num::NonZeroUsize::new(max_entries as usize).unwrap());
         Self {
             lru: Mutex::new(lru),
         }

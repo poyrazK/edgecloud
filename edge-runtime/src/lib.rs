@@ -105,6 +105,6 @@ world edge-runtime {
 });
 
 pub use engine::create_engine;
-pub use store::create_store;
 pub use metering::RequestMeter;
 pub use runtime::RuntimeState;
+pub use store::create_store;

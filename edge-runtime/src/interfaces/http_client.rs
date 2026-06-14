@@ -42,7 +42,9 @@ impl HttpClient {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = response.bytes().map_err(|e| format!("failed to read body: {}", e))?;
+        let body = response
+            .bytes()
+            .map_err(|e| format!("failed to read body: {}", e))?;
 
         Ok(HttpResponse {
             status,

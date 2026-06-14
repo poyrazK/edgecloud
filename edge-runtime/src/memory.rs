@@ -1,7 +1,7 @@
 //! Memory access helpers for crossing the wasm boundary.
 
-use wasmtime::{Caller, Memory, Val};
 use anyhow::Result;
+use wasmtime::{Caller, Memory, Val};
 
 /// Read a UTF-8 string from wasm linear memory.
 pub fn read_string<T>(memory: &Memory, caller: &Caller<'_, T>, ptr: i32, len: i32) -> String {
@@ -62,7 +62,11 @@ pub fn read_bytes<T>(memory: &Memory, caller: &Caller<'_, T>, ptr: i32, len: i32
 }
 
 /// Write raw bytes to wasm linear memory, returning (ptr, len).
-pub fn write_bytes<T>(memory: &Memory, caller: &mut Caller<'_, T>, bytes: &[u8]) -> Result<(i32, i32)> {
+pub fn write_bytes<T>(
+    memory: &Memory,
+    caller: &mut Caller<'_, T>,
+    bytes: &[u8],
+) -> Result<(i32, i32)> {
     let ptr = allocate(memory, caller, bytes.len() as i32)?;
     memory.write(caller, ptr as usize, bytes)?;
     Ok((ptr as i32, bytes.len() as i32))
