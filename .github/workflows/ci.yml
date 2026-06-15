@@ -28,6 +28,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Debug git state
+        run: |
+          echo "=== git log --oneline -5 ==="
+          git log --oneline -5
+          echo "=== git ls-files edge-runtime/ ==="
+          git ls-files edge-runtime/
+          echo "=== ls -laR edge-runtime/ ==="
+          ls -laR edge-runtime/ 2>&1 || echo "not found"
+
       - name: Install ${{ matrix.tool }}
         run: |
           case ${{ matrix.tool }} in
@@ -71,6 +80,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Debug git state
+        run: |
+          echo "=== git log --oneline -5 ==="
+          git log --oneline -5
+          echo "=== git ls-files edge-runtime/ ==="
+          git ls-files edge-runtime/
+          echo "=== ls -laR edge-runtime/ ==="
+          ls -laR edge-runtime/ 2>&1 || echo "not found"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
