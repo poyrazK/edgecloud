@@ -54,7 +54,6 @@ pub struct HttpServer {
     accept_task: Option<tokio::task::JoinHandle<()>>,
 
     // --- New fields ---
-
     /// Shutdown signal sender. When dropped or explicitly triggered, the accept
     /// loop exits cleanly.
     shutdown_tx: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
@@ -272,7 +271,10 @@ impl HttpServer {
                 Ok(Ok(n)) => {
                     total_read += n;
                     // Check for double CRLF.
-                    if header_buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
+                    if header_buf[..total_read]
+                        .windows(4)
+                        .any(|w| w == b"\r\n\r\n")
+                    {
                         break;
                     }
                     if total_read >= header_buf.len() {
@@ -282,7 +284,10 @@ impl HttpServer {
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "read deadline"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "read deadline",
+                    ));
                 }
             }
         }
@@ -355,7 +360,10 @@ impl HttpServer {
                     }
                     Ok(Err(e)) => return Err(e),
                     Err(_) => {
-                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "body read deadline"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "body read deadline",
+                        ));
                     }
                 }
             }
