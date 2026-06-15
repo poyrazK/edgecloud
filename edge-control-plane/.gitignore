@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

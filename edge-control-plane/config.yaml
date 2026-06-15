@@ -1,0 +1,18 @@
+database:
+  host: "localhost"
+  port: 5432
+  user: "edgecloud"
+  password: "edgecloud"
+  name: "edgecloud"
+  sslmode: "disable"
+
+nats:
+  url: "nats://localhost:4222"
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  env: "development"
+
+storage:
+  artifact_path: "/var/edgecloud/registry"
