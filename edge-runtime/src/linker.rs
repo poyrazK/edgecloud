@@ -1,6 +1,5 @@
 //! Linker setup for both core wasm and component model.
 
-use crate::EdgeRuntime;
 use crate::RuntimeState;
 use anyhow::Result;
 use wasmtime::component::Linker as ComponentLinker;
@@ -13,8 +12,8 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<()>> {
 }
 
 /// Create a linker for WASI Preview 2 components.
+/// WASI P2 and edge:* interfaces are wired via the bindgen-generated add_to_linker.
 pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<RuntimeState>> {
-    let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
-    EdgeRuntime::add_to_linker(&mut linker, |state: &mut RuntimeState| state)?;
+    let linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
     Ok(linker)
 }
