@@ -10,39 +10,60 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  # ============================================================
+  # FMT — rustfmt on all crates
+  # ============================================================
+  fmt:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - tool: rustfmt
-            command: fmt
-            args: --check
-          - tool: clippy
-            command: clippy
-            args: -- -D warnings
-          - tool: audit
-            command: audit
-            args: ""
-
+        crate: [edge-runtime, edge-cli, edge-worker]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix git state
+      - name: Generate Cargo.lock
         run: |
-          git reset --hard
-          git submodule update --init --force
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
 
-      - name: Install ${{ matrix.tool }}
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run rustfmt
+        run: cargo fmt --check --manifest-path ${{ matrix.crate }}/Cargo.toml
+
+  # ============================================================
+  # CLIPPY — clippy on all crates
+  # ============================================================
+  clippy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Cargo.lock
         run: |
-          case ${{ matrix.tool }} in
-            rustfmt) rustup component add rustfmt ;;
-            clippy) rustup component add clippy ;;
-            audit)
-              cargo install cargo-audit
-              ;;
-          esac
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
+
+      - name: Install clippy
+        run: rustup component add clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -60,25 +81,72 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target/
-          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run ${{ matrix.tool }}
+      - name: Run clippy
+        run: cargo clippy --manifest-path ${{ matrix.crate }}/Cargo.toml -- -D warnings
+
+  # ============================================================
+  # AUDIT — cargo audit on all crates (cached binary)
+  # ============================================================
+  audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Cargo.lock
         run: |
-          if [ "${{ matrix.tool }}" = "audit" ]; then
-            cargo audit --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }} || true
-          else
-            cargo ${{ matrix.command }} --manifest-path edge-runtime/Cargo.toml ${{ matrix.args }}
-          fi
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
 
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/
+          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo-audit binary
+        id: cache-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-audit-${{ runner.os }}-
+
+      - name: Install cargo-audit
+        if: steps.cache-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+
+  # ============================================================
+  # TEST — cargo test on all crates
+  # ============================================================
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix git state
+      - name: Generate Cargo.lock
         run: |
-          git reset --hard
-          git submodule update --init --force
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -96,7 +164,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target/
-          key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --manifest-path edge-runtime/Cargo.toml
+        run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
