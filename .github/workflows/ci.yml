@@ -31,14 +31,15 @@ jobs:
       - name: Fix git state
         run: |
           git reset --hard
-          git submodule update --init --force
+          rm -rf edge-runtime/
+          git submodule update --init --recursive --force
 
       - name: Debug
         run: |
-          echo "=== ls edge-runtime/ ==="
-          ls edge-runtime/
-          echo "=== ls edge-runtime/src/ ==="
-          ls edge-runtime/src/ 2>&1 || echo "NOT FOUND"
+          echo "=== ls -la edge-runtime/ ==="
+          ls -la edge-runtime/
+          echo "=== find edge-runtime/ -maxdepth 2 ==="
+          find edge-runtime/ -maxdepth 2
 
       - name: Install ${{ matrix.tool }}
         run: |
@@ -87,14 +88,15 @@ jobs:
       - name: Fix git state
         run: |
           git reset --hard
-          git submodule update --init --force
+          rm -rf edge-runtime/
+          git submodule update --init --recursive --force
 
       - name: Debug
         run: |
-          echo "=== ls edge-runtime/ ==="
-          ls edge-runtime/
-          echo "=== ls edge-runtime/src/ ==="
-          ls edge-runtime/src/ 2>&1 || echo "NOT FOUND"
+          echo "=== ls -la edge-runtime/ ==="
+          ls -la edge-runtime/
+          echo "=== find edge-runtime/ -maxdepth 2 ==="
+          find edge-runtime/ -maxdepth 2
 
       - name: Cache cargo registry
         uses: actions/cache@v4
