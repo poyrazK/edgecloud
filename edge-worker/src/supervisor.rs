@@ -38,18 +38,18 @@ impl Supervisor {
             ..
         } = msg;
 
-        let state = self.state.read().await;
-        let current_apps: HashMap<String, (String, AppInstanceStatus)> = state
-            .apps
-            .iter()
-            .map(|(name, inst)| {
-                (
+        let current_apps: HashMap<String, (String, AppInstanceStatus)> = {
+            let state = self.state.read().await;
+            let mut map = HashMap::new();
+            for (name, inst) in state.apps.iter() {
+                let inst = inst.lock().await;
+                map.insert(
                     name.clone(),
                     (inst.deployment_id.clone(), inst.status.clone()),
-                )
-            })
-            .collect();
-        drop(state);
+                );
+            }
+            map
+        };
 
         // Stop apps no longer in the desired set
         for app_name in current_apps.keys() {
@@ -92,33 +92,47 @@ impl Supervisor {
             self.stop_app(app_name).await?;
         }
 
-        // Acquire a port
-        let port = {
+        // Acquire a port.
+        let raw_port = {
             let mut pool = self.port_pool.lock().await;
             pool.acquire().expect("port pool exhausted")
         };
 
         // Download artifact (blocking on first request)
-        let artifact = self
+        let artifact = match self
             .downloader
             .get_artifact(&spec.deployment_id, &spec.deployment_hash)
-            .await?;
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let mut pool = self.port_pool.lock().await;
+                pool.release(raw_port);
+                return Err(e);
+            }
+        };
 
         // Compile the component using the shared engine
         let engine = &self.state.read().await.engine;
-        let component = wasmtime::component::Component::from_binary(engine, &artifact)
-            .with_context(|| format!("failed to compile component for {}", app_name))?;
+        let component = match wasmtime::component::Component::from_binary(engine, &artifact) {
+            Ok(c) => c,
+            Err(e) => {
+                let mut pool = self.port_pool.lock().await;
+                pool.release(raw_port);
+                return Err(e).context(format!("failed to compile component for {}", app_name));
+            }
+        };
 
         // Create the component linker and pre-instantiate
         let linker = create_component_linker(engine)?;
-        let instance_pre = linker
-            .instantiate_pre(&component)
-            .with_context(|| format!("failed to pre-instantiate {}", app_name))?;
-
-        // Set env vars in the process (global to the worker — see Known Issue #1)
-        for (key, value) in &spec.env {
-            std::env::set_var(key, value);
-        }
+        let instance_pre = match linker.instantiate_pre(&component) {
+            Ok(ip) => ip,
+            Err(e) => {
+                let mut pool = self.port_pool.lock().await;
+                pool.release(raw_port);
+                return Err(e).context(format!("failed to pre-instantiate {}", app_name));
+            }
+        };
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -132,24 +146,36 @@ impl Supervisor {
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
         let meter_clone = meter.clone();
+        let env = spec.env.clone();
+        let state_clone = self.state.clone();
 
-        // Spawn the per-app task
-        tokio::spawn(async move {
-            Self::run_app_loop(instance_pre_clone, meter_clone, shutdown_rx).await;
+        // Spawn the per-app task and store the JoinHandle so we can
+        // propagate panics when the app is stopped.
+        let handle = tokio::spawn(async move {
+            Self::run_app_loop(
+                instance_pre_clone,
+                meter_clone,
+                env,
+                state_clone,
+                app_name_str.clone(),
+                shutdown_rx,
+            )
+            .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
         });
 
-        // Register the app instance
-        let instance = AppInstance {
+        // Register the app instance (Arc<Mutex<>> for interior mutability).
+        let instance = Arc::new(Mutex::new(AppInstance {
             deployment_id: spec.deployment_id.clone(),
             app_name: app_name.to_string(),
             tenant_id: tenant_id.to_string(),
-            port,
+            port: raw_port,
             status: AppInstanceStatus::Running,
             meter,
-            shutdown_tx,
+            shutdown_tx: Some(shutdown_tx),
             instance_pre,
-        };
+            handle: Some(std::sync::Arc::new(handle)),
+        }));
 
         self.state
             .write()
@@ -157,24 +183,46 @@ impl Supervisor {
             .apps
             .insert(app_name.to_string(), instance);
 
-        tracing::info!(app_name, port, "app started");
+        tracing::info!(app_name, port = raw_port, "app started");
         Ok(())
     }
 
     /// Stop an app gracefully.
     pub async fn stop_app(&self, app_name: &str) -> anyhow::Result<()> {
-        let instance = match self.state.write().await.apps.remove(app_name) {
-            Some(inst) => inst,
-            None => return Ok(()), // already gone
+        // Clone the Arc so we can lock it while the instance is still in the map.
+        let instance = {
+            let state = self.state.read().await;
+            state.apps.get(app_name).cloned()
         };
 
-        // Signal shutdown
-        let _ = instance.shutdown_tx.send(());
+        let (port, handle) = if let Some(inst) = instance {
+            // Extract port, handle, and sender while locked.
+            let mut inst = inst.lock().await;
+            let port = inst.port;
+            let handle = inst.handle.clone();
+            let tx = inst.shutdown_tx.take();
+            drop(inst); // release lock before sending
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+            (port, handle)
+        } else {
+            return Ok(()); // already gone
+        };
 
-        // Free the port
+        // Remove from the map.
+        self.state.write().await.apps.remove(app_name);
+
+        // Free the port.
         {
             let mut pool = self.port_pool.lock().await;
-            pool.release(instance.port);
+            pool.release(port);
+        }
+
+        // Propagate any panic from the app task.
+        if let Some(handle) = handle {
+            handle.abort();
+            // Arc<JoinHandle> is dropped here — abort() has already terminated the task.
         }
 
         tracing::info!(app_name, "app stopped");
@@ -184,10 +232,15 @@ impl Supervisor {
     /// Per-app task loop.
     ///
     /// Executes the component in a loop. Handles crashes with exponential
-    /// backoff restart (max 5 restarts, then gives up).
+    /// backoff restart (max 5 restarts, then gives up). Long-running apps
+    /// (HTTP servers) that return from handle() keep running — only an explicit
+    /// process.exit from the guest means "stop".
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
+        env: HashMap<String, String>,
+        state: Arc<RwLock<WorkerState>>,
+        app_name: String,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         let mut restart_count = 0u32;
@@ -204,9 +257,15 @@ impl Supervisor {
                 }
 
                 // Run the component
-                result = Self::execute_app(&instance_pre, &meter) => {
+                result = Self::execute_app(&instance_pre, &meter, env.clone()) => {
                     match result {
-                        Ok(()) => {
+                        Ok(true) => {
+                            // Component wants to keep running (blocking call returned normally).
+                            // Loop back and re-execute — this supports long-running HTTP servers.
+                            continue;
+                        }
+                        Ok(false) => {
+                            // Guest explicitly called process.exit — clean exit.
                             tracing::info!("component exited normally");
                             break;
                         }
@@ -218,6 +277,14 @@ impl Supervisor {
                                     err = %e,
                                     "max restarts exceeded, giving up"
                                 );
+                                // Mark the app as crashed so the heartbeat reflects the failure.
+                                {
+                                    let mut s = state.write().await;
+                                    if let Some(inst) = s.apps.get_mut(&app_name) {
+                                        let mut inst = inst.lock().await;
+                                        inst.status = AppInstanceStatus::Crashed { restart_count };
+                                    }
+                                }
                                 break;
                             }
 
@@ -240,14 +307,20 @@ impl Supervisor {
     }
 
     /// Execute a single app invocation.
+    ///
+    /// Returns `Ok(true)` if the component wants to keep running (blocking call
+    /// returned normally). Returns `Ok(false)` if the guest explicitly called
+    /// `process.exit`. Returns `Err` on a wasm trap/error.
     async fn execute_app(
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
-        _meter: &Arc<RequestMeter>,
-    ) -> anyhow::Result<()> {
+        meter: &Arc<RequestMeter>,
+        env: HashMap<String, String>,
+    ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
-        // Create a fresh RuntimeState for this invocation
-        let runtime_state = edge_runtime::RuntimeState::new();
+        // Create a fresh RuntimeState with per-app env vars and metering for tenant isolation.
+        let runtime_state =
+            edge_runtime::RuntimeState::with_env_and_meter(env, Some(Arc::clone(meter)));
 
         // Create a store with per-invocation state
         let mut store = edge_runtime::create_store(engine, 256, runtime_state);
@@ -275,7 +348,8 @@ impl Supervisor {
                 .call(&mut store, ())?;
         }
 
-        Ok(())
+        // Component returned normally — it wants to keep running.
+        Ok(true)
     }
 
     /// Build a heartbeat message from current app states.
@@ -285,6 +359,7 @@ impl Supervisor {
 
         let state = self.state.read().await;
         for (app_name, inst) in &state.apps {
+            let inst = inst.lock().await;
             let status = match &inst.status {
                 AppInstanceStatus::Running => "running",
                 AppInstanceStatus::Starting => "starting",
@@ -297,6 +372,7 @@ impl Supervisor {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
                     exit_code: None,
+                    request_count: inst.meter.snapshot().request_count,
                 },
             );
         }

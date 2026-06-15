@@ -43,6 +43,8 @@ pub struct AppStatus {
     pub deployment_id: String,
     pub status: String, // "running" | "starting" | "stopping" | "crashed"
     pub exit_code: Option<i32>,
+    /// Number of HTTP requests handled since last heartbeat.
+    pub request_count: u64,
 }
 
 impl HeartbeatMessage {

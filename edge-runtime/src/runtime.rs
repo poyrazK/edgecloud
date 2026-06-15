@@ -12,6 +12,7 @@ use crate::edge::cloud::time::Host as TimeHost;
 use crate::interfaces::{
     cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
 };
+use crate::metering::RequestMeter;
 use std::sync::Arc;
 
 pub struct RuntimeState {
@@ -38,6 +39,39 @@ impl RuntimeState {
             process: process::Process::new(),
             networking: networking::NetworkingState::new(),
             http_server: http_server::HttpServer::new(),
+        }
+    }
+
+    /// Create a RuntimeState with per-app environment variables for tenant isolation.
+    pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
+        Self {
+            http_client: http_client::HttpClient::new(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
+            observe: observe::Observer::new(),
+            time: time::Clock::new(),
+            scheduling: scheduling::Scheduler::new(),
+            process: process::Process::with_env(Arc::new(env)),
+            networking: networking::NetworkingState::new(),
+            http_server: http_server::HttpServer::new(),
+        }
+    }
+
+    /// Create a RuntimeState with per-app env vars and a request meter.
+    pub fn with_env_and_meter(
+        env: std::collections::HashMap<String, String>,
+        meter: Option<Arc<RequestMeter>>,
+    ) -> Self {
+        Self {
+            http_client: http_client::HttpClient::new(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
+            observe: observe::Observer::new(),
+            time: time::Clock::new(),
+            scheduling: scheduling::Scheduler::new(),
+            process: process::Process::with_env(Arc::new(env)),
+            networking: networking::NetworkingState::new(),
+            http_server: http_server::HttpServer::with_meter(meter),
         }
     }
 }

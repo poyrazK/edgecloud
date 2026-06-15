@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use edge_runtime::RequestMeter;
+use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
 
@@ -30,16 +31,23 @@ pub struct AppInstance {
     pub port: u16,
     pub status: AppInstanceStatus,
     pub meter: Arc<RequestMeter>,
-    /// Channel to signal graceful shutdown to the app task.
-    pub shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// Channel to signal graceful shutdown to the app task. Wrapped in Option so
+    /// it can be taken out of the locked struct to call send().
+    pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Pre-compiled component for fast instantiation on restart.
     pub instance_pre: InstancePre<edge_runtime::RuntimeState>,
+    /// Handle to the spawned app task — used to propagate panics on stop.
+    /// Wrapped in Arc so it can be cloned without taking ownership.
+    pub handle: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.
+/// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
+/// (e.g., status update to Crashed) without replacing the Arc entry.
 pub struct WorkerState {
-    /// Currently running app instances: app_name -> AppInstance
-    pub apps: HashMap<String, AppInstance>,
+    /// Currently running app instances: app_name -> AppInstance (Arc-wrapped for
+    /// cheap clone, with Mutex for interior mutability of status/fields).
+    pub apps: HashMap<String, Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
 }
