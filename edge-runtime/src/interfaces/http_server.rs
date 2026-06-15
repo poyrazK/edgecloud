@@ -1,7 +1,7 @@
 //! `edge:http-server` — inbound HTTP serving.
 
 use crate::metering::RequestMeter;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,12 +26,8 @@ pub struct IncomingRequest {
     pub body: Vec<u8>,
 }
 
-#[allow(clippy::new_without_default)]
 pub struct HttpServer {
     port: Option<u16>,
-    /// Persisted TCP listener — must outlive the accept loop.
-    #[allow(dead_code)]
-    listener: Arc<tokio::net::TcpListener>,
     /// Sends incoming parsed requests toward `poll`.
     tx: Arc<RwLock<Option<mpsc::Sender<IncomingRequest>>>>,
     /// Receives incoming parsed requests in `poll`.
@@ -47,11 +43,10 @@ pub struct HttpServer {
     next_id: Arc<AtomicU64>,
     pub meter: Option<Arc<RequestMeter>>,
     /// Keep accept loop task alive so it doesn't get dropped.
-    #[allow(dead_code)]
     accept_task: Option<tokio::task::JoinHandle<()>>,
     /// Buffer size for reading HTTP requests (default 8KB).
     buffer_size: usize,
-    /// Connection read timeout in seconds (default 30s).
+    /// Connection read/write timeout in seconds (default 30s).
     connection_timeout_secs: u64,
 }
 
@@ -59,11 +54,6 @@ impl HttpServer {
     pub fn new() -> Self {
         Self {
             port: None,
-            listener: Arc::new({
-                let std_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-                std_listener.set_nonblocking(true).unwrap();
-                tokio::net::TcpListener::from_std(std_listener).unwrap()
-            }),
             tx: Arc::new(RwLock::new(None)),
             rx: Arc::new(Mutex::new(None)),
             responses: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -81,7 +71,7 @@ impl HttpServer {
         self
     }
 
-    /// Set the connection read timeout in seconds.
+    /// Set the connection read/write timeout in seconds.
     pub fn with_connection_timeout(mut self, secs: u64) -> Self {
         self.connection_timeout_secs = secs;
         self
@@ -91,8 +81,14 @@ impl HttpServer {
     /// This is synchronous — it spawns the async accept loop onto the current runtime
     /// and returns immediately without blocking.
     pub fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
+        // Abort any previous accept loop before spawning a new one.
+        if let Some(prev) = self.accept_task.take() {
+            prev.abort();
+        }
+
         let rt = tokio::runtime::Handle::current();
         let addr = format!("{}:{}", host.as_deref().unwrap_or("0.0.0.0"), port);
+        let addr_for_error = addr.clone();
 
         // Clone shared state for the async accept loop.
         let next_id = self.next_id.clone();
@@ -101,16 +97,21 @@ impl HttpServer {
         let buffer_size = self.buffer_size;
         let connection_timeout_secs = self.connection_timeout_secs;
 
+        // Flag set by the spawned task if bind fails — allows us to return an error.
+        let bind_failed = Arc::new(AtomicBool::new(false));
+        let bind_failed_clone = bind_failed.clone();
+
         // Set up channel for delivering incoming requests.
         let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
         let tx_clone = tx.clone();
 
         // Spawn the async bind + accept loop onto the runtime.
-        rt.spawn(async move {
+        let accept_task = rt.spawn(async move {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!(err = %e, "failed to bind {}", addr);
+                    bind_failed_clone.store(true, Ordering::Relaxed);
                     return;
                 }
             };
@@ -142,10 +143,17 @@ impl HttpServer {
             }
         });
 
-        // Store channel endpoints synchronously.
+        // Check if bind failed before returning success.
+        if bind_failed.load(Ordering::Relaxed) {
+            self.accept_task = Some(accept_task);
+            return Err(format!("failed to bind {}", addr_for_error));
+        }
+
+        // Store channel endpoints and task handle.
         self.port = Some(port);
         self.tx = Arc::new(RwLock::new(Some(tx)));
         self.rx = Arc::new(Mutex::new(Some(rx)));
+        self.accept_task = Some(accept_task);
         Ok(())
     }
 
@@ -160,10 +168,10 @@ impl HttpServer {
         buffer_size: usize,
         connection_timeout_secs: u64,
     ) {
-        // Read the HTTP request from the socket with a timeout.
-        let mut buf = vec![0u8; buffer_size];
         let timeout_duration = Duration::from_secs(connection_timeout_secs);
 
+        // Read the HTTP request from the socket with a timeout.
+        let mut buf = vec![0u8; buffer_size];
         let n = match timeout(timeout_duration, stream.read(&mut buf)).await {
             Ok(Ok(0)) => return,
             Ok(Ok(n)) => n,
@@ -191,17 +199,24 @@ impl HttpServer {
             return;
         }
 
-        // Wait for the guest's response via respond().
+        // Wait for the guest's response via respond() with a timeout.
         let HttpResponse {
             status,
             headers,
             body,
-        } = match ch_rx.await {
-            Ok(r) => r,
-            Err(_) => return,
+        } = match timeout(timeout_duration, ch_rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => {
+                tracing::warn!(req_id = %id, "response channel closed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(req_id = %id, "guest respond timeout");
+                return;
+            }
         };
 
-        // Write the HTTP/1.1 response back to the socket.
+        // Write the HTTP/1.1 response back to the socket with a timeout.
         let status_line = format!("HTTP/1.1 {} {}\r\n", status, Self::status_text(status));
         let mut response = status_line.into_bytes();
         for (k, v) in headers {
@@ -212,8 +227,8 @@ impl HttpServer {
         response.extend(b"\r\n\r\n");
         response.extend(&body);
 
-        if let Err(e) = stream.write_all(&response).await {
-            tracing::warn!(err = %e, "write error");
+        if let Err(e) = timeout(timeout_duration, stream.write_all(&response)).await {
+            tracing::warn!(err = %e, req_id = %id, "response write timeout or error");
         }
     }
 

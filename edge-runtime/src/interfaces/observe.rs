@@ -46,11 +46,20 @@ mod prometheus_backend {
     use std::sync::{Arc, RwLock};
     use metrics::{describe_counter, describe_gauge, describe_histogram, Counter, Gauge, Histogram};
 
+    /// Composite key: metric name + sorted labels for correct per-label tracking.
+    type MetricKey = (String, Vec<(String, String)>);
+
+    fn make_key(name: &str, labels: &[(String, String)]) -> MetricKey {
+        let mut sorted = labels.to_vec();
+        sorted.sort();
+        (name.to_string(), sorted)
+    }
+
     /// Prometheus-compatible backend using the `metrics` crate.
     pub struct PrometheusBackend {
-        counters: Arc<RwLock<HashMap<String, Counter>>>,
-        gauges: Arc<RwLock<HashMap<String, Gauge>>>,
-        histograms: Arc<RwLock<HashMap<String, Histogram>>>,
+        counters: Arc<RwLock<HashMap<MetricKey, Counter>>>,
+        gauges: Arc<RwLock<HashMap<MetricKey, Gauge>>>,
+        histograms: Arc<RwLock<HashMap<MetricKey, Histogram>>>,
     }
 
     impl PrometheusBackend {
@@ -65,11 +74,6 @@ mod prometheus_backend {
                 histograms: Arc::new(RwLock::new(HashMap::new())),
             }
         }
-
-        #[allow(dead_code)]
-        fn make_labels(labels: &[(String, String)]) -> Vec<metrics::Label> {
-            labels.iter().map(|(k, v)| metrics::Label::new(k.clone(), v.clone())).collect()
-        }
     }
 
     impl Default for PrometheusBackend {
@@ -79,43 +83,22 @@ mod prometheus_backend {
     }
 
     impl MetricsBackend for PrometheusBackend {
-        fn increment_counter(&self, name: &str, _labels: &[(String, String)]) {
-            let counter = self.counters.read().unwrap()
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let c = Counter::noop();
-                    let mut counters = self.counters.write().unwrap();
-                    counters.insert(name.to_string(), c.clone());
-                    c
-                });
-            counter.increment(1);
+        fn increment_counter(&self, name: &str, labels: &[(String, String)]) {
+            let key = make_key(name, labels);
+            let mut counters = self.counters.write().unwrap();
+            counters.entry(key).or_insert_with(Counter::noop).increment(1);
         }
 
-        fn record_gauge(&self, name: &str, value: f64, _labels: &[(String, String)]) {
-            let gauge = self.gauges.read().unwrap()
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let g = Gauge::noop();
-                    let mut gauges = self.gauges.write().unwrap();
-                    gauges.insert(name.to_string(), g.clone());
-                    g
-                });
-            gauge.set(value);
+        fn record_gauge(&self, name: &str, value: f64, labels: &[(String, String)]) {
+            let key = make_key(name, labels);
+            let mut gauges = self.gauges.write().unwrap();
+            gauges.entry(key).or_insert_with(Gauge::noop).set(value);
         }
 
-        fn record_histogram(&self, name: &str, value: f64, _labels: &[(String, String)]) {
-            let histogram = self.histograms.read().unwrap()
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let h = Histogram::noop();
-                    let mut histograms = self.histograms.write().unwrap();
-                    histograms.insert(name.to_string(), h.clone());
-                    h
-                });
-            histogram.record(value);
+        fn record_histogram(&self, name: &str, value: f64, labels: &[(String, String)]) {
+            let key = make_key(name, labels);
+            let mut histograms = self.histograms.write().unwrap();
+            histograms.entry(key).or_insert_with(Histogram::noop).record(value);
         }
 
         fn emit_log(&self, level: &str, message: &str) {

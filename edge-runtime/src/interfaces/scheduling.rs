@@ -13,12 +13,14 @@ pub struct ScheduledTask {
     pub next_at: Instant,
 }
 
+/// Maximum number of due tasks that can accumulate in the queue.
+/// Excess tasks are dropped (oldest first) to prevent unbounded memory growth.
+const MAX_DUE_QUEUE: usize = 1000;
+
 pub struct Scheduler {
     tasks: Arc<Mutex<HashMap<String, ScheduledTask>>>,
     /// Queue of due tasks ready for the guest to poll.
     due_queue: Arc<Mutex<Vec<ScheduledTask>>>,
-    #[allow(dead_code)]
-    runtime_handle: tokio::runtime::Handle,
 }
 
 impl Scheduler {
@@ -30,7 +32,7 @@ impl Scheduler {
     /// Create a Scheduler with an explicit runtime handle.
     pub fn new_with_handle(handle: tokio::runtime::Handle) -> Self {
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
-        let due_queue = Arc::new(Mutex::new(Vec::new()));
+        let due_queue: Arc<Mutex<Vec<ScheduledTask>>> = Arc::new(Mutex::new(Vec::new()));
         let tasks_clone = tasks.clone();
         let due_queue_clone = due_queue.clone();
 
@@ -51,27 +53,56 @@ impl Scheduler {
                 };
                 tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 
-                // Collect due tasks.
+                // Collect due tasks without removing non-due ones.
                 let now = Instant::now();
-                let mut tasks = tasks_clone.lock().unwrap();
-                let due: Vec<(String, ScheduledTask)> =
-                    tasks.drain().filter(|(_, t)| t.next_at <= now).collect();
+                let due: Vec<(String, ScheduledTask)> = {
+                    let tasks = tasks_clone.lock().unwrap();
+                    tasks
+                        .iter()
+                        .filter(|(_, t)| t.next_at <= now)
+                        .map(|(id, t)| (id.clone(), t.clone()))
+                        .collect()
+                };
 
-                drop(tasks);
+                // Remove only the due tasks from the HashMap.
+                {
+                    let mut tasks = tasks_clone.lock().unwrap();
+                    tasks.retain(|_, t| t.next_at > now);
+                }
 
                 for (id, mut task) in due {
                     if let Some(interval_ms) = task.interval_ms {
-                        // Repeating: reinsert with next deadline, push payload to queue.
+                        // Repeating: reinsert with next deadline.
                         task.next_at =
                             Instant::now() + std::time::Duration::from_millis(interval_ms);
                         tracing::debug!(task_id = %id, interval_ms, "repeating task due");
-                        due_queue_clone.lock().unwrap().push(task.clone());
+
+                        // Only push to queue if not already pending delivery.
+                        let already_queued = {
+                            let queue = due_queue_clone.lock().unwrap();
+                            queue.iter().any(|t| t.id == id)
+                        };
+                        if !already_queued {
+                            let mut queue = due_queue_clone.lock().unwrap();
+                            // Enforce max queue size — drop oldest if full.
+                            if queue.len() >= MAX_DUE_QUEUE {
+                                let drain_count = queue.len() - MAX_DUE_QUEUE + 1;
+                                queue.drain(0..drain_count);
+                            }
+                            queue.push(task.clone());
+                        }
+
                         let mut tasks = tasks_clone.lock().unwrap();
                         tasks.insert(id, task);
                     } else {
                         // One-shot: push to queue for guest polling.
                         tracing::debug!(task_id = %id, "one-shot task due");
-                        due_queue_clone.lock().unwrap().push(task);
+                        let mut queue = due_queue_clone.lock().unwrap();
+                        if queue.len() >= MAX_DUE_QUEUE {
+                            let drain_count = queue.len() - MAX_DUE_QUEUE + 1;
+                            queue.drain(0..drain_count);
+                        }
+                        queue.push(task);
                     }
                 }
             }
@@ -80,7 +111,6 @@ impl Scheduler {
         Self {
             tasks,
             due_queue,
-            runtime_handle: handle,
         }
     }
 
@@ -111,13 +141,17 @@ impl Scheduler {
     }
 
     pub fn cancel(&self, id: &str) -> Result<(), String> {
-        // Remove from tasks HashMap.
-        let removed = self.tasks.lock().unwrap().remove(id).is_some();
-        // Also remove from due_queue if present.
-        if removed {
-            let mut queue = self.due_queue.lock().unwrap();
-            queue.retain(|t| t.id != id);
-            tracing::debug!(task_id = %id, "cancelled task");
+        // First try to remove from the tasks HashMap.
+        if self.tasks.lock().unwrap().remove(id).is_some() {
+            tracing::debug!(task_id = %id, "cancelled task (not yet queued)");
+            return Ok(());
+        }
+
+        // Task not in HashMap — it may already be in the due_queue.
+        let mut queue = self.due_queue.lock().unwrap();
+        if let Some(pos) = queue.iter().position(|t| t.id == id) {
+            queue.remove(pos);
+            tracing::debug!(task_id = %id, "cancelled task (was queued)");
             Ok(())
         } else {
             Err(format!("task not found: {}", id))
