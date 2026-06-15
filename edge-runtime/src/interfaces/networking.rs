@@ -1,18 +1,40 @@
-//! `edge:networking` — TCP/UDP/DNS.
+//! `edge:networking` — DNS resolution.
 
-#[derive(Default)]
-pub struct Network;
+#[cfg(feature = "networking")]
+use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+#[cfg(feature = "networking")]
+use trust_dns_resolver::TokioAsyncResolver;
 
-impl Network {
+#[cfg(feature = "networking")]
+pub struct NetworkingState {
+    resolver: TokioAsyncResolver,
+}
+
+#[cfg(feature = "networking")]
+impl NetworkingState {
     pub fn new() -> Self {
-        Self {}
+        let resolver =
+            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        Self { resolver }
     }
 
-    pub fn resolve(&self, hostname: &str) -> Vec<String> {
-        let addr_format = format!("{}:443", hostname);
-        match addr_format.parse::<std::net::SocketAddr>() {
-            Ok(addr) => vec![addr.ip().to_string()],
-            Err(_) => vec![],
-        }
+    /// Resolve a hostname to a list of IP addresses.
+    pub fn resolve(&self, hostname: &str) -> Result<Vec<String>, String> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(self.resolve_async(hostname))
+    }
+
+    async fn resolve_async(&self, hostname: &str) -> Result<Vec<String>, String> {
+        self.resolver
+            .lookup_ip(hostname)
+            .await
+            .map(|lookup| lookup.iter().map(|ip| ip.to_string()).collect())
+            .map_err(|e| format!("DNS resolution failed: {}", e))
+    }
+}
+
+impl Default for NetworkingState {
+    fn default() -> Self {
+        Self::new()
     }
 }
