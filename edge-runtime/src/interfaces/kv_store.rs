@@ -28,12 +28,16 @@ impl KvEntry {
 
 pub struct KvStore {
     data: RwLock<HashMap<String, KvEntry>>,
+    /// Counts write operations since last TTL cleanup.
+    /// Triggers cleanup every KV_TTL_CLEANUP_BATCH_SIZE operations.
+    op_counter: RwLock<usize>,
 }
 
 impl Default for KvStore {
     fn default() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
+            op_counter: RwLock::new(0),
         }
     }
 }
@@ -57,7 +61,7 @@ impl KvStore {
     }
 
     /// Get a non-expired entry from the data map. Caller must hold the read lock.
-    fn get_entry(&self, data: &HashMap<String, KvEntry>, key: &str) -> Option<KvEntry> {
+    fn get_entry(data: &HashMap<String, KvEntry>, key: &str) -> Option<KvEntry> {
         data.get(key).cloned().filter(|e| !e.is_expired())
     }
 
@@ -67,9 +71,18 @@ impl KvStore {
         data.retain(|_, entry| entry.expires_at.map(|e| e > now).unwrap_or(true));
     }
 
+    /// Try to trigger TTL cleanup if the operation counter has reached the batch size.
+    /// Caller must hold both `data` and `op_counter` write locks.
+    fn try_cleanup(&self, data: &mut HashMap<String, KvEntry>, op_counter: &mut usize) {
+        if *op_counter >= KV_TTL_CLEANUP_BATCH_SIZE {
+            *op_counter = 0;
+            Self::cleanup_expired(data);
+        }
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         let mut data = self.data.write().unwrap();
-        if let Some(entry) = self.get_entry(&data, key) {
+        if let Some(entry) = Self::get_entry(&data, key) {
             return Ok(Some(entry.value));
         }
         // Key missing or expired — clean it up.
@@ -80,11 +93,10 @@ impl KvStore {
     pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: Option<u32>) -> Result<(), String> {
         let expires_at = ttl_secs.map(Self::ttl_to_abs);
         let mut data = self.data.write().unwrap();
+        let mut op_counter = self.op_counter.write().unwrap();
         data.insert(key, KvEntry { value, expires_at });
-        // Lazy TTL cleanup every KV_TTL_CLEANUP_BATCH_SIZE operations.
-        if data.len() % KV_TTL_CLEANUP_BATCH_SIZE == 0 {
-            Self::cleanup_expired(&mut data);
-        }
+        *op_counter += 1;
+        self.try_cleanup(&mut data, &mut op_counter);
         Ok(())
     }
 
@@ -106,22 +118,31 @@ impl KvStore {
     /// Fetch multiple keys at once. Returns a parallel list where each element
     /// is `Some(value)` if the key exists and is not expired, or `None` otherwise.
     pub fn get_many(&self, keys: &[String]) -> Vec<Option<Vec<u8>>> {
+        // First pass: read values under read lock.
+        let results: Vec<_> = {
+            let data = self.data.read().unwrap();
+            keys.iter().map(|k| Self::get_entry(&data, k)).collect()
+        };
+
+        // Second pass: write lock only for cleanup of expired entries.
         let mut data = self.data.write().unwrap();
-        keys.iter()
-            .map(|k| {
-                if let Some(entry) = self.get_entry(&data, k) {
-                    Some(entry.value)
-                } else {
-                    data.remove(k); // clean up expired entry.
-                    None
-                }
-            })
-            .collect()
+        let to_remove: Vec<_> = keys
+            .iter()
+            .zip(results.iter())
+            .filter(|(_, entry)| entry.is_none())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in to_remove {
+            data.remove(&k);
+        }
+
+        results.into_iter().map(|e| e.map(|e| e.value)).collect()
     }
 
     /// Set multiple key-value pairs atomically. Each item is (key, value, ttl_secs).
     pub fn set_many(&self, items: &[(String, Vec<u8>, Option<u32>)]) -> Result<(), String> {
         let mut data = self.data.write().unwrap();
+        let mut op_counter = self.op_counter.write().unwrap();
         for (key, value, ttl_secs) in items {
             let expires_at = ttl_secs.map(Self::ttl_to_abs);
             data.insert(
@@ -131,10 +152,9 @@ impl KvStore {
                     expires_at,
                 },
             );
+            *op_counter += 1;
         }
-        if data.len() % KV_TTL_CLEANUP_BATCH_SIZE < items.len() {
-            Self::cleanup_expired(&mut data);
-        }
+        self.try_cleanup(&mut data, &mut op_counter);
         Ok(())
     }
 
@@ -150,7 +170,7 @@ impl KvStore {
     /// Returns `true` if the key exists and is not expired.
     pub fn exists(&self, key: &str) -> bool {
         let data = self.data.read().unwrap();
-        self.get_entry(&data, key).is_some()
+        Self::get_entry(&data, key).is_some()
     }
 
     /// Remove all entries from the store.

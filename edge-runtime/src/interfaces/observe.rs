@@ -40,7 +40,7 @@ impl Observer {
             entry.0 += 1;
             entry.1 = effective_labels.to_vec();
         }
-        tracing::info!(counter = name, labels = ?effective_labels, "counter incremented");
+        tracing::debug!(counter = name, labels = ?effective_labels, "counter incremented");
     }
 
     /// Set a gauge to a specific value. Records to local storage for test access
@@ -54,7 +54,7 @@ impl Observer {
         if let Ok(mut gauges) = self.gauges.write() {
             gauges.insert(name.to_string(), (value, effective_labels.to_vec()));
         }
-        tracing::info!(gauge = name, value = value, labels = ?effective_labels, "gauge recorded");
+        tracing::debug!(gauge = name, value = value, labels = ?effective_labels, "gauge recorded");
     }
 
     /// Record a histogram sample. Records to local storage for test access
@@ -71,7 +71,7 @@ impl Observer {
                 .or_insert_with(Vec::new)
                 .push((value, effective_labels.to_vec()));
         }
-        tracing::info!(histogram = name, value = value, labels = ?effective_labels, "histogram recorded");
+        tracing::debug!(histogram = name, value = value, labels = ?effective_labels, "histogram recorded");
     }
 
     /// Emit a structured log message with optional label key-value pairs.
@@ -100,6 +100,15 @@ impl Observer {
     pub fn get_gauge(&self, name: &str) -> Option<f64> {
         self.gauges.read().ok().and_then(|g| g.get(name).map(|(v, _)| *v))
     }
+
+    /// Returns all recorded values for a histogram for testing.
+    #[cfg(test)]
+    pub fn get_histogram(&self, name: &str) -> Option<Vec<f64>> {
+        self.histograms
+            .read()
+            .ok()
+            .and_then(|h| h.get(name).map(|v| v.iter().map(|(val, _)| *val).collect()))
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +128,15 @@ mod tests {
         let observer = Observer::new();
         observer.record_gauge("memory_usage_bytes", 1024.0, &[]);
         assert_eq!(observer.get_gauge("memory_usage_bytes"), Some(1024.0));
+    }
+
+    #[test]
+    fn test_record_histogram() {
+        let observer = Observer::new();
+        observer.record_histogram("request_duration_ms", 50.0, &[]);
+        observer.record_histogram("request_duration_ms", 100.0, &[]);
+        let values = observer.get_histogram("request_duration_ms");
+        assert_eq!(values, Some(vec![50.0, 100.0]));
     }
 
     #[test]
