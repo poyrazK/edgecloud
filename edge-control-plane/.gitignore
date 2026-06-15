@@ -1,6 +1,14 @@
 # Binaries
-api
-migrate
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
 
 # IDE
 .idea/
