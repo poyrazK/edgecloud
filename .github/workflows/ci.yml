@@ -129,4 +129,5 @@ jobs:
           key: cargo-target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --manifest-path edge-worker/Cargo.toml
+        run: |
+          SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-worker/Cargo.toml

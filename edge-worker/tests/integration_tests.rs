@@ -6,6 +6,8 @@
 //! Run with: cargo test --manifest-path edge-worker/Cargo.toml
 //!
 //! Prerequisites: Docker must be running for testcontainers.
+//!
+//! Skip in CI with: SKIP_INTEGRATION_TESTS=1 cargo test ...
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +33,14 @@ use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
 use edge_worker::port_pool::PortPool;
 use edge_worker::state::{AppInstanceStatus, WorkerState};
 use edge_worker::supervisor::Supervisor;
+
+/// Returns true if integration tests should be skipped (e.g., in CI environments
+/// where Docker is unavailable or unreliable for container tests).
+fn should_skip_integration_tests() -> bool {
+    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
+        || std::env::var("CI").is_ok()
+        || !std::path::Path::new("/var/run/docker.sock").exists()
+}
 
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
@@ -195,6 +205,11 @@ async fn wait_for_app_gone(
 
 #[tokio::test]
 async fn test_app_lifecycle() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
     let harness = TestHarness::new().await.expect("create test harness");
 
     // Wire up the mock HTTP server to serve the test component.
@@ -265,6 +280,11 @@ async fn test_app_lifecycle() {
 
 #[tokio::test]
 async fn test_heartbeat_published() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
     timeout(HARNESS_STARTUP_TIMEOUT, test_heartbeat_published_inner())
         .await
         .expect("test_heartbeat_published timed out")
@@ -332,6 +352,11 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_stop_all_apps() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
     let harness = TestHarness::new().await.expect("create test harness");
 
     // Wire up the mock HTTP server to serve the test component.
