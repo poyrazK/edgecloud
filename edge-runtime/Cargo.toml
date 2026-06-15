@@ -29,6 +29,14 @@ metrics = { version = "0.24", optional = true }
 # HTTP parsing for http-server
 httparse = { version = "1.10", optional = true }
 
+# TLS for http-server
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+
+# gzip compression for http-server
+flate2 = { version = "1.1", optional = true }
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
@@ -55,5 +63,5 @@ observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
-http-server = ["dep:tokio", "dep:httparse"]
+http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2"]
 networking = ["dep:trust-dns-resolver", "dep:tokio"]

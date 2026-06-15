@@ -5,10 +5,63 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{timeout_at, Instant};
+
+/// Enum to hold either a plain TCP stream or a TLS stream.
+/// Allows a single handle_connection to work with both without dyn Trait.
+enum StreamKind {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl AsyncRead for StreamKind {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            StreamKind::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for StreamKind {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            StreamKind::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            StreamKind::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            StreamKind::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Unpin for StreamKind {}
 
 /// Default maximum concurrent connections.
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
@@ -16,8 +69,18 @@ const DEFAULT_MAX_CONNECTIONS: usize = 100;
 const DEFAULT_CONN_TIMEOUT_SECS: u64 = 30;
 /// Maximum header buffer size (16KB).
 const MAX_HEADER_SIZE: usize = 16384;
-/// Maximum request body size (10MB) — prevents memory exhaustion.
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+/// Default maximum request body size (10MB) — prevents memory exhaustion.
+const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
+/// Minimum allowed max body size (1KB).
+const MIN_MAX_BODY_SIZE: u64 = 1024;
+/// Threshold in bytes above which gzip compression kicks in.
+const GZIP_COMPRESSION_THRESHOLD: usize = 512;
+
+/// Environment variable names for TLS configuration.
+const ENV_TLS_CERT_PATH: &str = "EDGE_TLS_CERT_PATH";
+const ENV_TLS_KEY_PATH: &str = "EDGE_TLS_KEY_PATH";
+/// Environment variable name for max body size limit.
+const ENV_MAX_BODY_SIZE: &str = "EDGE_MAX_BODY_SIZE";
 
 /// Parts of an HTTP response sent back to the connection handler.
 pub struct HttpResponse {
@@ -70,10 +133,19 @@ pub struct HttpServer {
     max_connections: usize,
     /// Per-connection read/write deadline.
     conn_timeout: Duration,
+    /// TLS server configuration, if TLS is enabled via env vars.
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Maximum request body size in bytes.
+    max_body_size: u64,
 }
 
 impl HttpServer {
     pub fn new() -> Self {
+        let max_body_size = std::env::var(ENV_MAX_BODY_SIZE)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_BODY_SIZE);
+
         Self {
             port: None,
             tx: Arc::new(RwLock::new(None)),
@@ -86,11 +158,18 @@ impl HttpServer {
             conn_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
+            tls_config: try_load_tls_config(),
+            max_body_size,
         }
     }
 
     /// Construct with custom connection limit and timeout.
     pub fn with_limits(max_connections: usize, conn_timeout_secs: u64) -> Self {
+        let max_body_size = std::env::var(ENV_MAX_BODY_SIZE)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_BODY_SIZE);
+
         Self {
             port: None,
             tx: Arc::new(RwLock::new(None)),
@@ -103,6 +182,8 @@ impl HttpServer {
             conn_limit: Arc::new(Semaphore::new(max_connections)),
             max_connections,
             conn_timeout: Duration::from_secs(conn_timeout_secs),
+            tls_config: try_load_tls_config(),
+            max_body_size,
         }
     }
 
@@ -134,6 +215,8 @@ impl HttpServer {
         let conn_limit = self.conn_limit.clone();
         let conn_timeout = self.conn_timeout;
         let max_connections = self.max_connections;
+        let tls_config = self.tls_config.clone();
+        let max_body_size = self.max_body_size;
 
         let handle = tokio::spawn(async move {
             tokio::pin!(shutdown_rx);
@@ -147,7 +230,7 @@ impl HttpServer {
                     }
                     accept_result = listener.accept() => {
                         match accept_result {
-                            Ok((stream, _)) => {
+                            Ok((stream, peer_addr)) => {
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                                 let (ch_tx, ch_rx) = tokio::sync::oneshot::channel();
                                 responses.lock().unwrap().insert(id, ch_tx);
@@ -156,6 +239,8 @@ impl HttpServer {
                                 let meter = meter.clone();
                                 let conn_timeout = conn_timeout;
                                 let conn_limit = conn_limit.clone();
+                                let tls_config = tls_config.clone();
+                                let max_body_size = max_body_size;
 
                                 // Spawn a task that handles the connection and
                                 // acquires/releases the connection permit.
@@ -164,8 +249,36 @@ impl HttpServer {
                                         Ok(p) => p,
                                         Err(_) => return, // Semaphore closed — shouldn't happen.
                                     };
+
+                                    // Perform TLS handshake if configured.
+                                    let stream =
+                                        match tls_config.as_ref() {
+                                            Some(tls_cfg) => {
+                                                let acceptor =
+                                                    tokio_rustls::TlsAcceptor::from(tls_cfg.clone());
+                                                match acceptor.accept(stream).await {
+                                                    Ok(tls_stream) => {
+                                                        tracing::debug!(
+                                                            peer = %peer_addr,
+                                                            "TLS handshake complete",
+                                                        );
+                                                        StreamKind::Tls(Box::new(tls_stream))
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            peer = %peer_addr,
+                                                            err = %e,
+                                                            "TLS handshake failed",
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            None => StreamKind::Plain(stream),
+                                        };
+
                                     Self::handle_connection(
-                                        id, stream, tx, ch_rx, meter, conn_timeout,
+                                        id, stream, tx, ch_rx, meter, conn_timeout, max_body_size,
                                     )
                                     .await;
                                     drop(permit); // release connection slot
@@ -201,17 +314,18 @@ impl HttpServer {
     /// then wait for the guest's response and write it to the socket.
     async fn handle_connection(
         id: u64,
-        mut stream: tokio::net::TcpStream,
+        mut stream: StreamKind,
         tx: mpsc::Sender<IncomingRequest>,
         ch_rx: tokio::sync::oneshot::Receiver<HttpResponse>,
         meter: Option<Arc<RequestMeter>>,
         conn_timeout: Duration,
+        max_body_size: u64,
     ) {
         // Per-connection deadline. Each read/write operation must complete within
         // this window. If exceeded, the connection is aborted.
         let deadline = Instant::now() + conn_timeout;
 
-        let request = match Self::read_request(&mut stream, deadline, id).await {
+        let request = match Self::read_request(&mut stream, deadline, id, max_body_size).await {
             Ok(Some(req)) => req,
             Ok(None) => {
                 tracing::debug!(req_id = %id, "connection closed or parse error");
@@ -228,7 +342,7 @@ impl HttpServer {
         }
 
         // Send request to the guest via poll().
-        if tx.send(request).await.is_err() {
+        if tx.send(request.clone()).await.is_err() {
             tracing::debug!(req_id = %id, "poll channel closed, closing connection");
             return;
         }
@@ -251,7 +365,16 @@ impl HttpServer {
         };
 
         // Use the same deadline for write (does not refresh).
-        if let Err(e) = Self::write_response(&mut stream, status, &headers, &body, deadline).await {
+        if let Err(e) = Self::write_response(
+            &mut stream,
+            status,
+            &headers,
+            &body,
+            deadline,
+            &request.headers,
+        )
+        .await
+        {
             tracing::warn!(req_id = %id, err = %e, "response write error");
         }
     }
@@ -259,9 +382,10 @@ impl HttpServer {
     /// Read and parse one HTTP request from the stream. Returns None on EOF or
     /// parse failure. Returns the parsed IncomingRequest on success.
     async fn read_request(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut StreamKind,
         deadline: Instant,
         id: u64,
+        max_body_size: u64,
     ) -> Result<Option<IncomingRequest>, std::io::Error> {
         let mut header_buf = vec![0u8; MAX_HEADER_SIZE];
         let mut total_read = 0usize;
@@ -359,8 +483,13 @@ impl HttpServer {
             .unwrap_or(0);
 
         // Reject oversized bodies to prevent memory exhaustion.
-        if body_len > MAX_BODY_SIZE {
-            tracing::warn!(req_id = %id, body_len, "request body exceeds max size");
+        if body_len > max_body_size as usize {
+            tracing::warn!(
+                req_id = %id,
+                body_len,
+                max = %max_body_size,
+                "request body exceeds max size",
+            );
             return Ok(None);
         }
 
@@ -402,21 +531,32 @@ impl HttpServer {
         }))
     }
 
-    /// Write an HTTP/1.1 response back to the socket.
+    /// Write an HTTP/1.1 response back to the socket, with optional gzip compression.
     async fn write_response(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut StreamKind,
         status: u16,
         headers: &[(String, String)],
         body: &[u8],
         deadline: Instant,
+        request_headers: &[(String, String)],
     ) -> Result<(), std::io::Error> {
+        let accept_gzip = request_headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Encoding") && v.contains("gzip"));
+
+        let (body_to_send, is_compressed) = try_compress(body, accept_gzip);
+
         let status_line = format!("HTTP/1.1 {} {}\r\n", status, Self::status_text(status));
         let mut response = status_line.into_bytes();
         for (k, v) in headers {
             response.extend(format!("{}: {}\r\n", k, v).bytes());
         }
-        response.extend(format!("Content-Length: {}\r\n\r\n", body.len()).bytes());
-        response.extend(body);
+        if is_compressed {
+            response.extend(b"Content-Encoding: gzip\r\n");
+            response.extend(b"Vary: Accept-Encoding\r\n");
+        }
+        response.extend(format!("Content-Length: {}\r\n\r\n", body_to_send.len()).bytes());
+        response.extend(&body_to_send);
 
         timeout_at(deadline, stream.write_all(&response)).await??;
         timeout_at(deadline, stream.flush()).await??;
@@ -511,6 +651,66 @@ impl HttpServer {
         server.meter = meter;
         server
     }
+
+    /// Set the maximum request body size in bytes.
+    pub fn with_max_body_size(mut self, bytes: u64) -> Self {
+        self.max_body_size = bytes.max(MIN_MAX_BODY_SIZE);
+        self
+    }
+}
+
+/// Try to load TLS configuration from EDGE_TLS_CERT_PATH and EDGE_TLS_KEY_PATH.
+/// Returns None if the env vars are absent or the cert/key files are invalid.
+/// When None, the server falls back to plain HTTP.
+fn try_load_tls_config() -> Option<Arc<rustls::ServerConfig>> {
+    let cert_path = std::env::var(ENV_TLS_CERT_PATH).ok()?;
+    let key_path = std::env::var(ENV_TLS_KEY_PATH).ok()?;
+
+    let cert = std::fs::read(&cert_path)
+        .map_err(|e| tracing::warn!(path = %cert_path, err = %e, "failed to read TLS certificate"))
+        .ok()?;
+    let key = std::fs::read(&key_path)
+        .map_err(|e| tracing::warn!(path = %key_path, err = %e, "failed to read TLS private key"))
+        .ok()?;
+
+    if cert.is_empty() || key.is_empty() {
+        tracing::warn!("TLS certificate or key file is empty");
+        return None;
+    }
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert))
+        .filter_map(Result::ok)
+        .collect();
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key))
+        .ok()
+        .flatten()?;
+
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()?;
+
+    tracing::info!(cert_path = %cert_path, "TLS configured");
+    Some(Arc::new(cfg))
+}
+
+/// Attempt to gzip-compress `body` if it exceeds the compression threshold and
+/// the client signaled it accepts gzip via the Accept-Encoding request header.
+fn try_compress(body: &[u8], accept_gzip: bool) -> (Vec<u8>, bool) {
+    if !accept_gzip || body.len() < GZIP_COMPRESSION_THRESHOLD {
+        return (body.to_vec(), false);
+    }
+    let mut compressed = Vec::new();
+    let mut encoder =
+        flate2::GzBuilder::new().write(&mut compressed, flate2::Compression::default());
+    if std::io::Write::write_all(&mut encoder, body).is_ok()
+        && std::io::Write::flush(&mut encoder).is_ok()
+        && encoder.try_finish().is_ok()
+    {
+        drop(encoder); // release borrow on compressed
+        return (compressed, true);
+    }
+    (body.to_vec(), false)
 }
 
 #[cfg(test)]
@@ -567,6 +767,53 @@ mod tests {
         assert_eq!(DEFAULT_MAX_CONNECTIONS, 100);
         assert_eq!(DEFAULT_CONN_TIMEOUT_SECS, 30);
         assert_eq!(MAX_HEADER_SIZE, 16384);
-        assert_eq!(MAX_BODY_SIZE, 10 * 1024 * 1024);
+        assert_eq!(DEFAULT_MAX_BODY_SIZE, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_try_compress_small_body_below_threshold() {
+        // Body below GZIP_COMPRESSION_THRESHOLD should not be compressed
+        let small = b"hello".to_vec();
+        let (result, compressed) = try_compress(&small, true);
+        assert!(!compressed);
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn test_try_compress_no_accept_gzip() {
+        // Without Accept-Encoding gzip, compression should not happen
+        let large: Vec<u8> = (0..255u8).collect();
+        let (result, compressed) = try_compress(&large, false);
+        assert!(!compressed);
+        assert_eq!(result, large);
+    }
+
+    #[test]
+    fn test_try_compress_with_gzip_above_threshold() {
+        // Large body with Accept-Encoding gzip should compress
+        let large: Vec<u8> = vec![0u8; 1024];
+        let (result, compressed) = try_compress(&large, true);
+        assert!(compressed);
+        assert!(result.len() < large.len());
+    }
+
+    #[test]
+    fn test_with_max_body_size() {
+        let server = HttpServer::new().with_max_body_size(5_000_000);
+        assert_eq!(server.max_body_size, 5_000_000);
+    }
+
+    #[test]
+    fn test_with_max_body_size_clamped_to_minimum() {
+        let server = HttpServer::new().with_max_body_size(100);
+        assert_eq!(server.max_body_size, MIN_MAX_BODY_SIZE);
+    }
+
+    #[test]
+    fn test_try_load_tls_config_returns_none_when_no_env() {
+        // When neither EDGE_TLS_CERT_PATH nor EDGE_TLS_KEY_PATH is set,
+        // try_load_tls_config should return None (not panic).
+        let result = try_load_tls_config();
+        assert!(result.is_none());
     }
 }
