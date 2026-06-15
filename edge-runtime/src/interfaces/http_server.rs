@@ -36,11 +36,8 @@ pub struct HttpServer {
     rx: Arc<TokioMutex<Option<mpsc::Receiver<IncomingRequest>>>>,
     /// Maps request-id -> response sender, so `respond` can route data
     /// back to the correct connection handler.
-    responses: Arc<
-        StdMutex<
-            std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>,
-        >,
-    >,
+    responses:
+        Arc<StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>>>,
     /// Request counter — must be shared with the accept loop.
     next_id: Arc<AtomicU64>,
     pub meter: Option<Arc<RequestMeter>>,
