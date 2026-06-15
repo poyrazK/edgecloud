@@ -36,7 +36,9 @@ impl Observer {
             labels
         };
         if let Ok(mut counters) = self.counters.write() {
-            let entry = counters.entry(name.to_string()).or_insert_with(|| (0, Vec::new()));
+            let entry = counters
+                .entry(name.to_string())
+                .or_insert_with(|| (0, Vec::new()));
             entry.0 += 1;
             entry.1 = effective_labels.to_vec();
         }
@@ -76,10 +78,7 @@ impl Observer {
 
     /// Emit a structured log message with optional label key-value pairs.
     pub fn emit_log(&self, level: &str, message: &str, labels: &[(String, String)]) {
-        let label_strs: Vec<_> = labels
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let label_strs: Vec<_> = labels.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         match level {
             "error" => tracing::error!(labels = ?label_strs, "{}", message),
             "warn" => tracing::warn!(labels = ?label_strs, "{}", message),
@@ -92,13 +91,19 @@ impl Observer {
     /// Returns the current value of a counter for testing.
     #[cfg(test)]
     pub fn get_counter(&self, name: &str) -> Option<u64> {
-        self.counters.read().ok().and_then(|c| c.get(name).map(|(v, _)| *v))
+        self.counters
+            .read()
+            .ok()
+            .and_then(|c| c.get(name).map(|(v, _)| *v))
     }
 
     /// Returns the current value of a gauge for testing.
     #[cfg(test)]
     pub fn get_gauge(&self, name: &str) -> Option<f64> {
-        self.gauges.read().ok().and_then(|g| g.get(name).map(|(v, _)| *v))
+        self.gauges
+            .read()
+            .ok()
+            .and_then(|g| g.get(name).map(|(v, _)| *v))
     }
 
     /// Returns all recorded values for a histogram for testing.

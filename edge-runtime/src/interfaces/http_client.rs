@@ -243,7 +243,14 @@ mod tests {
         let client = HttpClient::new();
         // httpbin.org/get returns a valid JSON response with status 200.
         // On success, error field must be None.
-        let resp = client.fetch("GET", "https://httpbin.org/get", &[], None, Some(5000), None);
+        let resp = client.fetch(
+            "GET",
+            "https://httpbin.org/get",
+            &[],
+            None,
+            Some(5000),
+            None,
+        );
         assert!(
             resp.error.is_none(),
             "error field should be None on success, got: {:?}",
@@ -260,7 +267,14 @@ mod tests {
         let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01";
         // Unreachable host — error should be network-related, not a traceparent parsing error.
         // This verifies the traceparent header path is exercised without hitting a real server.
-        let resp = client.fetch("GET", "http://127.0.0.1:1", &[], None, Some(100), Some(traceparent));
+        let resp = client.fetch(
+            "GET",
+            "http://127.0.0.1:1",
+            &[],
+            None,
+            Some(100),
+            Some(traceparent),
+        );
         assert!(resp.error.is_some(), "error field should be populated");
         let err_msg = resp.error.unwrap();
         // Should NOT fail due to traceparent validation — error should be network-related.
@@ -271,14 +285,24 @@ mod tests {
     #[test]
     fn test_is_valid_traceparent() {
         // Valid traceparent
-        assert!(is_valid_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"));
+        assert!(is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
         // Invalid: wrong version
-        assert!(!is_valid_traceparent("01-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"));
+        assert!(!is_valid_traceparent(
+            "01-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
         // Invalid: malformed hex
-        assert!(!is_valid_traceparent("00-xyz7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"));
+        assert!(!is_valid_traceparent(
+            "00-xyz7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01"
+        ));
         // Invalid: wrong number of parts
-        assert!(!is_valid_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa"));
+        assert!(!is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa"
+        ));
         // Invalid: traceparent too short
-        assert!(!is_valid_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503-01"));
+        assert!(!is_valid_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503-01"
+        ));
     }
 }
