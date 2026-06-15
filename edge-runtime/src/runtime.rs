@@ -112,14 +112,15 @@ impl HttpClientHost for RuntimeState {
         let url = req.url.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let body = req.body.as_deref();
-        match self.http_client.fetch(method, url, &headers, body) {
-            Ok(resp) => Some(Response {
-                status: resp.status,
-                headers: resp.headers.into_iter().collect(),
-                body: resp.body,
-            }),
-            Err(_) => None,
-        }
+        let resp = self
+            .http_client
+            .fetch(method, url, &headers, body, req.timeout_ms);
+        Some(Response {
+            status: resp.status,
+            headers: resp.headers.into_iter().collect(),
+            body: resp.body,
+            error: resp.error,
+        })
     }
 }
 
