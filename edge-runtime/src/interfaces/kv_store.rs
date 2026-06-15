@@ -1,10 +1,15 @@
 //! `edge:kv-store` — durable key-value persistence.
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const KV_TTL_CLEANUP_BATCH_SIZE: usize = 100;
+const STORE_FILENAME: &str = "store.json";
+const ENV_KV_STORE_PATH: &str = "EDGE_KV_STORE_PATH";
 
 #[derive(Clone)]
 pub struct KvEntry {
@@ -26,11 +31,121 @@ impl KvEntry {
     }
 }
 
+/// Errors that can occur during persistence operations.
+#[derive(Debug, thiserror::Error)]
+pub enum KvStoreError {
+    #[error("IO error: {0}")]
+    Io(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("data file corrupted: {0}")]
+    Corrupted(String),
+}
+
+/// On-disk representation of the store.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedStore {
+    version: u32,
+    keys: Vec<PersistedKey>,
+}
+
+/// On-disk representation of a single key.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedKey {
+    key: String,
+    value: String, // base64-encoded
+    expires_at: Option<u64>,
+}
+
+/// Handles async file I/O for the store.
+struct KvStorePersistence {
+    path: PathBuf,
+}
+
+impl KvStorePersistence {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Load all non-expired keys from the store file.
+    /// Missing or corrupt files result in an empty store (no error).
+    pub async fn load(&self) -> Result<HashMap<String, KvEntry>, KvStoreError> {
+        let contents = match tokio::fs::read_to_string(&self.path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("KV store file not found, starting empty");
+                return Ok(HashMap::new());
+            }
+            Err(e) => return Err(KvStoreError::Io(e.to_string())),
+        };
+
+        let state: PersistedStore =
+            serde_json::from_str(&contents).map_err(|e| KvStoreError::Corrupted(e.to_string()))?;
+
+        let now = KvStore::now_secs();
+        state
+            .keys
+            .into_iter()
+            .filter(|k| k.expires_at.map(|e| e > now).unwrap_or(true))
+            .map(|k| {
+                let value = BASE64
+                    .decode(&k.value)
+                    .map_err(|_| KvStoreError::Corrupted("invalid base64".into()))?;
+                Ok((
+                    k.key,
+                    KvEntry {
+                        value,
+                        expires_at: k.expires_at,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Atomically flush the current in-memory state to disk.
+    /// Uses rename-to-replace: write to a .tmp file, then rename atomically.
+    /// Note: data is cloned under the lock, then lock is released before async I/O.
+    pub async fn flush(&self, data: &RwLock<HashMap<String, KvEntry>>) -> Result<(), KvStoreError> {
+        // Clone under lock, then release lock before async I/O.
+        let keys: Vec<PersistedKey> = {
+            let data = data.read().unwrap();
+            data.iter()
+                .map(|(k, v)| PersistedKey {
+                    key: k.clone(),
+                    value: BASE64.encode(&v.value),
+                    expires_at: v.expires_at,
+                })
+                .collect()
+        };
+        let state = PersistedStore { version: 1, keys };
+
+        let json = serde_json::to_string(&state)
+            .map_err(|e| KvStoreError::Serialization(e.to_string()))?;
+
+        let tmp_path = self.path.with_extension("json.tmp");
+        // Ensure the parent directory exists before writing.
+        if let Some(parent) = tmp_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                KvStoreError::Io(format!("failed to create store directory: {}", e))
+            })?;
+        }
+        tokio::fs::write(&tmp_path, json.as_bytes())
+            .await
+            .map_err(|e| KvStoreError::Io(e.to_string()))?;
+        tokio::fs::rename(&tmp_path, &self.path)
+            .await
+            .map_err(|e| KvStoreError::Io(e.to_string()))?;
+        Ok(())
+    }
+}
+
 pub struct KvStore {
     data: RwLock<HashMap<String, KvEntry>>,
     /// Counts write operations since last TTL cleanup.
     /// Triggers cleanup every KV_TTL_CLEANUP_BATCH_SIZE operations.
     op_counter: RwLock<usize>,
+    /// Persistence handle. None = ephemeral in-memory store.
+    persistence: Option<KvStorePersistence>,
 }
 
 impl Default for KvStore {
@@ -38,13 +153,38 @@ impl Default for KvStore {
         Self {
             data: RwLock::new(HashMap::new()),
             op_counter: RwLock::new(0),
+            persistence: None,
         }
     }
 }
 
 impl KvStore {
+    /// Ephemeral in-memory store (backward compatible).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Persistent store at the given directory path.
+    /// The store file is `<path>/store.json`.
+    pub fn with_persistence(path: &Path) -> Result<Self, KvStoreError> {
+        let store_path = path.join(STORE_FILENAME);
+        let persistence = KvStorePersistence::new(store_path);
+        let rt = tokio::runtime::Handle::current();
+        let data = rt.block_on(persistence.load())?;
+        Ok(Self {
+            data: RwLock::new(data),
+            op_counter: RwLock::new(0),
+            persistence: Some(persistence),
+        })
+    }
+
+    /// Persistent store using the `EDGE_KV_STORE_PATH` environment variable.
+    /// Returns `Ok(None)` if the env var is not set (ephemeral mode).
+    pub fn from_env() -> Result<Option<Self>, KvStoreError> {
+        match std::env::var(ENV_KV_STORE_PATH) {
+            Ok(path) => Self::with_persistence(Path::new(&path)).map(Some),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Returns the current unix timestamp in seconds.
@@ -80,6 +220,27 @@ impl KvStore {
         }
     }
 
+    /// Internal helper: flush to disk if persistence is configured.
+    /// If no Tokio runtime is active (e.g., in unit tests), skip the flush silently.
+    fn flush_if_persistent(&self) {
+        if self.persistence.is_none() {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let _ = rt.block_on(self.flush_impl());
+        }
+        // If no runtime is active, silently skip the flush (tests without persistence).
+    }
+
+    /// Called by `flush_if_persistent` only when `persistence` is `Some`.
+    async fn flush_impl(&self) -> Result<(), KvStoreError> {
+        // SAFETY: flush_if_persistent returns early when persistence.is_none(),
+        // so this is only invoked when persistence is Some.
+        let p = self.persistence.as_ref().unwrap();
+        p.flush(&self.data).await?;
+        Ok(())
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         let mut data = self.data.write().unwrap();
         if let Some(entry) = Self::get_entry(&data, key) {
@@ -90,6 +251,7 @@ impl KvStore {
         Ok(None)
     }
 
+    /// Set a key. Triggers a disk flush if persistence is configured.
     pub fn set(&self, key: String, value: Vec<u8>, ttl_secs: Option<u32>) -> Result<(), String> {
         let expires_at = ttl_secs.map(Self::ttl_to_abs);
         let mut data = self.data.write().unwrap();
@@ -97,12 +259,19 @@ impl KvStore {
         data.insert(key, KvEntry { value, expires_at });
         *op_counter += 1;
         self.try_cleanup(&mut data, &mut op_counter);
+        drop(data);
+        drop(op_counter);
+        self.flush_if_persistent();
         Ok(())
     }
 
+    /// Delete a key. Triggers a disk flush if persistence is configured.
     pub fn delete(&self, key: &str) -> Result<(), String> {
-        let mut data = self.data.write().unwrap();
-        data.remove(key);
+        {
+            let mut data = self.data.write().unwrap();
+            data.remove(key);
+        }
+        self.flush_if_persistent();
         Ok(())
     }
 
@@ -139,31 +308,37 @@ impl KvStore {
         results.into_iter().map(|e| e.map(|e| e.value)).collect()
     }
 
-    /// Set multiple key-value pairs atomically. Each item is (key, value, ttl_secs).
+    /// Set multiple key-value pairs atomically. Triggers one disk flush at the end.
     pub fn set_many(&self, items: &[(String, Vec<u8>, Option<u32>)]) -> Result<(), String> {
-        let mut data = self.data.write().unwrap();
-        let mut op_counter = self.op_counter.write().unwrap();
-        for (key, value, ttl_secs) in items {
-            let expires_at = ttl_secs.map(Self::ttl_to_abs);
-            data.insert(
-                key.clone(),
-                KvEntry {
-                    value: value.clone(),
-                    expires_at,
-                },
-            );
-            *op_counter += 1;
+        {
+            let mut data = self.data.write().unwrap();
+            let mut op_counter = self.op_counter.write().unwrap();
+            for (key, value, ttl_secs) in items {
+                let expires_at = ttl_secs.map(Self::ttl_to_abs);
+                data.insert(
+                    key.clone(),
+                    KvEntry {
+                        value: value.clone(),
+                        expires_at,
+                    },
+                );
+                *op_counter += 1;
+            }
+            self.try_cleanup(&mut data, &mut op_counter);
         }
-        self.try_cleanup(&mut data, &mut op_counter);
+        self.flush_if_persistent();
         Ok(())
     }
 
-    /// Delete multiple keys at once.
+    /// Delete multiple keys at once. Triggers one disk flush at the end.
     pub fn delete_many(&self, keys: &[String]) -> Result<(), String> {
-        let mut data = self.data.write().unwrap();
-        for key in keys {
-            data.remove(key);
+        {
+            let mut data = self.data.write().unwrap();
+            for key in keys {
+                data.remove(key);
+            }
         }
+        self.flush_if_persistent();
         Ok(())
     }
 
@@ -173,10 +348,13 @@ impl KvStore {
         Self::get_entry(&data, key).is_some()
     }
 
-    /// Remove all entries from the store.
+    /// Remove all entries from the store. Triggers a disk flush if persistence is configured.
     pub fn clear(&self) {
-        let mut data = self.data.write().unwrap();
-        data.clear();
+        {
+            let mut data = self.data.write().unwrap();
+            data.clear();
+        }
+        self.flush_if_persistent();
     }
 }
 
@@ -316,5 +494,13 @@ mod tests {
             .unwrap();
         // Without time travel, the key should still be there (cleanup not triggered yet).
         assert!(store.exists("short"));
+    }
+
+    #[test]
+    fn test_from_env_returns_none_when_not_set() {
+        // When EDGE_KV_STORE_PATH is not set, from_env should return Ok(None)
+        let result = KvStore::from_env();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

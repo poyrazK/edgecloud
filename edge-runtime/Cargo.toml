@@ -37,6 +37,9 @@ tokio-rustls = { version = "0.26", optional = true }
 # gzip compression for http-server
 flate2 = { version = "1.1", optional = true }
 
+# Base64 encoding for kv-store persistence
+base64 = "0.22"
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"

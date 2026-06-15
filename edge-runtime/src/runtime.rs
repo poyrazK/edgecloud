@@ -36,7 +36,7 @@ impl RuntimeState {
         let exit_code = Arc::new(AtomicU32::new(0));
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
+            kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
@@ -56,7 +56,7 @@ impl RuntimeState {
         let exit_code = Arc::new(AtomicU32::new(0));
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
+            kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
@@ -76,7 +76,7 @@ impl RuntimeState {
         let exit_code = Arc::new(AtomicU32::new(0));
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
+            kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
@@ -85,6 +85,19 @@ impl RuntimeState {
             networking: networking::NetworkingState::new(),
             http_server: http_server::HttpServer::with_meter(meter),
             exit_code,
+        }
+    }
+
+    /// Attempt to create a persistent KvStore from `EDGE_KV_STORE_PATH`,
+    /// falling back to an ephemeral in-memory store on any error.
+    fn make_kv_store() -> Arc<kv_store::KvStore> {
+        match kv_store::KvStore::from_env() {
+            Ok(Some(store)) => Arc::new(store),
+            Ok(None) => Arc::new(kv_store::KvStore::new()),
+            Err(e) => {
+                tracing::warn!("KV store persistence unavailable, using ephemeral: {}", e);
+                Arc::new(kv_store::KvStore::new())
+            }
         }
     }
 
