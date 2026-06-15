@@ -143,7 +143,9 @@ impl HttpServer {
             }
         });
 
-        // Check if bind failed before returning success.
+        // Note: bind_failed is only set on the failure path. If the spawned task
+        // reaches accept() successfully, the flag stays false — so we only check
+        // it here to detect a bind error. A successful bind never touches the flag.
         if bind_failed.load(Ordering::Relaxed) {
             self.accept_task = Some(accept_task);
             return Err(format!("failed to bind {}", addr_for_error));

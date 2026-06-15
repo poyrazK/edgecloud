@@ -49,7 +49,7 @@ mod prometheus_backend {
     /// Composite key: metric name + sorted labels for correct per-label tracking.
     type MetricKey = (String, Vec<(String, String)>);
 
-    fn make_key(name: &str, labels: &[(String, String)]) -> MetricKey {
+    pub(crate) fn make_key(name: &str, labels: &[(String, String)]) -> MetricKey {
         let mut sorted = labels.to_vec();
         sorted.sort();
         (name.to_string(), sorted)
@@ -57,9 +57,9 @@ mod prometheus_backend {
 
     /// Prometheus-compatible backend using the `metrics` crate.
     pub struct PrometheusBackend {
-        counters: Arc<RwLock<HashMap<MetricKey, Counter>>>,
-        gauges: Arc<RwLock<HashMap<MetricKey, Gauge>>>,
-        histograms: Arc<RwLock<HashMap<MetricKey, Histogram>>>,
+        pub(crate) counters: Arc<RwLock<HashMap<MetricKey, Counter>>>,
+        pub(crate) gauges: Arc<RwLock<HashMap<MetricKey, Gauge>>>,
+        pub(crate) histograms: Arc<RwLock<HashMap<MetricKey, Histogram>>>,
     }
 
     impl PrometheusBackend {
@@ -166,5 +166,92 @@ impl Observer {
 impl Default for Observer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_noop_backend_increment_counter_does_not_panic() {
+        let backend = NoOpBackend;
+        backend.increment_counter("test_counter", &[(String::from("method"), String::from("GET"))]);
+        backend.increment_counter("test_counter", &[(String::from("method"), String::from("POST"))]);
+    }
+
+    #[test]
+    fn test_noop_backend_record_gauge_does_not_panic() {
+        let backend = NoOpBackend;
+        backend.record_gauge("test_gauge", 42.0, &[(String::from("host"), String::from("localhost"))]);
+    }
+
+    #[test]
+    fn test_noop_backend_record_histogram_does_not_panic() {
+        let backend = NoOpBackend;
+        backend.record_histogram("test_histogram", 0.5, &[]);
+    }
+
+    #[test]
+    fn test_observer_with_noop_backend_does_not_panic() {
+        let observer = Observer::new();
+        observer.increment_counter("req", &[(String::from("method"), String::from("GET"))]);
+        observer.record_gauge("memory_bytes", 1024.0, &[]);
+        observer.record_histogram("latency_ms", 50.0, &[]);
+        observer.emit_log("info", "test message");
+    }
+
+    #[cfg(feature = "observe")]
+    #[test]
+    fn test_labels_tracked_separately_in_prometheus_backend() {
+        use prometheus_backend::PrometheusBackend;
+
+        let backend = PrometheusBackend::new();
+
+        // Increment same metric name with different labels
+        backend.increment_counter("http_requests", &[(String::from("method"), String::from("GET"))]);
+        backend.increment_counter("http_requests", &[(String::from("method"), String::from("GET"))]);
+        backend.increment_counter("http_requests", &[(String::from("method"), String::from("POST"))]);
+
+        // Both label combinations should exist as separate entries
+        let counters = backend.counters.read().unwrap();
+        assert_eq!(counters.len(), 2, "expected 2 separate metric entries for different labels");
+    }
+
+    #[cfg(feature = "observe")]
+    #[test]
+    fn test_gauge_labels_tracked_separately() {
+        use prometheus_backend::PrometheusBackend;
+
+        let backend = PrometheusBackend::new();
+
+        backend.record_gauge("memory_usage", 100.0, &[(String::from("host"), String::from("a"))]);
+        backend.record_gauge("memory_usage", 200.0, &[(String::from("host"), String::from("b"))]);
+
+        let gauges = backend.gauges.read().unwrap();
+        assert_eq!(gauges.len(), 2, "expected 2 separate gauge entries for different labels");
+    }
+
+    #[cfg(feature = "observe")]
+    #[test]
+    fn test_make_key_sorts_labels_canonical() {
+        use prometheus_backend::make_key;
+
+        // Same labels in different order should produce same key
+        let key1 = make_key("req", &[(String::from("a"), String::from("1")), (String::from("b"), String::from("2"))]);
+        let key2 = make_key("req", &[(String::from("b"), String::from("2")), (String::from("a"), String::from("1"))]);
+
+        assert_eq!(key1, key2, "label order should not affect key");
+        assert_eq!(key1.0, "req");
+    }
+
+    #[cfg(feature = "observe")]
+    #[test]
+    fn test_observer_with_prometheus_backend() {
+        let observer = Observer::with_prometheus();
+        observer.increment_counter("test_req", &[(String::from("method"), String::from("GET"))]);
+        observer.record_gauge("test_gauge", 1.0, &[]);
+        observer.record_histogram("test_hist", 0.1, &[]);
+        // Should not panic
     }
 }
