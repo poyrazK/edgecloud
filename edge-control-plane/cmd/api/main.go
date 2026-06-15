@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
@@ -37,8 +41,12 @@ func main() {
 	appEnvRepo := repository.NewAppEnvRepository(db)
 	_ = repository.NewWorkerRepository(db) // workerRepo initialized for future use
 
-	// Initialize NATS publisher (mock for now)
-	var publisher nats.Publisher = &nats.MockPublisher{}
+	// Initialize NATS publisher
+	publisher, err := nats.NewNATSPublisher(cfg.NATS.URL)
+	if err != nil {
+		log.Fatalf("Failed to connect to NATS: %v", err)
+	}
+	defer publisher.Close()
 
 	// Initialize artifact storage
 	artifactStore := storage.NewArtifactStore(cfg.Storage.ArtifactPath)
@@ -106,10 +114,25 @@ func main() {
 	// Internal endpoints (worker-facing, would need JWT auth)
 	mux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 
-	// Start server
+	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
-	log.Printf("Starting edge-cloud control plane on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		log.Printf("Starting edge-cloud control plane on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+	if err := srv.Shutdown(context.Background()); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+	log.Println("Server exited")
 }

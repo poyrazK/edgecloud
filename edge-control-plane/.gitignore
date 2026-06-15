@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+api
 
 # IDE
 .idea/
