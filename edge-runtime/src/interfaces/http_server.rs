@@ -417,7 +417,10 @@ impl HttpServer {
     pub async fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
         let mut rx = self.rx.lock().unwrap();
         if let Some(rx) = rx.as_mut() {
-            Ok(rx.blocking_recv())
+            match rx.recv().await {
+                Some(req) => Ok(Some(req)),
+                None => Err("http-server channel closed".to_string()),
+            }
         } else {
             Err("http-server not started".to_string())
         }
@@ -469,6 +472,15 @@ impl Drop for HttpServer {
 impl Default for HttpServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl HttpServer {
+    /// Create an HttpServer with a pre-set request meter.
+    pub fn with_meter(meter: Option<Arc<RequestMeter>>) -> Self {
+        let mut server = Self::new();
+        server.meter = meter;
+        server
     }
 }
 

@@ -12,6 +12,8 @@ use crate::edge::cloud::time::Host as TimeHost;
 use crate::interfaces::{
     cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
 };
+use crate::metering::RequestMeter;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub struct RuntimeState {
@@ -24,10 +26,14 @@ pub struct RuntimeState {
     pub process: process::Process,
     pub networking: networking::NetworkingState,
     pub http_server: http_server::HttpServer,
+    /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
+    /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
+    pub exit_code: Arc<AtomicU32>,
 }
 
 impl RuntimeState {
     pub fn new() -> Self {
+        let exit_code = Arc::new(AtomicU32::new(0));
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Arc::new(kv_store::KvStore::new()),
@@ -35,9 +41,61 @@ impl RuntimeState {
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: scheduling::Scheduler::new(),
-            process: process::Process::new(),
+            process: process::Process::with_env_and_exit_code(
+                Arc::new(std::env::vars().collect()),
+                exit_code.clone(),
+            ),
             networking: networking::NetworkingState::new(),
             http_server: http_server::HttpServer::new(),
+            exit_code,
+        }
+    }
+
+    /// Create a RuntimeState with per-app environment variables for tenant isolation.
+    pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
+        let exit_code = Arc::new(AtomicU32::new(0));
+        Self {
+            http_client: http_client::HttpClient::new(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
+            observe: observe::Observer::new(),
+            time: time::Clock::new(),
+            scheduling: scheduling::Scheduler::new(),
+            process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
+            networking: networking::NetworkingState::new(),
+            http_server: http_server::HttpServer::new(),
+            exit_code,
+        }
+    }
+
+    /// Create a RuntimeState with per-app env vars and a request meter.
+    pub fn with_env_and_meter(
+        env: std::collections::HashMap<String, String>,
+        meter: Option<Arc<RequestMeter>>,
+    ) -> Self {
+        let exit_code = Arc::new(AtomicU32::new(0));
+        Self {
+            http_client: http_client::HttpClient::new(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
+            observe: observe::Observer::new(),
+            time: time::Clock::new(),
+            scheduling: scheduling::Scheduler::new(),
+            process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
+            networking: networking::NetworkingState::new(),
+            http_server: http_server::HttpServer::with_meter(meter),
+            exit_code,
+        }
+    }
+
+    /// Returns `Some(code)` if the guest WASM component called `process.exit(code)`,
+    /// `None` if no exit was requested.
+    pub fn exit_requested(&self) -> Option<u32> {
+        let code = self.exit_code.load(Ordering::SeqCst);
+        if code == 0 {
+            None
+        } else {
+            Some(code)
         }
     }
 }
