@@ -25,21 +25,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Fix git state
         run: |
           git reset --hard
-          rm -rf edge-runtime/
-          git submodule update --init --recursive --force
-
-      - name: Debug
-        run: |
-          echo "=== ls -la edge-runtime/ ==="
-          ls -la edge-runtime/
-          echo "=== find edge-runtime/ -maxdepth 2 ==="
-          find edge-runtime/ -maxdepth 2
+          git submodule update --init --force
 
       - name: Install ${{ matrix.tool }}
         run: |
@@ -82,21 +72,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Fix git state
         run: |
           git reset --hard
-          rm -rf edge-runtime/
-          git submodule update --init --recursive --force
-
-      - name: Debug
-        run: |
-          echo "=== ls -la edge-runtime/ ==="
-          ls -la edge-runtime/
-          echo "=== find edge-runtime/ -maxdepth 2 ==="
-          find edge-runtime/ -maxdepth 2
+          git submodule update --init --force
 
       - name: Cache cargo registry
         uses: actions/cache@v4
