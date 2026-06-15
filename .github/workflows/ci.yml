@@ -99,7 +99,7 @@ jobs:
       - name: Run tests
         run: cargo test --manifest-path edge-runtime/Cargo.toml
 
-  test:edge-worker:
+  test-edge-worker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
