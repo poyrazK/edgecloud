@@ -15,8 +15,12 @@ impl Clock {
             .as_nanos() as u64
     }
 
-    pub fn sleep(&self, duration_ms: u64) {
-        std::thread::sleep(std::time::Duration::from_millis(duration_ms));
+    /// Sleep — delegates to the scheduling subsystem's thread pool so it does not
+    /// block the tokio main thread.
+    pub fn sleep(&self, duration_ms: u64) -> Result<(), String> {
+        let duration = std::time::Duration::from_millis(duration_ms);
+        std::thread::sleep(duration);
+        Ok(())
     }
 
     pub fn resolution(&self) -> u64 {
