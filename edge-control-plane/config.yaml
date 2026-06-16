@@ -21,3 +21,7 @@ jwt:
   secret: "change-me-in-production"
   ttl_hours: 24
   issuer: "edgecloud"
+
+migration:
+  edge_migrate_path: "edge-migrate"
+  wasi_sdk_path: "/usr/local/wasi-sdk/bin"

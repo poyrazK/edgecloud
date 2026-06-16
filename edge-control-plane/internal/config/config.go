@@ -15,6 +15,7 @@ type Config struct {
 	App      AppConfig      `yaml:"app"`
 	Storage  StorageConfig  `yaml:"storage"`
 	JWT      JWTConfig      `yaml:"jwt"`
+	Migration MigrationConfig `yaml:"migration"`
 }
 
 type DatabaseConfig struct {
@@ -38,6 +39,11 @@ type AppConfig struct {
 
 type StorageConfig struct {
 	ArtifactPath string `yaml:"artifact_path"`
+}
+
+type MigrationConfig struct {
+	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
+	WasiSdkPath     string `yaml:"wasi_sdk_path" env:"WASI_SDK_PATH" envDefault:"/usr/local/wasi-sdk/bin"`
 }
 
 type JWTConfig struct {
@@ -120,6 +126,12 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
+	}
+	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
+		cfg.Migration.EdgeMigratePath = v
+	}
+	if v := os.Getenv("WASI_SDK_PATH"); v != "" {
+		cfg.Migration.WasiSdkPath = v
 	}
 
 	// Defaults for JWT config
