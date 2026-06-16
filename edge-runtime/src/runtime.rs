@@ -34,8 +34,10 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
@@ -45,7 +47,7 @@ impl RuntimeState {
                 Arc::new(std::env::vars().collect()),
                 exit_code.clone(),
             ),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
         }
@@ -54,15 +56,17 @@ impl RuntimeState {
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
     pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: scheduling::Scheduler::new(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
         }
@@ -74,15 +78,17 @@ impl RuntimeState {
         meter: Option<Arc<RequestMeter>>,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
             kv_store: Self::make_kv_store(),
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
             scheduling: scheduling::Scheduler::new(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::with_meter(meter),
             exit_code,
         }

@@ -1,8 +1,11 @@
 //! `edge:http-client` — outbound HTTP requests.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use crate::interfaces::dns::DnsCache;
+use reqwest::Url;
 
 /// Default per-request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -11,8 +14,51 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Default base delay for exponential backoff in milliseconds.
 const DEFAULT_BASE_DELAY_MS: u64 = 100;
 
+/// HTTP client configuration sourced from environment variables.
+struct HttpClientConfig {
+    connect_timeout: Duration,
+    pool_idle_timeout: Duration,
+    dns_cache: Arc<DnsCache>,
+}
+
+impl HttpClientConfig {
+    fn load() -> Self {
+        let connect_timeout = std::env::var("EDGE_HTTP_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(5));
+
+        let dns_ttl_secs = std::env::var("EDGE_HTTP_DNS_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+
+        let pool_idle_timeout = std::env::var("EDGE_HTTP_POOL_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
+
+        let dns_cache = Arc::new(DnsCache::new(dns_ttl_secs));
+
+        Self {
+            connect_timeout,
+            pool_idle_timeout,
+            dns_cache,
+        }
+    }
+}
+
+static CONFIG: OnceLock<HttpClientConfig> = OnceLock::new();
+
+fn config() -> &'static HttpClientConfig {
+    CONFIG.get_or_init(HttpClientConfig::load)
+}
+
 pub struct HttpClient {
     client: Arc<reqwest::blocking::Client>,
+    dns_cache: Arc<DnsCache>,
 }
 
 impl Default for HttpClient {
@@ -22,9 +68,21 @@ impl Default for HttpClient {
 }
 
 impl HttpClient {
+    /// Create a new HttpClient with a fresh, shared DNS cache.
     pub fn new() -> Self {
+        let cfg = config();
         Self {
             client: global_client(),
+            dns_cache: cfg.dns_cache.clone(),
+        }
+    }
+
+    /// Create an HttpClient with a shared DNS cache from [`NetworkingState`](super::networking::NetworkingState).
+    /// Use this when constructing RuntimeState to ensure both interfaces share the same DNS cache.
+    pub fn new_with_dns_cache(dns_cache: Arc<DnsCache>) -> Self {
+        Self {
+            client: global_client(),
+            dns_cache,
         }
     }
 
@@ -50,8 +108,8 @@ impl HttpClient {
 
             match result {
                 Ok(resp) => {
-                    // Retry on 503 and 429 if we have retries left.
-                    if attempt < max_retries && (resp.status == 503 || resp.status == 429) {
+                    // Retry on 502, 503, 504, and 429 if we have retries left.
+                    if attempt < max_retries && is_retryable_status(resp.status) {
                         attempt += 1;
                         let delay = backoff(attempt, base_delay);
                         std::thread::sleep(delay);
@@ -59,11 +117,8 @@ impl HttpClient {
                     }
                     return resp;
                 }
-                Err(FetchError { message }) => {
-                    // Don't retry on permanent errors.
-                    // Note: reqwest Error::is_timeout() would be ideal but its constructors
-                    // are private, so we check the error message string for "timeout".
-                    if attempt >= max_retries || message.contains("timeout") {
+                Err(FetchError { message, retryable }) => {
+                    if attempt >= max_retries || !retryable {
                         return HttpResponse {
                             status: 0,
                             headers: HashMap::new(),
@@ -88,9 +143,9 @@ impl HttpClient {
         timeout: Duration,
         traceparent: Option<&str>,
     ) -> Result<HttpResponse, FetchError> {
-        // Validate method first.
         let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| FetchError {
             message: format!("invalid method: {}", e),
+            retryable: false,
         })?;
 
         let mut req = self.client.request(method, url);
@@ -110,30 +165,54 @@ impl HttpClient {
             req = req.body(b.to_vec());
         }
 
-        // Apply per-request timeout via request builder.
+        // Apply per-request read/write timeout.
         req = req.timeout(timeout);
 
-        let response = req.send().map_err(|e| FetchError {
-            message: e.to_string(),
-        })?;
+        // Attempt to resolve the hostname into the DNS cache before connecting.
+        if let Ok(host) = Url::parse(url) {
+            if let Some(host_str) = host.host_str() {
+                let _ = self.dns_cache.resolve(host_str);
+            }
+        }
 
-        let status = response.status().as_u16();
-        let response_headers: HashMap<_, _> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let body = response.bytes().map_err(|e| FetchError {
-            message: e.to_string(),
-        })?;
+        let response = req.send();
 
-        Ok(HttpResponse {
-            status,
-            headers: response_headers,
-            body: body.to_vec(),
-            error: None,
-        })
+        match response {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let response_headers: HashMap<_, _> = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let body = resp.bytes().map_err(|e| FetchError {
+                    message: e.to_string(),
+                    retryable: is_retryable_error(&e),
+                })?;
+
+                Ok(HttpResponse {
+                    status,
+                    headers: response_headers,
+                    body: body.to_vec(),
+                    error: None,
+                })
+            }
+            Err(e) => Err(FetchError {
+                message: e.to_string(),
+                retryable: is_retryable_error(&e),
+            }),
+        }
     }
+}
+
+/// Returns true for HTTP status codes that are safe to retry.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504)
+}
+
+/// Returns true for reqwest errors that represent transient failures.
+fn is_retryable_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
 }
 
 /// Compute exponential backoff: 100ms, 200ms, 400ms, ... capped at 10s.
@@ -165,13 +244,18 @@ fn is_valid_traceparent(tp: &str) -> bool {
     true
 }
 
-/// Lazily-initialized global reqwest client with connection pooling.
+/// Lazily-initialized global reqwest client with connection pooling and timeouts.
 fn global_client() -> Arc<reqwest::blocking::Client> {
-    static ONCE: std::sync::OnceLock<Arc<reqwest::blocking::Client>> = std::sync::OnceLock::new();
+    static ONCE: OnceLock<Arc<reqwest::blocking::Client>> = OnceLock::new();
     ONCE.get_or_init(|| {
+        let cfg = config();
+        let builder = reqwest::blocking::Client::builder()
+            .connect_timeout(cfg.connect_timeout)
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(cfg.pool_idle_timeout);
+
         Arc::new(
-            reqwest::blocking::Client::builder()
-                .pool_max_idle_per_host(16)
+            builder
                 .build()
                 .expect("reqwest global client creation failed"),
         )
@@ -183,6 +267,8 @@ fn global_client() -> Arc<reqwest::blocking::Client> {
 #[derive(Debug, Clone)]
 struct FetchError {
     message: String,
+    /// Whether this error is safe to retry.
+    retryable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -208,11 +294,23 @@ mod tests {
     }
 
     #[test]
+    fn test_is_retryable_status() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(500));
+        assert!(!is_retryable_status(404));
+    }
+
+    #[test]
     fn test_global_client_reuse() {
         let c1 = global_client();
         let c2 = global_client();
         // Arc should point to the same allocation.
-        assert!(std::sync::Arc::ptr_eq(&c1, &c2));
+        assert!(Arc::ptr_eq(&c1, &c2));
     }
 
     #[test]
@@ -266,7 +364,6 @@ mod tests {
         // Valid W3C traceparent format
         let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6a71660503fa-01";
         // Unreachable host — error should be network-related, not a traceparent parsing error.
-        // This verifies the traceparent header path is exercised without hitting a real server.
         let resp = client.fetch(
             "GET",
             "http://127.0.0.1:1",
@@ -278,7 +375,6 @@ mod tests {
         assert!(resp.error.is_some(), "error field should be populated");
         let err_msg = resp.error.unwrap();
         // Should NOT fail due to traceparent validation — error should be network-related.
-        // reqwest error messages vary by platform; any error is acceptable here.
         assert!(!err_msg.is_empty(), "error should be populated");
     }
 
