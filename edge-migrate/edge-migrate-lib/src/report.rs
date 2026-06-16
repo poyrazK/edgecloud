@@ -131,6 +131,7 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+                arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
                 transformability: Transformability::AutoTransformable,
             },
             PatternMatch {
@@ -139,6 +140,7 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::Connect,
                 snippet: "connect(fd, ...)".to_string(),
+                arg_nodes: vec!["fd".to_string(), "...".to_string()],
                 transformability: Transformability::AutoTransformable,
             },
         ];
@@ -156,6 +158,7 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+                arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
                 transformability: Transformability::AutoTransformable,
             },
             PatternMatch {
@@ -164,6 +167,7 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::Poll,
                 snippet: "poll(fds, 2, timeout)".to_string(),
+                arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
                 transformability: Transformability::NotTransformable,
             },
         ];
@@ -181,6 +185,7 @@ mod tests {
             end_byte: 0,
             pattern: PosixPattern::Fork,
             snippet: "fork()".to_string(),
+            arg_nodes: vec![],
             transformability: Transformability::NotTransformable,
         }];
         let report = MigrationReport::from_pattern_matches("hello_world", matches);

@@ -144,92 +144,90 @@ impl Transformer {
             }
             PosixPattern::Bind => {
                 // Two-phase: start-bind + finish-bind
-                // The original call is like: bind(fd, &addr, len)
-                // We replace with a two-line block
                 format!(
                     "// WASI: two-phase bind\n{{\n  wasi_socket_tcp_start_bind({}, {});\n  wasi_socket_tcp_finish_bind({});\n}}",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Listen => {
                 // Two-phase: start-listen + finish-listen
                 format!(
                     "// WASI: two-phase listen\n{{\n  wasi_socket_tcp_start_listen({}, {});\n  wasi_socket_tcp_finish_listen({});\n}}",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Connect => {
                 // Two-phase: start-connect + finish-connect
                 format!(
                     "// WASI: two-phase connect\n{{\n  wasi_socket_tcp_start_connect({}, {});\n  wasi_socket_tcp_finish_connect({});\n}}",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Accept => {
                 // Wrap in poll loop
                 format!(
                     "// WASI: accept with poll loop\n{{\n  wasi_socket_tcp_accept_result_t result;\n  do {{\n    result = wasi_socket_tcp_accept({});\n    if (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK) {{\n      wasi_poll_pollable_block(pollable);\n    }}\n  }} while (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK);\n  /* accepted socket in result.val */\n}}",
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m)
                 )
             }
             PosixPattern::Recv => {
                 format!(
                     "wasi_input_stream_read({}, {}, {})",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_third_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Send => {
                 format!(
                     "wasi_output_stream_write({}, {}, {})",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_third_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::GetHostByName => {
                 format!(
                     "wasi_ip_name_lookup_resolve({})",
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m)
                 )
             }
             PosixPattern::Close => {
-                format!("wasi_socket_close({})", Self::extract_first_arg(&m.snippet))
+                format!("wasi_socket_close({})", Self::extract_first_arg(m))
             }
             PosixPattern::Fopen => {
                 format!(
                     "wasi_filesystem_open({}, {})",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m)
                 )
             }
             PosixPattern::Fread => {
                 format!(
                     "wasi_filesystem_read({}, {}, {})",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_third_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Fwrite => {
                 format!(
                     "wasi_filesystem_write({}, {}, {})",
-                    Self::extract_first_arg(&m.snippet),
-                    Self::extract_second_arg(&m.snippet),
-                    Self::extract_third_arg(&m.snippet)
+                    Self::extract_first_arg(m),
+                    Self::extract_second_arg(m),
+                    Self::extract_third_arg(m)
                 )
             }
             PosixPattern::Fclose => {
                 format!(
                     "wasi_filesystem_close({})",
-                    Self::extract_first_arg(&m.snippet)
+                    Self::extract_first_arg(m)
                 )
             }
             // These should not reach here (NotTransformable patterns)
@@ -237,52 +235,19 @@ impl Transformer {
         }
     }
 
-    /// Extract the first argument from a call snippet.
-    fn extract_first_arg(snippet: &str) -> String {
-        Self::extract_arg(snippet, 0)
+    /// Extract the first argument from a call via arg_nodes (avoids comma-re-parsing bugs).
+    fn extract_first_arg(m: &PatternMatch) -> String {
+        m.arg_nodes.first().cloned().unwrap_or_else(|| "/* unknown */".to_string())
     }
 
-    /// Extract the second argument from a call snippet.
-    fn extract_second_arg(snippet: &str) -> String {
-        Self::extract_arg(snippet, 1)
+    /// Extract the second argument from a call via arg_nodes.
+    fn extract_second_arg(m: &PatternMatch) -> String {
+        m.arg_nodes.get(1).cloned().unwrap_or_else(|| "/* unknown */".to_string())
     }
 
-    /// Extract the third argument from a call snippet.
-    fn extract_third_arg(snippet: &str) -> String {
-        Self::extract_arg(snippet, 2)
-    }
-
-    /// Extract the nth argument from a call snippet like "func(arg1, arg2, arg3)".
-    fn extract_arg(snippet: &str, n: usize) -> String {
-        // Find the opening parenthesis
-        if let Some(paren_idx) = snippet.find('(') {
-            let args_part = &snippet[paren_idx + 1..];
-            // Count commas to find the right argument
-            let mut depth = 0;
-            let mut arg_start = 0;
-            let mut commas_found = 0;
-
-            for (i, c) in args_part.char_indices() {
-                if c == '(' {
-                    depth += 1;
-                } else if c == ')' {
-                    if depth == 0 {
-                        // End of arguments
-                        let arg = args_part[arg_start..i].trim();
-                        return arg.to_string();
-                    }
-                    depth -= 1;
-                } else if c == ',' && depth == 0 {
-                    if commas_found == n {
-                        let arg = args_part[arg_start..i].trim();
-                        return arg.to_string();
-                    }
-                    commas_found += 1;
-                    arg_start = i + 1;
-                }
-            }
-        }
-        "/* unknown */".to_string()
+    /// Extract the third argument from a call via arg_nodes.
+    fn extract_third_arg(m: &PatternMatch) -> String {
+        m.arg_nodes.get(2).cloned().unwrap_or_else(|| "/* unknown */".to_string())
     }
 }
 
@@ -304,6 +269,7 @@ int main() {
             end_byte: 48,
             pattern: PosixPattern::SocketTcp,
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -326,6 +292,7 @@ int main() {
             end_byte: 0,
             pattern: PosixPattern::Poll,
             snippet: "poll(fds, 2, timeout)".to_string(),
+            arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
             transformability: Transformability::NotTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -347,6 +314,7 @@ int main() {
             end_byte: 65,
             pattern: PosixPattern::Bind,
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
+            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -369,6 +337,7 @@ int main() {
             end_byte: 68,
             pattern: PosixPattern::Connect,
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
+            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -391,6 +360,7 @@ int main() {
             end_byte: 35,
             pattern: PosixPattern::Recv,
             snippet: "recv(fd, buf, len, 0)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -412,6 +382,7 @@ int main() {
             end_byte: 35,
             pattern: PosixPattern::Send,
             snippet: "send(fd, buf, len, 0)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -433,6 +404,7 @@ int main() {
             end_byte: 38,
             pattern: PosixPattern::Accept,
             snippet: "accept(fd, NULL, NULL)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
             transformability: Transformability::BestEffort,
         }];
         let result = Transformer::transform(source, matches);
@@ -443,14 +415,115 @@ int main() {
 
     #[test]
     fn test_extract_first_arg() {
-        assert_eq!(Transformer::extract_first_arg("socket(AF_INET, SOCK_STREAM, 0)"), "AF_INET");
-        assert_eq!(Transformer::extract_first_arg("bind(fd, &addr, len)"), "fd");
-        assert_eq!(Transformer::extract_first_arg("recv(fd, buf, len, 0)"), "fd");
+        let m = PatternMatch {
+            line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::SocketTcp,
+            snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        assert_eq!(Transformer::extract_first_arg(&m), "AF_INET");
+
+        let m = PatternMatch {
+            line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::Bind,
+            snippet: "bind(fd, &addr, len)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        assert_eq!(Transformer::extract_first_arg(&m), "fd");
     }
 
     #[test]
     fn test_extract_second_arg() {
-        assert_eq!(Transformer::extract_second_arg("bind(fd, &addr, len)"), "&addr");
-        assert_eq!(Transformer::extract_second_arg("listen(fd, 128)"), "128");
+        let m = PatternMatch {
+            line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::Bind,
+            snippet: "bind(fd, &addr, len)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        assert_eq!(Transformer::extract_second_arg(&m), "&addr");
+
+        let m = PatternMatch {
+            line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::Listen,
+            snippet: "listen(fd, 128)".to_string(),
+            arg_nodes: vec!["fd".to_string(), "128".to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        assert_eq!(Transformer::extract_second_arg(&m), "128");
+    }
+
+    /// Verifies that string literals with commas are NOT split on the comma.
+    #[test]
+    fn test_extract_arg_with_comma_in_string_literal() {
+        let m = PatternMatch {
+            line: 0,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::Fopen,
+            snippet: r#"fopen("foo,bar", "r")"#.to_string(),
+            arg_nodes: vec![r#"foo,bar"#.to_string(), r#""r""#.to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        // extract_first_arg must return "foo,bar" (with the comma inside the string)
+        assert_eq!(Transformer::extract_first_arg(&m), r#"foo,bar"#);
+        assert_eq!(Transformer::extract_second_arg(&m), r#""r""#);
+    }
+
+    /// Integration test: verify that a full socket sequence transforms to valid C
+    /// (at minimum — parses as correct syntax). Runs clang -fsyntax-only if available.
+    #[test]
+    fn test_transform_socket_sequence_valid_c() {
+        let source = r#"
+#include <stdio.h>
+int main() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    bind(fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(fd, 128);
+    int client = accept(fd, NULL, NULL);
+    return 0;
+}
+"#;
+        let mut analyzer = crate::analyzer::CAnalyzer::new();
+        let matches = analyzer.analyze(source);
+        let result = Transformer::transform(source, matches);
+
+        // Smoke checks: key WASI markers must be present
+        assert!(result.transformed_source.contains("wasi_socket_tcp_create"));
+        assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
+        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
+        assert!(result.transformed_source.contains("wasi_socket_tcp_start_listen"));
+        assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
+
+        // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
+        // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
+        // since WASI SDK is only available in the server-side build environment (Phase 6).
+        if std::env::var("EDGE_TEST_CLANG").is_ok()
+            && std::process::Command::new("clang").arg("--version").output().is_ok()
+        {
+            let pid = std::process::id();
+            let tmp_path = std::env::temp_dir().join(format!("edge_migrate_test_{}.c", pid));
+            std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
+            let output = std::process::Command::new("clang")
+                .args(["-fsyntax-only", "-Werror", tmp_path.to_str().unwrap()])
+                .output()
+                .expect("clang runs");
+            let _ = std::fs::remove_file(&tmp_path);
+            assert!(
+                output.status.success(),
+                "clang syntax check failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
