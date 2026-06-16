@@ -283,32 +283,35 @@ impl NetworkingHost for RuntimeState {
 }
 
 impl HttpServerHost for RuntimeState {
-    fn start(&mut self, port: u16, host: Option<String>) {
+    fn start(&mut self, port: u16, host: Option<String>) -> Result<(), String> {
         let rt = tokio::runtime::Handle::current();
-        let _ = rt.block_on(self.http_server.start(port, host));
+        rt.block_on(self.http_server.start(port, host))
     }
-    fn poll(&mut self) -> Option<crate::edge::cloud::http_server::IncomingRequest> {
+    fn poll(&mut self) -> Result<Option<crate::edge::cloud::http_server::IncomingRequest>, String> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.poll())
-            .ok()
-            .flatten()
-            .map(|req| crate::edge::cloud::http_server::IncomingRequest {
+            .map(|opt| opt.map(|req| crate::edge::cloud::http_server::IncomingRequest {
                 id: req.id,
                 method: req.method,
                 path: req.path,
                 query: req.query,
                 headers: req.headers,
                 body: req.body,
-                trace: req
-                    .trace
-                    .map(|tc| crate::edge::cloud::http_server::TraceContext {
-                        traceparent: tc.traceparent,
-                        tracestate: tc.tracestate,
-                    }),
-            })
+                trace: req.trace.map(|tc| crate::edge::cloud::http_server::TraceContext {
+                    traceparent: tc.traceparent,
+                    tracestate: tc.tracestate,
+                }),
+            }))
     }
-    fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
+    fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Result<(), String> {
         let rt = tokio::runtime::Handle::current();
-        let _ = rt.block_on(self.http_server.respond(req_id, status, headers, body));
+        rt.block_on(self.http_server.respond(req_id, status, headers, body))
+    }
+    fn shutdown(&mut self) {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(self.http_server.shutdown());
+    }
+    fn get_assigned_port(&mut self) -> u16 {
+        self.http_server.get_assigned_port()
     }
 }

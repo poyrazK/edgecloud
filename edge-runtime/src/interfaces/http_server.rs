@@ -310,6 +310,11 @@ impl HttpServer {
         }
     }
 
+    /// Returns the port the server is bound to, if it has been started.
+    pub fn get_assigned_port(&self) -> u16 {
+        self.port.unwrap_or(0)
+    }
+
     /// Handle one TCP connection: read and parse HTTP, send request to guest,
     /// then wait for the guest's response and write it to the socket.
     async fn handle_connection(

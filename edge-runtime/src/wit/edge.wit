@@ -91,9 +91,11 @@ interface http-server {
     trace: option<trace-context>,
   }
 
-  start: func(port: u16, host: option<string>);
-  poll: func() -> option<incoming-request>;
-  respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>);
+  start: func(port: u16, host: option<string>) -> result<_, string>;
+  shutdown: func();
+  get-assigned-port: func() -> u16;
+  poll: func() -> result<option<incoming-request>, string>;
+  respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<_, string>;
 }
 
 world edge-runtime {
