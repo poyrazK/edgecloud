@@ -66,3 +66,24 @@ pub struct HttpResponse {
     pub headers: std::collections::HashMap<String, String>,
     pub body: Vec<u8>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_successful_response_error_field_is_none() {
+        let client = HttpClient::new();
+        // jsonplaceholder.typicode.com/todos/1 returns a valid JSON response with status 200.
+        // On success, error field must be None.
+        let resp = client.fetch(
+            "GET",
+            "https://jsonplaceholder.typicode.com/todos/1",
+            &[],
+            None,
+        );
+        let resp = resp.expect("request should succeed");
+        assert_eq!(resp.status, 200);
+        assert!(!resp.body.is_empty());
+    }
+}
