@@ -339,11 +339,11 @@ mod tests {
     #[test]
     fn test_successful_response_error_field_is_none() {
         let client = HttpClient::new();
-        // httpbin.org/get returns a valid JSON response with status 200.
+        // jsonplaceholder.typicode.com/todos/1 returns a valid JSON response with status 200.
         // On success, error field must be None.
         let resp = client.fetch(
             "GET",
-            "https://httpbin.org/get",
+            "https://jsonplaceholder.typicode.com/todos/1",
             &[],
             None,
             Some(5000),

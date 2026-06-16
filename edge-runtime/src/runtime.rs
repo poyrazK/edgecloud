@@ -42,7 +42,7 @@ impl RuntimeState {
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(
                 Arc::new(std::env::vars().collect()),
                 exit_code.clone(),
@@ -64,7 +64,7 @@ impl RuntimeState {
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
             http_server: http_server::HttpServer::new(),
@@ -86,7 +86,7 @@ impl RuntimeState {
             cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
@@ -103,6 +103,19 @@ impl RuntimeState {
             Err(e) => {
                 tracing::warn!("KV store persistence unavailable, using ephemeral: {}", e);
                 Arc::new(kv_store::KvStore::new())
+            }
+        }
+    }
+
+    /// Attempt to create a persistent Scheduler from `EDGE_SCHEDULING_PATH`,
+    /// falling back to an ephemeral in-memory scheduler on any error.
+    fn make_scheduler() -> scheduling::Scheduler {
+        match scheduling::Scheduler::from_env() {
+            Ok(Some(s)) => s,
+            Ok(None) => scheduling::Scheduler::new(),
+            Err(e) => {
+                tracing::warn!("scheduling persistence unavailable, using ephemeral: {}", e);
+                scheduling::Scheduler::new()
             }
         }
     }
