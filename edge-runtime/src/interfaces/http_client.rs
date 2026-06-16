@@ -72,17 +72,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_successful_response_error_field_is_none() {
+    fn test_successful_response_returns_200() {
         let client = HttpClient::new();
         // jsonplaceholder.typicode.com/todos/1 returns a valid JSON response with status 200.
-        // On success, error field must be None.
         let resp = client.fetch(
             "GET",
             "https://jsonplaceholder.typicode.com/todos/1",
             &[],
             None,
         );
-        let resp = resp.expect("request should succeed");
+        assert!(resp.is_ok(), "request should succeed");
+        let resp = resp.unwrap();
         assert_eq!(resp.status, 200);
         assert!(!resp.body.is_empty());
     }
