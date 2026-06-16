@@ -66,4 +66,3 @@ pub struct HttpResponse {
     pub headers: std::collections::HashMap<String, String>,
     pub body: Vec<u8>,
 }
-
