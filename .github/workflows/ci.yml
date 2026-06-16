@@ -61,12 +61,12 @@ jobs:
 
       - name: Run ${{ matrix.tool }} (edge-runtime)
         if: matrix.tool != 'audit'
-        run: cargo ${{ matrix.command }} --locked
+        run: cargo ${{ matrix.command }}
         working-directory: edge-runtime
 
       - name: Run ${{ matrix.tool }} (edge-worker)
         if: matrix.tool != 'audit'
-        run: cargo ${{ matrix.command }} --locked
+        run: cargo ${{ matrix.command }}
         working-directory: edge-worker
 
       - name: Run audit
