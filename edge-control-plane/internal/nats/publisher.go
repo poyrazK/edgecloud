@@ -111,3 +111,8 @@ func (p *NATSPublisher) PublishHeartbeat(region string, msg *HeartbeatMessage) e
 func (p *NATSPublisher) Close() {
 	p.nc.Close()
 }
+
+// Conn returns the underlying NATS connection for subscriber use.
+func (p *NATSPublisher) Conn() *nats.Conn {
+	return p.nc
+}

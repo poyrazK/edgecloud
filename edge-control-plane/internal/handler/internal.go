@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -11,10 +13,14 @@ import (
 // InternalHandler handles internal worker-facing endpoints.
 type InternalHandler struct {
 	deploymentSvc *service.DeploymentService
+	workerSvc     *service.WorkerService
 }
 
-func NewInternalHandler(deploymentSvc *service.DeploymentService) *InternalHandler {
-	return &InternalHandler{deploymentSvc: deploymentSvc}
+func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService) *InternalHandler {
+	return &InternalHandler{
+		deploymentSvc: deploymentSvc,
+		workerSvc:     workerSvc,
+	}
 }
 
 // Download serves Wasm artifacts to authenticated workers.
@@ -42,4 +48,32 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 		// client disconnected, nothing we can do
 		return
 	}
+}
+
+// RegisterWorker handles POST /api/internal/workers — worker registration.
+func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetWorkerTenantID(r.Context())
+	var req domain.RegisterWorkerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := h.workerSvc.Register(r.Context(), tenantID, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// ListWorkers handles GET /api/internal/workers — list workers for the authenticated tenant.
+func (h *InternalHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetWorkerTenantID(r.Context())
+	workers, err := h.workerSvc.ListByTenant(r.Context(), tenantID)
+	if err != nil {
+		http.Error(w, "failed to list workers", http.StatusInternalServerError)
+		return
+	}
+	resp := map[string]interface{}{"workers": workers}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

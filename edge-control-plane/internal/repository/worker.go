@@ -23,14 +23,14 @@ func (r *WorkerRepository) WithTx(tx *sqlx.Tx) *WorkerRepository {
 }
 
 func (r *WorkerRepository) Create(ctx context.Context, w *domain.Worker) error {
-	query := `INSERT INTO workers (id, region, ip, memory_mb, last_seen, created_at) VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := r.db.ExecContext(ctx, query, w.ID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt)
+	query := `INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := r.db.ExecContext(ctx, query, w.ID, w.TenantID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt)
 	return err
 }
 
 func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Worker, error) {
 	var w domain.Worker
-	query := `SELECT id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE id = $1`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE id = $1`
 	err := r.db.GetContext(ctx, &w, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -40,8 +40,22 @@ func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Work
 
 func (r *WorkerRepository) List(ctx context.Context) ([]domain.Worker, error) {
 	var workers []domain.Worker
-	query := `SELECT id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`
 	err := r.db.SelectContext(ctx, &workers, query)
+	return workers, err
+}
+
+func (r *WorkerRepository) CountByTenant(ctx context.Context, tenantID string) (int, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM workers WHERE tenant_id = $1`
+	err := r.db.GetContext(ctx, &count, query, tenantID)
+	return count, err
+}
+
+func (r *WorkerRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error) {
+	var workers []domain.Worker
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE tenant_id = $1 ORDER BY region, created_at DESC`
+	err := r.db.SelectContext(ctx, &workers, query, tenantID)
 	return workers, err
 }
 
