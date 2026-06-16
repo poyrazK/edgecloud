@@ -1,0 +1,124 @@
+package handler
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+)
+
+// TenantHandler handles tenant HTTP requests.
+type TenantHandler struct {
+	tenantSvc *service.TenantService
+}
+
+func NewTenantHandler(tenantSvc *service.TenantService) *TenantHandler {
+	return &TenantHandler{tenantSvc: tenantSvc}
+}
+
+type CreateTenantRequest struct {
+	Name string `json:"name"`
+	Plan string `json:"plan"`
+}
+
+func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
+	var req CreateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		return
+	}
+	plan := req.Plan
+	if plan == "" {
+		plan = "free"
+	}
+
+	tenant, err := h.tenantSvc.CreateTenant(r.Context(), req.Name, plan)
+	if err != nil {
+		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(tenant)
+}
+
+func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
+	if err != nil {
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if tenant == nil {
+		http.Error(w, `{"error": "tenant not found"}`, http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tenant)
+}
+
+func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
+	tenants, err := h.tenantSvc.ListTenants(r.Context())
+	if err != nil {
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tenants)
+}
+
+type UpdateTenantRequest struct {
+	Name                   string   `json:"name"`
+	Plan                   string   `json:"plan"`
+	AllowlistedDestinations []string `json:"allowlisted_destinations"`
+}
+
+func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+
+	var req UpdateTenantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
+	if err != nil || tenant == nil {
+		http.Error(w, `{"error": "tenant not found"}`, http.StatusNotFound)
+		return
+	}
+
+	if req.Name != "" {
+		tenant.Name = req.Name
+	}
+	if req.Plan != "" {
+		tenant.Plan = req.Plan
+	}
+	if len(req.AllowlistedDestinations) > 0 {
+		tenant.AllowlistedDestinations = req.AllowlistedDestinations
+	}
+
+	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tenant)
+}
+
+func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	if err := h.tenantSvc.DeleteTenant(r.Context(), tenantID); err != nil {
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

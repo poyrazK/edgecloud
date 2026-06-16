@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
+use crate::output;
 use crate::state::State;
 
 /// Get deployment status.
@@ -17,6 +18,7 @@ pub fn run(path: &Path) -> Result<()> {
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
     let status = client.status(&state.deployment_id)?;
 
+    output::section("Deployment Status");
     println!("Deployment: {}", status.id);
     println!("Status: {}", status.status);
     println!("Created: {}", status.created_at);

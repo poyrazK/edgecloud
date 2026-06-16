@@ -20,7 +20,7 @@ pub fn run(path: &Path) -> Result<()> {
     if deployments.is_empty() {
         println!("No deployments found.");
     } else {
-        println!("{:<12} {:<10} {:<20}", "ID", "STATUS", "CREATED");
+        println!("{:<12} {:<10} {:<20} URL", "ID", "STATUS", "CREATED");
         println!("{}", "-".repeat(60));
         for d in deployments {
             println!(

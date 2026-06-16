@@ -1,10 +1,11 @@
 //! `edge deploy` — upload the artifact to the control plane.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
+use crate::output;
 use crate::state::State;
 
 /// Upload the artifact to the edgeCloud control plane.
@@ -17,8 +18,10 @@ pub fn run(path: &Path) -> Result<()> {
         .join("release")
         .join(format!("{}.wasm", edge_toml.project.name));
 
-    let wasm_bytes = std::fs::read(&artifact)
-        .with_context(|| format!("failed to read {}", artifact.display()))?;
+    let wasm_bytes = std::fs::read(&artifact).map_err(|e| {
+        output::error(&format!("failed to read {}: {}", artifact.display(), e));
+        e
+    })?;
 
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
     let resp = client.deploy(&edge_toml.project.name, &wasm_bytes)?;
@@ -31,7 +34,7 @@ pub fn run(path: &Path) -> Result<()> {
     };
     state.save(path)?;
 
-    println!("✓ Deployed successfully");
+    output::success("Deployed successfully");
     println!("  URL: {}", resp.url);
     Ok(())
 }

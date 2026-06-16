@@ -31,3 +31,68 @@ pub fn info(msg: &str) {
 pub fn section(label: &str) {
     println!("\n{} {}", style("›").cyan(), style(label).bold());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_success_does_not_panic() {
+        success("Deployment successful!");
+    }
+
+    #[test]
+    fn test_success_accepts_empty_string() {
+        success("");
+    }
+
+    #[test]
+    fn test_error_does_not_panic() {
+        error("Something went wrong");
+    }
+
+    #[test]
+    fn test_error_accepts_empty_string() {
+        error("");
+    }
+
+    #[test]
+    fn test_warn_does_not_panic() {
+        warn("This is a warning");
+    }
+
+    #[test]
+    fn test_warn_accepts_empty_string() {
+        warn("");
+    }
+
+    #[test]
+    fn test_info_does_not_panic() {
+        info("Info message");
+    }
+
+    #[test]
+    fn test_info_accepts_empty_string() {
+        info("");
+    }
+
+    #[test]
+    fn test_section_does_not_panic() {
+        section("Configuration");
+    }
+
+    #[test]
+    fn test_section_accepts_empty_string() {
+        section("");
+    }
+
+    #[test]
+    fn test_section_with_long_string() {
+        section("This is a very long section header that should still work");
+    }
+
+    #[test]
+    fn test_error_with_multiline_message() {
+        error("Line 1\nLine 2\nLine 3");
+    }
+}

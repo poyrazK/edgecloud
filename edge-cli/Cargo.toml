@@ -31,3 +31,5 @@ network = ["dep:reqwest", "dep:tokio"]
 [dev-dependencies]
 wiremock = "0.6"
 assert_cmd = "2.0"
+tempfile = "3.10"
+predicates = "3.0"

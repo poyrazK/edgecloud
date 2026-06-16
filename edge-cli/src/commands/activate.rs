@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
+use crate::output;
 use crate::state::State;
 
 /// Activate a specific deployment.
@@ -17,7 +18,7 @@ pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
     client.activate(&state.app_name, deployment_id)?;
 
-    println!("✓ Deployment {} activated", deployment_id);
+    output::success(&format!("Deployment {} activated", deployment_id));
     Ok(())
 }
 

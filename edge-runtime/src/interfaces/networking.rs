@@ -1,35 +1,31 @@
 //! `edge:networking` — DNS resolution.
 
+use std::sync::Arc;
+
 #[cfg(feature = "networking")]
-use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
-#[cfg(feature = "networking")]
-use trust_dns_resolver::TokioAsyncResolver;
+use crate::interfaces::dns::DnsCache;
 
 #[cfg(feature = "networking")]
 pub struct NetworkingState {
-    resolver: TokioAsyncResolver,
+    dns_cache: Arc<DnsCache>,
 }
 
 #[cfg(feature = "networking")]
 impl NetworkingState {
     pub fn new() -> Self {
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
-        Self { resolver }
+        Self {
+            dns_cache: Arc::new(DnsCache::new(60)),
+        }
+    }
+
+    /// Expose the DNS cache so [`super::http_client::HttpClient`] can share it.
+    pub fn dns_cache(&self) -> Arc<DnsCache> {
+        self.dns_cache.clone()
     }
 
     /// Resolve a hostname to a list of IP addresses.
     pub fn resolve(&self, hostname: &str) -> Result<Vec<String>, String> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(self.resolve_async(hostname))
-    }
-
-    async fn resolve_async(&self, hostname: &str) -> Result<Vec<String>, String> {
-        self.resolver
-            .lookup_ip(hostname)
-            .await
-            .map(|lookup| lookup.iter().map(|ip| ip.to_string()).collect())
-            .map_err(|e| format!("DNS resolution failed: {}", e))
+        self.dns_cache.resolve(hostname)
     }
 }
 

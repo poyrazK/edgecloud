@@ -1,17 +1,25 @@
 package edge:cloud@0.1.0;
 
 interface http-client {
+  record trace-context {
+    traceparent: string,
+    tracestate: option<string>,
+  }
+
   record request {
     method: string,
     url: string,
     headers: list<tuple<string, string>>,
     body: option<list<u8>>,
+    timeout-ms: option<u64>,
+    trace-context: option<trace-context>,
   }
 
   record response {
     status: u16,
     headers: list<tuple<string, string>>,
     body: list<u8>,
+    error: option<string>,
   }
 
   fetch: func(req: request) -> option<response>;
@@ -22,6 +30,11 @@ interface kv-store {
   set: func(key: string, value: list<u8>, ttl-secs: option<u32>);
   delete: func(key: string);
   list-keys: func(prefix: string) -> list<string>;
+  get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+  set-many: func(items: list<tuple<string, list<u8>, option<u32>>>);
+  delete-many: func(keys: list<string>);
+  exists: func(key: string) -> bool;
+  clear: func();
 }
 
 interface cache {
@@ -36,7 +49,7 @@ interface observe {
   increment-counter: func(name: string, labels: list<tuple<string, string>>);
   record-gauge: func(name: string, value: f64, labels: list<tuple<string, string>>);
   record-histogram: func(name: string, value: f64, labels: list<tuple<string, string>>);
-  emit-log: func(level: string, message: string);
+  emit-log: func(level: string, message: string, labels: list<tuple<string, string>>);
 }
 
 interface time {
@@ -63,6 +76,11 @@ interface networking {
 }
 
 interface http-server {
+  record trace-context {
+    traceparent: string,
+    tracestate: option<string>,
+  }
+
   record incoming-request {
     id: u64,
     method: string,
@@ -70,6 +88,7 @@ interface http-server {
     query: option<string>,
     headers: list<tuple<string, string>>,
     body: list<u8>,
+    trace: option<trace-context>,
   }
 
   start: func(port: u16, host: option<string>);

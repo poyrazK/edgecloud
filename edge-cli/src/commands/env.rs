@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
+use crate::output;
 use crate::state::State;
 
 /// Set an environment variable for the app.
@@ -17,7 +18,7 @@ pub fn set_var(path: &Path, key: &str, value: &str) -> Result<()> {
     let client = ApiClient::new(edge_toml.deployment.api.clone())?;
     client.set_env(&state.app_name, key, value)?;
 
-    println!("✓ {} set", key);
+    output::success(&format!("{} set", key));
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 //! edge CLI — edgeCloud developer toolchain.
 
-mod api;
+pub mod api;
 mod commands;
-mod config;
+pub mod config;
 mod migrate;
 mod output;
 mod state;

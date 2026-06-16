@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::config::EdgeToml;
+use crate::output;
 
 /// Local development server with hot-reload.
 pub fn run(path: &Path) -> Result<()> {
@@ -37,7 +38,7 @@ pub fn run(path: &Path) -> Result<()> {
         if event.kind.is_modify() || event.kind.is_create() {
             println!("\n--- Change detected, rebuilding ---");
             if let Err(e) = build_project(path, project_name) {
-                eprintln!("Build failed: {}", e);
+                output::warn(&format!("Build failed: {}", e));
             }
         }
     }

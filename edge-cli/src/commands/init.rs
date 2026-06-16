@@ -1,5 +1,6 @@
 //! `edge init` — scaffold a new project.
 
+use crate::output;
 use anyhow::Result;
 
 const EDGE_TOML_TEMPLATE: &str = r#"[project]
@@ -63,7 +64,7 @@ pub fn run(name: &str) -> Result<()> {
     // .gitignore
     std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
 
-    println!("✓ Project '{}' created", name);
+    output::success(&format!("Project '{}' created", name));
     println!("  cd {} && edge build", name);
     Ok(())
 }

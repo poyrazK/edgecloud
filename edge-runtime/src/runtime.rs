@@ -34,18 +34,20 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
-            cache: Arc::new(cache::Cache::new(1000)),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
+            kv_store: Self::make_kv_store(),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(
                 Arc::new(std::env::vars().collect()),
                 exit_code.clone(),
             ),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
         }
@@ -54,15 +56,17 @@ impl RuntimeState {
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
     pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
-            cache: Arc::new(cache::Cache::new(1000)),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
+            kv_store: Self::make_kv_store(),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
         }
@@ -74,17 +78,58 @@ impl RuntimeState {
         meter: Option<Arc<RequestMeter>>,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
+        let networking = networking::NetworkingState::new();
+        let dns_cache = networking.dns_cache();
         Self {
-            http_client: http_client::HttpClient::new(),
-            kv_store: Arc::new(kv_store::KvStore::new()),
-            cache: Arc::new(cache::Cache::new(1000)),
+            http_client: http_client::HttpClient::new_with_dns_cache(dns_cache),
+            kv_store: Self::make_kv_store(),
+            cache: Self::make_cache(),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: scheduling::Scheduler::new(),
+            scheduling: Self::make_scheduler(),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
-            networking: networking::NetworkingState::new(),
+            networking,
             http_server: http_server::HttpServer::with_meter(meter),
             exit_code,
+        }
+    }
+
+    /// Attempt to create a persistent KvStore from `EDGE_KV_STORE_PATH`,
+    /// falling back to an ephemeral in-memory store on any error.
+    fn make_kv_store() -> Arc<kv_store::KvStore> {
+        match kv_store::KvStore::from_env() {
+            Ok(Some(store)) => Arc::new(store),
+            Ok(None) => Arc::new(kv_store::KvStore::new()),
+            Err(e) => {
+                tracing::warn!("KV store persistence unavailable, using ephemeral: {}", e);
+                Arc::new(kv_store::KvStore::new())
+            }
+        }
+    }
+
+    /// Attempt to create a persistent Scheduler from `EDGE_SCHEDULING_PATH`,
+    /// falling back to an ephemeral in-memory scheduler on any error.
+    fn make_scheduler() -> scheduling::Scheduler {
+        match scheduling::Scheduler::from_env() {
+            Ok(Some(s)) => s,
+            Ok(None) => scheduling::Scheduler::new(),
+            Err(e) => {
+                tracing::warn!("scheduling persistence unavailable, using ephemeral: {}", e);
+                scheduling::Scheduler::new()
+            }
+        }
+    }
+
+    /// Attempt to create a persistent Cache from `EDGE_CACHE_PATH`,
+    /// falling back to an ephemeral in-memory cache on any error.
+    fn make_cache() -> Arc<cache::Cache> {
+        match cache::Cache::from_env(1000) {
+            Ok(Some(c)) => Arc::new(c),
+            Ok(None) => Arc::new(cache::Cache::new(1000)),
+            Err(e) => {
+                tracing::warn!("cache persistence unavailable, using ephemeral: {}", e);
+                Arc::new(cache::Cache::new(1000))
+            }
         }
     }
 
@@ -112,14 +157,16 @@ impl HttpClientHost for RuntimeState {
         let url = req.url.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let body = req.body.as_deref();
-        match self.http_client.fetch(method, url, &headers, body) {
-            Ok(resp) => Some(Response {
-                status: resp.status,
-                headers: resp.headers.into_iter().collect(),
-                body: resp.body,
-            }),
-            Err(_) => None,
-        }
+        let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
+        let resp =
+            self.http_client
+                .fetch(method, url, &headers, body, req.timeout_ms, trace_context);
+        Some(Response {
+            status: resp.status,
+            headers: resp.headers.into_iter().collect(),
+            body: resp.body,
+            error: resp.error,
+        })
     }
 }
 
@@ -135,6 +182,21 @@ impl KvStoreHost for RuntimeState {
     }
     fn list_keys(&mut self, prefix: String) -> Vec<String> {
         self.kv_store.list_keys(&prefix).ok().unwrap_or_default()
+    }
+    fn get_many(&mut self, keys: Vec<String>) -> Vec<Option<Vec<u8>>> {
+        self.kv_store.get_many(&keys)
+    }
+    fn set_many(&mut self, items: Vec<(String, Vec<u8>, Option<u32>)>) {
+        let _ = self.kv_store.set_many(&items);
+    }
+    fn delete_many(&mut self, keys: Vec<String>) {
+        let _ = self.kv_store.delete_many(&keys);
+    }
+    fn exists(&mut self, key: String) -> bool {
+        self.kv_store.exists(&key)
+    }
+    fn clear(&mut self) {
+        self.kv_store.clear();
     }
 }
 
@@ -166,8 +228,8 @@ impl ObserveHost for RuntimeState {
     fn record_histogram(&mut self, name: String, value: f64, labels: Vec<(String, String)>) {
         self.observe.record_histogram(&name, value, &labels);
     }
-    fn emit_log(&mut self, level: String, message: String) {
-        self.observe.emit_log(&level, &message);
+    fn emit_log(&mut self, level: String, message: String, labels: Vec<(String, String)>) {
+        self.observe.emit_log(&level, &message, &labels);
     }
 }
 
@@ -237,6 +299,12 @@ impl HttpServerHost for RuntimeState {
                 query: req.query,
                 headers: req.headers,
                 body: req.body,
+                trace: req
+                    .trace
+                    .map(|tc| crate::edge::cloud::http_server::TraceContext {
+                        traceparent: tc.traceparent,
+                        tracestate: tc.tracestate,
+                    }),
             })
     }
     fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
