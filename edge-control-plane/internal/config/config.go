@@ -122,5 +122,13 @@ func Load(path string) (*Config, error) {
 		cfg.JWT.Issuer = v
 	}
 
+	// Defaults for JWT config
+	if cfg.JWT.Issuer == "" {
+		cfg.JWT.Issuer = "edgecloud"
+	}
+	if cfg.JWT.TTL == 0 {
+		cfg.JWT.TTL = 24
+	}
+
 	return &cfg, nil
 }
