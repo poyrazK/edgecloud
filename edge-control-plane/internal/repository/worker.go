@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -23,14 +24,14 @@ func (r *WorkerRepository) WithTx(tx *sqlx.Tx) *WorkerRepository {
 }
 
 func (r *WorkerRepository) Create(ctx context.Context, w *domain.Worker) error {
-	query := `INSERT INTO workers (id, region, ip, memory_mb, last_seen, created_at) VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := r.db.ExecContext(ctx, query, w.ID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt)
+	query := `INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := r.db.ExecContext(ctx, query, w.ID, w.TenantID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt)
 	return err
 }
 
 func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Worker, error) {
 	var w domain.Worker
-	query := `SELECT id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE id = $1`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE id = $1`
 	err := r.db.GetContext(ctx, &w, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -40,13 +41,55 @@ func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Work
 
 func (r *WorkerRepository) List(ctx context.Context) ([]domain.Worker, error) {
 	var workers []domain.Worker
-	query := `SELECT id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`
 	err := r.db.SelectContext(ctx, &workers, query)
+	return workers, err
+}
+
+func (r *WorkerRepository) CountByTenant(ctx context.Context, tenantID string) (int, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM workers WHERE tenant_id = $1`
+	err := r.db.GetContext(ctx, &count, query, tenantID)
+	return count, err
+}
+
+func (r *WorkerRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error) {
+	var workers []domain.Worker
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE tenant_id = $1 ORDER BY region, created_at DESC`
+	err := r.db.SelectContext(ctx, &workers, query, tenantID)
 	return workers, err
 }
 
 func (r *WorkerRepository) UpdateLastSeen(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, `UPDATE workers SET last_seen = NOW() WHERE id = $1`, id)
+	return err
+}
+
+func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
+	memoryMB := req.MemoryMB
+	if memoryMB == 0 {
+		memoryMB = 4096
+	}
+	var ip *string
+	if req.IP != "" {
+		ip = &req.IP
+	}
+	now := time.Now()
+	query := `
+		INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+		RETURNING (xmax = 0) AS was_created`
+	var wasCreatedRow bool
+	err = r.db.GetContext(ctx, &wasCreatedRow, query, req.WorkerID, tenantID, req.Region, ip, memoryMB, now, now)
+	if err != nil {
+		return false, err
+	}
+	return wasCreatedRow, nil
+}
+
+func (r *WorkerRepository) Delete(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM workers WHERE id = $1`, id)
 	return err
 }
 

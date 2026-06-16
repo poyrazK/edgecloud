@@ -39,7 +39,7 @@ func main() {
 	deploymentRepo := repository.NewDeploymentRepository(db)
 	activeDeploymentRepo := repository.NewActiveDeploymentRepository(db)
 	appEnvRepo := repository.NewAppEnvRepository(db)
-	_ = repository.NewWorkerRepository(db) // workerRepo initialized for future use
+	workerRepo := repository.NewWorkerRepository(db)
 
 	// Initialize NATS publisher
 	publisher, err := nats.NewNATSPublisher(cfg.NATS.URL)
@@ -58,13 +58,14 @@ func main() {
 		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
 	)
 	envSvc := service.NewEnvService(appEnvRepo)
+	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
 
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 
 	// Initialize middleware
 	authMiddleware := middleware.NewAuthMiddleware(apiKeyRepo)
@@ -114,6 +115,8 @@ func main() {
 	// Internal endpoints (worker-facing, JWT auth)
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
+	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
@@ -128,6 +131,13 @@ func main() {
 		log.Printf("Starting edge-cloud control plane on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	// Start NATS heartbeat subscriber for worker lifecycle management
+	go func() {
+		if err := workerSvc.SubscribeHeartbeats(context.Background()); err != nil {
+			log.Printf("Worker heartbeat subscription error: %v", err)
 		}
 	}()
 
