@@ -52,6 +52,20 @@ impl Process {
         std::env::args().collect()
     }
 
+    /// Returns the current working directory of the host process.
+    pub fn get_cwd(&self) -> Result<String, String> {
+        std::env::current_dir()
+            .and_then(|p| {
+                p.into_os_string().into_string().map_err(|os| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("current directory path is not valid UTF-8: {:?}", os),
+                    )
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
+
     /// Called by the guest WASM component via the `exit` host function.
     /// Stores the exit code in an atomic flag and returns normally — the wasmtime
     /// trap that follows will cause `call()` to return Err, which we distinguish
@@ -132,5 +146,20 @@ mod tests {
         process.exit(1);
         process.exit(2); // second call should overwrite
         assert_eq!(process.exit_requested(), Some(2));
+    }
+
+    #[test]
+    fn test_get_cwd_returns_absolute_path() {
+        let process = Process::new();
+        let cwd = process.get_cwd().expect("get_cwd should succeed");
+        assert!(cwd.starts_with('/'), "cwd should be an absolute path");
+    }
+
+    #[test]
+    fn test_get_cwd_succeeds_in_normal_envs() {
+        // In normal test environments the cwd is always valid and readable.
+        // The API is fallible (e.g., cwd deleted at runtime) but untestable in unit tests.
+        let process = Process::new();
+        assert!(process.get_cwd().is_ok());
     }
 }

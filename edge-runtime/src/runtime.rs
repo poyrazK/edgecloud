@@ -216,6 +216,21 @@ impl CacheHost for RuntimeState {
     fn size(&mut self) -> u32 {
         self.cache.size().unwrap_or(0)
     }
+    fn exists(&mut self, key: String) -> bool {
+        self.cache.exists(&key)
+    }
+    fn list_keys(&mut self, prefix: String) -> Vec<String> {
+        self.cache.list_keys(&prefix)
+    }
+    fn get_many(&mut self, keys: Vec<String>) -> Vec<Option<Vec<u8>>> {
+        self.cache.get_many(&keys)
+    }
+    fn set_many(&mut self, items: Vec<(String, Vec<u8>, Option<u32>)>) {
+        let _ = self.cache.set_many(&items);
+    }
+    fn delete_many(&mut self, keys: Vec<String>) {
+        let _ = self.cache.delete_many(&keys);
+    }
 }
 
 impl ObserveHost for RuntimeState {
@@ -271,6 +286,9 @@ impl ProcessHost for RuntimeState {
     fn get_args(&mut self) -> Vec<String> {
         self.process.get_args()
     }
+    fn get_cwd(&mut self) -> Result<String, String> {
+        self.process.get_cwd()
+    }
     fn exit(&mut self, code: u32) {
         self.process.exit(code)
     }
@@ -310,5 +328,10 @@ impl HttpServerHost for RuntimeState {
     fn respond(&mut self, req_id: u64, status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
         let rt = tokio::runtime::Handle::current();
         let _ = rt.block_on(self.http_server.respond(req_id, status, headers, body));
+    }
+    fn stop(&mut self) {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.block_on(self.http_server.shutdown());
+        }
     }
 }
