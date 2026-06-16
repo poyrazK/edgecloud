@@ -55,10 +55,16 @@ pub struct Transformer;
 
 impl Transformer {
     /// Transform the given C source based on detected pattern matches.
+    ///
+    /// Processes matches from highest to lowest byte position, building the
+    /// output by: prepending the WASI header, then for each match appending
+    /// (original content in the gap, WASI replacement). The gap is the content
+    /// BETWEEN the current match's end and the PREVIOUS match's end (in
+    /// original source coordinates). After all matches, append any remaining
+    /// original content from byte 0 to the first match's start.
     pub fn transform(source: &str, matches: Vec<PatternMatch>) -> TransformResult {
         let mut transformations_applied = Vec::new();
         let mut manual_review = Vec::new();
-        let errors = Vec::new();
 
         // Partition into transformable and not-transformable
         let (transformable, not_transformable): (Vec<_>, Vec<_>) = matches
@@ -68,69 +74,64 @@ impl Transformer {
         manual_review.extend(not_transformable);
 
         // Sort by start_byte descending — process from end of file backward
-        // so earlier byte positions remain valid after replacements
         let mut sorted = transformable;
         sorted.sort_by_key(|m| Reverse(m.start_byte));
 
-        let mut source_bytes = source.as_bytes().to_vec();
-        let mut added_wasi_header = false;
-        let header_len = WASI_INCLUDES.len();
-        // Cumulative offset from all splices performed so far.
-        // A positive value means the source has grown; all subsequent
-        // positions must be adjusted by this amount.
-        let mut running_offset = 0_isize;
+        let source_bytes = source.as_bytes();
+
+        // Build output: WASI header + for each match (gap content + WASI replacement)
+        let mut output = WASI_INCLUDES.as_bytes().to_vec();
+
+        // prev_end tracks the END of the previous match in ORIGINAL coordinates.
+        // Start at source.len() (end of file in original).
+        let mut prev_end = source_bytes.len();
 
         for m in &sorted {
             let wasi_code = Self::generate_wasi_code(m);
-            if !wasi_code.is_empty() {
-                // Mark that we need the WASI header
-                if !added_wasi_header && m.start_byte > 0 {
-                    // Prepend header at the top of the file
-                    source_bytes = Self::prepend_wasi_header(&source_bytes);
-                    added_wasi_header = true;
-                    running_offset += header_len as isize;
-                }
-
-                // Apply running offset to get current position in source_bytes
-                let current_start = (m.start_byte as isize + running_offset) as usize;
-                let current_end = (m.end_byte as isize + running_offset) as usize;
-
-                // Replace the matched bytes with WASI code
-                let new_len = wasi_code.len();
-                let old_len = current_end - current_start;
-                source_bytes.splice(current_start..current_end, wasi_code.as_bytes().to_vec());
-
-                // Update running offset: subsequent positions shift by (new_len - old_len)
-                running_offset += (new_len as isize) - (old_len as isize);
-
-                transformations_applied.push(Transformation {
-                    line: m.line,
-                    pattern: m.pattern.clone(),
-                    description: format!(
-                        "Transformed {} → {}",
-                        m.snippet.split('(').next().unwrap_or(&m.snippet),
-                        m.pattern.wasi_equivalent()
-                    ),
-                });
+            if wasi_code.is_empty() {
+                continue;
             }
+
+            let orig_start = m.start_byte;
+            let orig_end = m.end_byte;
+
+            // Copy original content from orig_end to prev_end (the gap between
+            // this match and the previous one in original coordinates).
+            // This is the content that comes AFTER this match in the original
+            // but BEFORE the previous match was processed.
+            output.extend_from_slice(&source_bytes[orig_end..prev_end]);
+
+            // Append WASI replacement
+            output.extend_from_slice(wasi_code.as_bytes());
+
+            // Update: this match's start becomes the boundary for the next iteration
+            prev_end = orig_start;
+
+            transformations_applied.push(Transformation {
+                line: m.line,
+                pattern: m.pattern.clone(),
+                description: format!(
+                    "Transformed {} → {}",
+                    m.snippet.split('(').next().unwrap_or(&m.snippet),
+                    m.pattern.wasi_equivalent()
+                ),
+            });
         }
 
-        let transformed_source = String::from_utf8(source_bytes)
+        // After all matches: append remaining original content from byte 0 to first match start
+        if prev_end > 0 {
+            output.extend_from_slice(&source_bytes[..prev_end]);
+        }
+
+        let transformed_source = String::from_utf8(output)
             .expect("Transformed source is not valid UTF-8");
 
         TransformResult {
             transformed_source,
             transformations_applied,
             manual_review,
-            errors,
+            errors: Vec::new(),
         }
-    }
-
-    /// Prepend WASI header includes to the source.
-    fn prepend_wasi_header(source: &[u8]) -> Vec<u8> {
-        let mut result = WASI_INCLUDES.as_bytes().to_vec();
-        result.extend_from_slice(source);
-        result
     }
 
     /// Generate WASI C code for a pattern match.
@@ -264,10 +265,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("socket(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 48,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::SocketTcp,
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
@@ -287,10 +290,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("poll(").unwrap();
+        let call_end = source.find("timeout);").unwrap() + 9; // include "timeout);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 0,
-            end_byte: 0,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Poll,
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
@@ -309,10 +314,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("bind(").unwrap();
+        let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 65,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Bind,
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
@@ -332,10 +339,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("connect(").unwrap();
+        let call_end = source.find("addr));").unwrap() + 5; // include "addr));"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 68,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Connect,
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
@@ -355,10 +364,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("recv(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 35,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Recv,
             snippet: "recv(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
@@ -377,10 +388,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("send(").unwrap();
+        let call_end = source.find("0);").unwrap() + 3; // include "0);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 35,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Send,
             snippet: "send(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
@@ -399,10 +412,12 @@ int main() {
     return 0;
 }
 "#;
+        let call_start = source.find("accept(").unwrap();
+        let call_end = source.find("NULL);").unwrap() + 6; // include "NULL);"
         let matches = vec![PatternMatch {
             line: 3,
-            start_byte: 16,
-            end_byte: 38,
+            start_byte: call_start,
+            end_byte: call_end,
             pattern: PosixPattern::Accept,
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
@@ -505,6 +520,12 @@ int main() {
         assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_start_listen"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
+
+        // Original POSIX calls must NOT be present
+        assert!(!result.transformed_source.contains("socket(AF_INET"), "socket(AF_INET still present");
+        assert!(!result.transformed_source.contains("bind(fd, (struct sockaddr*)&addr"), "bind original still present");
+        assert!(!result.transformed_source.contains("listen(fd, 128)"), "listen original still present");
+        assert!(!result.transformed_source.contains("accept(fd, NULL, NULL)"), "accept original still present");
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
         // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI

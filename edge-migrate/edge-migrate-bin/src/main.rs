@@ -7,7 +7,7 @@ mod report;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use edge_migrate_lib::{analyzer::CAnalyzer, report::MigrationReport};
+use edge_migrate_lib::{analyzer::CAnalyzer, report::MigrationReport, transformer::Transformer};
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -20,7 +20,12 @@ const DEFAULT_API_URL: &str = "https://api.edgecloud.dev";
 struct Args {
     /// The C source file to migrate.
     #[arg(value_name = "FILE")]
-    file: String,
+    file: Option<String>,
+
+    /// Transform the source and write WASI C to stdout.
+    /// Used by the edgeCloud control-plane to pipe output to wasi-sdk clang.
+    #[arg(long, value_name = "SOURCE_FILE")]
+    transform: Option<String>,
 
     /// Force upload even if the file has untransformable patterns.
     #[arg(short, long)]
@@ -31,9 +36,20 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Read the source file
-    let source = read_file(&args.file).await?;
-    let app_name = derive_app_name(&args.file);
+    // --transform: analyze + transform, output WASI C to stdout, exit immediately.
+    // Used by the Go control-plane as: edge-migrate --transform <file>
+    if let Some(ref source_path) = args.transform {
+        let source = read_file(source_path).await?;
+        let mut analyzer = CAnalyzer::new();
+        let matches = analyzer.analyze(&source);
+        let result = Transformer::transform(&source, matches);
+        print!("{}", result.transformed_source);
+        return Ok(());
+    }
+
+    let file = args.file.as_ref().expect("FILE argument required when not using --transform");
+    let source = read_file(file).await?;
+    let app_name = derive_app_name(file);
 
     // Analyze locally
     let mut analyzer = CAnalyzer::new();
@@ -55,7 +71,7 @@ async fn main() -> Result<()> {
     // Upload to edgeCloud
     println!();
     println!("Uploading to edgeCloud for transformation...");
-    match upload_to_edgecloud(&args.file, &source).await {
+    match upload_to_edgecloud(file, &source).await {
         Ok(server_report) => {
             report::print_server_report(&server_report);
         }
