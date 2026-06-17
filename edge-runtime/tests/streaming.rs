@@ -46,7 +46,10 @@ async fn test_outgoing_stream_roundtrip_drains_via_futures_stream() {
     use futures::StreamExt;
 
     let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
-    let OutgoingEntry { stream, adapter } = entry;
+    let OutgoingEntry {
+        mut stream,
+        adapter,
+    } = entry;
     let adapter: OutgoingStreamAdapter =
         adapter.expect("fresh OutgoingEntry must have adapter present");
 
@@ -154,4 +157,146 @@ fn test_incoming_entry_construction() {
     let (producer, stream) = streams::incoming_pair(streams::DEFAULT_STREAM_CAPACITY);
     let _entry = IncomingEntry { stream };
     drop(producer); // drops sender; consumer would observe Closed
+}
+
+// ---- T3: stream_threshold drives BodySource::Streamed ---------------------
+
+/// Verifies that a Content-Length above the configured `stream_threshold`
+/// arrives at the guest as `BodySource::Streamed` and is readable as a
+/// stream of chunks (rather than a single buffered Vec<u8>). Also exercises
+/// the body-prefix path: TCP delivers headers + body in one read, so
+/// `read_headers` must preserve the bytes past `\r\n\r\n` for the body reader.
+#[tokio::test]
+async fn test_inbound_body_above_threshold_is_streamed() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_stream_threshold(4)
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let body_bytes: Vec<u8> = (0..64u8).cycle().take(64).collect();
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    let mut wire = Vec::new();
+    wire.extend_from_slice(request.as_bytes());
+    wire.extend_from_slice(&body_bytes);
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+
+    let req = tokio::time::timeout(std::time::Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path, "/upload");
+    assert_eq!(
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+            .map(|(_, v)| v.as_str()),
+        Some("64"),
+    );
+
+    let mut stream = match req.body {
+        BodySource::Streamed(s) => s,
+        other => panic!("expected BodySource::Streamed, got {:?}", other),
+    };
+
+    let mut collected = Vec::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read_chunk())
+            .await
+            .expect("read_chunk timed out")
+        {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(StreamError::Cancelled) => break,
+            Err(StreamError::Io(msg)) => panic!("io error: {msg}"),
+        }
+    }
+    assert_eq!(collected, body_bytes);
+
+    // Respond with a small body so the server can finish writing and close
+    // the socket. Then read the response back off the wire — also a smoke
+    // check that the SharedWriteHalf path works after the body-pipeline task
+    // is done.
+    server
+        .respond(
+            req.id,
+            200,
+            vec![("Content-Type".into(), "text/plain".into())],
+            b"ok".to_vec(),
+        )
+        .await
+        .expect("respond");
+
+    let mut response_buf = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        sock.read_to_end(&mut response_buf),
+    )
+    .await
+    .expect("read_to_end timed out")
+    .expect("read response");
+    let response_str = std::str::from_utf8(&response_buf).expect("utf-8 response");
+    assert!(
+        response_str.starts_with("HTTP/1.1 200"),
+        "unexpected response: {:?}",
+        &response_str[..response_str.len().min(64)],
+    );
+    assert!(response_str.contains("ok"));
+}
+
+/// Verifies that a small Content-Length (below `stream_threshold`) arrives at
+/// the guest as `BodySource::Buffered` — the streaming path is opt-in via the
+/// threshold, not the default.
+#[tokio::test]
+async fn test_inbound_body_below_threshold_is_buffered() {
+    use edge_runtime::interfaces::http_server::{BodySource, HttpServer};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    let mut server = HttpServer::new()
+        .with_stream_threshold(1024) // > 4-byte body
+        .with_max_body_size(64 * 1024)
+        .with_connection_timeout(5);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let body_bytes = b"abcd".to_vec();
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    let mut wire = Vec::new();
+    wire.extend_from_slice(request.as_bytes());
+    wire.extend_from_slice(&body_bytes);
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(&wire).await.expect("write request");
+
+    let req = tokio::time::timeout(std::time::Duration::from_secs(3), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll")
+        .expect("some request");
+
+    match req.body {
+        BodySource::Buffered(b) => assert_eq!(b, body_bytes),
+        other => panic!("expected BodySource::Buffered, got {:?}", other),
+    }
 }

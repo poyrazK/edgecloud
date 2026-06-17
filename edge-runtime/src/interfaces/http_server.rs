@@ -1,7 +1,9 @@
 //! `edge:http-server` — inbound HTTP serving.
 
 use crate::metering::RequestMeter;
-use crate::streams::{IncomingStream, OutgoingStreamAdapter};
+use crate::streams::{
+    IncomingProducer, IncomingStream, OutgoingStreamAdapter, DEFAULT_STREAM_CAPACITY,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -64,6 +66,158 @@ impl AsyncWrite for StreamKind {
 
 impl Unpin for StreamKind {}
 
+/// Shared inner handle for split read/write halves. Both halves lock the
+/// `StdMutex` synchronously during their `poll_*` calls — the lock is dropped
+/// before returning (no awaiting while holding), so a slow task on one half
+/// does not block the executor thread indefinitely. Used to split a
+/// `StreamKind` into independent read and write halves that can be moved
+/// across tasks (e.g. body-pipeline task reads, response writer writes).
+type SharedInner = Arc<StdMutex<StreamKind>>;
+
+/// Read half of a split `StreamKind`. Locks the inner mutex during `poll_read`.
+pub struct SharedReadHalf(SharedInner);
+
+/// Write half of a split `StreamKind`. Locks the inner mutex during `poll_write`.
+pub struct SharedWriteHalf(SharedInner);
+
+impl AsyncRead for SharedReadHalf {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::pin::Pin::new(&mut *guard).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedWriteHalf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::pin::Pin::new(&mut *guard).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::pin::Pin::new(&mut *guard).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        std::pin::Pin::new(&mut *guard).poll_shutdown(cx)
+    }
+}
+
+impl Unpin for SharedReadHalf {}
+impl Unpin for SharedWriteHalf {}
+
+/// Split a `StreamKind` into independent read and write halves. The two halves
+/// share an `Arc<StdMutex<StreamKind>>` and serialize I/O — they must not be
+/// used simultaneously to read and write the same socket from the same task.
+/// In `handle_connection`, the body-pipeline task owns the read half (active
+/// only until the body is fully consumed) and the response writer owns the
+/// write half (active only after the body-pipeline task is done).
+fn shared_split(stream: StreamKind) -> (SharedReadHalf, SharedWriteHalf) {
+    let inner = Arc::new(StdMutex::new(stream));
+    (SharedReadHalf(inner.clone()), SharedWriteHalf(inner))
+}
+
+/// Background task that reads the request body from the split read half and
+/// pushes chunks into the `IncomingProducer` so the guest can poll them via
+/// the `IncomingStream`. Stops early on EOF, deadline, or consumer drop.
+///
+/// `body_prefix` is bytes already read past the `\r\n\r\n` header delimiter
+/// (preserved from `read_headers`); they are pushed as the first chunk
+/// before reading more from the stream.
+async fn body_pipeline(
+    body_prefix: Vec<u8>,
+    mut rh: SharedReadHalf,
+    body_len: usize,
+    deadline: Instant,
+    producer: IncomingProducer,
+) {
+    let mut remaining = body_len;
+    // First, push the bytes already consumed past the header delimiter.
+    if !body_prefix.is_empty() {
+        let take = body_prefix.len().min(remaining);
+        let chunk = body_prefix[..take].to_vec();
+        if producer.push(Ok(chunk)).await.is_err() {
+            return; // Consumer dropped.
+        }
+        remaining -= take;
+    }
+    let mut buf = vec![0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        let n = match timeout_at(deadline, rh.read(&mut buf[..want])).await {
+            Ok(Ok(0)) => break, // EOF.
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                let _ = producer.push(Err(e.to_string())).await;
+                break;
+            }
+            Err(_) => {
+                let _ = producer.push(Err("body read deadline".to_string())).await;
+                break;
+            }
+        };
+        let chunk = buf[..n].to_vec();
+        if producer.push(Ok(chunk)).await.is_err() {
+            break; // Consumer dropped — guest cancelled.
+        }
+        remaining -= n;
+    }
+    // Dropping `producer` closes the channel; the guest's next `read_chunk`
+    // observes `StreamError::Closed`.
+}
+
+/// Inline body read for small requests: reads `body_len` bytes from the split
+/// read half into a `Vec<u8>` and returns them. Bounded by `body_len` and the
+/// per-connection deadline. `body_prefix` is bytes already consumed past the
+/// header delimiter — they seed the returned body.
+async fn read_body_inline(
+    body_prefix: Vec<u8>,
+    mut rh: SharedReadHalf,
+    body_len: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, std::io::Error> {
+    if body_len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut body = Vec::with_capacity(body_len);
+    let mut remaining = body_len;
+    // Seed with the bytes already past the header delimiter.
+    let take = body_prefix.len().min(remaining);
+    body.extend_from_slice(&body_prefix[..take]);
+    remaining -= take;
+    let mut buf = vec![0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        let n = match timeout_at(deadline, rh.read(&mut buf[..want])).await {
+            Ok(Ok(0)) => break, // EOF.
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "body read deadline",
+                ));
+            }
+        };
+        body.extend_from_slice(&buf[..n]);
+        remaining -= n;
+    }
+    Ok(body)
+}
+
 /// Default maximum concurrent connections.
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
 /// Default per-connection read/write timeout in seconds.
@@ -92,6 +246,23 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Parsed result of `read_headers` — the request line + headers + Content-Length,
+/// but not the body. The body is consumed separately by `read_body_inline`
+/// (small bodies, inline) or `body_pipeline` (large bodies, streamed).
+struct ParsedHeaders {
+    method: String,
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, String)>,
+    body_len: usize,
+    /// Bytes already read past the `\r\n\r\n` delimiter — TCP can deliver
+    /// the body in the same read as the headers, so we have to preserve these
+    /// bytes and pass them to the body reader (otherwise the body reader would
+    /// block on `read` while the bytes are sitting in our header buffer).
+    body_prefix: Vec<u8>,
+    trace: Option<TraceContext>,
 }
 
 /// Map of req-id -> streaming-response-parts sender. Aliased so the
@@ -263,7 +434,15 @@ impl HttpServer {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
-        self.port = Some(port);
+        // Capture the actual bound port — callers that pass `port = 0` for an
+        // OS-assigned ephemeral port need `get_assigned_port()` to return the
+        // real port, not `0`.
+        self.port = Some(
+            listener
+                .local_addr()
+                .map_err(|e| format!("local_addr: {e}"))?
+                .port(),
+        );
 
         let (tx, rx) = mpsc::channel::<IncomingRequest>(100);
         *self.tx.write().await = Some(tx.clone());
@@ -283,6 +462,7 @@ impl HttpServer {
         let max_connections = self.max_connections;
         let tls_config = self.tls_config.clone();
         let max_body_size = self.max_body_size;
+        let stream_threshold = self.stream_threshold;
 
         let handle = tokio::spawn(async move {
             tokio::pin!(shutdown_rx);
@@ -310,6 +490,7 @@ impl HttpServer {
                                 let conn_limit = conn_limit.clone();
                                 let tls_config = tls_config.clone();
                                 let max_body_size = max_body_size;
+                                let stream_threshold = stream_threshold;
 
                                 // Spawn a task that handles the connection and
                                 // acquires/releases the connection permit.
@@ -348,7 +529,7 @@ impl HttpServer {
                                         };
 
                                     Self::handle_connection(
-                                        id, stream, tx, ch_rx, stream_rx, meter, conn_timeout, max_body_size,
+                                        id, stream, tx, ch_rx, stream_rx, meter, conn_timeout, max_body_size, stream_threshold,
                                     )
                                     .await;
                                     drop(permit); // release connection slot
@@ -420,6 +601,13 @@ impl HttpServer {
 
     /// Handle one TCP connection: read and parse HTTP, send request to guest,
     /// then wait for the guest's response and write it to the socket.
+    ///
+    /// For requests whose Content-Length exceeds `stream_threshold`, the
+    /// stream is split via `shared_split`: a spawned body-pipeline task reads
+    /// remaining body bytes and pushes them into an `IncomingStream` (delivered
+    /// to the guest as `BodySource::Streamed`), while this function keeps the
+    /// write half for the response. For smaller requests, the body is read
+    /// fully inline and returned as `BodySource::Buffered`.
     #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         id: u64,
@@ -430,13 +618,15 @@ impl HttpServer {
         meter: Option<Arc<RequestMeter>>,
         conn_timeout: Duration,
         max_body_size: u64,
+        stream_threshold: u64,
     ) {
         // Per-connection deadline. Each read/write operation must complete within
         // this window. If exceeded, the connection is aborted.
         let deadline = Instant::now() + conn_timeout;
 
-        let request = match Self::read_request(&mut stream, deadline, id, max_body_size).await {
-            Ok(Some(req)) => req,
+        // 1. Read headers only (the body is consumed separately below).
+        let parsed = match Self::read_headers(&mut stream, deadline, id, max_body_size).await {
+            Ok(Some(p)) => p,
             Ok(None) => {
                 tracing::debug!(req_id = %id, "connection closed or parse error");
                 return;
@@ -445,6 +635,49 @@ impl HttpServer {
                 tracing::warn!(req_id = %id, err = %e, "connection timeout/error");
                 return;
             }
+        };
+
+        // 2. Split for concurrent body read / response write. The body-pipeline
+        //    task owns the read half (active until body is fully consumed); the
+        //    response writer owns the write half (active after the body-pipeline
+        //    task is done). They serialize I/O via the inner Mutex — fine for
+        //    HTTP/1.1, which is request/response-sequential on one connection.
+        let (read_half, mut write_half) = shared_split(stream);
+
+        // 3. Read the body: streamed if it exceeds the threshold, buffered
+        //    otherwise. `body_len == 0` always takes the buffered (empty) path.
+        //    `body_prefix` is the bytes already consumed past the \r\n\r\n —
+        //    TCP can deliver the body in the same packet as the headers, so we
+        //    have to preserve those bytes rather than losing them.
+        let body = if parsed.body_len > stream_threshold as usize && parsed.body_len > 0 {
+            let (producer, incoming_stream) =
+                crate::streams::incoming_pair(DEFAULT_STREAM_CAPACITY);
+            tokio::spawn(body_pipeline(
+                parsed.body_prefix,
+                read_half,
+                parsed.body_len,
+                deadline,
+                producer,
+            ));
+            BodySource::Streamed(incoming_stream)
+        } else {
+            match read_body_inline(parsed.body_prefix, read_half, parsed.body_len, deadline).await {
+                Ok(bytes) => BodySource::Buffered(bytes),
+                Err(e) => {
+                    tracing::warn!(req_id = %id, err = %e, "body read error");
+                    return;
+                }
+            }
+        };
+
+        let request = IncomingRequest {
+            id,
+            method: parsed.method,
+            path: parsed.path,
+            query: parsed.query,
+            headers: parsed.headers,
+            body,
+            trace: parsed.trace,
         };
 
         if let Some(ref m) = meter {
@@ -470,7 +703,7 @@ impl HttpServer {
                 match res {
                     Ok(Ok(HttpResponse { status, headers, body })) => {
                         if let Err(e) = Self::write_response(
-                            &mut stream,
+                            &mut write_half,
                             status,
                             &headers,
                             &body,
@@ -494,7 +727,7 @@ impl HttpServer {
                 match res {
                     Ok(Ok(StreamingResponseParts { head, mut adapter })) => {
                         if let Err(e) =
-                            Self::write_streaming_response(&mut stream, &head, &mut adapter, deadline)
+                            Self::write_streaming_response(&mut write_half, &head, &mut adapter, deadline)
                                 .await
                         {
                             tracing::warn!(req_id = %id, err = %e, "streaming response write error");
@@ -515,7 +748,7 @@ impl HttpServer {
     /// OutgoingStreamAdapter chunks with `timeout_at(deadline, write_all)`
     /// per chunk. Requires Content-Length in headers (v1 — no chunked TE).
     async fn write_streaming_response(
-        stream: &mut StreamKind,
+        stream: &mut SharedWriteHalf,
         head: &StreamingResponseHead,
         adapter: &mut OutgoingStreamAdapter,
         deadline: Instant,
@@ -534,7 +767,9 @@ impl HttpServer {
         timeout_at(deadline, stream.write_all(&response)).await??;
         timeout_at(deadline, stream.flush()).await??;
 
-        // Drain the adapter to EOF (sender dropped = guest finished).
+        // Drain the adapter to EOF. EOF arrives either from the guest calling
+        // `finish()` (sender dropped) or from the bindgen releasing the
+        // Outgoing resource (sender dropped on drop). See streams::OutgoingStream.
         while let Some(item) = adapter.next().await {
             let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
             timeout_at(deadline, stream.write_all(&chunk)).await??;
@@ -543,18 +778,27 @@ impl HttpServer {
         Ok(())
     }
 
-    /// Read and parse one HTTP request from the stream. Returns None on EOF or
-    /// parse failure. Returns the parsed IncomingRequest on success.
-    async fn read_request(
+    /// Read and parse the HTTP headers only — the body is consumed by
+    /// `read_body_inline` (small bodies) or `body_pipeline` (large bodies).
+    /// Returns `None` on EOF or parse failure.
+    #[allow(unused_assignments)] // `header_end` is only assigned inside the loop before any read.
+    async fn read_headers(
         stream: &mut StreamKind,
         deadline: Instant,
         id: u64,
         max_body_size: u64,
-    ) -> Result<Option<IncomingRequest>, std::io::Error> {
+    ) -> Result<Option<ParsedHeaders>, std::io::Error> {
         let mut header_buf = vec![0u8; MAX_HEADER_SIZE];
         let mut total_read = 0usize;
+        // Offset right after the `\r\n\r\n` header delimiter, populated when
+        // we find the delimiter during the read loop.
+        let mut header_end = 0usize;
 
-        // Read headers (up to double CRLF) with deadline.
+        // Read headers (up to double CRLF) with deadline. TCP can deliver the
+        // request body in the same read as the headers, so once we find the
+        // header delimiter we capture any post-delimiter bytes as `body_prefix`
+        // and return them with the parsed headers — the body reader uses them
+        // before reading more from the stream.
         loop {
             let read_fut = stream.read(&mut header_buf[total_read..]);
             match timeout_at(deadline, read_fut).await {
@@ -566,11 +810,12 @@ impl HttpServer {
                 }
                 Ok(Ok(n)) => {
                     total_read += n;
-                    // Check for double CRLF.
-                    if header_buf[..total_read]
+                    // Find the double CRLF.
+                    if let Some(pos) = header_buf[..total_read]
                         .windows(4)
-                        .any(|w| w == b"\r\n\r\n")
+                        .position(|w| w == b"\r\n\r\n")
                     {
+                        header_end = pos + 4;
                         break;
                     }
                     if total_read >= header_buf.len() {
@@ -588,9 +833,14 @@ impl HttpServer {
             }
         }
 
-        // Parse headers with httparse.
-        let mut req = httparse::Request::new(&mut []);
-        match req.parse(&header_buf[..total_read]) {
+        // Parse headers with httparse. Allocate a header slot array — an empty
+        // slice (`&mut []`) makes `parse` fail with `TooManyHeaders` for any
+        // non-empty header set. 32 slots is generous for the typical request.
+        // We only parse up to `header_end` so the body bytes that share the
+        // buffer do not get misinterpreted as additional header lines.
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(&header_buf[..header_end]) {
             Ok(httparse::Status::Complete(_)) => {}
             Ok(httparse::Status::Partial) => {
                 tracing::debug!(req_id = %id, "incomplete request");
@@ -601,6 +851,14 @@ impl HttpServer {
                 return Ok(None);
             }
         }
+
+        // Body bytes that arrived in the same read as the headers — preserve
+        // them so the body reader does not stall.
+        let body_prefix = if total_read > header_end {
+            header_buf[header_end..total_read].to_vec()
+        } else {
+            Vec::new()
+        };
 
         // Extract method, path.
         let method = req.method.unwrap_or("").to_string();
@@ -657,47 +915,20 @@ impl HttpServer {
             return Ok(None);
         }
 
-        // Read body.
-        let mut body = Vec::new();
-        if body_len > 0 {
-            let mut remaining = body_len;
-            let mut read_buf = vec![0u8; body_len.min(65536)]; // 64KB temp buffer
-
-            while remaining > 0 {
-                let chunk_size = remaining.min(read_buf.len());
-                let buf = &mut read_buf[..chunk_size];
-                let read_fut = stream.read(buf);
-                match timeout_at(deadline, read_fut).await {
-                    Ok(Ok(0)) => break, // EOF.
-                    Ok(Ok(n)) => {
-                        body.extend_from_slice(&buf[..n]);
-                        remaining -= n;
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "body read deadline",
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(Some(IncomingRequest {
-            id,
+        Ok(Some(ParsedHeaders {
             method,
             path,
             query,
             headers,
-            body: BodySource::Buffered(body),
+            body_len,
+            body_prefix,
             trace,
         }))
     }
 
     /// Write an HTTP/1.1 response back to the socket, with optional gzip compression.
     async fn write_response(
-        stream: &mut StreamKind,
+        stream: &mut SharedWriteHalf,
         status: u16,
         headers: &[(String, String)],
         body: &[u8],
