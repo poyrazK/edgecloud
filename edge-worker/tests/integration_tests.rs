@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerRequest;
@@ -45,6 +46,17 @@ fn should_skip_integration_tests() -> bool {
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
     include_bytes!("fixtures/test-handle.wasm")
+}
+
+/// SHA-256 of `test_component_bytes()`, formatted as 64 lowercase hex chars.
+/// Computed at test time so it tracks any fixture change.
+fn test_component_hash() -> String {
+    let digest = Sha256::digest(test_component_bytes());
+    digest
+        .as_slice()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Timeout for subscribing to heartbeats.
@@ -219,7 +231,7 @@ async fn test_app_lifecycle() {
     // Step 1: send TaskMessage to start an app
     let spec = AppSpec {
         deployment_id: "d_deploy_001".to_string(),
-        deployment_hash: "abc123".to_string(),
+        deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
     };
@@ -372,7 +384,7 @@ async fn test_stop_all_apps() {
     for i in 0..2 {
         let spec = AppSpec {
             deployment_id: format!("d_deploy_{:03}", i),
-            deployment_hash: "abc123".to_string(),
+            deployment_hash: test_component_hash(),
             env: HashMap::new(),
             allowlist: vec![],
         };
@@ -402,4 +414,127 @@ async fn test_stop_all_apps() {
 
     let state = harness.supervisor.state.read().await;
     assert!(state.apps.is_empty(), "all apps should be stopped");
+}
+
+/// Positive-path: when AppSpec.deployment_hash matches the artifact's SHA-256,
+/// the app starts normally. Guards against a future regression where the hash
+/// check accidentally blocks valid starts.
+#[tokio::test]
+async fn test_artifact_hash_match_starts_app() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_hash_match"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    let spec = AppSpec {
+        deployment_id: "d_hash_match".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: vec![],
+    };
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-17T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("hash-match-app".to_string(), spec)]),
+    };
+
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    let running = wait_for_app_running(&harness.supervisor, "hash-match-app", 10).await;
+    assert!(running, "matching-hash app should reach Running within 10s");
+}
+
+/// Negative-path: when AppSpec.deployment_hash does NOT match the artifact's
+/// SHA-256, the app is not registered. Then a follow-up start of a different
+/// app with the real hash proves the port pool was released by the first failure.
+#[tokio::test]
+async fn test_artifact_hash_mismatch_rejects_app() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // The mock returns the real fixture bytes regardless of the AppSpec hash —
+    // simulating a compromised control plane that ships the right bytes but a
+    // wrong advertised hash (or vice versa).
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_hash_bad"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_hash_good"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // 1. Send a task message whose deployment_hash is syntactically valid but wrong.
+    let wrong_hash = "0".repeat(64);
+    let bad_spec = AppSpec {
+        deployment_id: "d_hash_bad".to_string(),
+        deployment_hash: wrong_hash,
+        env: HashMap::new(),
+        allowlist: vec![],
+    };
+    let bad_msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-17T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("bad-hash-app".to_string(), bad_spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(bad_msg)
+        .await
+        .expect("handle_task_message");
+
+    // Give the supervisor a moment to attempt + fail.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    {
+        let state = harness.supervisor.state.read().await;
+        assert!(
+            !state.apps.contains_key("bad-hash-app"),
+            "tampered-hash app must NOT be registered"
+        );
+    }
+
+    // 2. Send a second task message with a DIFFERENT deployment_id and the real hash.
+    // Using a different id avoids the poisoned cache; the new download verifies fine
+    // and starts, proving the port was released by the first failure.
+    let good_spec = AppSpec {
+        deployment_id: "d_hash_good".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: vec![],
+    };
+    let good_msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-17T00:00:01Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("good-hash-app".to_string(), good_spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(good_msg)
+        .await
+        .expect("handle_task_message");
+
+    let running = wait_for_app_running(&harness.supervisor, "good-hash-app", 10).await;
+    assert!(
+        running,
+        "matching-hash app should reach Running within 10s — proves port was released after the failed start"
+    );
 }
