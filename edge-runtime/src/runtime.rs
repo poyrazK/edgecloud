@@ -51,9 +51,13 @@ pub struct RuntimeState {
     /// State backing the `streams::outgoing` resource, keyed by rep.
     #[cfg(any(feature = "http-client", feature = "http-server"))]
     pub outgoing_streams: StdMutex<std::collections::HashMap<u32, OutgoingEntry>>,
-    /// Monotonic counter for outgoing resource reps (constructor allocates).
+    /// Monotonic counter for stream resource reps. A single counter mints
+    /// keys for BOTH the `incoming_streams` and `outgoing_streams` maps;
+    /// the two maps are disjoint, so collisions are not possible, but the
+    /// shared rep space must not be split across two counters. Renamed from
+    /// `next_outgoing_rep` (which misleadingly suggested outgoing-only).
     #[cfg(any(feature = "http-client", feature = "http-server"))]
-    pub next_outgoing_rep: AtomicU32,
+    pub next_stream_rep: AtomicU32,
 }
 
 impl RuntimeState {
@@ -79,7 +83,7 @@ impl RuntimeState {
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
-            next_outgoing_rep: AtomicU32::new(1),
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -103,7 +107,7 @@ impl RuntimeState {
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
-            next_outgoing_rep: AtomicU32::new(1),
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -130,7 +134,7 @@ impl RuntimeState {
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
-            next_outgoing_rep: AtomicU32::new(1),
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -251,7 +255,7 @@ impl HttpClientHost for RuntimeState {
                 #[cfg(feature = "http-client")]
                 {
                     let rep = self
-                        .next_outgoing_rep
+                        .next_stream_rep
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.incoming_streams
                         .lock()
@@ -429,7 +433,7 @@ impl HttpServerHost for RuntimeState {
                     }
                     HttpServerInternalBodySource::Streamed(stream) => {
                         let rep = self
-                            .next_outgoing_rep
+                            .next_stream_rep
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.incoming_streams
                             .lock()
@@ -535,27 +539,26 @@ mod streams_impl {
     use crate::edge::cloud::streams::{
         HostIncoming, HostOutgoing, Incoming, Outgoing, StreamError as WitStreamError,
     };
-    use crate::streams::{self, OutgoingEntry, DEFAULT_STREAM_CAPACITY};
+    use crate::streams::{self, OutgoingEntry, StreamError, DEFAULT_STREAM_CAPACITY};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use wasmtime::component::Resource;
 
     /// Bridge a sync Host trait method to an async operation with a 5s
-    /// timeout. The existing `Handle::current().block_on` pattern at the WIT
-    /// boundary has a known dead-lock risk if the producer is on the same
-    /// tokio runtime; the timeout bounds the window.
-    fn block_on_timeout<F>(fut: F) -> F::Output
+    /// timeout. The inner future must produce `Result<T, StreamError>` — the
+    /// outer `Result` collapses the timeout case into `Closed` so a stalled
+    /// stream op does not panic the worker. The other Host trait methods map
+    /// failures to `Result`; streams does too.
+    fn block_on_timeout<F, T>(fut: F) -> Result<T, StreamError>
     where
-        F: std::future::Future,
+        F: std::future::Future<Output = Result<T, StreamError>>,
     {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async move {
-            tokio::time::timeout(Duration::from_secs(5), fut)
-                .await
-                .unwrap_or_else(|_| {
-                    // Best-effort recovery: surface a Closed-equivalent.
-                    panic!("stream op timed out after 5s")
-                })
+            match tokio::time::timeout(Duration::from_secs(5), fut).await {
+                Ok(inner) => inner,
+                Err(_) => Err(StreamError::Closed),
+            }
         })
     }
 
@@ -586,7 +589,7 @@ mod streams_impl {
 
     impl HostOutgoing for RuntimeState {
         fn new(&mut self) -> Resource<Outgoing> {
-            let rep = self.next_outgoing_rep.fetch_add(1, Ordering::Relaxed);
+            let rep = self.next_stream_rep.fetch_add(1, Ordering::Relaxed);
             self.outgoing_streams
                 .lock()
                 .unwrap()
@@ -599,14 +602,18 @@ mod streams_impl {
             self_: Resource<Outgoing>,
             bytes: Vec<u8>,
         ) -> Result<(), WitStreamError> {
-            let outgoing = self.outgoing_streams.lock().unwrap();
-            let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+            let mut outgoing = self.outgoing_streams.lock().unwrap();
+            let entry = outgoing
+                .get_mut(&self_.rep())
+                .ok_or(WitStreamError::Closed)?;
             block_on_timeout(entry.stream.write_chunk(bytes)).map_err(streams::to_wit)
         }
 
         fn finish(&mut self, self_: Resource<Outgoing>) -> Result<(), WitStreamError> {
-            let outgoing = self.outgoing_streams.lock().unwrap();
-            let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+            let mut outgoing = self.outgoing_streams.lock().unwrap();
+            let entry = outgoing
+                .get_mut(&self_.rep())
+                .ok_or(WitStreamError::Closed)?;
             block_on_timeout(entry.stream.finish()).map_err(streams::to_wit)
         }
 
