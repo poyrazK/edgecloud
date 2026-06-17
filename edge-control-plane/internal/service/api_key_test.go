@@ -6,12 +6,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/hashutil"
 )
 
-// mockAPIKeyRepo implements apiKeyRepoInterface for testing.
+// mockAPIKeyRepo implements APIKeyRepo for testing.
 type mockAPIKeyRepo struct {
 	createFn                func(ctx context.Context, k *domain.APIKey) error
 	getByLookupHashFn       func(ctx context.Context, lookupHash string) (*domain.APIKey, error)
@@ -300,5 +301,109 @@ func TestAPIKeyService_AuthenticateRawKey_Empty(t *testing.T) {
 	_, err := svc.AuthenticateRawKey(context.Background(), "")
 	if !errors.Is(err, ErrInvalidAPIKey) {
 		t.Errorf("error = %v, want ErrInvalidAPIKey", err)
+	}
+}
+
+// TestAPIKeyService_AuthenticateRawKey_RejectsExpiredKey asserts that an
+// API key whose ExpiresAt is in the past is rejected with ErrInvalidAPIKey,
+// even when the underlying hash verifies correctly. The check runs after
+// the verify so a bug here cannot be exploited to enumerate valid IDs.
+func TestAPIKeyService_AuthenticateRawKey_RejectsExpiredKey(t *testing.T) {
+	raw := "expired-but-correctly-hashed-key"
+	hash, err := HashAPIKey(raw)
+	if err != nil {
+		t.Fatalf("HashAPIKey: %v", err)
+	}
+	past := time.Now().Add(-1 * time.Hour)
+
+	repo := &mockAPIKeyRepo{
+		getByLookupHashFn: func(ctx context.Context, h string) (*domain.APIKey, error) {
+			return &domain.APIKey{
+				ID:            "k_expired",
+				TenantID:      "t_test",
+				KeyHash:       hash,
+				LookupHash:    h,
+				HashAlgorithm: domain.HashAlgorithmArgon2ID,
+				Role:          domain.RoleDeveloper,
+				ExpiresAt:     &past,
+			}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	_, err = svc.AuthenticateRawKey(context.Background(), raw)
+	if !errors.Is(err, ErrInvalidAPIKey) {
+		t.Errorf("error = %v, want ErrInvalidAPIKey for expired key", err)
+	}
+}
+
+// TestAPIKeyService_AuthenticateRawKey_AcceptsUnsetExpiry asserts that a
+// key with a nil ExpiresAt (never expires) is still accepted after the
+// new expiry check is in place.
+func TestAPIKeyService_AuthenticateRawKey_AcceptsUnsetExpiry(t *testing.T) {
+	raw := "key-with-no-expiry"
+	hash, err := HashAPIKey(raw)
+	if err != nil {
+		t.Fatalf("HashAPIKey: %v", err)
+	}
+
+	repo := &mockAPIKeyRepo{
+		getByLookupHashFn: func(ctx context.Context, h string) (*domain.APIKey, error) {
+			return &domain.APIKey{
+				ID:            "k_noexpiry",
+				TenantID:      "t_test",
+				KeyHash:       hash,
+				LookupHash:    h,
+				HashAlgorithm: domain.HashAlgorithmArgon2ID,
+				Role:          domain.RoleDeveloper,
+				ExpiresAt:     nil, // never expires
+			}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	got, err := svc.AuthenticateRawKey(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("AuthenticateRawKey: %v", err)
+	}
+	if got.ID != "k_noexpiry" {
+		t.Errorf("ID = %q, want k_noexpiry", got.ID)
+	}
+}
+
+// TestAPIKeyService_AuthenticateRawKey_AcceptsFutureExpiry asserts that a
+// key whose ExpiresAt is in the future is accepted.
+func TestAPIKeyService_AuthenticateRawKey_AcceptsFutureExpiry(t *testing.T) {
+	raw := "key-future-expiry"
+	hash, err := HashAPIKey(raw)
+	if err != nil {
+		t.Fatalf("HashAPIKey: %v", err)
+	}
+	future := time.Now().Add(24 * time.Hour)
+
+	repo := &mockAPIKeyRepo{
+		getByLookupHashFn: func(ctx context.Context, h string) (*domain.APIKey, error) {
+			return &domain.APIKey{
+				ID:            "k_future",
+				TenantID:      "t_test",
+				KeyHash:       hash,
+				LookupHash:    h,
+				HashAlgorithm: domain.HashAlgorithmArgon2ID,
+				Role:          domain.RoleDeveloper,
+				ExpiresAt:     &future,
+			}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	got, err := svc.AuthenticateRawKey(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("AuthenticateRawKey: %v", err)
+	}
+	if got.ID != "k_future" {
+		t.Errorf("ID = %q, want k_future", got.ID)
 	}
 }

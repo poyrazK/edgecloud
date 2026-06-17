@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/hashutil"
@@ -18,10 +19,11 @@ import (
 // match any row. Callers should map this to 401 Unauthorized.
 var ErrInvalidAPIKey = errors.New("invalid api key")
 
-// apiKeyRepoInterface is the subset of *repository.APIKeyRepository used by
-// APIKeyService. Defining it here keeps the service decoupled from the
-// concrete repo and lets tests substitute a mock.
-type apiKeyRepoInterface interface {
+// APIKeyRepo is the subset of *repository.APIKeyRepository used by
+// APIKeyService. It is exported so tests outside this package (notably the
+// middleware layer) can substitute a stub without depending on the concrete
+// repository type.
+type APIKeyRepo interface {
 	Create(ctx context.Context, k *domain.APIKey) error
 	GetByLookupHash(ctx context.Context, lookupHash string) (*domain.APIKey, error)
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error)
@@ -32,11 +34,21 @@ type apiKeyRepoInterface interface {
 
 // APIKeyService handles API key business logic.
 type APIKeyService struct {
-	apiKeyRepo apiKeyRepoInterface
+	apiKeyRepo APIKeyRepo
 }
 
 func NewAPIKeyService(apiKeyRepo *repository.APIKeyRepository) *APIKeyService {
 	return &APIKeyService{apiKeyRepo: apiKeyRepo}
+}
+
+// SetAPIKeyRepo replaces the repository used by this service. It exists
+// for tests outside the package (e.g. the middleware suite) that need to
+// inject a stub repository; production code should rely on the
+// NewAPIKeyService constructor instead. Returns the receiver so it can be
+// chained immediately after construction.
+func (s *APIKeyService) SetAPIKeyRepo(r APIKeyRepo) *APIKeyService {
+	s.apiKeyRepo = r
+	return s
 }
 
 // CreateAPIKey creates a new API key and returns the raw key (shown only once).
@@ -153,6 +165,15 @@ func (s *APIKeyService) AuthenticateRawKey(ctx context.Context, rawKey string) (
 
 	default:
 		return nil, fmt.Errorf("unsupported hash algorithm %q for key %s", algo, candidate.ID)
+	}
+
+	// Defense-in-depth: enforce expiry after successful verification. The
+	// verify already gates the response, so a bug here cannot be exploited
+	// to enumerate which IDs are valid vs expired. Without this check, an
+	// operator-issued expiry (ExpiresAt in the past) would have no effect —
+	// the row would still authenticate.
+	if candidate.ExpiresAt != nil && time.Now().After(*candidate.ExpiresAt) {
+		return nil, ErrInvalidAPIKey
 	}
 
 	if err := s.apiKeyRepo.UpdateLastUsed(ctx, candidate.ID); err != nil {
