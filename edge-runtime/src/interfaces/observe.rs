@@ -30,6 +30,9 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Parse from a WIT string level (backward compat with string-based emit-log).
+    ///
+    /// Unknown levels map to `Trace` — the lowest floor — so that future WIT enum
+    /// variants are silently clamped rather than silently dropped.
     pub fn from_level_str(s: &str) -> Self {
         match s {
             "error" => LogLevel::Error,
@@ -210,14 +213,14 @@ impl Observer {
 
     /// Emit a structured log message with optional label key-value pairs.
     pub fn emit_log(&self, level: &str, message: &str, labels: &[(String, String)]) {
-        let log_level = LogLevel::from_level_str(level);
+        let parsed_level = LogLevel::from_level_str(level);
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let record = LogRecord {
             timestamp_ms,
-            level: log_level,
+            level: parsed_level,
             message: message.to_string(),
             labels: labels.to_vec(),
         };
@@ -231,8 +234,10 @@ impl Observer {
 
     /// Internal emit path — handles level filtering, tracing, and NATS forwarding.
     fn emit_log_record_inner(&self, record: &LogRecord) {
-        // Filter by minimum log level.
-        if record.level.to_tracing_level() > self.min_log_level.to_tracing_level() {
+        // Filter by minimum log level — drop records less severe than min_log_level.
+        // tracing::Level ordering: ERROR(1) < WARN(2) < INFO(3) < DEBUG(4) < TRACE(5).
+        // So a record is below minimum when its numeric level is less than the configured minimum.
+        if record.level.to_tracing_level() < self.min_log_level.to_tracing_level() {
             return;
         }
 
@@ -252,6 +257,8 @@ impl Observer {
         }
 
         // Forward via NATS if configured.
+        // TODO: region routing — pull region from runtime context / tenant metadata
+        // instead of hardcoding "global".
         if let Some(ref publisher) = self.nats_publisher {
             publisher.publish_log("global", record);
         }
@@ -352,5 +359,58 @@ mod tests {
                 .with_min_log_level(LogLevel::Debug),
         );
         observer.emit_log("debug", "test", &[]);
+    }
+
+    /// Mock publisher that records which log levels were published.
+    struct RecordingPublisher {
+        published: RwLock<Vec<LogLevel>>,
+    }
+    impl RecordingPublisher {
+        fn new() -> Self {
+            Self {
+                published: RwLock::new(Vec::new()),
+            }
+        }
+        fn published_levels(&self) -> Vec<LogLevel> {
+            self.published.read().unwrap().clone()
+        }
+    }
+    impl NatsPublisher for RecordingPublisher {
+        fn publish_log(&self, _region: &str, record: &LogRecord) {
+            self.published.write().unwrap().push(record.level);
+        }
+    }
+
+    #[test]
+    fn test_min_log_level_filters_correctly() {
+        // min=Info: Error and Warn should be blocked; Info/Debug/Trace should pass.
+        let publisher = Arc::new(RecordingPublisher::new());
+        let observer = Observer::from_config(
+            ObserveConfig::new()
+                .with_nats_publisher(publisher.clone())
+                .with_min_log_level(LogLevel::Info),
+        );
+
+        for (msg, lvl) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            observer.emit_log_record(&LogRecord {
+                timestamp_ms: 0,
+                level: lvl,
+                message: msg.into(),
+                labels: vec![],
+            });
+        }
+
+        let published = publisher.published_levels();
+        assert!(!published.contains(&LogLevel::Error), "Error should be filtered");
+        assert!(!published.contains(&LogLevel::Warn), "Warn should be filtered");
+        assert!(published.contains(&LogLevel::Info), "Info should pass");
+        assert!(published.contains(&LogLevel::Debug), "Debug should pass");
+        assert!(published.contains(&LogLevel::Trace), "Trace should pass");
     }
 }
