@@ -98,7 +98,10 @@ impl Supervisor {
             pool.acquire().expect("port pool exhausted")
         };
 
-        // Download artifact (blocking on first request)
+        // Download artifact (blocking on first request).
+        // Note: Downloader::get_artifact verifies SHA-256 against
+        // spec.deployment_hash before returning; on mismatch/empty/malformed it
+        // returns Err, which this arm propagates and the port-release path handles.
         let artifact = match self
             .downloader
             .get_artifact(&spec.deployment_id, &spec.deployment_hash)
