@@ -11,6 +11,7 @@ pub struct Config {
     pub control_plane_url: String,
     pub cache_dir: PathBuf,
     pub heartbeat_interval_secs: u64,
+    pub health_check_timeout_secs: u64,
     pub port_cooldown_secs: u64,
     pub starting_port: u16,
 }
@@ -37,6 +38,10 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(".worker-cache")),
             heartbeat_interval_secs: 30,
+            health_check_timeout_secs: std::env::var("EDGE_HEALTH_CHECK_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "60".into())
+                .parse()
+                .unwrap_or(60),
             port_cooldown_secs: 60,
             starting_port: 8081,
         })

@@ -16,10 +16,11 @@ pub enum AppInstanceStatus {
     Running,
     #[allow(dead_code)]
     Stopping,
-    #[allow(dead_code)]
     Crashed {
         restart_count: u32,
     },
+    /// App did not return from execute_app within the health check timeout.
+    Hung,
 }
 
 /// A single running app instance.

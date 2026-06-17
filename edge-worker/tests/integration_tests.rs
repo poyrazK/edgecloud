@@ -92,6 +92,7 @@ impl TestHarness {
             control_plane_url: mock_server.uri(),
             cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
             heartbeat_interval_secs: 30,
+            health_check_timeout_secs: 60,
             port_cooldown_secs: 60,
             starting_port: 18_000,
         };
@@ -299,6 +300,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
         heartbeat_interval_secs: 30,
+        health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
     };
