@@ -331,7 +331,15 @@ mod tests {
         let client = HttpClient::new();
         // Unreachable address — should fail fast without hanging.
         let resp = client
-            .fetch("GET", "http://127.0.0.1:1", &[], None, Some(500), None, None)
+            .fetch(
+                "GET",
+                "http://127.0.0.1:1",
+                &[],
+                None,
+                Some(500),
+                None,
+                None,
+            )
             .await;
         assert!(
             resp.error.is_some(),
