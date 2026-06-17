@@ -4,75 +4,157 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-edgeCloud is a managed WebAssembly edge computing platform. This repository contains the **edge-runtime** Rust library — a Wasmtime-based runtime that exposes WASI Preview 2 host interfaces (`edge:*`) to Wasm modules running on the platform.
+edgeCloud is a managed WebAssembly edge computing platform. Developers compile a service to a WASI Preview 2 component, run `edge deploy`, and the platform runs it on worker nodes close to end users. Tenant code is sandboxed in Wasmtime, scoped per-tenant, metered per request, and can call platform-provided host interfaces (`edge:*`) for HTTP, KV, cache, scheduling, etc.
 
-## Build Commands
+The repository contains five modules. There is **no top-level Cargo workspace** — each Rust crate is built independently via `--manifest-path`, and the Go module is built on its own. The Rust crates reference each other via `path = "..."`.
+
+| Module | Language | Role |
+|---|---|---|
+| `edge-runtime/` | Rust | Wasmtime-based host library. Exposes `create_engine`, `create_store`, `RuntimeState`, `RequestMeter`. Implements the `edge:cloud@0.1.0` WIT world. |
+| `edge-worker/` | Rust | Per-node supervisor binary. Subscribes to NATS for desired-app updates, instantiates WASM components, hosts their HTTP servers. |
+| `edge-control-plane/` | Go | HTTP API + Postgres (sqlx) + NATS publisher. Two binaries: `cmd/api` (the server) and `cmd/migrate` (DB migrations). JWT auth for workers, API-key auth for tenants. |
+| `edge-cli/` | Rust | Developer CLI (`edge init | build | deploy | dev | activate | env | ...`). Persists local state to `.edge/state.json`. |
+| `edge-migrate/` | Rust workspace | Standalone `edge-migrate` developer CLI binary + `edge-migrate-lib` (tree-sitter C → WASI C analysis/transform library imported by the Go control plane). |
+
+**Documentation:** `whitepaper.md` is the broad design doc (2026-06-14). Per-tool design docs (e.g. `edge-migrate/docs/design.md`) are scoped to one tool and may be newer — **when the two conflict, trust the per-tool design doc**. Treat any design doc as the source of intent, but always verify against the actual code.
+
+## Build & Test
+
+Each Rust module is built with `--manifest-path`. There is no workspace `Cargo.toml` at the repo root, so don't try to `cargo build` from there.
 
 ```bash
-# Build
-cargo build --manifest-path edge-runtime/Cargo.toml
-cargo build --manifest-path edge-runtime/Cargo.toml --release
+# edge-runtime (the Wasmtime host library)
+cargo build  --manifest-path edge-runtime/Cargo.toml
+cargo test   --manifest-path edge-runtime/Cargo.toml
+cargo build  --manifest-path edge-runtime/Cargo.toml --release
 
-# Test
-cargo test --manifest-path edge-runtime/Cargo.toml
-cargo test --manifest-path edge-runtime/Cargo.toml -- <test-name>  # single test
+# edge-worker (the supervisor)
+cargo build  --manifest-path edge-worker/Cargo.toml
+cargo test   --manifest-path edge-worker/Cargo.toml
+# Integration tests in edge-worker/tests/ need Docker (testcontainers + wiremock).
+# They self-skip when CI=true or SKIP_INTEGRATION_TESTS=1.
 
-# Lint
-cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
-cargo fmt --check --manifest-path edge-runtime/Cargo.toml
+# edge-cli
+cargo build  --manifest-path edge-cli/Cargo.toml
+cargo test   --manifest-path edge-cli/Cargo.toml
+
+# edge-migrate (its own internal workspace with lib + bin)
+cargo build  --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml
+cargo build  --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml
+
+# edge-control-plane (Go)
+cd edge-control-plane && go build ./... && go test ./...
 ```
 
-CI pipeline: `.gitlab-ci.yml` — runs fmt, clippy, audit, test, build:debug, build:release on MRs and main.
+## Lint & CI
 
-## Architecture
+```bash
+# Rust
+cargo fmt --check --manifest-path edge-runtime/Cargo.toml
+cargo clippy --all-targets --all-features --manifest-path edge-runtime/Cargo.toml -- -D warnings
 
-### Core Components
+# Go
+cd edge-control-plane && gofmt -l . && go vet ./...
+```
 
-The runtime is structured around a single WIT world defined **inline** in `src/lib.rs` (the `edge-runtime` world). The `wasmtime::component::bindgen!` macro generates Rust bindings from this inline definition at compile time.
+CI runs in two places:
 
-**Key modules:**
+- **`.gitlab-ci.yml`** — runs fmt, clippy, audit, test, build:debug, build:release on **`edge-runtime` only**. Other Rust crates and Go are not covered here.
+- **`.github/workflows/`** — covers `edge-control-plane` (go-fmt, go-vet, go-test) per recent commits.
+
+If you change `edge-worker`, `edge-cli`, or `edge-migrate`, lint/test them manually — GitLab CI won't catch regressions in those crates.
+
+## End-to-End Architecture
+
+A request flows through the system like this:
+
+1. **Build** — developer runs `edge build` → `cargo build --target wasm32-wasip2 --release` → `.wasm` component.
+2. **Deploy** — `edge deploy` POSTs the artifact to `POST /api/deploy/{appName}` on the control plane with a Bearer API key. Control plane SHA-256-hashes the blob and stores it on the filesystem at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`, plus a row in the `deployments` table.
+3. **Activate** — `edge activate <deployment_id>` flips the `active_deployments` row, which causes the control plane to publish a `TaskMessage` over NATS JetStream to `edgecloud.tasks.<region>`.
+4. **Reconcile** — `edge-worker` subscribes to that subject. `Supervisor::handle_task_message` diffs desired apps vs. running apps and starts/stops accordingly. Starting an app means: acquire a port from `PortPool`, download the artifact (cached locally), instantiate the component, and spawn `run_app_loop`.
+5. **Execute** — the guest calls `edge:http-server.start(port, host)` to open a real TCP socket on the worker. Each accepted request goes through `httparse`, into an `mpsc`, the guest polls it via `edge:http-server.poll`, calls `respond`, and the server writes bytes back. Each request bumps `RequestMeter::count` for billing.
+6. **Heartbeat** — the worker publishes `HeartbeatMessage{app_status, request_count}` to `edgecloud.heartbeats.<region>` every **30s** (whitepaper §5.6) so the control plane can bill and monitor.
+
+### Key contracts
+
+**NATS subjects** (all JetStream-durable; per whitepaper §8.4 the streams are configured with retention `workqueue`, replication factor 3, max age 24h):
+- `edgecloud.tasks.<region>` — control plane → workers (`TaskMessage{timestamp, tenant_id, apps}`)
+- `edgecloud.heartbeats.<region>` — workers → control plane (`HeartbeatMessage{timestamp, worker_id, region, apps}`)
+- `edgecloud.deployments.<tenantID>` — tenant-scoped deployment events (per whitepaper §4.2)
+
+**PostgreSQL schema** (control plane; see whitepaper §4.3 for full DDL): `tenants`, `quotas`, `api_keys`, `deployments`, `active_deployments`, `app_env`, `workers`, `worker_status`. IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<region>_`.
+
+**Control-plane HTTP surface** (see `edge-control-plane/cmd/api/main.go`):
+- Public: `POST /api/tenants`, `POST /api/keys`, `GET /health`
+- Tenant-authenticated (Bearer API key, SHA-256-hashed in `api_keys`): deploy, activate, env, status, apps, etc.
+- Admin (owner role): `/api/admin/tenants/*`, `DELETE /api/admin/apps/{appName}`
+- Internal (Worker JWT, HMAC-SHA256, 24h TTL per whitepaper §9.3): `/api/internal/download/{deploymentID}`, `/api/internal/workers*`
+
+**Migration flow** (server-side; the dev CLI is a thin uploader — per `edge-migrate/docs/design.md` v0.1):
+1. Developer runs standalone `edge-migrate hello_world.c` (or the `edge migrate` CLI subcommand; see Gotchas).
+2. CLI POSTs the C source to `POST /api/migrate` (multipart: `file`, `filename`, `language`).
+3. Control plane's `MigrationService` imports **`edge-migrate-lib` directly** for tree-sitter C analysis + auto-transformation of safe POSIX → WASI patterns (e.g. `socket()` → `create-tcp-socket()`, `bind()` → `start-bind()`/`finish-bind()`, `recv`/`send` → wasi:io streams).
+4. Transformed C is compiled via wasi-sdk's `clang --target=wasm32-wasip2 -nostdlib`.
+5. Wasm stored at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`; a `deployments` row is written with status `migrated` (no `active_deployments` row yet).
+6. Transformation report (`{patterns_detected, patterns_transformed, patterns_manual_review, errors}`) is returned; the developer activates via `edge deploy <app> --id <id>`.
+
+## edge-runtime Deep Dive
+
+The runtime library is structured around the WIT world in `src/wit/edge.wit` (loaded at `src/lib.rs:13-15` via `wasmtime::component::bindgen!({path: "src/wit/edge.wit"})` — **not inline in `lib.rs`**, contrary to the previous CLAUDE.md). The macro generates Rust bindings at compile time.
+
+### Core modules
 
 | File | Role |
 |------|------|
-| `src/lib.rs` | WIT world definition + public exports (`create_engine`, `create_store`, `RuntimeState`) |
-| `src/engine.rs` | wasmtime `Engine` creation with security-hardened config (no threads, no reference types, SIMD enabled, component model enabled, epoch interruption enabled) |
-| `src/runtime.rs` | `RuntimeState` struct implementing all WIT Host traits via delegation to sub-components |
-| `src/linker.rs` | `create_linker` (core wasm/P1) and `create_component_linker` (WASI P2) |
-| `src/store.rs` | wasmtime `Store` creation |
-| `src/memory.rs` | Host-to-wasm memory access helpers: `read_string`, `write_string`, `read_bytes`, `write_bytes`, `allocate`, `get_memory` |
-| `src/limits.rs` | `StoreLimits` configuration via `StoreLimitsBuilder` |
-| `src/interfaces/` | Per-interface host implementations (feature-gated) |
+| `src/lib.rs` | Public re-exports; loads WIT via `bindgen!`. |
+| `src/engine.rs` | wasmtime `Engine` with security-hardened config (no threads, no reference types, SIMD on, component model on, epoch interruption on). Engine is meant to be shared across apps so compilation is cached. |
+| `src/runtime.rs` | `RuntimeState` — implements every WIT `Host` trait by **delegating** to per-interface sub-structs. Three constructors: `new()`, `with_env(env)` (tenant isolation), `with_env_and_meter(env, meter)` (per-deployment billing). |
+| `src/linker.rs` | `create_component_linker` wires every WIT interface in via the macro-generated `EdgeRuntime::add_to_linker`. |
+| `src/store.rs` | `create_store` attaches a `StoreLimits` via a deliberately-leaked `Box<StoreLimits>` (the only way to satisfy wasmtime's `ResourceLimiter` lifetime requirements). |
+| `src/memory.rs` | `read_string`/`write_string`/`read_bytes`/`write_bytes`/`allocate`/`get_memory` for crossing the wasm boundary. `get_memory` must be called **after** any wasm execution because `memory.grow()` invalidates the `Memory` handle. |
+| `src/limits.rs` | `StoreLimitsBuilder` config (memory size + table elements + instances/memories counts). |
+| `src/metering.rs` | `RequestMeter` — atomic per-deployment request counter, snapshotted into heartbeats. |
+| `src/interfaces/` | Per-interface host implementations (feature-gated). |
 
-### Interfaces
+### The `edge:*` interfaces
 
-Each `edge:*` interface lives in its own feature-gated module under `src/interfaces/`:
+Each interface lives in its own feature-gated module under `src/interfaces/`. `RuntimeState` holds one instance of each and implements the bindgen-generated `Host` trait by delegating to the inner struct.
 
-- `http-client` — outbound HTTP via `reqwest`
-- `kv-store` — key-value persistence
-- `cache` — in-memory LRU (size-capped)
-- `observe` — metrics and logging
-- `time` — monotonic clock
-- `scheduling` — delayed/repeating tasks via `tokio`
-- `process` — env vars, args, exit
-- `networking` — DNS resolution
-- `http-server` — inbound HTTP serving
+| Interface | Module | Notes |
+|---|---|---|
+| `http-client` | `http_client.rs` | `reqwest::Client` (async) with `tokio::time::sleep` for backoff (no `spawn_blocking`; the previous blocking-client approach panicked under async contexts — fixed in commit `d2399f4`). 3 retries with exponential backoff capped at 10s; retryable = timeout/connect/`429`/`502`/`503`/`504`. W3C `traceparent` validation + `tracestate` forwarding; one global `OnceLock<Arc<Client>>` for pooling. |
+| `kv-store` | `kv_store.rs` | `RwLock<HashMap>`; optional on-disk persistence to `<EDGE_KV_STORE_PATH>/store.json` via atomic rename; TTL cleanup every 100 writes; batch `get/set/delete_many`. Initial load runs in a separate thread+runtime so `block_on` doesn't panic inside an existing tokio context. |
+| `cache` | `cache.rs` | Same persistence pattern as kv-store but with an LRU cap. |
+| `observe` | `observe.rs` | Wraps the `metrics` crate: counters, gauges, histograms, `emit_log`. |
+| `time` | `time.rs` | `now`/`sleep`/`resolution` via the `clock` crate. |
+| `scheduling` | `scheduling.rs` | Delayed + repeating tasks via tokio; persistent; uses an `Instant ↔ Unix` boot-time offset. |
+| `process` | `process.rs` | Env vars + args + cwd + **clean exit mechanism**: `exit(code)` stores an `AtomicU32` then returns; the resulting wasmtime trap is later distinguished from a real error by `RuntimeState::exit_requested()`. Has a defensive env blocklist (`AWS_*`, `*SECRET*`, `*API_KEY*`, …) — best-effort, not exhaustive. |
+| `networking` | `networking.rs` + `dns.rs` | DNS resolution with a 60-entry cache, shared with `http-client` for outbound lookups. |
+| `http-server` | `http_server.rs` | The largest module (880 lines). tokio TCP server with `httparse`, optional TLS via `rustls`, gzip above 512 bytes, 10 MB body cap, `mpsc` queue to hand requests to guest code, tracks requests by `u64` id. Calls `RequestMeter::record_request` on every accepted connection. |
 
-The `RuntimeState` in `src/runtime.rs` holds one instance of each and delegates WIT trait calls to them.
+### Feature flags
 
-### Memory Access Pattern
+Each interface has a Cargo feature in `edge-runtime/Cargo.toml`. The `default` feature set enables all nine. To add a new interface: add it to `src/wit/edge.wit`, create `src/interfaces/<name>.rs`, wire it through `src/interfaces/mod.rs` + `src/runtime.rs`, and add a `#[cfg(feature = "...")] pub mod` entry. Run `cargo build` to regenerate bindings.
 
-All host function implementations follow a consistent pattern for crossing the wasm boundary:
-1. Get the `memory` export from `Caller`
-2. Read args from wasm linear memory via `read_string` / `read_bytes`
-3. Perform the operation
-4. Write results back via `write_string` / `write_bytes` if needed
+### WIT world
 
-The `get_memory` helper must be called **after** any wasm execution — the `Memory` handle is invalidated by `memory.grow()`.
+```wit
+package edge:cloud@0.1.0;
+world edge-runtime {
+  import http-client; import networking; import kv-store; import cache;
+  import observe; import time; import scheduling; import process; import http-server;
+}
+```
 
-### Feature Flags
+No exports — the guest is fully host-provided. All nine interfaces are pulled in unconditionally at the WIT level; only the Rust implementations are feature-gated.
 
-Interfaces are conditionally compiled via Cargo features in `Cargo.toml`. The `default` feature set enables all interfaces.
+## Conventions & Gotchas
 
-### WIT World Definition
-
-The WIT world is defined inline in `src/lib.rs` under the `package edge:cloud@0.1.0` namespace. If you add a new interface, add it to this inline WIT definition and run `cargo build` to regenerate bindings — no external `wit` tool is required since everything is inline.
+- **No top-level Cargo workspace.** Don't add `[workspace]` at the repo root — each crate is independent. The `edge-migrate` sub-directory has its own internal workspace.
+- **`edge-runtime` engine is meant to be shared.** Create it once (e.g., per worker process) so wasmtime can cache compilation across app instances.
+- **Bridge sync → async.** `HttpClientHost::fetch` and `HttpServerHost` calls still use `tokio::runtime::Handle::current().block_on(...)` to call the now-async `http_client.fetch()` / `http_server` methods from sync WIT trait impls. The historical foot-gun (blocking reqwest runtime panic when dropped in an async context) was fixed by `d2399f4` — but the sync→async bridge in `runtime.rs` remains. Don't move async work outside that bridge.
+- **Guest exit vs. wasm trap.** Always check `RuntimeState::exit_requested()` after a guest call returns `Err` — a clean `process.exit` looks like a trap to wasmtime.
+- **`edge-migrate` placement.** Per `edge-migrate/docs/design.md` v0.1 (2026-06-15, the more authoritative doc for this tool), `edge-migrate` is a **standalone binary** (`cargo install edge-migrate`), not a subcommand of `edge-cli`. The older whitepaper §10.2 (2026-06-14) still describes it as an `edge migrate` subcommand — that description is **superseded by design.md**. The current code has a stub in `edge-cli/src/migrate/transformer.rs`; the real transform lives in `edge-migrate/edge-migrate-lib`, imported by the Go control plane. Don't add new logic to the CLI stub.
+- **Egress allowlist.** Per whitepaper §9.5, tenants can specify allowed outbound destinations (e.g. `api.stripe.com`). The `http-client` interface does not currently enforce this; enforcement is the worker's job (or a future middleware).
+- **Port pool exhaustion** in `edge-worker/src/supervisor.rs` calls `.expect("port pool exhausted")` — should probably surface as `Err` instead.
+- **Persisted interfaces** (kv-store, cache, scheduling) honor `EDGE_KV_STORE_PATH` / `EDGE_CACHE_PATH` / `EDGE_SCHEDULING_PATH` env vars. Absent or invalid → ephemeral in-memory only.
