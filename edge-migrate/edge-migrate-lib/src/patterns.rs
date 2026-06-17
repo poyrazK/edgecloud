@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Classification of how transformable a POSIX pattern is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Transformability {
     /// Can be automatically transformed to WASI with no manual intervention.
     AutoTransformable,
@@ -142,6 +143,19 @@ impl PosixPattern {
             | PosixPattern::NonBlocking
             | PosixPattern::SockRaw
             | PosixPattern::Unknown => Transformability::NotTransformable,
+        }
+    }
+}
+
+impl Transformability {
+    /// Stable kebab-case form of this classification. Used in
+    /// `PatternInfo.transformability` and in any user-facing label.
+    /// Keep in sync with `#[serde(rename_all = "kebab-case")]` on the enum.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Transformability::AutoTransformable => "auto-transformable",
+            Transformability::BestEffort => "best-effort",
+            Transformability::NotTransformable => "not-transformable",
         }
     }
 }
