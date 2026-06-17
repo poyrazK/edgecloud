@@ -36,10 +36,13 @@ type ArtifactStoreInterface interface {
 
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.
 // Emitted by `edge-migrate --transform --format json`. The Go control
-// plane is the only consumer in this repo.
+// plane is the only consumer in this repo. The `Version` field lets the
+// server reject envelopes from a binary whose wire shape this server
+// doesn't know how to parse.
 type transformEnvelope struct {
-	Report domain.MigrationReport `json:"report"`
-	WasiC  string                 `json:"wasi_c"`
+	Version uint32                 `json:"version"`
+	Report  domain.MigrationReport `json:"report"`
+	WasiC   string                 `json:"wasi_c"`
 }
 
 // MigrationService transforms POSIX C source to WASI and compiles it to wasm.
@@ -132,6 +135,24 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 			Errors: []domain.ErrorInfo{{
 				Line:    0,
 				Message: fmt.Sprintf("edge-migrate JSON parse failed: %v — stderr: %s", err, edgeMigErr.String()),
+			}},
+		}, ErrEdgeMigrateFailed
+	}
+
+	// Reject envelopes whose wire shape this server doesn't understand.
+	// Adding a new optional field is NOT a version bump; renaming or
+	// retyping an existing field IS.
+	if envelope.Version != domain.MigrateEnvelopeVersion {
+		return &domain.MigrationReport{
+			Status:     domain.MigrationStatusFailed,
+			WasmStored: false,
+			AppName:    appName,
+			Errors: []domain.ErrorInfo{{
+				Line: 0,
+				Message: fmt.Sprintf(
+					"edge-migrate envelope version %d unsupported (server expects %d) — please upgrade",
+					envelope.Version, domain.MigrateEnvelopeVersion,
+				),
 			}},
 		}, ErrEdgeMigrateFailed
 	}

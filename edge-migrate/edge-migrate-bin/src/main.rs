@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use edge_migrate_lib::{
     analyzer::CAnalyzer,
-    report::{MigrationReport, TransformOutput},
+    report::{MigrationReport, TransformOutput, TRANSFORM_OUTPUT_VERSION},
     transformer::Transformer,
 };
 use std::path::Path;
@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
             }
             OutputFormat::Json => {
                 let envelope = TransformOutput {
+                    version: TRANSFORM_OUTPUT_VERSION,
                     report,
                     wasi_c: result.transformed_source,
                 };

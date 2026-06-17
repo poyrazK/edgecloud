@@ -117,6 +117,14 @@ impl MigrationReport {
     }
 }
 
+/// Current wire-format version of `TransformOutput`. Bumped when the
+/// envelope's JSON shape changes in a way that requires consumer
+/// coordination (renamed keys, changed semantics). Additive changes
+/// (new optional fields) do NOT require a bump — consumers should
+/// ignore unknown fields. Must match
+/// `domain.MigrateEnvelopeVersion` on the Go side.
+pub const TRANSFORM_OUTPUT_VERSION: u32 = 1;
+
 /// Envelope emitted by the binary's `--format json` output.
 ///
 /// Bundles the structured `MigrationReport` (the data the Go control
@@ -125,7 +133,11 @@ impl MigrationReport {
 /// returned to the API caller, `wasi_c` is piped to clang.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformOutput {
+    /// Wire-format version (see `TRANSFORM_OUTPUT_VERSION`).
+    pub version: u32,
+    /// The structured migration report.
     pub report: MigrationReport,
+    /// The raw transformed WASI C source (for piping to clang).
     pub wasi_c: String,
 }
 
@@ -222,6 +234,7 @@ mod tests {
         }];
         let report = MigrationReport::from_pattern_matches("hello", matches);
         let out = TransformOutput {
+            version: TRANSFORM_OUTPUT_VERSION,
             report: report.clone(),
             wasi_c: "#include <wasi/sockets.h>\n".to_string(),
         };
