@@ -1,6 +1,7 @@
 //! `edge:http-server` — inbound HTTP serving.
 
 use crate::metering::RequestMeter;
+use crate::streams::{IncomingStream, OutgoingStreamAdapter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -75,6 +76,10 @@ const DEFAULT_MAX_BODY_SIZE: u64 = 10 * 1024 * 1024;
 const MIN_MAX_BODY_SIZE: u64 = 1024;
 /// Threshold in bytes above which gzip compression kicks in.
 const GZIP_COMPRESSION_THRESHOLD: usize = 512;
+/// Threshold in bytes above which an inbound request body is exposed as a
+/// streaming IncomingStream instead of a fully-buffered Vec<u8>. Below this,
+/// the host buffers the entire body before delivering to the guest.
+pub const DEFAULT_STREAM_THRESHOLD: u64 = 1024 * 1024;
 
 /// Environment variable names for TLS configuration.
 const ENV_TLS_CERT_PATH: &str = "EDGE_TLS_CERT_PATH";
@@ -89,15 +94,58 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Map of req-id -> streaming-response-parts sender. Aliased so the
+/// `HttpServer` struct doesn't trip clippy::type_complexity.
+type StreamingResponseMap =
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<StreamingResponseParts>>;
+
+/// Parts delivered through `respond_stream`: the head + the adapter the
+/// per-connection task drains to write chunks to the socket.
+pub struct StreamingResponseParts {
+    pub head: StreamingResponseHead,
+    pub adapter: OutgoingStreamAdapter,
+}
+
+/// Head of a streaming response: status + headers, then chunks stream in via
+/// the OutgoingStreamAdapter. Content-Length MUST be present in headers.
+pub struct StreamingResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+/// Body shape delivered to the guest via `IncomingRequest.body`.
+pub enum BodySource {
+    /// No body (Content-Length: 0 or absent on a body-less request).
+    None,
+    /// Fully-buffered body bytes (Content-Length <= STREAM_THRESHOLD).
+    Buffered(Vec<u8>),
+    /// Streaming body (Content-Length > STREAM_THRESHOLD). The host's
+    /// body-pipeline task pushes chunks into this stream's producer.
+    Streamed(IncomingStream),
+}
+
+impl std::fmt::Debug for BodySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodySource::None => f.write_str("BodySource::None"),
+            BodySource::Buffered(b) => f
+                .debug_tuple("BodySource::Buffered")
+                .field(&b.len())
+                .finish(),
+            BodySource::Streamed(_) => f.write_str("BodySource::Streamed(<stream>)"),
+        }
+    }
+}
+
 /// A received HTTP request delivered to the guest.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IncomingRequest {
     pub id: u64,
     pub method: String,
     pub path: String,
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: BodySource,
     pub trace: Option<TraceContext>,
 }
 
@@ -118,6 +166,11 @@ pub struct HttpServer {
     /// back to the correct connection handler.
     responses:
         Arc<StdMutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<HttpResponse>>>>,
+    /// Maps request-id -> streaming-response parts sender. `respond_stream`
+    /// sends the (head, adapter) via this oneshot; the per-connection task
+    /// writes the head, then drains the OutgoingStreamAdapter to write
+    /// chunks with timeout_at(deadline, write_all).
+    streaming_responses: Arc<StdMutex<StreamingResponseMap>>,
     /// Request counter — must be shared with the accept loop.
     next_id: Arc<AtomicU64>,
     pub meter: Option<Arc<RequestMeter>>,
@@ -137,6 +190,9 @@ pub struct HttpServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     /// Maximum request body size in bytes.
     max_body_size: u64,
+    /// Threshold above which inbound request bodies are streamed instead of
+    /// buffered. Configurable via `with_stream_threshold`.
+    stream_threshold: u64,
     /// Active connection handler task handles — drained on shutdown.
     conn_handles: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
@@ -153,6 +209,7 @@ impl HttpServer {
             tx: Arc::new(RwLock::new(None)),
             rx: Arc::new(TokioMutex::new(None)),
             responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            streaming_responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
@@ -162,6 +219,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
             tls_config: try_load_tls_config(),
             max_body_size,
+            stream_threshold: DEFAULT_STREAM_THRESHOLD,
             conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -178,6 +236,7 @@ impl HttpServer {
             tx: Arc::new(RwLock::new(None)),
             rx: Arc::new(TokioMutex::new(None)),
             responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            streaming_responses: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             meter: None,
             accept_task: None,
@@ -187,6 +246,7 @@ impl HttpServer {
             conn_timeout: Duration::from_secs(conn_timeout_secs),
             tls_config: try_load_tls_config(),
             max_body_size,
+            stream_threshold: DEFAULT_STREAM_THRESHOLD,
             conn_handles: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -215,6 +275,7 @@ impl HttpServer {
 
         let next_id = self.next_id.clone();
         let responses = self.responses.clone();
+        let streaming_responses = self.streaming_responses.clone();
         let meter = self.meter.clone();
         let conn_limit = self.conn_limit.clone();
         let conn_handles = self.conn_handles.clone();
@@ -238,7 +299,10 @@ impl HttpServer {
                             Ok((stream, peer_addr)) => {
                                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                                 let (ch_tx, ch_rx) = tokio::sync::oneshot::channel();
+                                let (stream_tx, stream_rx) =
+                                    tokio::sync::oneshot::channel::<StreamingResponseParts>();
                                 responses.lock().unwrap().insert(id, ch_tx);
+                                streaming_responses.lock().unwrap().insert(id, stream_tx);
 
                                 let tx = tx.clone();
                                 let meter = meter.clone();
@@ -284,7 +348,7 @@ impl HttpServer {
                                         };
 
                                     Self::handle_connection(
-                                        id, stream, tx, ch_rx, meter, conn_timeout, max_body_size,
+                                        id, stream, tx, ch_rx, stream_rx, meter, conn_timeout, max_body_size,
                                     )
                                     .await;
                                     drop(permit); // release connection slot
@@ -356,11 +420,13 @@ impl HttpServer {
 
     /// Handle one TCP connection: read and parse HTTP, send request to guest,
     /// then wait for the guest's response and write it to the socket.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         id: u64,
         mut stream: StreamKind,
         tx: mpsc::Sender<IncomingRequest>,
         ch_rx: tokio::sync::oneshot::Receiver<HttpResponse>,
+        stream_ch_rx: tokio::sync::oneshot::Receiver<StreamingResponseParts>,
         meter: Option<Arc<RequestMeter>>,
         conn_timeout: Duration,
         max_body_size: u64,
@@ -385,42 +451,96 @@ impl HttpServer {
             m.record_request();
         }
 
+        // Save the request headers for response-side processing (gzip, etc.)
+        // before moving `request` to the guest. Streamed bodies are moved
+        // into the request — they cannot be cloned.
+        let request_headers = request.headers.clone();
+
         // Send request to the guest via poll().
-        if tx.send(request.clone()).await.is_err() {
+        if tx.send(request).await.is_err() {
             tracing::debug!(req_id = %id, "poll channel closed, closing connection");
             return;
         }
 
-        // Wait for the guest's response with the connection deadline.
-        let HttpResponse {
-            status,
-            headers,
-            body,
-        } = match timeout_at(deadline, ch_rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => {
-                tracing::debug!(req_id = %id, "response channel closed");
-                return;
+        // Wait for either a buffered or a streaming response. The guest picks
+        // one path per request.
+        tokio::select! {
+            biased;
+            res = timeout_at(deadline, ch_rx) => {
+                match res {
+                    Ok(Ok(HttpResponse { status, headers, body })) => {
+                        if let Err(e) = Self::write_response(
+                            &mut stream,
+                            status,
+                            &headers,
+                            &body,
+                            deadline,
+                            &request_headers,
+                        )
+                        .await
+                        {
+                            tracing::warn!(req_id = %id, err = %e, "response write error");
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        tracing::debug!(req_id = %id, "buffered response channel closed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(req_id = %id, "guest respond timeout (buffered)");
+                    }
+                }
             }
-            Err(_) => {
-                tracing::warn!(req_id = %id, "guest respond timeout");
-                return;
+            res = timeout_at(deadline, stream_ch_rx) => {
+                match res {
+                    Ok(Ok(StreamingResponseParts { head, mut adapter })) => {
+                        if let Err(e) =
+                            Self::write_streaming_response(&mut stream, &head, &mut adapter, deadline)
+                                .await
+                        {
+                            tracing::warn!(req_id = %id, err = %e, "streaming response write error");
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        tracing::debug!(req_id = %id, "streaming response channel closed");
+                    }
+                    Err(_) => {
+                        tracing::warn!(req_id = %id, "guest respond timeout (streaming)");
+                    }
+                }
             }
-        };
-
-        // Use the same deadline for write (does not refresh).
-        if let Err(e) = Self::write_response(
-            &mut stream,
-            status,
-            &headers,
-            &body,
-            deadline,
-            &request.headers,
-        )
-        .await
-        {
-            tracing::warn!(req_id = %id, err = %e, "response write error");
         }
+    }
+
+    /// Write a streaming response: status line, headers, then drain the
+    /// OutgoingStreamAdapter chunks with `timeout_at(deadline, write_all)`
+    /// per chunk. Requires Content-Length in headers (v1 — no chunked TE).
+    async fn write_streaming_response(
+        stream: &mut StreamKind,
+        head: &StreamingResponseHead,
+        adapter: &mut OutgoingStreamAdapter,
+        deadline: Instant,
+    ) -> Result<(), std::io::Error> {
+        use futures::StreamExt;
+        let status_line = format!(
+            "HTTP/1.1 {} {}\r\n",
+            head.status,
+            Self::status_text(head.status)
+        );
+        let mut response = status_line.into_bytes();
+        for (k, v) in &head.headers {
+            response.extend(format!("{}: {}\r\n", k, v).bytes());
+        }
+        response.extend(b"\r\n");
+        timeout_at(deadline, stream.write_all(&response)).await??;
+        timeout_at(deadline, stream.flush()).await??;
+
+        // Drain the adapter to EOF (sender dropped = guest finished).
+        while let Some(item) = adapter.next().await {
+            let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
+            timeout_at(deadline, stream.write_all(&chunk)).await??;
+        }
+        timeout_at(deadline, stream.flush()).await??;
+        Ok(())
     }
 
     /// Read and parse one HTTP request from the stream. Returns None on EOF or
@@ -570,7 +690,7 @@ impl HttpServer {
             path,
             query,
             headers,
-            body,
+            body: BodySource::Buffered(body),
             trace,
         }))
     }
@@ -663,6 +783,31 @@ impl HttpServer {
         Ok(())
     }
 
+    /// Deliver a streaming response: send (head, adapter) to the per-connection
+    /// task, which writes the head then drains the adapter chunks to the
+    /// socket. Content-Length MUST be present in `headers` — v1 does not
+    /// implement chunked transfer encoding.
+    pub async fn respond_stream(
+        &self,
+        req_id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        adapter: OutgoingStreamAdapter,
+    ) -> Result<(), String> {
+        let ch = self
+            .streaming_responses
+            .lock()
+            .unwrap()
+            .remove(&req_id)
+            .ok_or("unknown request ID")?;
+        ch.send(StreamingResponseParts {
+            head: StreamingResponseHead { status, headers },
+            adapter,
+        })
+        .map_err(|_| "streaming response channel closed".to_string())?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn inject_request(&self, request: IncomingRequest) {
         // No-op helper for testing — the server doesn't support direct injection.
@@ -700,6 +845,14 @@ impl HttpServer {
     /// Set the maximum request body size in bytes.
     pub fn with_max_body_size(mut self, bytes: u64) -> Self {
         self.max_body_size = bytes.max(MIN_MAX_BODY_SIZE);
+        self
+    }
+
+    /// Set the threshold (in bytes) above which inbound request bodies are
+    /// exposed to the guest as a streaming `Incoming` resource. Bodies at or
+    /// below this threshold are fully buffered as `BodySource::Buffered`.
+    pub fn with_stream_threshold(mut self, bytes: u64) -> Self {
+        self.stream_threshold = bytes;
         self
     }
 }
@@ -876,5 +1029,28 @@ mod tests {
         let server = HttpServer::new();
         server.shutdown().await;
         server.shutdown().await;
+    }
+
+    #[test]
+    fn test_with_stream_threshold() {
+        let server = HttpServer::new().with_stream_threshold(2_000_000);
+        assert_eq!(server.stream_threshold, 2_000_000);
+    }
+
+    #[test]
+    fn test_default_stream_threshold_is_1mb() {
+        let server = HttpServer::new();
+        assert_eq!(server.stream_threshold, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_body_source_debug_redacts_streamed_payload() {
+        // Debug impl must not print stream internals — they don't impl Debug.
+        let s = BodySource::None;
+        assert!(format!("{:?}", s).contains("None"));
+        let b = BodySource::Buffered(vec![0xde, 0xad, 0xbe, 0xef]);
+        let dbg = format!("{:?}", b);
+        assert!(dbg.contains("Buffered"));
+        assert!(dbg.contains("4"));
     }
 }
