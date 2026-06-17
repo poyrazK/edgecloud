@@ -32,6 +32,13 @@ func (r *APIKeyRepository) Create(ctx context.Context, k *domain.APIKey) error {
 		return fmt.Errorf("api_key %s: HashAlgorithm must be set (use %q or %q)",
 			k.ID, domain.HashAlgorithmArgon2ID, domain.HashAlgorithmSHA256)
 	}
+	if k.LookupHash == "" {
+		// Programming error: callers must compute the SHA-256 lookup hash
+		// from the raw key. A row without LookupHash is invisible to
+		// AuthenticateRawKey, and the partial UNIQUE index tolerates NULLs
+		// so duplicates could pile up unnoticed.
+		return fmt.Errorf("api_key %s: LookupHash must be set (SHA-256 hex of raw key)", k.ID)
+	}
 	query := `INSERT INTO api_keys (id, tenant_id, name, key_hash, lookup_hash, role, created_at, expires_at, hash_algorithm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 	_, err := r.db.ExecContext(ctx, query, k.ID, k.TenantID, k.Name, k.KeyHash, k.LookupHash, k.Role, k.CreatedAt, k.ExpiresAt, k.HashAlgorithm)
 	return err

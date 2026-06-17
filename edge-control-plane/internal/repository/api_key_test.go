@@ -53,6 +53,37 @@ func TestAPIKeyRepository_Create_RejectsMissingHashAlgorithm(t *testing.T) {
 	}
 }
 
+func TestAPIKeyRepository_Create_RejectsMissingLookupHash(t *testing.T) {
+	repo, mock, cleanup := newMockRepo(t)
+	defer cleanup()
+
+	// LookupHash empty — the repo must refuse to issue a query and
+	// surface a clear error. A row without a lookup hash is invisible
+	// to AuthenticateRawKey and (because the partial UNIQUE index
+	// tolerates NULLs) would allow duplicates to pile up unnoticed.
+	k := &domain.APIKey{
+		ID:            "k_abc",
+		TenantID:      "t_test",
+		Name:          "my-key",
+		KeyHash:       "$argon2id$v=19$m=65536,t=1,p=4$AAAA$BBBB",
+		LookupHash:    "", // missing
+		Role:          domain.RoleDeveloper,
+		CreatedAt:     time.Now(),
+		HashAlgorithm: domain.HashAlgorithmArgon2ID,
+	}
+
+	err := repo.Create(context.Background(), k)
+	if err == nil {
+		t.Fatal("expected error for missing LookupHash, got nil")
+	}
+	if !strings.Contains(err.Error(), "LookupHash") {
+		t.Errorf("error %q should name 'LookupHash'", err.Error())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations — should have been zero: %v", err)
+	}
+}
+
 func TestAPIKeyRepository_Create_IncludesLookupHash(t *testing.T) {
 	repo, mock, cleanup := newMockRepo(t)
 	defer cleanup()
