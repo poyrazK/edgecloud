@@ -33,8 +33,11 @@ enum Command {
     Build,
 
     /// Upload the artifact to the edgeCloud control plane, or activate a stored one.
+    ///
+    /// Use --id <deployment_id> to activate a previously-stored deployment
+    /// (e.g. one produced by `edge migrate`).
     Deploy {
-        /// App name (used with --id; otherwise read from edge.toml).
+        /// App name. Upload mode: overrides edge.toml. Activate mode (with --id): primary source; falls back to .edge/state.json.
         #[arg(default_value = "")]
         app: String,
 

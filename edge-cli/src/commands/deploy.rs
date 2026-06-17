@@ -61,7 +61,7 @@ fn run_upload(path: &Path, app: &str) -> Result<()> {
 /// API base URL must come from `edge.toml` (matches `edge activate` semantics).
 #[cfg(feature = "network")]
 fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
-    let state = State::load(path).ok();
+    let state = load_state_optional(path)?;
     let app_name = resolve_app_name(app, state.as_ref())?;
 
     let edge_toml = EdgeToml::from_path(path).with_context(|| {
@@ -74,12 +74,33 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
 
     output::success("Activated successfully");
     println!("  ID: {deployment_id}");
-    if let Some(s) = state {
-        println!("  URL: {}", s.live_url);
-    } else {
-        println!("  (run `edge status` to view)");
+    // Only show the URL from state.json when it corresponds to the app we just
+    // activated. A stale state.json from a different app would be misleading.
+    match state {
+        Some(s) if s.app_name == app_name => println!("  URL: {}", s.live_url),
+        _ => println!("  (run `edge status` to view)"),
     }
     Ok(())
+}
+
+/// Load `.edge/state.json` if it exists. Suppress only `NotFound`; surface
+/// parse/IO errors so the user gets a real diagnostic instead of a generic
+/// "requires an app name" message.
+fn load_state_optional(path: &Path) -> Result<Option<State>> {
+    match State::load(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) => {
+            let is_not_found = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if is_not_found {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Resolve the app name to use for the activate path.
@@ -154,6 +175,33 @@ mod tests {
         assert!(
             msg.contains("requires an app name"),
             "expected 'requires an app name' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_state_optional_returns_none_when_missing() {
+        // A directory with no .edge/state.json at all.
+        let dir = tempfile::tempdir().unwrap();
+        let got = load_state_optional(dir.path()).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn load_state_optional_surfaces_parse_error() {
+        // A .edge/state.json that exists but is not valid JSON — must surface
+        // the error rather than silently treating it as "no state".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".edge")).unwrap();
+        std::fs::write(
+            dir.path().join(".edge").join("state.json"),
+            "{not valid json",
+        )
+        .unwrap();
+        let err = load_state_optional(dir.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to parse") || msg.contains("parse"),
+            "expected a parse error, got: {msg}"
         );
     }
 }
