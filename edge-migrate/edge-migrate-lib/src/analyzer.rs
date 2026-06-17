@@ -22,7 +22,10 @@ impl CAnalyzer {
 
     /// Analyze C source code and return all detected POSIX patterns.
     pub fn analyze(&mut self, source: &str) -> Vec<PatternMatch> {
-        let tree = self.parser.parse(source, None).expect("Failed to parse C source");
+        let tree = self
+            .parser
+            .parse(source, None)
+            .expect("Failed to parse C source");
         let root = tree.root_node();
         let mut matches = Vec::new();
         self.walk_node(source, root, &mut matches);
@@ -90,7 +93,10 @@ impl CAnalyzer {
             _ => return Vec::new(),
         };
 
-        let snippet = node.utf8_text(source.as_bytes()).unwrap_or_default().to_string();
+        let snippet = node
+            .utf8_text(source.as_bytes())
+            .unwrap_or_default()
+            .to_string();
         let start_byte = node.start_byte();
         let end_byte = node.end_byte();
         let arg_nodes = self.get_call_args(source, node);
@@ -134,7 +140,10 @@ impl CAnalyzer {
         let _cursor = node.walk();
         for i in 1..node.child_count() {
             if let Some(arg_node) = node.child(i) {
-                let arg_text = arg_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                let arg_text = arg_node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .to_string();
                 args.push(arg_text);
             }
         }
@@ -162,7 +171,9 @@ int main() {
 }
 "#;
         let matches = analyzer.analyze(source);
-        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
     }
 
     #[test]
@@ -175,7 +186,9 @@ int main() {
 }
 "#;
         let matches = analyzer.analyze(source);
-        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::SocketUdp)));
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.pattern, PosixPattern::SocketUdp)));
     }
 
     #[test]
@@ -189,10 +202,20 @@ int main() {
 "#;
         let matches = analyzer.analyze(source);
         // Should produce both SocketTcp and NonBlocking
-        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
-        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::NonBlocking)));
-        let nonblocking = matches.iter().find(|m| matches!(m.pattern, PosixPattern::NonBlocking)).unwrap();
-        assert!(matches!(nonblocking.transformability, Transformability::NotTransformable));
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.pattern, PosixPattern::NonBlocking)));
+        let nonblocking = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PosixPattern::NonBlocking))
+            .unwrap();
+        assert!(matches!(
+            nonblocking.transformability,
+            Transformability::NotTransformable
+        ));
     }
 
     #[test]
@@ -225,9 +248,17 @@ int main() {
 }
 "#;
         let matches = analyzer.analyze(source);
-        assert!(matches.iter().any(|m| matches!(m.pattern, PosixPattern::Poll)));
-        let poll_match = matches.iter().find(|m| matches!(m.pattern, PosixPattern::Poll)).unwrap();
-        assert!(matches!(poll_match.transformability, crate::Transformability::NotTransformable));
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.pattern, PosixPattern::Poll)));
+        let poll_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PosixPattern::Poll))
+            .unwrap();
+        assert!(matches!(
+            poll_match.transformability,
+            crate::Transformability::NotTransformable
+        ));
     }
 
     #[test]

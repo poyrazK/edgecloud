@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,10 +57,20 @@ func NewMigrationService(
 	}
 }
 
+// MaxSourceSize is the maximum allowed source code size (10 MB).
+const MaxSourceSize = 10 << 20
+
 // Migrate transforms the given C source to WASI C, compiles it to wasm,
 // stores the artifact, and creates a deployment record.
 func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _language, source string) (*domain.MigrationReport, error) {
-	// Derive app name: strip .c suffix
+	if source == "" {
+		return nil, fmt.Errorf("source code is empty")
+	}
+	if len(source) > MaxSourceSize {
+		return nil, fmt.Errorf("source exceeds maximum size of %d bytes", MaxSourceSize)
+	}
+
+	// Derive app name: strip .c suffix; "." alone falls through to "app"
 	appName := strings.TrimSuffix(filename, ".c")
 	if appName == "" {
 		appName = "app"
@@ -77,8 +89,9 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	}
 	tmpSrc.Close()
 
-	// Run edge-migrate --transform <path>
-	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--transform", tmpSrcPath)
+	// Run edge-migrate --transform --report-json <path>
+	// --report-json emits a JSON MigrationReport to stderr with full pattern analysis.
+	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--transform", "--report-json", tmpSrcPath)
 	var edgeMigOut bytes.Buffer
 	edgeMigCmd.Stdout = &edgeMigOut
 	var edgeMigErr bytes.Buffer
@@ -96,8 +109,18 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	}
 	wasiC := edgeMigOut.String()
 
-	// Build pattern report from the WASI C output
-	patternsTransformed := detectTransformedPatterns(wasiC)
+	// Parse the JSON MigrationReport from stderr to get authoritative pattern data.
+	var edgeReport domain.MigrationReport
+	if err := json.Unmarshal([]byte(edgeMigErr.String()), &edgeReport); err != nil {
+		// Fallback: if JSON parsing fails, log the error and return an empty report.
+		// The migration still proceeds using the WASI C from stdout.
+		log.Printf("warning: failed to parse migration report from edge-migrate: %v", err)
+		edgeReport = domain.MigrationReport{
+			Status:    domain.MigrationStatusSuccess,
+			WasmStored: false,
+			AppName:  appName,
+		}
+	}
 
 	// Compile WASI C → wasm via clang
 	tmpWasm, err := os.CreateTemp("", "migrate-*.wasm")
@@ -117,11 +140,14 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	clangCmd.Stderr = &clangErr
 
 	if err := clangCmd.Run(); err != nil {
+		// Compilation failed — return partial report with pattern data intact.
 		return &domain.MigrationReport{
-			Status:              domain.MigrationStatusPartial,
-			WasmStored:          false,
-			AppName:             appName,
-			PatternsTransformed: patternsTransformed,
+			Status:               domain.MigrationStatusPartial,
+			WasmStored:           false,
+			AppName:              appName,
+			PatternsDetected:     edgeReport.PatternsDetected,
+			PatternsTransformed:  edgeReport.PatternsTransformed,
+			PatternsManualReview: edgeReport.PatternsManualReview,
 			Errors: []domain.ErrorInfo{{
 				Line:    0,
 				Message: fmt.Sprintf("clang failed: %s — %s", err, clangErr.String()),
@@ -133,6 +159,22 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	wasmBytes, err := os.ReadFile(tmpWasmPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading compiled wasm: %w", err)
+	}
+
+	// Verify the compiled output is actually a valid wasm binary.
+	if !validateWasm(wasmBytes) {
+		return &domain.MigrationReport{
+			Status:               domain.MigrationStatusFailed,
+			WasmStored:           false,
+			AppName:              appName,
+			PatternsDetected:     edgeReport.PatternsDetected,
+			PatternsTransformed:  edgeReport.PatternsTransformed,
+			PatternsManualReview: edgeReport.PatternsManualReview,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: "clang produced invalid wasm binary",
+			}},
+		}, ErrClangFailed
 	}
 
 	// Generate deployment ID and hash
@@ -158,48 +200,66 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	}
 
 	return &domain.MigrationReport{
-		Status:              domain.MigrationStatusSuccess,
-		WasmStored:          true,
+		Status:               domain.MigrationStatusSuccess,
+		WasmStored:           true,
 		DeploymentID:        &depID,
-		AppName:             appName,
-		PatternsTransformed:  patternsTransformed,
+		AppName:              appName,
+		PatternsDetected:     edgeReport.PatternsDetected,
+		PatternsTransformed:  edgeReport.PatternsTransformed,
+		PatternsManualReview: edgeReport.PatternsManualReview,
 	}, nil
 }
 
-// detectTransformedPatterns scans WASI C output for known WASI function names
-// and returns a list of PatternInfo describing what was transformed.
-func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
-	transforms := []struct {
-		contains string
-		pattern  string
-		wasi     string
-	}{
-		{"wasi_socket_tcp_create", "socket(AF_INET, SOCK_STREAM, 0)", "wasi_socket_tcp_create"},
-		{"wasi_socket_tcp_start_bind", "bind(fd, addr, len)", "wasi_socket_tcp_start_bind"},
-		{"wasi_socket_tcp_start_listen", "listen(fd, backlog)", "wasi_socket_tcp_start_listen"},
-		{"wasi_socket_tcp_accept", "accept(fd, ...)", "wasi_socket_tcp_accept"},
-		{"wasi_socket_tcp_start_connect", "connect(fd, addr, len)", "wasi_socket_tcp_start_connect"},
-		{"wasi_output_stream_write", "send(fd, buf, len, flags)", "wasi_output_stream_write"},
-		{"wasi_input_stream_read", "recv(fd, buf, len, flags)", "wasi_input_stream_read"},
-		{"wasi_filesystem_open", "fopen(path, mode)", "wasi_filesystem_open"},
-		{"wasi_ip_name_lookup_resolve", "gethostbyname(name)", "wasi_ip_name_lookup_resolve"},
+// Analyze runs pattern analysis on C source using edge-migrate and returns
+// the MigrationReport without compiling or storing anything.
+func (s *MigrationService) Analyze(ctx context.Context, tenantID, filename, source string) (*domain.MigrationReport, error) {
+	if source == "" {
+		return nil, fmt.Errorf("source code is empty")
+	}
+	if len(source) > MaxSourceSize {
+		return nil, fmt.Errorf("source exceeds maximum size of %d bytes", MaxSourceSize)
 	}
 
-	var patterns []domain.PatternInfo
-	seen := make(map[string]bool)
-	for _, t := range transforms {
-		if strings.Contains(wasiC, t.contains) && !seen[t.pattern] {
-			seen[t.pattern] = true
-			patterns = append(patterns, domain.PatternInfo{
-				Line:             0,
-				Pattern:          t.pattern,
-				Snippet:          t.pattern,
-				WasiEquivalent:    t.wasi,
-				Transformability: "Auto-transformable",
-			})
-		}
+	appName := strings.TrimSuffix(filename, ".c")
+	if appName == "" {
+		appName = "app"
 	}
-	return patterns
+
+	tmpSrc, err := os.CreateTemp("", "migrate-*.c")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp source file: %w", err)
+	}
+	tmpSrcPath := tmpSrc.Name()
+	defer os.Remove(tmpSrcPath)
+	if _, err := tmpSrc.WriteString(source); err != nil {
+		tmpSrc.Close()
+		return nil, fmt.Errorf("writing temp source: %w", err)
+	}
+	tmpSrc.Close()
+
+	// Run edge-migrate --transform --report-json (no clang step).
+	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--transform", "--report-json", tmpSrcPath)
+	var edgeMigOut bytes.Buffer
+	edgeMigCmd.Stdout = &edgeMigOut
+	var edgeMigErr bytes.Buffer
+	edgeMigCmd.Stderr = &edgeMigErr
+	if err := edgeMigCmd.Run(); err != nil {
+		return &domain.MigrationReport{
+			Status:    domain.MigrationStatusFailed,
+			WasmStored: false,
+			AppName:   appName,
+			Errors: []domain.ErrorInfo{{
+				Line:    0,
+				Message: fmt.Sprintf("edge-migrate failed: %s — %s", err, edgeMigErr.String()),
+			}},
+		}, ErrEdgeMigrateFailed
+	}
+
+	var report domain.MigrationReport
+	if err := json.Unmarshal([]byte(edgeMigErr.String()), &report); err != nil {
+		return nil, fmt.Errorf("parsing migration report: %w", err)
+	}
+	return &report, nil
 }
 
 // validateWasm checks whether b is a valid wasm binary (magic number check).

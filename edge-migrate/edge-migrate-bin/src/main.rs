@@ -30,6 +30,11 @@ struct Args {
     /// Force upload even if the file has untransformable patterns.
     #[arg(short, long)]
     force: bool,
+
+    /// Output a JSON MigrationReport to stderr when used with --transform.
+    /// The Go control-plane uses this to get pattern analysis data.
+    #[arg(long)]
+    report_json: bool,
 }
 
 #[tokio::main]
@@ -42,12 +47,28 @@ async fn main() -> Result<()> {
         let source = read_file(source_path).await?;
         let mut analyzer = CAnalyzer::new();
         let matches = analyzer.analyze(&source);
-        let result = Transformer::transform(&source, matches);
+        let result = Transformer::transform(&source, matches.clone());
+
+        // Always print WASI C to stdout so the Go pipeline continues to work.
         print!("{}", result.transformed_source);
+
+        // If --report-json is set, also emit the full MigrationReport to stderr as JSON.
+        // This lets the Go service populate PatternsDetected/PatternsTransformed/PatternsManualReview
+        // with authoritative data from the analyzer.
+        if args.report_json {
+            let app_name = derive_app_name(source_path);
+            let report = MigrationReport::from_pattern_matches(&app_name, matches);
+            serde_json::to_writer(std::io::stderr(), &report)
+                .context("Failed to serialize migration report")?;
+        }
+
         return Ok(());
     }
 
-    let file = args.file.as_ref().expect("FILE argument required when not using --transform");
+    let file = args
+        .file
+        .as_ref()
+        .expect("FILE argument required when not using --transform");
     let source = read_file(file).await?;
     let app_name = derive_app_name(file);
 
@@ -100,8 +121,7 @@ fn derive_app_name(path: &str) -> String {
 }
 
 async fn upload_to_edgecloud(file_path: &str, source: &str) -> Result<MigrationReport> {
-    let api_url = std::env::var("EDGE_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+    let api_url = std::env::var("EDGE_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     let api_key = std::env::var("EDGE_API_KEY")
         .context("EDGE_API_KEY not set — run `edge auth login` first")?;
 
@@ -111,8 +131,7 @@ async fn upload_to_edgecloud(file_path: &str, source: &str) -> Result<MigrationR
         .text("language", "c".to_string())
         .part(
             "file",
-            reqwest::multipart::Part::text(source.to_string())
-                .file_name(file_path.to_string()),
+            reqwest::multipart::Part::text(source.to_string()).file_name(file_path.to_string()),
         );
 
     let response = client

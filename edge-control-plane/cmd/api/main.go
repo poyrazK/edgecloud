@@ -93,6 +93,7 @@ func main() {
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/deploy/{appName}", deploymentHandler.Deploy)
 	api.HandleFunc("POST /api/migrate", migrationHandler.Migrate)
+	api.HandleFunc("GET /api/migrate/analyze", migrationHandler.Analyze)
 	api.HandleFunc("GET /api/status/{deploymentID}", deploymentHandler.GetStatus)
 	api.HandleFunc("GET /api/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)

@@ -69,10 +69,7 @@ impl MigrationReport {
     }
 
     /// Create a report from a list of pattern matches.
-    pub fn from_pattern_matches(
-        app_name: &str,
-        matches: Vec<PatternMatch>,
-    ) -> Self {
+    pub fn from_pattern_matches(app_name: &str, matches: Vec<PatternMatch>) -> Self {
         let patterns_detected: Vec<PatternInfo> = matches
             .iter()
             .map(|m| PatternInfo {
@@ -131,7 +128,11 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-                arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+                arg_nodes: vec![
+                    "AF_INET".to_string(),
+                    "SOCK_STREAM".to_string(),
+                    "0".to_string(),
+                ],
                 transformability: Transformability::AutoTransformable,
             },
             PatternMatch {
@@ -158,7 +159,11 @@ mod tests {
                 end_byte: 0,
                 pattern: PosixPattern::SocketTcp,
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-                arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+                arg_nodes: vec![
+                    "AF_INET".to_string(),
+                    "SOCK_STREAM".to_string(),
+                    "0".to_string(),
+                ],
                 transformability: Transformability::AutoTransformable,
             },
             PatternMatch {

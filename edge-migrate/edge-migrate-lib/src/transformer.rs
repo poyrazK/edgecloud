@@ -123,8 +123,8 @@ impl Transformer {
             output.extend_from_slice(&source_bytes[..prev_end]);
         }
 
-        let transformed_source = String::from_utf8(output)
-            .expect("Transformed source is not valid UTF-8");
+        let transformed_source =
+            String::from_utf8(output).expect("Transformed source is not valid UTF-8");
 
         TransformResult {
             transformed_source,
@@ -137,12 +137,8 @@ impl Transformer {
     /// Generate WASI C code for a pattern match.
     fn generate_wasi_code(m: &PatternMatch) -> String {
         match m.pattern {
-            PosixPattern::SocketTcp => {
-                "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
-            }
-            PosixPattern::SocketUdp => {
-                "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
-            }
+            PosixPattern::SocketTcp => "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string(),
+            PosixPattern::SocketUdp => "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string(),
             PosixPattern::Bind => {
                 // Two-phase: start-bind + finish-bind
                 format!(
@@ -227,10 +223,7 @@ impl Transformer {
                 )
             }
             PosixPattern::Fclose => {
-                format!(
-                    "wasi_filesystem_close({})",
-                    Self::extract_first_arg(m)
-                )
+                format!("wasi_filesystem_close({})", Self::extract_first_arg(m))
             }
             // These should not reach here (NotTransformable patterns)
             _ => String::new(),
@@ -239,17 +232,26 @@ impl Transformer {
 
     /// Extract the first argument from a call via arg_nodes (avoids comma-re-parsing bugs).
     fn extract_first_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.first().cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 
     /// Extract the second argument from a call via arg_nodes.
     fn extract_second_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.get(1).cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 
     /// Extract the third argument from a call via arg_nodes.
     fn extract_third_arg(m: &PatternMatch) -> String {
-        m.arg_nodes.get(2).cloned().unwrap_or_else(|| "/* unknown */".to_string())
+        m.arg_nodes
+            .get(2)
+            .cloned()
+            .unwrap_or_else(|| "/* unknown */".to_string())
     }
 }
 
@@ -273,7 +275,11 @@ int main() {
             end_byte: call_end,
             pattern: PosixPattern::SocketTcp,
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -322,13 +328,21 @@ int main() {
             end_byte: call_end,
             pattern: PosixPattern::Bind,
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
-            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_bind"));
     }
 
     #[test]
@@ -347,13 +361,21 @@ int main() {
             end_byte: call_end,
             pattern: PosixPattern::Connect,
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
-            arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_connect"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_connect"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_connect"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_connect"));
     }
 
     #[test]
@@ -372,7 +394,12 @@ int main() {
             end_byte: call_end,
             pattern: PosixPattern::Recv,
             snippet: "recv(fd, buf, len, 0)".to_string(),
-            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "buf".to_string(),
+                "len".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
@@ -396,12 +423,19 @@ int main() {
             end_byte: call_end,
             pattern: PosixPattern::Send,
             snippet: "send(fd, buf, len, 0)".to_string(),
-            arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "fd".to_string(),
+                "buf".to_string(),
+                "len".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         }];
         let result = Transformer::transform(source, matches);
         assert_eq!(result.transformations_applied.len(), 1);
-        assert!(result.transformed_source.contains("wasi_output_stream_write"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_output_stream_write"));
     }
 
     #[test]
@@ -426,7 +460,9 @@ int main() {
         let result = Transformer::transform(source, matches);
         assert_eq!(result.transformations_applied.len(), 1);
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
-        assert!(result.transformed_source.contains("wasi_poll_pollable_block"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_poll_pollable_block"));
     }
 
     #[test]
@@ -437,7 +473,11 @@ int main() {
             end_byte: 0,
             pattern: PosixPattern::SocketTcp,
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
-            arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
+            arg_nodes: vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ],
             transformability: Transformability::AutoTransformable,
         };
         assert_eq!(Transformer::extract_first_arg(&m), "AF_INET");
@@ -516,26 +556,50 @@ int main() {
 
         // Smoke checks: key WASI markers must be present
         assert!(result.transformed_source.contains("wasi_socket_tcp_create"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_finish_bind"));
-        assert!(result.transformed_source.contains("wasi_socket_tcp_start_listen"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_finish_bind"));
+        assert!(result
+            .transformed_source
+            .contains("wasi_socket_tcp_start_listen"));
         assert!(result.transformed_source.contains("wasi_socket_tcp_accept"));
 
         // Original POSIX calls must NOT be present
-        assert!(!result.transformed_source.contains("socket(AF_INET"), "socket(AF_INET still present");
-        assert!(!result.transformed_source.contains("bind(fd, (struct sockaddr*)&addr"), "bind original still present");
-        assert!(!result.transformed_source.contains("listen(fd, 128)"), "listen original still present");
-        assert!(!result.transformed_source.contains("accept(fd, NULL, NULL)"), "accept original still present");
+        assert!(
+            !result.transformed_source.contains("socket(AF_INET"),
+            "socket(AF_INET still present"
+        );
+        assert!(
+            !result
+                .transformed_source
+                .contains("bind(fd, (struct sockaddr*)&addr"),
+            "bind original still present"
+        );
+        assert!(
+            !result.transformed_source.contains("listen(fd, 128)"),
+            "listen original still present"
+        );
+        assert!(
+            !result.transformed_source.contains("accept(fd, NULL, NULL)"),
+            "accept original still present"
+        );
 
         // If clang is available AND EDGE_TEST_CLANG is set, verify valid C syntax.
         // This requires the WASI SDK headers (-DWASI_SDK_PATH) and is skipped in CI
         // since WASI SDK is only available in the server-side build environment (Phase 6).
         if std::env::var("EDGE_TEST_CLANG").is_ok()
-            && std::process::Command::new("clang").arg("--version").output().is_ok()
+            && std::process::Command::new("clang")
+                .arg("--version")
+                .output()
+                .is_ok()
         {
             let pid = std::process::id();
             let tmp_path = std::env::temp_dir().join(format!("edge_migrate_test_{}.c", pid));
-            std::fs::write(&tmp_path, &result.transformed_source).expect("write transformed source");
+            std::fs::write(&tmp_path, &result.transformed_source)
+                .expect("write transformed source");
             let output = std::process::Command::new("clang")
                 .args(["-fsyntax-only", "-Werror", tmp_path.to_str().unwrap()])
                 .output()

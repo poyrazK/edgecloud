@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -213,5 +214,119 @@ int main() { return 0; }`
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected status 401, got: %d", rr.Code)
+	}
+}
+
+func TestMigrationHandler_Migrate_ClangFailureReturnsPartial(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	h := NewMigrationHandler(svc)
+
+	// Source that edge-migrate accepts but clang rejects (syntax error).
+	badSource := `int main() { invalid syntax here }`
+	req, err := makeMigrationReq("hello.c", "c", badSource)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	// Clang failure returns 200 with a partial report (analysis is still useful).
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200 (partial), got: %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"status"`) {
+		t.Errorf("expected JSON report in body, got: %s", rr.Body.String())
+	}
+}
+
+func TestMigrationHandler_Analyze_Success(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	h := NewMigrationHandler(svc)
+
+	source := `int main() { int fd = socket(AF_INET, SOCK_STREAM, 0); return 0; }`
+	req := httptest.NewRequest("GET", "/api/migrate/analyze?source="+url.QueryEscape(source), nil)
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Analyze(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got: %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Header().Get("Content-Type"), "application/json") {
+		t.Errorf("expected Content-Type application/json, got: %s", rr.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rr.Body.String(), `"patterns_detected"`) {
+		t.Errorf("expected patterns_detected in response, got: %s", rr.Body.String())
+	}
+}
+
+func TestMigrationHandler_Analyze_MissingTenantID(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	h := NewMigrationHandler(svc)
+
+	req := httptest.NewRequest("GET", "/api/migrate/analyze?source=int+main(){return+0;}", nil)
+	// No tenant ID in context
+
+	rr := httptest.NewRecorder()
+	h.Analyze(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got: %d", rr.Code)
+	}
+}
+
+func TestMigrationHandler_Analyze_MultipartFile(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	h := NewMigrationHandler(svc)
+
+	source := `int main() { int fd = socket(AF_INET, SOCK_STREAM, 0); return 0; }`
+
+	// Build multipart form with file field.
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("filename", "hello.c"); err != nil {
+		t.Fatalf("WriteField: %v", err)
+	}
+	part, err := writer.CreateFormFile("file", "hello.c")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte(source)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/migrate/analyze", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Analyze(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got: %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"patterns_detected"`) {
+		t.Errorf("expected patterns_detected in response, got: %s", rr.Body.String())
 	}
 }

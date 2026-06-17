@@ -21,9 +21,15 @@ pub fn print_analysis_report(report: &MigrationReport) {
     println!();
 
     if !report.patterns_transformed.is_empty() {
-        println!("Auto-transformable ({}):", report.patterns_transformed.len());
+        println!(
+            "Auto-transformable ({}):",
+            report.patterns_transformed.len()
+        );
         for p in &report.patterns_transformed {
-            println!("  ✅ Line {}: {} → {}", p.line, p.pattern, p.wasi_equivalent);
+            println!(
+                "  ✅ Line {}: {} → {}",
+                p.line, p.pattern, p.wasi_equivalent
+            );
         }
         println!();
     }
@@ -48,24 +54,38 @@ pub fn print_server_report(report: &MigrationReport) {
         MigrationStatus::Success => {
             println!("✅ Migration successful!");
             println!();
-            println!("Binary stored. Run `edge deploy {} --id {}` to go live.", report.app_name, report.deployment_id.as_deref().unwrap_or("<id>"));
+            println!(
+                "Binary stored. Run `edge deploy {} --id {}` to go live.",
+                report.app_name,
+                report.deployment_id.as_deref().unwrap_or("<id>")
+            );
         }
         MigrationStatus::Partial => {
             println!("⚠️  Migration partially successful.");
             println!();
             println!("Binary stored, but some patterns require manual review:");
             for p in &report.patterns_manual_review {
-                println!("  ⚠️  Line {}: {} — {}", p.line, p.pattern, p.wasi_equivalent);
+                println!(
+                    "  ⚠️  Line {}: {} — {}",
+                    p.line, p.pattern, p.wasi_equivalent
+                );
             }
             println!();
-            println!("Run `edge deploy {} --id {}` to deploy anyway.", report.app_name, report.deployment_id.as_deref().unwrap_or("<id>"));
+            println!(
+                "Run `edge deploy {} --id {}` to deploy anyway.",
+                report.app_name,
+                report.deployment_id.as_deref().unwrap_or("<id>")
+            );
         }
         MigrationStatus::Failed => {
             println!("❌ Migration failed.");
             println!();
             println!("The following patterns could not be auto-transformed:");
             for p in &report.patterns_manual_review {
-                println!("  ❌ Line {}: {} — {}", p.line, p.pattern, p.wasi_equivalent);
+                println!(
+                    "  ❌ Line {}: {} — {}",
+                    p.line, p.pattern, p.wasi_equivalent
+                );
             }
             println!();
             println!("Fix these issues and re-run `edge-migrate`.");

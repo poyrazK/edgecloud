@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -132,22 +133,25 @@ func TestMigrationService_Migrate_AppNameStripsC(t *testing.T) {
 }
 
 func TestMigrationService_Migrate_EmptySource(t *testing.T) {
-	skipIfNoEdgeMigrate(t)
-	skipIfNoClang(t)
-
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
 	svc := migrationSvcForTest(repo, store)
 
-	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", emptySource)
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
+	_, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", "")
+	if err == nil {
+		t.Fatal("expected error for empty source")
 	}
-	if report.Status != domain.MigrationStatusSuccess {
-		t.Errorf("expected status success, got: %s", report.Status)
-	}
-	if !report.WasmStored {
-		t.Error("expected WasmStored=true")
+}
+
+func TestMigrationService_Migrate_SourceTooLarge(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	largeSource := strings.Repeat("x", MaxSourceSize+1)
+	_, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", largeSource)
+	if err == nil {
+		t.Fatal("expected error for source exceeding MaxSourceSize")
 	}
 }
 
@@ -237,31 +241,6 @@ func TestMigrationService_Migrate_AppNameNoExtension(t *testing.T) {
 	}
 }
 
-func TestDetectTransformedPatterns(t *testing.T) {
-	tests := []struct {
-		name     string
-		wasiC    string
-		expected int // minimum number of patterns we expect to detect
-	}{
-		{"socket only", `wasi_socket_tcp_create`, 1},
-		{"full pipeline", `#include <wasi/sockets.h>
-wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4);
-wasi_socket_tcp_start_bind(fd, addr);
-wasi_socket_tcp_start_listen(fd, 128);
-wasi_socket_tcp_accept(fd);`, 4},
-		{"empty", ``, 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			patterns := detectTransformedPatterns(tt.wasiC)
-			if len(patterns) < tt.expected {
-				t.Errorf("detectTransformedPatterns() returned %d patterns, want at least %d", len(patterns), tt.expected)
-			}
-		})
-	}
-}
-
 func TestValidateWasm(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -280,5 +259,95 @@ func TestValidateWasm(t *testing.T) {
 				t.Errorf("ValidateWasm() = %v, want %v", got, tt.valid)
 			}
 		})
+	}
+}
+
+func TestMigrationService_Analyze_Success(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	report, err := svc.Analyze(context.Background(), "tenant-1", "hello.c", posixHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report")
+	}
+	if report.Status != domain.MigrationStatusSuccess {
+		t.Errorf("expected status success, got: %s", report.Status)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false for Analyze")
+	}
+	if len(report.PatternsDetected) == 0 {
+		t.Error("expected PatternsDetected to be populated")
+	}
+	if report.AppName != "hello" {
+		t.Errorf("expected appName=hello, got: %s", report.AppName)
+	}
+}
+
+func TestMigrationService_Analyze_UntransformablePattern(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	src := `int main() { poll(NULL, 0, 1000); return 0; }`
+	report, err := svc.Analyze(context.Background(), "tenant-1", "poll.c", src)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status failed, got: %s", report.Status)
+	}
+	if len(report.PatternsManualReview) == 0 {
+		t.Error("expected PatternsManualReview to contain poll")
+	}
+}
+
+func TestMigrationService_Analyze_EdgeMigrateFails(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin")
+
+	report, err := svc.Analyze(context.Background(), "tenant-1", "hello.c", posixHTTPSource)
+	if !errors.Is(err, ErrEdgeMigrateFailed) {
+		t.Fatalf("expected ErrEdgeMigrateFailed, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report")
+	}
+}
+
+func TestMigrationService_Analyze_EmptySource(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Analyze(context.Background(), "tenant-1", "hello.c", "")
+	if err == nil {
+		t.Fatal("expected error for empty source")
+	}
+}
+
+func TestMigrationService_Analyze_JsonParseFails(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	// edge-migrate that succeeds but prints non-JSON to stderr.
+	svc := NewMigrationService(repo, store, "echo", "/usr/local/wasi-sdk/bin")
+
+	report, err := svc.Analyze(context.Background(), "tenant-1", "hello.c", "int main(){return 0;}")
+	// echo prints to stdout; stderr is empty, JSON parse fails.
+	// The error returned is NOT ErrEdgeMigrateFailed — it's a parse error.
+	if err == nil {
+		t.Fatal("expected error when JSON parse fails")
+	}
+	if report != nil {
+		t.Errorf("expected nil report on parse failure, got: %v", report)
 	}
 }
