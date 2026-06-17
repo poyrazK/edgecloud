@@ -2,7 +2,7 @@
 //!
 //! Defines the structured report format returned by the migration pipeline.
 
-use crate::patterns::PatternMatch;
+use crate::patterns::{PatternMatch, Transformability};
 use serde::{Deserialize, Serialize};
 
 /// Overall migration status.
@@ -80,19 +80,19 @@ impl MigrationReport {
                 pattern: format!("{:?}", m.pattern),
                 snippet: m.snippet.clone(),
                 wasi_equivalent: m.pattern.wasi_equivalent().to_string(),
-                transformability: format!("{:?}", m.transformability),
+                transformability: m.transformability.as_str().to_string(),
             })
             .collect();
 
         let patterns_transformed: Vec<PatternInfo> = patterns_detected
             .iter()
-            .filter(|p| p.transformability != "NotTransformable")
+            .filter(|p| p.transformability != Transformability::NotTransformable.as_str())
             .cloned()
             .collect();
 
         let patterns_manual_review: Vec<PatternInfo> = patterns_detected
             .iter()
-            .filter(|p| p.transformability == "NotTransformable")
+            .filter(|p| p.transformability == Transformability::NotTransformable.as_str())
             .cloned()
             .collect();
 
@@ -115,6 +115,18 @@ impl MigrationReport {
             errors: Vec::new(),
         }
     }
+}
+
+/// Envelope emitted by the binary's `--format json` output.
+///
+/// Bundles the structured `MigrationReport` (the data the Go control
+/// plane would otherwise re-derive by string-matching) with the raw
+/// WASI C source. The Go server splits these apart: `report` is
+/// returned to the API caller, `wasi_c` is piped to clang.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformOutput {
+    pub report: MigrationReport,
+    pub wasi_c: String,
 }
 
 #[cfg(test)]
@@ -191,5 +203,72 @@ mod tests {
         let report = MigrationReport::from_pattern_matches("hello_world", matches);
         assert!(!report.is_migratable());
         assert!(matches!(report.status, MigrationStatus::Failed));
+    }
+
+    #[test]
+    fn test_transform_output_roundtrip() {
+        let matches = vec![PatternMatch {
+            line: 7,
+            start_byte: 0,
+            end_byte: 0,
+            pattern: PosixPattern::SocketTcp,
+            snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
+            arg_nodes: vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ],
+            transformability: Transformability::AutoTransformable,
+        }];
+        let report = MigrationReport::from_pattern_matches("hello", matches);
+        let out = TransformOutput {
+            report: report.clone(),
+            wasi_c: "#include <wasi/sockets.h>\n".to_string(),
+        };
+        let json = serde_json::to_string(&out).expect("serialize");
+        let back: TransformOutput = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.report.app_name, "hello");
+        assert_eq!(back.report.patterns_detected.len(), 1);
+        assert_eq!(
+            back.report.patterns_detected[0].transformability,
+            "auto-transformable"
+        );
+        assert_eq!(back.report.patterns_detected[0].line, 7);
+        assert_eq!(back.wasi_c, "#include <wasi/sockets.h>\n");
+    }
+
+    #[test]
+    fn test_transformability_as_str() {
+        assert_eq!(
+            Transformability::AutoTransformable.as_str(),
+            "auto-transformable"
+        );
+        assert_eq!(Transformability::BestEffort.as_str(), "best-effort");
+        assert_eq!(
+            Transformability::NotTransformable.as_str(),
+            "not-transformable"
+        );
+    }
+
+    #[test]
+    fn test_transformability_serde_kebab_case() {
+        // The serde rename is part of the wire contract with the Go
+        // control plane. If a future contributor renames a variant
+        // and forgets the rename, this test catches it.
+        let cases = [
+            (
+                Transformability::AutoTransformable,
+                "\"auto-transformable\"",
+            ),
+            (Transformability::BestEffort, "\"best-effort\""),
+            (
+                Transformability::NotTransformable,
+                "\"not-transformable\"",
+            ),
+        ];
+        for (variant, expected) in cases {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(json, expected, "transformability {} serialized wrong", variant.as_str());
+        }
     }
 }
