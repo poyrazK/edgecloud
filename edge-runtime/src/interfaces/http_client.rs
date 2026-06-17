@@ -45,7 +45,7 @@ fn config() -> &'static HttpClientConfig {
 }
 
 pub struct HttpClient {
-    client: Arc<reqwest::blocking::Client>,
+    client: Arc<reqwest::Client>,
 }
 
 impl Default for HttpClient {
@@ -65,8 +65,7 @@ impl HttpClient {
     /// Fetch a URL with retry, backoff, and per-request timeout.
     /// Returns the response on success; on error the `error` field is populated.
     ///
-    /// The retry loop runs in `spawn_blocking` to avoid blocking the tokio executor
-    /// thread during backoff sleeps.
+    /// The retry loop uses `tokio::time::sleep` so it does not block the tokio executor.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch(
         &self,
@@ -82,72 +81,44 @@ impl HttpClient {
         let base_delay = Duration::from_millis(DEFAULT_BASE_DELAY_MS);
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
 
-        let client = self.client.clone();
-        let method = method.to_string();
-        let url = url.to_string();
-        let headers = headers.to_vec();
-        let body = body.map(|b| b.to_vec());
-        let traceparent = traceparent.map(|s| s.to_string());
-        let tracestate = tracestate.map(|s| s.to_string());
+        let mut attempt = 0;
 
-        // Run the blocking retry loop on a dedicated thread so std::thread::sleep
-        // during backoff does not block the tokio executor thread.
-        tokio::task::spawn_blocking(move || {
-            let mut attempt = 0;
+        loop {
+            let result = self
+                .fetch_once_impl(method, url, headers, body, timeout, traceparent, tracestate)
+                .await;
 
-            loop {
-                let result = Self::fetch_once_impl(
-                    &client,
-                    &method,
-                    &url,
-                    &headers,
-                    body.as_deref(),
-                    timeout,
-                    traceparent.as_deref(),
-                    tracestate.as_deref(),
-                );
-
-                match result {
-                    Ok(resp) => {
-                        if attempt < max_retries && is_retryable_status(resp.status) {
-                            attempt += 1;
-                            let delay = backoff(attempt, base_delay);
-                            std::thread::sleep(delay);
-                            continue;
-                        }
-                        return resp;
-                    }
-                    Err(FetchError { message, retryable }) => {
-                        if attempt >= max_retries || !retryable {
-                            return HttpResponse {
-                                status: 0,
-                                headers: HashMap::new(),
-                                body: Vec::new(),
-                                error: Some(message),
-                            };
-                        }
+            match result {
+                Ok(resp) => {
+                    if attempt < max_retries && is_retryable_status(resp.status) {
                         attempt += 1;
                         let delay = backoff(attempt, base_delay);
-                        std::thread::sleep(delay);
+                        tokio::time::sleep(delay).await;
+                        continue;
                     }
+                    return resp;
+                }
+                Err(FetchError { message, retryable }) => {
+                    if attempt >= max_retries || !retryable {
+                        return HttpResponse {
+                            status: 0,
+                            headers: HashMap::new(),
+                            body: Vec::new(),
+                            error: Some(message),
+                        };
+                    }
+                    attempt += 1;
+                    let delay = backoff(attempt, base_delay);
+                    tokio::time::sleep(delay).await;
                 }
             }
-        })
-        .await
-        .unwrap_or_else(|_| HttpResponse {
-            status: 0,
-            headers: HashMap::new(),
-            body: Vec::new(),
-            error: Some("fetch task panicked".into()),
-        })
+        }
     }
 
     /// Non-blocking implementation of a single HTTP request.
-    /// Client and dns_cache are passed explicitly so this can be called from
-    /// inside spawn_blocking without a Self reference.
     #[allow(clippy::too_many_arguments)]
-    fn fetch_once_impl(
-        client: &reqwest::blocking::Client,
+    async fn fetch_once_impl(
+        &self,
         method: &str,
         url: &str,
         headers: &[(String, String)],
@@ -161,7 +132,7 @@ impl HttpClient {
             retryable: false,
         })?;
 
-        let mut req = client.request(method, url);
+        let mut req = self.client.request(method, url);
 
         for (k, v) in headers {
             req = req.header(k, v);
@@ -188,7 +159,7 @@ impl HttpClient {
         // Apply per-request read/write timeout.
         req = req.timeout(timeout);
 
-        let response = req.send();
+        let response = req.send().await;
 
         match response {
             Ok(resp) => {
@@ -198,7 +169,7 @@ impl HttpClient {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect();
-                let body = resp.bytes().map_err(|e| FetchError {
+                let body = resp.bytes().await.map_err(|e| FetchError {
                     message: e.to_string(),
                     retryable: is_retryable_error(&e),
                 })?;
@@ -257,18 +228,16 @@ fn is_valid_traceparent(tp: &str) -> bool {
     true
 }
 
-/// Lazily-initialized global reqwest client with connection pooling and timeouts.
-fn global_client() -> Arc<reqwest::blocking::Client> {
-    static ONCE: OnceLock<Arc<reqwest::blocking::Client>> = OnceLock::new();
+/// Lazily-initialized global async reqwest client with connection pooling and timeouts.
+fn global_client() -> Arc<reqwest::Client> {
+    static ONCE: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
     ONCE.get_or_init(|| {
         let cfg = config();
-        let builder = reqwest::blocking::Client::builder()
-            .connect_timeout(cfg.connect_timeout)
-            .pool_max_idle_per_host(16)
-            .pool_idle_timeout(cfg.pool_idle_timeout);
-
         Arc::new(
-            builder
+            reqwest::Client::builder()
+                .connect_timeout(cfg.connect_timeout)
+                .pool_max_idle_per_host(16)
+                .pool_idle_timeout(cfg.pool_idle_timeout)
                 .build()
                 .expect("reqwest global client creation failed"),
         )
