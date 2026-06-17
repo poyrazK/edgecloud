@@ -15,7 +15,6 @@ use std::time::Duration;
 use edge_runtime::streams::{
     self, IncomingEntry, IncomingProducer, OutgoingEntry, OutgoingStreamAdapter, StreamError,
 };
-
 /// Skip the test when in CI or when the operator sets the skip env var.
 fn skip_in_ci() -> bool {
     std::env::var("CI").is_ok() || std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
@@ -366,4 +365,109 @@ async fn test_truncated_body_streaming_path_returns_error() {
         }
     }
     assert!(saw_error, "expected a truncation error chunk");
+}
+
+/// F2 regression: a guest that calls `respond_stream`, writes one chunk, and
+/// then never calls `finish` and never drops the Outgoing resource must not
+/// pin the connection task forever — the per-iteration deadline tears the
+/// connection down at the configured `conn_timeout`.
+///
+/// This test uses a `conn_timeout` of 1 second and a stalled guest to keep
+/// wall-clock time short. The test asserts the connection is closed within
+/// a generous upper bound (3 seconds) after the chunk is written.
+#[tokio::test]
+async fn test_streaming_response_stalled_guest_is_timed_out() {
+    use edge_runtime::interfaces::http_server::{HttpServer, IncomingRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // 1s conn_timeout so the test completes quickly; the streaming deadline
+    // is also at conn_timeout, so a stalled guest is torn down at ~1s.
+    let mut server = HttpServer::new()
+        .with_connection_timeout(1)
+        .with_max_body_size(64 * 1024)
+        .with_stream_threshold(1024);
+    server.start(0, None).await.expect("server start");
+    let port = server.get_assigned_port().expect("port assigned");
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    sock.write_all(b"GET /streamed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request");
+
+    // Receive the IncomingRequest on the server side.
+    let req: IncomingRequest = tokio::time::timeout(Duration::from_secs(2), server.poll())
+        .await
+        .expect("poll timed out")
+        .expect("poll ok")
+        .expect("some request");
+    let req_id = req.id;
+
+    // Build an outgoing stream and a stalled guest: write one chunk, then
+    // intentionally hold the writer (no finish, no drop) until the
+    // per-iteration deadline fires.
+    let entry = OutgoingEntry::new(streams::DEFAULT_STREAM_CAPACITY);
+    let OutgoingEntry {
+        stream: writer,
+        adapter,
+    } = entry;
+    let adapter: OutgoingStreamAdapter = adapter.expect("adapter present");
+
+    // The writer is moved into a task that writes one chunk and then
+    // sleeps well past the conn_timeout — simulating a stalled guest.
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        writer
+            .write_chunk(b"first-and-only".to_vec())
+            .await
+            .unwrap();
+        // Stalled: no finish(), no drop. Drop is forced at end of scope.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    // Send the response. This enters write_streaming_response's drain loop.
+    // The first chunk writes successfully; the second iteration's
+    // `adapter.next().await` will park until the deadline timer fires
+    // (~1s after the deadline was set, which is `now() + conn_timeout`).
+    let respond = server.respond_stream(
+        req_id,
+        200,
+        vec![
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Content-Length".to_string(), "999".to_string()),
+        ],
+        adapter,
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(3), respond)
+        .await
+        .expect("respond_stream should return within 3s of stall");
+
+    // The connection should be torn down — sock.read_to_end should observe
+    // EOF (server closed the connection) within a few seconds of the deadline.
+    // The server will have already written the head + the first chunk before
+    // the deadline fires; the assertion is that the connection is *closed*
+    // (read_to_end returns), not that zero bytes were sent.
+    let mut drain = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut drain))
+        .await
+        .expect("read timed out — server did not close the connection at the deadline")
+        .expect("read ok");
+    assert!(
+        drain.starts_with(b"HTTP/1.1 200"),
+        "expected a partial response on the wire, got: {:?}",
+        String::from_utf8_lossy(&drain[..drain.len().min(80)])
+    );
+    assert!(
+        drain
+            .windows(b"first-and-only".len())
+            .any(|w| w == b"first-and-only"),
+        "expected the first chunk to be on the wire, got: {:?}",
+        String::from_utf8_lossy(&drain)
+    );
+    let _ = read;
+
+    // Cleanup: the writer is held by writer_task; let it finish.
+    let _ = writer_task.await;
 }

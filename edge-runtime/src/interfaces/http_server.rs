@@ -787,9 +787,29 @@ impl HttpServer {
         // Drain the adapter to EOF. EOF arrives either from the guest calling
         // `finish()` (sender dropped) or from the bindgen releasing the
         // Outgoing resource (sender dropped on drop). See streams::OutgoingStream.
-        while let Some(item) = adapter.next().await {
-            let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
-            timeout_at(deadline, stream.write_all(&chunk)).await??;
+        //
+        // Each iteration is bounded by `deadline` via tokio::select!: a
+        // stalled guest (writes one chunk, never calls finish, never drops
+        // the Outgoing resource) is torn down at the connection deadline
+        // instead of pinning a connection task indefinitely. The
+        // `biased;` modifier matches the rest of this file and prefers
+        // making progress on chunks before checking the timer.
+        loop {
+            let chunk_fut = adapter.next();
+            tokio::select! {
+                biased;
+                item = chunk_fut => {
+                    let Some(item) = item else { break; };
+                    let chunk = item.map_err(|e| std::io::Error::other(e.to_string()))?;
+                    timeout_at(deadline, stream.write_all(&chunk)).await??;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "streaming response deadline",
+                    ));
+                }
+            }
         }
         timeout_at(deadline, stream.flush()).await??;
         Ok(())
