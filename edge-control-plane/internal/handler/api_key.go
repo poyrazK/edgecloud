@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -49,7 +50,8 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	apiKey, rawKey, err := h.apiKeySvc.CreateAPIKey(r.Context(), tenantID, req.Name, role)
 	if err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 

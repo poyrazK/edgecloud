@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -67,13 +68,14 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 	if err := h.workerSvc.Register(r.Context(), tenantID, &req); err != nil {
 		switch {
 		case errors.Is(err, service.ErrInvalidWorkerID):
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, `{"error": "invalid worker ID"}`, http.StatusBadRequest)
 		case errors.Is(err, service.ErrRegionMismatch):
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, `{"error": "region mismatch"}`, http.StatusBadRequest)
 		case errors.Is(err, service.ErrQuotaExceeded):
-			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			http.Error(w, `{"error": "quota exceeded"}`, http.StatusTooManyRequests)
 		default:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("internal error: %v", err)
+			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		}
 		return
 	}

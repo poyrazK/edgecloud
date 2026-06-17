@@ -141,6 +141,7 @@ func (s *DeploymentService) ListDeployments(ctx context.Context, tenantID, appNa
 }
 
 func (s *DeploymentService) ListDeploymentsPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+	// Negative inputs are silently corrected: limit ≤ 0 becomes 20, offset < 0 becomes 0.
 	if limit <= 0 {
 		limit = 20
 	}
@@ -151,6 +152,27 @@ func (s *DeploymentService) ListDeploymentsPaginated(ctx context.Context, tenant
 		offset = 0
 	}
 	return s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
+}
+
+func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
+	if err != nil {
+		return nil, 0, fmt.Errorf("counting deployments: %w", err)
+	}
+	deployments, err := s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return deployments, total, nil
 }
 
 func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error {

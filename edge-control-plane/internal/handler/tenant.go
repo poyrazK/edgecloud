@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
@@ -54,7 +55,8 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 
 	tenant, rawKey, err := h.tenantSvc.BootstrapTenant(r.Context(), req.Name, plan, req.KeyName)
 	if err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -83,7 +85,8 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	tenant, err := h.tenantSvc.CreateTenant(r.Context(), req.Name, plan)
 	if err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 

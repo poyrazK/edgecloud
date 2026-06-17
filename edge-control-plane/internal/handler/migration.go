@@ -2,8 +2,8 @@ package handler
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -54,26 +54,26 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 
 	srcFile, err := fileParts[0].Open()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to open file: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, `{"error": "failed to open file"}`, http.StatusInternalServerError)
 		return
 	}
 	defer srcFile.Close()
 
 	source, err := io.ReadAll(srcFile)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to read file: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, `{"error": "failed to read file"}`, http.StatusInternalServerError)
 		return
 	}
 
 	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename[0], language[0], string(source))
 	if err != nil {
-		// Service errors are logged server-side; return 500 with the error message
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(report); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"failed to encode response: %s"}`, err), http.StatusInternalServerError)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 	}
 }

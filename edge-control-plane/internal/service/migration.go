@@ -57,7 +57,7 @@ func NewMigrationService(
 
 // Migrate transforms the given C source to WASI C, compiles it to wasm,
 // stores the artifact, and creates a deployment record.
-func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, language, source string) (*domain.MigrationReport, error) {
+func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _language, source string) (*domain.MigrationReport, error) {
 	// Derive app name: strip .c suffix
 	appName := strings.TrimSuffix(filename, ".c")
 	if appName == "" {
@@ -136,7 +136,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	}
 
 	// Generate deployment ID and hash
-	depID := "d_" + uuid.NewString()
+	depID := "d_" + uuid.New().String()
 	hash := sha256.Sum256(wasmBytes)
 
 	// Create deployment DB record
@@ -200,4 +200,9 @@ func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
 		}
 	}
 	return patterns
+}
+
+// validateWasm checks whether b is a valid wasm binary (magic number check).
+func validateWasm(b []byte) bool {
+	return bytes.HasPrefix(b, []byte{0x00, 0x61, 0x73, 0x6d})
 }

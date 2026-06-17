@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -40,7 +41,8 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -89,14 +91,20 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deployments, err := h.deploymentSvc.ListDeploymentsPaginated(r.Context(), tenantID, appName, limit, offset)
+	deployments, total, err := h.deploymentSvc.ListDeploymentsPaginatedWithTotal(r.Context(), tenantID, appName, limit, offset)
 	if err != nil {
+		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(deployments)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"items":  deployments,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +113,8 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	deploymentID := r.PathValue("deploymentID")
 
 	if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 

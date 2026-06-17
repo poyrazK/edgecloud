@@ -105,6 +105,8 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 	}
 
 	// Delete artifact files before cascade — os.Remove is idempotent (no error if absent).
+	// Collect errors so caller knows if cleanup failed.
+	var delErr error
 	if s.artifactStore != nil {
 		deployments, err := s.deployRepo.ListByApp(ctx, tenantID, appName)
 		if err != nil {
@@ -112,7 +114,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		} else {
 			for _, d := range deployments {
 				if err := s.artifactStore.Delete(tenantID, appName, d.ID); err != nil {
-					log.Printf("warning: failed to delete artifact %s/%s/%s: %v", tenantID, appName, d.ID, err)
+					delErr = fmt.Errorf("artifact cleanup failed for %s: %w", d.ID, err)
 				}
 			}
 		}
@@ -139,6 +141,10 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		// Log but don't fail — app row already deleted above.
 		// In production, consider a background reconciler to clean orphaned rows.
 		log.Printf("warning: cascade delete partially failed after app deletion: %v", err)
+	}
+	// Surface artifact deletion errors to the caller. DB deletion has already committed.
+	if delErr != nil {
+		return delErr
 	}
 	return nil
 }

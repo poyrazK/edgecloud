@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -277,14 +276,9 @@ func TestValidateWasm(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ValidateWasm(tt.data); got != tt.valid {
+			if got := validateWasm(tt.data); got != tt.valid {
 				t.Errorf("ValidateWasm() = %v, want %v", got, tt.valid)
 			}
 		})
 	}
-}
-
-// ValidateWasm checks whether b is a valid wasm binary (magic number check).
-func ValidateWasm(b []byte) bool {
-	return bytes.HasPrefix(b, []byte{0x00, 0x61, 0x73, 0x6d})
 }

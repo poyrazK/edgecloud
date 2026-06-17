@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -39,10 +40,11 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	app, err := h.appSvc.Create(r.Context(), tenantID, appName, &req)
 	if err != nil {
 		if errors.Is(err, service.ErrAppAlreadyExists) {
-			http.Error(w, err.Error(), http.StatusConflict)
+			http.Error(w, `{"error": "app already exists"}`, http.StatusConflict)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -70,7 +72,8 @@ func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	apps, err := h.appSvc.List(r.Context(), tenantID, limit, offset)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
@@ -90,7 +93,8 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	app, err := h.appSvc.Get(r.Context(), tenantID, appName)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 	if app == nil {
@@ -115,10 +119,11 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	err := h.appSvc.Delete(r.Context(), tenantID, appName)
 	if err != nil {
 		if errors.Is(err, service.ErrAppNotFound) {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(w, `{"error": "app not found"}`, http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
 
