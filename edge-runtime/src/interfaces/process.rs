@@ -7,20 +7,27 @@ use std::sync::Arc;
 /// Prefixes of environment variables that are blocked from the guest.
 /// These typically contain secrets (credentials, keys, tokens) that should
 /// not be exposed to guest WASM components.
+/// Prefixes and names of environment variables blocked from the guest.
+/// This is a best-effort defense-in-depth filter — not exhaustive.
+/// Secrets should be managed via a secrets manager in production, not env vars.
 const BLOCKED_ENV_PREFIXES: &[&str] = &[
     "AWS_",
     "AZURE_",
     "EDGE_SECRET",
     "EDGE_API_KEY",
     "DATABASE_URL",
-    "REDIS_PASSWORD",
-    "REDIS_URL",
+    "GCP_",
     "NATS_CREDS",
     "NATS_TOKEN",
+    "REDIS_PASSWORD",
+    "REDIS_URL",
     "JWT_SECRET",
     "JWT_TOKEN",
     "AUTH_TOKEN",
     "BEARER_TOKEN",
+    "STRIPE_",
+    "TWILIO_",
+    "SENDGRID_",
     "PASSWORD",
     "SECRET",
     "PRIVATE_KEY",
@@ -35,7 +42,7 @@ fn is_blocked_env_key(key: &str) -> bool {
 }
 
 /// Filter an iterator of (key, value) pairs, removing blocked env vars.
-fn filter_env_vars<'a>(
+pub fn filter_env_vars<'a>(
     iter: impl Iterator<Item = (String, String)> + 'a,
 ) -> impl Iterator<Item = (String, String)> + 'a {
     iter.filter(|(k, _)| !is_blocked_env_key(k))

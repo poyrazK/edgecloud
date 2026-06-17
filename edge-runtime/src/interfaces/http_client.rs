@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::interfaces::dns::DnsCache;
-
 /// Default per-request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Default retry count.
@@ -17,7 +15,6 @@ const DEFAULT_BASE_DELAY_MS: u64 = 100;
 struct HttpClientConfig {
     connect_timeout: Duration,
     pool_idle_timeout: Duration,
-    dns_cache: Arc<DnsCache>,
 }
 
 impl HttpClientConfig {
@@ -28,23 +25,15 @@ impl HttpClientConfig {
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(5));
 
-        let dns_ttl_secs = std::env::var("EDGE_HTTP_DNS_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
-
         let pool_idle_timeout = std::env::var("EDGE_HTTP_POOL_IDLE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(30));
 
-        let dns_cache = Arc::new(DnsCache::new(dns_ttl_secs));
-
         Self {
             connect_timeout,
             pool_idle_timeout,
-            dns_cache,
         }
     }
 }
@@ -57,8 +46,6 @@ fn config() -> &'static HttpClientConfig {
 
 pub struct HttpClient {
     client: Arc<reqwest::blocking::Client>,
-    #[allow(dead_code)]
-    dns_cache: Arc<DnsCache>, // kept for future DNS pre-resolution feature
 }
 
 impl Default for HttpClient {
@@ -68,21 +55,10 @@ impl Default for HttpClient {
 }
 
 impl HttpClient {
-    /// Create a new HttpClient with a fresh, shared DNS cache.
+    /// Create a new HttpClient.
     pub fn new() -> Self {
-        let cfg = config();
         Self {
             client: global_client(),
-            dns_cache: cfg.dns_cache.clone(),
-        }
-    }
-
-    /// Create an HttpClient with a shared DNS cache from [`NetworkingState`](super::networking::NetworkingState).
-    /// Use this when constructing RuntimeState to ensure both interfaces share the same DNS cache.
-    pub fn new_with_dns_cache(dns_cache: Arc<DnsCache>) -> Self {
-        Self {
-            client: global_client(),
-            dns_cache,
         }
     }
 
