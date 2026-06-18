@@ -93,10 +93,6 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    eprintln!("[debug] HOME={:?}", std::env::var_os("HOME"));
-    eprintln!("[debug] XDG_CONFIG_HOME={:?}", std::env::var_os("XDG_CONFIG_HOME"));
-    eprintln!("[debug] EDGE_API_KEY={:?}", std::env::var_os("EDGE_API_KEY"));
-    eprintln!("[debug] dirs::config_dir={:?}", dirs::config_dir());
     let cli = Cli::parse();
 
     match cli.command {
