@@ -32,13 +32,18 @@ type AppConfig struct {
 }
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.
+//
+// This type is publish-only — no code in the repo deserializes into it
+// (the consumer in service/worker.go uses an anonymous inline struct
+// so it can pass the apps blob through as json.RawMessage to the JSONB
+// upsert path). New wire fields should be added here AND mirrored in
+// the consumer's anonymous struct.
 type HeartbeatMessage struct {
-	Type       string                      `json:"type"`
-	Timestamp  time.Time                   `json:"timestamp"`
-	WorkerID   string                      `json:"worker_id"`
-	Region     string                      `json:"region"`
-	WorkerAddr string                      `json:"worker_addr,omitempty"`
-	Apps       map[string]domain.AppStatus `json:"apps"`
+	Type      string                      `json:"type"`
+	Timestamp time.Time                   `json:"timestamp"`
+	WorkerID  string                      `json:"worker_id"`
+	Region    string                      `json:"region"`
+	Apps      map[string]domain.AppStatus `json:"apps"`
 }
 
 // MockPublisher is a no-op publisher for development.
