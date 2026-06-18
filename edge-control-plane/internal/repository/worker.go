@@ -65,6 +65,44 @@ func (r *WorkerRepository) UpdateLastSeen(ctx context.Context, id string) error 
 	return err
 }
 
+// UpdateAddr updates the worker's public IP. Called from the heartbeat handler
+// when a heartbeat carries a non-empty `worker_addr` so the column reflects
+// the worker's current routable address. A previous good value is preserved
+// when the new value is empty (defensive default — operators should always
+// set `EDGE_WORKER_ADDR` on the worker).
+func (r *WorkerRepository) UpdateAddr(ctx context.Context, id, addr string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE workers SET ip = $2 WHERE id = $1`, id, addr)
+	return err
+}
+
+// ListRunningAppTargets joins workers and worker_status to enumerate every
+// running app, with the per-app port and tenant_id extracted from the
+// JSONB apps blob. Used by the public ingress (cold start) and by the
+// CLI's `edge status` to validate a URL is live.
+func (r *WorkerRepository) ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error) {
+	const query = `
+		SELECT
+			apps.key                                    AS app_name,
+			apps.value->>'tenant_id'                    AS tenant_id,
+			workers.id                                  AS worker_id,
+			workers.region                              AS region,
+			COALESCE(workers.ip, '')                    AS worker_addr,
+			COALESCE((apps.value->>'port')::int, 0)     AS port
+		FROM workers
+		JOIN worker_status ON worker_status.worker_id = workers.id
+		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
+		WHERE apps.value->>'status' = 'running'
+		  AND (apps.value->>'port') IS NOT NULL
+		  AND COALESCE((apps.value->>'port')::int, 0) > 0
+		  AND workers.ip IS NOT NULL
+		  AND workers.ip <> ''`
+	var targets []domain.AppTarget
+	if err := r.db.SelectContext(ctx, &targets, query); err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
 func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
 	memoryMB := req.MemoryMB
 	if memoryMB == 0 {
@@ -78,7 +116,9 @@ func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *dom
 	query := `
 		INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (id) DO UPDATE SET last_seen = EXCLUDED.last_seen
+		ON CONFLICT (id) DO UPDATE SET
+			last_seen = EXCLUDED.last_seen,
+			ip        = EXCLUDED.ip
 		RETURNING (xmax = 0) AS was_created`
 	var wasCreatedRow bool
 	err = r.db.GetContext(ctx, &wasCreatedRow, query, req.WorkerID, tenantID, req.Region, ip, memoryMB, now, now)

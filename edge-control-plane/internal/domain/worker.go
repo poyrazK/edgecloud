@@ -37,6 +37,25 @@ type AppStatus struct {
 	Status       string `json:"status"`
 	ExitCode     int    `json:"exit_code"`
 	DeploymentID string `json:"deployment_id"`
+	// Tenant the app belongs to. Sourced from the worker's `tenant_id`
+	// (the worker can host apps from multiple tenants).
+	TenantID string `json:"tenant_id,omitempty"`
+	// Port the app's HTTP server is listening on, on the worker host.
+	// Sourced from `AppInstance.port` in the worker; used by the public
+	// ingress to dial the upstream.
+	Port int `json:"port,omitempty"`
+}
+
+// AppTarget describes a running app reachable on a worker — what the
+// public ingress needs to render a route. Extracted from the JSONB apps
+// blob on `worker_status` joined with `workers.ip`.
+type AppTarget struct {
+	AppName    string `json:"app_name"`
+	TenantID   string `json:"tenant_id"`
+	WorkerID   string `json:"worker_id"`
+	Region     string `json:"region"`
+	WorkerAddr string `json:"worker_addr"`
+	Port       int    `json:"port"`
 }
 
 // IsValidWorkerID checks that worker ID matches the format w_<region>_<uuid>.

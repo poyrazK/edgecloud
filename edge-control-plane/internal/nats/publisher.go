@@ -33,11 +33,12 @@ type AppConfig struct {
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.
 type HeartbeatMessage struct {
-	Type      string                      `json:"type"`
-	Timestamp time.Time                   `json:"timestamp"`
-	WorkerID  string                      `json:"worker_id"`
-	Region    string                      `json:"region"`
-	Apps      map[string]domain.AppStatus `json:"apps"`
+	Type       string                      `json:"type"`
+	Timestamp  time.Time                   `json:"timestamp"`
+	WorkerID   string                      `json:"worker_id"`
+	Region     string                      `json:"region"`
+	WorkerAddr string                      `json:"worker_addr,omitempty"`
+	Apps       map[string]domain.AppStatus `json:"apps"`
 }
 
 // MockPublisher is a no-op publisher for development.
