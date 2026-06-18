@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod config;
 pub mod downloader;
+pub mod log_forwarder;
 pub mod messages;
 pub mod nats;
 pub mod port_pool;
