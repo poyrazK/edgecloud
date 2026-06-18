@@ -6,16 +6,19 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/nats-io/nats.go"
 )
 
 // mockWorkerRepo implements workerRepoInterface for testing.
 type mockWorkerRepo struct {
-	upsertFunc         func(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
-	countByTenantFunc  func(ctx context.Context, tenantID string) (int, error)
-	deleteFunc         func(ctx context.Context, id string) error
-	listByTenantFunc   func(ctx context.Context, tenantID string) ([]domain.Worker, error)
-	updateLastSeenFunc func(ctx context.Context, id string) error
-	upsertStatusFunc   func(ctx context.Context, ws *domain.WorkerStatus) error
+	upsertFunc              func(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
+	countByTenantFunc       func(ctx context.Context, tenantID string) (int, error)
+	deleteFunc              func(ctx context.Context, id string) error
+	listByTenantFunc        func(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	updateLastSeenFunc      func(ctx context.Context, id string) error
+	updateAddrFunc          func(ctx context.Context, id, addr string) error
+	upsertStatusFunc        func(ctx context.Context, ws *domain.WorkerStatus) error
+	listRunningAppTargetsFn func(ctx context.Context) ([]domain.AppTarget, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -33,8 +36,20 @@ func (m *mockWorkerRepo) ListByTenant(ctx context.Context, tenantID string) ([]d
 func (m *mockWorkerRepo) UpdateLastSeen(ctx context.Context, id string) error {
 	return m.updateLastSeenFunc(ctx, id)
 }
+func (m *mockWorkerRepo) UpdateAddr(ctx context.Context, id, addr string) error {
+	if m.updateAddrFunc == nil {
+		return nil
+	}
+	return m.updateAddrFunc(ctx, id, addr)
+}
 func (m *mockWorkerRepo) UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error {
 	return m.upsertStatusFunc(ctx, ws)
+}
+func (m *mockWorkerRepo) ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error) {
+	if m.listRunningAppTargetsFn == nil {
+		return nil, nil
+	}
+	return m.listRunningAppTargetsFn(ctx)
 }
 
 // mockQuotaRepo implements quotaRepoInterface for testing.
@@ -317,5 +332,103 @@ func TestWorkerService_SubscribeHeartbeats_NilNATS(t *testing.T) {
 	err := svc.SubscribeHeartbeats(context.Background())
 	if err != nil {
 		t.Errorf("SubscribeHeartbeats() error = %v, want nil (nil NATS)", err)
+	}
+}
+
+func TestWorkerService_HandleHeartbeat(t *testing.T) {
+	const appsJSON = `{"myapp":{"status":"running","exit_code":null,"deployment_id":"d_1","tenant_id":"t_test","port":8081}}`
+
+	tests := []struct {
+		name            string
+		payload         string
+		wantUpdateAddr  bool
+		wantAddr        string
+		wantAppsPersist string
+	}{
+		{
+			name: "addr and apps present",
+			payload: `{"type":"heartbeat","timestamp":"2026-06-17T12:00:00Z",` +
+				`"worker_id":"w_fra_abc","region":"fra","worker_addr":"203.0.113.10",` +
+				`"apps":` + appsJSON + `}`,
+			wantUpdateAddr:  true,
+			wantAddr:        "203.0.113.10",
+			wantAppsPersist: appsJSON,
+		},
+		{
+			name: "addr absent (legacy worker) — must not clobber",
+			payload: `{"type":"heartbeat","timestamp":"2026-06-17T12:00:00Z",` +
+				`"worker_id":"w_fra_abc","region":"fra",` +
+				`"apps":` + appsJSON + `}`,
+			wantUpdateAddr:  false,
+			wantAppsPersist: appsJSON,
+		},
+		{
+			name: "apps empty",
+			payload: `{"type":"heartbeat","timestamp":"2026-06-17T12:00:00Z",` +
+				`"worker_id":"w_fra_abc","region":"fra","worker_addr":"203.0.113.10",` +
+				`"apps":{}}`,
+			wantUpdateAddr:  true,
+			wantAddr:        "203.0.113.10",
+			wantAppsPersist: `{}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var updateAddrCalled bool
+			var gotAddr string
+			var gotAppsPersist string
+
+			wr := &mockWorkerRepo{
+				updateLastSeenFunc: func(ctx context.Context, id string) error { return nil },
+				updateAddrFunc: func(ctx context.Context, id, addr string) error {
+					updateAddrCalled = true
+					gotAddr = addr
+					return nil
+				},
+				upsertStatusFunc: func(ctx context.Context, ws *domain.WorkerStatus) error {
+					gotAppsPersist = string(ws.Apps)
+					return nil
+				},
+			}
+			qr := &mockQuotaRepo{}
+			svc := workerSvcForTest(wr, qr)
+
+			svc.handleHeartbeat(context.Background(),
+				&nats.Msg{Subject: "edgecloud.heartbeats.fra", Data: []byte(tt.payload)})
+
+			if updateAddrCalled != tt.wantUpdateAddr {
+				t.Errorf("UpdateAddr called = %v, want %v", updateAddrCalled, tt.wantUpdateAddr)
+			}
+			if tt.wantUpdateAddr && gotAddr != tt.wantAddr {
+				t.Errorf("UpdateAddr addr = %q, want %q", gotAddr, tt.wantAddr)
+			}
+			// Persisted apps blob must include the new port and tenant_id fields
+			// so the ingress query (`ListRunningAppTargets`) can extract them.
+			if gotAppsPersist != tt.wantAppsPersist {
+				t.Errorf("persisted apps = %s, want %s", gotAppsPersist, tt.wantAppsPersist)
+			}
+		})
+	}
+}
+
+func TestWorkerService_ListRunningAppTargets(t *testing.T) {
+	want := []domain.AppTarget{
+		{AppName: "myapp", TenantID: "t_test", WorkerID: "w_fra_abc", Region: "fra", WorkerAddr: "203.0.113.10", Port: 8081},
+	}
+	wr := &mockWorkerRepo{
+		listRunningAppTargetsFn: func(ctx context.Context) ([]domain.AppTarget, error) {
+			return want, nil
+		},
+	}
+	qr := &mockQuotaRepo{}
+	svc := workerSvcForTest(wr, qr)
+
+	got, err := svc.ListRunningAppTargets(context.Background())
+	if err != nil {
+		t.Fatalf("ListRunningAppTargets() error = %v", err)
+	}
+	if len(got) != 1 || got[0].AppName != "myapp" || got[0].Port != 8081 {
+		t.Errorf("ListRunningAppTargets() = %+v, want %+v", got, want)
 	}
 }

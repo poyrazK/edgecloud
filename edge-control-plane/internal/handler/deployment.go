@@ -51,7 +51,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":   deployment.ID,
 		"hash": deployment.Hash,
-		"url":  "https://" + appName + ".edgecloud.dev",
+		"url":  "https://" + tenantID + "-" + appName + ".edgecloud.dev",
 	})
 }
 
