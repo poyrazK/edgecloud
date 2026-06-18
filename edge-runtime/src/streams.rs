@@ -107,10 +107,6 @@ pub struct OutgoingStream {
     /// on the host side. After `finish` or `Drop`, `tx.is_none()` is the
     /// canonical closed-channel signal.
     tx: Option<mpsc::Sender<Result<Vec<u8>, String>>>,
-    /// Kept for documentation and as a cheap read-side hint; `tx.is_none()`
-    /// is the authoritative check. Marked on `finish` and on `Drop` as a
-    /// cancellation backstop.
-    finished: Arc<AtomicBool>,
 }
 
 impl OutgoingStream {
@@ -127,7 +123,6 @@ impl OutgoingStream {
     /// resource handle itself to be released. Subsequent `write_chunk` calls
     /// return `Err(Closed)`.
     pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.finished.store(true, Ordering::Release);
         // Drop the sender — this closes the channel and unblocks the adapter.
         let _ = self.tx.take();
         Ok(())
@@ -139,7 +134,6 @@ impl Drop for OutgoingStream {
         // Cancellation backstop: if the guest abandons the stream without
         // calling finish(), drop the sender so the adapter's drain does not
         // stall forever on a never-arriving chunk.
-        self.finished.store(true, Ordering::Release);
         let _ = self.tx.take();
     }
 }
@@ -226,12 +220,8 @@ impl futures::stream::Stream for OutgoingStreamAdapter {
 /// the same channel.
 pub fn outgoing_pair(buffer: usize) -> (OutgoingStream, OutgoingStreamAdapter) {
     let (tx, rx) = mpsc::channel(buffer);
-    let finished = Arc::new(AtomicBool::new(false));
     (
-        OutgoingStream {
-            tx: Some(tx),
-            finished,
-        },
+        OutgoingStream { tx: Some(tx) },
         OutgoingStreamAdapter { rx },
     )
 }
