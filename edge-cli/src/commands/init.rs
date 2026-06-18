@@ -66,5 +66,6 @@ pub fn run(name: &str) -> Result<()> {
 
     output::success(&format!("Project '{}' created", name));
     println!("  cd {} && edge build", name);
+    output::hint("Next: edge auth signup  (or `edge auth login` if you already have an API key)");
     Ok(())
 }

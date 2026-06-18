@@ -84,6 +84,12 @@ enum Command {
 
     /// List all deployments for the app.
     Deployments,
+
+    /// Manage authentication (signup, login, whoami, logout).
+    Auth {
+        #[command(subcommand)]
+        action: crate::commands::auth::AuthAction,
+    },
 }
 
 fn main() -> Result<()> {
@@ -101,5 +107,6 @@ fn main() -> Result<()> {
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open => commands::open::run(&cli.path),
         Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Auth { action } => action.run(),
     }
 }

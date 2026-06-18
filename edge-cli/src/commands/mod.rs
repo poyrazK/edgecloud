@@ -1,6 +1,7 @@
 //! CLI commands.
 
 pub mod activate;
+pub mod auth;
 pub mod build;
 pub mod deploy;
 pub mod deployments;
