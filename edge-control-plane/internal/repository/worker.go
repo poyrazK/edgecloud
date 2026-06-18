@@ -75,34 +75,6 @@ func (r *WorkerRepository) UpdateAddr(ctx context.Context, id, addr string) erro
 	return err
 }
 
-// ListRunningAppTargets joins workers and worker_status to enumerate every
-// running app, with the per-app port and tenant_id extracted from the
-// JSONB apps blob. Used by the public ingress (cold start) and by the
-// CLI's `edge status` to validate a URL is live.
-func (r *WorkerRepository) ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error) {
-	const query = `
-		SELECT
-			apps.key                                    AS app_name,
-			apps.value->>'tenant_id'                    AS tenant_id,
-			workers.id                                  AS worker_id,
-			workers.region                              AS region,
-			COALESCE(workers.ip, '')                    AS worker_addr,
-			COALESCE((apps.value->>'port')::int, 0)     AS port
-		FROM workers
-		JOIN worker_status ON worker_status.worker_id = workers.id
-		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
-		WHERE apps.value->>'status' = 'running'
-		  AND (apps.value->>'port') IS NOT NULL
-		  AND COALESCE((apps.value->>'port')::int, 0) > 0
-		  AND workers.ip IS NOT NULL
-		  AND workers.ip <> ''`
-	var targets []domain.AppTarget
-	if err := r.db.SelectContext(ctx, &targets, query); err != nil {
-		return nil, err
-	}
-	return targets, nil
-}
-
 // ListRunningAppTarget returns the running target for a single
 // `(tenant_id, app_name)` pair, or an empty slice if none. The query
 // pushes the tenant + app filter into SQL so the handler does not have
@@ -148,7 +120,7 @@ func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *dom
 	// one (EXCLUDED.ip is NULL). The heartbeat path (WorkerRepository.UpdateAddr)
 	// is the primary writer of `workers.ip`; a worker restart that omits IP
 	// from the register body must not clobber the IP that heartbeats have
-	// established — otherwise the public ingress's ListRunningAppTargets
+	// established — otherwise the public ingress's ListRunningAppTarget
 	// filter (`workers.ip IS NOT NULL`) drops the app from routing and
 	// every public request 502s until the next heartbeat lands.
 	query := `
