@@ -35,28 +35,46 @@ func (r *LogEntryRepository) WithTx(tx *sqlx.Tx) *LogEntryRepository {
 // TS is intentionally omitted from the column list so the DB DEFAULT NOW()
 // applies; stamping TS in Go would force every caller to remember it, and a
 // stale time skew across multiple workers would produce inconsistent logs.
+// logEntryColumns lists the columns populated by InsertBatch, in order.
+// The INSERT statement and per-row placeholder math are derived from this
+// slice, so adding a column means appending here plus matching the
+// corresponding args in the row loop below.
+var logEntryColumns = []string{
+	"tenant_id",
+	"deployment_id",
+	"app_name",
+	"worker_id",
+	"region",
+	"level",
+	"message",
+	"labels",
+}
+
 func (r *LogEntryRepository) InsertBatch(ctx context.Context, entries []domain.LogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	// 8 columns per row: tenant_id, deployment_id, app_name, worker_id,
-	// region, level, message, labels.
-	const colsPerRow = 8
-
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO logs (tenant_id, deployment_id, app_name, worker_id, region, level, message, labels) VALUES `)
+	sb.WriteString("INSERT INTO logs (")
+	sb.WriteString(strings.Join(logEntryColumns, ", "))
+	sb.WriteString(") VALUES ")
 
-	args := make([]any, 0, len(entries)*colsPerRow)
+	args := make([]any, 0, len(entries)*len(logEntryColumns))
 	for i, e := range entries {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		base := i*colsPerRow + 1
-		fmt.Fprintf(&sb,
-			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			base, base+1, base+2, base+3, base+4, base+5, base+6, base+7,
-		)
+		base := i*len(logEntryColumns) + 1
+		// Build the placeholder list, e.g. "($1, $2, $3)".
+		placeholders := make([]string, len(logEntryColumns))
+		for j := range logEntryColumns {
+			placeholders[j] = fmt.Sprintf("$%d", base+j)
+		}
+		sb.WriteByte('(')
+		sb.WriteString(strings.Join(placeholders, ", "))
+		sb.WriteByte(')')
+
 		// labels may be nil (omitted) or sent as JSON null / an empty
 		// array; the JSONB column is NOT NULL with DEFAULT '{}'::jsonb,
 		// so we normalize all "empty-ish" inputs to '{}' for predictable

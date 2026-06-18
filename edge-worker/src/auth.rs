@@ -153,11 +153,18 @@ impl WorkerJwtSigner {
     }
 }
 
-/// Parses and validates a worker JWT with the given secret. Used by tests
+/// Parses and validates a worker JWT with the given secret. Used by the
+/// `signed_token_parses_with_correct_claims` and `verify_rejects_wrong_secret`
+/// unit tests AND by `tests/integration_tests.rs::signed_token_round_trips`
 /// to round-trip the signed token back through the same wire format the
-/// control plane expects. Production code on the worker doesn't need to
-/// verify its own tokens — `sign()` always produces valid output — so the
-/// `allow(dead_code)` is justified; tests and future integrations may use it.
+/// control plane expects.
+///
+/// Production code on the worker doesn't need to verify its own tokens —
+/// `sign()` always produces valid output — but the function is public so
+/// the integration test can import it via `edge_worker::auth::verify`. The
+/// `allow(dead_code)` is needed because the regular (non-test) bin and
+/// lib builds don't link against `tests/integration_tests.rs`, so neither
+/// compilation unit has a non-test call site.
 #[allow(dead_code)]
 pub fn verify(secret: &[u8], token: &str) -> anyhow::Result<WorkerClaims> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -201,7 +208,10 @@ mod tests {
         let s = signer();
         let t1 = s.sign();
         let t2 = s.sign();
-        assert_eq!(t1, t2, "second sign() within cache window must return same token");
+        assert_eq!(
+            t1, t2,
+            "second sign() within cache window must return same token"
+        );
     }
 
     #[test]
@@ -210,7 +220,10 @@ mod tests {
         let t1 = s.sign();
         s.expire_cache_for_test();
         let t2 = s.sign();
-        assert_ne!(t1, t2, "after expire_cache_for_test() the next token must be fresh");
+        assert_ne!(
+            t1, t2,
+            "after expire_cache_for_test() the next token must be fresh"
+        );
     }
 
     #[test]
