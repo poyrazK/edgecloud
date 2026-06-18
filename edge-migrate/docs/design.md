@@ -86,11 +86,16 @@ is attached to `MigrationReport.preprocessor` and `TransformResult.preprocessor`
 
 ### 2.3 Source Upload Model
 
-`edge migrate <path>` accepts a **single C file** as input initially (directory/tree support in a later phase).
+The CLI supports two upload modes:
 
-The CLI uploads the file to edgeCloud's migration endpoint. All heavy lifting — analysis, transformation, compilation — happens server-side.
+1. **Single file** — `edge migrate <file.c>` POSTs the file to `POST /api/migrate`. App name is derived from the file stem (`hello_world.c` → `hello_world`).
+2. **Directory / tree** — `edge-migrate --tree <DIR> [--app-name NAME]` walks the directory for `.c`/`.h` files (skipping `build/`, `target/`, `node_modules/`, etc.) and POSTs the whole tree to `POST /api/migrate-tree`. The developer supplies an explicit `--app-name` that must match `^[a-z0-9][a-z0-9-]{0,62}$`. Without `--app-name`, the dir basename is used.
 
-**App name derivation:** The app name is derived from the uploaded filename (without extension). For example, `edge migrate hello_world.c` sets the app name to `hello_world`. This is stored in the deployment record and used by `edge deploy`.
+In tree mode, all transformed `.c` files are compiled together in a single clang invocation (`--target=wasm32-wasip2 -nostdlib -I <tmpdir>`) and produce one wasm binary. The server response includes a per-file `FileReport` with the patterns detected, transformations applied, and any errors.
+
+**App name derivation (single-file mode):** The app name is derived from the uploaded filename (without extension). For example, `edge migrate hello_world.c` sets the app name to `hello_world`. This is stored in the deployment record and used by `edge deploy`.
+
+For directory mode, the explicit `--app-name` is required to be a valid `^[a-z0-9][a-z0-9-]{0,62}$` name (defense-in-depth + DNS-safety for the eventual `*.edgecloud.dev` URL). See §6.1.2 for the full request/response shape.
 
 **Standalone binary:** `edge-migrate` is its own binary, not a subcommand of `edge-cli`. Developers install it separately: `cargo install edge-migrate`.
 
@@ -229,12 +234,20 @@ edge-migrate/
 
 The migration endpoint (`POST /api/migrate`) performs:
 
-1. **Receive** — Accept the uploaded C source file
-2. **Analyze** — Run `edge-migrate-lib` analysis (AST + pattern matching)
+1. **Receive** — Accept the uploaded C source file (single-file mode)
+2. **Analyze** — Run `edge-migrate-lib` analysis (AST + pattern matching, with preprocessor if `clang` is reachable)
 3. **Transform** — Apply auto-transformations for safe patterns
 4. **Compile** — Compile transformed C to wasm32-wasip2 via `clang`
 5. **Store** — Store wasm binary under tenant + app (or temporary store for deploy)
 6. **Report** — Return structured transformation report to CLI
+
+**Tree mode (`POST /api/migrate-tree`, M2):** Accepts a multipart form with one `file` part per source plus a `tree` JSON manifest, OR a single `tree` part with `Content-Type: application/zip`. For each `.c` file:
+
+1. Run `edge-migrate --transform <path>` → WASI C
+2. Run `edge-migrate --analyze --json <path>` → structured `MigrationReport` JSON (used to populate per-file `FileReport.patterns_detected` / `transformations` / `manual_review` and `preprocessor`)
+3. On `--analyze --json` failure (older binary), fall back to the `detectTransformedPatterns` heuristic
+
+All transformed C files are compiled together in a single clang invocation. The wasm size is checked against `MaxArtifactSize` (100 MiB); oversized builds return a `Failed` tree report with an error entry. The artifact + deployment row are written only on success.
 
 ### 5.3 Pattern Engine
 
@@ -306,6 +319,125 @@ Response: 200 OK
 - `deployment_id`: the deployment ID assigned (same format as `edge deploy`). Used by `edge deploy --id` to activate.
 - `app_name`: the app name derived from the uploaded filename (e.g., `hello_world` from `hello_world.c`)
 - `report`: transformation report (see §3)
+
+### 6.1.2 Tree Upload — `POST /api/migrate-tree`
+
+Accepts a multi-file C project. Two wire formats are supported; the
+handler dispatches based on which `tree` form part is present:
+
+**Variant A — multipart parts** (preferred for small projects):
+
+```
+POST /api/migrate-tree
+Authorization: Bearer <api-key>
+Content-Type: multipart/form-data
+
+Fields:
+  - app_name: <string>             (required; regex ^[a-z0-9][a-z0-9-]{0,62}$)
+  - language: "c"                  (required; only "c" is accepted in M2)
+  - tree: <json string>            (required: {"files": ["src/main.c", ...]})
+  - file: <binary>                 (one per entry in `tree.files`; the
+                                   multipart part's filename = the
+                                   relative path from the manifest)
+```
+
+The handler validates that every entry in `tree.files` has a
+matching `file` part and that no path contains `..`, starts with `/`,
+or contains a backslash. Mismatch → `400`.
+
+**Variant B — zip archive** (preferred for projects with many files):
+
+```
+POST /api/migrate-tree
+Authorization: Bearer <api-key>
+Content-Type: multipart/form-data
+
+Fields:
+  - app_name: <string>             (required; same regex as variant A)
+  - language: "c"                  (required)
+  - tree: <binary application/zip> (required; the directory tree zipped;
+                                   entries are the source of truth;
+                                   `tree` JSON manifest is not parsed)
+```
+
+Zip entries are read in order. Non-`.c`/`.h` entries are skipped.
+Entry names are validated against `isSafeFilePath` (rejects `..`,
+absolute paths, backslashes, and Windows drive letters — zip-slip
+protection). Cap: 256 files, 50 MiB decompressed.
+
+**Response: 200 OK**
+
+```json
+{
+  "status": "success" | "partial" | "failed",
+  "wasm_stored": true | false,
+  "deployment_id": "d_<uuid>" | null,
+  "app_name": "tree_project",
+  "files": [
+    {
+      "path": "src/main.c",
+      "status": "success" | "partial" | "failed",
+      "patterns_detected": [ ...PatternInfo... ],
+      "transformations":  [ ...PatternInfo... ],
+      "manual_review":    [ ...PatternInfo... ],
+      "errors":           [ ...ErrorInfo... ],
+      "preprocessor":     { "clang_version": "...", "files_processed": 1, "macros_expanded": 0 } | null
+    }
+  ],
+  "errors": [],                       // tree-level errors (clang, wasm size, DB)
+  "files_total": <int>,
+  "files_transformed": <int>,
+  "files_manual_review": <int>
+}
+```
+
+**Tree-level `status` aggregation:**
+
+| Per-file statuses | Tree status |
+|---|---|
+| All `success` | `success` |
+| Any `failed` | `failed` (wasm not stored) |
+| All `success`/`partial`, no `failed` | `partial` (wasm stored) |
+| Empty `files` | `failed` (handler rejects earlier with 400) |
+
+`wasm_stored` is `true` only when at least one file reached
+`success`/`partial` and the clang compile succeeded. A `failed` file
+**does not** prevent other files from compiling — the resulting wasm
+may still build, but the tree-level status reflects the worst file.
+
+**Limits (server-enforced):**
+
+| Limit | Value | Source |
+|---|---|---|
+| Request body | 50 MiB | `maxTreeBodyBytes` in `handler/migration.go` |
+| File count | 256 | `maxTreeFiles` in `handler/migration.go` |
+| Output wasm | 100 MiB | `MaxArtifactSize` in `service/migration.go` |
+| App name length | 1–63 | regex `^[a-z0-9][a-z0-9-]{0,62}$` |
+
+**Per-file data sources:**
+
+| `FileReport` field | Source |
+|---|---|
+| `status` | classified from per-file patterns (see §3 status rules) |
+| `patterns_detected`, `transformations`, `manual_review` | parsed from `edge-migrate --analyze --json <path>` subprocess stdout (one subprocess per `.c` file) |
+| `errors` | per-file parse/transform errors (stderr captured) |
+| `preprocessor` | mirror of the preprocessor's `PreprocessorInfo` for that file |
+
+If `--analyze --json` is unavailable (older `edge-migrate` binary),
+the service falls back to the `detectTransformedPatterns` heuristic
+on the transformed WASI C output. This fallback is tracked for
+removal once the version floor advances. See §5.2 for the full
+subprocess flow.
+
+**Status codes:**
+
+| HTTP Status | Meaning |
+|---|---|
+| 200 | Migration attempted (any of `success` / `partial` / `failed` in the body) |
+| 400 | Invalid input (bad `app_name`, manifest mismatch, zip-slip, non-C language, too many files, bad manifest JSON) |
+| 401 | Missing or invalid tenant API key |
+| 413 | Request body exceeds 50 MiB (caught mid-stream by `http.MaxBytesReader`) |
+| 500 | Server-side error (DB, internal) |
 
 ### 6.2 Error Responses
 

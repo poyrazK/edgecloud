@@ -90,13 +90,17 @@ A request flows through the system like this:
 - Admin (owner role): `/api/admin/tenants/*`, `DELETE /api/admin/apps/{appName}`
 - Internal (Worker JWT, HMAC-SHA256, 24h TTL per whitepaper §9.3): `/api/internal/download/{deploymentID}`, `/api/internal/workers*`
 
-**Migration flow** (server-side; the dev CLI is a thin uploader — per `edge-migrate/docs/design.md` v0.1):
-1. Developer runs standalone `edge-migrate hello_world.c` (or the `edge migrate` CLI subcommand; see Gotchas).
-2. CLI POSTs the C source to `POST /api/migrate` (multipart: `file`, `filename`, `language`).
-3. Control plane's `MigrationService` invokes **`edge-migrate` as a subprocess** (`exec.CommandContext(... "edge-migrate" "--transform" <path>)` — see `edge-control-plane/internal/service/migration.go`) for tree-sitter C analysis + auto-transformation of safe POSIX → WASI patterns (e.g. `socket()` → `create-tcp-socket()`, `bind()` → `start-bind()`/`finish-bind()`, `recv`/`send` → wasi:io streams). The Go control plane does **not** import the Rust library directly; it shells out and parses the JSON `MigrationReport` from stdout.
-4. Transformed C is compiled via wasi-sdk's `clang --target=wasm32-wasip2 -nostdlib`.
+**Migration flow** (server-side; the dev CLI is a thin uploader — per `edge-migrate/docs/design.md` v0.2):
+1. Developer runs either:
+   - `edge-migrate hello_world.c` — single-file mode, app name derived from the file stem.
+   - `edge-migrate --tree ./my_project/ [--app-name NAME]` — tree mode, walks `.c`/`.h` files (skipping `build/`, `target/`, `node_modules/`, etc.) and POSTs the whole tree.
+2. The CLI POSTs to one of two endpoints:
+   - `POST /api/migrate` (single-file) — multipart: `file`, `filename`, `language`.
+   - `POST /api/migrate-tree` (tree) — either multipart parts + a `tree` JSON manifest (`{"files":[...]}`) + one `file` part per entry, **or** a single `tree` part with `Content-Type: application/zip`. Required form field: `app_name` (must match `^[a-z0-9][a-z0-9-]{0,62}$`). 50 MiB body cap.
+3. Control plane's `MigrationService` invokes **`edge-migrate` as a subprocess** (`exec.CommandContext(... "edge-migrate" "--transform" <path>)` — see `edge-control-plane/internal/service/migration.go`) for tree-sitter C analysis + auto-transformation of safe POSIX → WASI patterns (e.g. `socket()` → `create-tcp-socket()`, `bind()` → `start-bind()`/`finish-bind()`, `recv`/`send` → wasi:io streams). The Go control plane does **not** import the Rust library directly; it shells out and parses the JSON `MigrationReport` from stdout. In tree mode, it also runs `edge-migrate --analyze --json <path>` per file to populate per-file `FileReport` fields.
+4. Transformed C is compiled via wasi-sdk's `clang --target=wasm32-wasip2 -nostdlib`. Tree mode compiles all transformed files together in a single invocation. The wasm size is checked against `MaxArtifactSize` (100 MiB) on **both** endpoints.
 5. Wasm stored at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`; a `deployments` row is written with status `migrated` (no `active_deployments` row yet).
-6. Transformation report (`{patterns_detected, patterns_transformed, patterns_manual_review, errors}`) is returned; the developer activates via `edge deploy <app> --id <id>`.
+6. Response is returned: single-file mode returns `MigrationReport`; tree mode returns `TreeMigrationReport` with a per-file `FileReport` array (`{path, status, patterns_detected, transformations, manual_review, errors, preprocessor}`). The developer activates via `edge deploy <app> --id <id>`.
 
 ## edge-runtime Deep Dive
 
