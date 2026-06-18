@@ -13,8 +13,8 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Returns a fresh tempdir. The caller is responsible for passing
-/// `home.path()` to the child as both `HOME` and `XDG_CONFIG_HOME`.
+/// Returns a fresh tempdir. The caller passes `home.path()` to the
+/// child as `HOME` (and on Windows, as `APPDATA`/`USERPROFILE`).
 /// This function does not mutate the parent process env, so concurrent
 /// tests do not race.
 fn isolated_home() -> TempDir {
@@ -22,14 +22,17 @@ fn isolated_home() -> TempDir {
 }
 
 /// Path to the config file the CLI will actually read/write, given the
-/// tempdir we passed as `HOME` / `XDG_CONFIG_HOME` to the child.
+/// tempdir we passed as `HOME` (or `APPDATA` on Windows) to the child.
 ///
 /// IMPORTANT: do not call `dirs::config_dir()` here — that resolves
 /// against the *test process* env, which is the developer's real home,
 /// not the child's overridden home. Tests would then read/write the
 /// developer's actual config file and stomp on each other. Instead,
 /// compute the path the same way the child will: on macOS, join
-/// `Library/Application Support`; on Linux, join `.config`.
+/// `Library/Application Support`; on Linux, join `.config` (the XDG
+/// default — we deliberately do NOT set `XDG_CONFIG_HOME` for the
+/// child, so `dirs::config_dir()` falls back to `$HOME/.config` and
+/// the path here matches the path the child sees).
 fn config_file_for(home: &TempDir) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.path()
@@ -53,15 +56,20 @@ fn config_file_for(home: &TempDir) -> PathBuf {
 
 /// Inject the platform-appropriate env vars so the child CLI resolves
 /// its config dir to the test tempdir, not the developer's real home.
+///
+/// On Linux we set `HOME` only — NOT `XDG_CONFIG_HOME`. If we set
+/// `XDG_CONFIG_HOME=tempdir`, `dirs::config_dir()` returns the tempdir
+/// directly (without the `.config` suffix), which then diverges from
+/// the layout `config_file_for` expects and tests start reading/writing
+/// at different paths. Leaving `XDG_CONFIG_HOME` unset lets
+/// `dirs::config_dir()` fall back to the XDG default `$HOME/.config`,
+/// matching `config_file_for`.
 fn set_platform_env(cmd: &mut Command, home: &TempDir) {
     if cfg!(target_os = "windows") {
         cmd.env("APPDATA", home.path().join("AppData").join("Roaming"));
         cmd.env("USERPROFILE", home.path());
     } else {
         cmd.env("HOME", home.path());
-        if !cfg!(target_os = "macos") {
-            cmd.env("XDG_CONFIG_HOME", home.path());
-        }
     }
     // Always strip any host-process env vars that could shadow the test.
     cmd.env_remove("EDGE_API_KEY");
