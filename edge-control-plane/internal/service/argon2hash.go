@@ -59,16 +59,20 @@ func VerifyAPIKey(rawKey, encoded string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if version != argon2.Version {
-		return false, fmt.Errorf("argon2: unsupported version %d", version)
+	// Accept the two argon2 PHC version values that exist in the wild:
+	//   0x10 — original draft spec (some libsodium / passlib builds)
+	//   0x13 — current RFC 9106 (matches golang.org/x/crypto/argon2.Version)
+	// Anything else is unsupported and would silently weaken the verify.
+	if version != 0x10 && version != 0x13 {
+		return false, fmt.Errorf("argon2: unsupported version %d (want 0x10 or 0x13)", version)
 	}
 
-	memory, time, threads, err := parsePHCParams(parts[3])
+	memory, iters, threads, err := parsePHCParams(parts[3])
 	if err != nil {
 		return false, err
 	}
-	if memory == 0 || time == 0 || threads == 0 {
-		return false, fmt.Errorf("argon2: parameters must be non-zero (got m=%d, t=%d, p=%d)", memory, time, threads)
+	if memory == 0 || iters == 0 || threads == 0 {
+		return false, fmt.Errorf("argon2: parameters must be non-zero (got m=%d, t=%d, p=%d)", memory, iters, threads)
 	}
 
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
@@ -80,7 +84,15 @@ func VerifyAPIKey(rawKey, encoded string) (bool, error) {
 		return false, fmt.Errorf("argon2: bad key: %w", err)
 	}
 
-	got := argon2.IDKey([]byte(rawKey), salt, time, memory, threads, uint32(len(want)))
+	// Validate the decoded key length BEFORE passing it to argon2.IDKey.
+	// The library is permissive about keyLen — passing a length derived
+	// from a malformed row would silently produce a bogus comparison
+	// (and, on older golang.org/x/crypto/argon2 versions, panic).
+	if len(want) != argonKeyLen {
+		return false, fmt.Errorf("argon2: key length %d, want %d", len(want), argonKeyLen)
+	}
+
+	got := argon2.IDKey([]byte(rawKey), salt, iters, memory, threads, argonKeyLen)
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
 }
 
@@ -98,11 +110,13 @@ func parsePHCVersion(s string) (int, error) {
 	return n, nil
 }
 
-// parsePHCParams parses an "m=<mem>,t=<time>,p=<threads>" segment.
+// parsePHCParams parses an "m=<mem>,t=<iters>,p=<threads>" segment.
 // fmt.Sscanf is notoriously lenient (matches partial input, swallows
 // trailing junk); a hand-rolled parser lets us fail loudly on malformed
-// strings.
-func parsePHCParams(s string) (memory, time uint32, threads uint8, err error) {
+// strings. Named returns use "iters" (not "time") to avoid shadowing
+// the stdlib time package — a previous revision used the bare name and
+// made the call site in VerifyAPIKey a one-rename-away bug.
+func parsePHCParams(s string) (memory, iters uint32, threads uint8, err error) {
 	for _, kv := range strings.Split(s, ",") {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok {
@@ -120,7 +134,7 @@ func parsePHCParams(s string) (memory, time uint32, threads uint8, err error) {
 			if err != nil {
 				return 0, 0, 0, fmt.Errorf("argon2: bad t=%q: %w", v, err)
 			}
-			time = uint32(n)
+			iters = uint32(n)
 		case "p":
 			n, err := parseUintDecimal(v)
 			if err != nil {
@@ -131,7 +145,7 @@ func parsePHCParams(s string) (memory, time uint32, threads uint8, err error) {
 			return 0, 0, 0, fmt.Errorf("argon2: unknown parameter %q", k)
 		}
 	}
-	return memory, time, threads, nil
+	return memory, iters, threads, nil
 }
 
 // parseUintDecimal parses a non-negative decimal integer without leading

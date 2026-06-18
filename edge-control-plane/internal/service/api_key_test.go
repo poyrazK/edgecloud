@@ -407,3 +407,52 @@ func TestAPIKeyService_AuthenticateRawKey_AcceptsFutureExpiry(t *testing.T) {
 		t.Errorf("ID = %q, want k_future", got.ID)
 	}
 }
+
+// TestAPIKeyService_AuthenticateRawKey_ExpiredLegacyKeySkipsRehash pins
+// the ExpiresAt ordering fix from the PR #64 review. The previous
+// implementation ran the expiry check AFTER the algorithm switch, so the
+// legacy SHA-256 → argon2id rehash write to the DB fired for an expired
+// key. An attacker who knew the legacy raw for an expired account could
+// thus cause a successful argon2id row replacement via the lazy-rehash
+// path. The CAS guard does not protect against expiry.
+//
+// The test wires a mock with a counter on UpdateHashIfAlgorithm. If the
+// rehash fires, the counter goes to 1. We assert it stays 0.
+func TestAPIKeyService_AuthenticateRawKey_ExpiredLegacyKeySkipsRehash(t *testing.T) {
+	raw := "expired-legacy-raw"
+	legacyHash := hashutil.SHA256Hex(raw)
+	past := time.Now().Add(-1 * time.Hour)
+
+	var rehashCalls int
+	repo := &mockAPIKeyRepo{
+		getByLookupHashFn: func(ctx context.Context, h string) (*domain.APIKey, error) {
+			return &domain.APIKey{
+				ID:            "k_legacy_expired",
+				TenantID:      "t_test",
+				KeyHash:       legacyHash, // legacy SHA-256
+				LookupHash:    h,
+				HashAlgorithm: domain.HashAlgorithmSHA256,
+				Role:          domain.RoleDeveloper,
+				ExpiresAt:     &past,
+			}, nil
+		},
+		updateHashIfAlgorithmFn: func(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error) {
+			rehashCalls++
+			return 1, nil
+		},
+		updateLastUsedFn: func(ctx context.Context, id string) error {
+			t.Errorf("UpdateLastUsed should not be called for an expired key, got id=%s", id)
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	_, err := svc.AuthenticateRawKey(context.Background(), raw)
+	if !errors.Is(err, ErrInvalidAPIKey) {
+		t.Errorf("error = %v, want ErrInvalidAPIKey for expired legacy key", err)
+	}
+	if rehashCalls != 0 {
+		t.Errorf("rehash called %d times for expired legacy key; want 0 (expiry must gate before rehash)", rehashCalls)
+	}
+}

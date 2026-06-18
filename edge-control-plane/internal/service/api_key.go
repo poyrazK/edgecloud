@@ -147,6 +147,19 @@ func (s *APIKeyService) AuthenticateRawKey(ctx context.Context, rawKey string) (
 		return nil, ErrInvalidAPIKey
 	}
 
+	// Defense-in-depth: enforce expiry BEFORE any DB writes (notably the
+	// legacy SHA-256 → argon2id rehash). If the check ran after the
+	// algorithm switch, an attacker who knew a legacy raw key for an
+	// expired account could still cause a successful argon2id row
+	// replacement via the lazy-rehash path. The CAS guard does not
+	// protect against expiry — expiry must gate the response on its
+	// own. The check sits after the lookup so a bug here cannot be
+	// exploited to enumerate which IDs are valid vs expired (the lookup
+	// already gates that).
+	if candidate.ExpiresAt != nil && time.Now().After(*candidate.ExpiresAt) {
+		return nil, ErrInvalidAPIKey
+	}
+
 	algo := candidate.HashAlgorithm
 	if algo == "" {
 		// Pre-migration rows. Treat as legacy SHA-256.
@@ -181,15 +194,6 @@ func (s *APIKeyService) AuthenticateRawKey(ctx context.Context, rawKey string) (
 
 	default:
 		return nil, fmt.Errorf("unsupported hash algorithm %q for key %s", algo, candidate.ID)
-	}
-
-	// Defense-in-depth: enforce expiry after successful verification. The
-	// verify already gates the response, so a bug here cannot be exploited
-	// to enumerate which IDs are valid vs expired. Without this check, an
-	// operator-issued expiry (ExpiresAt in the past) would have no effect —
-	// the row would still authenticate.
-	if candidate.ExpiresAt != nil && time.Now().After(*candidate.ExpiresAt) {
-		return nil, ErrInvalidAPIKey
 	}
 
 	if err := s.apiKeyRepo.UpdateLastUsed(ctx, candidate.ID); err != nil {

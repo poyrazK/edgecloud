@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -125,6 +127,95 @@ func TestVerifyAPIKey_ZeroParamsRejected(t *testing.T) {
 			ok, err := VerifyAPIKey("any-key", c)
 			if err == nil {
 				t.Errorf("expected error for zero-param %q, got nil (ok=%v)", c, ok)
+			}
+		})
+	}
+}
+
+// TestVerifyAPIKey_RejectsBadKeyLength pins the new len(want) check
+// added in the PR #64 review. Before the check, a malformed row whose
+// decoded key was not 32 bytes would pass through to argon2.IDKey,
+// which silently truncates len() to uint32 — a row that *looks* like a
+// real hash on disk but produces a bogus comparison. Now we reject
+// non-32-byte keys up front with a clear error.
+func TestVerifyAPIKey_RejectsBadKeyLength(t *testing.T) {
+	cases := []struct {
+		name        string
+		keyB64      string
+		wantErrSubs string
+	}{
+		{"empty_key", "", "key length"},
+		{"short_key", "AAAA", "key length"},                                // 3 bytes
+		{"long_key", base64.RawStdEncoding.EncodeToString(make([]byte, 64)), "key length"},
+		{"one_byte_short", base64.RawStdEncoding.EncodeToString(make([]byte, 31)), "key length"},
+		{"one_byte_long", base64.RawStdEncoding.EncodeToString(make([]byte, 33)), "key length"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			enc := "$argon2id$v=19$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$" + c.keyB64
+			_, err := VerifyAPIKey("any-key", enc)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", c.name)
+			}
+			if !strings.Contains(err.Error(), c.wantErrSubs) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantErrSubs)
+			}
+		})
+	}
+}
+
+// TestVerifyAPIKey_AcceptsBothPHCVersions pins the version-acceptance fix
+// from the PR #64 review. The previous check was `version != argon2.Version`,
+// which is `0x13` only — silently rejecting any v=0x10 row a future operator
+// imports from libsodium or passlib. Now we accept both 0x10 and 0x13.
+//
+// We don't generate a real 0x10 hash here (the Go library only emits 0x13);
+// instead we hand-craft a PHC string with v=16 and verify the parser +
+// version gate lets it through to the IDKey path, which will fail with a
+// real crypto error (not a version error). That proves the gate is open.
+func TestVerifyAPIKey_AcceptsBothPHCVersions(t *testing.T) {
+	cases := []struct {
+		name    string
+		version int
+	}{
+		{"v16_draft_spec", 16},
+		{"v19_rfc9106", 19},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			enc := fmt.Sprintf(
+				"$argon2id$v=%d$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+				c.version,
+			)
+			_, err := VerifyAPIKey("any-key", enc)
+			// Either nil (no error → gate let it through) OR a non-version
+			// error. Crucially, the error must NOT mention "unsupported
+			// version".
+			if err != nil && strings.Contains(err.Error(), "unsupported version") {
+				t.Errorf("v=%d rejected by version gate; want accepted (16 or 19): %v", c.version, err)
+			}
+		})
+	}
+}
+
+// TestVerifyAPIKey_RejectsUnknownPHCVersion is the negative half: a version
+// outside the 0x10/0x13 set is rejected by the version gate with a clear
+// message. This is what protects us from silently verifying a row whose
+// version is something the library never defined.
+func TestVerifyAPIKey_RejectsUnknownPHCVersion(t *testing.T) {
+	cases := []int{0, 1, 15, 17, 18, 20, 100}
+	for _, v := range cases {
+		t.Run(fmt.Sprintf("v%d", v), func(t *testing.T) {
+			enc := fmt.Sprintf(
+				"$argon2id$v=%d$m=65536,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAA",
+				v,
+			)
+			_, err := VerifyAPIKey("any-key", enc)
+			if err == nil {
+				t.Fatalf("v=%d should be rejected, got nil", v)
+			}
+			if !strings.Contains(err.Error(), "unsupported version") {
+				t.Errorf("v=%d: error %q should mention 'unsupported version'", v, err.Error())
 			}
 		})
 	}

@@ -11,6 +11,16 @@
 -- key hash IS the lookup hash). argon2id rows cannot be backfilled — the
 -- raw key is unrecoverable from an argon2id hash. Operators must re-issue
 -- those keys. Partial UNIQUE index tolerates NULLs.
+-- Wrap the column add, backfill, and partial unique index in a single
+-- transaction so an interrupted migration leaves the schema atomic.
+-- The partial index tolerates NULLs, so a pre-existing argon2id row
+-- (unrecoverable from the hash) does not block the index creation, but
+-- we still want the three statements to commit together — otherwise a
+-- crash between the UPDATE and CREATE INDEX leaves rows with NULL
+-- lookup_hash and no enforcing index. BEGIN/COMMIT makes that failure
+-- mode all-or-nothing.
+BEGIN;
+
 ALTER TABLE api_keys ADD COLUMN lookup_hash TEXT;
 
 UPDATE api_keys
@@ -19,3 +29,5 @@ UPDATE api_keys
 
 CREATE UNIQUE INDEX idx_api_keys_lookup_hash
     ON api_keys(lookup_hash) WHERE lookup_hash IS NOT NULL;
+
+COMMIT;
