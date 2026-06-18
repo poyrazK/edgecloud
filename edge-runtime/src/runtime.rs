@@ -101,18 +101,19 @@ impl RuntimeState {
     }
 
 /// Create a RuntimeState with per-app environment variables, log sink,
-    /// app context, and tenant_id for tenant isolation. `log_sink` receives
-    /// every record emitted by `edge:observe.emit_log`; `app_ctx` is stamped
-    /// onto each forwarded record so downstream sinks know the
-    /// tenant/app/deployment. `egress` is the per-tenant outbound allowlist
-    /// enforced by `edge:http-client.fetch` (see `EgressPolicy`).
+    /// and app context for tenant isolation. `log_sink` receives every record
+    /// emitted by `edge:observe.emit_log`; `app_ctx` is stamped onto each
+    /// forwarded record so downstream sinks know the tenant/app/deployment.
+    /// Tenant isolation derives from `app_ctx.tenant_id`. `egress` is the
+    /// per-tenant outbound allowlist enforced by `edge:http-client.fetch`
+    /// (see `EgressPolicy`).
     pub fn with_env(
         env: std::collections::HashMap<String, String>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
-        tenant_id: String,
         egress: Arc<EgressPolicy>,
     ) -> Self {
+        let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
@@ -142,16 +143,17 @@ impl RuntimeState {
     }
 
     /// Create a RuntimeState with per-app env vars, request meter, log sink,
-    /// app context, and tenant_id. The worker's per-app `execute_app` path
-    /// uses this.
+    /// and app context. The worker's per-app `execute_app` path uses this.
+    /// Tenant isolation is derived from `app_ctx.tenant_id` so the call site
+    /// doesn't have to thread `tenant_id` as a separate parameter.
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
-        tenant_id: String,
         egress: Arc<EgressPolicy>,
     ) -> Self {
+        let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {

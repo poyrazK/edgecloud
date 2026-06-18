@@ -13,6 +13,7 @@ use wasmtime::component::InstancePre;
 
 use crate::config::Config;
 use crate::downloader::Downloader;
+use crate::log_forwarder::LogForwarder;
 use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
@@ -25,6 +26,10 @@ pub struct Supervisor {
     pub downloader: Arc<Downloader>,
     pub port_pool: Arc<Mutex<PortPool>>,
     pub nats: Arc<dyn NatsClient>,
+    /// Per-worker log shipper. Shared across all apps — the per-app
+    /// `AppLogContext` travels with each `emit_log` call so the forwarder
+    /// knows which tenant/app/deployment the record belongs to.
+    pub log_forwarder: Arc<LogForwarder>,
 }
 
 impl Supervisor {
@@ -171,7 +176,6 @@ impl Supervisor {
 
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
-        let tenant_id_str = tenant_id.to_string();
         let meter_clone = meter.clone();
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
@@ -186,6 +190,7 @@ impl Supervisor {
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
         let allowlist = spec.allowlist.clone();
+        let log_forwarder = self.log_forwarder.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -202,6 +207,7 @@ impl Supervisor {
                 health_check_timeout_secs,
                 tenant_id_str,
                 allowlist,
+                log_forwarder,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -324,6 +330,7 @@ impl Supervisor {
         health_check_timeout_secs: u64,
         tenant_id: String,
         allowlist: Vec<String>,
+        log_forwarder: Arc<LogForwarder>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -356,6 +363,8 @@ impl Supervisor {
                         epoch_deadline_ticks,
                         &tenant_id,
                         allowlist.clone(),
+                        &app_name,
+                        &log_forwarder,
                     ),
                 ) => {
                     match result {
@@ -443,30 +452,30 @@ impl Supervisor {
         epoch_deadline_ticks: u64,
         tenant_id: &str,
         allowlist: Vec<String>,
+        app_name: &str,
+        log_forwarder: &Arc<LogForwarder>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
         // Build per-deployment egress policy from the tenant's allowlist.
         let egress = Arc::new(EgressPolicy::new(allowlist));
 
-        // Create a fresh RuntimeState with per-app env vars, metering, log sink,
-        // app context, and tenant_id. The PR #98 follow-up commits will
-        // replace the stub `NoopLogSink` / empty `app_ctx` with the worker's
-        // real `LogForwarder` and a populated AppLogContext.
-        use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
-        struct NoopLogSink;
-        impl LogSink for NoopLogSink {
-            fn push(&self, _record: LogRecord, _ctx: AppLogContext) {}
-        }
+        // Build per-app LogContext — stamped onto every record this app emits
+        // so the LogForwarder knows which tenant/app/deployment to attribute
+        // the record to (worker_id/region are added inside the forwarder).
+        let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
+            app_name: app_name.to_string(),
+            tenant_id: meter.tenant_id.clone(),
+            deployment_id: meter.deployment_id.clone(),
+        };
+
+        // Create a fresh RuntimeState with per-app env vars, metering, log
+        // sink, app context, and tenant_id for tenant isolation.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
-            Arc::new(NoopLogSink) as Arc<dyn LogSink>,
-            AppLogContext {
-                app_name: String::new(),
-                tenant_id: tenant_id.to_string(),
-                deployment_id: String::new(),
-            },
+            log_forwarder.clone(),
+            app_ctx,
             tenant_id.to_string(),
             egress,
         );

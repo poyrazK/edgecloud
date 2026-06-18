@@ -3,6 +3,7 @@
 mod auth;
 mod config;
 mod downloader;
+mod log_forwarder;
 mod messages;
 mod nats;
 mod port_pool;
@@ -20,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 use crate::auth::WorkerJwtSigner;
 use crate::config::Config;
 use crate::downloader::Downloader;
+use crate::log_forwarder::LogForwarder;
 use crate::nats::NatsClientImpl;
 use crate::port_pool::PortPool;
 use crate::state::WorkerState;
@@ -73,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
-        jwt_signer,
+        jwt_signer.clone(),
     ));
 
     // Initialize port pool
@@ -91,6 +93,16 @@ async fn main() -> anyhow::Result<()> {
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // Initialize LogForwarder — receives tenant `emit_log` records from the
+    // runtime and ships them to the control plane's POST /api/internal/logs.
+    // One per worker; per-app AppLogContext travels with each record.
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer,
+    );
+
     // Create the supervisor
     let supervisor = Arc::new(Supervisor {
         config: config.clone(),
@@ -98,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         downloader,
         port_pool,
         nats: nats.clone(),
+        log_forwarder: log_forwarder.clone(),
     });
 
     let heartbeat_supervisor = supervisor.clone();
@@ -136,22 +149,37 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("heartbeat task started");
 
-    // Spawn SIGTERM handler — signal shutdown and let main drain.
-    let shutdown_tx_t = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let mut sigterm = signal(SignalKind::terminate()).unwrap();
-        sigterm.recv().await;
-        tracing::info!("received SIGTERM, initiating graceful shutdown");
-        let _ = shutdown_tx_t.send(());
+    // Spawn the log-forwarder flush loop. It listens on the same shutdown
+    // broadcast as the heartbeat task; on shutdown it does one final flush
+    // before exiting so in-flight logs survive a clean worker shutdown.
+    let shutdown_tx_for_logs = shutdown_tx.clone();
+    let log_forwarder_for_loop = log_forwarder.clone();
+    let logs_task = tokio::spawn(async move {
+        let shutdown_rx = shutdown_tx_for_logs.subscribe();
+        log_forwarder_for_loop.flush_loop(shutdown_rx).await;
     });
+    tracing::info!("log forwarder task started");
 
-    // Spawn SIGINT handler (Ctrl+C)
-    let shutdown_tx_i = shutdown_tx.clone();
+    // Subscribe to task updates
+    tracing::info!(region = %config.region, "subscribed to task updates");
+
+    // Single signal handler for SIGTERM and SIGINT — whichever fires first
+    // initiates graceful shutdown and consumes the log-forwarder JoinHandle.
+    // The other signal is ignored (the process exits before it can fire).
+    let shutdown_supervisor = supervisor.clone();
+    let shutdown_tx_s = Arc::new(shutdown_tx.clone());
     tokio::spawn(async move {
-        let mut sigint = signal(SignalKind::interrupt()).unwrap();
-        sigint.recv().await;
-        tracing::info!("received SIGINT, initiating graceful shutdown");
-        let _ = shutdown_tx_i.send(());
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let signal_name = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv()  => "SIGINT",
+        };
+        tracing::info!(
+            signal = signal_name,
+            "received signal, initiating graceful shutdown"
+        );
+        graceful_shutdown(shutdown_tx_s, shutdown_supervisor, logs_task).await;
     });
 
     tracing::info!(
@@ -186,6 +214,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // graceful_shutdown (spawned above) does the work — it signaled the
+    // broadcast, stopped apps, published the final heartbeat, and awaited
+    // the log forwarder drain. main() returns cleanly.
+    Ok(())
+}
+
+/// Perform graceful shutdown: signal the heartbeat + log-forwarder to stop,
+/// stop all apps, publish a final heartbeat, wait for the log forwarder to
+/// drain its final flush, then exit the process.
+async fn graceful_shutdown(
+    shutdown_tx: Arc<broadcast::Sender<()>>,
+    supervisor: Arc<Supervisor>,
+    logs_task: tokio::task::JoinHandle<()>,
+) {
+    // Signal the heartbeat + log-forwarder tasks to stop.
+    let _ = shutdown_tx.send(());
+
+    tracing::info!("graceful shutdown: stopping all apps");
+    supervisor.stop_all_apps().await;
+
     // Shutdown signalled. Publish one final heartbeat so the control plane
     // doesn't have to wait for the 30s heartbeat timeout to learn the
     // worker is gone.
@@ -199,11 +247,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(err = %e, "failed to publish final heartbeat");
     }
 
-    // Stop all running apps so they release their ports and shut down
-    // cleanly before the runtime drops.
-    tracing::info!("stopping all apps");
-    supervisor.stop_all_apps().await;
+    // Wait for the log forwarder to flush its final batch. We can't `await`
+    // a broadcast signal directly, but the spawned task exits within
+    // REQUEST_TIMEOUT (5s) of receiving shutdown — well under any
+    // operator-imposed shutdown deadline.
+    tracing::info!("awaiting log forwarder final flush");
+    let _ = tokio::time::timeout(Duration::from_secs(10), logs_task).await;
 
     tracing::info!("shutdown complete");
-    Ok(())
 }
