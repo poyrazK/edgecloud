@@ -66,11 +66,31 @@ impl Config {
     /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
+        let consumer_name =
+            std::env::var("EDGE_CONSUMER_NAME").unwrap_or_else(|_| format!("worker-{}", worker_id));
+        // Guard against operator misconfiguration where two workers
+        // share `EDGE_CONSUMER_NAME`. JetStream's `get_or_create_consumer`
+        // is name-keyed; if two workers collide they end up on the same
+        // durable cursor and one will silently do all the work while the
+        // other sits idle — defeating issue #86's queue-group pinning.
+        // The safest default is to require the consumer name to embed the
+        // worker_id; an explicit override that omits it is almost always a
+        // misconfiguration.
+        if consumer_name != format!("worker-{}", worker_id) && !consumer_name.contains(&worker_id) {
+            anyhow::bail!(
+                "EDGE_CONSUMER_NAME={:?} does not contain WORKER_ID={:?}; \
+                 a shared consumer name causes duplicate-app-style collisions \
+                 across workers in the same region. Unset EDGE_CONSUMER_NAME \
+                 to use the default (worker-{{WORKER_ID}}), or include the \
+                 worker_id in the override.",
+                consumer_name,
+                worker_id,
+            );
+        }
         Ok(Config {
             queue_group: std::env::var("EDGE_QUEUE_GROUP")
                 .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
-            consumer_name: std::env::var("EDGE_CONSUMER_NAME")
-                .unwrap_or_else(|_| format!("worker-{}", worker_id)),
+            consumer_name,
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),

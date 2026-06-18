@@ -10,7 +10,7 @@
 //! Skip in CI with: SKIP_INTEGRATION_TESTS=1 cargo test ...
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,43 +103,21 @@ impl TestHarness {
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
 
-        let config = Config {
-            worker_id: "test-worker".to_string(),
-            region: "test-region".to_string(),
-            nats_url: nats_url.clone(),
-            control_plane_url: mock_server.uri(),
-            cache_dir: cache_dir.path().to_path_buf(),
-            heartbeat_interval_secs: 30,
-            health_check_timeout_secs: 60,
-            port_cooldown_secs: 60,
-            starting_port: 18_000,
-            max_memory_mb: 256,
-            epoch_tick_ms: 10,
-            epoch_deadline_ticks: 100,
-            queue_group: "test-pinning-group".to_string(),
-            consumer_name: "test-consumer".to_string(),
-        };
-
-        let engine = edge_runtime::create_engine()?;
-        let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-        let downloader = Arc::new(Downloader::new(
-            config.control_plane_url.clone(),
-            config.cache_dir.clone(),
-        ));
-        let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-            config.starting_port,
-            config.port_cooldown_secs,
-        )));
-
-        let nats = Arc::new(NatsClientImpl::connect(&nats_url).await?) as Arc<dyn NatsClientTrait>;
-
-        let supervisor = Arc::new(Supervisor {
-            config,
-            state,
-            downloader,
-            port_pool,
-            nats,
-        });
+        // Delegate supervisor wiring to the shared helper used by the
+        // multi-worker queue-group test so there is one canonical path
+        // for constructing a Supervisor in tests. The per-test tempdir
+        // is passed in so cache-poisoning tests don't leak state across
+        // the suite (test_cached_tampered_artifact_*).
+        let supervisor = build_supervisor(
+            &nats_url,
+            "test-worker",
+            "test-region",
+            "test-pinning-group",
+            "test-consumer",
+            &mock_server.uri(),
+            cache_dir.path(),
+        )
+        .await?;
 
         Ok(Self {
             nats_url,
@@ -441,6 +419,11 @@ async fn test_stop_all_apps() {
 
 /// Build a Supervisor that connects to `nats_url`. Shared helper for both
 /// the single-worker `TestHarness` and the multi-worker queue-group test.
+///
+/// `cache_dir` is explicit so per-test tempdirs (needed by the
+/// cache-poisoning tests) can be plumbed through. Pass
+/// `Path::new("/tmp/edge-worker-test-cache")` for tests that don't care
+/// about cache isolation.
 async fn build_supervisor(
     nats_url: &str,
     worker_id: &str,
@@ -448,17 +431,21 @@ async fn build_supervisor(
     queue_group: &str,
     consumer_name: &str,
     control_plane_url: &str,
+    cache_dir: &std::path::Path,
 ) -> anyhow::Result<Arc<Supervisor>> {
     let config = Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         nats_url: nats_url.to_string(),
         control_plane_url: control_plane_url.to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
+        cache_dir: cache_dir.to_path_buf(),
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
         starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
         queue_group: queue_group.to_string(),
         consumer_name: consumer_name.to_string(),
     };
@@ -817,6 +804,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     let queue_group = "test-pinning-group";
 
     // Two workers — same region, same queue group, distinct consumer names.
+    // The pinning test doesn't touch the downloader, so a shared /tmp cache
+    // is fine — give each worker its own subdir to avoid cross-worker clobber.
     let sup_a = build_supervisor(
         &nats_url,
         "w_pinning_a",
@@ -824,6 +813,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         queue_group,
         "consumer-a",
         "http://localhost:9999",
+        Path::new("/tmp/edge-worker-test-pinning-a"),
     )
     .await?;
     let sup_b = build_supervisor(
@@ -833,6 +823,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         queue_group,
         "consumer-b",
         "http://localhost:9999",
+        Path::new("/tmp/edge-worker-test-pinning-b"),
     )
     .await?;
 
