@@ -11,6 +11,7 @@ mod supervisor;
 use std::sync::Arc;
 
 use tokio::signal::unix::{signal, SignalKind};
+
 use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
 use tracing_subscriber::EnvFilter;
@@ -120,24 +121,22 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("heartbeat task started");
 
-    // Spawn SIGTERM handler for graceful shutdown
-    let shutdown_supervisor = supervisor.clone();
-    let shutdown_tx_s = Arc::new(shutdown_tx.clone());
+    // Spawn SIGTERM handler — signal shutdown and let main drain.
+    let shutdown_tx_t = shutdown_tx.clone();
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
         sigterm.recv().await;
         tracing::info!("received SIGTERM, initiating graceful shutdown");
-        graceful_shutdown(shutdown_tx_s, shutdown_supervisor).await;
+        let _ = shutdown_tx_t.send(());
     });
 
     // Spawn SIGINT handler (Ctrl+C)
-    let shutdown_supervisor = supervisor.clone();
-    let shutdown_tx_s = Arc::new(shutdown_tx.clone());
+    let shutdown_tx_i = shutdown_tx.clone();
     tokio::spawn(async move {
         let mut sigint = signal(SignalKind::interrupt()).unwrap();
         sigint.recv().await;
         tracing::info!("received SIGINT, initiating graceful shutdown");
-        graceful_shutdown(shutdown_tx_s, shutdown_supervisor).await;
+        let _ = shutdown_tx_i.send(());
     });
 
     tracing::info!(
@@ -146,15 +145,35 @@ async fn main() -> anyhow::Result<()> {
         "ready — waiting for task messages"
     );
 
-    // Run the consume loop on the main task. Exits when the shutdown
-    // signal fires (handled inside the loop).
-    let consume_shutdown_rx = shutdown_tx.subscribe();
-    if let Err(e) = supervisor.run_consume_loop(consume_shutdown_rx).await {
-        tracing::error!(err = %e, "consume loop exited with error");
+    // Run the consume loop on the main task. Wrapped in a reconnect loop
+    // with bounded exponential backoff so transient stream-end (consumer
+    // deleted, server restart, push-consumer dropped) doesn't kill the
+    // worker. Shutdown signal is observed via the broadcast receiver, so
+    // Ok(()) here means "shutdown was signalled" — break and drain.
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    loop {
+        let consume_shutdown_rx = shutdown_tx.subscribe();
+        match supervisor.run_consume_loop(consume_shutdown_rx).await {
+            Ok(()) => {
+                tracing::info!("consume loop returned after shutdown signal");
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "consume loop ended unexpectedly; reconnecting"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+            }
+        }
     }
 
-    // If we got here the consume loop returned (which means shutdown was
-    // signalled). Do a final heartbeat + exit cleanly.
+    // Shutdown signalled. Publish one final heartbeat so the control plane
+    // doesn't have to wait for the 30s heartbeat timeout to learn the
+    // worker is gone.
     tracing::info!("publishing final heartbeat");
     let heartbeat = supervisor.build_heartbeat().await;
     if let Err(e) = supervisor
@@ -165,17 +184,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(err = %e, "failed to publish final heartbeat");
     }
 
-    Ok(())
-}
-
-/// Perform graceful shutdown: signal the heartbeat to stop, stop all apps.
-async fn graceful_shutdown(shutdown_tx: Arc<broadcast::Sender<()>>, supervisor: Arc<Supervisor>) {
-    // Signal the heartbeat task and the consume loop to stop.
-    let _ = shutdown_tx.send(());
-
-    tracing::info!("graceful shutdown: stopping all apps");
+    // Stop all running apps so they release their ports and shut down
+    // cleanly before the runtime drops.
+    tracing::info!("stopping all apps");
     supervisor.stop_all_apps().await;
 
     tracing::info!("shutdown complete");
-    std::process::exit(0);
+    Ok(())
 }

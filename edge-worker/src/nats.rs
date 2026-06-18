@@ -130,11 +130,13 @@ impl NatsClient for NatsClientImpl {
             ack_policy: jetstream::consumer::AckPolicy::Explicit,
             deliver_policy: jetstream::consumer::DeliverPolicy::All,
             filter_subject: format!("edgecloud.tasks.{}", region),
-            // Bound re-deliveries to avoid a poison message thrashing the
-            // worker forever. After this many redeliveries the server will
-            // stop sending the message and the worker is expected to
-            // `term()` it.
-            max_deliver: 5,
+            // Bound re-deliveries so a persistently-failing message can't
+            // dead-letter the whole consumer. After this many redeliveries
+            // the server stops sending the message and the worker is
+            // expected to `term()` it. Set high enough that transient
+            // failures (e.g., slow artifact download) have room to recover
+            // before the consumer stalls.
+            max_deliver: 20,
             ..Default::default()
         };
         let consumer: jetstream::consumer::PushConsumer = stream
