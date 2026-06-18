@@ -71,6 +71,21 @@ async fn main() -> anyhow::Result<()> {
         config.worker_tenant_id.clone(),
     );
 
+    // Without a JWT secret the worker can still run — NATS heartbeats and
+    // the deployment supervisor don't need it — but every outbound call
+    // to /api/internal/* will 401 until the secret is provisioned. Warn
+    // loudly so an operator notices instead of discovering it from a
+    // silent drop in log forwarding. A real fix needs a JWT bootstrap
+    // handshake (see follow-up issue D).
+    if config.worker_jwt_secret.is_empty() {
+        tracing::warn!(
+            "WORKER_JWT_SECRET is not set; /api/internal/* calls will return 401 \
+             until the secret is provisioned. NATS heartbeats and the deployment \
+             supervisor keep running — only the log forwarder and downloader are \
+             affected. See follow-up issue D for the bootstrap handshake."
+        );
+    }
+
     // Initialize downloader
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
