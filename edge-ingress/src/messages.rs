@@ -1,51 +1,10 @@
-//! NATS message types mirrored from edge-worker. Every field uses
-//! `#[serde(default)]` so legacy heartbeats (pre-EDGE_WORKER_ADDR, pre-port)
-//! still parse cleanly.
+//! Re-exported wire types from `edge-worker`. The ingress must use the
+//! same canonical types the worker emits so a heartbeat cannot drift
+//! between producer and consumer (the previous hand-cloned copies in
+//! this file had already started to drift — `port: u16` vs `Option<u16>`).
 
-use serde::Deserialize;
-use std::collections::HashMap;
-
-/// HeartbeatMessage: received on `edgecloud.heartbeats.<region>`. Several
-/// fields are accepted for forward-compat with the worker's wire format but
-/// are not consulted on the ingress side — we only need `worker_addr` and
-/// the per-app `tenant_id`/`port`/`status`.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct HeartbeatMessage {
-    #[serde(rename = "type", default)]
-    pub msg_type: String,
-    #[serde(default)]
-    pub timestamp: String,
-    #[serde(default)]
-    pub worker_id: String,
-    #[serde(default)]
-    pub region: String,
-    #[serde(default)]
-    pub worker_addr: Option<String>,
-    #[serde(default)]
-    pub apps: HashMap<String, AppStatus>,
-}
-
-/// AppStatus: status of a single app within a heartbeat.
-///
-/// Several fields are kept for forward-compatibility with the wire format
-/// (so legacy and future heartbeats still parse) but are not consulted on
-/// the ingress side — we only need `tenant_id`, `port`, and `status`.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct AppStatus {
-    #[serde(default)]
-    pub deployment_id: String,
-    /// "running" | "starting" | "stopping" | "crashed" | "hung"
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
-    #[serde(default)]
-    pub request_count: u64,
-    #[serde(default)]
-    pub tenant_id: String,
-    /// Optional on the wire — older workers didn't carry it.
-    #[serde(default)]
-    pub port: Option<u16>,
-}
+// `AppStatus` is unused inside this crate (the heartbeat loop only names
+// `HeartbeatMessage` and walks the map), but it is part of the public
+// surface for downstream tests / tooling.
+#[allow(unused_imports)]
+pub use edge_worker::messages::{AppStatus, HeartbeatMessage};
