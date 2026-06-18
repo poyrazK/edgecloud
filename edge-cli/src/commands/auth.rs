@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::io::Read;
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
 use crate::output;
 
@@ -116,18 +116,47 @@ fn login(key: Option<&str>) -> Result<()> {
         output::hint(&format!("Saved to {}", path.display()));
     }
 
-    // Try to confirm the key works by calling whoami. We treat any
-    // network/HTTP failure as a soft warning so the local write is
-    // never rolled back — the user can run `edge auth whoami` later.
-    match whoami() {
-        Ok(()) => {}
+    // Verify the just-saved key. Use `new_from_config_only` so an
+    // exported `EDGE_API_KEY` cannot shadow the key we just saved
+    // (issue #69 review finding F2).
+    let base_url = load_api_url("https://api.edgecloud.dev");
+    let client = match ApiClient::new_from_config_only(base_url) {
+        Ok(c) => c,
         Err(e) => {
-            output::warn(&format!(
-                "could not verify key against the control plane: {e}"
+            // No key in config (shouldn't happen - we just saved one).
+            // Treat as transient: leave the saved file alone, warn.
+            output::warn(&format!("could not read saved key for verification: {e}"));
+            return Ok(());
+        }
+    };
+
+    match client.auth().whoami() {
+        Ok(info) => {
+            output::success(&format!(
+                "Logged in as {} ({}, plan: {})",
+                info.tenant_name, info.tenant_id, info.plan
             ));
+            Ok(())
+        }
+        Err(ApiError::Rejected { status, body }) => {
+            output::error(&format!(
+                "saved key rejected by server ({status}): {}",
+                if body.is_empty() { "<no body>" } else { &body }
+            ));
+            if let Some(path) = ApiKey::config_path() {
+                output::hint(&format!("the key was written to {}", path.display()));
+            }
+            output::hint("re-run `edge auth login` with the correct key to replace it");
+            std::process::exit(1);
+        }
+        Err(ApiError::Transient { source }) => {
+            output::warn(&format!(
+                "could not verify key against the control plane: {source}"
+            ));
+            output::hint("the key was saved; run `edge auth whoami` later to verify");
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// `edge auth whoami`
@@ -138,7 +167,10 @@ fn login(key: Option<&str>) -> Result<()> {
 fn whoami() -> Result<()> {
     let base_url = load_api_url("https://api.edgecloud.dev");
     let client = ApiClient::new(base_url)?;
-    let info = client.auth().whoami().with_context(|| "whoami failed")?;
+    let info = client
+        .auth()
+        .whoami_anyhow()
+        .with_context(|| "whoami failed")?;
 
     println!("  Tenant:    {} ({})", info.tenant_name, info.tenant_id);
     println!("  Plan:      {}", info.plan);

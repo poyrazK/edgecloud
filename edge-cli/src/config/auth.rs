@@ -44,6 +44,28 @@ impl ApiKey {
         )
     }
 
+    /// Load API key from the config file only — never the `EDGE_API_KEY`
+    /// env var. Used by flows that just wrote a key to disk and need to
+    /// validate the on-disk value without an ambient env var shadowing it.
+    pub fn load_without_env() -> Result<Self> {
+        if let Some(path) = Self::config_path() {
+            if path.exists() {
+                let content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                if let Ok(config) = toml::from_str::<TomlConfig>(&content) {
+                    if let Some(key) = config.default.api_key {
+                        if !key.is_empty() {
+                            return Ok(Self(key));
+                        }
+                    }
+                }
+            }
+        }
+        anyhow::bail!(
+            "no API key in config file; run `edge auth signup` or `edge auth login` first"
+        )
+    }
+
     /// Persist this key to the user's config file. Creates the parent
     /// directory if it does not exist. Any pre-existing config file is
     /// preserved — only `default.api_key` is overwritten.
@@ -129,7 +151,7 @@ impl ApiKey {
     /// Returns `~/.config/edgecloud/config.toml` (or the platform
     /// equivalent) if `dirs` can resolve a config directory, else `None`.
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("edgecloud").join("config.toml"))
+        edge_config::config_path()
     }
 }
 
@@ -137,27 +159,10 @@ impl ApiKey {
 /// `~/.config/edgecloud/config.toml` `[default].api` → `fallback`.
 ///
 /// Used by subcommands that have no `edge.toml` to read from (e.g.
-/// `edge auth signup`).
+/// `edge auth signup`). Delegates to the shared `edge-config` crate
+/// so `edge-migrate` and the CLI stay in sync.
 pub fn load_api_url(fallback: &str) -> String {
-    if let Ok(url) = env::var("EDGE_API_URL") {
-        if !url.is_empty() {
-            return url;
-        }
-    }
-    if let Some(path) = ApiKey::config_path() {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(config) = toml::from_str::<TomlConfig>(&content) {
-                    if let Some(api) = config.default.api {
-                        if !api.is_empty() {
-                            return api;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    fallback.to_string()
+    edge_config::read_api_url(fallback)
 }
 
 fn write_file_atomically(tmp: &Path, final_path: &Path, contents: &[u8]) -> Result<()> {
