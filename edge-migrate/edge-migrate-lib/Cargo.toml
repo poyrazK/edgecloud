@@ -5,9 +5,16 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+# M3: enables the Rust analyzer/transformer. Off by default so the C
+# path keeps zero Rust toolchain footprint for users who don't need it.
+rust = ["dep:tree-sitter-rust"]
+default = []
+
 [dependencies]
 tree-sitter = { workspace = true }
 tree-sitter-c = { workspace = true }
+tree-sitter-rust = { workspace = true, optional = true }
 walkdir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
