@@ -522,9 +522,10 @@ impl Supervisor {
     /// ack'd on success. Failures are nack'd for redelivery; unparseable
     /// (poison) messages are terminated so the consumer makes progress.
     ///
-    /// The loop exits when `shutdown_rx` resolves. Any in-flight message
-    /// is finished first. Errors from the NATS layer are logged and the
-    /// loop returns — the caller decides whether to restart it.
+    /// Returns `Ok(())` only when `shutdown_rx` resolves. If the JetStream
+    /// push stream ends (consumer deleted, server restart, transient
+    /// disconnect that doesn't auto-heal inside `consumer.messages()`),
+    /// returns `Err` so the caller's reconnect loop can resubscribe.
     pub async fn run_consume_loop(
         &self,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -553,11 +554,9 @@ impl Supervisor {
                 }
                 msg = stream.next() => {
                     let Some(msg) = msg else {
-                        // JetStream streams are durable and shouldn't end
-                        // on transient disconnects. If we get here, log
-                        // and exit so the caller can decide.
-                        tracing::warn!("task stream ended unexpectedly");
-                        return Ok(());
+                        // Stream ended. Not a shutdown — return Err so the
+                        // caller's reconnect loop resubscribes with backoff.
+                        anyhow::bail!("task stream ended unexpectedly");
                     };
                     self.process_task_message(msg).await;
                 }
@@ -568,15 +567,20 @@ impl Supervisor {
     /// Process a single JetStream task message with ack/nack/term flow
     /// control. Errors are logged, never propagated — a single bad
     /// message must not tear down the consume loop.
+    ///
+    /// Ack/nack/term failures are best-effort retried with a short delay
+    /// so a transient network blip doesn't cause silent duplicate
+    /// delivery. If the ack itself fails after `handle_task_message`
+    /// succeeded, we `nack` instead of swallowing — this puts the message
+    /// back in the work queue under server control rather than letting
+    /// the next reconnect blindly redeliver it.
     async fn process_task_message(&self, msg: async_nats::jetstream::Message) {
         let payload = msg.payload.clone();
         let task_msg: TaskMessage = match serde_json::from_slice(&payload) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(err = %e, "poison-pill task message, terminating");
-                if let Err(e) = self.nats.term(&msg).await {
-                    tracing::error!(err = %e, "term() failed for poison message");
-                }
+                self.try_term(&msg).await;
                 return;
             }
         };
@@ -584,15 +588,34 @@ impl Supervisor {
         match self.handle_task_message(task_msg).await {
             Ok(()) => {
                 if let Err(e) = self.nats.ack(&msg).await {
-                    tracing::error!(err = %e, "ack() failed — server will redeliver");
+                    tracing::error!(
+                        err = %e,
+                        "ack() failed — nacking with delay to force a clean redelivery"
+                    );
+                    // Don't swallow: if the server never received our ack,
+                    // it will redeliver on reconnect. nack-with-delay tells
+                    // the server explicitly "put this back, I didn't keep it".
+                    if let Err(e2) = self.nats.nack(&msg, Some(Duration::from_secs(30))).await {
+                        tracing::error!(err = %e2, "nack-after-ack-failure also failed");
+                    }
                 }
             }
             Err(e) => {
                 tracing::error!(err = %e, "handle_task_message failed, nacking");
-                if let Err(e) = self.nats.nack(&msg, None).await {
-                    tracing::error!(err = %e, "nack() failed");
-                }
+                self.try_nack(&msg).await;
             }
+        }
+    }
+
+    async fn try_nack(&self, msg: &async_nats::jetstream::Message) {
+        if let Err(e) = self.nats.nack(msg, None).await {
+            tracing::error!(err = %e, "nack() failed — message will be redelivered on next reconnect");
+        }
+    }
+
+    async fn try_term(&self, msg: &async_nats::jetstream::Message) {
+        if let Err(e) = self.nats.term(msg).await {
+            tracing::error!(err = %e, "term() failed — message may be redelivered");
         }
     }
 }
