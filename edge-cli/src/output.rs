@@ -26,6 +26,12 @@ pub fn info(msg: &str) {
     println!("{}", style(msg).cyan());
 }
 
+/// Print a hint / "next step" suggestion in dim gray.
+#[allow(dead_code)]
+pub fn hint(msg: &str) {
+    println!("{} {}", style("→").dim(), style(msg).dim());
+}
+
 /// Print a section header.
 #[allow(dead_code)]
 pub fn section(label: &str) {
