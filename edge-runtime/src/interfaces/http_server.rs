@@ -993,6 +993,25 @@ impl HttpServer {
             .and_then(|(_, v)| v.parse::<usize>().ok())
             .unwrap_or(0);
 
+        // Reject Transfer-Encoding: chunked — v1 does not implement
+        // chunked decoding (the body reader is length-driven; an unknown-
+        // length body would need a sentinel value and a chunk-size
+        // parser). Per RFC 7230 §3.3.3, TE takes precedence over CL when
+        // both are present, so we reject the combination rather than
+        // silently honoring CL. The connection is closed without an
+        // `IncomingRequest` being delivered.
+        if headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("Transfer-Encoding")
+                && v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+        }) {
+            tracing::warn!(
+                req_id = %id,
+                "Transfer-Encoding: chunked not supported; closing connection"
+            );
+            return Ok(None);
+        }
+
         // Reject oversized bodies to prevent memory exhaustion.
         if body_len > max_body_size as usize {
             tracing::warn!(
@@ -1401,6 +1420,82 @@ mod tests {
         writer.await.unwrap();
     }
 
+    /// F6 regression: `read_headers` must reject `Transfer-Encoding:
+    /// chunked` (v1 does not implement chunked decoding) by returning
+    /// `Ok(None)`, causing the connection handler to drop the
+    /// connection without delivering an `IncomingRequest`. The check is
+    /// case-insensitive on the header name and tolerant of multi-value
+    /// TE like `gzip, chunked`.
+    #[tokio::test]
+    async fn test_chunked_transfer_encoding_rejected() {
+        use std::net::SocketAddr;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(
+                b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            sock.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let parsed =
+            HttpServer::read_headers(&mut StreamKind::Plain(client), deadline, 1, 64 * 1024)
+                .await
+                .expect("read_headers ok");
+        assert!(
+            parsed.is_none(),
+            "expected Transfer-Encoding: chunked to be rejected, got a request"
+        );
+        writer.await.unwrap();
+    }
+
+    /// F6 regression: the TE check must also fire on multi-value TE
+    /// (e.g. `gzip, chunked`) and on header name case variations
+    /// (`transfer-encoding`, `TRANSFER-ENCODING`).
+    #[tokio::test]
+    async fn test_chunked_transfer_encoding_rejected_multivalue_and_case() {
+        // Pure unit test of the predicate shape: the in-function check
+        // uses `headers.iter().any(...)` with case-insensitive name
+        // match and `v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked"))`
+        // for the value. Verify both branches with a small helper.
+        fn is_chunked_te(headers: &[(String, String)]) -> bool {
+            headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("Transfer-Encoding")
+                    && v.split(',')
+                        .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+            })
+        }
+        assert!(is_chunked_te(&[(
+            "Transfer-Encoding".to_string(),
+            "chunked".to_string()
+        )]));
+        assert!(is_chunked_te(&[(
+            "transfer-encoding".to_string(),
+            "CHUNKED".to_string()
+        )]));
+        assert!(is_chunked_te(&[(
+            "Transfer-Encoding".to_string(),
+            "gzip, chunked".to_string()
+        )]));
+        assert!(!is_chunked_te(&[(
+            "Transfer-Encoding".to_string(),
+            "identity".to_string()
+        )]));
+        assert!(!is_chunked_te(&[(
+            "Transfer-Encoding".to_string(),
+            "gzip".to_string()
+        )]));
+    }
     #[test]
     fn test_server_new_has_defaults() {
         let server = HttpServer::new();
