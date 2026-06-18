@@ -51,29 +51,47 @@ func NewClusterService(workerRepo *repository.WorkerRepository) *ClusterService 
 	return &ClusterService{workerRepo: workerRepo}
 }
 
+// regionAccum collects per-region aggregates during the worker loop so we
+// don't have to keep three parallel maps (workers, app totals, worker
+// counts) in lockstep. Adding a new per-region aggregate only requires
+// adding a field here.
+type regionAccum struct {
+	workers     []WorkerView
+	appTotal    int
+	workerCount int
+}
+
 // List returns the current cluster view.
+//
+// Cost: exactly 2 SQL queries regardless of cluster size (one to list
+// workers, one batched DISTINCT ON to load the latest worker_status row
+// per worker). The previous N+1 implementation called GetStatus() once
+// per worker.
 func (s *ClusterService) List(ctx context.Context) (*ClusterView, error) {
 	workers, err := s.workerRepo.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing workers: %w", err)
 	}
 
+	// Pre-load every worker's latest status in one query.
+	ids := make([]string, len(workers))
+	for i, w := range workers {
+		ids[i] = w.ID
+	}
+	statuses, err := s.workerRepo.GetLatestStatuses(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("loading worker statuses: %w", err)
+	}
+
 	view := &ClusterView{
 		GeneratedAt: time.Now().UTC(),
 		Regions:     make(map[string]RegionView),
 	}
-
-	// Bucket workers by region. Within each region we accumulate the
-	// running-app count (from worker_status.apps, parsed as a JSON object)
-	// and the per-worker AppCount for the view.
-	regionAppTotals := make(map[string]int)
-	regionWorkerCount := make(map[string]int)
-	regionViews := make(map[string][]WorkerView)
+	acc := make(map[string]*regionAccum)
 
 	for _, w := range workers {
 		appCount := 0
-		status, err := s.workerRepo.GetStatus(ctx, w.ID)
-		if err == nil && status != nil {
+		if status, ok := statuses[w.ID]; ok {
 			var apps map[string]domain.AppStatus
 			if jsonErr := json.Unmarshal(status.Apps, &apps); jsonErr == nil {
 				appCount = len(apps)
@@ -90,20 +108,24 @@ func (s *ClusterService) List(ctx context.Context) (*ClusterView, error) {
 		if w.IP != nil {
 			wv.IP = *w.IP
 		}
-		regionViews[w.Region] = append(regionViews[w.Region], wv)
-		regionAppTotals[w.Region] += appCount
-		regionWorkerCount[w.Region]++
+
+		a, ok := acc[w.Region]
+		if !ok {
+			a = &regionAccum{}
+			acc[w.Region] = a
+		}
+		a.workers = append(a.workers, wv)
+		a.appTotal += appCount
+		a.workerCount++
 	}
 
-	for region, ws := range regionViews {
-		total := regionAppTotals[region]
-		count := regionWorkerCount[region]
+	for region, a := range acc {
 		avg := 0
-		if count > 0 {
-			avg = total / count
+		if a.workerCount > 0 {
+			avg = a.appTotal / a.workerCount
 		}
 		view.Regions[region] = RegionView{
-			Workers:       ws,
+			Workers:       a.workers,
 			AppsPerWorker: avg,
 		}
 	}
