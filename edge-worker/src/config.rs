@@ -8,6 +8,14 @@ use std::path::PathBuf;
 // per-app wasmtime limits: StoreLimits for memory, and an epoch ticker +
 // deadline for CPU budgets. The previous PR deferred the wiring; this PR
 // closes the loop and removes the dead_code allow.
+//
+// `queue_group` and `consumer_name` (PR #96) drive the JetStream push
+// consumer: every worker in a region joins `queue_group` so a TaskMessage
+// is delivered to exactly one worker, and `consumer_name` is the durable
+// cursor identity (derived from `worker_id` by default).
+
+use crate::nats::DEFAULT_QUEUE_GROUP;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub worker_id: String,
@@ -29,6 +37,15 @@ pub struct Config {
     /// With the default tick of 10 ms and deadline of 100, each call has a
     /// ~1 s CPU budget. Tune via `EPOCH_DEADLINE_TICKS`.
     pub epoch_deadline_ticks: u64,
+    /// NATS queue group this worker subscribes to. All workers in a region
+    /// join the same group so that NATS delivers each `TaskMessage` to
+    /// exactly one worker — preventing duplicate app starts across workers.
+    /// Override with `EDGE_QUEUE_GROUP`.
+    pub queue_group: String,
+    /// Durable JetStream consumer name. Derived from `worker_id` by default
+    /// so each worker has its own cursor and resumes from its last ack on
+    /// restart. Override with `EDGE_CONSUMER_NAME`.
+    pub consumer_name: String,
 }
 
 impl Config {
@@ -45,9 +62,36 @@ impl Config {
     /// - `APP_MAX_MEMORY_MB` (default: 256)
     /// - `EPOCH_TICK_MS` (default: 10)
     /// - `EPOCH_DEADLINE_TICKS` (default: 100)
+    /// - `EDGE_QUEUE_GROUP` (default: `edgecloud-workers`)
+    /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
     pub fn from_env() -> anyhow::Result<Self> {
+        let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
+        let consumer_name =
+            std::env::var("EDGE_CONSUMER_NAME").unwrap_or_else(|_| format!("worker-{}", worker_id));
+        // Guard against operator misconfiguration where two workers
+        // share `EDGE_CONSUMER_NAME`. JetStream's `get_or_create_consumer`
+        // is name-keyed; if two workers collide they end up on the same
+        // durable cursor and one will silently do all the work while the
+        // other sits idle — defeating issue #86's queue-group pinning.
+        // The safest default is to require the consumer name to embed the
+        // worker_id; an explicit override that omits it is almost always a
+        // misconfiguration.
+        if consumer_name != format!("worker-{}", worker_id) && !consumer_name.contains(&worker_id) {
+            anyhow::bail!(
+                "EDGE_CONSUMER_NAME={:?} does not contain WORKER_ID={:?}; \
+                 a shared consumer name causes duplicate-app-style collisions \
+                 across workers in the same region. Unset EDGE_CONSUMER_NAME \
+                 to use the default (worker-{{WORKER_ID}}), or include the \
+                 worker_id in the override.",
+                consumer_name,
+                worker_id,
+            );
+        }
         Ok(Config {
-            worker_id: std::env::var("WORKER_ID").context("WORKER_ID not set")?,
+            queue_group: std::env::var("EDGE_QUEUE_GROUP")
+                .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
+            consumer_name,
+            worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
             control_plane_url: std::env::var("CONTROL_PLANE_URL")
