@@ -10,7 +10,7 @@
 //! fail analysis because the preprocessor failed.
 
 use crate::patterns::{PatternMatch, PosixPattern, Transformability};
-use crate::preprocessor::Preprocessor;
+use crate::preprocessor::{Preprocessor, PreprocessorInfo};
 use tree_sitter::Parser;
 
 /// Filename hint passed to `Preprocessor::expand` so clang's
@@ -73,6 +73,24 @@ impl CAnalyzer {
     /// line number. See `edge-migrate/docs/design.md` §2.2 for the
     /// full limitation write-up.
     pub fn analyze(&mut self, source: &str) -> Vec<PatternMatch> {
+        self.analyze_with_preprocessor_info(source).0
+    }
+
+    /// Analyze the source and also return per-call `PreprocessorInfo`
+    /// (one file processed, with macro expansion count) when a
+    /// preprocessor is attached and expansion succeeds. When no
+    /// preprocessor is attached, expansion fails, or the analyzer
+    /// falls back to the unexpanded source, the second tuple element
+    /// is `None`.
+    ///
+    /// This is the entry point for the tree walker
+    /// (`transform_tree`) which needs to attach `PreprocessorInfo` to
+    /// each per-file report. Single-file callers can keep using
+    /// `analyze()`.
+    pub fn analyze_with_preprocessor_info(
+        &mut self,
+        source: &str,
+    ) -> (Vec<PatternMatch>, Option<PreprocessorInfo>) {
         // Resolve to an owned buffer + a reference so the buffer lives
         // for the duration of tree-sitter parsing. We avoid `Box::leak`
         // by keeping the owned `String` in a local binding. The
@@ -80,15 +98,24 @@ impl CAnalyzer {
         // or no preprocessor, `line_map` is empty (identity mapping).
         let owned: String;
         let line_map: Vec<u32>;
+        let pp_info: Option<PreprocessorInfo>;
         let parse_source: &str = match self.preprocessor.as_ref() {
             None => {
                 line_map = Vec::new();
+                pp_info = None;
                 source
             }
             Some(pp) => match pp.expand(source, DEFAULT_FILENAME_HINT) {
                 Ok(expanded) => {
                     line_map = expanded.line_map;
+                    let macros = expanded.macros_expanded;
+                    let clang_version = pp.clang_version();
                     owned = expanded.text;
+                    pp_info = Some(PreprocessorInfo {
+                        clang_version,
+                        files_processed: 1,
+                        macros_expanded: macros,
+                    });
                     &owned
                 }
                 Err(e) => {
@@ -97,6 +124,7 @@ impl CAnalyzer {
                         e
                     );
                     line_map = Vec::new();
+                    pp_info = None;
                     source
                 }
             },
@@ -125,7 +153,7 @@ impl CAnalyzer {
             }
         }
         matches.sort_by_key(|m| m.line);
-        matches
+        (matches, pp_info)
     }
 
     fn walk_node(&self, source: &str, node: tree_sitter::Node, matches: &mut Vec<PatternMatch>) {
@@ -150,6 +178,7 @@ impl CAnalyzer {
         let func_name = func_node.utf8_text(source.as_bytes()).unwrap_or_default();
 
         let line = node.start_position().row + 1;
+        let column = node.start_position().column;
 
         let pattern = match func_name {
             "socket" => {
@@ -198,7 +227,7 @@ impl CAnalyzer {
 
         let mut results = vec![PatternMatch {
             line,
-            column: None,
+            column: Some(column),
             start_byte,
             end_byte,
             pattern: pattern.clone(),
@@ -216,7 +245,7 @@ impl CAnalyzer {
             if has_nonblocking {
                 results.push(PatternMatch {
                     line,
-                    column: None,
+                    column: Some(column),
                     start_byte,
                     end_byte,
                     pattern: PosixPattern::NonBlocking,
@@ -484,16 +513,34 @@ int main(void) {
 
     #[test]
     fn test_pattern_match_column_field_default_none() {
-        // M1.C4: `column: Option<usize>` is added to PatternMatch
-        // (default None — M2 will populate it). Verify the field is
-        // `None` for matches produced by a no-preprocessor analyzer.
+        // M1.C4: `column: Option<usize>` is added to PatternMatch.
+        // M2.C3 populates it via the analyzer. We retain a test that
+        // exercises the `Default` impl (column=None) so unit tests
+        // that build PatternMatch via `..Default::default()` still
+        // get the expected baseline.
+        let m: PatternMatch = Default::default();
+        assert_eq!(m.column, None);
+    }
+
+    #[test]
+    fn test_pattern_match_column_is_populated_after_call_node() {
+        // M2.C3: every call_expression match now carries the byte
+        // column where the call begins (0-based). Confirm a `socket()`
+        // match on a known line reports the expected column.
+        //
+        //   "    int fd = socket(2, 1, 0);"
+        //    0         1
+        //    0123456789012345
+        //
+        // 8 spaces + "int fd = " (8 chars) → `socket` starts at column 13.
         let mut analyzer = CAnalyzer::new();
-        let source = "int main() { int fd = socket(2, 1, 0); (void)fd; return 0; }\n";
+        let source = "/* leading comment */\nint main() {\n    int fd = socket(2, 1, 0);\n    (void)fd; return 0;\n}\n";
         let matches = analyzer.analyze(source);
         let socket_match = matches
             .iter()
             .find(|m| matches!(m.pattern, PosixPattern::SocketTcp))
             .expect("socket match should be present");
-        assert_eq!(socket_match.column, None);
+        let col = socket_match.column.expect("column must be populated");
+        assert_eq!(col, 13, "expected column 13, got {}", col);
     }
 }
