@@ -54,6 +54,14 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 	}
 }
 
+// AppTargetLookup is the narrow contract the deployment handler needs to
+// answer "is this tenant's app currently routable?". Kept separate from
+// the full WorkerService so handler tests can mock just the one method
+// without standing up a NATS connection, a worker repo, and a quota repo.
+type AppTargetLookup interface {
+	GetAppTarget(ctx context.Context, tenantID, appName string) (*domain.AppTarget, error)
+}
+
 // Register creates or updates a worker record for a tenant.
 // It is idempotent — if the worker already exists, it just updates last_seen.
 func (s *WorkerService) Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error {
