@@ -2,10 +2,30 @@
 //!
 //! Defines all POSIX patterns that edge-migrate can detect, their
 //! transformability classification, and WASI equivalents.
+//!
+//! M3 adds a parallel `RustPattern` enum and a `PatternKind` sum type
+//! that holds either. The wire format is `serde(untagged)`, so a
+//! `PatternKind::Posix(PosixPattern::Listen)` serializes as the bare
+//! string `"Listen"` (back-compat with the M1/M2 JSON shape) and
+//! `PatternKind::Rust(RustPattern::TcpBind)` as `"TcpBind"`.
 
 use serde::{Deserialize, Serialize};
 
-/// Classification of how transformable a POSIX pattern is.
+/// Source language for a pattern match.
+///
+/// M3 introduces this; M1+M2 only ever produced `Language::C`. The
+/// CLI's `--language` flag and the Go control plane's `language` form
+/// field both use the lowercase serde representation: `"c"` and `"rust"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    /// C source (parsed via `tree-sitter-c`, preprocessed via `clang -E`).
+    C,
+    /// Rust source (parsed via `tree-sitter-rust`, no preprocessor in v1).
+    Rust,
+}
+
+/// Classification of how transformable a pattern is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Transformability {
     /// Can be automatically transformed to WASI with no manual intervention.
@@ -16,7 +36,14 @@ pub enum Transformability {
     NotTransformable,
 }
 
-/// A detected POSIX pattern in source code.
+/// A detected pattern in source code.
+///
+/// M1+M2 had `pattern: PosixPattern` directly. M3 widened this to a
+/// `PatternKind` sum type so a single `PatternMatch` can carry either
+/// a C/POSIX pattern or a Rust `std::net` / `std::fs` / `std::process`
+/// pattern. Serde's `untagged` keeps the wire format a bare variant
+/// name (e.g. `"Listen"`, `"TcpBind"`), preserving back-compat for
+/// existing M1/M2 reports.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PatternMatch {
@@ -31,18 +58,15 @@ pub struct PatternMatch {
     /// fed to tree-sitter.
     pub line: usize,
     /// 0-based column (byte offset within the line) where the pattern
-    /// starts. Currently always `None`; populated in M2 by the
-    /// multi-file tree walker so reports include both line and column
-    /// for editor integration. `#[serde(default)]` keeps older reports
-    /// deserializable.
+    /// starts. Populated by both `CAnalyzer` and `RustAnalyzer`.
     #[serde(default)]
     pub column: Option<usize>,
     /// Start byte offset in the source (for replacement).
     pub start_byte: usize,
     /// End byte offset in the source (for replacement).
     pub end_byte: usize,
-    /// The kind of POSIX pattern detected.
-    pub pattern: PosixPattern,
+    /// The kind of pattern detected (POSIX or Rust). See `PatternKind`.
+    pub pattern: PatternKind,
     /// The original source code snippet.
     pub snippet: String,
     /// Raw text of each argument node from the AST (for accurate arg extraction).
@@ -61,7 +85,7 @@ impl Default for PatternMatch {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Unknown,
+            pattern: PatternKind::Posix(PosixPattern::Unknown),
             snippet: String::new(),
             arg_nodes: Vec::new(),
             transformability: Transformability::NotTransformable,
@@ -120,7 +144,120 @@ pub enum PosixPattern {
     Unknown,
 }
 
+/// All known Rust `std` patterns that edge-migrate can detect.
+///
+/// M3 only covers the `std` namespace. `tokio::net`, `async-std`, and
+/// `#![no_std]` are out of scope for v1; see `rust_analyzer.rs` for
+/// the explicit scope statement and the TODO for future expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RustPattern {
+    /// `std::net::TcpListener::bind(addr)` — bind a TCP listener.
+    TcpBind,
+    /// `listener.accept()` — accept a connection (transformed with
+    /// a poll-loop wrapper, see `BestEffort`).
+    TcpAccept,
+    /// `std::net::TcpStream::connect(addr)` — open a TCP connection.
+    TcpConnect,
+    /// `std::net::UdpSocket::bind(addr)` — bind a UDP socket.
+    UdpBind,
+    /// `udp.connect(addr)` — connect a UDP socket (no direct WASI
+    /// equivalent; surfaces as `NotTransformable`).
+    UdpConnect,
+    /// `std::fs::File::open(path)` — open a file.
+    FsOpen,
+    /// `std::fs::read(path)` / `read_to_string` — read a file.
+    FsRead,
+    /// `std::fs::write(path, ...)` — write a file.
+    FsWrite,
+    /// `file.close()` — close a file (drop shim).
+    FsClose,
+    /// `std::process::exit(code)` — terminate the process
+    /// (WASM has no process model; `NotTransformable`).
+    ProcessExit,
+}
+
+/// Sum type that holds either a C/POSIX pattern or a Rust `std` pattern.
+///
+/// Serialized as `serde(untagged)`, so:
+///   - `PatternKind::Posix(PosixPattern::Listen)` → `"Listen"`
+///   - `PatternKind::Rust(RustPattern::TcpBind)` → `"TcpBind"`
+///
+/// This keeps the JSON wire format a bare variant name (no wrapper
+/// object), which preserves back-compat with the M1/M2 shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PatternKind {
+    /// A C/POSIX pattern.
+    Posix(PosixPattern),
+    /// A Rust `std` pattern.
+    Rust(RustPattern),
+}
+
+impl PatternKind {
+    /// Returns the transformability classification for this pattern.
+    pub fn transformability(&self) -> Transformability {
+        match self {
+            PatternKind::Posix(p) => p.transformability(),
+            PatternKind::Rust(p) => p.transformability(),
+        }
+    }
+
+    /// Returns a short, language-neutral name for the pattern. Used by
+    /// `PatternInfo.pattern` (a `String`) in the wire format.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PatternKind::Posix(p) => p.name(),
+            PatternKind::Rust(p) => p.name(),
+        }
+    }
+
+    /// Returns a human-readable description of the WASI equivalent.
+    /// For C/POSIX patterns, this is the same string `Transformer`
+    /// used pre-M3. For Rust patterns, it points at the corresponding
+    /// `wasi::socket::*` / `wasi::filesystem::*` API.
+    ///
+    /// `report.rs` and `transformer.rs` both call this through
+    /// `PatternKind`, so dispatch lives here rather than at every call
+    /// site.
+    pub fn wasi_equivalent(&self) -> &'static str {
+        match self {
+            PatternKind::Posix(p) => p.wasi_equivalent(),
+            PatternKind::Rust(p) => p.wasi_equivalent(),
+        }
+    }
+}
+
 impl PosixPattern {
+    /// Short, language-neutral name. Stable across versions; used in
+    /// the JSON wire format (`PatternInfo.pattern`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            PosixPattern::SocketTcp => "SocketTcp",
+            PosixPattern::SocketUdp => "SocketUdp",
+            PosixPattern::Bind => "Bind",
+            PosixPattern::Listen => "Listen",
+            PosixPattern::Accept => "Accept",
+            PosixPattern::Connect => "Connect",
+            PosixPattern::Recv => "Recv",
+            PosixPattern::Send => "Send",
+            PosixPattern::GetHostByName => "GetHostByName",
+            PosixPattern::Close => "Close",
+            PosixPattern::Fopen => "Fopen",
+            PosixPattern::Fread => "Fread",
+            PosixPattern::Fwrite => "Fwrite",
+            PosixPattern::Fclose => "Fclose",
+            PosixPattern::Poll => "Poll",
+            PosixPattern::Select => "Select",
+            PosixPattern::Fork => "Fork",
+            PosixPattern::Exec => "Exec",
+            PosixPattern::SocketPair => "SocketPair",
+            PosixPattern::Shutdown => "Shutdown",
+            PosixPattern::NonBlocking => "NonBlocking",
+            PosixPattern::SockRaw => "SockRaw",
+            PosixPattern::Unknown => "Unknown",
+        }
+    }
+
     /// Returns the WASI equivalent description for this pattern.
     pub fn wasi_equivalent(&self) -> &'static str {
         match self {
@@ -176,6 +313,73 @@ impl PosixPattern {
             | PosixPattern::NonBlocking
             | PosixPattern::SockRaw
             | PosixPattern::Unknown => Transformability::NotTransformable,
+        }
+    }
+}
+
+impl RustPattern {
+    /// Short, language-neutral name. Stable across versions; used in
+    /// the JSON wire format (`PatternInfo.pattern`).
+    pub fn name(&self) -> &'static str {
+        match self {
+            RustPattern::TcpBind => "TcpBind",
+            RustPattern::TcpAccept => "TcpAccept",
+            RustPattern::TcpConnect => "TcpConnect",
+            RustPattern::UdpBind => "UdpBind",
+            RustPattern::UdpConnect => "UdpConnect",
+            RustPattern::FsOpen => "FsOpen",
+            RustPattern::FsRead => "FsRead",
+            RustPattern::FsWrite => "FsWrite",
+            RustPattern::FsClose => "FsClose",
+            RustPattern::ProcessExit => "ProcessExit",
+        }
+    }
+
+    /// Returns the transformability classification for this pattern.
+    pub fn transformability(&self) -> Transformability {
+        match self {
+            RustPattern::TcpBind
+            | RustPattern::TcpConnect
+            | RustPattern::UdpBind
+            | RustPattern::FsOpen
+            | RustPattern::FsRead
+            | RustPattern::FsWrite
+            | RustPattern::FsClose => Transformability::AutoTransformable,
+            RustPattern::TcpAccept => Transformability::BestEffort,
+            RustPattern::UdpConnect | RustPattern::ProcessExit => {
+                Transformability::NotTransformable
+            }
+        }
+    }
+
+    /// Returns a human-readable description of the WASI equivalent.
+    /// Mirrors `PosixPattern::wasi_equivalent` so `report.rs` and
+    /// `transformer.rs` can keep dispatching through `PatternKind`.
+    pub fn wasi_equivalent(&self) -> &'static str {
+        match self {
+            RustPattern::TcpBind => {
+                "wasi::socket::tcp::TcpSocket::new + start_bind + finish_bind + \
+                 start_listen + finish_listen"
+            }
+            RustPattern::TcpAccept => {
+                "wasi::socket::tcp::TcpSocket::accept wrapped in poll loop"
+            }
+            RustPattern::TcpConnect => {
+                "wasi::socket::tcp::TcpSocket::new + start_connect + finish_connect"
+            }
+            RustPattern::UdpBind => {
+                "wasi::socket::udp::UdpSocket::new + start_bind + finish_bind"
+            }
+            RustPattern::UdpConnect => {
+                "no WASI equivalent — UdpSocket::connect not in wasi-sockets"
+            }
+            RustPattern::FsOpen => "wasi::filesystem::open",
+            RustPattern::FsRead => "wasi::filesystem::read",
+            RustPattern::FsWrite => "wasi::filesystem::write",
+            RustPattern::FsClose => "drop shim around wasi::filesystem handle",
+            RustPattern::ProcessExit => {
+                "no WASI equivalent — Wasm has no process model"
+            }
         }
     }
 }
@@ -240,5 +444,157 @@ mod tests {
         // Path traversal
         assert!(!is_valid_deployment_app_name("../traversal"));
         assert!(!is_valid_deployment_app_name("a/../b"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // M3: PatternKind, RustPattern, Language
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_language_serializes_lowercase() {
+        let c = serde_json::to_string(&Language::C).unwrap();
+        let r = serde_json::to_string(&Language::Rust).unwrap();
+        assert_eq!(c, "\"c\"");
+        assert_eq!(r, "\"rust\"");
+    }
+
+    #[test]
+    fn test_language_deserializes_lowercase() {
+        let c: Language = serde_json::from_str("\"c\"").unwrap();
+        let r: Language = serde_json::from_str("\"rust\"").unwrap();
+        assert_eq!(c, Language::C);
+        assert_eq!(r, Language::Rust);
+    }
+
+    #[test]
+    fn test_pattern_kind_posix_legacy_serialization() {
+        // Back-compat: a C match serializes as the bare variant name,
+        // matching the M1/M2 wire format.
+        let kind = PatternKind::Posix(PosixPattern::Listen);
+        let s = serde_json::to_string(&kind).unwrap();
+        assert_eq!(s, "\"Listen\"");
+    }
+
+    #[test]
+    fn test_pattern_kind_rust_serialization() {
+        let kind = PatternKind::Rust(RustPattern::TcpBind);
+        let s = serde_json::to_string(&kind).unwrap();
+        assert_eq!(s, "\"TcpBind\"");
+    }
+
+    #[test]
+    fn test_pattern_match_serializes_with_posix_kind() {
+        // End-to-end: PatternMatch.pattern field is a bare string for C.
+        let m = PatternMatch {
+            line: 5,
+            column: Some(0),
+            start_byte: 42,
+            end_byte: 60,
+            pattern: PatternKind::Posix(PosixPattern::Listen),
+            snippet: "bind(...)".to_string(),
+            arg_nodes: vec![],
+            transformability: Transformability::AutoTransformable,
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["pattern"], "Listen");
+        assert_eq!(v["line"], 5);
+    }
+
+    #[test]
+    fn test_pattern_match_serializes_with_rust_kind() {
+        let m = PatternMatch {
+            line: 7,
+            column: Some(0),
+            start_byte: 100,
+            end_byte: 145,
+            pattern: PatternKind::Rust(RustPattern::TcpBind),
+            snippet: "TcpListener::bind(\"127.0.0.1:8080\")".to_string(),
+            arg_nodes: vec!["\"127.0.0.1:8080\"".to_string()],
+            transformability: Transformability::AutoTransformable,
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["pattern"], "TcpBind");
+        assert_eq!(v["line"], 7);
+    }
+
+    #[test]
+    fn test_pattern_match_deserializes_legacy_without_column() {
+        // M1 reports had no `column` field; ensure they still parse.
+        let j = r#"{
+            "line": 3,
+            "start_byte": 10,
+            "end_byte": 20,
+            "pattern": "Accept",
+            "snippet": "accept(fd, NULL, NULL)",
+            "arg_nodes": [],
+            "transformability": "BestEffort"
+        }"#;
+        let m: PatternMatch = serde_json::from_str(j).unwrap();
+        assert_eq!(m.line, 3);
+        assert!(m.column.is_none());
+        assert_eq!(m.pattern, PatternKind::Posix(PosixPattern::Accept));
+        assert_eq!(m.transformability, Transformability::BestEffort);
+    }
+
+    #[test]
+    fn test_pattern_match_default_is_posix_unknown() {
+        // Default::default() should produce a Posix::Unknown match,
+        // not panic or pick a Rust variant by accident.
+        let m = PatternMatch::default();
+        assert_eq!(m.pattern, PatternKind::Posix(PosixPattern::Unknown));
+        assert_eq!(m.transformability, Transformability::NotTransformable);
+        assert!(m.column.is_none());
+    }
+
+    #[test]
+    fn test_pattern_kind_transformability_matrix() {
+        // C path: AutoTransformable for the bulk, BestEffort for Accept,
+        // NotTransformable for the un-fixables.
+        assert_eq!(
+            PatternKind::Posix(PosixPattern::Listen).transformability(),
+            Transformability::AutoTransformable
+        );
+        assert_eq!(
+            PatternKind::Posix(PosixPattern::Accept).transformability(),
+            Transformability::BestEffort
+        );
+        assert_eq!(
+            PatternKind::Posix(PosixPattern::Poll).transformability(),
+            Transformability::NotTransformable
+        );
+        // Rust path: TcpAccept is BestEffort (poll loop wrapper),
+        // UdpConnect and ProcessExit are NotTransformable, the rest
+        // are AutoTransformable.
+        assert_eq!(
+            PatternKind::Rust(RustPattern::TcpBind).transformability(),
+            Transformability::AutoTransformable
+        );
+        assert_eq!(
+            PatternKind::Rust(RustPattern::TcpAccept).transformability(),
+            Transformability::BestEffort
+        );
+        assert_eq!(
+            PatternKind::Rust(RustPattern::UdpConnect).transformability(),
+            Transformability::NotTransformable
+        );
+        assert_eq!(
+            PatternKind::Rust(RustPattern::ProcessExit).transformability(),
+            Transformability::NotTransformable
+        );
+    }
+
+    #[test]
+    fn test_pattern_kind_name_stable() {
+        // The wire-format `pattern` field on `PatternInfo` is rendered
+        // from `name()`. Lock the strings down so accidental renames
+        // surface as test failures.
+        assert_eq!(PatternKind::Posix(PosixPattern::Listen).name(), "Listen");
+        assert_eq!(PatternKind::Rust(RustPattern::TcpBind).name(), "TcpBind");
+        assert_eq!(
+            PatternKind::Rust(RustPattern::ProcessExit).name(),
+            "ProcessExit"
+        );
     }
 }

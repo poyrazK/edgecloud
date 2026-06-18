@@ -3,7 +3,7 @@
 //! Transforms detected POSIX patterns to WASI equivalents,
 //! generating transformed source code and a transformation report.
 
-use crate::patterns::{PatternMatch, PosixPattern, Transformability};
+use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::PreprocessorInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -13,8 +13,8 @@ use std::cmp::Reverse;
 pub struct Transformation {
     /// 1-based line number where the transformation was applied.
     pub line: usize,
-    /// The pattern that was transformed.
-    pub pattern: PosixPattern,
+    /// The pattern that was transformed (M3: `PatternKind`, was `PosixPattern`).
+    pub pattern: PatternKind,
     /// A description of what was changed.
     pub description: String,
 }
@@ -24,8 +24,8 @@ pub struct Transformation {
 pub struct TransformError {
     /// 1-based line number where the error occurred.
     pub line: usize,
-    /// The pattern that failed.
-    pub pattern: PosixPattern,
+    /// The pattern that failed (M3: `PatternKind`, was `PosixPattern`).
+    pub pattern: PatternKind,
     /// Human-readable error message.
     pub message: String,
 }
@@ -151,15 +151,21 @@ impl Transformer {
     }
 
     /// Generate WASI C code for a pattern match.
+    ///
+    /// M3 added `PatternKind` (a sum type with `Posix(...)` and
+    /// `Rust(...)` variants). The C `Transformer` only handles the
+    /// `Posix` arm; `Rust` matches are caught by the `_ => String::new()`
+    /// fallback (they have no place in C source). M3.C4 introduces
+    /// `RustTransformer` for the Rust path.
     fn generate_wasi_code(m: &PatternMatch) -> String {
-        match m.pattern {
-            PosixPattern::SocketTcp => {
+        match &m.pattern {
+            PatternKind::Posix(PosixPattern::SocketTcp) => {
                 "wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
             }
-            PosixPattern::SocketUdp => {
+            PatternKind::Posix(PosixPattern::SocketUdp) => {
                 "wasi_socket_udp_create(IP_ADDRESS_FAMILY_IPV4)".to_string()
             }
-            PosixPattern::Bind => {
+            PatternKind::Posix(PosixPattern::Bind) => {
                 // Two-phase: start-bind + finish-bind
                 format!(
                     "// WASI: two-phase bind\n{{\n  wasi_socket_tcp_start_bind({}, {});\n  wasi_socket_tcp_finish_bind({});\n}}",
@@ -168,7 +174,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Listen => {
+            PatternKind::Posix(PosixPattern::Listen) => {
                 // Two-phase: start-listen + finish-listen
                 // listen(fd, backlog) — arg0=fd(socket), arg1=backlog
                 format!(
@@ -178,7 +184,7 @@ impl Transformer {
                     Self::extract_first_arg(m)   // socket fd again
                 )
             }
-            PosixPattern::Connect => {
+            PatternKind::Posix(PosixPattern::Connect) => {
                 // Two-phase: start-connect + finish-connect
                 format!(
                     "// WASI: two-phase connect\n{{\n  wasi_socket_tcp_start_connect({}, {});\n  wasi_socket_tcp_finish_connect({});\n}}",
@@ -187,14 +193,14 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Accept => {
+            PatternKind::Posix(PosixPattern::Accept) => {
                 // Wrap in poll loop
                 format!(
                     "// WASI: accept with poll loop\n{{\n  wasi_socket_tcp_accept_result_t result;\n  do {{\n    result = wasi_socket_tcp_accept({});\n    if (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK) {{\n      wasi_poll_pollable_block(pollable);\n    }}\n  }} while (result.tag == WASI_SOCKET_TCP_ACCEPT_ERROR_WOULD_BLOCK);\n  /* accepted socket in result.val */\n}}",
                     Self::extract_first_arg(m)
                 )
             }
-            PosixPattern::Recv => {
+            PatternKind::Posix(PosixPattern::Recv) => {
                 format!(
                     "wasi_input_stream_read({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -202,7 +208,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Send => {
+            PatternKind::Posix(PosixPattern::Send) => {
                 format!(
                     "wasi_output_stream_write({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -210,23 +216,23 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::GetHostByName => {
+            PatternKind::Posix(PosixPattern::GetHostByName) => {
                 format!(
                     "wasi_ip_name_lookup_resolve({})",
                     Self::extract_first_arg(m)
                 )
             }
-            PosixPattern::Close => {
+            PatternKind::Posix(PosixPattern::Close) => {
                 format!("wasi_socket_close({})", Self::extract_first_arg(m))
             }
-            PosixPattern::Fopen => {
+            PatternKind::Posix(PosixPattern::Fopen) => {
                 format!(
                     "wasi_filesystem_open({}, {})",
                     Self::extract_first_arg(m),
                     Self::extract_second_arg(m)
                 )
             }
-            PosixPattern::Fread => {
+            PatternKind::Posix(PosixPattern::Fread) => {
                 format!(
                     "wasi_filesystem_read({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -234,7 +240,7 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Fwrite => {
+            PatternKind::Posix(PosixPattern::Fwrite) => {
                 format!(
                     "wasi_filesystem_write({}, {}, {})",
                     Self::extract_first_arg(m),
@@ -242,13 +248,15 @@ impl Transformer {
                     Self::extract_third_arg(m)
                 )
             }
-            PosixPattern::Fclose => {
+            PatternKind::Posix(PosixPattern::Fclose) => {
                 format!(
                     "wasi_filesystem_close({})",
                     Self::extract_first_arg(m)
                 )
             }
-            // These should not reach here (NotTransformable patterns)
+            // Rust variants (handled by RustTransformer in M3.C4) and
+            // NotTransformable Posix patterns (should not reach here)
+            // are caught by the catch-all and emit an empty string.
             _ => String::new(),
         }
     }
@@ -288,7 +296,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::SocketTcp,
+            pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -314,7 +322,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Poll,
+            pattern: PatternKind::Posix(PosixPattern::Poll),
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
             transformability: Transformability::NotTransformable,
@@ -339,7 +347,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -365,7 +373,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Connect,
+            pattern: PatternKind::Posix(PosixPattern::Connect),
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec!["fd".to_string(), "(struct sockaddr*)&addr".to_string(), "sizeof(addr)".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -391,7 +399,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Recv,
+            pattern: PatternKind::Posix(PosixPattern::Recv),
             snippet: "recv(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -416,7 +424,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Send,
+            pattern: PatternKind::Posix(PosixPattern::Send),
             snippet: "send(fd, buf, len, 0)".to_string(),
             arg_nodes: vec!["fd".to_string(), "buf".to_string(), "len".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -441,7 +449,7 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
-            pattern: PosixPattern::Accept,
+            pattern: PatternKind::Posix(PosixPattern::Accept),
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
             transformability: Transformability::BestEffort,
@@ -459,7 +467,7 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::SocketTcp,
+            pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -471,7 +479,7 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -486,7 +494,7 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Bind,
+            pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -498,7 +506,7 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Listen,
+            pattern: PatternKind::Posix(PosixPattern::Listen),
             snippet: "listen(fd, 128)".to_string(),
             arg_nodes: vec!["fd".to_string(), "128".to_string()],
             transformability: Transformability::AutoTransformable,
@@ -514,7 +522,7 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Fopen,
+            pattern: PatternKind::Posix(PosixPattern::Fopen),
             snippet: r#"fopen("foo,bar", "r")"#.to_string(),
             arg_nodes: vec![r#"foo,bar"#.to_string(), r#""r""#.to_string()],
             transformability: Transformability::AutoTransformable,

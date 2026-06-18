@@ -291,7 +291,7 @@ fn aggregate_status(files: &[FileReport]) -> MigrationStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patterns::{PosixPattern, Transformability};
+    use crate::patterns::{PatternKind, PosixPattern, Transformability};
 
     #[test]
     fn test_is_migratable_all_auto() {
@@ -301,7 +301,7 @@ mod tests {
                 column: None,
                 start_byte: 0,
                 end_byte: 0,
-                pattern: PosixPattern::SocketTcp,
+                pattern: PatternKind::Posix(PosixPattern::SocketTcp),
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
                 arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
                 transformability: Transformability::AutoTransformable,
@@ -311,7 +311,7 @@ mod tests {
                 column: None,
                 start_byte: 0,
                 end_byte: 0,
-                pattern: PosixPattern::Connect,
+                pattern: PatternKind::Posix(PosixPattern::Connect),
                 snippet: "connect(fd, ...)".to_string(),
                 arg_nodes: vec!["fd".to_string(), "...".to_string()],
                 transformability: Transformability::AutoTransformable,
@@ -330,7 +330,7 @@ mod tests {
                 column: None,
                 start_byte: 0,
                 end_byte: 0,
-                pattern: PosixPattern::SocketTcp,
+                pattern: PatternKind::Posix(PosixPattern::SocketTcp),
                 snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
                 arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
                 transformability: Transformability::AutoTransformable,
@@ -340,7 +340,7 @@ mod tests {
                 column: None,
                 start_byte: 0,
                 end_byte: 0,
-                pattern: PosixPattern::Poll,
+                pattern: PatternKind::Posix(PosixPattern::Poll),
                 snippet: "poll(fds, 2, timeout)".to_string(),
                 arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
                 transformability: Transformability::NotTransformable,
@@ -359,7 +359,7 @@ mod tests {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::Fork,
+            pattern: PatternKind::Posix(PosixPattern::Fork),
             snippet: "fork()".to_string(),
             arg_nodes: vec![],
             transformability: Transformability::NotTransformable,
@@ -376,7 +376,7 @@ mod tests {
             column: None,
             start_byte: 0,
             end_byte: 0,
-            pattern: PosixPattern::SocketTcp,
+            pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec!["AF_INET".to_string(), "SOCK_STREAM".to_string(), "0".to_string()],
             transformability: Transformability::AutoTransformable,

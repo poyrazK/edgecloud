@@ -9,7 +9,7 @@
 //! analyzer silently falls back to the unexpanded source — never
 //! fail analysis because the preprocessor failed.
 
-use crate::patterns::{PatternMatch, PosixPattern, Transformability};
+use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::{Preprocessor, PreprocessorInfo};
 use tree_sitter::Parser;
 
@@ -184,7 +184,7 @@ impl CAnalyzer {
             "socket" => {
                 // Check if we can determine TCP vs UDP from arguments
                 let args = self.get_call_args(source, node);
-                if let Some(first_arg) = args.first() {
+                let p = if let Some(first_arg) = args.first() {
                     if first_arg.contains("SOCK_STREAM") {
                         PosixPattern::SocketTcp
                     } else if first_arg.contains("SOCK_DGRAM") {
@@ -194,26 +194,29 @@ impl CAnalyzer {
                     }
                 } else {
                     PosixPattern::SocketTcp
-                }
+                };
+                PatternKind::Posix(p)
             }
-            "bind" => PosixPattern::Bind,
-            "listen" => PosixPattern::Listen,
-            "accept" | "accept4" => PosixPattern::Accept,
-            "connect" => PosixPattern::Connect,
-            "recv" | "read" => PosixPattern::Recv,
-            "send" | "write" => PosixPattern::Send,
-            "gethostbyname" | "getaddrinfo" | "gethostbyaddr" => PosixPattern::GetHostByName,
-            "close" => PosixPattern::Close,
-            "fopen" | "fopen_s" => PosixPattern::Fopen,
-            "fread" => PosixPattern::Fread,
-            "fwrite" => PosixPattern::Fwrite,
-            "fclose" => PosixPattern::Fclose,
-            "poll" => PosixPattern::Poll,
-            "select" => PosixPattern::Select,
-            "fork" | "vfork" => PosixPattern::Fork,
-            "exec" | "execve" | "execl" | "execvp" => PosixPattern::Exec,
-            "socketpair" => PosixPattern::SocketPair,
-            "shutdown" => PosixPattern::Shutdown,
+            "bind" => PatternKind::Posix(PosixPattern::Bind),
+            "listen" => PatternKind::Posix(PosixPattern::Listen),
+            "accept" | "accept4" => PatternKind::Posix(PosixPattern::Accept),
+            "connect" => PatternKind::Posix(PosixPattern::Connect),
+            "recv" | "read" => PatternKind::Posix(PosixPattern::Recv),
+            "send" | "write" => PatternKind::Posix(PosixPattern::Send),
+            "gethostbyname" | "getaddrinfo" | "gethostbyaddr" => {
+                PatternKind::Posix(PosixPattern::GetHostByName)
+            }
+            "close" => PatternKind::Posix(PosixPattern::Close),
+            "fopen" | "fopen_s" => PatternKind::Posix(PosixPattern::Fopen),
+            "fread" => PatternKind::Posix(PosixPattern::Fread),
+            "fwrite" => PatternKind::Posix(PosixPattern::Fwrite),
+            "fclose" => PatternKind::Posix(PosixPattern::Fclose),
+            "poll" => PatternKind::Posix(PosixPattern::Poll),
+            "select" => PatternKind::Posix(PosixPattern::Select),
+            "fork" | "vfork" => PatternKind::Posix(PosixPattern::Fork),
+            "exec" | "execve" | "execl" | "execvp" => PatternKind::Posix(PosixPattern::Exec),
+            "socketpair" => PatternKind::Posix(PosixPattern::SocketPair),
+            "shutdown" => PatternKind::Posix(PosixPattern::Shutdown),
             _ => return Vec::new(),
         };
 
@@ -248,7 +251,7 @@ impl CAnalyzer {
                     column: Some(column),
                     start_byte,
                     end_byte,
-                    pattern: PosixPattern::NonBlocking,
+                    pattern: PatternKind::Posix(PosixPattern::NonBlocking),
                     snippet,
                     arg_nodes,
                     transformability: Transformability::NotTransformable,
@@ -299,7 +302,7 @@ int main() {
         let matches = analyzer.analyze(source);
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp))));
     }
 
     #[test]
@@ -314,7 +317,7 @@ int main() {
         let matches = analyzer.analyze(source);
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::SocketUdp)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketUdp))));
     }
 
     #[test]
@@ -330,13 +333,13 @@ int main() {
         // Should produce both SocketTcp and NonBlocking
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp))));
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::NonBlocking)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::NonBlocking))));
         let nonblocking = matches
             .iter()
-            .find(|m| matches!(m.pattern, PosixPattern::NonBlocking))
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::NonBlocking)))
             .unwrap();
         assert!(matches!(
             nonblocking.transformability,
@@ -358,9 +361,9 @@ int main() {
 "#;
         let matches = analyzer.analyze(source);
         let patterns: Vec<_> = matches.iter().map(|m| m.pattern.clone()).collect();
-        assert!(patterns.contains(&PosixPattern::Bind));
-        assert!(patterns.contains(&PosixPattern::Listen));
-        assert!(patterns.contains(&PosixPattern::Accept));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Bind)));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Listen)));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Accept)));
     }
 
     #[test]
@@ -376,10 +379,10 @@ int main() {
         let matches = analyzer.analyze(source);
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::Poll)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::Poll))));
         let poll_match = matches
             .iter()
-            .find(|m| matches!(m.pattern, PosixPattern::Poll))
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::Poll)))
             .unwrap();
         assert!(matches!(
             poll_match.transformability,
@@ -401,10 +404,10 @@ int main() {
 "#;
         let matches = analyzer.analyze(source);
         let patterns: Vec<_> = matches.iter().map(|m| m.pattern.clone()).collect();
-        assert!(patterns.contains(&PosixPattern::Fopen));
-        assert!(patterns.contains(&PosixPattern::Fread));
-        assert!(patterns.contains(&PosixPattern::Fwrite));
-        assert!(patterns.contains(&PosixPattern::Fclose));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Fopen)));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Fread)));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Fwrite)));
+        assert!(patterns.contains(&PatternKind::Posix(PosixPattern::Fclose)));
     }
 
     #[test]
@@ -427,7 +430,7 @@ int main() {
         // detected by tree-sitter.
         assert!(matches
             .iter()
-            .any(|m| matches!(m.pattern, PosixPattern::SocketTcp)));
+            .any(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp))));
     }
 
     #[test]
@@ -494,7 +497,7 @@ int main(void) {
         let matches = analyzer.analyze(source);
         let socket_match = matches
             .iter()
-            .find(|m| matches!(m.pattern, PosixPattern::SocketTcp));
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)));
         // If the preprocessor expanded the source in a way that
         // exposed the socket() call, the line should be within the
         // original source's line count. We don't pin to a specific
@@ -538,7 +541,7 @@ int main(void) {
         let matches = analyzer.analyze(source);
         let socket_match = matches
             .iter()
-            .find(|m| matches!(m.pattern, PosixPattern::SocketTcp))
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)))
             .expect("socket match should be present");
         let col = socket_match.column.expect("column must be populated");
         assert_eq!(col, 13, "expected column 13, got {}", col);
