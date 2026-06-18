@@ -85,9 +85,9 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 	edgeMigCmd.Stderr = &edgeMigErr
 	if err := edgeMigCmd.Run(); err != nil {
 		return &domain.MigrationReport{
-			Status:    domain.MigrationStatusFailed,
+			Status:     domain.MigrationStatusFailed,
 			WasmStored: false,
-			AppName:   appName,
+			AppName:    appName,
 			Errors: []domain.ErrorInfo{{
 				Line:    0,
 				Message: fmt.Sprintf("edge-migrate failed: %s — %s", err, edgeMigErr.String()),
@@ -162,7 +162,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, _lan
 		WasmStored:          true,
 		DeploymentID:        &depID,
 		AppName:             appName,
-		PatternsTransformed:  patternsTransformed,
+		PatternsTransformed: patternsTransformed,
 	}, nil
 }
 
@@ -194,7 +194,7 @@ func detectTransformedPatterns(wasiC string) []domain.PatternInfo {
 				Line:             0,
 				Pattern:          t.pattern,
 				Snippet:          t.pattern,
-				WasiEquivalent:    t.wasi,
+				WasiEquivalent:   t.wasi,
 				Transformability: "Auto-transformable",
 			})
 		}

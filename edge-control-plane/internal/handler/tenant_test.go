@@ -15,17 +15,17 @@ import (
 
 // mockTenantSvc implements service.TenantServiceInterface for testing.
 type mockTenantSvc struct {
-	bootstrapErr      error
-	bootstrapTenant   *domain.Tenant
-	bootstrapRawKey   string
-	createTenantResp  *domain.Tenant
-	createTenantErr   error
-	getTenantResp     *domain.TenantWithQuota
-	getTenantErr      error
-	listTenantsResp   []domain.Tenant
-	listTenantsErr    error
-	updateTenantErr   error
-	deleteTenantErr   error
+	bootstrapErr     error
+	bootstrapTenant  *domain.Tenant
+	bootstrapRawKey  string
+	createTenantResp *domain.Tenant
+	createTenantErr  error
+	getTenantResp    *domain.TenantWithQuota
+	getTenantErr     error
+	listTenantsResp  []domain.Tenant
+	listTenantsErr   error
+	updateTenantErr  error
+	deleteTenantErr  error
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
