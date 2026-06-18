@@ -26,8 +26,6 @@ impl ApiKey {
         }
 
         if let Some(path) = Self::config_path() {
-            eprintln!("[debug] ApiKey::load config_path = {}", path.display());
-            eprintln!("[debug] ApiKey::load exists = {}", path.exists());
             if path.exists() {
                 let content = std::fs::read_to_string(&path)
                     .with_context(|| format!("failed to read {}", path.display()))?;

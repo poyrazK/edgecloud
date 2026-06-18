@@ -57,13 +57,13 @@ fn config_file_for(home: &TempDir) -> PathBuf {
 /// Inject the platform-appropriate env vars so the child CLI resolves
 /// its config dir to the test tempdir, not the developer's real home.
 ///
-/// On Linux we set `HOME` only — NOT `XDG_CONFIG_HOME`. If we set
-/// `XDG_CONFIG_HOME=tempdir`, `dirs::config_dir()` returns the tempdir
-/// directly (without the `.config` suffix), which then diverges from
-/// the layout `config_file_for` expects and tests start reading/writing
-/// at different paths. Leaving `XDG_CONFIG_HOME` unset lets
-/// `dirs::config_dir()` fall back to the XDG default `$HOME/.config`,
-/// matching `config_file_for`.
+/// We set `HOME` (and on Windows, `APPDATA`/`USERPROFILE`) and
+/// explicitly strip `XDG_CONFIG_HOME`. On Linux, `dirs::config_dir()`
+/// prefers `XDG_CONFIG_HOME` over `HOME`; if the test process (or the
+/// CI runner) has `XDG_CONFIG_HOME` pointing at the developer's real
+/// config, the child would inherit it and read/write the real file
+/// instead of the test tempdir. macOS and Windows ignore `XDG_CONFIG_HOME`,
+/// but stripping it is harmless there.
 fn set_platform_env(cmd: &mut Command, home: &TempDir) {
     if cfg!(target_os = "windows") {
         cmd.env("APPDATA", home.path().join("AppData").join("Roaming"));
@@ -72,6 +72,7 @@ fn set_platform_env(cmd: &mut Command, home: &TempDir) {
         cmd.env("HOME", home.path());
     }
     // Always strip any host-process env vars that could shadow the test.
+    cmd.env_remove("XDG_CONFIG_HOME");
     cmd.env_remove("EDGE_API_KEY");
 }
 
