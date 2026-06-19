@@ -106,7 +106,7 @@ func TestMigrationService_Migrate_Success(t *testing.T) {
 	if len(repo.deployments) != 1 {
 		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
 	}
-	if repo.deployments[0].Status != "migrated" {
+	if repo.deployments[0].Status != domain.StatusMigrated {
 		t.Errorf("expected deployment status=migrated, got: %s", repo.deployments[0].Status)
 	}
 	if len(store.artifacts) != 1 {
@@ -237,28 +237,107 @@ func TestMigrationService_Migrate_AppNameNoExtension(t *testing.T) {
 	}
 }
 
-func TestDetectTransformedPatterns(t *testing.T) {
-	tests := []struct {
-		name     string
-		wasiC    string
-		expected int // minimum number of patterns we expect to detect
-	}{
-		{"socket only", `wasi_socket_tcp_create`, 1},
-		{"full pipeline", `#include <wasi/sockets.h>
-wasi_socket_tcp_create(IP_ADDRESS_FAMILY_IPV4);
-wasi_socket_tcp_start_bind(fd, addr);
-wasi_socket_tcp_start_listen(fd, 128);
-wasi_socket_tcp_accept(fd);`, 4},
-		{"empty", ``, 0},
+func TestMigrationService_Migrate_PathTraversalFilename(t *testing.T) {
+	// Service-level rejection: this fires before any subprocess, so no
+	// skipIfNoEdgeMigrate / skipIfNoClang needed. Guards against future
+	// refactors that try to remove the defense-in-depth check on the
+	// grounds that the handler already rejects.
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "../etc.c", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+	if len(store.artifacts) != 0 {
+		t.Errorf("expected 0 artifacts stored, got: %d", len(store.artifacts))
+	}
+}
+
+func TestMigrationService_Migrate_EmptyFilename(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "", "c", emptySource)
+	if err == nil {
+		t.Fatal("expected error for empty filename")
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+}
+
+func TestMigrationService_Migrate_PopulatesPatternsDetected(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	// posixHTTPSource has socket + bind + listen + accept — all transformable
+	// (Accept is "best-effort"; the rest are "auto-transformable").
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			patterns := detectTransformedPatterns(tt.wasiC)
-			if len(patterns) < tt.expected {
-				t.Errorf("detectTransformedPatterns() returned %d patterns, want at least %d", len(patterns), tt.expected)
-			}
-		})
+	// Bug #3: PatternsDetected was always empty in API responses. With
+	// --format json, the report now carries the lib's classification.
+	if len(report.PatternsDetected) == 0 {
+		t.Error("expected PatternsDetected to be non-empty for a source with POSIX patterns")
+	}
+	if len(report.PatternsTransformed) == 0 {
+		t.Error("expected PatternsTransformed to be non-empty for an auto-transformable source")
+	}
+
+	// Bug #3 regression guard: the wire form must be kebab-case, matching
+	// edge-migrate-lib's `Transformability::as_str`. A future drift (e.g.,
+	// someone switching back to Debug-serialized CamelCase) would otherwise
+	// pass a non-empty check silently — the API would just stop returning
+	// patterns the control plane can interpret.
+	for _, p := range report.PatternsDetected {
+		if p.Line == 0 {
+			t.Errorf("expected non-zero line on detected pattern: %+v", p)
+		}
+		switch p.Transformability {
+		case domain.TransformabilityAutoTransformable,
+			domain.TransformabilityBestEffort,
+			domain.TransformabilityNotTransformable:
+			// ok — one of the three documented kebab-case values
+		default:
+			t.Errorf("transformability must be one of the documented kebab-case values, got: %q (pattern: %s)", p.Transformability, p.Pattern)
+		}
+	}
+
+	// posixHTTPSource has socket + bind + listen + accept. The first three
+	// are auto-transformable; accept is best-effort (poll loop). Count the
+	// bins to catch a regression where, say, Accept is silently dropped.
+	var gotAuto, gotBest int
+	for _, p := range report.PatternsDetected {
+		switch p.Transformability {
+		case domain.TransformabilityAutoTransformable:
+			gotAuto++
+		case domain.TransformabilityBestEffort:
+			gotBest++
+		}
+	}
+	if gotAuto < 3 {
+		t.Errorf("expected at least 3 auto-transformable patterns (socket/bind/listen), got: %d", gotAuto)
+	}
+	if gotBest < 1 {
+		t.Errorf("expected at least 1 best-effort pattern (accept), got: %d", gotBest)
+	}
+
+	// The struct field name is PatternsManualReview; for this source there
+	// are no untransformable patterns.
+	if len(report.PatternsManualReview) != 0 {
+		t.Errorf("expected no manual-review patterns for an all-transformable source, got: %d", len(report.PatternsManualReview))
 	}
 }
 
@@ -280,5 +359,60 @@ func TestValidateWasm(t *testing.T) {
 				t.Errorf("ValidateWasm() = %v, want %v", got, tt.valid)
 			}
 		})
+	}
+}
+
+func TestSanitizeAppName_StripsDotC(t *testing.T) {
+	got, err := sanitizeAppName("hello.c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_NoExtension(t *testing.T) {
+	got, err := sanitizeAppName("hello")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "hello" {
+		t.Errorf("expected hello, got: %s", got)
+	}
+}
+
+func TestSanitizeAppName_Empty(t *testing.T) {
+	_, err := sanitizeAppName(".c")
+	if err == nil {
+		t.Fatal("expected error for empty derived app name")
+	}
+}
+
+func TestSanitizeAppName_PathTraversal(t *testing.T) {
+	_, err := sanitizeAppName("../etc.c")
+	if err == nil {
+		t.Fatal("expected error for path-traversal filename")
+	}
+}
+
+func TestSanitizeAppName_AbsolutePath(t *testing.T) {
+	_, err := sanitizeAppName("/etc/passwd.c")
+	if err == nil {
+		t.Fatal("expected error for absolute-path filename")
+	}
+}
+
+func TestSanitizeAppName_Backslash(t *testing.T) {
+	_, err := sanitizeAppName(`foo\bar.c`)
+	if err == nil {
+		t.Fatal("expected error for backslash filename")
+	}
+}
+
+func TestSanitizeAppName_EmptyString(t *testing.T) {
+	_, err := sanitizeAppName("")
+	if err == nil {
+		t.Fatal("expected error for empty filename")
 	}
 }

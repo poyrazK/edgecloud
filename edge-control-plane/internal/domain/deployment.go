@@ -19,6 +19,7 @@ const (
 	StatusDeployed = "deployed"
 	StatusActive   = "active"
 	StatusFailed   = "failed"
+	StatusMigrated = "migrated"
 )
 
 // ActiveDeployment maps an app name to its active deployment for a tenant.

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
@@ -37,6 +38,13 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	filename := r.MultipartForm.Value["filename"]
 	if len(filename) == 0 || filename[0] == "" {
 		http.Error(w, `{"error":"missing filename field"}`, http.StatusBadRequest)
+		return
+	}
+	// Reject path-traversal early — derived app_name is what actually gets
+	// written to the DB and used in the registry path. The service has a
+	// defense-in-depth check; this one gives a clear 400 to the client.
+	if containsPathTraversal(strings.TrimSuffix(filename[0], ".c")) {
+		http.Error(w, `{"error":"filename must not contain path-traversal characters"}`, http.StatusBadRequest)
 		return
 	}
 

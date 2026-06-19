@@ -215,3 +215,31 @@ int main() { return 0; }`
 		t.Errorf("expected status 401, got: %d", rr.Code)
 	}
 }
+
+func TestMigrationHandler_Migrate_PathTraversalFilename(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin")
+	h := NewMigrationHandler(svc)
+
+	source := `#include <stdio.h>
+int main() { return 0; }`
+	req, err := makeMigrationReq("../etc.c", "c", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got: %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "path-traversal") {
+		t.Errorf("expected 'path-traversal' in error, got: %s", rr.Body.String())
+	}
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected 0 deployments created, got: %d", len(repo.deployments))
+	}
+}

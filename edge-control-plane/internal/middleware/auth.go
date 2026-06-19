@@ -2,22 +2,28 @@ package middleware
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"log"
+	"errors"
 	"net/http"
 	"strings"
 
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
-// AuthMiddleware validates API keys and injects tenant context.
+// AuthMiddleware authenticates incoming requests by Bearer-token API key.
+// It delegates to APIKeyService.AuthenticateRawKey, which dispatches to
+// the algorithm-specific verifier (argon2id for new keys; lazy upgrade
+// from legacy SHA-256) and enforces ExpiresAt.
+//
+// Earlier versions of this middleware called the repository directly and
+// treated the lookup_hash match as proof of validity, which silently
+// bypassed argon2id verification and ignored expiry. That bypass is the
+// headline reason this file was rewritten.
 type AuthMiddleware struct {
-	apiKeyRepo *repository.APIKeyRepository
+	apiKeySvc *service.APIKeyService
 }
 
-func NewAuthMiddleware(apiKeyRepo *repository.APIKeyRepository) *AuthMiddleware {
-	return &AuthMiddleware{apiKeyRepo: apiKeyRepo}
+func NewAuthMiddleware(apiKeySvc *service.APIKeyService) *AuthMiddleware {
+	return &AuthMiddleware{apiKeySvc: apiKeySvc}
 }
 
 // contextKey is a custom type for context keys to avoid collisions.
@@ -27,7 +33,9 @@ const TenantIDKey contextKey = "tenant_id"
 const APIKeyIDKey contextKey = "api_key_id"
 const RoleKey contextKey = "role"
 
-// Authenticate extracts and validates the Bearer token.
+// Authenticate extracts the Bearer token and validates it through the
+// APIKeyService. On success the tenant_id, api_key_id, and role are
+// stored in the request context for downstream handlers.
 func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -37,35 +45,36 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
 			http.Error(w, `{"error": "invalid authorization format"}`, http.StatusUnauthorized)
 			return
 		}
 
-		rawKey := parts[1]
-		hash := sha256.Sum256([]byte(rawKey))
-		keyHash := hex.EncodeToString(hash[:])
-
-		apiKey, err := m.apiKeyRepo.GetByHash(r.Context(), keyHash)
-		if err != nil {
-			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
-			return
-		}
-		if apiKey == nil {
+		// Trim trailing whitespace from the token. A header like
+		// "Bearer <key> " (trailing space) would otherwise hash to a
+		// different value than "Bearer <key>" and reject a valid key.
+		rawKey := strings.TrimSpace(parts[1])
+		if rawKey == "" {
 			http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
 			return
 		}
 
-		// Update last used
-		if err := m.apiKeyRepo.UpdateLastUsed(r.Context(), apiKey.ID); err != nil {
-			log.Printf("warning: failed to update last_used for api key %s: %v", apiKey.ID, err)
+		apiKey, err := m.apiKeySvc.AuthenticateRawKey(r.Context(), rawKey)
+		if err != nil {
+			// service.ErrInvalidAPIKey is the public "401 Unauthorized"
+			// signal; any other error is an infrastructure failure and
+			// must surface as 500.
+			if errors.Is(err, service.ErrInvalidAPIKey) {
+				http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			return
 		}
 
-		// Inject into context
 		ctx := context.WithValue(r.Context(), TenantIDKey, apiKey.TenantID)
 		ctx = context.WithValue(ctx, APIKeyIDKey, apiKey.ID)
 		ctx = context.WithValue(ctx, RoleKey, apiKey.Role)
-
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

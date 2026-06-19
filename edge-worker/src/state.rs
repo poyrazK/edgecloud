@@ -40,6 +40,11 @@ pub struct AppInstance {
     /// Handle to the spawned app task — used to propagate panics on stop.
     /// Wrapped in Arc so it can be cloned without taking ownership.
     pub handle: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
+    /// Handle to the epoch ticker that advances the wasmtime engine clock.
+    /// The ticker is aborted on app stop; without it the engine epoch would
+    /// never advance, and the Store-level deadline would never fire.
+    /// Wrapped in Option so stop_app can take it out of the locked struct.
+    pub ticker: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.

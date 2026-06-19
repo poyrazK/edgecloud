@@ -102,6 +102,15 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	if int64(len(data)) > MaxArtifactSize {
 		return nil, fmt.Errorf("artifact exceeds maximum size of %d bytes", MaxArtifactSize)
 	}
+
+	// Reject non-wasm artifacts before persisting them. Without this guard a
+	// non-wasm file would be stored, hashed, and shipped to workers, where
+	// it would fail only at execution time. Magic bytes are the cheapest
+	// first-line check — full module validation is wasmtime's job.
+	if !validateWasm(data) {
+		return nil, fmt.Errorf("invalid wasm artifact: missing magic bytes (\\0asm)")
+	}
+
 	hash := sha256.Sum256(data)
 
 	deployment := &domain.Deployment{

@@ -139,7 +139,52 @@ func Load(path string) (*Config, error) {
 		cfg.JWT.TTL = 24
 	}
 
+	// Reject insecure JWT secrets. Operators frequently ship with the
+	// default `change-me-in-production` placeholder and forget to override
+	// it; failing startup is louder and safer than silently running with a
+	// publicly-known secret. (Audit finding #2 — also referenced by tests.)
+	if err := validateJWTSecret(cfg.JWT.Secret); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// insecureJWTSecretValues is the set of well-known placeholder JWT secrets
+// that must not be accepted in production. Operators must override these
+// with a real secret via `JWT_SECRET` env var or `jwt.secret` config field.
+//
+// The set is small and curated — adding entries requires a code review so
+// a typo doesn't accidentally invalidate a legitimate operator secret.
+//
+// An empty string is checked separately so operators get a clear "not set"
+// message rather than the misleading "is a known placeholder".
+var insecureJWTSecretValues = map[string]struct{}{
+	"change-me-in-production": {},
+	"changeme":                {},
+	"secret":                  {},
+	"default":                 {},
+	"insecure":                {},
+}
+
+// validateJWTSecret enforces three rules in priority order:
+//  1. secret must be set (non-empty),
+//  2. secret must not match a known placeholder,
+//  3. secret must be at least 32 bytes long.
+//
+// Empty and placeholder checks are separate because the operator action
+// they imply is different (set the var vs. choose a unique value).
+func validateJWTSecret(s string) error {
+	if s == "" {
+		return fmt.Errorf("jwt.secret is not set; set JWT_SECRET or jwt.secret to a unique value")
+	}
+	if _, ok := insecureJWTSecretValues[s]; ok {
+		return fmt.Errorf("jwt.secret %q is a known placeholder; set JWT_SECRET or jwt.secret to a unique value", s)
+	}
+	if len(s) < 32 {
+		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(s))
+	}
+	return nil
 }
 
 // MigrationConfig holds paths to migration toolchain binaries.

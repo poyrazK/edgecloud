@@ -7,12 +7,28 @@ mod report;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use edge_migrate_lib::{analyzer::CAnalyzer, report::MigrationReport, transformer::Transformer};
+use edge_migrate_lib::{
+    analyzer::CAnalyzer,
+    report::{MigrationReport, TransformOutput, TRANSFORM_OUTPUT_VERSION},
+    transformer::Transformer,
+};
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 const DEFAULT_API_URL: &str = "https://api.edgecloud.dev";
+
+/// Output format for `--transform`. `text` (default) writes raw WASI C
+/// to stdout — the contract external CLI users have always had.
+/// `json` writes a `TransformOutput` envelope that bundles the
+/// structured `MigrationReport` with the WASI C source — consumed by
+/// the Go control plane to populate `PatternsDetected` /
+/// `PatternsTransformed` / `PatternsManualReview` with real data.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "edge-migrate")]
@@ -30,20 +46,53 @@ struct Args {
     /// Force upload even if the file has untransformable patterns.
     #[arg(short, long)]
     force: bool,
+
+    /// Output format for `--transform`: `text` (default, raw WASI C on
+    /// stdout) or `json` (a `TransformOutput` envelope with both the
+    /// structured `MigrationReport` and the WASI C source). The Go
+    /// control plane uses `json`; external users should leave this alone.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // --transform: analyze + transform, output WASI C to stdout, exit immediately.
-    // Used by the Go control-plane as: edge-migrate --transform <file>
+    // --transform: analyze + transform, output WASI C (or a JSON
+    // envelope) to stdout, exit immediately. Used by the Go control
+    // plane as: edge-migrate --transform <file> --format json
     if let Some(ref source_path) = args.transform {
         let source = read_file(source_path).await?;
         let mut analyzer = CAnalyzer::new();
         let matches = analyzer.analyze(&source);
+
+        // The lib's app_name is informational here; the Go server
+        // overwrites it with its own sanitized value. Keep the report
+        // self-describing for any other consumer (CLI tools, IDE
+        // plugins).
+        let app_name = derive_app_name(source_path);
+        let report = MigrationReport::from_pattern_matches(&app_name, matches.clone());
+
+        // `Transformer::transform` consumes matches; build the report
+        // first so we don't pay for cloning a second time.
         let result = Transformer::transform(&source, matches);
-        print!("{}", result.transformed_source);
+
+        match args.format {
+            OutputFormat::Text => {
+                print!("{}", result.transformed_source);
+            }
+            OutputFormat::Json => {
+                let envelope = TransformOutput {
+                    version: TRANSFORM_OUTPUT_VERSION,
+                    report,
+                    wasi_c: result.transformed_source,
+                };
+                let json =
+                    serde_json::to_string(&envelope).context("serializing TransformOutput")?;
+                print!("{}", json);
+            }
+        }
         return Ok(());
     }
 

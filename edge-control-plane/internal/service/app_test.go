@@ -342,4 +342,3 @@ func TestArtifactStore_Delete_RemovesFile(t *testing.T) {
 		t.Errorf("artifact file still exists after Delete")
 	}
 }
-

@@ -386,6 +386,21 @@ impl ObserveHost for RuntimeState {
     fn emit_log(&mut self, level: String, message: String, labels: Vec<(String, String)>) {
         self.observe.emit_log(&level, &message, &labels);
     }
+    fn emit_log_record(&mut self, r: crate::edge::cloud::observe::LogRecord) {
+        let record = observe::LogRecord {
+            timestamp_ms: r.timestamp_ms,
+            level: match r.level {
+                crate::edge::cloud::observe::LogLevel::Error => observe::LogLevel::Error,
+                crate::edge::cloud::observe::LogLevel::Warn => observe::LogLevel::Warn,
+                crate::edge::cloud::observe::LogLevel::Info => observe::LogLevel::Info,
+                crate::edge::cloud::observe::LogLevel::Debug => observe::LogLevel::Debug,
+                crate::edge::cloud::observe::LogLevel::Trace => observe::LogLevel::Trace,
+            },
+            message: r.message,
+            labels: r.labels,
+        };
+        self.observe.emit_log_record(&record);
+    }
 }
 
 impl TimeHost for RuntimeState {

@@ -2,9 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -69,7 +66,14 @@ func (s *TenantService) CreateTenant(ctx context.Context, name, plan string) (*d
 }
 
 // BootstrapTenant creates a new tenant with its first API key atomically.
-// This is the self-signup entry point: one request creates tenant + initial owner key.
+// This is the self-signup entry point: one request creates tenant + initial
+// owner key.
+//
+// The initial key is minted through mintAPIKey so it carries the same
+// fields (argon2id hash, lookup hash, role) as a key produced by
+// CreateAPIKey. Without this, the bootstrap path was writing raw SHA-256
+// hashes with no HashAlgorithm or LookupHash — the new repo guards added
+// for migrations 005/007 would have rejected the row outright.
 func (s *TenantService) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
 	tenant := &domain.Tenant{
 		ID:                      "t_" + uuid.New().String(),
@@ -95,24 +99,15 @@ func (s *TenantService) BootstrapTenant(ctx context.Context, name, plan, keyName
 			return fmt.Errorf("creating quota: %w", err)
 		}
 
-		raw := make([]byte, 32)
-		if _, err := rand.Read(raw); err != nil {
-			return fmt.Errorf("generating key: %w", err)
-		}
-		rawKey = hex.EncodeToString(raw)
-		hash := sha256.Sum256([]byte(rawKey))
-
-		apiKey := &domain.APIKey{
-			ID:       "k_" + uuid.New().String(),
-			TenantID: tenant.ID,
-			Name:     keyName,
-			KeyHash:  hex.EncodeToString(hash[:]),
-			Role:     domain.RoleOwner,
+		mintedRaw, apiKey, err := mintAPIKey(tenant.ID, keyName, domain.RoleOwner)
+		if err != nil {
+			return fmt.Errorf("minting initial api key: %w", err)
 		}
 		if err := apiKeyRepo.Create(ctx, apiKey); err != nil {
 			return fmt.Errorf("creating api key: %w", err)
 		}
 
+		rawKey = mintedRaw
 		created = tenant
 		return nil
 	})

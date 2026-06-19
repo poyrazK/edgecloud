@@ -10,5 +10,5 @@ pub mod transformer;
 
 pub use analyzer::CAnalyzer;
 pub use patterns::{PatternMatch, PosixPattern, Transformability};
-pub use report::MigrationReport;
+pub use report::{MigrationReport, TransformOutput};
 pub use transformer::{TransformResult, Transformer};

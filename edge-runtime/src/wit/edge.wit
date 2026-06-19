@@ -106,10 +106,26 @@ interface cache {
 }
 
 interface observe {
+  enum log-level {
+    error,
+    warn,
+    info,
+    debug,
+    trace,
+  }
+
+  record log-record {
+    timestamp-ms: u64,
+    level: log-level,
+    message: string,
+    labels: list<tuple<string, string>>,
+  }
+
   increment-counter: func(name: string, labels: list<tuple<string, string>>);
   record-gauge: func(name: string, value: f64, labels: list<tuple<string, string>>);
   record-histogram: func(name: string, value: f64, labels: list<tuple<string, string>>);
   emit-log: func(level: string, message: string, labels: list<tuple<string, string>>);
+  emit-log-record: func(r: log-record);
 }
 
 interface time {

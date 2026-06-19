@@ -61,6 +61,7 @@ clock = { version = "0.4", optional = true }
 [dev-dependencies]
 wasmtime-environ = "25.0"
 wiremock = "0.6"
+wat = "1"
 
 [features]
 default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking"]

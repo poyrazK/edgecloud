@@ -108,3 +108,28 @@ func (r *WorkerRepository) GetStatus(ctx context.Context, workerID string) (*dom
 	}
 	return &ws, err
 }
+
+// GetLatestStatuses returns the most-recent worker_status row for each
+// worker in `workerIDs`, in a single query. Workers with no status row
+// are simply absent from the result map — callers should treat absence
+// as "no heartbeat yet" (AppCount=0).
+//
+// Used by ClusterService.List() to avoid the N+1 of calling GetStatus()
+// once per worker.
+func (r *WorkerRepository) GetLatestStatuses(ctx context.Context, workerIDs []string) (map[string]domain.WorkerStatus, error) {
+	out := make(map[string]domain.WorkerStatus)
+	if len(workerIDs) == 0 {
+		return out, nil
+	}
+	var rows []domain.WorkerStatus
+	// sqlx + the pgx driver accept []string as a Postgres text[] array,
+	// which binds to ANY($1) directly.
+	query := `SELECT DISTINCT ON (worker_id) worker_id, apps, last_report FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`
+	if err := r.db.SelectContext(ctx, &rows, query, workerIDs); err != nil {
+		return nil, err
+	}
+	for _, ws := range rows {
+		out[ws.WorkerID] = ws
+	}
+	return out, nil
+}

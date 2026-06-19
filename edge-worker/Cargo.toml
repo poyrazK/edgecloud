@@ -20,9 +20,11 @@ futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
+tempfile = "3"
