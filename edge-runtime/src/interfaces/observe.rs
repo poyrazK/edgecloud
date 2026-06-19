@@ -335,8 +335,7 @@ impl Observer {
         // tenant/worker identity, batching, and transport. Per-app
         // AppLogContext travels with the record so downstream sinks don't
         // need a separate lookup.
-        self.log_sink
-            .push(record.clone(), self.app_ctx.clone());
+        self.log_sink.push(record.clone(), self.app_ctx.clone());
     }
 
     /// Returns the current value of a counter for testing.
@@ -508,11 +507,23 @@ mod tests {
 
         let pushed = sink.records();
         let levels: Vec<LogLevel> = pushed.iter().map(|(r, _)| r.level).collect();
-        assert!(levels.contains(&LogLevel::Error), "Error must pass (more severe than Info)");
-        assert!(levels.contains(&LogLevel::Warn), "Warn must pass (more severe than Info)");
+        assert!(
+            levels.contains(&LogLevel::Error),
+            "Error must pass (more severe than Info)"
+        );
+        assert!(
+            levels.contains(&LogLevel::Warn),
+            "Warn must pass (more severe than Info)"
+        );
         assert!(levels.contains(&LogLevel::Info), "Info must pass");
-        assert!(!levels.contains(&LogLevel::Debug), "Debug should be filtered (less severe than Info)");
-        assert!(!levels.contains(&LogLevel::Trace), "Trace should be filtered (less severe than Info)");
+        assert!(
+            !levels.contains(&LogLevel::Debug),
+            "Debug should be filtered (less severe than Info)"
+        );
+        assert!(
+            !levels.contains(&LogLevel::Trace),
+            "Trace should be filtered (less severe than Info)"
+        );
     }
 
     /// Default Observer (no sink configured) uses NoopLogSink; emit must
