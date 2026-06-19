@@ -64,16 +64,18 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// Test-only constructor. Always uses ephemeral in-memory stores regardless of env vars.
+    /// Production code must use `with_env_and_meter` to get per-tenant persistent stores.
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Self::make_kv_store(),
-            cache: Self::make_cache(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: Self::make_scheduler(),
+            scheduling: scheduling::Scheduler::new(),
             process: process::Process::with_env_and_exit_code(
                 Arc::new(process::filter_env_vars(std::env::vars()).collect()),
                 exit_code.clone(),
@@ -145,19 +147,6 @@ impl RuntimeState {
         }
     }
 
-    /// Attempt to create a persistent KvStore from `EDGE_KV_STORE_PATH`,
-    /// falling back to an ephemeral in-memory store on any error.
-    fn make_kv_store() -> Arc<kv_store::KvStore> {
-        match kv_store::KvStore::from_env() {
-            Ok(Some(store)) => Arc::new(store),
-            Ok(None) => Arc::new(kv_store::KvStore::new()),
-            Err(e) => {
-                tracing::warn!("KV store persistence unavailable, using ephemeral: {}", e);
-                Arc::new(kv_store::KvStore::new())
-            }
-        }
-    }
-
     /// Attempt to create a persistent KvStore scoped to `tenant_id`.
     /// Falls back to ephemeral if `EDGE_KV_STORE_PATH` is unset or the path is unusable.
     fn make_kv_store_for_tenant(tenant_id: &str) -> Arc<kv_store::KvStore> {
@@ -165,21 +154,8 @@ impl RuntimeState {
             Ok(Some(store)) => Arc::new(store),
             Ok(None) => Arc::new(kv_store::KvStore::new()),
             Err(e) => {
-                tracing::warn!(tenant_id, "KV store persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(tenant_id, "KV store persistence unavailable, using ephemeral: {}", e);
                 Arc::new(kv_store::KvStore::new())
-            }
-        }
-    }
-
-    /// Attempt to create a persistent Scheduler from `EDGE_SCHEDULING_PATH`,
-    /// falling back to an ephemeral in-memory scheduler on any error.
-    fn make_scheduler() -> scheduling::Scheduler {
-        match scheduling::Scheduler::from_env() {
-            Ok(Some(s)) => s,
-            Ok(None) => scheduling::Scheduler::new(),
-            Err(e) => {
-                tracing::warn!("scheduling persistence unavailable, using ephemeral: {}", e);
-                scheduling::Scheduler::new()
             }
         }
     }
@@ -191,21 +167,8 @@ impl RuntimeState {
             Ok(Some(s)) => s,
             Ok(None) => scheduling::Scheduler::new(),
             Err(e) => {
-                tracing::warn!(tenant_id, "scheduling persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(tenant_id, "scheduling persistence unavailable, using ephemeral: {}", e);
                 scheduling::Scheduler::new()
-            }
-        }
-    }
-
-    /// Attempt to create a persistent Cache from `EDGE_CACHE_PATH`,
-    /// falling back to an ephemeral in-memory cache on any error.
-    fn make_cache() -> Arc<cache::Cache> {
-        match cache::Cache::from_env(1000) {
-            Ok(Some(c)) => Arc::new(c),
-            Ok(None) => Arc::new(cache::Cache::new(1000)),
-            Err(e) => {
-                tracing::warn!("cache persistence unavailable, using ephemeral: {}", e);
-                Arc::new(cache::Cache::new(1000))
             }
         }
     }
@@ -217,7 +180,7 @@ impl RuntimeState {
             Ok(Some(c)) => Arc::new(c),
             Ok(None) => Arc::new(cache::Cache::new(1000)),
             Err(e) => {
-                tracing::warn!(tenant_id, "cache persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(tenant_id, "cache persistence unavailable, using ephemeral: {}", e);
                 Arc::new(cache::Cache::new(1000))
             }
         }

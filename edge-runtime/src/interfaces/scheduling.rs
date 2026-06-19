@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -49,6 +50,8 @@ pub enum SchedulerError {
     Io(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("invalid tenant_id: {0:?}")]
+    InvalidTenantId(String),
 }
 
 // --- On-disk representation ---
@@ -180,6 +183,13 @@ pub struct ScheduledTask {
 pub struct Scheduler {
     tasks: Arc<Mutex<HashMap<String, ScheduledTask>>>,
     persistence: Option<SchedulerPersistence>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
 }
 
 impl Default for Scheduler {
@@ -194,6 +204,8 @@ impl Scheduler {
         init_time_refs();
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
         let tasks_clone = tasks.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
 
         // Spawn a background worker that fires due tasks.
         std::thread::spawn(move || {
@@ -204,6 +216,9 @@ impl Scheduler {
 
             rt.block_on(async {
                 loop {
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
                     let sleep_ms = {
                         let tasks = tasks_clone.lock().unwrap();
                         let next = tasks.values().map(|t| t.next_at).min_by_key(|i| *i);
@@ -216,6 +231,10 @@ impl Scheduler {
                         }
                     };
                     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     let now = Instant::now();
                     let mut tasks = tasks_clone.lock().unwrap();
@@ -239,6 +258,7 @@ impl Scheduler {
         Self {
             tasks,
             persistence: None,
+            shutdown,
         }
     }
 
@@ -268,6 +288,8 @@ impl Scheduler {
 
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
         let tasks_clone = tasks.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
 
         // Spawn the background worker (same as new()).
         std::thread::spawn(move || {
@@ -278,6 +300,9 @@ impl Scheduler {
 
             rt.block_on(async {
                 loop {
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
                     let sleep_ms = {
                         let tasks = tasks_clone.lock().unwrap();
                         let next = tasks.values().map(|t| t.next_at).min_by_key(|i| *i);
@@ -290,6 +315,10 @@ impl Scheduler {
                         }
                     };
                     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     let now = Instant::now();
                     let mut tasks = tasks_clone.lock().unwrap();
@@ -321,6 +350,7 @@ impl Scheduler {
         Ok(Self {
             tasks,
             persistence: Some(persistence),
+            shutdown,
         })
     }
 
@@ -337,6 +367,9 @@ impl Scheduler {
     /// The schedule file is `{EDGE_SCHEDULING_PATH}/{tenant_id}/schedule.json`.
     /// Returns `Ok(None)` if `EDGE_SCHEDULING_PATH` is not set.
     pub fn from_env_for_tenant(tenant_id: &str) -> Result<Option<Self>, SchedulerError> {
+        if !super::is_safe_tenant_id(tenant_id) {
+            return Err(SchedulerError::InvalidTenantId(tenant_id.to_string()));
+        }
         match std::env::var(ENV_SCHEDULING_PATH) {
             Ok(base) => {
                 let path = Path::new(&base).join(tenant_id);

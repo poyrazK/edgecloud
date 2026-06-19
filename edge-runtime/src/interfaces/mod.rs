@@ -1,5 +1,17 @@
 //! Host function implementations for edge:* WIT interfaces.
 
+/// Returns `true` iff `id` is safe to use as a single directory component.
+/// Rejects empty strings, path separators, `.`, `..`, null bytes, and colons.
+pub fn is_safe_tenant_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains('\0')
+        && !id.contains(':')
+}
+
 #[cfg(feature = "cache")]
 pub mod cache;
 #[cfg(feature = "networking")]

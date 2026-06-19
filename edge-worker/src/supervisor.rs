@@ -86,6 +86,12 @@ impl Supervisor {
         spec: &AppSpec,
         tenant_id: &str,
     ) -> anyhow::Result<()> {
+        // Validate tenant_id before any filesystem or store operations.
+        // Reject path-traversal characters that could escape the base persistence directory.
+        if !edge_runtime::is_safe_tenant_id(tenant_id) {
+            anyhow::bail!("refusing to start app: unsafe tenant_id {:?}", tenant_id);
+        }
+
         tracing::info!(app_name, deployment_id = spec.deployment_id, "starting app");
 
         // Stop existing instance if present

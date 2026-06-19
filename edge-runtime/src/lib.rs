@@ -19,6 +19,7 @@ wasmtime::component::bindgen!({
 });
 
 pub use engine::create_engine;
+pub use interfaces::is_safe_tenant_id;
 pub use metering::RequestMeter;
 pub use runtime::RuntimeState;
 pub use store::create_store;
