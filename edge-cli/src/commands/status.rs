@@ -15,7 +15,7 @@ pub fn run(path: &Path) -> Result<()> {
         State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
-    let client = ApiClient::new(edge_toml.deployment.api.clone())?;
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
     let status = client.status(&state.deployment_id)?;
 
     output::section("Deployment Status");

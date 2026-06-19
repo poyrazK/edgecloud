@@ -15,7 +15,7 @@ pub fn set_var(path: &Path, key: &str, value: &str) -> Result<()> {
         State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
-    let client = ApiClient::new(edge_toml.deployment.api.clone())?;
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
     client.set_env(&state.app_name, key, value)?;
 
     output::success(&format!("{} set", key));
@@ -29,7 +29,7 @@ pub fn list_vars(path: &Path) -> Result<()> {
         State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
-    let client = ApiClient::new(edge_toml.deployment.api.clone())?;
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
     let vars = client.list_env(&state.app_name)?;
 
     if vars.is_empty() {

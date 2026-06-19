@@ -27,6 +27,12 @@ enum Command {
     Init {
         /// Name of the project to create.
         name: String,
+        /// Override the control-plane URL written into edge.toml's
+        /// `[deployment].api`. If omitted, the section is left empty
+        /// and the runtime falls back to `EDGE_API_URL`,
+        /// `~/.config/edgecloud/config.toml`, then the default.
+        #[arg(long)]
+        api: Option<String>,
     },
 
     /// Compile the project to WebAssembly.
@@ -96,7 +102,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { name } => commands::init::run(&name),
+        Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
         Command::Build => commands::build::run(&cli.path),
         Command::Deploy { app, id } => commands::deploy::run(&cli.path, &app, id.as_deref()),
         Command::Status => commands::status::run(&cli.path),

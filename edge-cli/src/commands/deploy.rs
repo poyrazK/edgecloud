@@ -39,7 +39,7 @@ fn run_upload(path: &Path, app: &str) -> Result<()> {
         e
     })?;
 
-    let client = ApiClient::new(edge_toml.deployment.api.clone())?;
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
     let resp = client.deploy(&app_name, &wasm_bytes)?;
 
     let live_url = resp.url.clone();
@@ -66,7 +66,7 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
 
     let edge_toml = EdgeToml::from_path(path)
         .with_context(|| "edge deploy --id requires edge.toml with [deployment] api = \"<url>\"")?;
-    let base_url = edge_toml.deployment.api.clone();
+    let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
     client.activate(&app_name, deployment_id)?;
