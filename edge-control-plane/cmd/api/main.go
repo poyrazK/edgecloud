@@ -62,7 +62,7 @@ func main() {
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
-	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath)
+	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
