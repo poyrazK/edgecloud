@@ -227,7 +227,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("getting quota: %w", err)
 	}
 	maxMemoryMB := 256
-	if quota != nil {
+	if quota != nil && quota.MaxMemoryMB > 0 {
 		maxMemoryMB = quota.MaxMemoryMB
 	}
 

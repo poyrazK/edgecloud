@@ -78,6 +78,8 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		defer tx.Rollback()
 
 		// Lock the tenant row for the duration of this transaction.
+		// Acquire a row lock on the tenant row. The boolean result is unused;
+		// only the lock (held until tx.Commit) matters for serializing concurrent creates.
 		var tenantExists bool
 		err = tx.GetContext(ctx, &tenantExists, `SELECT true FROM tenants WHERE id = $1 FOR UPDATE`, tenantID)
 		if err != nil {
@@ -229,6 +231,8 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		}
 		defer tx.Rollback()
 
+		// Acquire a row lock on the tenant row. The boolean result is unused;
+		// only the lock (held until tx.Commit) matters for serializing concurrent creates.
 		var tenantExists bool
 		err = tx.GetContext(ctx, &tenantExists, `SELECT true FROM tenants WHERE id = $1 FOR UPDATE`, tenantID)
 		if err != nil {
