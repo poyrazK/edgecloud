@@ -5,8 +5,15 @@
 //! each match into a [`FileEntry`] sorted lexicographically. Callers
 //! feed the entries into [`transform_tree`] to produce a
 //! [`TreeTransformResult`] with one [`FileReport`] per file.
+//!
+//! M3 adds [`walk_tree_for_language`] and
+//! [`transform_tree_for_language`], which dispatch on a [`Language`]
+//! value. The original `walk_tree` and `transform_tree` functions are
+//! preserved as thin aliases for `Language::C`, so existing callers
+//! (the M2 CLI bin, the Go control plane) are unchanged.
 
 use crate::analyzer::CAnalyzer;
+use crate::patterns::Language;
 use crate::preprocessor::Preprocessor;
 use crate::report::{FileReport, MigrationReport, TreeMigrationReport};
 use serde::{Deserialize, Serialize};
@@ -28,10 +35,16 @@ const SKIP_DIRS: &[&str] = &[
     "out",
 ];
 
-/// Case-insensitive set of file extensions the walker accepts.
-/// Header files (`.h`) are included alongside sources (`.c`) so the
-/// downstream clang invocation can resolve `#include "header.h"`.
-const ALLOWED_EXTS: &[&str] = &["c", "h"];
+/// Case-insensitive set of file extensions the walker accepts per
+/// language. M3 added `Language::Rust → ["rs"]`; the C entry is the
+/// original `["c", "h"]` (header files are included so the downstream
+/// clang invocation can resolve `#include "header.h"`).
+fn allowed_exts_for(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::C => &["c", "h"],
+        Language::Rust => &["rs"],
+    }
+}
 
 /// A single source file discovered during a tree walk.
 ///
@@ -64,18 +77,24 @@ pub enum WalkError {
     Io(#[from] std::io::Error),
 }
 
-/// Walk a directory recursively, returning every `.c`/`.h` file as a
-/// [`FileEntry`]. Entries are sorted lexicographically by `path` so
-/// the output is deterministic across runs.
+/// Walk a directory recursively, returning every source file (filtered
+/// by [`Language`]) as a [`FileEntry`]. Entries are sorted
+/// lexicographically by `path` so the output is deterministic across
+/// runs.
 ///
 /// Symlinks are followed by default (walkdir's `follow_links(true)`).
 /// This is a known limitation — a future hardening pass should reject
 /// symlinks that escape the root. Tracked as a follow-up issue.
-pub fn walk_tree(root: &Path) -> Result<Vec<FileEntry>, WalkError> {
+pub fn walk_tree_for_language(
+    root: &Path,
+    language: Language,
+) -> Result<Vec<FileEntry>, WalkError> {
     let meta = std::fs::metadata(root)?;
     if !meta.is_dir() {
         return Err(WalkError::NotADirectory(root.to_path_buf()));
     }
+
+    let allowed_exts = allowed_exts_for(language);
 
     let mut entries: Vec<FileEntry> = Vec::new();
     let walker = WalkDir::new(root).follow_links(true).into_iter();
@@ -120,7 +139,7 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileEntry>, WalkError> {
             continue;
         }
 
-        // Filter to .c / .h (case-insensitive on the extension).
+        // Filter to language-specific extensions (case-insensitive on the extension).
         let ext = entry
             .path()
             .extension()
@@ -130,7 +149,7 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileEntry>, WalkError> {
             Some(e) => e,
             None => continue,
         };
-        if !ALLOWED_EXTS.contains(&ext.as_str()) {
+        if !allowed_exts.contains(&ext.as_str()) {
             continue;
         }
 
@@ -160,6 +179,14 @@ pub fn walk_tree(root: &Path) -> Result<Vec<FileEntry>, WalkError> {
     Ok(entries)
 }
 
+/// Walk a directory for **C** sources (`.c`/`.h`). Equivalent to
+/// [`walk_tree_for_language`] with `Language::C`. Preserved as a
+/// non-breaking alias so existing callers (the M2 CLI bin, the Go
+/// control plane) don't need to pass a language argument.
+pub fn walk_tree(root: &Path) -> Result<Vec<FileEntry>, WalkError> {
+    walk_tree_for_language(root, Language::C)
+}
+
 /// Result of [`transform_tree`]: the input entries plus one
 /// [`FileReport`] per file, aggregated into a [`TreeMigrationReport`].
 #[derive(Debug)]
@@ -172,33 +199,90 @@ pub struct TreeTransformResult {
     pub tree_report: TreeMigrationReport,
 }
 
-/// Run the C analyzer + transformer over a list of [`FileEntry`]s and
-/// produce per-file + tree-level reports.
+/// Run the analyzer + transformer for a specific language over a list
+/// of [`FileEntry`]s and produce per-file + tree-level reports.
 ///
-/// Builds a single [`Preprocessor`] (via [`Preprocessor::discover`])
-/// and a single [`CAnalyzer::with_preprocessor`] that are reused
-/// across all files — `clang` is still invoked once per file (no
-/// batch mode yet; tracked as a follow-up).
+/// **Language dispatch:**
+/// - `Language::C`: builds one [`Preprocessor`] (via
+///   [`Preprocessor::discover`]) and one
+///   [`CAnalyzer::with_preprocessor`] reused across files. `clang`
+///   is still invoked once per file (no batch mode yet; tracked as
+///   a follow-up).
+/// - `Language::Rust` (requires `rust` feature): builds one
+///   [`RustAnalyzer`] reused across files. No preprocessor.
 ///
 /// On a per-file parse / transform failure, the file produces a
 /// `FileReport` with `status: Failed` and an entry in `errors`. Tree
 /// processing continues — one bad file does not abort the rest of
 /// the tree.
-pub fn transform_tree(entries: Vec<FileEntry>) -> TreeTransformResult {
+pub fn transform_tree_for_language(
+    entries: Vec<FileEntry>,
+    language: Language,
+) -> TreeTransformResult {
     let app_name = String::new();
-    transform_tree_with_app_name(entries, &app_name)
+    transform_tree_for_language_with_app_name(entries, &app_name, language)
 }
 
-/// Like [`transform_tree`] but uses the provided `app_name` when
-/// building each per-file `MigrationReport`. The CLI passes the
-/// developer-supplied app name; the server uses a fixed string.
-pub fn transform_tree_with_app_name(
+/// Like [`transform_tree_for_language`] but uses the provided
+/// `app_name` when building each per-file `MigrationReport`. The CLI
+/// passes the developer-supplied app name; the server uses a fixed
+/// string.
+pub fn transform_tree_for_language_with_app_name(
     entries: Vec<FileEntry>,
     app_name: &str,
+    language: Language,
 ) -> TreeTransformResult {
-    // Build the preprocessor + analyzer once. `CAnalyzer::new()` is the
-    // fallback when `clang` isn't reachable. `Preprocessor::discover`
-    // returns `None` on missing binaries, so we use the same.
+    let file_reports = match language {
+        Language::C => transform_tree_c(entries.iter().collect(), app_name),
+        Language::Rust => {
+            #[cfg(feature = "rust")]
+            {
+                transform_tree_rust(entries.iter().collect(), app_name)
+            }
+            #[cfg(not(feature = "rust"))]
+            {
+                // Without the rust feature, we can't analyze Rust
+                // sources. Surface the situation as a single Failed
+                // report so callers see the language mismatch
+                // explicitly rather than a silent empty result.
+                let _ = app_name;
+                entries
+                    .iter()
+                    .map(|e| {
+                        use crate::report::{ErrorInfo, MigrationStatus};
+                        FileReport {
+                            path: e.path.clone(),
+                            status: MigrationStatus::Failed,
+                            patterns_detected: Vec::new(),
+                            transformations: Vec::new(),
+                            manual_review: Vec::new(),
+                            errors: vec![ErrorInfo {
+                                line: 0,
+                                message: "edge-migrate-lib was built without the `rust` feature; \
+                                          Rust language requested but unavailable"
+                                    .to_string(),
+                            }],
+                            preprocessor: None,
+                        }
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    let tree_report =
+        TreeMigrationReport::from_files(app_name.to_string(), file_reports.clone());
+
+    TreeTransformResult {
+        entries,
+        file_reports,
+        tree_report,
+    }
+}
+
+/// C-only path of `transform_tree_for_language_with_app_name`. Builds
+/// the preprocessor + CAnalyzer once and reuses them across files.
+fn transform_tree_c(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport> {
     let pre = Preprocessor::discover();
     let mut analyzer = match &pre {
         Some(p) => CAnalyzer::with_preprocessor(p.clone()),
@@ -206,19 +290,8 @@ pub fn transform_tree_with_app_name(
     };
 
     let mut file_reports: Vec<FileReport> = Vec::with_capacity(entries.len());
-
     for entry in &entries {
-        // Per-file analysis. The analyzer returns matches + the
-        // per-call preprocessor info (when a preprocessor is attached
-        // and expansion succeeds).
         let (matches, pp_info) = analyzer.analyze_with_preprocessor_info(&entry.source);
-
-        // Build the per-file MigrationReport. We don't actually use the
-        // transformed source here — the server-side compile in M2.C9
-        // will read the per-file `transformed_source` from the
-        // `edge-migrate --transform` subprocess. For the lib's
-        // local-only use (CLI printing, library consumers), the
-        // MigrationReport is enough.
         let report = match pp_info {
             Some(info) => MigrationReport::from_pattern_matches_with_preprocessor(
                 app_name,
@@ -229,15 +302,41 @@ pub fn transform_tree_with_app_name(
         };
         file_reports.push(FileReport::from_report(entry.path.clone(), report));
     }
+    file_reports
+}
 
-    let tree_report =
-        TreeMigrationReport::from_files(app_name.to_string(), file_reports.clone());
+/// Rust path of `transform_tree_for_language_with_app_name`. Builds
+/// one `RustAnalyzer` reused across files; no preprocessor.
+#[cfg(feature = "rust")]
+fn transform_tree_rust(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport> {
+    use crate::rust_analyzer::RustAnalyzer;
 
-    TreeTransformResult {
-        entries,
-        file_reports,
-        tree_report,
+    let mut analyzer = RustAnalyzer::new();
+    let mut file_reports: Vec<FileReport> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let matches = analyzer.analyze(&entry.source);
+        let report = MigrationReport::from_pattern_matches(app_name, matches);
+        file_reports.push(FileReport::from_report(entry.path.clone(), report));
     }
+    file_reports
+}
+
+/// Run the C analyzer + transformer over a list of [`FileEntry`]s and
+/// produce per-file + tree-level reports. Equivalent to
+/// [`transform_tree_for_language`] with `Language::C`. Preserved as
+/// a non-breaking alias for M2 callers.
+pub fn transform_tree(entries: Vec<FileEntry>) -> TreeTransformResult {
+    transform_tree_for_language(entries, Language::C)
+}
+
+/// Like [`transform_tree`] but uses the provided `app_name` when
+/// building each per-file `MigrationReport`. The CLI passes the
+/// developer-supplied app name; the server uses a fixed string.
+pub fn transform_tree_with_app_name(
+    entries: Vec<FileEntry>,
+    app_name: &str,
+) -> TreeTransformResult {
+    transform_tree_for_language_with_app_name(entries, app_name, Language::C)
 }
 
 #[cfg(test)]
@@ -441,5 +540,112 @@ mod tests {
         // patterns means no manual review). The important property is
         // that transform_tree did not panic and continued.
         let _ = result.tree_report.clone();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // M3.C5 — walk_tree_for_language / transform_tree_for_language
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Make a small mixed Rust project: one `.rs` file, one `.c` file,
+    /// one `Makefile` (no extension match).
+    fn make_rust_project() -> TempDir {
+        let dir = TempDir::new("rust_proj");
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn main() {\n    let _ = std::net::TcpListener::bind(\"127.0.0.1:80\");\n}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("ignored.c"), "// C file we should not see\n").unwrap();
+        fs::write(dir.path().join("Makefile"), "# not Rust\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_walk_tree_for_language_rust_filters_to_rs() {
+        let dir = make_rust_project();
+        let entries = walk_tree_for_language(dir.path(), Language::Rust).expect("walk");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["main.rs"], "Rust walk should pick only .rs, got {:?}", paths);
+    }
+
+    #[test]
+    fn test_walk_tree_for_language_c_includes_h() {
+        // C walk must still include .h (regression check for the
+        // C path after the extension list moved into a function).
+        let dir = make_project();
+        let entries = walk_tree_for_language(dir.path(), Language::C).expect("walk");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"main.c"));
+        assert!(paths.contains(&"helper.h"));
+        assert!(!paths.iter().any(|p| p.ends_with(".rs")));
+    }
+
+    #[test]
+    fn test_transform_tree_default_alias_unchanged_for_c() {
+        // The M2 `transform_tree` alias must keep returning C reports
+        // for C inputs (regression check after introducing the
+        // language-aware variant).
+        let dir = make_tree_with_poll();
+        let entries = walk_tree(dir.path()).expect("walk");
+        let result = transform_tree(entries);
+        // Two C files with one socket + one poll → Partial at the
+        // tree level (matches the M2.C4 test).
+        use crate::report::MigrationStatus;
+        assert!(matches!(result.tree_report.status, MigrationStatus::Partial));
+        assert_eq!(result.file_reports.len(), 2);
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn test_transform_tree_for_language_rust_dispatches_to_rust_analyzer() {
+        let dir = make_rust_project();
+        let entries = walk_tree_for_language(dir.path(), Language::Rust).expect("walk");
+        let result = transform_tree_for_language(entries, Language::Rust);
+        assert_eq!(result.file_reports.len(), 1);
+        let main = &result.file_reports[0];
+        assert_eq!(main.path, "main.rs");
+        // The Rust analyzer should detect the TcpBind match.
+        // PatternInfo.pattern renders via Debug today, so the
+        // string form is "Rust(TcpBind)" — see report.rs. M3.C5
+        // keeps the existing Debug-format rendering for
+        // back-compat with C reports.
+        assert!(
+            main.patterns_detected
+                .iter()
+                .any(|p| p.pattern.contains("TcpBind")),
+            "expected a TcpBind detection in Rust report, got {:?}",
+            main.patterns_detected
+        );
+        // M3 wires the Rust analyzer through `analyze()` but the
+        // binary transformation still happens server-side via the
+        // `edge-migrate --transform` subprocess. The lib's local
+        // tree path reports the analysis only, mirroring the C path
+        // where the per-file transformed source is also produced by
+        // the subprocess. Confirm the manual_review list is empty
+        // (TcpBind is AutoTransformable, not BestEffort).
+        assert!(main.manual_review.is_empty());
+        // And no preprocessor info (Rust has none in v1).
+        assert!(main.preprocessor.is_none());
+    }
+
+    #[cfg(not(feature = "rust"))]
+    #[test]
+    fn test_transform_tree_for_language_rust_without_feature_records_failed_reports() {
+        // When the lib is built without the `rust` feature, asking
+        // for Rust produces explicit Failed reports (not silent empty
+        // results). This is the defense-in-depth contract for
+        // downstream consumers.
+        let dir = make_rust_project();
+        let entries = walk_tree_for_language(dir.path(), Language::Rust).expect("walk");
+        let result = transform_tree_for_language(entries, Language::Rust);
+        assert_eq!(result.file_reports.len(), 1);
+        let main = &result.file_reports[0];
+        use crate::report::MigrationStatus;
+        assert!(matches!(main.status, MigrationStatus::Failed));
+        assert!(
+            main.errors[0].message.contains("rust"),
+            "error message must mention the missing feature, got: {}",
+            main.errors[0].message
+        );
     }
 }

@@ -25,7 +25,11 @@ pub use patterns::{is_valid_deployment_app_name, Language, PatternKind, PatternM
 pub use preprocessor::{ExpandedSource, PreprocessError, Preprocessor, PreprocessorInfo};
 pub use report::{FileReport, MigrationReport, TreeMigrationReport};
 pub use transformer::{TransformResult, Transformer};
-pub use tree::{transform_tree, transform_tree_with_app_name, walk_tree, FileEntry, TreeTransformResult, WalkError};
+pub use tree::{
+    transform_tree, transform_tree_for_language, transform_tree_for_language_with_app_name,
+    transform_tree_with_app_name, walk_tree, walk_tree_for_language, FileEntry,
+    TreeTransformResult, WalkError,
+};
 
 #[cfg(feature = "rust")]
 pub use rust_analyzer::RustAnalyzer;
