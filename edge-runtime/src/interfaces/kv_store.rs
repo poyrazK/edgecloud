@@ -565,10 +565,14 @@ mod tests {
             let base = base.clone();
             move || {
                 let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
-                store_a.set("secret".into(), b"tenant_a_value".to_vec(), None).unwrap();
+                store_a
+                    .set("secret".into(), b"tenant_a_value".to_vec(), None)
+                    .unwrap();
 
                 let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
-                store_b.set("secret".into(), b"tenant_b_value".to_vec(), None).unwrap();
+                store_b
+                    .set("secret".into(), b"tenant_b_value".to_vec(), None)
+                    .unwrap();
 
                 // In-memory view is isolated.
                 assert_eq!(
@@ -611,7 +615,9 @@ mod tests {
             let base = base.clone();
             move || {
                 let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
-                store_a.set("user:1".into(), b"alice".to_vec(), None).unwrap();
+                store_a
+                    .set("user:1".into(), b"alice".to_vec(), None)
+                    .unwrap();
                 store_a.set("user:2".into(), b"bob".to_vec(), None).unwrap();
 
                 let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
@@ -635,8 +641,19 @@ mod tests {
     #[test]
     fn test_from_env_for_tenant_rejects_path_traversal() {
         let dangerous = [
-            "../escape", "../../etc", "/absolute", "a/b", ".", "..", "a\0b",
-            "CON", "NUL", "PRN", "AUX", "COM1", "LPT9",
+            "../escape",
+            "../../etc",
+            "/absolute",
+            "a/b",
+            ".",
+            "..",
+            "a\0b",
+            "CON",
+            "NUL",
+            "PRN",
+            "AUX",
+            "COM1",
+            "LPT9",
         ];
         for id in dangerous {
             assert!(

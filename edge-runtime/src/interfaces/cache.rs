@@ -246,7 +246,10 @@ impl Cache {
     /// Persistent cache scoped to a specific tenant.
     /// The cache file is `{EDGE_CACHE_PATH}/{tenant_id}/cache.json`.
     /// Returns `Ok(None)` if `EDGE_CACHE_PATH` is not set.
-    pub fn from_env_for_tenant(tenant_id: &str, max_entries: u32) -> Result<Option<Self>, CacheError> {
+    pub fn from_env_for_tenant(
+        tenant_id: &str,
+        max_entries: u32,
+    ) -> Result<Option<Self>, CacheError> {
         if !super::is_safe_tenant_id(tenant_id) {
             return Err(CacheError::InvalidTenantId(tenant_id.to_string()));
         }

@@ -155,7 +155,11 @@ impl RuntimeState {
             Ok(Some(store)) => Arc::new(store),
             Ok(None) => Arc::new(kv_store::KvStore::new()),
             Err(e) => {
-                tracing::error!(tenant_id, "KV store persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "KV store persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 Arc::new(kv_store::KvStore::new())
             }
         }
@@ -168,7 +172,11 @@ impl RuntimeState {
             Ok(Some(s)) => s,
             Ok(None) => scheduling::Scheduler::new(),
             Err(e) => {
-                tracing::error!(tenant_id, "scheduling persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "scheduling persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 scheduling::Scheduler::new()
             }
         }
@@ -181,7 +189,11 @@ impl RuntimeState {
             Ok(Some(c)) => Arc::new(c),
             Ok(None) => Arc::new(cache::Cache::new(1000)),
             Err(e) => {
-                tracing::error!(tenant_id, "cache persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "cache persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 Arc::new(cache::Cache::new(1000))
             }
         }
