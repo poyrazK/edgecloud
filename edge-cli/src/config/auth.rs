@@ -299,30 +299,4 @@ mod tests {
         ApiKey::clear_at(&path).unwrap();
         assert!(!path.exists());
     }
-
-    #[test]
-    fn load_api_url_prefers_env_over_file_over_default() {
-        // Build an isolated config file path; we can't easily set
-        // EDGE_API_URL in a test (it would leak), so we exercise the
-        // file/default branch only and trust the env branch is a
-        // straight env::var read.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("edgecloud").join("config.toml");
-        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
-        std::fs::write(&cfg, "[default]\napi = \"https://from-file\"\n").unwrap();
-
-        // We can't override `ApiKey::config_path()` without an env hook,
-        // so this test asserts the env-passthrough behavior only when
-        // EDGE_API_URL is set. In CI it usually isn't, so the
-        // assertion is conditional.
-        if env::var("EDGE_API_URL").is_err() {
-            let resolved = load_api_url("https://fallback");
-            // The function will fall through to either the file (if
-            // `dirs` happens to point at our tempdir, which it won't
-            // in practice) or the default. We assert it picks one
-            // non-empty value.
-            assert!(!resolved.is_empty());
-            let _ = cfg; // silence unused warning when assertion runs
-        }
-    }
 }

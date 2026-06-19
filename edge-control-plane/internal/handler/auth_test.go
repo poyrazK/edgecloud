@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,10 +184,10 @@ func TestWhoami_TenantServiceError(t *testing.T) {
 		t.Errorf("expected status 500, got: %d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !contains(body, `"error"`) {
+	if !strings.Contains(body, `"error"`) {
 		t.Errorf("expected JSON error field, got: %s", body)
 	}
-	if contains(body, "db connection refused") {
+	if strings.Contains(body, "db connection refused") {
 		t.Errorf("response should not leak raw error, got: %s", body)
 	}
 }
@@ -225,13 +226,4 @@ func TestWhoami_MissingContext(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected status 401 when context is empty, got: %d", rr.Code)
 	}
-}
-
-func contains(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

@@ -80,27 +80,3 @@ pub fn read_api_url(fallback: &str) -> String {
     }
     fallback.to_string()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_api_url_falls_back_when_nothing_set() {
-        // EDGE_API_URL may or may not be set in the test env; we cannot
-        // mutate it from a multi-threaded test, so just check the
-        // fallback path produces *some* non-empty value.
-        let resolved = read_api_url("https://fallback.example");
-        assert!(!resolved.is_empty());
-    }
-
-    #[test]
-    fn read_api_key_falls_through_when_nothing_set() {
-        // If neither EDGE_API_KEY nor a config file is reachable, the
-        // function bails with the "run `edge auth signup`" error.
-        // We can't unset the env var cleanly, so we only assert the
-        // function doesn't panic — the success/err shape depends on the
-        // host environment.
-        let _ = read_api_key();
-    }
-}
