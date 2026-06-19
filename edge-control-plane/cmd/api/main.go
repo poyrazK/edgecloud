@@ -72,7 +72,7 @@ func main() {
 	// Initialize services
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore)
+	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo)
 	deploymentSvc := service.NewDeploymentService(
 		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
 	)
@@ -92,6 +92,7 @@ func main() {
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
+	quotaHandler := handler.NewQuotaHandler(tenantSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -123,6 +124,7 @@ func main() {
 	api.HandleFunc("POST /api/apps/{appName}/env", envHandler.Set)
 	api.HandleFunc("GET /api/apps/{appName}/env", envHandler.List)
 	api.HandleFunc("DELETE /api/apps/{appName}/env/{key}", envHandler.Delete)
+	api.HandleFunc("GET /api/quotas", quotaHandler.GetQuota)
 	api.HandleFunc("POST /api/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/apps", appHandler.List)
 	api.HandleFunc("GET /api/apps/{appName}", appHandler.Get)

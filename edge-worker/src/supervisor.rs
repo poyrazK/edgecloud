@@ -169,7 +169,13 @@ impl Supervisor {
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
         let state_clone = self.state.clone();
-        let max_memory_mb = self.config.max_memory_mb;
+        // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
+        // falling back to the worker's config default otherwise.
+        let max_memory_mb = if spec.max_memory_mb > 0 {
+            spec.max_memory_mb
+        } else {
+            self.config.max_memory_mb
+        };
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
 

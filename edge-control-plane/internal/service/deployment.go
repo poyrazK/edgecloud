@@ -29,6 +29,9 @@ func IsValidAppName(name string) bool {
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
 const MaxArtifactSize = 100 * 1024 * 1024
 
+// Sentinel errors.
+var ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	deploymentRepo *repository.DeploymentRepository
@@ -91,7 +94,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, fmt.Errorf("counting deployments: %w", err)
 	}
 	if count >= quota.MaxDeployments {
-		return nil, fmt.Errorf("max deployments (%d) reached", quota.MaxDeployments)
+		return nil, ErrMaxDeploymentsQuotaExceeded
 	}
 
 	// Read artifact and compute hash (bounded to prevent memory exhaustion)
@@ -219,6 +222,15 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("tenant not found")
 	}
 
+	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
+	maxMemoryMB := 256
+	if quota != nil {
+		maxMemoryMB = quota.MaxMemoryMB
+	}
+
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
 		Timestamp: time.Now(),
@@ -229,6 +241,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
 				Allowlist:      tenant.AllowlistedDestinations,
+				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
 	}

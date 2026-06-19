@@ -24,6 +24,7 @@ pub struct AppSpec {
     pub env: HashMap<String, String>,
     #[allow(dead_code)]
     pub allowlist: Vec<String>,
+    pub max_memory_mb: u64,
 }
 
 /// HeartbeatMessage: published to `edgecloud.heartbeats.<region>` every 30s.

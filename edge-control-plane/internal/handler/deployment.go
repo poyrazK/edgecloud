@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -43,6 +44,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body))
 	if err != nil {
+		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
+			http.Error(w, `{"error": "max deployments quota exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
+		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
+			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return

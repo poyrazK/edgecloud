@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -18,6 +20,7 @@ type appRepoInterface interface {
 	Create(ctx context.Context, app *domain.App) error
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
 }
@@ -30,6 +33,7 @@ type AppService struct {
 	activeRepo    *repository.ActiveDeploymentRepository
 	deployRepo    *repository.DeploymentRepository
 	artifactStore *storage.ArtifactStore
+	quotaRepo     quotaRepoInterface
 }
 
 func NewAppService(
@@ -39,6 +43,7 @@ func NewAppService(
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
 	artifactStore *storage.ArtifactStore,
+	quotaRepo *repository.QuotaRepository,
 ) *AppService {
 	return &AppService{
 		db:            db,
@@ -47,15 +52,70 @@ func NewAppService(
 		appEnvRepo:    appEnvRepo,
 		deployRepo:    deploymentRepo,
 		artifactStore: artifactStore,
+		quotaRepo:     quotaRepo,
 	}
 }
 
-// Create creates a new app. Returns ErrAppAlreadyExists if it already exists.
+// Sentinel errors.
 var ErrAppAlreadyExists = fmt.Errorf("app already exists")
+var ErrMaxAppsQuotaExceeded = fmt.Errorf("max apps reached for tenant")
 
+// Create creates a new app. Returns ErrAppAlreadyExists if it already exists.
+// Returns ErrMaxAppsQuotaExceeded if the tenant has reached their MaxApps limit.
 func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error) {
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name: %s", appName)
+	}
+
+	// Serialize concurrent creates for the same tenant via SELECT FOR UPDATE.
+	// This prevents a TOCTOU race where two simultaneous creates both count N
+	// apps, both pass the quota check, and the tenant ends up with N+1 apps.
+	if s.db != nil {
+		tx, err := s.db.BeginTxx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("beginning transaction: %w", err)
+		}
+		defer tx.Rollback()
+
+		// Lock the tenant row for the duration of this transaction.
+		var tenantExists bool
+		err = tx.GetContext(ctx, &tenantExists, `SELECT true FROM tenants WHERE id = $1 FOR UPDATE`, tenantID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("tenant not found")
+			}
+			return nil, fmt.Errorf("locking tenant: %w", err)
+		}
+
+		// Check MaxApps quota while holding the lock.
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("getting quota: %w", err)
+		}
+		count, err := s.appRepo.CountByTenant(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("counting apps: %w", err)
+		}
+		if quota != nil && count >= quota.MaxApps {
+			return nil, ErrMaxAppsQuotaExceeded
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing transaction: %w", err)
+		}
+	} else {
+		// No DB available (test path) — check quota without the lock.
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("getting quota: %w", err)
+		}
+		count, err := s.appRepo.CountByTenant(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("counting apps: %w", err)
+		}
+		if quota != nil && count >= quota.MaxApps {
+			return nil, ErrMaxAppsQuotaExceeded
+		}
 	}
 
 	var desc *string
@@ -151,9 +211,23 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 
 // CreateIfNotExists creates an app if it doesn't already exist.
 // Idempotent — safe to call multiple times.
+// Returns ErrMaxAppsQuotaExceeded if the tenant has reached their MaxApps limit.
 func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName string) error {
 	if !IsValidAppName(appName) {
 		return fmt.Errorf("invalid app name: %s", appName)
+	}
+
+	// Check MaxApps quota before inserting.
+	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
+	count, err := s.appRepo.CountByTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("counting apps: %w", err)
+	}
+	if quota != nil && count >= quota.MaxApps {
+		return ErrMaxAppsQuotaExceeded
 	}
 
 	app := &domain.App{
@@ -164,7 +238,7 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		CreatedAt:   time.Now(),
 	}
 	// InsertIfNotExists uses INSERT ... ON CONFLICT DO NOTHING — inherently idempotent.
-	_, err := s.appRepo.InsertIfNotExists(ctx, app)
+	_, err = s.appRepo.InsertIfNotExists(ctx, app)
 	if err != nil {
 		return fmt.Errorf("creating app: %w", err)
 	}

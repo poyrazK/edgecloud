@@ -35,6 +35,7 @@ type AppConfig struct {
 	DeploymentHash string            `json:"deployment_hash"`
 	Env            map[string]string `json:"env"`
 	Allowlist      []string          `json:"allowlist"`
+	MaxMemoryMB    int               `json:"max_memory_mb"`
 }
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.

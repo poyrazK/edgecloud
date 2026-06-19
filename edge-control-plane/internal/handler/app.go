@@ -43,6 +43,10 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "app already exists"}`, http.StatusConflict)
 			return
 		}
+		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
+			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return

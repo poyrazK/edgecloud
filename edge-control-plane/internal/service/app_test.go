@@ -17,6 +17,7 @@ type mockAppRepo struct {
 	createFunc            func(ctx context.Context, app *domain.App) error
 	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	listFunc              func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	countByTenantFunc     func(ctx context.Context, tenantID string) (int, error)
 	atomicDeleteFunc      func(ctx context.Context, tenantID, appName string) (bool, error)
 	insertIfNotExistsFunc func(ctx context.Context, app *domain.App) (bool, error)
 }
@@ -42,6 +43,13 @@ func (m *mockAppRepo) List(ctx context.Context, tenantID string, limit, offset i
 	return nil, nil
 }
 
+func (m *mockAppRepo) CountByTenant(ctx context.Context, tenantID string) (int, error) {
+	if m.countByTenantFunc != nil {
+		return m.countByTenantFunc(ctx, tenantID)
+	}
+	return 0, nil
+}
+
 func (m *mockAppRepo) AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error) {
 	if m.atomicDeleteFunc != nil {
 		return m.atomicDeleteFunc(ctx, tenantID, appName)
@@ -56,12 +64,25 @@ func (m *mockAppRepo) InsertIfNotExists(ctx context.Context, app *domain.App) (b
 	return false, nil
 }
 
+// mockQuotaRepoForApps implements quotaRepoInterface for testing.
+type mockQuotaRepoForApps struct {
+	getByTenantIDFunc func(ctx context.Context, tenantID string) (*domain.Quota, error)
+}
+
+func (m *mockQuotaRepoForApps) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.getByTenantIDFunc != nil {
+		return m.getByTenantIDFunc(ctx, tenantID)
+	}
+	return &domain.Quota{MaxApps: 5, MaxMemoryMB: 256}, nil
+}
+
 // appSvcForTest builds an AppService with mock dependencies.
 // Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
 // Delete is not testable without a real DB connection for repository.Transaction.
-func appSvcForTest(repo appRepoInterface) *AppService {
+func appSvcForTest(repo appRepoInterface, quotaRepo quotaRepoInterface) *AppService {
 	return &AppService{
-		appRepo: repo,
+		appRepo:   repo,
+		quotaRepo: quotaRepo,
 	}
 }
 
@@ -73,7 +94,7 @@ func TestAppService_Create_HappyPath(t *testing.T) {
 			return true, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	app, err := svc.Create(context.Background(), "t_tenant1", "my-app", &domain.CreateAppRequest{
 		Description: "my description",
@@ -104,7 +125,7 @@ func TestAppService_Create_AlreadyExists(t *testing.T) {
 			return false, nil // already exists
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	app, err := svc.Create(context.Background(), "t_tenant1", "existing-app", &domain.CreateAppRequest{})
 	if !errors.Is(err, ErrAppAlreadyExists) {
@@ -128,7 +149,7 @@ func TestAppService_Create_InvalidName(t *testing.T) {
 		{"path traversal combo", "../etc"},
 	}
 	repo := &mockAppRepo{}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -146,11 +167,64 @@ func TestAppService_Create_DBError(t *testing.T) {
 			return false, errors.New("db error")
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	_, err := svc.Create(context.Background(), "t_tenant1", "valid-app", &domain.CreateAppRequest{})
 	if err == nil {
 		t.Error("Create() error = nil, want non-nil")
+	}
+}
+
+func TestAppService_Create_MaxAppsExceeded(t *testing.T) {
+	repo := &mockAppRepo{
+		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
+			return true, nil
+		},
+		countByTenantFunc: func(ctx context.Context, tenantID string) (int, error) {
+			return 1, nil // tenant already has 1 app
+		},
+	}
+	quotaRepo := &mockQuotaRepoForApps{
+		getByTenantIDFunc: func(ctx context.Context, tenantID string) (*domain.Quota, error) {
+			return &domain.Quota{MaxApps: 1}, nil
+		},
+	}
+	svc := appSvcForTest(repo, quotaRepo)
+
+	_, err := svc.Create(context.Background(), "t_tenant1", "another-app", &domain.CreateAppRequest{})
+	if !errors.Is(err, ErrMaxAppsQuotaExceeded) {
+		t.Errorf("Create() error = %v, want ErrMaxAppsQuotaExceeded", err)
+	}
+}
+
+func TestAppService_CreateIfNotExists_MaxAppsExceeded(t *testing.T) {
+	repo := &mockAppRepo{
+		countByTenantFunc: func(ctx context.Context, tenantID string) (int, error) {
+			return 4, nil
+		},
+	}
+	quotaRepo := &mockQuotaRepoForApps{
+		getByTenantIDFunc: func(ctx context.Context, tenantID string) (*domain.Quota, error) {
+			return &domain.Quota{MaxApps: 5}, nil
+		},
+	}
+	// This case: count (4) < MaxApps (5) → should not error
+	svc := appSvcForTest(repo, quotaRepo)
+	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "new-app")
+	if err != nil {
+		t.Errorf("CreateIfNotExists() error = %v, want nil (under quota)", err)
+	}
+
+	// Now exhaust the quota
+	quotaRepo.getByTenantIDFunc = func(ctx context.Context, tenantID string) (*domain.Quota, error) {
+		return &domain.Quota{MaxApps: 1}, nil
+	}
+	repo.countByTenantFunc = func(ctx context.Context, tenantID string) (int, error) {
+		return 1, nil
+	}
+	err = svc.CreateIfNotExists(context.Background(), "t_tenant1", "yet-another-app")
+	if !errors.Is(err, ErrMaxAppsQuotaExceeded) {
+		t.Errorf("CreateIfNotExists() error = %v, want ErrMaxAppsQuotaExceeded", err)
 	}
 }
 
@@ -160,7 +234,7 @@ func TestAppService_Get_NotFound(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	app, err := svc.Get(context.Background(), "t_tenant1", "nonexistent")
 	if err != nil {
@@ -183,7 +257,7 @@ func TestAppService_Get_Found(t *testing.T) {
 			return existing, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	app, err := svc.Get(context.Background(), "t_tenant1", "my-app")
 	if err != nil {
@@ -207,7 +281,7 @@ func TestAppService_List_HappyPath(t *testing.T) {
 			return apps, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
 	if err != nil {
@@ -224,7 +298,7 @@ func TestAppService_List_Empty(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
 	if err != nil {
@@ -238,12 +312,15 @@ func TestAppService_List_Empty(t *testing.T) {
 func TestAppService_CreateIfNotExists_HappyPath(t *testing.T) {
 	var createdApp *domain.App
 	repo := &mockAppRepo{
+		countByTenantFunc: func(ctx context.Context, tenantID string) (int, error) {
+			return 0, nil
+		},
 		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
 			createdApp = app
 			return true, nil
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "new-app")
 	if err != nil {
@@ -258,11 +335,14 @@ func TestAppService_CreateIfNotExists_Idempotent(t *testing.T) {
 	// When app already exists, InsertIfNotExists returns false, no error.
 	// The operation should still succeed (idempotent).
 	repo := &mockAppRepo{
+		countByTenantFunc: func(ctx context.Context, tenantID string) (int, error) {
+			return 0, nil
+		},
 		insertIfNotExistsFunc: func(ctx context.Context, app *domain.App) (bool, error) {
 			return false, nil // already existed
 		},
 	}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "existing-app")
 	if err != nil {
@@ -272,7 +352,7 @@ func TestAppService_CreateIfNotExists_Idempotent(t *testing.T) {
 
 func TestAppService_CreateIfNotExists_InvalidName(t *testing.T) {
 	repo := &mockAppRepo{}
-	svc := appSvcForTest(repo)
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
 	err := svc.CreateIfNotExists(context.Background(), "t_tenant1", "")
 	if err == nil {

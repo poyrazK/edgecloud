@@ -69,6 +69,14 @@ func (r *AppRepository) AtomicDelete(ctx context.Context, tenantID, appName stri
 	return deleted, err
 }
 
+// CountByTenant returns the number of apps for a tenant.
+func (r *AppRepository) CountByTenant(ctx context.Context, tenantID string) (int, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM apps WHERE tenant_id = $1`
+	err := r.db.GetContext(ctx, &count, query, tenantID)
+	return count, err
+}
+
 // InsertIfNotExists inserts an app only if no app with this tenant+name exists.
 // Returns true if a row was inserted, false if it already existed.
 func (r *AppRepository) InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error) {

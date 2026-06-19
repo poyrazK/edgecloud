@@ -15,6 +15,7 @@ type TenantServiceInterface interface {
 	BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error)
 	CreateTenant(ctx context.Context, name, plan string) (*domain.Tenant, error)
 	GetTenant(ctx context.Context, id string) (*domain.TenantWithQuota, error)
+	GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error)
 	ListTenants(ctx context.Context) ([]domain.Tenant, error)
 	UpdateTenant(ctx context.Context, t *domain.Tenant) error
 	DeleteTenant(ctx context.Context, id string) error
@@ -133,6 +134,10 @@ func (s *TenantService) GetTenant(ctx context.Context, id string) (*domain.Tenan
 	}
 
 	return &domain.TenantWithQuota{Tenant: *tenant, Quota: *quota}, nil
+}
+
+func (s *TenantService) GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	return s.quotaRepo.GetByTenantID(ctx, tenantID)
 }
 
 func (s *TenantService) ListTenants(ctx context.Context) ([]domain.Tenant, error) {
