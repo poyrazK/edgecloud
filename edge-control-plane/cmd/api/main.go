@@ -109,7 +109,8 @@ func main() {
 
 	// Public endpoints (no auth required)
 	mux.HandleFunc("POST /api/tenants", tenantHandler.Bootstrap) // Self-signup: create tenant + first API key
-	mux.HandleFunc("POST /api/keys", apiKeyHandler.Create)       // Create API key (would need tenant creation first)
+	// POST /api/keys lives in the authenticated api mux below — it reads
+	// tenant_id from the auth context, which only the middleware populates.
 
 	// Protected API routes
 	api := http.NewServeMux()
@@ -126,6 +127,7 @@ func main() {
 	api.HandleFunc("POST /api/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/apps", appHandler.List)
 	api.HandleFunc("GET /api/apps/{appName}", appHandler.Get)
+	api.HandleFunc("POST /api/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/keys/{keyID}", apiKeyHandler.Delete)
 

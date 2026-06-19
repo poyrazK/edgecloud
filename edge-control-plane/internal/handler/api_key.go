@@ -12,10 +12,10 @@ import (
 
 // APIKeyHandler handles API key HTTP requests.
 type APIKeyHandler struct {
-	apiKeySvc *service.APIKeyService
+	apiKeySvc service.APIKeyServiceInterface
 }
 
-func NewAPIKeyHandler(apiKeySvc *service.APIKeyService) *APIKeyHandler {
+func NewAPIKeyHandler(apiKeySvc service.APIKeyServiceInterface) *APIKeyHandler {
 	return &APIKeyHandler{apiKeySvc: apiKeySvc}
 }
 
@@ -33,6 +33,14 @@ type CreateAPIKeyResponse struct {
 
 func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
+	// Defensive guard: this handler must only run behind the auth
+	// middleware. If it ever gets re-registered on a public route by
+	// mistake, refuse rather than call CreateAPIKey with an empty
+	// tenant_id (which would FK-violate the tenants table).
+	if tenantID == "" {
+		http.Error(w, `{"error": "authentication required"}`, http.StatusUnauthorized)
+		return
+	}
 
 	var req CreateAPIKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
