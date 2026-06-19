@@ -1,9 +1,12 @@
-//! In-memory routing table: app_name → {worker_addr, port}.
+//! In-memory routing table: `(tenant_id, app_name)` → {worker_addr, port}.
 //!
 //! The table is updated on every heartbeat and pruned periodically to drop
 //! entries that haven't been refreshed within `stale_after`. v1 keeps a single
-//! entry per app_name (the freshest one seen). Multi-worker-per-app is a v2
-//! concern (#85 autoscale) and will turn this into `Vec<RouteEntry>` per key.
+//! entry per `(tenant, app)` key (the freshest one seen), so two tenants
+//! deploying the same app name never collide on the routing table — their
+//! routes are kept under separate keys even though they share the same
+//! `app_name`. Multi-worker-per-app is a v2 concern (#85 autoscale) and
+//! will turn each entry into `Vec<RouteEntry>`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -19,8 +22,25 @@ pub struct RouteEntry {
     pub last_seen: Instant,
 }
 
+/// Composite key. Two tenants may share an `app_name`; their routes must
+/// not collide.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct AppKey {
+    pub tenant_id: String,
+    pub app_name: String,
+}
+
+impl AppKey {
+    pub fn new(tenant_id: impl Into<String>, app_name: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            app_name: app_name.into(),
+        }
+    }
+}
+
 pub struct RoutingTable {
-    inner: RwLock<HashMap<String, RouteEntry>>,
+    inner: RwLock<HashMap<AppKey, RouteEntry>>,
 }
 
 impl RoutingTable {
@@ -38,9 +58,10 @@ impl Default for RoutingTable {
 }
 
 impl RoutingTable {
-    /// Upsert a route. Per `app_name`, the freshest entry wins — if a stale
-    /// entry exists, it's overwritten by the new one. Only `status == "running"`
-    /// apps are routable; other statuses are dropped.
+    /// Upsert a route under `(tenant_id, app_name)`. The freshest entry
+    /// wins — if a stale entry exists, it's overwritten by the new one.
+    /// Only `status == "running"` apps are routable; other statuses
+    /// remove the entry under this key.
     pub async fn upsert(
         &self,
         tenant_id: &str,
@@ -49,13 +70,14 @@ impl RoutingTable {
         port: u16,
         status: &str,
     ) {
+        let key = AppKey::new(tenant_id, app_name);
         if status != "running" {
-            self.remove(app_name).await;
+            self.remove(&key).await;
             return;
         }
         let mut inner = self.inner.write().await;
         inner.insert(
-            app_name.to_string(),
+            key,
             RouteEntry {
                 tenant_id: tenant_id.to_string(),
                 app_name: app_name.to_string(),
@@ -66,19 +88,18 @@ impl RoutingTable {
         );
     }
 
-    /// Remove a single app_name (called when a heartbeat reports it
-    /// non-running or stopped).
-    pub async fn remove(&self, app_name: &str) {
+    /// Remove the entry under a single `(tenant_id, app_name)` key.
+    pub async fn remove(&self, key: &AppKey) {
         let mut inner = self.inner.write().await;
-        inner.remove(app_name);
+        inner.remove(key);
     }
 
-    /// Drop entries whose `last_seen` is older than `older_than`. Returns the
-    /// list of removed app_names so the caller can log them.
-    pub async fn remove_stale(&self, older_than: Duration) -> Vec<String> {
+    /// Drop entries whose `last_seen` is older than `older_than`. Returns
+    /// the list of removed keys so the caller can log them.
+    pub async fn remove_stale(&self, older_than: Duration) -> Vec<AppKey> {
         let mut inner = self.inner.write().await;
         let cutoff = Instant::now() - older_than;
-        let stale: Vec<String> = inner
+        let stale: Vec<AppKey> = inner
             .iter()
             .filter(|(_, e)| e.last_seen < cutoff)
             .map(|(k, _)| k.clone())
@@ -122,13 +143,50 @@ mod tests {
     async fn upsert_overwrites_existing_with_freshest() {
         let t = RoutingTable::new();
         t.upsert("t_a", "api", "1.2.3.4", 8081, "running").await;
-        // A heartbeat for the same app from a different worker (e.g. after a
-        // worker restart and a re-assignment) replaces the prior entry.
+        // A heartbeat for the same (tenant, app) from a different worker
+        // (e.g. after a worker restart and a re-assignment) replaces
+        // the prior entry.
         t.upsert("t_a", "api", "5.6.7.8", 8082, "running").await;
         let snap = t.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].worker_addr, "5.6.7.8");
         assert_eq!(snap[0].port, 8082);
+    }
+
+    /// The whole point of the composite key: two tenants with the same
+    /// `app_name` keep their routes independent. Without the composite
+    /// key, one tenant's entry would silently clobber the other.
+    #[tokio::test]
+    async fn cross_tenant_apps_with_same_name_dont_collide() {
+        let t = RoutingTable::new();
+        t.upsert("t_a", "api", "1.2.3.4", 8081, "running").await;
+        t.upsert("t_b", "api", "5.6.7.8", 9000, "running").await;
+
+        let snap = t.snapshot().await;
+        assert_eq!(snap.len(), 2, "both tenants' routes must coexist");
+
+        let by_tenant: std::collections::HashMap<&str, &RouteEntry> =
+            snap.iter().map(|e| (e.tenant_id.as_str(), e)).collect();
+        assert_eq!(by_tenant["t_a"].worker_addr, "1.2.3.4");
+        assert_eq!(by_tenant["t_a"].port, 8081);
+        assert_eq!(by_tenant["t_b"].worker_addr, "5.6.7.8");
+        assert_eq!(by_tenant["t_b"].port, 9000);
+    }
+
+    /// Companion to the above: removing one tenant's crashed app must
+    /// not touch the other tenant's still-running entry.
+    #[tokio::test]
+    async fn removing_one_tenant_does_not_affect_others_with_same_app_name() {
+        let t = RoutingTable::new();
+        t.upsert("t_a", "api", "1.2.3.4", 8081, "running").await;
+        t.upsert("t_b", "api", "5.6.7.8", 9000, "running").await;
+
+        t.upsert("t_a", "api", "1.2.3.4", 8081, "crashed").await;
+        assert_eq!(t.len().await, 1);
+
+        let snap = t.snapshot().await;
+        assert_eq!(snap[0].tenant_id, "t_b");
+        assert_eq!(snap[0].worker_addr, "5.6.7.8");
     }
 
     #[tokio::test]
@@ -152,7 +210,11 @@ mod tests {
         t.upsert("t_a", "web", "1.2.3.4", 8082, "running").await;
 
         let removed = t.remove_stale(Duration::from_millis(10)).await;
-        assert_eq!(removed, vec!["api".to_string()]);
+        assert_eq!(
+            removed,
+            vec![AppKey::new("t_a", "api")],
+            "only the (t_a, api) key should be removed"
+        );
         assert_eq!(t.len().await, 1);
     }
 }

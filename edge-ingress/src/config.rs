@@ -2,6 +2,19 @@
 
 use anyhow::Context;
 
+/// Suffix for every public hostname the ingress serves. Must stay in sync
+/// with the Go control plane's `domain.IngressHostSuffix` (in
+/// `edge-control-plane/internal/domain/worker.go`) — drift between the
+/// two produces 404s for every public URL the control plane has
+/// advertised to tenants. Re-branding (e.g. to `edgecloud.run`) is a
+/// single-line change in each language.
+pub const INGRESS_HOST_SUFFIX: &str = "edgecloud.dev";
+
+/// Render the public hostname for a `(tenant_id, app_name)` pair.
+pub fn ingress_host(tenant_id: &str, app_name: &str) -> String {
+    format!("{}-{}.{}", tenant_id, app_name, INGRESS_HOST_SUFFIX)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub nats_url: String,

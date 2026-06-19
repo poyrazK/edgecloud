@@ -28,6 +28,12 @@ use edge_ingress::config::Config;
 use edge_ingress::heartbeats;
 use edge_ingress::routing::RoutingTable;
 
+// TODO(shared-test-harness): this helper and the `start_nats`
+// testcontainers setup below are byte-for-byte copies of the same code
+// in `edge-worker/tests/integration_tests.rs`. Extract both into a
+// shared `edge-test-helpers` crate (workspace-relative) so a future
+// change to the test-skip policy or the NATS startup contract lands in
+// one place.
 fn should_skip_integration_tests() -> bool {
     std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
         || std::env::var("CI").is_ok()

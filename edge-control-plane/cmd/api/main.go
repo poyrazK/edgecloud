@@ -68,7 +68,7 @@ func main() {
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 	appHandler := handler.NewAppHandler(appSvc)
@@ -103,6 +103,7 @@ func main() {
 	api.HandleFunc("POST /api/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/apps", appHandler.List)
 	api.HandleFunc("GET /api/apps/{appName}", appHandler.Get)
+	api.HandleFunc("GET /api/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/keys/{keyID}", apiKeyHandler.Delete)
 
@@ -129,7 +130,6 @@ func main() {
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
-	internalMux.HandleFunc("GET /api/internal/apps/{appName}/ingress", internalHandler.AppIngress)
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,

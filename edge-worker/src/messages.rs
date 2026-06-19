@@ -52,7 +52,10 @@ pub struct AppStatus {
     /// Number of HTTP requests handled since last heartbeat.
     pub request_count: u64,
     /// Tenant the app belongs to. Used by the public ingress to render the
-    /// host (`<tenant_id>-<app_name>.edgecloud.dev`).
+    /// host (`<tenant_id>-<app_name>.edgecloud.dev` — see
+    /// `edge-ingress::config::ingress_host` and
+    /// `edge-control-plane/internal/domain.IngressHost`; the suffix lives
+    /// in `edge-ingress::config::INGRESS_HOST_SUFFIX`).
     pub tenant_id: String,
     /// Port the app's HTTP server is listening on, on the worker host.
     /// Used by the public ingress to dial the upstream.

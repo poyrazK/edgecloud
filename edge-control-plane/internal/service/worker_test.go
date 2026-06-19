@@ -11,14 +11,14 @@ import (
 
 // mockWorkerRepo implements workerRepoInterface for testing.
 type mockWorkerRepo struct {
-	upsertFunc              func(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
-	countByTenantFunc       func(ctx context.Context, tenantID string) (int, error)
-	deleteFunc              func(ctx context.Context, id string) error
-	listByTenantFunc        func(ctx context.Context, tenantID string) ([]domain.Worker, error)
-	updateLastSeenFunc      func(ctx context.Context, id string) error
-	updateAddrFunc          func(ctx context.Context, id, addr string) error
-	upsertStatusFunc        func(ctx context.Context, ws *domain.WorkerStatus) error
-	listRunningAppTargetsFn func(ctx context.Context) ([]domain.AppTarget, error)
+	upsertFunc               func(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
+	countByTenantFunc        func(ctx context.Context, tenantID string) (int, error)
+	deleteFunc               func(ctx context.Context, id string) error
+	listByTenantFunc         func(ctx context.Context, tenantID string) ([]domain.Worker, error)
+	updateLastSeenFunc       func(ctx context.Context, id string) error
+	updateAddrFunc           func(ctx context.Context, id, addr string) error
+	upsertStatusFunc         func(ctx context.Context, ws *domain.WorkerStatus) error
+	listRunningAppTargetFunc func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -45,11 +45,11 @@ func (m *mockWorkerRepo) UpdateAddr(ctx context.Context, id, addr string) error 
 func (m *mockWorkerRepo) UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error {
 	return m.upsertStatusFunc(ctx, ws)
 }
-func (m *mockWorkerRepo) ListRunningAppTargets(ctx context.Context) ([]domain.AppTarget, error) {
-	if m.listRunningAppTargetsFn == nil {
+func (m *mockWorkerRepo) ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error) {
+	if m.listRunningAppTargetFunc == nil {
 		return nil, nil
 	}
-	return m.listRunningAppTargetsFn(ctx)
+	return m.listRunningAppTargetFunc(ctx, tenantID, appName)
 }
 
 // mockQuotaRepo implements quotaRepoInterface for testing.
@@ -404,7 +404,7 @@ func TestWorkerService_HandleHeartbeat(t *testing.T) {
 				t.Errorf("UpdateAddr addr = %q, want %q", gotAddr, tt.wantAddr)
 			}
 			// Persisted apps blob must include the new port and tenant_id fields
-			// so the ingress query (`ListRunningAppTargets`) can extract them.
+			// so the ingress query (`ListRunningAppTarget`) can extract them.
 			if gotAppsPersist != tt.wantAppsPersist {
 				t.Errorf("persisted apps = %s, want %s", gotAppsPersist, tt.wantAppsPersist)
 			}
@@ -412,23 +412,60 @@ func TestWorkerService_HandleHeartbeat(t *testing.T) {
 	}
 }
 
-func TestWorkerService_ListRunningAppTargets(t *testing.T) {
-	want := []domain.AppTarget{
-		{AppName: "myapp", TenantID: "t_test", WorkerID: "w_fra_abc", Region: "fra", WorkerAddr: "203.0.113.10", Port: 8081},
+func TestWorkerService_GetAppTarget(t *testing.T) {
+	want := domain.AppTarget{
+		AppName: "myapp", TenantID: "t_test", WorkerID: "w_fra_abc", Region: "fra", WorkerAddr: "203.0.113.10", Port: 8081,
 	}
-	wr := &mockWorkerRepo{
-		listRunningAppTargetsFn: func(ctx context.Context) ([]domain.AppTarget, error) {
-			return want, nil
+	tests := []struct {
+		name      string
+		repoRows  []domain.AppTarget
+		wantNil   bool
+		wantFirst *domain.AppTarget
+	}{
+		{
+			name:      "single row found",
+			repoRows:  []domain.AppTarget{want},
+			wantNil:   false,
+			wantFirst: &want,
+		},
+		{
+			name:     "no rows found",
+			repoRows: nil,
+			wantNil:  true,
 		},
 	}
-	qr := &mockQuotaRepo{}
-	svc := workerSvcForTest(wr, qr)
 
-	got, err := svc.ListRunningAppTargets(context.Background())
-	if err != nil {
-		t.Fatalf("ListRunningAppTargets() error = %v", err)
-	}
-	if len(got) != 1 || got[0].AppName != "myapp" || got[0].Port != 8081 {
-		t.Errorf("ListRunningAppTargets() = %+v, want %+v", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotTenantID, gotAppName string
+			wr := &mockWorkerRepo{
+				listRunningAppTargetFunc: func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error) {
+					gotTenantID, gotAppName = tenantID, appName
+					return tt.repoRows, nil
+				},
+			}
+			qr := &mockQuotaRepo{}
+			svc := workerSvcForTest(wr, qr)
+
+			got, err := svc.GetAppTarget(context.Background(), "t_test", "myapp")
+			if err != nil {
+				t.Fatalf("GetAppTarget() error = %v", err)
+			}
+			if gotTenantID != "t_test" || gotAppName != "myapp" {
+				t.Errorf("repo called with (%q, %q), want (t_test, myapp)", gotTenantID, gotAppName)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("GetAppTarget() = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("GetAppTarget() = nil, want %+v", tt.wantFirst)
+			}
+			if *got != *tt.wantFirst {
+				t.Errorf("GetAppTarget() = %+v, want %+v", *got, *tt.wantFirst)
+			}
+		})
 	}
 }

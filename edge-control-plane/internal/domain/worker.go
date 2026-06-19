@@ -71,3 +71,16 @@ func IsValidWorkerID(id string) bool {
 	}
 	return len(parts[0]) > 0 && len(parts[1]) > 0
 }
+
+// IngressHostSuffix is the wildcard DNS suffix the public ingress serves.
+// MUST stay in sync with the Rust ingress's INGRESS_HOST_SUFFIX constant
+// (edge-ingress/src/config.rs) and the hostname rendered by the ingress's
+// Caddyfile JSON. A drift between the two produces 404s for every public
+// URL the control plane has advertised to tenants.
+const IngressHostSuffix = "edgecloud.dev"
+
+// IngressHost returns the public hostname for a (tenant, app) pair.
+// Example: IngressHost("t_acme", "api") == "t_acme-api.edgecloud.dev".
+func IngressHost(tenantID, appName string) string {
+	return tenantID + "-" + appName + "." + IngressHostSuffix
+}

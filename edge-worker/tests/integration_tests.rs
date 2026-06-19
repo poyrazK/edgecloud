@@ -34,6 +34,13 @@ use edge_worker::port_pool::PortPool;
 use edge_worker::state::{AppInstanceStatus, WorkerState};
 use edge_worker::supervisor::Supervisor;
 
+// TODO(shared-test-harness): this helper is a byte-for-byte copy of the
+// same code in `edge-ingress/tests/integration.rs`. Extract both
+// `should_skip_integration_tests` and the testcontainers NATS startup
+// into a shared `edge-test-helpers` crate (workspace-relative) so a
+// future change to the test-skip policy or NATS startup contract lands
+// in one place.
+
 /// Returns true if integration tests should be skipped (e.g., in CI environments
 /// where Docker is unavailable or unreliable for container tests).
 fn should_skip_integration_tests() -> bool {

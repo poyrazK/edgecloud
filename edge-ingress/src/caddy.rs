@@ -4,8 +4,11 @@
 //! We render the full Caddyfile-JSON in Rust and `POST /load` it on every
 //! routing change. The config is small (one route per app) and the round
 //! trip is fast (~50ms for thousands of routes), so a full reload is fine
-//! for v1. If the route count exceeds ~10k, switch to incremental
-//! `PUT /id/<id>/apps/http/servers/edge_https/routes/<n>` patches.
+//! for v1.
+//!
+//! TODO(incremental-caddy): when route count exceeds ~10k, switch to
+//! `PUT /id/<id>/apps/http/servers/edge_https/routes/<n>` patches and
+//! track per-route handles in the `RoutingTable` snapshot.
 
 use std::time::Duration;
 
@@ -13,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use crate::config::Config;
+use crate::config::{ingress_host, Config};
 use crate::routing::RouteEntry;
 
 const SERVER_NAME_HTTPS: &str = "edge_https";
@@ -75,7 +78,7 @@ pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
     let routes: Vec<Value> = sorted
         .iter()
         .map(|e| {
-            let host = format!("{}-{}.edgecloud.dev", e.tenant_id, e.app_name);
+            let host = ingress_host(&e.tenant_id, &e.app_name);
             json!({
                 "match": [{"host": [host]}],
                 "handle": [{

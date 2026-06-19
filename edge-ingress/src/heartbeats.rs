@@ -59,8 +59,9 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
     while let Some(msg) = subscription.next().await {
         match serde_json::from_slice::<HeartbeatMessage>(&msg.payload) {
             Ok(hb) => {
-                handle_one(&table, &hb).await;
-                render_notify.notify_one();
+                if handle_one(&table, &hb).await {
+                    render_notify.notify_one();
+                }
             }
             Err(e) => {
                 warn!(err = %e, "failed to parse heartbeat; ignoring");
@@ -71,22 +72,21 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>)
     Err(anyhow::anyhow!("NATS subscription stream ended"))
 }
 
-async fn handle_one(table: &RoutingTable, hb: &HeartbeatMessage) {
+/// Returns `true` iff at least one app caused a table mutation. The caller
+/// uses this to skip the Caddy reload notify when the heartbeat carried no
+/// usable routing data (e.g. a legacy worker that hasn't published
+/// `worker_addr` yet — pre-#70 workers that don't carry a port will fail
+/// to deserialize at the `serde_json::from_slice` call site above, which
+/// is the intended hard-cutover behaviour).
+async fn handle_one(table: &RoutingTable, hb: &HeartbeatMessage) -> bool {
     let worker_addr = hb.worker_addr.as_deref().unwrap_or("");
+    if worker_addr.is_empty() {
+        warn!("heartbeat has no worker_addr; cannot route any apps from it");
+        return false;
+    }
+    let mut changed = false;
     for (app_name, app) in &hb.apps {
-        let Some(port) = app.port else {
-            // No port means the worker hasn't told us where to dial. Skip
-            // but don't remove the prior entry — a transient heartbeat
-            // without a port shouldn't drop the route.
-            continue;
-        };
-        if worker_addr.is_empty() {
-            warn!(
-                app = %app_name,
-                "heartbeat has no worker_addr; cannot route this app"
-            );
-            continue;
-        }
+        let port = app.port;
         debug!(
             app = %app_name,
             tenant = %app.tenant_id,
@@ -98,7 +98,9 @@ async fn handle_one(table: &RoutingTable, hb: &HeartbeatMessage) {
         table
             .upsert(&app.tenant_id, app_name, worker_addr, port, &app.status)
             .await;
+        changed = true;
     }
+    changed
 }
 
 fn spawn_renderer(

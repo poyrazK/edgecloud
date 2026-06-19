@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -16,10 +17,11 @@ import (
 // DeploymentHandler handles deployment HTTP requests.
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
+	workerSvc     service.AppTargetLookup
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService) *DeploymentHandler {
-	return &DeploymentHandler{deploymentSvc: deploymentSvc}
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
+	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc}
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +53,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":   deployment.ID,
 		"hash": deployment.Hash,
-		"url":  "https://" + tenantID + "-" + appName + ".edgecloud.dev",
+		"url":  "https://" + domain.IngressHost(tenantID, appName),
 	})
 }
 
@@ -136,9 +138,59 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(deployment)
 }
 
+// containsPathTraversal blocks the *decoded* traversal shapes ("/", "\\",
+// ".."). The caller is responsible for passing a value that has already
+// been percent-decoded — e.g. http.Request.PathValue (used by AppIngress
+// and Deploy), or an explicit url.PathUnescape for body fields. Encoding
+// bypasses (e.g. %2F, %2E%2E) are intentionally not caught here because
+// the input is already decoded by the time this helper sees it; the
+// helper's job is to reject post-decode traversal, not to decode.
 func containsPathTraversal(s string) bool {
 	if s == "" {
 		return true
 	}
 	return strings.ContainsAny(s, "/\\") || strings.Contains(s, "..")
+}
+
+// AppIngress handles GET /api/apps/{appName}/ingress — tenant-authenticated
+// diagnostic that returns whether the calling tenant's app is currently
+// routable on a worker (and on which addr/port). Used by the CLI's
+// `edge status` to validate that a `live_url` is actually live. The
+// tenant filter is applied at the SQL level so a tenant cannot learn
+// about another tenant's apps.
+func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+	if appName == "" || containsPathTraversal(appName) {
+		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		return
+	}
+
+	target, err := h.workerSvc.GetAppTarget(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if target == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ready":    false,
+			"app_name": appName,
+			"reason":   "no running app found for this tenant",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ready":       true,
+		"app_name":    target.AppName,
+		"tenant_id":   target.TenantID,
+		"worker_id":   target.WorkerID,
+		"region":      target.Region,
+		"worker_addr": target.WorkerAddr,
+		"port":        target.Port,
+	})
 }
