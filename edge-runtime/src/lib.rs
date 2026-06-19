@@ -8,6 +8,9 @@ pub mod metering;
 pub mod runtime;
 pub mod store;
 
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+pub mod streams;
+
 pub mod interfaces;
 
 // Generated WIT bindings — creates edge_runtime module at crate root

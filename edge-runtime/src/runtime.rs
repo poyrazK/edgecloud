@@ -1,20 +1,32 @@
 //! Root runtime state — implements all WIT Host traits.
 
 use crate::edge::cloud::cache::Host as CacheHost;
-use crate::edge::cloud::http_client::{Host as HttpClientHost, Request, Response};
-use crate::edge::cloud::http_server::Host as HttpServerHost;
+use crate::edge::cloud::http_client::{
+    Host as HttpClientHost, Request, RequestBodySource, Response, ResponseBodySource,
+};
+use crate::edge::cloud::http_server::{
+    BodySource as HttpServerBodySource, Host as HttpServerHost, IncomingRequest,
+};
 use crate::edge::cloud::kv_store::Host as KvStoreHost;
 use crate::edge::cloud::networking::Host as NetworkingHost;
 use crate::edge::cloud::observe::Host as ObserveHost;
 use crate::edge::cloud::process::Host as ProcessHost;
 use crate::edge::cloud::scheduling::Host as SchedulingHost;
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+use crate::edge::cloud::streams::Host as StreamsHost;
 use crate::edge::cloud::time::Host as TimeHost;
+#[cfg(feature = "http-server")]
+use crate::interfaces::http_server::BodySource as HttpServerInternalBodySource;
 use crate::interfaces::{
     cache, http_client, http_server, kv_store, networking, observe, process, scheduling, time,
 };
 use crate::metering::RequestMeter;
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+use crate::streams::{IncomingEntry, OutgoingEntry};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+use std::sync::Mutex as StdMutex;
 
 pub struct RuntimeState {
     pub http_client: http_client::HttpClient,
@@ -29,6 +41,23 @@ pub struct RuntimeState {
     /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
     /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
+    /// State backing the `streams::incoming` resource. Keyed by the rep
+    /// of the WIT-generated `Resource<Incoming>`. We maintain our own map
+    /// rather than stuffing our types into the typed `ResourceTable`,
+    /// because the WIT-generated resource type is an empty marker and
+    /// doesn't match our state shape.
+    #[cfg(any(feature = "http-client", feature = "http-server"))]
+    pub incoming_streams: StdMutex<std::collections::HashMap<u32, IncomingEntry>>,
+    /// State backing the `streams::outgoing` resource, keyed by rep.
+    #[cfg(any(feature = "http-client", feature = "http-server"))]
+    pub outgoing_streams: StdMutex<std::collections::HashMap<u32, OutgoingEntry>>,
+    /// Monotonic counter for stream resource reps. A single counter mints
+    /// keys for BOTH the `incoming_streams` and `outgoing_streams` maps;
+    /// the two maps are disjoint, so collisions are not possible, but the
+    /// shared rep space must not be split across two counters. Renamed from
+    /// `next_outgoing_rep` (which misleadingly suggested outgoing-only).
+    #[cfg(any(feature = "http-client", feature = "http-server"))]
+    pub next_stream_rep: AtomicU32,
 }
 
 impl RuntimeState {
@@ -49,6 +78,12 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            incoming_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -67,6 +102,12 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             exit_code,
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            incoming_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -88,6 +129,12 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
             exit_code,
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            incoming_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
+            #[cfg(any(feature = "http-client", feature = "http-server"))]
+            next_stream_rep: AtomicU32::new(1),
         }
     }
 
@@ -153,12 +200,51 @@ impl HttpClientHost for RuntimeState {
         let method = req.method.as_str();
         let url = req.url.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
-        let body = req.body.as_deref();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
         let tracestate = req
             .trace_context
             .as_ref()
             .and_then(|tc| tc.tracestate.as_deref());
+
+        // Resolve WIT request body to HttpClient's BodySource enum.
+        let body = match req.body {
+            RequestBodySource::None => http_client::BodySource::None,
+            RequestBodySource::Buffered(bytes) => http_client::BodySource::Buffered(bytes),
+            RequestBodySource::Chunked(handle) => {
+                // Take ownership of the adapter so the resource entry remains
+                // valid for any post-fetch write_chunk/finish calls (which the
+                // guest should not make — but if it does, they'd see Closed).
+                #[cfg(feature = "http-client")]
+                {
+                    let mut outgoing = self
+                        .outgoing_streams
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let adapter = match outgoing.get_mut(&handle.rep()) {
+                        Some(entry) => match entry.adapter.take() {
+                            Some(a) => a,
+                            None => {
+                                return Some(self.chunked_body_error_response(
+                                    "chunked body: adapter already consumed",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Some(self.chunked_body_error_response(
+                                "chunked body: resource entry missing",
+                            ));
+                        }
+                    };
+                    http_client::BodySource::Streamed(adapter)
+                }
+                #[cfg(not(feature = "http-client"))]
+                {
+                    let _ = handle;
+                    unreachable!("chunked body without http-client feature enabled");
+                }
+            }
+        };
+
         let rt = tokio::runtime::Handle::current();
         let resp = rt.block_on(self.http_client.fetch(
             method,
@@ -169,12 +255,58 @@ impl HttpClientHost for RuntimeState {
             trace_context,
             tracestate,
         ));
+
+        // Resolve HttpClient's ResponseBody to WIT ResponseBodySource. For
+        // streamed responses, register the IncomingStream in our own map
+        // keyed by a fresh rep and return a Resource<Incoming> handle.
+        let body = match resp.body {
+            http_client::ResponseBody::None => ResponseBodySource::None,
+            http_client::ResponseBody::Buffered(bytes) => ResponseBodySource::Buffered(bytes),
+            http_client::ResponseBody::Streamed(stream) => {
+                #[cfg(feature = "http-client")]
+                {
+                    let rep = self
+                        .next_stream_rep
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.incoming_streams
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(rep, IncomingEntry { stream });
+                    let handle = wasmtime::component::Resource::<
+                        crate::edge::cloud::streams::Incoming,
+                    >::new_own(rep);
+                    ResponseBodySource::Chunked(handle)
+                }
+                #[cfg(not(feature = "http-client"))]
+                {
+                    let _ = stream;
+                    unreachable!("streamed response without http-client feature enabled");
+                }
+            }
+        };
+
         Some(Response {
             status: resp.status,
             headers: resp.headers.into_iter().collect(),
-            body: resp.body,
+            body,
             error: resp.error,
         })
+    }
+}
+
+impl RuntimeState {
+    /// Build a 502 Bad Gateway response for a chunked-body resolution
+    /// failure (stale `Outgoing` handle, already-consumed adapter, etc.).
+    /// Used by `HttpClientHost::fetch` to return a meaningful error to
+    /// the guest instead of panicking the worker.
+    #[cfg(feature = "http-client")]
+    fn chunked_body_error_response(&self, msg: &str) -> Response {
+        Response {
+            status: 502,
+            headers: Vec::new(),
+            body: ResponseBodySource::None,
+            error: Some(msg.to_string()),
+        }
     }
 }
 
@@ -328,22 +460,52 @@ impl HttpServerHost for RuntimeState {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.start(port, host))
     }
-    fn poll(&mut self) -> Result<Option<crate::edge::cloud::http_server::IncomingRequest>, String> {
+    fn poll(&mut self) -> Result<Option<IncomingRequest>, String> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.poll()).map(|opt| {
-            opt.map(|req| crate::edge::cloud::http_server::IncomingRequest {
-                id: req.id,
-                method: req.method,
-                path: req.path,
-                query: req.query,
-                headers: req.headers,
-                body: req.body,
-                trace: req
-                    .trace
-                    .map(|tc| crate::edge::cloud::http_server::TraceContext {
-                        traceparent: tc.traceparent,
-                        tracestate: tc.tracestate,
-                    }),
+            opt.map(|req| {
+                // Translate http_server::BodySource → WIT BodySource. For
+                // streamed bodies, register the IncomingStream in our map
+                // and return a Resource<Incoming> handle.
+                #[cfg(feature = "http-server")]
+                let body = match req.body {
+                    HttpServerInternalBodySource::None => HttpServerBodySource::None,
+                    HttpServerInternalBodySource::Buffered(bytes) => {
+                        HttpServerBodySource::Buffered(bytes)
+                    }
+                    HttpServerInternalBodySource::Streamed(stream) => {
+                        let rep = self
+                            .next_stream_rep
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.incoming_streams
+                            .lock()
+                            .unwrap()
+                            .insert(rep, IncomingEntry { stream });
+                        let handle = wasmtime::component::Resource::<
+                            crate::edge::cloud::streams::Incoming,
+                        >::new_own(rep);
+                        HttpServerBodySource::Chunked(handle)
+                    }
+                };
+                #[cfg(not(feature = "http-server"))]
+                let body = {
+                    let _ = req.body;
+                    HttpServerBodySource::None
+                };
+                IncomingRequest {
+                    id: req.id,
+                    method: req.method,
+                    path: req.path,
+                    query: req.query,
+                    headers: req.headers,
+                    body,
+                    trace: req
+                        .trace
+                        .map(|tc| crate::edge::cloud::http_server::TraceContext {
+                            traceparent: tc.traceparent,
+                            tracestate: tc.tracestate,
+                        }),
+                }
             })
         })
     }
@@ -357,6 +519,39 @@ impl HttpServerHost for RuntimeState {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.respond(req_id, status, headers, body))
     }
+    fn respond_stream(
+        &mut self,
+        req_id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body_stream: wasmtime::component::Resource<crate::edge::cloud::streams::Outgoing>,
+    ) -> Result<(), String> {
+        // Take ownership of the OutgoingEntry's adapter from our map.
+        #[cfg(feature = "http-server")]
+        let adapter = {
+            let mut outgoing = self.outgoing_streams.lock().unwrap();
+            let entry = outgoing
+                .get_mut(&body_stream.rep())
+                .ok_or_else(|| "respond_stream: resource entry missing".to_string())?;
+            entry
+                .adapter
+                .take()
+                .ok_or_else(|| "respond_stream: adapter already consumed".to_string())?
+        };
+        #[cfg(not(feature = "http-server"))]
+        {
+            let _ = body_stream;
+            return Err("respond_stream called without http-server feature".to_string());
+        }
+        #[cfg(feature = "http-server")]
+        {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(
+                self.http_server
+                    .respond_stream(req_id, status, headers, adapter),
+            )
+        }
+    }
     fn shutdown(&mut self) {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.shutdown());
@@ -369,3 +564,142 @@ impl HttpServerHost for RuntimeState {
         rt.block_on(self.http_server.shutdown());
     }
 }
+
+// ---- Streams host impls ----------------------------------------------------
+//
+// These are only compiled when at least one of http-client/http-server is
+// enabled, since those are the interfaces that `use` the stream types. The
+// generated HostIncoming / HostOutgoing traits live under
+// `crate::edge::cloud::streams`. State is held in the `incoming_streams` /
+// `outgoing_streams` maps on `RuntimeState`, keyed by `Resource::rep()` —
+// the typed `ResourceTable` would require us to store the WIT-generated
+// marker type, which is empty, so we keep our own state external.
+
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+mod streams_impl {
+    use super::RuntimeState;
+    use crate::edge::cloud::streams::{
+        HostIncoming, HostOutgoing, Incoming, Outgoing, StreamError as WitStreamError,
+    };
+    use crate::streams::{self, OutgoingEntry, StreamError, DEFAULT_STREAM_CAPACITY};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use wasmtime::component::Resource;
+
+    /// Bridge a sync Host trait method to an async operation with a 5s
+    /// timeout. The inner future must produce `Result<T, StreamError>` — the
+    /// outer `Result` collapses the timeout case into `Closed` so a stalled
+    /// stream op does not panic the worker. The other Host trait methods map
+    /// failures to `Result`; streams does too.
+    fn block_on_timeout<F, T>(fut: F) -> Result<T, StreamError>
+    where
+        F: std::future::Future<Output = Result<T, StreamError>>,
+    {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move {
+            match tokio::time::timeout(Duration::from_secs(5), fut).await {
+                Ok(inner) => inner,
+                Err(_) => Err(StreamError::Closed),
+            }
+        })
+    }
+
+    impl HostIncoming for RuntimeState {
+        fn read_chunk(
+            &mut self,
+            self_: Resource<Incoming>,
+            _max_bytes: u32,
+        ) -> Result<Vec<u8>, WitStreamError> {
+            // Clone the IncomingStream out of the map, drop the map guard,
+            // then await on the clone. This avoids holding the
+            // `StdMutex<HashMap>` across the `block_on_timeout` await — a
+            // stalled stream op would otherwise block every other stream op
+            // on this RuntimeState for up to 5 seconds.
+            //
+            // Recovers from a poisoned mutex (F7): a panic elsewhere in the
+            // worker must not take down every subsequent stream op.
+            let mut cloned = {
+                let incoming = self
+                    .incoming_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = incoming.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.read_chunk()).map_err(streams::to_wit)
+        }
+
+        fn cancel(&mut self, self_: Resource<Incoming>) {
+            if let Some(entry) = self
+                .incoming_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&self_.rep())
+            {
+                entry.stream.cancel();
+            }
+        }
+
+        fn drop(&mut self, rep: Resource<Incoming>) -> wasmtime::Result<()> {
+            self.incoming_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&rep.rep());
+            Ok(())
+        }
+    }
+
+    impl HostOutgoing for RuntimeState {
+        fn new(&mut self) -> Resource<Outgoing> {
+            let rep = self.next_stream_rep.fetch_add(1, Ordering::Relaxed);
+            self.outgoing_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(rep, OutgoingEntry::new(DEFAULT_STREAM_CAPACITY));
+            Resource::new_own(rep)
+        }
+
+        fn write_chunk(
+            &mut self,
+            self_: Resource<Outgoing>,
+            bytes: Vec<u8>,
+        ) -> Result<(), WitStreamError> {
+            // Clone the OutgoingStream out of the map, drop the map guard,
+            // then await on the clone. See `read_chunk` above for the
+            // lock-across-await rationale.
+            let mut cloned = {
+                let outgoing = self
+                    .outgoing_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.write_chunk(bytes)).map_err(streams::to_wit)
+        }
+
+        fn finish(&mut self, self_: Resource<Outgoing>) -> Result<(), WitStreamError> {
+            // Clone out + drop-guard pattern — see `read_chunk` above.
+            let mut cloned = {
+                let outgoing = self
+                    .outgoing_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = outgoing.get(&self_.rep()).ok_or(WitStreamError::Closed)?;
+                entry.stream.clone()
+            };
+            block_on_timeout(cloned.finish()).map_err(streams::to_wit)
+        }
+
+        fn drop(&mut self, rep: Resource<Outgoing>) -> wasmtime::Result<()> {
+            self.outgoing_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&rep.rep());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(feature = "http-client", feature = "http-server"))]
+impl StreamsHost for RuntimeState {}

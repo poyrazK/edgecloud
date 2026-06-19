@@ -14,7 +14,11 @@ wasmtime-wasi = { version = "25.0" }
 tokio = { version = "1.45", features = ["full"], optional = true }
 
 # HTTP client for edge:http-client
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false, optional = true }
+
+# Streaming primitives for reqwest::Body::wrap_stream (inbound + outbound body streams)
+futures = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 # Caching
 lru = { version = "0.12", optional = true }
@@ -56,16 +60,17 @@ clock = { version = "0.4", optional = true }
 
 [dev-dependencies]
 wasmtime-environ = "25.0"
+wiremock = "0.6"
 wat = "1"
 
 [features]
 default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking"]
-http-client = ["dep:reqwest", "reqwest/blocking"]
+http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "tokio/sync", "dep:bytes", "dep:futures"]
 kv-store = []
 cache = ["dep:lru"]
 observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
-http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2"]
+http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2", "dep:bytes", "dep:futures"]
 networking = ["dep:trust-dns-resolver", "dep:tokio"]

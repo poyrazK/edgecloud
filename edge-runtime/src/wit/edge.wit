@@ -1,6 +1,61 @@
-package edge:cloud@0.1.0;
+package edge:cloud@0.2.0;
+
+interface streams {
+  // Why a shared interface: both http-client and http-server need the same
+  // resource shapes. Sharing them via `use` avoids duplicate type definitions
+  // and the cross-interface compatibility shim that would require.
+  //
+  // Resource methods are sync at the WIT boundary; the host bridges to async
+  // via tokio::runtime::Handle::current().block_on(...) with a 5s timeout.
+  // EOF is signaled by stream-error::closed on incoming::read-chunk.
+  // finish() is the explicit end-of-stream signal on outgoing; Drop on the
+  // host-side stream value is the cancellation backstop for guest abandonment.
+
+  variant stream-error {
+    cancelled,
+    closed,
+    io(string),
+  }
+
+  // host -> guest read direction (e.g. response body, large request body).
+  resource incoming {
+    // Read the next chunk. The host delivers the chunk at whatever size the
+    // producer placed on the channel (bounded by the host's backpressure
+    // buffer — default 8 chunks at the producer's natural chunk size). The
+    // `max-bytes` parameter is ADVISORY and MAY be ignored by the host;
+    // chunk-splitting is not implemented in v1. EOF is signaled by
+    // `stream-error::closed`.
+    read-chunk: func(max-bytes: u32) -> result<list<u8>, stream-error>;
+    cancel: func();
+  }
+
+  // guest -> host write direction (e.g. streaming request body, streaming response body).
+  resource outgoing {
+    // Constructor the guest calls to obtain a fresh outgoing stream handle.
+    // The host returns a Resource<Outgoing> backed by a bounded mpsc sender.
+    constructor();
+    write-chunk: func(bytes: list<u8>) -> result<_, stream-error>;
+    finish: func() -> result<_, stream-error>;
+  }
+}
 
 interface http-client {
+  use streams.{incoming, outgoing, stream-error};
+
+  // Request body: guest produces (none, buffered bytes, or outgoing stream).
+  // Response body: host produces (none, buffered bytes, or incoming stream).
+  // Two distinct variants make the direction explicit at the type level.
+  variant request-body-source {
+    none,
+    buffered(list<u8>),
+    chunked(outgoing),
+  }
+  variant response-body-source {
+    none,
+    buffered(list<u8>),
+    chunked(incoming),
+  }
+
   record trace-context {
     traceparent: string,
     tracestate: option<string>,
@@ -10,7 +65,7 @@ interface http-client {
     method: string,
     url: string,
     headers: list<tuple<string, string>>,
-    body: option<list<u8>>,
+    body: request-body-source,
     timeout-ms: option<u64>,
     trace-context: option<trace-context>,
   }
@@ -18,7 +73,7 @@ interface http-client {
   record response {
     status: u16,
     headers: list<tuple<string, string>>,
-    body: list<u8>,
+    body: response-body-source,
     error: option<string>,
   }
 
@@ -98,6 +153,14 @@ interface networking {
 }
 
 interface http-server {
+  use streams.{incoming, outgoing, stream-error};
+
+  variant body-source {
+    none,
+    buffered(list<u8>),
+    chunked(incoming),
+  }
+
   record trace-context {
     traceparent: string,
     tracestate: option<string>,
@@ -109,15 +172,35 @@ interface http-server {
     path: string,
     query: option<string>,
     headers: list<tuple<string, string>>,
-    body: list<u8>,
+    body: body-source,
     trace: option<trace-context>,
+    // Inbound body framing accepted by the host:
+    // - Content-Length declared: body is buffered or streamed per the
+    //   host's `stream_threshold`.
+    // - Transfer-Encoding: chunked: body is decoded into the body-source.
+    //   Per-chunk size is capped at the host's `max_body_size`. Trailers
+    //   are read and discarded in v1.
+    // - Neither (e.g. GET): body is empty.
+    // Per RFC 7230 §3.3.3, when both Content-Length and TE: chunked are
+    // present, TE wins and CL is ignored.
   }
+
+  // Buffered response — existing call. Body is fully delivered.
+  respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<_, string>;
+  // Streaming response — Content-Length is REQUIRED in headers and must be
+  // a valid non-negative integer. Compression (Content-Encoding) is NOT
+  // supported on this path in v1; use `respond` for pre-compressed bodies.
+  // The host drains the outgoing stream and writes chunks with
+  // timeout_at(deadline, write_all). Chunked transfer encoding is not
+  // implemented in v1; deferred to v2. The host strips hop-by-hop and
+  // host-reserved headers (Connection, Keep-Alive, Proxy-*, TE, Trailer,
+  // Transfer-Encoding, Upgrade, Date, Server) from the guest's set.
+  respond-stream: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body-stream: outgoing) -> result<_, string>;
 
   start: func(port: u16, host: option<string>) -> result<_, string>;
   shutdown: func();
   get-assigned-port: func() -> u16;
   poll: func() -> result<option<incoming-request>, string>;
-  respond: func(req-id: u64, status: u16, headers: list<tuple<string, string>>, body: list<u8>) -> result<_, string>;
   stop: func();
 }
 
