@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -159,6 +160,40 @@ func TestRollback_ServiceError_Returns500(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "db unreachable") {
 		t.Errorf("body must not leak raw error, got %s", rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rollback — 502 (post-commit NATS publish failed)
+// ---------------------------------------------------------------------------
+
+func TestRollback_PublishFailed_Returns502(t *testing.T) {
+	// Service returns the wrapped ErrPublishFailed sentinel that
+	// RollbackDeployment emits when PublishTaskUpdate fails after the
+	// DB transaction has committed. Handler must surface this as 502
+	// (not 500) so the client knows the DB write may have succeeded
+	// and to treat it as an upstream-dependency failure.
+	wrapped := fmt.Errorf("%w: %w", service.ErrPublishFailed, errors.New("nats unreachable"))
+	svc := &stubRollbacker{err: wrapped}
+	mux := newRollbackMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "worker notification failed") {
+		t.Errorf("body should explain 502, got %s", rr.Body.String())
+	}
+	// Body must not leak the sentinel or the raw NATS error.
+	if strings.Contains(rr.Body.String(), "nats unreachable") {
+		t.Errorf("body leaks raw error: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
 	}
 }
 

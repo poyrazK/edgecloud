@@ -106,6 +106,14 @@ var (
 	// row in the apps table) so handlers can map to HTTP 404 without
 	// false matches. Handler maps to HTTP 404.
 	ErrNoActiveDeployment = fmt.Errorf("no active deployment")
+	// ErrPublishFailed is returned by ActivateDeployment /
+	// RollbackDeployment when the post-commit NATS publish of the
+	// TaskMessage failed. The DB transaction may have already
+	// committed, so workers may still be serving the prior
+	// deployment; the client should treat this as a transient
+	// infrastructure failure. Handler maps to HTTP 502. The wrapped
+	// cause (using Go 1.20+ multi-%w) is preserved for logs.
+	ErrPublishFailed = fmt.Errorf("publishing task update failed")
 )
 
 // DeploymentService handles deployment business logic.
@@ -420,11 +428,12 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	// logged but do NOT abort the loop — if a tenant activated to
 	// three regions and one publish fails (e.g. NATS blip), the
 	// other two should still get the message. The error returned
-	// here is a summary so the HTTP layer can surface a 5xx and
-	// the tenant can retry the failed regions. (A future
-	// improvement could track per-region publish state in the
-	// `active_deployments` row and only retry the failed ones;
-	// out of scope for the v1.)
+	// here is a summary wrapped with ErrPublishFailed so the HTTP
+	// layer can match via errors.Is and surface a 502 — the DB row
+	// has already committed by this point, so workers may still be
+	// serving the prior deployment; the client should treat this
+	// as a transient infrastructure failure and retry the failed
+	// regions.
 	var failedRegions []string
 	for _, region := range regions {
 		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
@@ -433,7 +442,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		}
 	}
 	if len(failedRegions) > 0 {
-		return fmt.Errorf("publishing task update failed for %d region(s): %s", len(failedRegions), strings.Join(failedRegions, ","))
+		return fmt.Errorf("%w: %d region(s) failed: %s", ErrPublishFailed, len(failedRegions), strings.Join(failedRegions, ","))
 	}
 
 	return nil
@@ -539,7 +548,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		},
 	}
 	if err := s.publisher.PublishTaskUpdate("global", msg); err != nil {
-		return "", fmt.Errorf("publishing task update: %w", err)
+		return "", fmt.Errorf("%w: %w", ErrPublishFailed, err)
 	}
 
 	return rolledBackID, nil

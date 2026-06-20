@@ -27,6 +27,10 @@ type DeploymentHandler struct {
 	// (DB + NATS + publisher + artifact store). The concrete
 	// *service.DeploymentService satisfies it.
 	rollbackSvc deploymentRollbacker
+	// activateSvc mirrors rollbackSvc for the Activate handler — narrow
+	// contract lets tests stub the activate path without the full service
+	// surface. Concrete *service.DeploymentService satisfies it.
+	activateSvc deploymentActivator
 }
 
 // deploymentRollbacker is the narrow contract the Rollback handler needs.
@@ -36,14 +40,22 @@ type deploymentRollbacker interface {
 	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
 }
 
+// deploymentActivator is the narrow contract the Activate handler needs.
+// Mirrors deploymentRollbacker for the activate path.
+type deploymentActivator interface {
+	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
+}
+
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
-		// Concrete *service.DeploymentService satisfies the narrow interface.
+		// Concrete *service.DeploymentService satisfies the narrow interfaces.
 		// nil is also fine for tests that only exercise the workerSvc path
-		// (e.g. AppIngress) — that method never touches rollbackSvc.
+		// (e.g. AppIngress) — those methods never touch rollbackSvc /
+		// activateSvc.
 		rollbackSvc: deploymentSvc,
+		activateSvc: deploymentSvc,
 	}
 }
 
@@ -215,12 +227,28 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
+//
+// Status codes:
+//   - 200: activated; body is {"status": "activated"}
+//   - 502: activation committed but the post-commit NATS publish of
+//     the TaskMessage failed — workers may still be serving the prior
+//     deployment. Client should re-activate the desired deployment
+//     (a plain retry will 409 because the row is already in the
+//     desired state, or 404 if the deploy was deleted).
+//   - 500: anything else (DB error, etc.).
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	deploymentID := r.PathValue("deploymentID")
 
-	if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+	if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+		if errors.Is(err, service.ErrPublishFailed) {
+			http.Error(w,
+				`{"error": "activation committed but worker notification failed; please retry"}`,
+				http.StatusBadGateway)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
@@ -239,7 +267,11 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 //   - 404: no active deployment for this app (user never activated)
 //   - 409: app is active but has no last-good pointer (only ever activated
 //     one deployment, so there is nothing to roll back to)
-//   - 500: anything else (DB error, NATS publish failure, …)
+//   - 502: rollback committed but the post-commit NATS publish failed —
+//     workers may still be serving the prior deployment. Client should
+//     re-activate the desired deployment; a plain retry will 409
+//     because last_good was cleared on this attempt.
+//   - 500: anything else (DB error, etc.).
 func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -256,6 +288,12 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrNoActiveDeployment) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, service.ErrPublishFailed) {
+			http.Error(w,
+				`{"error": "rollback committed but worker notification failed; please retry"}`,
+				http.StatusBadGateway)
 			return
 		}
 		log.Printf("internal error: %v", err)
