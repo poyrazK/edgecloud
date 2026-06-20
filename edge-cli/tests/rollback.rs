@@ -2,12 +2,10 @@
 //!
 //! Uses `wiremock` for the control plane, `assert_cmd` to drive the
 //! `edge` binary, and `HOME` override (via `dirs::config_dir()`) to
-//! isolate the config file per-test. Mirrors the helpers in `tests/auth.rs`
-//! — we duplicate the small helpers rather than introduce a shared
-//! module to keep the test files independently runnable.
-
-use std::io::Write;
-use std::path::PathBuf;
+//! isolate the config file per-test. The cross-cutting CLI helpers
+//! (isolated_home / config_file_for / set_platform_env / seed_api_key)
+//! live in `tests/common/mod.rs`; the rollback-specific project
+//! seeder stays below.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -15,54 +13,7 @@ use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-// ---------------------------------------------------------------------------
-// Helpers (mirrored from tests/auth.rs — kept local to avoid coupling).
-// ---------------------------------------------------------------------------
-
-fn isolated_home() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
-
-fn config_file_for(home: &TempDir) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home.path()
-            .join("Library")
-            .join("Application Support")
-            .join("edgecloud")
-            .join("config.toml")
-    } else if cfg!(target_os = "windows") {
-        home.path()
-            .join("AppData")
-            .join("Roaming")
-            .join("edgecloud")
-            .join("config.toml")
-    } else {
-        home.path()
-            .join(".config")
-            .join("edgecloud")
-            .join("config.toml")
-    }
-}
-
-fn set_platform_env(cmd: &mut Command, home: &TempDir) {
-    if cfg!(target_os = "windows") {
-        cmd.env("APPDATA", home.path().join("AppData").join("Roaming"));
-        cmd.env("USERPROFILE", home.path());
-    } else {
-        cmd.env("HOME", home.path());
-    }
-    cmd.env_remove("XDG_CONFIG_HOME");
-    cmd.env_remove("EDGE_API_KEY");
-}
-
-fn seed_api_key(home: &TempDir, key: &str) {
-    let cfg_path = config_file_for(home);
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let mut f = std::fs::File::create(&cfg_path).unwrap();
-    writeln!(f, "[default]\napi_key = \"{key}\"\n").unwrap();
-}
+mod common;
 
 /// Write a minimal `edge.toml` (no `[deployment].api` — URL falls through
 /// to EDGE_API_URL) plus a `.edge/state.json` so `edge rollback` can
@@ -105,11 +56,11 @@ fn read_state_deployment_id(project: &TempDir) -> Option<String> {
 
 #[tokio::test]
 async fn rollback_flips_state_to_returned_deployment_id() {
-    let home = isolated_home();
-    let project = isolated_home();
+    let home = common::isolated_home();
+    let project = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     seed_project(&project, "myapp", "d_broken");
 
     Mock::given(method("POST"))
@@ -123,7 +74,7 @@ async fn rollback_flips_state_to_returned_deployment_id() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback");
@@ -148,11 +99,11 @@ async fn rollback_flips_state_to_returned_deployment_id() {
 
 #[tokio::test]
 async fn rollback_no_last_good_exits_non_zero() {
-    let home = isolated_home();
-    let project = isolated_home();
+    let home = common::isolated_home();
+    let project = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     seed_project(&project, "myapp", "d_only");
 
     Mock::given(method("POST"))
@@ -165,7 +116,7 @@ async fn rollback_no_last_good_exits_non_zero() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback");
@@ -189,11 +140,11 @@ async fn rollback_no_last_good_exits_non_zero() {
 
 #[tokio::test]
 async fn rollback_resolves_app_from_positional_when_state_differs() {
-    let home = isolated_home();
-    let project = isolated_home();
+    let home = common::isolated_home();
+    let project = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     // state.json says app = "oldapp" but the user passed "newapp".
     seed_project(&project, "oldapp", "d_broken");
 
@@ -208,7 +159,7 @@ async fn rollback_resolves_app_from_positional_when_state_differs() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback");
@@ -223,11 +174,11 @@ async fn rollback_resolves_app_from_positional_when_state_differs() {
 
 #[tokio::test]
 async fn rollback_resolves_app_from_state_when_arg_empty() {
-    let home = isolated_home();
-    let project = isolated_home();
+    let home = common::isolated_home();
+    let project = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     seed_project(&project, "fromstate", "d_broken");
 
     Mock::given(method("POST"))
@@ -240,7 +191,7 @@ async fn rollback_resolves_app_from_state_when_arg_empty() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback"); // no positional
@@ -255,11 +206,11 @@ async fn rollback_resolves_app_from_state_when_arg_empty() {
 
 #[tokio::test]
 async fn rollback_does_not_overwrite_state_for_different_app() {
-    let home = isolated_home();
-    let project = isolated_home();
+    let home = common::isolated_home();
+    let project = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     // state.json says app = "oldapp" but the user passed "newapp".
     seed_project(&project, "oldapp", "d_oldapp_state");
 
@@ -272,7 +223,7 @@ async fn rollback_does_not_overwrite_state_for_different_app() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback");
@@ -294,11 +245,11 @@ async fn rollback_does_not_overwrite_state_for_different_app() {
 
 #[tokio::test]
 async fn rollback_without_app_or_state_exits_non_zero() {
-    let home = isolated_home();
-    let project = isolated_home(); // empty dir, no state.json
+    let home = common::isolated_home();
+    let project = common::isolated_home(); // empty dir, no state.json
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
     std::fs::write(
         project.path().join("edge.toml"),
         r#"[project]
@@ -315,7 +266,7 @@ target = "wasm32-wasip2"
     // it will get a connection refused and surface a different error.
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("rollback");

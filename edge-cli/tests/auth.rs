@@ -4,81 +4,17 @@
 //! `edge` binary, and a `HOME` override (via `dirs::config_dir()`) to
 //! isolate the config file per-test.
 
-use std::io::Write;
-use std::path::PathBuf;
-
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Returns a fresh tempdir. The caller passes `home.path()` to the
-/// child as `HOME` (and on Windows, as `APPDATA`/`USERPROFILE`).
-/// This function does not mutate the parent process env, so concurrent
-/// tests do not race.
-fn isolated_home() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
-
-/// Path to the config file the CLI will actually read/write, given the
-/// tempdir we passed as `HOME` (or `APPDATA` on Windows) to the child.
-///
-/// IMPORTANT: do not call `dirs::config_dir()` here — that resolves
-/// against the *test process* env, which is the developer's real home,
-/// not the child's overridden home. Tests would then read/write the
-/// developer's actual config file and stomp on each other. Instead,
-/// compute the path the same way the child will: on macOS, join
-/// `Library/Application Support`; on Linux, join `.config` (the XDG
-/// default — we deliberately do NOT set `XDG_CONFIG_HOME` for the
-/// child, so `dirs::config_dir()` falls back to `$HOME/.config` and
-/// the path here matches the path the child sees).
-fn config_file_for(home: &TempDir) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home.path()
-            .join("Library")
-            .join("Application Support")
-            .join("edgecloud")
-            .join("config.toml")
-    } else if cfg!(target_os = "windows") {
-        home.path()
-            .join("AppData")
-            .join("Roaming")
-            .join("edgecloud")
-            .join("config.toml")
-    } else {
-        home.path()
-            .join(".config")
-            .join("edgecloud")
-            .join("config.toml")
-    }
-}
-
-/// Inject the platform-appropriate env vars so the child CLI resolves
-/// its config dir to the test tempdir, not the developer's real home.
-///
-/// We set `HOME` (and on Windows, `APPDATA`/`USERPROFILE`) and
-/// explicitly strip `XDG_CONFIG_HOME`. On Linux, `dirs::config_dir()`
-/// prefers `XDG_CONFIG_HOME` over `HOME`; if the test process (or the
-/// CI runner) has `XDG_CONFIG_HOME` pointing at the developer's real
-/// config, the child would inherit it and read/write the real file
-/// instead of the test tempdir. macOS and Windows ignore `XDG_CONFIG_HOME`,
-/// but stripping it is harmless there.
-fn set_platform_env(cmd: &mut Command, home: &TempDir) {
-    if cfg!(target_os = "windows") {
-        cmd.env("APPDATA", home.path().join("AppData").join("Roaming"));
-        cmd.env("USERPROFILE", home.path());
-    } else {
-        cmd.env("HOME", home.path());
-    }
-    // Always strip any host-process env vars that could shadow the test.
-    cmd.env_remove("XDG_CONFIG_HOME");
-    cmd.env_remove("EDGE_API_KEY");
-}
+mod common;
 
 /// Read the config file and parse out `default.api_key` (if any).
 fn read_api_key(home: &TempDir) -> Option<String> {
-    let path = config_file_for(home);
+    let path = common::config_file_for(home);
     let content = std::fs::read_to_string(&path).ok()?;
     #[derive(serde::Deserialize)]
     struct Cfg {
@@ -94,7 +30,7 @@ fn read_api_key(home: &TempDir) -> Option<String> {
 
 #[tokio::test]
 async fn signup_writes_returned_key_to_config_file() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -107,7 +43,7 @@ async fn signup_writes_returned_key_to_config_file() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("signup")
@@ -124,10 +60,10 @@ async fn signup_writes_returned_key_to_config_file() {
 
 #[test]
 fn login_with_key_flag_writes_to_config() {
-    let home = isolated_home();
+    let home = common::isolated_home();
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("login").arg("--key").arg("k_from_flag");
 
     // Login also tries to call whoami at the end. We don't mount a
@@ -141,10 +77,10 @@ fn login_with_key_flag_writes_to_config() {
 
 #[test]
 fn login_from_stdin_writes_to_config() {
-    let home = isolated_home();
+    let home = common::isolated_home();
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("login").write_stdin("k_from_stdin\n");
 
     cmd.assert().success();
@@ -155,16 +91,11 @@ fn login_from_stdin_writes_to_config() {
 
 #[tokio::test]
 async fn whoami_prints_tenant_info() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
     // Pre-seed the config so the client has a key.
-    let cfg_path = config_file_for(&home);
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let mut f = std::fs::File::create(&cfg_path).unwrap();
-    writeln!(f, "[default]\napi_key = \"k_seed\"\n").unwrap();
+    common::seed_api_key(&home, "k_seed");
 
     Mock::given(method("GET"))
         .and(path("/api/v1/auth/whoami"))
@@ -181,7 +112,7 @@ async fn whoami_prints_tenant_info() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("whoami");
@@ -195,16 +126,11 @@ async fn whoami_prints_tenant_info() {
 
 #[test]
 fn logout_removes_key_from_config() {
-    let home = isolated_home();
-    let cfg_path = config_file_for(&home);
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let mut f = std::fs::File::create(&cfg_path).unwrap();
-    writeln!(f, "[default]\napi_key = \"k_to_remove\"\n").unwrap();
+    let home = common::isolated_home();
+    common::seed_api_key(&home, "k_to_remove");
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("logout");
 
     cmd.assert().success();
@@ -216,11 +142,11 @@ fn logout_removes_key_from_config() {
 
 #[test]
 fn logout_is_idempotent_when_no_key() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     // No config file exists.
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("logout");
 
     cmd.assert().success();
@@ -232,7 +158,7 @@ fn logout_is_idempotent_when_no_key() {
 /// credential rejection as a hard error rather than a soft warning.
 #[tokio::test]
 async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -242,7 +168,7 @@ async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("login")
@@ -267,7 +193,7 @@ async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
 async fn login_verifies_just_saved_key_not_env_var() {
     use wiremock::matchers::header;
 
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -289,7 +215,7 @@ async fn login_verifies_just_saved_key_not_env_var() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .env("EDGE_API_KEY", "k_env_stale")
         .arg("auth")
@@ -307,7 +233,7 @@ async fn login_verifies_just_saved_key_not_env_var() {
 /// a tenant the server never created.
 #[tokio::test]
 async fn signup_server_rejects_invalid_plan_does_not_write_key() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -318,7 +244,7 @@ async fn signup_server_rejects_invalid_plan_does_not_write_key() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("signup")
@@ -338,24 +264,12 @@ async fn signup_server_rejects_invalid_plan_does_not_write_key() {
     );
 }
 
-/// Pre-seed the tempdir config with a known API key. Used by the
-/// `keys create` tests below so the CLI is already authenticated when
-/// it tries to mint an additional key.
-fn seed_api_key(home: &TempDir, key: &str) {
-    let cfg_path = config_file_for(home);
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let mut f = std::fs::File::create(&cfg_path).unwrap();
-    writeln!(f, "[default]\napi_key = \"{key}\"\n").unwrap();
-}
-
 #[tokio::test]
 async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_existing");
+    common::seed_api_key(&home, "k_existing");
 
     // Assert the bearer token the CLI sends matches the on-disk key
     // (i.e. the new key never overwrites it; we are using the saved
@@ -376,7 +290,7 @@ async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("keys")
@@ -400,12 +314,12 @@ async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
 
 #[tokio::test]
 async fn keys_create_without_saved_key_exits_non_zero() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     // No seed_api_key call → no key on disk, no EDGE_API_KEY env.
     // The CLI must refuse to try to authenticate against /api/keys.
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth")
         .arg("keys")
         .arg("create")
@@ -419,10 +333,10 @@ async fn keys_create_without_saved_key_exits_non_zero() {
 
 #[tokio::test]
 async fn keys_create_server_rejects_does_not_overwrite_key() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_existing");
+    common::seed_api_key(&home, "k_existing");
 
     Mock::given(method("POST"))
         .and(path("/api/v1/keys"))
@@ -431,7 +345,7 @@ async fn keys_create_server_rejects_does_not_overwrite_key() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("keys")
@@ -459,15 +373,15 @@ async fn keys_create_server_rejects_does_not_overwrite_key() {
 /// `edge_toml.deployment.api.clone()` to `edge_toml.api_url(...)`.
 #[tokio::test]
 async fn status_falls_through_to_env_api_url_when_toml_has_no_api() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_seed");
+    common::seed_api_key(&home, "k_seed");
 
     // The CLI is invoked with `current_dir = <project>` and reads
     // `edge.toml` from there. Write a minimal `edge.toml` with NO
     // `[deployment].api` so the only source of the URL is the env var.
-    let project = isolated_home();
+    let project = common::isolated_home();
     std::fs::write(
         project.path().join("edge.toml"),
         r#"[project]
@@ -505,7 +419,7 @@ target = "wasm32-wasip2"
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
     cmd.arg("status");
@@ -521,10 +435,10 @@ target = "wasm32-wasip2"
 /// the `if !force` guard would fail this test.
 #[tokio::test]
 async fn signup_force_overwrites_saved_key_without_warning() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_old");
+    common::seed_api_key(&home, "k_old");
 
     Mock::given(method("POST"))
         .and(path("/api/v1/tenants"))
@@ -537,7 +451,7 @@ async fn signup_force_overwrites_saved_key_without_warning() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("signup")
@@ -561,10 +475,10 @@ async fn signup_force_overwrites_saved_key_without_warning() {
 /// this test.
 #[tokio::test]
 async fn signup_warns_then_overwrites_when_saved_key_present() {
-    let home = isolated_home();
+    let home = common::isolated_home();
     let server = MockServer::start().await;
 
-    seed_api_key(&home, "k_old");
+    common::seed_api_key(&home, "k_old");
 
     Mock::given(method("POST"))
         .and(path("/api/v1/tenants"))
@@ -576,7 +490,7 @@ async fn signup_warns_then_overwrites_when_saved_key_present() {
         .await;
 
     let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    set_platform_env(&mut cmd, &home);
+    common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
         .arg("signup")
