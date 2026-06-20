@@ -42,10 +42,7 @@ pub fn run(path: &Path, app: &str) -> Result<()> {
         }
     }
 
-    output::success(&format!(
-        "Rolled back to deployment {}",
-        resp.deployment_id
-    ));
+    output::success(&format!("Rolled back to deployment {}", resp.deployment_id));
     output::hint("verify with `edge status` or open in a browser with `edge open`");
     Ok(())
 }

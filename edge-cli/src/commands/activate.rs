@@ -64,9 +64,7 @@ fn load_state_optional(path: &Path) -> Result<Option<State>> {
 fn resolve_app_name(state: &Option<State>) -> Result<String> {
     match state {
         Some(s) if !s.app_name.is_empty() => Ok(s.app_name.clone()),
-        _ => anyhow::bail!(
-            "edge activate requires .edge/state.json — run `edge deploy` first"
-        ),
+        _ => anyhow::bail!("edge activate requires .edge/state.json — run `edge deploy` first"),
     }
 }
 

@@ -66,12 +66,7 @@ fn seed_api_key(home: &TempDir, key: &str) {
     writeln!(f, "[default]\napi_key = \"{key}\"\n").unwrap();
 }
 
-fn seed_project_with_state(
-    project: &TempDir,
-    app_name: &str,
-    deployment_id: &str,
-    live_url: &str,
-) {
+fn seed_project_with_state(project: &TempDir, app_name: &str, deployment_id: &str, live_url: &str) {
     std::fs::write(
         project.path().join("edge.toml"),
         r#"[project]
@@ -159,12 +154,11 @@ async fn open_force_skips_crash_preflight() {
     let server = MockServer::start().await;
 
     seed_api_key(&home, "k_seed");
-    seed_project_with_state(
-        &project,
-        "myapp",
-        "d_crashed",
-        "https://crashed.example.test",
-    );
+    // Use a URL that doesn't contain the substring "crashed" — on Linux
+    // CI the open crate may try to launch xdg-open and surface the
+    // URL in its own error message, which would false-positive a bare
+    // substring assertion below.
+    seed_project_with_state(&project, "myapp", "d_crashed", "https://app.example.test");
 
     // Mount status with expect(0) — if the CLI calls it, the test fails.
     Mock::given(method("GET"))
@@ -187,10 +181,17 @@ async fn open_force_skips_crash_preflight() {
     cmd.arg("--force");
 
     // We can't assert success (the open crate would try to launch
-    // a browser), but we CAN assert the CLI did NOT print the
-    // crash-hint message. If the preflight ran, "crashed" would
-    // appear on stderr.
-    cmd.assert().stderr(predicate::str::contains("crashed").not());
+    // a browser — on Linux CI that may itself emit a noisy error
+    // containing the URL, which could include substrings like
+    // "crashed" if we used one in the URL).
+    //
+    // What we CAN assert: if the preflight had run, the CLI would
+    // have bailed with the specific preflight error
+    // "deployment <id> has crashed" BEFORE the open crate was called.
+    // The absence of that exact phrase on stderr means the preflight
+    // was skipped — i.e., --force worked.
+    cmd.assert()
+        .stderr(predicate::str::contains("has crashed").not());
 }
 
 // ---------------------------------------------------------------------------
@@ -206,12 +207,7 @@ async fn open_ready_deployment_does_not_warn() {
     let server = MockServer::start().await;
 
     seed_api_key(&home, "k_seed");
-    seed_project_with_state(
-        &project,
-        "myapp",
-        "d_ok",
-        "https://ok.example.test",
-    );
+    seed_project_with_state(&project, "myapp", "d_ok", "https://ok.example.test");
 
     Mock::given(method("GET"))
         .and(path("/api/status/d_ok"))
