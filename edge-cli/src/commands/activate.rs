@@ -3,6 +3,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use super::state_io::load_state_optional;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
@@ -38,25 +39,6 @@ pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
 
     output::success(&format!("Deployment {} activated", deployment_id));
     Ok(())
-}
-
-/// Load `.edge/state.json` if it exists. Suppress only `NotFound`;
-/// surface parse/IO errors so the user gets a real diagnostic.
-fn load_state_optional(path: &Path) -> Result<Option<State>> {
-    match State::load(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) => {
-            let is_not_found = e.chain().any(|c| {
-                c.downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-            });
-            if is_not_found {
-                Ok(None)
-            } else {
-                Err(e)
-            }
-        }
-    }
 }
 
 /// Resolve the app name. Requires an existing `.edge/state.json`
@@ -110,12 +92,5 @@ mod tests {
             msg.contains("requires .edge/state.json"),
             "expected missing-state error, got: {msg}"
         );
-    }
-
-    #[test]
-    fn load_state_optional_returns_none_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let got = load_state_optional(dir.path()).unwrap();
-        assert!(got.is_none());
     }
 }
