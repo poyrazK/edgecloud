@@ -34,8 +34,10 @@ use testcontainers_modules::nats::Nats;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 
+use edge_worker::auth::WorkerJwtSigner;
 use edge_worker::config::Config;
 use edge_worker::downloader::Downloader;
+use edge_worker::log_forwarder::LogForwarder;
 use edge_worker::messages::HeartbeatMessage;
 use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
 use edge_worker::port_pool::PortPool;
@@ -100,13 +102,28 @@ async fn build_supervisor(
         epoch_deadline_ticks: 100,
         queue_group: "ingress-wire-group".to_string(),
         consumer_name: format!("ingress-wire-{}", worker_id),
+        // JWT fields: required by Config, but the wire tests construct
+        // Config directly and never hit the auth path against a real
+        // control plane (the mock server accepts anything). Any non-empty
+        // placeholder is fine.
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
+        jwt_signer.clone(),
     ));
     let port_pool = Arc::new(TokioMutex::new(PortPool::new(
         config.starting_port,
@@ -114,12 +131,19 @@ async fn build_supervisor(
     )));
 
     let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer,
+    );
     Ok(Arc::new(Supervisor {
         config,
         state,
         downloader,
         port_pool,
         nats,
+        log_forwarder,
     }))
 }
 

@@ -99,6 +99,7 @@ fn test_config(
         epoch_deadline_ticks: 100,
         queue_group: "test-group".to_string(),
         consumer_name: format!("test-{}", worker_id),
+        worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
@@ -1066,6 +1067,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         deployment_hash: test_component_hash(),
         env: HashMap::new(),
         allowlist: vec![],
+        max_memory_mb: 0,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-18T00:00:00Z".to_string(),
