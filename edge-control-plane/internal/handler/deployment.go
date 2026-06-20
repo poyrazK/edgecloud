@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -25,6 +26,16 @@ func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc se
 	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc}
 }
 
+// deployResponse is the JSON shape returned by `POST /api/deploy/{appName}`.
+// Typed (vs the prior anonymous `map[string]interface{}`) so the contract
+// is explicit and the test asserts against a struct, not a string match.
+type deployResponse struct {
+	ID      string   `json:"id"`
+	Hash    string   `json:"hash"`
+	URL     string   `json:"url"`
+	Regions []string `json:"regions"`
+}
+
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -35,6 +46,18 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse `?regions=us-east,eu-west`. Split on `,`, trim whitespace,
+	// drop empties, dedupe (preserving first-seen order so the response
+	// is stable). Invalid regions are caught at the service layer
+	// (`IsValidRegion`) — we still return 400 from the handler with a
+	// caller-friendly message because the service error string is
+	// also surfaced via the internal log.
+	regions, perr := parseRegions(r.URL.Query().Get("regions"))
+	if perr != nil {
+		http.Error(w, `{"error": "`+perr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -42,7 +65,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body))
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body), regions)
 	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			http.Error(w, `{"error": "max deployments quota exceeded"}`, http.StatusTooManyRequests)
@@ -52,6 +75,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
 			return
 		}
+		if errors.Is(err, service.ErrInvalidRegion) {
+			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, service.ErrTooManyRegions) {
+			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
@@ -59,11 +90,56 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":   deployment.ID,
-		"hash": deployment.Hash,
-		"url":  "https://" + domain.IngressHost(tenantID, appName),
+	json.NewEncoder(w).Encode(deployResponse{
+		ID:      deployment.ID,
+		Hash:    deployment.Hash,
+		URL:     "https://" + domain.IngressHost(tenantID, appName),
+		Regions: domain.StringArrayTo(deployment.Regions),
 	})
+}
+
+// parseRegions turns the `?regions=` query value into a deduped slice.
+// Returns an error for entries that don't match `[a-z0-9-]{1,64}` so
+// the caller can return 400 with a precise message. Empty input or
+// all-empty-after-trim returns a nil slice and no error — the service
+// layer treats nil/empty as "use the control plane's default region".
+func parseRegions(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		// Validate charset and length at the handler boundary so a
+		// malformed value never reaches the service layer. Mirrors
+		// service.IsValidRegion — the duplication is deliberate
+		// (handler gives a clean 400 message; service is a second
+		// line of defense).
+		if !service.IsValidRegion(t) {
+			return nil, fmt.Errorf("invalid region %q: must match [a-z0-9-]{1,64}", t)
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	if len(out) == 0 {
+		// All entries were blank/dupes — equivalent to no regions.
+		return nil, nil
+	}
+	// Enforce the per-deployment cap AFTER dedupe so duplicate values
+	// don't count toward the limit. The service also enforces this as
+	// defense-in-depth for non-HTTP callers.
+	if len(out) > service.MaxRegionsPerDeployment {
+		return nil, fmt.Errorf("too many regions: %d (max %d)", len(out), service.MaxRegionsPerDeployment)
+	}
+	return out, nil
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -206,5 +207,164 @@ func TestAppIngress_PathTraversal_Returns400(t *testing.T) {
 				t.Errorf("GetAppTarget should not have been called for traversal appName, got %q", lookup.lastApp)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseRegions — pure-function unit tests for the `?regions=` query parser.
+// Pulled out from the deploy handler so the parsing contract is testable
+// without standing up a DeploymentService. The handler-level 400 tests
+// below exercise the parser indirectly through the real HTTP path.
+// ---------------------------------------------------------------------------
+
+func TestParseRegions(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    []string
+		wantErr bool
+	}{
+		// Empty / missing → nil, no error. The service layer
+		// treats nil as "use the control plane's default region".
+		{"empty string", "", nil, false},
+		{"whitespace only", "   ", nil, false},
+		{"commas only", ",,,", nil, false},
+
+		// Single value, happy paths.
+		{"single region", "us-east", []string{"us-east"}, false},
+		{"single region with surrounding spaces", "  eu-west  ", []string{"eu-west"}, false},
+
+		// Multiple values, order preserved.
+		{"two regions", "us-east,eu-west", []string{"us-east", "eu-west"}, false},
+		{"three regions with spaces", "us-east, eu-west , ap-south", []string{"us-east", "eu-west", "ap-south"}, false},
+
+		// Dedup (first-seen wins).
+		{"dupe collapsed", "us-east,us-east,eu-west", []string{"us-east", "eu-west"}, false},
+		{"dupe with spaces", "us-east, us-east ,eu-west", []string{"us-east", "eu-west"}, false},
+
+		// Empty entries are dropped, not surfaced as `""`.
+		{"leading empty", ",us-east,eu-west", []string{"us-east", "eu-west"}, false},
+		{"trailing empty", "us-east,eu-west,", []string{"us-east", "eu-west"}, false},
+		{"interleaved empties", "us-east,,eu-west", []string{"us-east", "eu-west"}, false},
+
+		// Invalid: anything outside `[a-z0-9-]{1,64}`. Each entry is
+		// validated at the handler boundary so a malformed value
+		// never reaches the service layer.
+		{"uppercase rejected", "US-EAST", nil, true},
+		{"underscore rejected", "us_east", nil, true},
+		{"dot rejected", "us.east", nil, true},
+		{"slash rejected", "us/east", nil, true},
+		{"space inside rejected", "us east", nil, true},
+		// Empty entries (consecutive commas) are dropped, not rejected —
+		// the parser trims first, then validates. A list of only
+		// empties (`",,,"`) collapses to nil.
+		{"empties dropped, rest kept", "us-east,,eu-west", []string{"us-east", "eu-west"}, false},
+		// 65 chars = over the 64-char cap.
+		{"too long rejected", "a2345678901234567890123456789012345678901234567890123456789012345", nil, true},
+
+		// Cap (MaxRegionsPerDeployment = 16). The cap is enforced AFTER
+		// dedupe, so duplicates must not count toward the limit.
+		{"at cap (16 unique)", "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p",
+			[]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p"}, false},
+		{"over cap (17 unique)", "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q", nil, true},
+		{"dupes not counted (17 copies of a)", strings.Repeat("a,", 16) + "a", []string{"a"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseRegions(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseRegions(%q) err = %v, wantErr = %v", tt.input, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if !equalSlices(got, tt.want) {
+				t.Errorf("parseRegions(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Deploy handler — 400 paths (invalid regions). The 200 path is covered
+// by service-level tests in service/deployment_regions_test.go, which
+// exercise the full Deploy → ActivateDeployment chain end-to-end with a
+// real service and a recording mock publisher.
+// ---------------------------------------------------------------------------
+
+// newDeployMux wires a single route through a real *http.ServeMux. The
+// deploymentSvc is nil because these tests only cover 400 paths that
+// short-circuit before the service is called; a happy-path test would
+// panic on the nil pointer deref.
+func newDeployMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/deploy/{appName}", NewDeploymentHandler(nil, nil).Deploy)
+	return mux
+}
+
+func TestDeploy_InvalidRegions_Returns400(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		appName string
+	}{
+		{"uppercase region", "regions=US-EAST", "myapp"},
+		{"dot in region", "regions=us.east", "myapp"},
+		{"slash in region", "regions=us/east", "myapp"},
+		{"one good one bad", "regions=us-east,US-EAST", "myapp"},
+		// Path-traversal in appName is checked BEFORE the regions
+		// query, so a backslash in appName + valid regions still
+		// 400s on app name, not regions — confirming the layering.
+		{"path traversal in appName", "regions=us-east", "foo\\bar"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := newDeployMux()
+			url := "/api/deploy/" + tt.appName + "?" + tt.query
+			req := httptest.NewRequest("POST", url, nil)
+			req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestDeploy_TooManyRegions_Returns400 verifies the cap enforcement
+// at the handler boundary. parseRegions runs BEFORE the service is
+// called, so 17 valid regions get a 400 without ever reaching the
+// service. The service-layer rejection (defense-in-depth) is tested
+// separately in service/deployment_test.go.
+func TestDeploy_TooManyRegions_Returns400(t *testing.T) {
+	mux := newDeployMux()
+	// 17 unique valid regions → over the cap of 16.
+	query := "regions=" + strings.Join([]string{
+		"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+	}, ",")
+	req := httptest.NewRequest("POST", "/api/deploy/myapp?"+query, nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "too many regions") {
+		t.Errorf("body = %q, want it to mention 'too many regions'", rr.Body.String())
 	}
 }

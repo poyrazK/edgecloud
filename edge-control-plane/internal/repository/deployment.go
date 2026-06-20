@@ -6,6 +6,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // DeploymentRepository handles deployment data access.
@@ -23,14 +24,27 @@ func (r *DeploymentRepository) WithTx(tx *sqlx.Tx) *DeploymentRepository {
 }
 
 func (r *DeploymentRepository) Create(ctx context.Context, d *domain.Deployment) error {
-	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, created_at) VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, d.CreatedAt)
+	// `regions` is `NOT NULL DEFAULT '{}'` in the schema (migration 008).
+	// sqlx/pq maps a Go nil slice to SQL NULL, which would violate the
+	// constraint — so the service layer is responsible for passing a
+	// non-nil slice (it does, via the regions-with-default path in
+	// `Deploy` and `ActivateDeployment`). Defensive: treat nil as
+	// empty here so a future caller that forgets the invariant gets
+	// `[]` on disk, not a constraint error. The field is
+	// pq.StringArray (which is []string underneath) so the nil check
+	// and the pq.Array() marshal both work as for a plain slice.
+	regions := d.Regions
+	if regions == nil {
+		regions = pq.StringArray{}
+	}
+	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt)
 	return err
 }
 
 func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
 	var d domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, created_at FROM deployments WHERE id = $1`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id = $1`
 	err := r.db.GetContext(ctx, &d, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -40,14 +54,14 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.
 
 func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName)
 	return deployments, err
 }
 
 func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
 	return deployments, err
 }

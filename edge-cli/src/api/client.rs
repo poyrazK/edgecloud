@@ -86,6 +86,13 @@ pub struct ApiClient {
 pub struct DeployResponse {
     pub id: String,
     pub url: String,
+    /// Regions the deployment is replicated to. Returned by the
+    /// control plane so the CLI can persist them into state.json
+    /// (and so the tenant knows what their deploy targeted when the
+    /// server applies a default). May be empty if the server fills
+    /// it in lazily; treated as "use default" downstream in that case.
+    #[serde(default)]
+    pub regions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,10 +209,33 @@ impl ApiClient {
     }
 
     /// Upload a deployment artifact.
-    pub fn deploy(&self, app_name: &str, wasm_bytes: &[u8]) -> Result<DeployResponse> {
+    ///
+    /// `regions` is the list of regions the deployment should be
+    /// replicated to. Empty slice means "use the control plane's default
+    /// region" (the control plane applies the same default). The values
+    /// are passed through the `?regions=` query parameter as a
+    /// comma-separated string; the server splits, validates, and dedupes.
+    pub fn deploy(
+        &self,
+        app_name: &str,
+        wasm_bytes: &[u8],
+        regions: &[String],
+    ) -> Result<DeployResponse> {
         use reqwest::blocking::multipart;
 
-        let url = format!("{}/api/deploy/{}", self.base_url, app_name);
+        let mut url = format!("{}/api/deploy/{}", self.base_url, app_name);
+        if !regions.is_empty() {
+            // Use reqwest::Url to percent-encode the comma list so a
+            // region with a stray `+` or non-ASCII char doesn't break
+            // the URL. The server splits on `,` so the encoding is
+            // applied per the CSV string as a whole.
+            let mut parsed =
+                reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
+            parsed
+                .query_pairs_mut()
+                .append_pair("regions", &regions.join(","));
+            url = parsed.to_string();
+        }
         let part = multipart::Part::bytes(wasm_bytes.to_vec()).file_name("payload");
         let form = multipart::Form::new().part("payload", part);
 

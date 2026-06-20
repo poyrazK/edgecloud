@@ -2,15 +2,24 @@ package domain
 
 import (
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // Tenant represents a platform customer.
 type Tenant struct {
-	ID                      string    `db:"id"`
-	Name                    string    `db:"name"`
-	Plan                    string    `db:"plan"`
-	AllowlistedDestinations []string  `db:"allowlisted_destinations"`
-	CreatedAt               time.Time `db:"created_at"`
+	ID   string `db:"id"`
+	Name string `db:"name"`
+	Plan string `db:"plan"`
+	// AllowlistedDestinations is a TEXT[] column. Typed as
+	// pq.StringArray (which is []string underneath) so the column
+	// scans correctly via lib/pq's Scanner — a bare []string does NOT
+	// implement sql.Scanner and would fail on SELECT. The JSON wire
+	// format is unchanged because pq.StringArray marshals identically
+	// to []string. The repo also wraps writes in pq.Array() for the
+	// same reason on the encoding side.
+	AllowlistedDestinations pq.StringArray `db:"allowlisted_destinations"`
+	CreatedAt               time.Time      `db:"created_at"`
 }
 
 // Quota defines resource limits for a tenant.

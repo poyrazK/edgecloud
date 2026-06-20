@@ -8,6 +8,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // TenantServiceInterface abstracts tenant operations for testing.
@@ -39,7 +40,7 @@ func (s *TenantService) CreateTenant(ctx context.Context, name, plan string) (*d
 		ID:                      "t_" + uuid.New().String(),
 		Name:                    name,
 		Plan:                    plan,
-		AllowlistedDestinations: []string{},
+		AllowlistedDestinations: pq.StringArray{},
 	}
 
 	var created *domain.Tenant
@@ -80,7 +81,7 @@ func (s *TenantService) BootstrapTenant(ctx context.Context, name, plan, keyName
 		ID:                      "t_" + uuid.New().String(),
 		Name:                    name,
 		Plan:                    plan,
-		AllowlistedDestinations: []string{},
+		AllowlistedDestinations: pq.StringArray{},
 	}
 
 	var rawKey string
