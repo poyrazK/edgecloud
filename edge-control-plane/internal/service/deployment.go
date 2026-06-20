@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -56,6 +59,26 @@ func IsValidDeploymentAppName(name string) bool {
 	return true
 }
 
+// regionPattern constrains a region string to the charset used by
+// NATS subjects (which forbid `*`, `>`, `.`, whitespace, and path-
+// separator-like characters). The 64-char cap is a defensive ceiling;
+// AWS/GCP region codes are all <20 chars. See `IsValidRegion`.
+var regionPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+
+// IsValidRegion returns true if the region string is safe to use as a
+// NATS subject segment and as a deployment audit field. Rejects:
+//   - empty strings,
+//   - strings longer than 64 chars,
+//   - characters outside `[a-z0-9-]` (uppercase, whitespace, `.`, `/`,
+//     NATS wildcards, etc. — all of which would either break the
+//     subject or invite injection).
+//
+// Modeled on `IsValidAppName`. The service layer rejects invalid
+// regions before they reach the DB or the publisher.
+func IsValidRegion(r string) bool {
+	return regionPattern.MatchString(r)
+}
+
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
 const MaxArtifactSize = 100 * 1024 * 1024
 
@@ -72,6 +95,14 @@ type DeploymentService struct {
 	artifactStore  *storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
+	// defaultRegion is this control plane's own region. Used as the
+	// fallback `regions` list for deployments that don't explicitly
+	// target any region — both in `Deploy` (when the HTTP request
+	// omits `?regions=`) and in `ActivateDeployment` (when a
+	// pre-migration-008 row has an empty `regions` array). Set via
+	// the constructor; never nil/empty (the config layer defaults to
+	// "global" when unset).
+	defaultRegion string
 }
 
 func NewDeploymentService(
@@ -82,7 +113,17 @@ func NewDeploymentService(
 	tenantRepo *repository.TenantRepository,
 	artifactStore *storage.ArtifactStore,
 	publisher nats.Publisher,
+	defaultRegion string,
 ) *DeploymentService {
+	// Defensive: never let the service run with an empty default
+	// region. A blank region would build a NATS subject like
+	// `edgecloud.tasks.` which is malformed and the publish would
+	// fail opaquely. The config layer already defaults to "global",
+	// but a misconfigured test harness or a future refactor that
+	// bypasses the config layer would otherwise crash here.
+	if defaultRegion == "" {
+		defaultRegion = "global"
+	}
 	return &DeploymentService{
 		deploymentRepo: deploymentRepo,
 		activeRepo:     activeRepo,
@@ -91,6 +132,7 @@ func NewDeploymentService(
 		tenantRepo:     tenantRepo,
 		artifactStore:  artifactStore,
 		publisher:      publisher,
+		defaultRegion:  defaultRegion,
 	}
 }
 
@@ -100,10 +142,30 @@ func (s *DeploymentService) SetAppService(appSvc *AppService) {
 }
 
 // Deploy creates a new deployment and stores the artifact.
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader) (*domain.Deployment, error) {
+//
+// `regions` is the list of regions the deployment is targeted at. Pass
+// nil/empty to use the control plane's default region (preserves the
+// pre-#82 single-region behavior). Each region is validated against
+// `IsValidRegion`; the first invalid entry fails the call before any
+// DB or storage I/O.
+//
+// After the deployment row is written, the activate path will publish
+// one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
+// `ActivateDeployment`.)
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
+	}
+
+	// Validate every region before any side effect. An invalid
+	// region string would either break the NATS subject or
+	// (worse) inject a wildcard into a subject. The empty
+	// `regions` slice is NOT an error — it means "use default".
+	for _, r := range regions {
+		if !IsValidRegion(r) {
+			return nil, fmt.Errorf("invalid region %q: must match [a-z0-9-]{1,64}", r)
+		}
 	}
 
 	// Auto-create the app record if it doesn't already exist (backward compatible).
@@ -146,12 +208,23 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 
 	hash := sha256.Sum256(data)
 
+	// Resolve the effective regions list: explicit > default. We
+	// keep the empty `regions` slice distinct from nil so the repo
+	// layer can pass an empty array to the NOT NULL column without
+	// ambiguity. Pre-#82 behavior (no regions field) is preserved
+	// when the caller passes nil/empty.
+	effectiveRegions := regions
+	if len(effectiveRegions) == 0 {
+		effectiveRegions = []string{s.defaultRegion}
+	}
+
 	deployment := &domain.Deployment{
 		ID:        "d_" + uuid.New().String(),
 		TenantID:  tenantID,
 		AppName:   appName,
 		Status:    domain.StatusDeployed,
 		Hash:      hex.EncodeToString(hash[:]),
+		Regions:   pq.StringArray(effectiveRegions),
 		CreatedAt: time.Now(),
 	}
 
@@ -270,13 +343,42 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentID:   deploymentID,
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
-				Allowlist:      tenant.AllowlistedDestinations,
+				Allowlist:      []string(tenant.AllowlistedDestinations),
 				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
 	}
-	if err := s.publisher.PublishTaskUpdate("global", msg); err != nil {
-		return fmt.Errorf("publishing task update: %w", err)
+
+	// Resolve the effective regions list to publish to:
+	//   - deployment.Regions if non-empty (post-migration-008 row),
+	//   - otherwise the control plane's default region (handles
+	//     pre-migration rows AND any caller that wrote the row via a
+	//     path that left Regions nil). pq.StringArray is a named
+	//     []string — we copy into a plain []string so the rest of
+	//     this function doesn't care which one it has.
+	regions := []string(deployment.Regions)
+	if len(regions) == 0 {
+		regions = []string{s.defaultRegion}
+	}
+
+	// Fan out: publish one TaskMessage per region. Failures are
+	// logged but do NOT abort the loop — if a tenant activated to
+	// three regions and one publish fails (e.g. NATS blip), the
+	// other two should still get the message. The error returned
+	// here is a summary so the HTTP layer can surface a 5xx and
+	// the tenant can retry the failed regions. (A future
+	// improvement could track per-region publish state in the
+	// `active_deployments` row and only retry the failed ones;
+	// out of scope for the v1.)
+	var failedRegions []string
+	for _, region := range regions {
+		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
+			log.Printf("publishing task update failed for region %q (deployment %s): %v", region, deploymentID, err)
+			failedRegions = append(failedRegions, region)
+		}
+	}
+	if len(failedRegions) > 0 {
+		return fmt.Errorf("publishing task update failed for %d region(s): %s", len(failedRegions), strings.Join(failedRegions, ","))
 	}
 
 	return nil

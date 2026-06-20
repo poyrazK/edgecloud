@@ -70,7 +70,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -113,7 +113,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}

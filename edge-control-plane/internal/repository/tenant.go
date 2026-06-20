@@ -6,6 +6,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // TenantRepository handles tenant data access.
@@ -24,7 +25,12 @@ func (r *TenantRepository) WithTx(tx *sqlx.Tx) *TenantRepository {
 
 func (r *TenantRepository) Create(ctx context.Context, t *domain.Tenant) error {
 	query := `INSERT INTO tenants (id, name, plan, allowlisted_destinations) VALUES ($1, $2, $3, $4)`
-	_, err := r.db.ExecContext(ctx, query, t.ID, t.Name, t.Plan, t.AllowlistedDestinations)
+	// pq.Array wraps pq.StringArray so lib/pq encodes it as a
+	// Postgres array literal. Without the wrap, a bare []string
+	// would be encoded as comma-separated bytes — which Postgres
+	// rejects as a malformed array literal. See commit notes for
+	// the latent bug this fixed (issue #82 fan-out tests surfaced).
+	_, err := r.db.ExecContext(ctx, query, t.ID, t.Name, t.Plan, pq.Array(t.AllowlistedDestinations))
 	return err
 }
 
@@ -47,7 +53,7 @@ func (r *TenantRepository) List(ctx context.Context) ([]domain.Tenant, error) {
 
 func (r *TenantRepository) Update(ctx context.Context, t *domain.Tenant) error {
 	query := `UPDATE tenants SET name = $2, plan = $3, allowlisted_destinations = $4 WHERE id = $1`
-	_, err := r.db.ExecContext(ctx, query, t.ID, t.Name, t.Plan, t.AllowlistedDestinations)
+	_, err := r.db.ExecContext(ctx, query, t.ID, t.Name, t.Plan, pq.Array(t.AllowlistedDestinations))
 	return err
 }
 

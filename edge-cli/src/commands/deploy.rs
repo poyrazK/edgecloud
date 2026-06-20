@@ -9,19 +9,27 @@ use crate::output;
 use crate::state::State;
 
 /// Dispatch to the upload or activate path based on whether `--id` was given.
+///
+/// `regions` is forwarded to the upload path so the server can fan
+/// out the activate-time `TaskMessage` to each region. The activate
+/// path (with `--id`) ignores `regions` because regions are baked
+/// into the deployment row at upload time; activation reads them from
+/// the row, not from the CLI flag.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, app: &str, id: Option<&str>) -> Result<()> {
+pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String]) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app)
+    run_upload(path, app, regions)
 }
 
 /// Upload the project's compiled artifact to the control plane.
 ///
 /// `app`: positional app-name override. When empty, read from `edge.toml`.
+/// `regions`: list of regions to replicate to. Empty slice = server's
+/// default region.
 #[cfg(feature = "network")]
-fn run_upload(path: &Path, app: &str) -> Result<()> {
+fn run_upload(path: &Path, app: &str, regions: &[String]) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
         app.to_string()
@@ -40,13 +48,23 @@ fn run_upload(path: &Path, app: &str) -> Result<()> {
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes)?;
+    let resp = client.deploy(&app_name, &wasm_bytes, regions)?;
 
     let live_url = resp.url.clone();
+    // Persist the regions the server actually accepted (it may
+    // dedupe, apply a default, or reject). This keeps state.json in
+    // sync with the deployment row even when the user passed an
+    // empty `--regions` and the server filled in its own default.
+    let persisted_regions = if !resp.regions.is_empty() {
+        resp.regions.clone()
+    } else {
+        regions.to_vec()
+    };
     let state = State {
         deployment_id: resp.id,
         app_name,
         live_url,
+        regions: persisted_regions,
     };
     state.save(path)?;
 
@@ -120,7 +138,7 @@ fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _app: &str, _id: Option<&str>) -> Result<()> {
+pub fn run(_path: &Path, _app: &str, _id: Option<&str>, _regions: &[String]) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
 
@@ -133,6 +151,10 @@ mod tests {
             deployment_id: "d_test".to_string(),
             app_name: name.to_string(),
             live_url: "https://example.test".to_string(),
+            // Empty regions for the resolve_* tests — those helpers
+            // don't touch regions. The serde round-trip tests for
+            // state.json live in state/mod.rs.
+            regions: vec![],
         }
     }
 

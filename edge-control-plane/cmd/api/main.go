@@ -74,7 +74,7 @@ func main() {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo)
 	deploymentSvc := service.NewDeploymentService(
-		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher,
+		deploymentRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)

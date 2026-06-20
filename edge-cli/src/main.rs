@@ -50,6 +50,14 @@ enum Command {
         /// Activate a previously-stored deployment by ID (e.g. from `edge migrate`).
         #[arg(long, value_name = "deployment_id")]
         id: Option<String>,
+
+        /// Comma-separated list of regions to replicate this deployment to.
+        /// `us-east,eu-west` fans out a TaskMessage to both regions at
+        /// activate time. Omit to use the control plane's default
+        /// region. Ignored when --id is set (regions are baked into
+        /// the deployment row at upload time).
+        #[arg(long, value_name = "REGIONS", value_delimiter = ',')]
+        regions: Vec<String>,
     },
 
     /// Get deployment status.
@@ -104,7 +112,9 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
         Command::Build => commands::build::run(&cli.path),
-        Command::Deploy { app, id } => commands::deploy::run(&cli.path, &app, id.as_deref()),
+        Command::Deploy { app, id, regions } => {
+            commands::deploy::run(&cli.path, &app, id.as_deref(), &regions)
+        }
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
