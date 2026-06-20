@@ -23,14 +23,27 @@ func (r *ActiveDeploymentRepository) WithTx(tx *sqlx.Tx) *ActiveDeploymentReposi
 }
 
 func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveDeployment) error {
-	query := `INSERT INTO active_deployments (tenant_id, app_name, deployment_id) VALUES ($1, $2, $3) ON CONFLICT (tenant_id, app_name) DO UPDATE SET deployment_id = $3`
-	_, err := r.db.ExecContext(ctx, query, ad.TenantID, ad.AppName, ad.DeploymentID)
+	query := `INSERT INTO active_deployments (tenant_id, app_name, deployment_id, last_good_deployment_id) VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, app_name) DO UPDATE SET deployment_id = $3, last_good_deployment_id = $4`
+	_, err := r.db.ExecContext(ctx, query, ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID)
 	return err
 }
 
 func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
+	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &ad, err
+}
+
+// GetForUpdate reads the active_deployments row for (tenant, app) inside a
+// transaction with a row-level lock so the caller can swap
+// deployment_id ↔ last_good_deployment_id atomically. Pair with WithTx.
+func (r *ActiveDeploymentRepository) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
+	var ad domain.ActiveDeployment
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -45,7 +58,7 @@ func (r *ActiveDeploymentRepository) Delete(ctx context.Context, tenantID, appNa
 
 func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
 	var ads []domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id FROM active_deployments WHERE tenant_id = $1`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id FROM active_deployments WHERE tenant_id = $1`
 	err := r.db.SelectContext(ctx, &ads, query, tenantID)
 	return ads, err
 }

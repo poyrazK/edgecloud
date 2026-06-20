@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,10 +22,29 @@ import (
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
+	// rollbackSvc is a narrow contract for the rollback handler so the
+	// test can stub it without standing up the full *service.DeploymentService
+	// (DB + NATS + publisher + artifact store). The concrete
+	// *service.DeploymentService satisfies it.
+	rollbackSvc deploymentRollbacker
+}
+
+// deploymentRollbacker is the narrow contract the Rollback handler needs.
+// Kept package-local so handler tests can implement it inline without
+// having to mock the full DeploymentService surface.
+type deploymentRollbacker interface {
+	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
 }
 
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
-	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc}
+	return &DeploymentHandler{
+		deploymentSvc: deploymentSvc,
+		workerSvc:     workerSvc,
+		// Concrete *service.DeploymentService satisfies the narrow interface.
+		// nil is also fine for tests that only exercise the workerSvc path
+		// (e.g. AppIngress) — that method never touches rollbackSvc.
+		rollbackSvc: deploymentSvc,
+	}
 }
 
 // deployResponse is the JSON shape returned by `POST /api/deploy/{appName}`.
@@ -208,6 +228,43 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+}
+
+// Rollback handles POST /api/apps/{appName}/rollback. Swaps the active
+// deployment back to the stored last_good_deployment_id and republishes a
+// TaskMessage so workers reconcile.
+//
+// Status codes:
+//   - 200: rolled back; body is {"deployment_id": "<new active id>"}
+//   - 404: no active deployment for this app (user never activated)
+//   - 409: app is active but has no last-good pointer (only ever activated
+//     one deployment, so there is nothing to roll back to)
+//   - 500: anything else (DB error, NATS publish failure, …)
+func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+	if appName == "" || containsPathTraversal(appName) {
+		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		return
+	}
+
+	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName)
+	if err != nil {
+		if errors.Is(err, service.ErrNoLastGood) {
+			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
+			return
+		}
+		if err.Error() == "app not found" {
+			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
+			return
+		}
+		log.Printf("internal error: %v", err)
+		http.Error(w, `{"error": "rollback failed"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {

@@ -18,6 +18,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -91,14 +92,19 @@ const MaxRegionsPerDeployment = 16
 //
 // The handler matches ErrInvalidRegion and ErrTooManyRegions via
 // errors.Is and maps them to 400. Quota errors stay 429.
+// ErrNoLastGood is returned by RollbackDeployment when the active row
+// exists but last_good_deployment_id is NULL — the tenant has no
+// previous deployment to roll back to. Handler maps to HTTP 409.
 var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
 )
 
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
+	db             *sqlx.DB
 	deploymentRepo *repository.DeploymentRepository
 	activeRepo     *repository.ActiveDeploymentRepository
 	appEnvRepo     *repository.AppEnvRepository
@@ -118,6 +124,7 @@ type DeploymentService struct {
 }
 
 func NewDeploymentService(
+	db *sqlx.DB,
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
@@ -137,6 +144,7 @@ func NewDeploymentService(
 		defaultRegion = "global"
 	}
 	return &DeploymentService{
+		db:             db,
 		deploymentRepo: deploymentRepo,
 		activeRepo:     activeRepo,
 		appEnvRepo:     appEnvRepo,
@@ -321,10 +329,31 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("deployment not found")
 	}
 
-	if err := s.activeRepo.Set(ctx, &domain.ActiveDeployment{
-		TenantID:     tenantID,
-		AppName:      appName,
-		DeploymentID: deploymentID,
+	// Atomically move the current active id into last_good_deployment_id
+	// and write the new id. Two readers can race on a non-tx read+write;
+	// use a tx with FOR UPDATE so concurrent activate/rollback serialize.
+	//
+	// Edge cases handled:
+	//   - First-ever activate: current is nil → last_good stays NULL.
+	//   - Re-activate the same id: current.deployment_id == newID →
+	//     last_good becomes equal to deployment_id (visually a no-op,
+	//     but the row stays consistent).
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txActive := s.activeRepo.WithTx(tx)
+		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("reading current active deployment: %w", err)
+		}
+		var lastGood *string
+		if current != nil {
+			lastGood = &current.DeploymentID
+		}
+		return txActive.Set(ctx, &domain.ActiveDeployment{
+			TenantID:             tenantID,
+			AppName:              appName,
+			DeploymentID:         deploymentID,
+			LastGoodDeploymentID: lastGood,
+		})
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
 	}
@@ -402,6 +431,112 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	}
 
 	return nil
+}
+
+// RollbackDeployment atomically swaps the active deployment back to the
+// stored last_good_deployment_id and republishes a TaskMessage so workers
+// reconcile. Returns ErrNoLastGood if the row has no last-good pointer
+// (tenant has only ever activated one deployment).
+//
+// On success, returns the deployment_id that is now active (i.e., the
+// prior last_good value). The prior current deployment_id is overwritten
+// — there is no multi-step history in this minimum viable version.
+func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error) {
+	var rolledBackID string
+	var deploymentHash string
+	var tenant *domain.Tenant
+	var envs []domain.AppEnv
+	var maxMemoryMB int
+
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txActive := s.activeRepo.WithTx(tx)
+		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("reading current active deployment: %w", err)
+		}
+		if current == nil {
+			return fmt.Errorf("app not found")
+		}
+		if current.LastGoodDeploymentID == nil {
+			return ErrNoLastGood
+		}
+
+		rolledBackID = *current.LastGoodDeploymentID
+
+		// Confirm the target still exists. Defends against the (unlikely)
+		// case where the last_good row was deleted out from under us.
+		dep, err := s.deploymentRepo.GetByID(ctx, rolledBackID)
+		if err != nil || dep == nil {
+			return fmt.Errorf("previous deployment %s not found", rolledBackID)
+		}
+		if dep.TenantID != tenantID || dep.AppName != appName {
+			return fmt.Errorf("previous deployment %s not found", rolledBackID)
+		}
+		deploymentHash = dep.Hash
+
+		// Clear last_good so a second rollback is a no-op (returns 409
+		// rather than rolling back to whatever was active two steps ago —
+		// that requires an N-step history table, out of scope for the
+		// minimum viable UX).
+		if err := txActive.Set(ctx, &domain.ActiveDeployment{
+			TenantID:             tenantID,
+			AppName:              appName,
+			DeploymentID:         rolledBackID,
+			LastGoodDeploymentID: nil,
+		}); err != nil {
+			return fmt.Errorf("swapping active deployment: %w", err)
+		}
+
+		// Snapshot the publish inputs inside the tx so the message
+		// reflects post-rollback state even if another activate lands
+		// between commit and publish (which would itself race with this
+		// publish; see plan §"Risk register").
+		envsList, err := s.appEnvRepo.List(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing env vars: %w", err)
+		}
+		envs = envsList
+		tenant, err = s.tenantRepo.GetByID(ctx, tenantID)
+		if err != nil || tenant == nil {
+			return fmt.Errorf("getting tenant: %w", err)
+		}
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		maxMemoryMB = 256
+		if quota != nil && quota.MaxMemoryMB > 0 {
+			maxMemoryMB = quota.MaxMemoryMB
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	envMap := make(map[string]string)
+	for _, e := range envs {
+		envMap[e.EnvKey] = e.EnvValue
+	}
+
+	msg := &nats.TaskMessage{
+		Type:      "task_update",
+		Timestamp: time.Now(),
+		TenantID:  tenantID,
+		Apps: map[string]nats.AppConfig{
+			appName: {
+				DeploymentID:   rolledBackID,
+				DeploymentHash: deploymentHash,
+				Env:            envMap,
+				Allowlist:      tenant.AllowlistedDestinations,
+				MaxMemoryMB:    maxMemoryMB,
+			},
+		},
+	}
+	if err := s.publisher.PublishTaskUpdate("global", msg); err != nil {
+		return "", fmt.Errorf("publishing task update: %w", err)
+	}
+
+	return rolledBackID, nil
 }
 
 func (s *DeploymentService) GetActiveDeployment(ctx context.Context, tenantID, appName string) (*domain.Deployment, error) {
