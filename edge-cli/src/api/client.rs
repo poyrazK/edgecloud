@@ -146,6 +146,14 @@ pub struct WhoamiResponse {
     pub created_at: String,
 }
 
+/// Response from POST `/api/apps/{appName}/rollback`. The
+/// `deployment_id` field is the deployment that is now active after
+/// the rollback — i.e., the prior `last_good_deployment_id`.
+#[derive(Debug, Deserialize)]
+pub struct RollbackResponse {
+    pub deployment_id: String,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -339,6 +347,29 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
         Ok(())
+    }
+
+    /// Rollback the active deployment of `app_name` to the stored
+    /// `last_good_deployment_id`. Returns the deployment id that is now
+    /// active. If the server returns 409 ("no previous deployment to
+    /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
+    /// caller can detect that via `body.contains("no previous")`.
+    pub fn rollback(&self, app_name: &str) -> Result<RollbackResponse> {
+        let url = format!("{}/api/apps/{}/rollback", self.base_url, app_name);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("rollback failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
 
     /// List all deployments for an app.
