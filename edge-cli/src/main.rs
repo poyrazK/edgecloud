@@ -80,6 +80,18 @@ enum Command {
         deployment_id: String,
     },
 
+    /// Roll back to the previous deployment.
+    ///
+    /// Swaps the active deployment back to the deployment that was
+    /// active before the most recent `edge activate` (or `edge deploy`).
+    /// Useful for recovering from a broken release without re-uploading
+    /// a known-good artifact.
+    Rollback {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+    },
+
     /// Analyze source for WASI compatibility.
     Migrate {
         /// Path to source directory (default: path argument).
@@ -94,7 +106,11 @@ enum Command {
     Dev,
 
     /// Open the deployed URL in a browser.
-    Open,
+    Open {
+        /// Open even if the current deployment has crashed.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// List all deployments for the app.
     Deployments,
@@ -119,9 +135,10 @@ fn main() -> Result<()> {
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
         Command::Activate { deployment_id } => commands::activate::run(&cli.path, &deployment_id),
+        Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev => commands::dev::run(&cli.path),
-        Command::Open => commands::open::run(&cli.path),
+        Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
         Command::Auth { action } => action.run(),
     }
