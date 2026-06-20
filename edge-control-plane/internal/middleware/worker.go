@@ -63,10 +63,12 @@ func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, er
 func WorkerAuth(cfg WorkerJWTConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Header-only transport: a token in the URL would leak into
+			// access logs, browser history, and reverse-proxy error pages.
+			// (Previously `r.URL.Query().Get("jwt")` was a fallback; it was
+			// removed because any leak of the URL — which is much more
+			// likely than a leak of the header — would expose a 24h bearer.)
 			token := r.Header.Get("Authorization")
-			if token == "" {
-				token = r.URL.Query().Get("jwt")
-			}
 			if token == "" {
 				http.Error(w, `{"error": "missing worker token"}`, http.StatusUnauthorized)
 				return

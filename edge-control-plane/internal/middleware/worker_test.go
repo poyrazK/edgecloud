@@ -232,3 +232,69 @@ func TestWorkerAuth_PutsRegionInContext(t *testing.T) {
 		t.Errorf("region = %q, want %q", gotRegion, "fra")
 	}
 }
+
+// TestWorkerAuth_RejectsQueryStringToken pins the header-only contract.
+// A token passed via `?jwt=<valid>` in the URL (and no Authorization
+// header) must be rejected — it would otherwise leak into access logs,
+// browser history, and reverse-proxy error pages.
+func TestWorkerAuth_RejectsQueryStringToken(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("downstream handler must not be called when no Authorization header is set")
+	})
+	mw := WorkerAuth(cfg)(handler)
+
+	// Token in URL only, no header.
+	req := httptest.NewRequest("GET", "/api/internal/download/d_abc?jwt="+tokenString, nil)
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (query-string token must be rejected)", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestWorkerAuth_HeaderWinsWhenBothPresent documents the priority:
+// when both `?jwt=` and a valid Authorization header are present, the
+// header is the source of truth. A request that contains both should
+// succeed (assuming the header token is valid).
+func TestWorkerAuth_HeaderWinsWhenBothPresent(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mw := WorkerAuth(cfg)(handler)
+
+	req := httptest.NewRequest("GET", "/api/internal/download/d_abc?jwt="+tokenString, nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (header should win when both present)", rec.Code, http.StatusOK)
+	}
+}
