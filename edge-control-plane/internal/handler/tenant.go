@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
-	"github.com/lib/pq"
 )
 
 // TenantHandler handles tenant HTTP requests.
@@ -154,11 +154,11 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 		tenant.Plan = req.Plan
 	}
 	if len(req.AllowlistedDestinations) > 0 {
-		// Convert []string -> pq.StringArray so the field type matches
-		// the domain. The repo wraps the value in pq.Array() on the
-		// way to Postgres; the conversion here just gets the Go type
-		// right so the assignment compiles.
-		tenant.AllowlistedDestinations = pq.StringArray(req.AllowlistedDestinations)
+		// Convert []string -> domain.StringArrayFrom so the field type
+		// matches the domain. The repo wraps the value in pq.Array()
+		// on the way to Postgres; the conversion here just gets the Go
+		// type right so the assignment compiles.
+		tenant.AllowlistedDestinations = domain.StringArrayFrom(req.AllowlistedDestinations)
 	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {

@@ -148,17 +148,24 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	}
 
 	// Every publish must use the same TaskMessage body (same
-	// deployment id, hash, env, allowlist). Only the region arg
-	// should differ.
+	// deployment id, hash, env, allowlist, MaxMemoryMB). Only the
+	// region arg should differ.
 	if len(pub.calls) != 3 {
 		t.Fatalf("len(pub.calls) = %d, want 3", len(pub.calls))
 	}
 	first := pub.calls[0].msg.Apps[appName]
+	// The mock quota row sets MaxMemoryMB=512; assert it propagates.
+	if first.MaxMemoryMB != 512 {
+		t.Errorf("call 0: MaxMemoryMB = %d, want 512", first.MaxMemoryMB)
+	}
 	for i, c := range pub.calls[1:] {
 		app := c.msg.Apps[appName]
-		if app.DeploymentID != first.DeploymentID || app.DeploymentHash != first.DeploymentHash {
-			t.Errorf("call %d: msg differs from call 0: got deploymentID=%q hash=%q, want %q / %q",
-				i+1, app.DeploymentID, app.DeploymentHash, first.DeploymentID, first.DeploymentHash)
+		if app.DeploymentID != first.DeploymentID ||
+			app.DeploymentHash != first.DeploymentHash ||
+			app.MaxMemoryMB != first.MaxMemoryMB {
+			t.Errorf("call %d: msg differs from call 0: got deploymentID=%q hash=%q maxMemoryMB=%d, want %q / %q / %d",
+				i+1, app.DeploymentID, app.DeploymentHash, app.MaxMemoryMB,
+				first.DeploymentID, first.DeploymentHash, first.MaxMemoryMB)
 		}
 	}
 
@@ -202,6 +209,11 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	}
 	if got := pub.regionsCalled(); !equalStringSlices(got, []string{"global"}) {
 		t.Errorf("publish regions = %v, want [global]", got)
+	}
+	// The mock quota row has MaxMemoryMB=256; assert it propagates so
+	// the quota→TaskMessage wiring is pinned.
+	if got := pub.calls[0].msg.Apps["myapp"].MaxMemoryMB; got != 256 {
+		t.Errorf("MaxMemoryMB = %d, want 256", got)
 	}
 }
 
@@ -285,6 +297,84 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	wantRegions := []string{"us-east", "eu-west", "ap-south"}
 	if !equalStringSlices(gotRegions, wantRegions) {
 		t.Errorf("publish regions = %v, want %v (all must be attempted even on partial failure)", gotRegions, wantRegions)
+	}
+}
+
+// TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault pins the
+// fallback branch at service/deployment.go: maxMemoryMB starts at 256
+// and only gets overwritten when quota != nil && quota.MaxMemoryMB > 0.
+// A zero in the quota row must NOT be used as the actual limit — the
+// service treats it as "unset" and falls through to the 256 default.
+// (Without this test, a future "always honor the quota value" refactor
+// would silently set MaxMemoryMB=0 in the TaskMessage and trip a worker
+// limit that rejects zero.)
+func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const deploymentID = "d_zero_quota"
+	regionsCol := `{"us-east"}`
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now()))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
+			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Quota row with MaxMemoryMB=0 — should be treated as "unset" and
+	// fall through to the 256 default.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}).
+			AddRow("t_test", 100, 50, 10, 0, 1024))
+
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+		t.Fatalf("ActivateDeployment: %v", err)
+	}
+	if got := pub.calls[0].msg.Apps["myapp"].MaxMemoryMB; got != 256 {
+		t.Errorf("MaxMemoryMB = %d, want 256 (fallback when quota has 0)", got)
+	}
+}
+
+// TestActivateDeployment_NilQuota_FallsBackToDefault covers the case
+// where GetByTenantID returns (nil, nil) — no quota row at all. The
+// service must still produce a TaskMessage with MaxMemoryMB=256, not
+// crash on a nil pointer deref.
+func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const deploymentID = "d_no_quota"
+	regionsCol := `{"us-east"}`
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now()))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
+			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Empty row set (no quota row) — GetByTenantID returns (nil, nil).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb"}))
+
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+		t.Fatalf("ActivateDeployment: %v", err)
+	}
+	if got := pub.calls[0].msg.Apps["myapp"].MaxMemoryMB; got != 256 {
+		t.Errorf("MaxMemoryMB = %d, want 256 (fallback when quota is nil)", got)
 	}
 }
 

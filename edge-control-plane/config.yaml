@@ -25,3 +25,9 @@ jwt:
 migration:
   edge_migrate_path: "edge-migrate"
   wasi_sdk_path: "/usr/local/wasi-sdk/bin"
+
+# region is this control plane's own region. Used as the default for
+# deployments that don't specify `?regions=`. Defaults to "global" if
+# unset (which works with the wildcard NATS subject edgecloud.tasks.>).
+# Override via CONTROL_PLANE_REGION env var. See issue #82.
+# region: "global"

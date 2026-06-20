@@ -75,15 +75,15 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
 			return
 		}
-		log.Printf("internal error: %v", err)
-		// Service-layer region validation surfaces as 400. The string
-		// is the only signal we have today; the dedicated test
-		// (deployment_test.go) pins the contract so a future
-		// refactor can't silently demote this to 500.
-		if strings.HasPrefix(err.Error(), "invalid region") {
+		if errors.Is(err, service.ErrInvalidRegion) {
 			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
 			return
 		}
+		if errors.Is(err, service.ErrTooManyRegions) {
+			http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -94,7 +94,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		ID:      deployment.ID,
 		Hash:    deployment.Hash,
 		URL:     "https://" + domain.IngressHost(tenantID, appName),
-		Regions: []string(deployment.Regions),
+		Regions: domain.StringArrayTo(deployment.Regions),
 	})
 }
 
@@ -132,6 +132,12 @@ func parseRegions(raw string) ([]string, error) {
 	if len(out) == 0 {
 		// All entries were blank/dupes — equivalent to no regions.
 		return nil, nil
+	}
+	// Enforce the per-deployment cap AFTER dedupe so duplicate values
+	// don't count toward the limit. The service also enforces this as
+	// defense-in-depth for non-HTTP callers.
+	if len(out) > service.MaxRegionsPerDeployment {
+		return nil, fmt.Errorf("too many regions: %d (max %d)", len(out), service.MaxRegionsPerDeployment)
 	}
 	return out, nil
 }

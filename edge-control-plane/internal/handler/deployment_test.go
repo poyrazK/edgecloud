@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -260,6 +261,13 @@ func TestParseRegions(t *testing.T) {
 		{"empties dropped, rest kept", "us-east,,eu-west", []string{"us-east", "eu-west"}, false},
 		// 65 chars = over the 64-char cap.
 		{"too long rejected", "a2345678901234567890123456789012345678901234567890123456789012345", nil, true},
+
+		// Cap (MaxRegionsPerDeployment = 16). The cap is enforced AFTER
+		// dedupe, so duplicates must not count toward the limit.
+		{"at cap (16 unique)", "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p",
+			[]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p"}, false},
+		{"over cap (17 unique)", "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q", nil, true},
+		{"dupes not counted (17 copies of a)", strings.Repeat("a,", 16) + "a", []string{"a"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -334,5 +342,29 @@ func TestDeploy_InvalidRegions_Returns400(t *testing.T) {
 				t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+// TestDeploy_TooManyRegions_Returns400 verifies the cap enforcement
+// at the handler boundary. parseRegions runs BEFORE the service is
+// called, so 17 valid regions get a 400 without ever reaching the
+// service. The service-layer rejection (defense-in-depth) is tested
+// separately in service/deployment_test.go.
+func TestDeploy_TooManyRegions_Returns400(t *testing.T) {
+	mux := newDeployMux()
+	// 17 unique valid regions → over the cap of 16.
+	query := "regions=" + strings.Join([]string{
+		"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+	}, ",")
+	req := httptest.NewRequest("POST", "/api/deploy/myapp?"+query, nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "too many regions") {
+		t.Errorf("body = %q, want it to mention 'too many regions'", rr.Body.String())
 	}
 }

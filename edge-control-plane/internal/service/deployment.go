@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +18,6 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -82,8 +82,20 @@ func IsValidRegion(r string) bool {
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
 const MaxArtifactSize = 100 * 1024 * 1024
 
+// MaxRegionsPerDeployment caps the number of regions a single deployment
+// can target. Defensive ceiling against fan-out abuse; realistic tenants
+// want ≤10 regions. Operators can raise this constant if needed.
+const MaxRegionsPerDeployment = 16
+
 // Sentinel errors.
-var ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
+//
+// The handler matches ErrInvalidRegion and ErrTooManyRegions via
+// errors.Is and maps them to 400. Quota errors stay 429.
+var (
+	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
+	ErrInvalidRegion               = errors.New("invalid region")
+	ErrTooManyRegions              = errors.New("too many regions")
+)
 
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
@@ -162,10 +174,20 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	// region string would either break the NATS subject or
 	// (worse) inject a wildcard into a subject. The empty
 	// `regions` slice is NOT an error — it means "use default".
+	// Return on the first invalid entry so the error message
+	// names the offending region (the old shape fell through the
+	// loop and reported only the LAST invalid entry, a pre-existing
+	// minor bug fixed in the #116 review follow-up).
+	//
+	// %w wraps the sentinel so handlers can match via errors.Is;
+	// the message also embeds the failing region for the operator.
 	for _, r := range regions {
 		if !IsValidRegion(r) {
-			return nil, fmt.Errorf("invalid region %q: must match [a-z0-9-]{1,64}", r)
+			return nil, fmt.Errorf("%w %q: must match [a-z0-9-]{1,64}", ErrInvalidRegion, r)
 		}
+	}
+	if len(regions) > MaxRegionsPerDeployment {
+		return nil, fmt.Errorf("%w: %d (max %d)", ErrTooManyRegions, len(regions), MaxRegionsPerDeployment)
 	}
 
 	// Auto-create the app record if it doesn't already exist (backward compatible).
@@ -224,7 +246,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		AppName:   appName,
 		Status:    domain.StatusDeployed,
 		Hash:      hex.EncodeToString(hash[:]),
-		Regions:   pq.StringArray(effectiveRegions),
+		Regions:   domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
 	}
 
@@ -343,7 +365,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentID:   deploymentID,
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
-				Allowlist:      []string(tenant.AllowlistedDestinations),
+				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
 				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
@@ -353,10 +375,8 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	//   - deployment.Regions if non-empty (post-migration-008 row),
 	//   - otherwise the control plane's default region (handles
 	//     pre-migration rows AND any caller that wrote the row via a
-	//     path that left Regions nil). pq.StringArray is a named
-	//     []string — we copy into a plain []string so the rest of
-	//     this function doesn't care which one it has.
-	regions := []string(deployment.Regions)
+	//     path that left Regions nil).
+	regions := domain.StringArrayTo(deployment.Regions)
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
