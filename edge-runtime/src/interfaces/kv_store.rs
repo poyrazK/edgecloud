@@ -40,6 +40,8 @@ pub enum KvStoreError {
     Serialization(String),
     #[error("data file corrupted: {0}")]
     Corrupted(String),
+    #[error("invalid tenant_id: {0:?}")]
+    InvalidTenantId(String),
 }
 
 /// On-disk representation of the store.
@@ -199,6 +201,22 @@ impl KvStore {
     pub fn from_env() -> Result<Option<Self>, KvStoreError> {
         match std::env::var(ENV_KV_STORE_PATH) {
             Ok(path) => Self::with_persistence(Path::new(&path)).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Persistent store scoped to a specific tenant.
+    /// The store file is `{EDGE_KV_STORE_PATH}/{tenant_id}/store.json`.
+    /// Returns `Ok(None)` if `EDGE_KV_STORE_PATH` is not set.
+    pub fn from_env_for_tenant(tenant_id: &str) -> Result<Option<Self>, KvStoreError> {
+        if !super::is_safe_tenant_id(tenant_id) {
+            return Err(KvStoreError::InvalidTenantId(tenant_id.to_string()));
+        }
+        match std::env::var(ENV_KV_STORE_PATH) {
+            Ok(base) => {
+                let path = Path::new(&base).join(tenant_id);
+                Self::with_persistence(&path).map(Some)
+            }
             Err(_) => Ok(None),
         }
     }
@@ -518,5 +536,133 @@ mod tests {
         let result = KvStore::from_env();
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// RAII guard that removes a temp directory on drop.
+    struct DeferRmDir(std::path::PathBuf);
+    impl Drop for DeferRmDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_test_dir() -> (std::path::PathBuf, DeferRmDir) {
+        use uuid::Uuid;
+        let path = std::env::temp_dir().join(format!("edge-kv-test-{}", Uuid::new_v4()));
+        let guard = DeferRmDir(path.clone());
+        (path, guard)
+    }
+
+    /// Two tenants writing the same key to their own scoped stores must not
+    /// see each other's data. Store ops run in `spawn_blocking` so
+    /// `flush_if_persistent` can call `Handle::block_on` (not allowed on
+    /// executor threads), verifying path-level isolation on disk.
+    #[tokio::test]
+    async fn test_tenant_stores_are_isolated() {
+        let (base, _cleanup) = unique_test_dir();
+
+        tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || {
+                let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+                store_a
+                    .set("secret".into(), b"tenant_a_value".to_vec(), None)
+                    .unwrap();
+
+                let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+                store_b
+                    .set("secret".into(), b"tenant_b_value".to_vec(), None)
+                    .unwrap();
+
+                // In-memory view is isolated.
+                assert_eq!(
+                    store_a.get("secret").unwrap(),
+                    Some(b"tenant_a_value".to_vec()),
+                    "tenant A must not see tenant B's data"
+                );
+                assert_eq!(
+                    store_b.get("secret").unwrap(),
+                    Some(b"tenant_b_value".to_vec()),
+                    "tenant B must not see tenant A's data"
+                );
+
+                // Reload from disk and verify paths are separate.
+                let store_a2 = KvStore::with_persistence(&base.join("t_a")).expect("store_a2");
+                assert_eq!(
+                    store_a2.get("secret").unwrap(),
+                    Some(b"tenant_a_value".to_vec()),
+                    "reloading tenant A must not return tenant B's value"
+                );
+                let store_b2 = KvStore::with_persistence(&base.join("t_b")).expect("store_b2");
+                assert_eq!(
+                    store_b2.get("secret").unwrap(),
+                    Some(b"tenant_b_value".to_vec()),
+                    "reloading tenant B must not return tenant A's value"
+                );
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
+
+    /// A tenant must not be able to enumerate keys belonging to another tenant
+    /// even when both have the same key prefix.
+    #[tokio::test]
+    async fn test_tenant_list_keys_does_not_cross_tenant_boundary() {
+        let (base, _cleanup) = unique_test_dir();
+
+        tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || {
+                let store_a = KvStore::with_persistence(&base.join("t_a")).expect("store_a");
+                store_a
+                    .set("user:1".into(), b"alice".to_vec(), None)
+                    .unwrap();
+                store_a.set("user:2".into(), b"bob".to_vec(), None).unwrap();
+
+                let store_b = KvStore::with_persistence(&base.join("t_b")).expect("store_b");
+                store_b.set("user:1".into(), b"eve".to_vec(), None).unwrap();
+
+                let mut keys_a = store_a.list_keys("user:").unwrap();
+                keys_a.sort();
+                assert_eq!(keys_a, vec!["user:1", "user:2"]);
+                assert_eq!(store_a.get("user:1").unwrap(), Some(b"alice".to_vec()));
+
+                let keys_b = store_b.list_keys("user:").unwrap();
+                assert_eq!(keys_b, vec!["user:1"]);
+                assert_eq!(store_b.get("user:1").unwrap(), Some(b"eve".to_vec()));
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
+
+    /// from_env_for_tenant must reject path-traversal and Windows-reserved tenant IDs.
+    #[test]
+    fn test_from_env_for_tenant_rejects_path_traversal() {
+        let dangerous = [
+            "../escape",
+            "../../etc",
+            "/absolute",
+            "a/b",
+            ".",
+            "..",
+            "a\0b",
+            "CON",
+            "NUL",
+            "PRN",
+            "AUX",
+            "COM1",
+            "LPT9",
+        ];
+        for id in dangerous {
+            assert!(
+                KvStore::from_env_for_tenant(id).is_err(),
+                "expected Err for dangerous tenant_id: {:?}",
+                id
+            );
+        }
+        // Safe IDs return Ok (either Ok(None) when env var absent, or Ok(Some)).
+        assert!(KvStore::from_env_for_tenant("t_abc123").is_ok());
     }
 }

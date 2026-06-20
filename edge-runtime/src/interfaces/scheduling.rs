@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -49,6 +50,8 @@ pub enum SchedulerError {
     Io(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("invalid tenant_id: {0:?}")]
+    InvalidTenantId(String),
 }
 
 // --- On-disk representation ---
@@ -180,6 +183,16 @@ pub struct ScheduledTask {
 pub struct Scheduler {
     tasks: Arc<Mutex<HashMap<String, ScheduledTask>>>,
     persistence: Option<SchedulerPersistence>,
+    shutdown: Arc<AtomicBool>,
+    /// Signals the background thread to wake and exit without waiting the full sleep period.
+    shutdown_notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.shutdown_notify.notify_one();
+    }
 }
 
 impl Default for Scheduler {
@@ -194,16 +207,22 @@ impl Scheduler {
         init_time_refs();
         let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
         let tasks_clone = tasks.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
 
-        // Spawn a background worker that fires due tasks.
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("scheduling: failed to spawn runtime");
 
             rt.block_on(async {
                 loop {
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
                     let sleep_ms = {
                         let tasks = tasks_clone.lock().unwrap();
                         let next = tasks.values().map(|t| t.next_at).min_by_key(|i| *i);
@@ -215,7 +234,13 @@ impl Scheduler {
                             None => 10_000,
                         }
                     };
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {}
+                        _ = shutdown_notify_clone.notified() => { break; }
+                    }
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     let now = Instant::now();
                     let mut tasks = tasks_clone.lock().unwrap();
@@ -239,6 +264,8 @@ impl Scheduler {
         Self {
             tasks,
             persistence: None,
+            shutdown,
+            shutdown_notify,
         }
     }
 
@@ -266,18 +293,30 @@ impl Scheduler {
             .recv()
             .map_err(|_| SchedulerError::Io("load thread panicked".into()))??;
 
-        let tasks = Arc::new(Mutex::new(HashMap::<String, ScheduledTask>::new()));
+        // Populate tasks before spawning the worker so the thread sees the full
+        // task list immediately on its first iteration.
+        let mut initial_tasks = HashMap::<String, ScheduledTask>::new();
+        for task in loaded {
+            initial_tasks.insert(task.id.clone(), task);
+        }
+        let tasks = Arc::new(Mutex::new(initial_tasks));
         let tasks_clone = tasks.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
 
-        // Spawn the background worker (same as new()).
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("scheduling: failed to spawn runtime");
 
             rt.block_on(async {
                 loop {
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
                     let sleep_ms = {
                         let tasks = tasks_clone.lock().unwrap();
                         let next = tasks.values().map(|t| t.next_at).min_by_key(|i| *i);
@@ -289,7 +328,13 @@ impl Scheduler {
                             None => 10_000,
                         }
                     };
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)) => {}
+                        _ = shutdown_notify_clone.notified() => { break; }
+                    }
+                    if shutdown_clone.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     let now = Instant::now();
                     let mut tasks = tasks_clone.lock().unwrap();
@@ -310,17 +355,11 @@ impl Scheduler {
             });
         });
 
-        // Populate tasks from loaded state.
-        {
-            let mut tasks_guard = tasks.lock().unwrap();
-            for task in loaded {
-                tasks_guard.insert(task.id.clone(), task);
-            }
-        }
-
         Ok(Self {
             tasks,
             persistence: Some(persistence),
+            shutdown,
+            shutdown_notify,
         })
     }
 
@@ -329,6 +368,22 @@ impl Scheduler {
     pub fn from_env() -> Result<Option<Self>, SchedulerError> {
         match std::env::var(ENV_SCHEDULING_PATH) {
             Ok(path) => Self::with_persistence(Path::new(&path)).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Persistent scheduler scoped to a specific tenant.
+    /// The schedule file is `{EDGE_SCHEDULING_PATH}/{tenant_id}/schedule.json`.
+    /// Returns `Ok(None)` if `EDGE_SCHEDULING_PATH` is not set.
+    pub fn from_env_for_tenant(tenant_id: &str) -> Result<Option<Self>, SchedulerError> {
+        if !super::is_safe_tenant_id(tenant_id) {
+            return Err(SchedulerError::InvalidTenantId(tenant_id.to_string()));
+        }
+        match std::env::var(ENV_SCHEDULING_PATH) {
+            Ok(base) => {
+                let path = Path::new(&base).join(tenant_id);
+                Self::with_persistence(&path).map(Some)
+            }
             Err(_) => Ok(None),
         }
     }

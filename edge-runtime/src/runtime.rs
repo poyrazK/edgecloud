@@ -38,6 +38,9 @@ pub struct RuntimeState {
     pub process: process::Process,
     pub networking: networking::NetworkingState,
     pub http_server: http_server::HttpServer,
+    /// Tenant that owns this runtime instance. Used to scope persisted stores
+    /// to per-tenant directories so one tenant's data cannot be accessed by another.
+    pub tenant_id: String,
     /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
     /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
@@ -61,22 +64,26 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// Test-only constructor. Always uses ephemeral in-memory stores regardless of env vars.
+    /// Production code must use `with_env_and_meter` to get per-tenant persistent stores.
+    #[cfg(test)]
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Self::make_kv_store(),
-            cache: Self::make_cache(),
+            kv_store: Arc::new(kv_store::KvStore::new()),
+            cache: Arc::new(cache::Cache::new(1000)),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: Self::make_scheduler(),
+            scheduling: scheduling::Scheduler::new(),
             process: process::Process::with_env_and_exit_code(
                 Arc::new(process::filter_env_vars(std::env::vars()).collect()),
                 exit_code.clone(),
             ),
             networking,
             http_server: http_server::HttpServer::new(),
+            tenant_id: String::new(),
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -88,19 +95,20 @@ impl RuntimeState {
     }
 
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
-    pub fn with_env(env: std::collections::HashMap<String, String>) -> Self {
+    pub fn with_env(env: std::collections::HashMap<String, String>, tenant_id: String) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Self::make_kv_store(),
-            cache: Self::make_cache(),
+            kv_store: Self::make_kv_store_for_tenant(&tenant_id),
+            cache: Self::make_cache_for_tenant(&tenant_id),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: Self::make_scheduler(),
+            scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
             http_server: http_server::HttpServer::new(),
+            tenant_id,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -115,19 +123,21 @@ impl RuntimeState {
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
+        tenant_id: String,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
-            kv_store: Self::make_kv_store(),
-            cache: Self::make_cache(),
+            kv_store: Self::make_kv_store_for_tenant(&tenant_id),
+            cache: Self::make_cache_for_tenant(&tenant_id),
             observe: observe::Observer::new(),
             time: time::Clock::new(),
-            scheduling: Self::make_scheduler(),
+            scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
+            tenant_id,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -138,40 +148,52 @@ impl RuntimeState {
         }
     }
 
-    /// Attempt to create a persistent KvStore from `EDGE_KV_STORE_PATH`,
-    /// falling back to an ephemeral in-memory store on any error.
-    fn make_kv_store() -> Arc<kv_store::KvStore> {
-        match kv_store::KvStore::from_env() {
+    /// Attempt to create a persistent KvStore scoped to `tenant_id`.
+    /// Falls back to ephemeral if `EDGE_KV_STORE_PATH` is unset or the path is unusable.
+    fn make_kv_store_for_tenant(tenant_id: &str) -> Arc<kv_store::KvStore> {
+        match kv_store::KvStore::from_env_for_tenant(tenant_id) {
             Ok(Some(store)) => Arc::new(store),
             Ok(None) => Arc::new(kv_store::KvStore::new()),
             Err(e) => {
-                tracing::warn!("KV store persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "KV store persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 Arc::new(kv_store::KvStore::new())
             }
         }
     }
 
-    /// Attempt to create a persistent Scheduler from `EDGE_SCHEDULING_PATH`,
-    /// falling back to an ephemeral in-memory scheduler on any error.
-    fn make_scheduler() -> scheduling::Scheduler {
-        match scheduling::Scheduler::from_env() {
+    /// Attempt to create a persistent Scheduler scoped to `tenant_id`.
+    /// Falls back to ephemeral if `EDGE_SCHEDULING_PATH` is unset or the path is unusable.
+    fn make_scheduler_for_tenant(tenant_id: &str) -> scheduling::Scheduler {
+        match scheduling::Scheduler::from_env_for_tenant(tenant_id) {
             Ok(Some(s)) => s,
             Ok(None) => scheduling::Scheduler::new(),
             Err(e) => {
-                tracing::warn!("scheduling persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "scheduling persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 scheduling::Scheduler::new()
             }
         }
     }
 
-    /// Attempt to create a persistent Cache from `EDGE_CACHE_PATH`,
-    /// falling back to an ephemeral in-memory cache on any error.
-    fn make_cache() -> Arc<cache::Cache> {
-        match cache::Cache::from_env(1000) {
+    /// Attempt to create a persistent Cache scoped to `tenant_id`.
+    /// Falls back to ephemeral if `EDGE_CACHE_PATH` is unset or the path is unusable.
+    fn make_cache_for_tenant(tenant_id: &str) -> Arc<cache::Cache> {
+        match cache::Cache::from_env_for_tenant(tenant_id, 1000) {
             Ok(Some(c)) => Arc::new(c),
             Ok(None) => Arc::new(cache::Cache::new(1000)),
             Err(e) => {
-                tracing::warn!("cache persistence unavailable, using ephemeral: {}", e);
+                tracing::error!(
+                    tenant_id,
+                    "cache persistence unavailable, using ephemeral: {}",
+                    e
+                );
                 Arc::new(cache::Cache::new(1000))
             }
         }
@@ -189,6 +211,7 @@ impl RuntimeState {
     }
 }
 
+#[cfg(test)]
 impl Default for RuntimeState {
     fn default() -> Self {
         Self::new()

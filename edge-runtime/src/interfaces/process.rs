@@ -197,7 +197,11 @@ mod tests {
     fn test_get_cwd_returns_absolute_path() {
         let process = Process::new();
         let cwd = process.get_cwd().expect("get_cwd should succeed");
-        assert!(cwd.starts_with('/'), "cwd should be an absolute path");
+        assert!(
+            std::path::Path::new(&cwd).is_absolute(),
+            "cwd should be an absolute path, got: {:?}",
+            cwd
+        );
     }
 
     #[test]

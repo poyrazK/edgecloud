@@ -108,7 +108,7 @@ The runtime library is structured around the WIT world in `src/wit/edge.wit` (lo
 |------|------|
 | `src/lib.rs` | Public re-exports; loads WIT via `bindgen!`. |
 | `src/engine.rs` | wasmtime `Engine` with security-hardened config (no threads, no reference types, SIMD on, component model on, epoch interruption on). Engine is meant to be shared across apps so compilation is cached. |
-| `src/runtime.rs` | `RuntimeState` — implements every WIT `Host` trait by **delegating** to per-interface sub-structs. Three constructors: `new()`, `with_env(env)` (tenant isolation), `with_env_and_meter(env, meter)` (per-deployment billing). |
+| `src/runtime.rs` | `RuntimeState` — implements every WIT `Host` trait by **delegating** to per-interface sub-structs. Three constructors: `new()` (`#[cfg(test)]` only, ephemeral), `with_env(env, tenant_id)` (tenant isolation), `with_env_and_meter(env, meter, tenant_id)` (per-deployment billing). All three make per-tenant persistent stores via `EDGE_KV_STORE_PATH/{tenant_id}/`, `EDGE_CACHE_PATH/{tenant_id}/`, `EDGE_SCHEDULING_PATH/{tenant_id}/`. |
 | `src/linker.rs` | `create_component_linker` wires every WIT interface in via the macro-generated `EdgeRuntime::add_to_linker`. |
 | `src/store.rs` | `create_store` attaches a `StoreLimits` via a deliberately-leaked `Box<StoreLimits>` (the only way to satisfy wasmtime's `ResourceLimiter` lifetime requirements). |
 | `src/memory.rs` | `read_string`/`write_string`/`read_bytes`/`write_bytes`/`allocate`/`get_memory` for crossing the wasm boundary. `get_memory` must be called **after** any wasm execution because `memory.grow()` invalidates the `Memory` handle. |
