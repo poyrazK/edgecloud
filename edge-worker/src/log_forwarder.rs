@@ -225,6 +225,14 @@ impl LogForwarder {
         match result {
             Ok(resp) => {
                 let status = resp.status();
+                // Drain the response body so the underlying connection
+                // returns to reqwest's pool. Without this, a 4xx/5xx
+                // response leaves the connection held by the response
+                // object and the pool can exhaust under sustained
+                // control-plane errors. We discard the bytes — we
+                // already have the status code we care about, and any
+                // body is purely diagnostic.
+                let _ = resp.bytes().await;
                 if status.is_success() {
                     tracing::debug!(count, status = status.as_u16(), "logs flushed");
                 } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -619,5 +627,69 @@ mod tests {
             cap_after >= cap_before,
             "buffer capacity must be preserved across flush; before={cap_before}, after={cap_after}"
         );
+    }
+
+    /// Regression: a 4xx response body must be drained, not just status-checked.
+    /// Without the drain, the connection is held by the response object and
+    /// reqwest's pool can exhaust under sustained control-plane errors. The
+    /// test asserts the mock recorded exactly one request and the buffer was
+    /// drained (a regression would surface as a panic on the await of
+    /// resp.bytes() or a hung second request).
+    #[tokio::test]
+    async fn flush_now_drains_response_body_on_4xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/logs"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("oops"))
+            .expect(1..=2) // ≥1 succeeds; allow 2 if a regression re-fires
+            .mount(&server)
+            .await;
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(server.uri(), "w_test", "test-region", signer);
+
+        f.push(record(LogLevel::Info, "drain me"), ctx());
+        f.flush_now().await;
+
+        // Buffer drained (drops happen post-drain, regardless of status).
+        assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
+    }
+
+    /// Same regression as the 4xx test, on a 5xx response. The 5xx path
+    /// also needs body-draining so the connection returns to the pool.
+    #[tokio::test]
+    async fn flush_now_drains_response_body_on_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/logs"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("try later"))
+            .mount(&server)
+            .await;
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(server.uri(), "w_test", "test-region", signer);
+
+        f.push(record(LogLevel::Info, "drain me 5xx"), ctx());
+        f.flush_now().await;
+
+        assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
     }
 }
