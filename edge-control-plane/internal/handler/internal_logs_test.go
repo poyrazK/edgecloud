@@ -255,7 +255,7 @@ func TestIngestLogs_RegionFromJWT(t *testing.T) {
 	token := validTokenWithRegion(t, "t_real", "w_fra_real", "fra")
 
 	// Body claims region "us-east-1"; JWT carries "fra". Handler must use "fra".
-	entries := []domain.LogEntry{{AppName: "x", Message: "m", Region: "us-east-1"}}
+	entries := []domain.LogEntry{{AppName: "x", Level: "info", Message: "m", Region: "us-east-1"}}
 	rec := postLogs(t, server, token, entries, "", "", "us-east-1")
 
 	if rec.Code != http.StatusNoContent {
@@ -352,7 +352,7 @@ func TestIngestLogs_RepoError(t *testing.T) {
 	server := newIngestLogsServer(repo)
 	token := validToken(t, "t_real", "w_fra_abc123")
 
-	rec := postLogs(t, server, token, []domain.LogEntry{{AppName: "x"}}, "", "", "")
+	rec := postLogs(t, server, token, []domain.LogEntry{{AppName: "x", Level: "info"}}, "", "", "")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -371,7 +371,7 @@ func TestIngestLogs_TenantIDAndWorkerOverwritten(t *testing.T) {
 
 	// Body tries to attribute the log to a different tenant and a different
 	// worker. The handler must refuse these and use the JWT identity.
-	entries := []domain.LogEntry{{AppName: "x", Message: "leak attempt"}}
+	entries := []domain.LogEntry{{AppName: "x", Level: "info", Message: "leak attempt"}}
 	rec := postLogs(t, server, token, entries, "t_evil", "w_fra_evil", "us-east-1")
 
 	if rec.Code != http.StatusNoContent {
@@ -386,6 +386,55 @@ func TestIngestLogs_TenantIDAndWorkerOverwritten(t *testing.T) {
 	}
 	if got.WorkerID != "w_fra_real" {
 		t.Errorf("WorkerID = %q, want w_fra_real (body value w_fra_evil must be overwritten)", got.WorkerID)
+	}
+}
+
+// TestIngestLogs_RejectsInvalidLevel pins the level allow-list. Body-
+// supplied levels outside the canonical set are rejected with 400 before
+// any row is written. Without this guard, a guest that emits "critical"
+// or "fatal" would land a row the query endpoint cannot filter on.
+func TestIngestLogs_RejectsInvalidLevel(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validToken(t, "t_real", "w_fra_real")
+
+	entries := []domain.LogEntry{
+		{AppName: "x", Level: "info", Message: "ok"},
+		{AppName: "x", Level: "critical", Message: "not canonical"},
+	}
+	rec := postLogs(t, server, token, entries, "", "", "")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid level") {
+		t.Errorf("expected error to mention 'invalid level', got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "critical") {
+		t.Errorf("expected error to echo the offending level, got: %s", rec.Body.String())
+	}
+	if repo.calls != 0 {
+		t.Errorf("repo must not be called when any entry has an invalid level, got %d calls", repo.calls)
+	}
+}
+
+// TestIngestLogs_AcceptsAllCanonicalLevels verifies the allow-list is
+// inclusive for every canonical level. If a future change accidentally
+// narrows the set (e.g. dropping "trace"), this test catches it.
+func TestIngestLogs_AcceptsAllCanonicalLevels(t *testing.T) {
+	repo := &mockLogEntryRepo{}
+	server := newIngestLogsServer(repo)
+	token := validToken(t, "t_real", "w_fra_real")
+
+	for _, lvl := range []string{"debug", "info", "warn", "error", "trace"} {
+		entries := []domain.LogEntry{{AppName: "x", Level: lvl, Message: "m"}}
+		rec := postLogs(t, server, token, entries, "", "", "")
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("level=%q: status = %d, want 204; body=%s", lvl, rec.Code, rec.Body.String())
+		}
+	}
+	if got := repo.calls; got != 5 {
+		t.Errorf("repo called %d times, want 5 (one per canonical level)", got)
 	}
 }
 

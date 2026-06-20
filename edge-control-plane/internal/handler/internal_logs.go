@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -24,6 +25,24 @@ const MaxLogBatchSize = 1 << 20
 // batch always fits. A runaway worker cannot submit unbounded rows in one
 // POST even with tiny messages.
 const MaxEntries = 1000
+
+// validLevels is the canonical set of log-level strings the runtime emits.
+// The WIT `edge:observe/log-level` enum is typed on the runtime side, but
+// the ingest wire is still stringly-typed — body-supplied levels are stored
+// verbatim, so a guest that emits "critical" or "fatal" today gets a row
+// the query endpoint cannot index by. We reject anything outside this set at
+// the ingest boundary so non-canonical values are a clean 400 instead of a
+// silently-orphaned record.
+//
+// This is the interim fix; the full fix is a WIT change (typed emit_log
+// enum) tracked separately.
+var validLevels = map[string]struct{}{
+	"debug": {},
+	"info":  {},
+	"warn":  {},
+	"error": {},
+	"trace": {},
+}
 
 // logEntryRepo is the subset of *repository.LogEntryRepository used here.
 // Defining it locally keeps tests mockable without a live DB.
@@ -98,6 +117,21 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 	if len(req.Entries) > MaxEntries {
 		http.Error(w, `{"error": "too many entries"}`, http.StatusBadRequest)
 		return
+	}
+
+	// Validate each entry's level against the canonical set. Body-supplied
+	// levels are stored verbatim, so a non-canonical value ("critical",
+	// "fatal", etc.) would land in the logs table and break the level
+	// filter on the query side. Reject the whole batch with 400 so the
+	// guest sees a clean failure instead of an orphaned record.
+	for i, e := range req.Entries {
+		if _, ok := validLevels[e.Level]; !ok {
+			http.Error(w,
+				fmt.Sprintf(`{"error": "invalid level: %q"}`, e.Level),
+				http.StatusBadRequest)
+			log.Printf("ingest logs: invalid level %q at entry[%d] (tenant=%s)", e.Level, i, tenantID)
+			return
+		}
 	}
 
 	// Overwrite authoritative fields from the JWT. We trust the JWT, not

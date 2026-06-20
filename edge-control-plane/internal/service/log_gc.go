@@ -49,8 +49,8 @@ func (s *LogGCService) Run(ctx context.Context, interval, retention time.Duratio
 	// batches/sweep caps a worst-case first-sweep at 10M rows (well
 	// above any realistic backlog).
 	const (
-		gcBatchSize   = 10_000
-		gcMaxBatches  = 1000
+		gcBatchSize  = 10_000
+		gcMaxBatches = 1000
 	)
 
 	// runOnce is a closure so the immediate-first-sweep path and the
