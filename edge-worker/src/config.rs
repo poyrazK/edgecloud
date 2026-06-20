@@ -287,11 +287,8 @@ mod tests {
             ("WORKER_ID", Some("w_test_abc")),
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
-<<<<<<< HEAD
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
-=======
             ("WORKER_TENANT_ID", Some("t_test")),
->>>>>>> ade8b5a (fix(worker): make WORKER_JWT_SECRET optional at startup)
             ("APP_MAX_MEMORY_MB", Some("64")),
         ]);
         let cfg = Config::from_env().expect("from_env");
@@ -308,11 +305,8 @@ mod tests {
             ("WORKER_ID", Some("w_test_abc")),
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
-<<<<<<< HEAD
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
-=======
             ("WORKER_TENANT_ID", Some("t_test")),
->>>>>>> ade8b5a (fix(worker): make WORKER_JWT_SECRET optional at startup)
             ("EPOCH_TICK_MS", Some("5")),
             ("EPOCH_DEADLINE_TICKS", Some("50")),
         ]);
@@ -333,11 +327,8 @@ mod tests {
             ("WORKER_ID", Some("w_test_abc")),
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
-<<<<<<< HEAD
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
-=======
             ("WORKER_TENANT_ID", Some("t_test")),
->>>>>>> ade8b5a (fix(worker): make WORKER_JWT_SECRET optional at startup)
             ("APP_MAX_MEMORY_MB", None),
             ("EPOCH_TICK_MS", None),
             ("EPOCH_DEADLINE_TICKS", None),
