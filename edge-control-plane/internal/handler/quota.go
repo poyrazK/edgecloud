@@ -24,11 +24,11 @@ func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 
 	quota, err := h.tenantSvc.GetQuota(r.Context(), tenantID)
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if quota == nil {
-		httperror.NotFound(w, "quota not found")
+		httperror.NotFoundCtx(w, r, "quota not found")
 		return
 	}
 

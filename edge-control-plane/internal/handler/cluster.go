@@ -25,7 +25,7 @@ func (h *ClusterHandler) Get(w http.ResponseWriter, r *http.Request) {
 	view, err := h.clusterSvc.List(r.Context())
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

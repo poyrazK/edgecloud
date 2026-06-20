@@ -29,16 +29,16 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 
 	var req SetEnvRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Key == "" {
-		httperror.BadRequest(w, "key is required")
+		httperror.BadRequestCtx(w, r, "key is required")
 		return
 	}
 
 	if err := h.envSvc.SetEnv(r.Context(), tenantID, appName, req.Key, req.Value); err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -51,7 +51,7 @@ func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	envs, err := h.envSvc.ListEnv(r.Context(), tenantID, appName)
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -71,7 +71,7 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
 	if err := h.envSvc.DeleteEnv(r.Context(), tenantID, appName, key); err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

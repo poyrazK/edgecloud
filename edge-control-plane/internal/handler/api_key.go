@@ -45,11 +45,11 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateAPIKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		httperror.BadRequest(w, "name is required")
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	role := req.Role
@@ -60,7 +60,7 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	apiKey, rawKey, err := h.apiKeySvc.CreateAPIKey(r.Context(), tenantID, req.Name, role)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -79,7 +79,7 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	keys, err := h.apiKeySvc.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -107,7 +107,7 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	keyID := r.PathValue("keyID")
 	if err := h.apiKeySvc.DeleteAPIKey(r.Context(), keyID); err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

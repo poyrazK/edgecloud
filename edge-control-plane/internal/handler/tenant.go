@@ -39,11 +39,11 @@ type BootstrapResponse struct {
 func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	var req BootstrapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		httperror.BadRequest(w, "name is required")
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	if req.KeyName == "" {
@@ -57,7 +57,7 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	tenant, rawKey, err := h.tenantSvc.BootstrapTenant(r.Context(), req.Name, plan, req.KeyName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -72,11 +72,11 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req CreateTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		httperror.BadRequest(w, "name is required")
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	plan := req.Plan
@@ -87,7 +87,7 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	tenant, err := h.tenantSvc.CreateTenant(r.Context(), req.Name, plan)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -100,11 +100,11 @@ func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if tenant == nil {
-		httperror.NotFound(w, "tenant not found")
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 
@@ -115,7 +115,7 @@ func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenants, err := h.tenantSvc.ListTenants(r.Context())
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -134,13 +134,13 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	var req UpdateTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 
 	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
 	if err != nil || tenant == nil {
-		httperror.NotFound(w, "tenant not found")
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 
@@ -155,7 +155,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -166,7 +166,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	if err := h.tenantSvc.DeleteTenant(r.Context(), tenantID); err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

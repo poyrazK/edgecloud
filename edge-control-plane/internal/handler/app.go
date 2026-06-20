@@ -28,28 +28,28 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	if appName == "" {
-		httperror.BadRequest(w, "app name required")
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	var req domain.CreateAppRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httperror.BadRequest(w, "invalid request body")
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 
 	app, err := h.appSvc.Create(r.Context(), tenantID, appName, &req)
 	if err != nil {
 		if errors.Is(err, service.ErrAppAlreadyExists) {
-			httperror.Conflict(w, "app already exists")
+			httperror.ConflictCtx(w, r, "app already exists")
 			return
 		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
-			httperror.QuotaExceeded(w, "max apps quota exceeded")
+			httperror.QuotaExceededCtx(w, r, "max apps quota exceeded")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -78,7 +78,7 @@ func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	apps, err := h.appSvc.List(r.Context(), tenantID, limit, offset)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -99,11 +99,11 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 	app, err := h.appSvc.Get(r.Context(), tenantID, appName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if app == nil {
-		httperror.NotFound(w, "app not found")
+		httperror.NotFoundCtx(w, r, "app not found")
 		return
 	}
 
@@ -117,18 +117,18 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	if appName == "" {
-		httperror.BadRequest(w, "app name required")
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	err := h.appSvc.Delete(r.Context(), tenantID, appName)
 	if err != nil {
 		if errors.Is(err, service.ErrAppNotFound) {
-			httperror.NotFound(w, "app not found")
+			httperror.NotFoundCtx(w, r, "app not found")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 

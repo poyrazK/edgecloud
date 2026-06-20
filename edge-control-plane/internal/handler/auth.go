@@ -46,29 +46,29 @@ func (h *AuthHandler) Whoami(w http.ResponseWriter, r *http.Request) {
 
 	if tenantID == "" || apiKeyID == "" {
 		// Should not happen behind AuthMiddleware; defensive only.
-		httperror.Unauthorized(w, "unauthorized")
+		httperror.UnauthorizedCtx(w, r, "unauthorized")
 		return
 	}
 
 	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
 	if err != nil {
 		log.Printf("whoami: lookup tenant %q failed: %v", tenantID, err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if tenant == nil {
-		httperror.NotFound(w, "tenant not found")
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 
 	key, err := h.apiKeySvc.GetByID(r.Context(), apiKeyID)
 	if err != nil {
 		log.Printf("whoami: lookup api key %q failed: %v", apiKeyID, err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if key == nil {
-		httperror.NotFound(w, "api key not found")
+		httperror.NotFoundCtx(w, r, "api key not found")
 		return
 	}
 

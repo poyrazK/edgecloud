@@ -32,29 +32,29 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	// Validate app name
 	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequest(w, "invalid app name")
+		httperror.BadRequestCtx(w, r, "invalid app name")
 		return
 	}
 
 	// Read artifact from multipart form or raw body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		httperror.BadRequest(w, "failed to read body")
+		httperror.BadRequestCtx(w, r, "failed to read body")
 		return
 	}
 
 	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, bytes.NewReader(body))
 	if err != nil {
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
-			httperror.QuotaExceeded(w, "max deployments quota exceeded")
+			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
 			return
 		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
-			httperror.QuotaExceeded(w, "max apps quota exceeded")
+			httperror.QuotaExceededCtx(w, r, "max apps quota exceeded")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -73,11 +73,11 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
 	if err != nil {
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if deployment == nil {
-		httperror.NotFound(w, "deployment not found")
+		httperror.NotFoundCtx(w, r, "deployment not found")
 		return
 	}
 
@@ -106,7 +106,7 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	deployments, total, err := h.deploymentSvc.ListDeploymentsPaginatedWithTotal(r.Context(), tenantID, appName, limit, offset)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -126,7 +126,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -140,7 +140,7 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
 	if err != nil || deployment == nil {
-		httperror.NotFound(w, "no active deployment")
+		httperror.NotFoundCtx(w, r, "no active deployment")
 		return
 	}
 
@@ -172,14 +172,14 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequest(w, "invalid app name")
+		httperror.BadRequestCtx(w, r, "invalid app name")
 		return
 	}
 
 	target, err := h.workerSvc.GetAppTarget(r.Context(), tenantID, appName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		httperror.InternalError(w)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if target == nil {

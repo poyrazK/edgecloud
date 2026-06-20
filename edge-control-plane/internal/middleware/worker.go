@@ -61,13 +61,13 @@ func WorkerAuth(cfg WorkerJWTConfig) func(http.Handler) http.Handler {
 				token = r.URL.Query().Get("jwt")
 			}
 			if token == "" {
-				httperror.Unauthorized(w, "missing worker token")
+				httperror.UnauthorizedCtx(w, r, "missing worker token")
 				return
 			}
 			token = strings.TrimPrefix(token, "Bearer ")
 			claims, err := VerifyWorkerJWT(token, cfg)
 			if err != nil {
-				httperror.Unauthorized(w, "invalid worker token")
+				httperror.UnauthorizedCtx(w, r, "invalid worker token")
 				return
 			}
 			ctx := context.WithValue(r.Context(), WorkerIDKey, claims.WorkerID)

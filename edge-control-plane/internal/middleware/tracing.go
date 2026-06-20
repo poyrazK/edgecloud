@@ -8,6 +8,7 @@ import (
 )
 
 // RequestIDKey is the context key for the request ID.
+// Matches the key expected by handler/httperror/requestIDFromContext.
 const RequestIDKey contextKey = "request_id"
 
 // RequestID middleware generates a UUID request ID for every request and

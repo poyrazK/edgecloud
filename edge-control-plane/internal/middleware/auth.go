@@ -41,13 +41,13 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			httperror.Unauthorized(w, "missing authorization header")
+			httperror.UnauthorizedCtx(w, r, "missing authorization header")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-			httperror.Unauthorized(w, "invalid authorization format")
+			httperror.UnauthorizedCtx(w, r, "invalid authorization format")
 			return
 		}
 
@@ -56,7 +56,7 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		// different value than "Bearer <key>" and reject a valid key.
 		rawKey := strings.TrimSpace(parts[1])
 		if rawKey == "" {
-			httperror.Unauthorized(w, "invalid api key")
+			httperror.UnauthorizedCtx(w, r, "invalid api key")
 			return
 		}
 
@@ -66,10 +66,10 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			// signal; any other error is an infrastructure failure and
 			// must surface as 500.
 			if errors.Is(err, service.ErrInvalidAPIKey) {
-				httperror.Unauthorized(w, "invalid api key")
+				httperror.UnauthorizedCtx(w, r, "invalid api key")
 				return
 			}
-			httperror.InternalError(w)
+			httperror.InternalErrorCtx(w, r)
 			return
 		}
 
@@ -86,7 +86,7 @@ func RequireRole(allowed ...string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			role, ok := r.Context().Value(RoleKey).(string)
 			if !ok {
-				httperror.Unauthorized(w, "unauthorized")
+				httperror.UnauthorizedCtx(w, r, "unauthorized")
 				return
 			}
 
@@ -97,7 +97,7 @@ func RequireRole(allowed ...string) func(http.Handler) http.Handler {
 				}
 			}
 
-			httperror.Forbidden(w, "forbidden")
+			httperror.ForbiddenCtx(w, r, "forbidden")
 		})
 	}
 }
