@@ -438,6 +438,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 		deployment, err := s.deploymentRepo.GetByID(ctx, ad.DeploymentID)
 		if err != nil || deployment == nil {
 			log.Printf("republish: skipping app %q — deployment %s not found", ad.AppName, ad.DeploymentID)
+			failedApps = append(failedApps, ad.AppName)
 			continue
 		}
 

@@ -126,11 +126,11 @@ impl EgressPolicy {
 
         // Match each allowlist entry against the request host.
         for entry in &self.allowlist {
-            if let Some(_bare) = entry.strip_prefix("*.") {
+            if let Some(bare) = entry.strip_prefix("*.") {
                 // Wildcard suffix pattern: *.stripe.com matches api.stripe.com
                 // but not a.b.stripe.com or evil-stripe.com.
                 let suffix = &entry[1..];
-                if host_str == _bare {
+                if host_str == bare {
                     // Bare apex: "stripe.com" matches "*.stripe.com".
                     return Ok(());
                 }

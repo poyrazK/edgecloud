@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -33,6 +34,7 @@ func egressValidationErr(format string, args ...any) *EgressValidationError {
 // validateEgressAllowlist returns an *EgressValidationError if any entry is malformed.
 // Accepted forms: "foo.example.com" or "*.example.com" (one wildcard label).
 // The bare "*" sentinel is rejected so tenants cannot bypass enforcement.
+// Entries are expected to already be lowercased (UpdateEgressAllowlist lowercases before calling).
 func validateEgressAllowlist(entries []string) error {
 	if len(entries) > MaxEgressAllowlistEntries {
 		return egressValidationErr("allowlist exceeds maximum of %d entries", MaxEgressAllowlistEntries)
@@ -47,12 +49,15 @@ func validateEgressAllowlist(entries []string) error {
 			if !strings.Contains(host, ".") {
 				return egressValidationErr("wildcard entry %q must have at least two labels after *. (e.g. *.example.com)", e)
 			}
-		} else if strings.ContainsAny(e, "*/") || strings.HasPrefix(e, "http") {
+		} else if strings.ContainsAny(e, "*/") || strings.HasPrefix(e, "http://") || strings.HasPrefix(e, "https://") {
 			return egressValidationErr("entry %q must be a plain hostname or *.suffix (no scheme, no path, no slash)", e)
 		} else if !strings.Contains(e, ".") {
 			// Single-label names (localhost, intranet, metadata) are not valid
 			// public hostnames and may resolve to internal services on the worker.
 			return egressValidationErr("entry %q must be a fully qualified hostname (e.g. api.example.com)", e)
+		}
+		if net.ParseIP(host) != nil {
+			return egressValidationErr("entry %q must be a hostname, not an IP address", e)
 		}
 		if !hostnameRe.MatchString(host) {
 			return egressValidationErr("entry %q is not a valid hostname", e)
@@ -220,8 +225,21 @@ func (s *TenantService) GetEgressAllowlist(ctx context.Context, tenantID string)
 }
 
 // UpdateEgressAllowlist replaces the tenant's outbound allowlist after validation.
-// Passing an empty slice clears the list (restores allow-all behaviour).
+// Passing an empty slice clears the list; on the wire the worker receives an absent
+// or empty `allowlist` field, which its serde deserializer maps to None → allow_all().
 func (s *TenantService) UpdateEgressAllowlist(ctx context.Context, tenantID string, allowlist []string) error {
+	// Normalize to lowercase before validation and storage. EgressPolicy::check
+	// compares against the lowercased hostname produced by url::Url::parse; storing
+	// mixed-case entries would cause silent 403s for those hosts.
+	normalized := make([]string, len(allowlist))
+	for i, e := range allowlist {
+		if strings.HasPrefix(e, "*.") {
+			normalized[i] = "*." + strings.ToLower(e[2:])
+		} else {
+			normalized[i] = strings.ToLower(e)
+		}
+	}
+	allowlist = normalized
 	if err := validateEgressAllowlist(allowlist); err != nil {
 		return err
 	}

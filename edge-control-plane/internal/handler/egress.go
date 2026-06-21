@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"log"
@@ -32,9 +33,17 @@ type updateEgressRequest struct {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		log.Printf("writeJSON: marshal failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		log.Printf("writeJSON: write failed: %v", err)
+	}
 }
 
 // Get returns the authenticated tenant's current outbound allowlist.
@@ -88,14 +97,5 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return the canonical stored list, not the raw request, so any
-	// normalization the service applied is visible to the caller.
-	stored, err := h.tenantSvc.GetEgressAllowlist(r.Context(), tenantID)
-	if err != nil {
-		log.Printf("egress update: re-read after save failed for tenant %s: %v", tenantID, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, egressResponse{Allowlist: stored})
+	writeJSON(w, http.StatusOK, egressResponse{Allowlist: req.Allowlist})
 }
