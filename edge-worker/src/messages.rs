@@ -3,18 +3,20 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
-/// Deserializes `allowlist` so that both an absent field and an explicit `[]`
-/// map to `None` (allow-all). Only a non-empty array becomes `Some(list)`.
+/// Deserializes `allowlist` so that absent, `[]`, and `["*"]` all map to
+/// `None` (allow-all). Only a non-empty array without a bare `"*"` sentinel
+/// becomes `Some(list)`.
 ///
-/// This prevents a rolling-upgrade hazard: an old control plane that doesn't
-/// send `allowlist` at all, or one that initialises it to `[]` by default,
-/// must not trigger `EgressPolicy::new([])` = deny-all on every app.
+/// The `["*"]` case handles legacy DB rows written before this PR where
+/// `allowlisted_destinations = '{*}'` was the conventional "no restriction"
+/// value. `EgressPolicy::new(["*"])` strips the sentinel and produces deny-all,
+/// which is the wrong semantic; mapping it to `None` → `allow_all()` is correct.
 fn deserialize_allowlist<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let v: Option<Vec<String>> = Option::deserialize(de)?;
-    Ok(v.filter(|list| !list.is_empty()))
+    Ok(v.filter(|list| !list.is_empty() && !list.iter().all(|e| e == "*")))
 }
 
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
@@ -201,6 +203,21 @@ mod tests {
         assert!(
             spec.allowlist.is_none(),
             "empty-array allowlist must deserialize to None (allow-all)"
+        );
+    }
+
+    /// Legacy `["*"]` sentinel → `None` (allow-all). Pre-enforcement DB rows that
+    /// stored `allowlisted_destinations = '{*}'` must not trigger deny-all after
+    /// deployment; `EgressPolicy::new(["*"])` strips the sentinel and produces
+    /// deny-all, so we intercept here and map to None → allow_all() instead.
+    #[test]
+    fn allowlist_star_sentinel_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"allowlist":["*"]}"#,
+        );
+        assert!(
+            spec.allowlist.is_none(),
+            "legacy [\"*\"] sentinel must deserialize to None (allow-all), not Some([\"*\"]) which becomes deny-all"
         );
     }
 

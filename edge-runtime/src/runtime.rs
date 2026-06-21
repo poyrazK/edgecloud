@@ -287,13 +287,27 @@ impl HttpClientHost for RuntimeState {
                         }
                     };
                     for ip_str in &resolved {
-                        if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                            if let Err(reason) = self.egress.check_resolved_ip(ip) {
+                        match ip_str.parse::<std::net::IpAddr>() {
+                            Ok(ip) => {
+                                if let Err(reason) = self.egress.check_resolved_ip(ip) {
+                                    return Some(Response {
+                                        status: 403,
+                                        headers: Vec::new(),
+                                        body: ResponseBodySource::Buffered(Vec::new()),
+                                        error: Some(reason),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                // Unparseable IP string (e.g. scoped IPv6 zone ID).
+                                // Fail-closed: deny rather than skip the check.
                                 return Some(Response {
                                     status: 403,
                                     headers: Vec::new(),
                                     body: ResponseBodySource::Buffered(Vec::new()),
-                                    error: Some(reason),
+                                    error: Some(format!(
+                                        "egress denied: unparseable IP in DNS response: {ip_str}"
+                                    )),
                                 });
                             }
                         }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
@@ -73,6 +74,12 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Treat a missing field the same as an explicit empty list (allow-all).
 	if req.Allowlist == nil {
 		req.Allowlist = []string{}
+	}
+	// Normalize to lowercase here so the response body matches what is stored.
+	// The service also lowercases before writing, but operates on a local copy;
+	// normalizing in the handler keeps req.Allowlist consistent with stored state.
+	for i := range req.Allowlist {
+		req.Allowlist[i] = strings.ToLower(req.Allowlist[i])
 	}
 
 	if err := h.tenantSvc.UpdateEgressAllowlist(r.Context(), tenantID, req.Allowlist); err != nil {
