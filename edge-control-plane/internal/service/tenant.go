@@ -20,28 +20,42 @@ const MaxEgressAllowlistEntries = 50
 // by dots, hyphens allowed in the interior of each label.
 var hostnameRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$`)
 
-// validateEgressAllowlist returns an error if any entry is malformed.
+// EgressValidationError is returned when an allowlist entry fails input validation.
+// Handlers use errors.As to map it to HTTP 400; all other errors become HTTP 500.
+type EgressValidationError struct{ msg string }
+
+func (e *EgressValidationError) Error() string { return e.msg }
+
+func egressValidationErr(format string, args ...any) *EgressValidationError {
+	return &EgressValidationError{msg: fmt.Sprintf(format, args...)}
+}
+
+// validateEgressAllowlist returns an *EgressValidationError if any entry is malformed.
 // Accepted forms: "foo.example.com" or "*.example.com" (one wildcard label).
 // The bare "*" sentinel is rejected so tenants cannot bypass enforcement.
 func validateEgressAllowlist(entries []string) error {
 	if len(entries) > MaxEgressAllowlistEntries {
-		return fmt.Errorf("allowlist exceeds maximum of %d entries", MaxEgressAllowlistEntries)
+		return egressValidationErr("allowlist exceeds maximum of %d entries", MaxEgressAllowlistEntries)
 	}
 	for _, e := range entries {
 		if e == "*" {
-			return fmt.Errorf("wildcard-only entry %q is not allowed; use a hostname or *.suffix pattern", e)
+			return egressValidationErr("wildcard-only entry %q is not allowed; use a hostname or *.suffix pattern", e)
 		}
 		host := e
 		if strings.HasPrefix(e, "*.") {
 			host = e[2:]
 			if !strings.Contains(host, ".") {
-				return fmt.Errorf("wildcard entry %q must have at least two labels after *. (e.g. *.example.com)", e)
+				return egressValidationErr("wildcard entry %q must have at least two labels after *. (e.g. *.example.com)", e)
 			}
 		} else if strings.ContainsAny(e, "*/") || strings.HasPrefix(e, "http") {
-			return fmt.Errorf("entry %q must be a plain hostname or *.suffix (no scheme, no path, no slash)", e)
+			return egressValidationErr("entry %q must be a plain hostname or *.suffix (no scheme, no path, no slash)", e)
+		} else if !strings.Contains(e, ".") {
+			// Single-label names (localhost, intranet, metadata) are not valid
+			// public hostnames and may resolve to internal services on the worker.
+			return egressValidationErr("entry %q must be a fully qualified hostname (e.g. api.example.com)", e)
 		}
 		if !hostnameRe.MatchString(host) {
-			return fmt.Errorf("entry %q is not a valid hostname", e)
+			return egressValidationErr("entry %q is not a valid hostname", e)
 		}
 	}
 	return nil

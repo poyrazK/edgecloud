@@ -425,8 +425,11 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 	}
 
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
 	maxMemoryMB := 256
-	if err == nil && quota != nil && quota.MaxMemoryMB > 0 {
+	if quota != nil && quota.MaxMemoryMB > 0 {
 		maxMemoryMB = quota.MaxMemoryMB
 	}
 

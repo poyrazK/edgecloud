@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -30,18 +31,23 @@ type updateEgressRequest struct {
 	Allowlist []string `json:"allowlist"`
 }
 
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
 // Get returns the authenticated tenant's current outbound allowlist.
 func (h *EgressHandler) Get(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
 	list, err := h.tenantSvc.GetEgressAllowlist(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(egressResponse{Allowlist: list})
+	writeJSON(w, http.StatusOK, egressResponse{Allowlist: list})
 }
 
 // Update replaces the authenticated tenant's outbound allowlist and immediately
@@ -52,7 +58,7 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	var req updateEgressRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
 	// Treat a missing field the same as an explicit empty list (allow-all).
@@ -61,19 +67,35 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.tenantSvc.UpdateEgressAllowlist(r.Context(), tenantID, req.Allowlist); err != nil {
-		errBody, _ := json.Marshal(map[string]string{"error": err.Error()})
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write(errBody)
+		var valErr *service.EgressValidationError
+		if errors.As(err, &valErr) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		} else {
+			log.Printf("egress update: DB error for tenant %s: %v", tenantID, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		}
 		return
 	}
 
-	// Best-effort republish: workers will pick up the new allowlist on the
-	// next TaskMessage; a blip here doesn't roll back the DB write.
+	// Republish so running workers pick up the new policy immediately.
+	// Failure here means workers will lag until their next re-activate;
+	// we surface it as 500 so the client knows to retry.
 	if err := h.deploymentSvc.RepublishActiveDeployments(r.Context(), tenantID); err != nil {
 		log.Printf("egress update: republish failed for tenant %s: %v", tenantID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "allowlist saved but worker propagation failed; retry to push to workers",
+		})
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(egressResponse{Allowlist: req.Allowlist})
+	// Return the canonical stored list, not the raw request, so any
+	// normalization the service applied is visible to the caller.
+	stored, err := h.tenantSvc.GetEgressAllowlist(r.Context(), tenantID)
+	if err != nil {
+		log.Printf("egress update: re-read after save failed for tenant %s: %v", tenantID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, egressResponse{Allowlist: stored})
 }

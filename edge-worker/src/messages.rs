@@ -211,8 +211,8 @@ mod tests {
             r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"allowlist":["api.stripe.com","*.sendgrid.net"]}"#,
         );
         assert_eq!(
-            spec.allowlist.as_deref(),
-            Some(["api.stripe.com", "*.sendgrid.net"].as_slice())
+            spec.allowlist,
+            Some(vec!["api.stripe.com".to_string(), "*.sendgrid.net".to_string()])
         );
     }
 }

@@ -247,16 +247,45 @@ impl HttpClientHost for RuntimeState {
         }
 
         // DNS rebinding guard: resolve the destination hostname and verify none
-        // of the returned IPs fall in a hard-deny range. This catches the common
+        // of the returned IPs fall in a hard-deny range. Catches the common
         // attack where an allowlisted domain is redirected to a metadata/private
-        // IP via a zero-TTL DNS record. A residual race exists between our
-        // resolver call and reqwest's own DNS query, but this blocks the most
-        // common pattern.
+        // IP via a zero-TTL DNS record.
+        //
+        // Known residual race (TOCTOU): reqwest performs its own DNS query when
+        // it opens the TCP connection. A TTL-0 record can change between our
+        // check and that dial. Eliminating this gap requires a custom reqwest
+        // Resolve impl that both checks and reuses the same resolved address.
+        //
+        // Fail-closed: any DNS error or empty result set is treated as a denial
+        // so an attacker cannot force a lookup failure to bypass the guard.
         {
             use url::Url;
             if let Ok(parsed) = Url::parse(url) {
                 if let Some(url::Host::Domain(hostname)) = parsed.host() {
-                    let resolved = self.networking.resolve(hostname).unwrap_or_default();
+                    let resolved = match self.networking.resolve(hostname) {
+                        Ok(ips) if !ips.is_empty() => ips,
+                        Ok(_) => {
+                            return Some(Response {
+                                status: 403,
+                                headers: Vec::new(),
+                                body: ResponseBodySource::Buffered(Vec::new()),
+                                error: Some(
+                                    "egress denied: DNS resolution returned no addresses"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            return Some(Response {
+                                status: 403,
+                                headers: Vec::new(),
+                                body: ResponseBodySource::Buffered(Vec::new()),
+                                error: Some(
+                                    "egress denied: DNS resolution failed".to_string(),
+                                ),
+                            });
+                        }
+                    };
                     for ip_str in &resolved {
                         if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
                             if let Err(reason) = self.egress.check_resolved_ip(ip) {
