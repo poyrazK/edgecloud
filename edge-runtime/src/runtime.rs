@@ -280,9 +280,7 @@ impl HttpClientHost for RuntimeState {
                                 status: 403,
                                 headers: Vec::new(),
                                 body: ResponseBodySource::Buffered(Vec::new()),
-                                error: Some(
-                                    "egress denied: DNS resolution failed".to_string(),
-                                ),
+                                error: Some("egress denied: DNS resolution failed".to_string()),
                             });
                         }
                     };

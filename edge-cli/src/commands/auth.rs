@@ -92,7 +92,7 @@ fn keys_run(action: KeysAction) -> Result<()> {
 
 /// `edge auth signup --name <NAME> [--plan <PLAN>] [--key-name <N>] [--force]`
 ///
-/// Hits the public `POST /api/tenants` endpoint, then persists the
+/// Hits the public `POST /api/v1/tenants` endpoint, then persists the
 /// returned API key to the local config file. Requires network.
 #[cfg(feature = "network")]
 fn signup(name: &str, plan: &str, key_name: &str, force: bool) -> Result<()> {
@@ -236,7 +236,7 @@ fn login(key: Option<&str>) -> Result<()> {
 
 /// `edge auth whoami`
 ///
-/// Calls `GET /api/auth/whoami` and prints the result. Requires a saved
+/// Calls `GET /api/v1/auth/whoami` and prints the result. Requires a saved
 /// or env-supplied API key.
 #[cfg(feature = "network")]
 fn whoami() -> Result<()> {

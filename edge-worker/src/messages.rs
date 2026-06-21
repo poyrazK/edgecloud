@@ -229,7 +229,10 @@ mod tests {
         );
         assert_eq!(
             spec.allowlist,
-            Some(vec!["api.stripe.com".to_string(), "*.sendgrid.net".to_string()])
+            Some(vec![
+                "api.stripe.com".to_string(),
+                "*.sendgrid.net".to_string()
+            ])
         );
     }
 }

@@ -247,6 +247,47 @@ jobs:
           SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-ingress/Cargo.toml
 
   # ============================================================
+  # OPENAPI-VALIDATE — verify all mux routes are covered by the spec
+  # ============================================================
+  openapi-validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Validate spec coverage
+        run: go run ./scripts/openapi_check.go
+
+  # ============================================================
+  # TS-CLIENT — generate and diff TypeScript client from OpenAPI spec
+  # ============================================================
+  ts-client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate TypeScript client
+        run: bash ./scripts/generate_tsc.sh
+
+      - name: Check for drift
+        run: git diff --exit-code internal/generated/api-types.ts
+
+  # ============================================================
   # GO-FMT — gofmt on edge-control-plane
   # ============================================================
   go-fmt:

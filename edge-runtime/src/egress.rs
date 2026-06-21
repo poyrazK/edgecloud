@@ -480,8 +480,6 @@ mod tests {
         assert!(policy
             .check_resolved_ip("93.184.216.34".parse().unwrap())
             .is_ok());
-        assert!(policy
-            .check_resolved_ip("8.8.8.8".parse().unwrap())
-            .is_ok());
+        assert!(policy.check_resolved_ip("8.8.8.8".parse().unwrap()).is_ok());
     }
 }

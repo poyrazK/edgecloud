@@ -125,8 +125,7 @@ func TestCluster_Get_ServiceError(t *testing.T) {
 		t.Fatalf("expected 500, got %d", rr.Code)
 	}
 	// Body should be a structured error envelope, not the raw error string.
-	// http.Error appends a trailing newline — trim before comparing.
-	if got := strings.TrimSpace(rr.Body.String()); got != `{"error":"internal error"}` {
+	if got := strings.TrimSpace(rr.Body.String()); got != `{"error":{"code":"INTERNAL_ERROR","message":"internal error"}}` {
 		t.Errorf("body = %q, want structured envelope", got)
 	}
 }
