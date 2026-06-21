@@ -367,6 +367,24 @@ components:
         NODE_ENV: production
 
     # -------------------------------------------------------------------------
+    # Egress
+    # -------------------------------------------------------------------------
+    EgressAllowlist:
+      type: object
+      properties:
+        allowlist:
+          type: array
+          items:
+            type: string
+          description: >
+            Outbound hostname allowlist. Empty array means allow-all (no restriction).
+            Each entry is either an exact FQDN (`api.stripe.com`) or a single-level
+            wildcard pattern (`*.sendgrid.net`). Entries are stored lowercase.
+          example:
+            - api.stripe.com
+            - "*.sendgrid.net"
+
+    # -------------------------------------------------------------------------
     # Quotas
     # -------------------------------------------------------------------------
     Quota:
@@ -1369,6 +1387,53 @@ paths:
       responses:
         '204':
           description: API key revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Egress allowlist
+  # -------------------------------------------------------------------------
+  /api/v1/egress:
+    get:
+      operationId: getEgressAllowlist
+      summary: Get the authenticated tenant's outbound egress allowlist
+      responses:
+        '200':
+          description: Current egress allowlist. Empty array means allow-all (no restriction).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: updateEgressAllowlist
+      summary: Replace the authenticated tenant's outbound egress allowlist
+      description: >
+        Replaces the tenant's allowlist and immediately republishes TaskMessages
+        to all running workers so they enforce the new policy without a manual
+        re-activate. An empty array clears the list (allow-all). A non-empty
+        array restricts outbound HTTP to only the listed hostnames or wildcard
+        patterns (e.g. `api.stripe.com`, `*.sendgrid.net`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EgressAllowlist'
+      responses:
+        '200':
+          description: Updated allowlist (normalized to lowercase).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
