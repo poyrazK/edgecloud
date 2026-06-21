@@ -15,6 +15,7 @@ use crate::edge::cloud::scheduling::Host as SchedulingHost;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 use crate::edge::cloud::streams::Host as StreamsHost;
 use crate::edge::cloud::time::Host as TimeHost;
+use crate::egress::EgressPolicy;
 #[cfg(feature = "http-server")]
 use crate::interfaces::http_server::BodySource as HttpServerInternalBodySource;
 use crate::interfaces::{
@@ -41,6 +42,10 @@ pub struct RuntimeState {
     /// Tenant that owns this runtime instance. Used to scope persisted stores
     /// to per-tenant directories so one tenant's data cannot be accessed by another.
     pub tenant_id: String,
+    /// Per-deployment egress policy. Checked in HttpClientHost::fetch before
+    /// every outbound request. Enforces the tenant's allowlist and always
+    /// hard-denies private/loopback/link-local IP ranges.
+    pub egress: Arc<EgressPolicy>,
     /// Shared exit-code flag set by Process::exit when the guest calls process.exit.
     /// This allows execute_app to distinguish a clean guest exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
@@ -64,8 +69,8 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
-    /// Test-only constructor. Always uses ephemeral in-memory stores regardless of env vars.
-    /// Production code must use `with_env_and_meter` to get per-tenant persistent stores.
+    /// Test-only constructor. Always uses ephemeral in-memory stores and an
+    /// unrestricted egress policy regardless of env vars.
     #[cfg(test)]
     pub fn new() -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -84,6 +89,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             tenant_id: String::new(),
+            egress: Arc::new(EgressPolicy::allow_all()),
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -95,7 +101,11 @@ impl RuntimeState {
     }
 
     /// Create a RuntimeState with per-app environment variables for tenant isolation.
-    pub fn with_env(env: std::collections::HashMap<String, String>, tenant_id: String) -> Self {
+    pub fn with_env(
+        env: std::collections::HashMap<String, String>,
+        tenant_id: String,
+        egress: Arc<EgressPolicy>,
+    ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
@@ -109,6 +119,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::new(),
             tenant_id,
+            egress,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -124,6 +135,7 @@ impl RuntimeState {
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
         tenant_id: String,
+        egress: Arc<EgressPolicy>,
     ) -> Self {
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
@@ -138,6 +150,7 @@ impl RuntimeState {
             networking,
             http_server: http_server::HttpServer::with_meter(meter),
             tenant_id,
+            egress,
             exit_code,
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             incoming_streams: StdMutex::new(std::collections::HashMap::new()),
@@ -220,8 +233,20 @@ impl Default for RuntimeState {
 
 impl HttpClientHost for RuntimeState {
     fn fetch(&mut self, req: Request) -> Option<Response> {
-        let method = req.method.as_str();
         let url = req.url.as_str();
+
+        // Enforce egress policy before issuing any outbound request.
+        // Returns 403 to the guest so it can handle the denial gracefully.
+        if let Err(reason) = self.egress.check(url) {
+            return Some(Response {
+                status: 403,
+                headers: Vec::new(),
+                body: ResponseBodySource::Buffered(Vec::new()),
+                error: Some(reason),
+            });
+        }
+
+        let method = req.method.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
         let tracestate = req
@@ -234,9 +259,6 @@ impl HttpClientHost for RuntimeState {
             RequestBodySource::None => http_client::BodySource::None,
             RequestBodySource::Buffered(bytes) => http_client::BodySource::Buffered(bytes),
             RequestBodySource::Chunked(handle) => {
-                // Take ownership of the adapter so the resource entry remains
-                // valid for any post-fetch write_chunk/finish calls (which the
-                // guest should not make — but if it does, they'd see Closed).
                 #[cfg(feature = "http-client")]
                 {
                     let mut outgoing = self
@@ -279,9 +301,6 @@ impl HttpClientHost for RuntimeState {
             tracestate,
         ));
 
-        // Resolve HttpClient's ResponseBody to WIT ResponseBodySource. For
-        // streamed responses, register the IncomingStream in our own map
-        // keyed by a fresh rep and return a Resource<Incoming> handle.
         let body = match resp.body {
             http_client::ResponseBody::None => ResponseBodySource::None,
             http_client::ResponseBody::Buffered(bytes) => ResponseBodySource::Buffered(bytes),
@@ -318,10 +337,6 @@ impl HttpClientHost for RuntimeState {
 }
 
 impl RuntimeState {
-    /// Build a 502 Bad Gateway response for a chunked-body resolution
-    /// failure (stale `Outgoing` handle, already-consumed adapter, etc.).
-    /// Used by `HttpClientHost::fetch` to return a meaningful error to
-    /// the guest instead of panicking the worker.
     #[cfg(feature = "http-client")]
     fn chunked_body_error_response(&self, msg: &str) -> Response {
         Response {
@@ -487,9 +502,6 @@ impl HttpServerHost for RuntimeState {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.http_server.poll()).map(|opt| {
             opt.map(|req| {
-                // Translate http_server::BodySource → WIT BodySource. For
-                // streamed bodies, register the IncomingStream in our map
-                // and return a Resource<Incoming> handle.
                 #[cfg(feature = "http-server")]
                 let body = match req.body {
                     HttpServerInternalBodySource::None => HttpServerBodySource::None,
@@ -549,7 +561,6 @@ impl HttpServerHost for RuntimeState {
         headers: Vec<(String, String)>,
         body_stream: wasmtime::component::Resource<crate::edge::cloud::streams::Outgoing>,
     ) -> Result<(), String> {
-        // Take ownership of the OutgoingEntry's adapter from our map.
         #[cfg(feature = "http-server")]
         let adapter = {
             let mut outgoing = self.outgoing_streams.lock().unwrap();
@@ -589,14 +600,6 @@ impl HttpServerHost for RuntimeState {
 }
 
 // ---- Streams host impls ----------------------------------------------------
-//
-// These are only compiled when at least one of http-client/http-server is
-// enabled, since those are the interfaces that `use` the stream types. The
-// generated HostIncoming / HostOutgoing traits live under
-// `crate::edge::cloud::streams`. State is held in the `incoming_streams` /
-// `outgoing_streams` maps on `RuntimeState`, keyed by `Resource::rep()` —
-// the typed `ResourceTable` would require us to store the WIT-generated
-// marker type, which is empty, so we keep our own state external.
 
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 mod streams_impl {
@@ -609,11 +612,6 @@ mod streams_impl {
     use std::time::Duration;
     use wasmtime::component::Resource;
 
-    /// Bridge a sync Host trait method to an async operation with a 5s
-    /// timeout. The inner future must produce `Result<T, StreamError>` — the
-    /// outer `Result` collapses the timeout case into `Closed` so a stalled
-    /// stream op does not panic the worker. The other Host trait methods map
-    /// failures to `Result`; streams does too.
     fn block_on_timeout<F, T>(fut: F) -> Result<T, StreamError>
     where
         F: std::future::Future<Output = Result<T, StreamError>>,
@@ -633,14 +631,6 @@ mod streams_impl {
             self_: Resource<Incoming>,
             _max_bytes: u32,
         ) -> Result<Vec<u8>, WitStreamError> {
-            // Clone the IncomingStream out of the map, drop the map guard,
-            // then await on the clone. This avoids holding the
-            // `StdMutex<HashMap>` across the `block_on_timeout` await — a
-            // stalled stream op would otherwise block every other stream op
-            // on this RuntimeState for up to 5 seconds.
-            //
-            // Recovers from a poisoned mutex (F7): a panic elsewhere in the
-            // worker must not take down every subsequent stream op.
             let mut cloned = {
                 let incoming = self
                     .incoming_streams
@@ -687,9 +677,6 @@ mod streams_impl {
             self_: Resource<Outgoing>,
             bytes: Vec<u8>,
         ) -> Result<(), WitStreamError> {
-            // Clone the OutgoingStream out of the map, drop the map guard,
-            // then await on the clone. See `read_chunk` above for the
-            // lock-across-await rationale.
             let mut cloned = {
                 let outgoing = self
                     .outgoing_streams
@@ -702,7 +689,6 @@ mod streams_impl {
         }
 
         fn finish(&mut self, self_: Resource<Outgoing>) -> Result<(), WitStreamError> {
-            // Clone out + drop-guard pattern — see `read_chunk` above.
             let mut cloned = {
                 let outgoing = self
                     .outgoing_streams
@@ -726,3 +712,101 @@ mod streams_impl {
 
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 impl StreamsHost for RuntimeState {}
+
+// ── Egress integration tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod egress_http_tests {
+    use crate::edge::cloud::http_client::{Request, RequestBodySource};
+    use crate::egress::EgressPolicy;
+    use crate::RuntimeState;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn egress_check_returns_403_in_fetch() {
+        let egress = Arc::new(EgressPolicy::new(vec![]));
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        let req = Request {
+            method: "GET".into(),
+            url: "http://127.0.0.1:9999/should-not-be-reached".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(5000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        assert_eq!(resp.status, 403);
+        assert!(resp
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("egress denied")));
+    }
+
+    #[test]
+    fn egress_allowlist_passes_matching_host_via_policy_check() {
+        let policy = EgressPolicy::new(vec!["api.stripe.com".to_string()]);
+        let result = policy.check("http://api.stripe.com:9999/v1/charges");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn egress_check_denies_non_allowlisted_host() {
+        let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        let req = Request {
+            method: "GET".into(),
+            url: "http://evil.com/".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(1000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        assert_eq!(resp.status, 403);
+        assert!(resp
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("not in the allowlist")));
+    }
+
+    #[tokio::test]
+    async fn hard_deny_loopback_returns_403_even_with_star_allowlist() {
+        let egress = Arc::new(EgressPolicy::new(vec!["*".to_string()]));
+        let env = std::collections::HashMap::new();
+        let mut runtime_state =
+            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+
+        let req = Request {
+            method: "GET".into(),
+            url: "http://127.0.0.1/".into(),
+            headers: Vec::new(),
+            body: RequestBodySource::None,
+            timeout_ms: Some(1000),
+            trace_context: None,
+        };
+
+        let resp = crate::edge::cloud::http_client::Host::fetch(&mut runtime_state, req);
+        assert!(resp.is_some());
+        assert_eq!(resp.unwrap().status, 403);
+    }
+
+    #[test]
+    fn egress_allowlist_passes_public_host() {
+        let policy = EgressPolicy::new(vec!["example.com".to_string()]);
+        let result = policy.check("http://example.com/");
+        assert!(result.is_ok());
+    }
+}

@@ -1,5 +1,6 @@
 //! edge-runtime: WASI Preview 2 host interfaces for edge computing.
 
+pub mod egress;
 pub mod engine;
 pub mod limits;
 pub mod linker;
@@ -18,6 +19,7 @@ wasmtime::component::bindgen!({
     path: "src/wit/edge.wit",
 });
 
+pub use egress::EgressPolicy;
 pub use engine::create_engine;
 pub use interfaces::is_safe_tenant_id;
 pub use metering::RequestMeter;

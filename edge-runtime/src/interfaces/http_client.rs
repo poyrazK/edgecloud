@@ -418,6 +418,12 @@ fn global_client() -> Arc<reqwest::Client> {
                 .connect_timeout(cfg.connect_timeout)
                 .pool_max_idle_per_host(16)
                 .pool_idle_timeout(cfg.pool_idle_timeout)
+                // Never follow redirects automatically. The egress check fires
+                // only on the initial URL; a redirect to a hard-deny target
+                // (e.g. 169.254.169.254) would otherwise bypass enforcement.
+                // Guests receive the 3xx response and can decide whether to
+                // follow after the host re-checks the Location URL.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest global client creation failed"),
         )

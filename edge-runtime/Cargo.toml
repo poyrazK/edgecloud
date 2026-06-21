@@ -44,6 +44,9 @@ flate2 = { version = "1.1", optional = true }
 # Base64 encoding for kv-store persistence
 base64 = "0.22"
 
+# URL parsing for egress policy
+url = "2"
+
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use edge_runtime::linker::create_component_linker;
-use edge_runtime::RequestMeter;
+use edge_runtime::{EgressPolicy, RequestMeter};
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -185,6 +185,7 @@ impl Supervisor {
         };
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
+        let allowlist = spec.allowlist.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -200,6 +201,7 @@ impl Supervisor {
                 epoch_deadline_ticks,
                 health_check_timeout_secs,
                 tenant_id_str,
+                allowlist,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -321,6 +323,7 @@ impl Supervisor {
         epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
         tenant_id: String,
+        allowlist: Vec<String>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -352,6 +355,7 @@ impl Supervisor {
                         max_memory_mb,
                         epoch_deadline_ticks,
                         &tenant_id,
+                        allowlist.clone(),
                     ),
                 ) => {
                     match result {
@@ -438,8 +442,12 @@ impl Supervisor {
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
         tenant_id: &str,
+        allowlist: Vec<String>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
+
+        // Build per-deployment egress policy from the tenant's allowlist.
+        let egress = Arc::new(EgressPolicy::new(allowlist));
 
         // Create a fresh RuntimeState with per-app env vars, metering, and tenant-scoped
         // persistent stores (KV, cache, scheduling) so data never leaks across tenants.
@@ -447,6 +455,7 @@ impl Supervisor {
             env,
             Some(Arc::clone(meter)),
             tenant_id.to_string(),
+            egress,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
