@@ -74,8 +74,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	// Validate app name
-	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequestCtx(w, r, "invalid app name")
+	if !validateAppName(w, appName) {
 		return
 	}
 
@@ -247,12 +246,10 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	// (see Download handler) — a ".." or "/" in the id lets a caller
 	// reference arbitrary files on the worker's filesystem. Reject
 	// 400 here rather than 500 from the storage layer.
-	if appName == "" || containsPathTraversal(appName) {
-		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+	if !validateAppName(w, appName) {
 		return
 	}
-	if deploymentID == "" || containsPathTraversal(deploymentID) {
-		http.Error(w, `{"error": "invalid deployment id"}`, http.StatusBadRequest)
+	if !validateDeploymentID(w, deploymentID) {
 		return
 	}
 
@@ -289,8 +286,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
-	if appName == "" || containsPathTraversal(appName) {
-		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+	if !validateAppName(w, appName) {
 		return
 	}
 
@@ -333,6 +329,32 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(deployment)
 }
 
+// validateAppName writes a 400 with {"error": "invalid app name"} and
+// returns false if appName is empty or contains path-traversal
+// characters. Callers should `return` immediately when this is false.
+func validateAppName(w http.ResponseWriter, appName string) bool {
+	if appName == "" || containsPathTraversal(appName) {
+		http.Error(w, `{"error": "invalid app name"}`, http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+// validateDeploymentID writes a 400 with {"error": "invalid deployment
+// id"} and returns false if deploymentID is empty or contains
+// path-traversal characters. Callers should `return` when this is false.
+// The deployment id flows into the /registry/{tenant}/{app}/{deployment}
+// .wasm path on the worker (see Download handler) — a ".." or "/" in the
+// id lets a caller reference arbitrary files on the worker's filesystem.
+// Reject 400 here rather than 500 from the storage layer.
+func validateDeploymentID(w http.ResponseWriter, deploymentID string) bool {
+	if deploymentID == "" || containsPathTraversal(deploymentID) {
+		http.Error(w, `{"error": "invalid deployment id"}`, http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 // containsPathTraversal blocks the *decoded* traversal shapes ("/", "\\",
 // ".."). The caller is responsible for passing a value that has already
 // been percent-decoded — e.g. http.Request.PathValue (used by AppIngress
@@ -356,8 +378,7 @@ func containsPathTraversal(s string) bool {
 func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
-	if appName == "" || containsPathTraversal(appName) {
-		httperror.BadRequestCtx(w, r, "invalid app name")
+	if !validateAppName(w, appName) {
 		return
 	}
 
