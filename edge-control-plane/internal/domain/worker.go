@@ -37,6 +37,12 @@ type AppStatus struct {
 	Status       string `json:"status"`
 	ExitCode     int    `json:"exit_code"`
 	DeploymentID string `json:"deployment_id"`
+	// Number of HTTP requests handled since the last heartbeat interval.
+	RequestCount uint64 `json:"request_count"`
+	// Total outbound bytes since the last heartbeat interval.
+	// Absent from old workers; defaults to 0 via json omitempty absence — treat
+	// 0 as "no data" rather than "zero traffic" when deciding quota actions.
+	OutboundBytes uint64 `json:"outbound_bytes"`
 	// Tenant the app belongs to. Sourced from the worker's `tenant_id`
 	// (the worker can host apps from multiple tenants).
 	TenantID string `json:"tenant_id,omitempty"`

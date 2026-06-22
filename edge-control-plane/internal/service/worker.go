@@ -173,6 +173,56 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
 		log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
 	}
+
+	// Decode app statuses to sum outbound bytes and enforce the per-tenant
+	// max_outbound_mb quota. Old workers omit outbound_bytes (defaults to 0),
+	// which we treat as "no data" — we log but do not act on a 0-byte total
+	// so a single old worker cannot cause a false quota violation.
+	s.checkOutboundQuota(ctx, hb.Apps)
+}
+
+// checkOutboundQuota sums outbound_bytes across all apps in a heartbeat and
+// logs a violation when a tenant's total for this interval exceeds their quota.
+// Phase 1: log-only. Phase 2 (tracked in issue #120 follow-up): evict apps.
+func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.RawMessage) {
+	if len(appsRaw) == 0 {
+		return
+	}
+	var apps map[string]domain.AppStatus
+	if err := json.Unmarshal(appsRaw, &apps); err != nil {
+		log.Printf("heartbeat: could not decode apps for quota check: %v", err)
+		return
+	}
+
+	// Group outbound bytes by tenant across all apps in this heartbeat.
+	byTenant := make(map[string]uint64)
+	for _, app := range apps {
+		if app.TenantID != "" {
+			byTenant[app.TenantID] += app.OutboundBytes
+		}
+	}
+
+	for tenantID, totalBytes := range byTenant {
+		if totalBytes == 0 {
+			// Old worker or no traffic — skip; don't act on missing data.
+			continue
+		}
+		quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+		if err != nil || quota == nil {
+			continue
+		}
+		if quota.MaxOutboundMB <= 0 {
+			// Unlimited or unconfigured — nothing to enforce.
+			continue
+		}
+		limitBytes := uint64(quota.MaxOutboundMB) * 1024 * 1024
+		if totalBytes > limitBytes {
+			log.Printf(
+				"quota: tenant %s outbound bytes %d exceeds interval limit %d (%d MB) — enforcement pending",
+				tenantID, totalBytes, limitBytes, quota.MaxOutboundMB,
+			)
+		}
+	}
 }
 
 // GetAppTarget returns the running target for a single
