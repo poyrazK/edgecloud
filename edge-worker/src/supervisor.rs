@@ -546,6 +546,15 @@ impl Supervisor {
         msg
     }
 
+    /// Reset all app meters after a successful heartbeat publish so the next
+    /// interval carries a delta rather than a cumulative lifetime total.
+    pub async fn reset_meters(&self) {
+        let state = self.state.read().await;
+        for inst in state.apps.values() {
+            inst.lock().await.meter.reset();
+        }
+    }
+
     /// Stop all running apps (used during graceful shutdown).
     pub async fn stop_all_apps(&self) {
         let app_names: Vec<String> = self.state.read().await.apps.keys().cloned().collect();

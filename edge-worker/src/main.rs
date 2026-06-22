@@ -108,12 +108,17 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ = ticker.tick() => {
                     let heartbeat = heartbeat_supervisor.build_heartbeat().await;
-                    if let Err(e) = heartbeat_supervisor
+                    match heartbeat_supervisor
                         .nats
                         .publish_heartbeat(&heartbeat_supervisor.config.region, &heartbeat)
                         .await
                     {
-                        tracing::error!(err = %e, "failed to publish heartbeat");
+                        Ok(()) => {
+                            heartbeat_supervisor.reset_meters().await;
+                        }
+                        Err(e) => {
+                            tracing::error!(err = %e, "failed to publish heartbeat");
+                        }
                     }
                 }
             }
