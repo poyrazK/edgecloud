@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/nats-io/nats.go"
@@ -61,9 +63,239 @@ func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*do
 	return m.getByTenantIDFunc(ctx, tenantID)
 }
 
+// mockActiveRepo implements activeRepoInterface for testing the
+// stability-window evaluator. Each method records its args so tests
+// can assert the wire shape; default funcs return zero values
+// (nil/empty) so tests that only exercise one method don't need to
+// stub the others.
+type mockActiveRepo struct {
+	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+	setStableSinceFunc    func(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error
+	clearStableSinceFunc  func(ctx context.Context, tenantID, appName string) error
+	promoteToLastGoodFunc func(ctx context.Context, tenantID, appName, deploymentID string) error
+}
+
+func (m *mockActiveRepo) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
+	if m.getFunc == nil {
+		return nil, nil
+	}
+	return m.getFunc(ctx, tenantID, appName)
+}
+func (m *mockActiveRepo) SetStableSince(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error {
+	if m.setStableSinceFunc == nil {
+		return nil
+	}
+	return m.setStableSinceFunc(ctx, tenantID, appName, deploymentID, ts)
+}
+func (m *mockActiveRepo) ClearStableSince(ctx context.Context, tenantID, appName string) error {
+	if m.clearStableSinceFunc == nil {
+		return nil
+	}
+	return m.clearStableSinceFunc(ctx, tenantID, appName)
+}
+func (m *mockActiveRepo) PromoteToLastGood(ctx context.Context, tenantID, appName, deploymentID string) error {
+	if m.promoteToLastGoodFunc == nil {
+		return nil
+	}
+	return m.promoteToLastGoodFunc(ctx, tenantID, appName, deploymentID)
+}
+
 // workerSvcForTest builds a WorkerService with mock dependencies.
+// activeRepo is the new parameter the stability-window evaluator
+// needs; pre-existing tests pass nil and the evaluator is only
+// called from handleHeartbeat when a tenant_id is present, which
+// the pre-existing tests don't send.
 func workerSvcForTest(wr *mockWorkerRepo, qr *mockQuotaRepo) *WorkerService {
-	return &WorkerService{workerRepo: wr, quotaRepo: qr, nc: nil}
+	return &WorkerService{workerRepo: wr, quotaRepo: qr, nc: nil, activeRepo: nil}
+}
+
+// workerSvcForStabilityTest builds a WorkerService with a 1-second
+// stability window and the supplied activeRepo. Used by the four
+// TestEvaluateStability_* cases below — a short window keeps the
+// math (now.Sub(stable_since)) readable in test code.
+func workerSvcForStabilityTest(ar *mockActiveRepo) *WorkerService {
+	return &WorkerService{
+		workerRepo:   &mockWorkerRepo{},
+		quotaRepo:    &mockQuotaRepo{},
+		activeRepo:   ar,
+		nc:           nil,
+		stableWindow: 1 * time.Second,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stability-window evaluator
+// ---------------------------------------------------------------------------
+
+// appsPayload is a helper to construct the apps JSON shape the
+// stability evaluator parses. Status + deployment_id are the only
+// fields the evaluator looks at; other fields (port, request_count)
+// are passed through verbatim and ignored.
+func appsPayload(apps map[string]struct {
+	Status       string
+	DeploymentID string
+}) json.RawMessage {
+	m := make(map[string]map[string]interface{}, len(apps))
+	for k, v := range apps {
+		m[k] = map[string]interface{}{
+			"status":        v.Status,
+			"deployment_id": v.DeploymentID,
+		}
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+// TestEvaluateStability_FirstRunningArmsTheClock pins the contract
+// that the very first observation of "running" for a deployment
+// sets stable_since to NOW. Subsequent observations (covered by
+// other tests in this file) do NOT overwrite stable_since.
+func TestEvaluateStability_FirstRunningArmsTheClock(t *testing.T) {
+	var setStableSinceCalled bool
+	var gotDeploymentID string
+	ar := &mockActiveRepo{
+		getFunc: func(_ context.Context, _, _ string) (*domain.ActiveDeployment, error) {
+			return &domain.ActiveDeployment{
+				TenantID:            "t_test",
+				AppName:             "myapp",
+				DeploymentID:        "d_v1",
+				AutoRollbackEnabled: true,
+				StableSince:         nil, // not yet armed
+			}, nil
+		},
+		setStableSinceFunc: func(_ context.Context, _, _, deploymentID string, _ time.Time) error {
+			setStableSinceCalled = true
+			gotDeploymentID = deploymentID
+			return nil
+		},
+	}
+	svc := workerSvcForStabilityTest(ar)
+
+	svc.evaluateStability(context.Background(), "t_test", appsPayload(map[string]struct {
+		Status       string
+		DeploymentID string
+	}{"myapp": {Status: "running", DeploymentID: "d_v1"}}))
+
+	if !setStableSinceCalled {
+		t.Fatal("SetStableSince was not called on first running observation")
+	}
+	if gotDeploymentID != "d_v1" {
+		t.Errorf("SetStableSince deployment = %q, want d_v1", gotDeploymentID)
+	}
+}
+
+// TestEvaluateStability_RunningForLongEnoughPromotesToLastGood
+// pins the contract that a deployment observed running for ≥
+// stableWindow AND with auto_rollback_enabled=true gets promoted to
+// last_good_deployment_id. Without a successful promote, a future
+// crash has nothing to roll back to.
+func TestEvaluateStability_RunningForLongEnoughPromotesToLastGood(t *testing.T) {
+	armedAt := time.Now().Add(-2 * time.Second) // older than stableWindow
+	var promoteCalled bool
+	var promoteDeploymentID string
+	ar := &mockActiveRepo{
+		getFunc: func(_ context.Context, _, _ string) (*domain.ActiveDeployment, error) {
+			return &domain.ActiveDeployment{
+				TenantID:            "t_test",
+				AppName:             "myapp",
+				DeploymentID:        "d_v1",
+				AutoRollbackEnabled: true,
+				StableSince:         &armedAt,
+			}, nil
+		},
+		promoteToLastGoodFunc: func(_ context.Context, _, _, deploymentID string) error {
+			promoteCalled = true
+			promoteDeploymentID = deploymentID
+			return nil
+		},
+	}
+	svc := workerSvcForStabilityTest(ar)
+
+	svc.evaluateStability(context.Background(), "t_test", appsPayload(map[string]struct {
+		Status       string
+		DeploymentID string
+	}{"myapp": {Status: "running", DeploymentID: "d_v1"}}))
+
+	if !promoteCalled {
+		t.Fatal("PromoteToLastGood was not called for a long-stable deployment")
+	}
+	if promoteDeploymentID != "d_v1" {
+		t.Errorf("PromoteToLastGood deployment = %q, want d_v1", promoteDeploymentID)
+	}
+}
+
+// TestEvaluateStability_CrashedResetsTheClock pins the contract
+// that a non-running status clears stable_since so the next
+// "running" observation has to start the window from scratch.
+// Without this, a flapping app could accumulate partial-window
+// credit across flaps and never actually be observed stable.
+func TestEvaluateStability_CrashedResetsTheClock(t *testing.T) {
+	armedAt := time.Now().Add(-2 * time.Second)
+	var clearStableSinceCalled bool
+	ar := &mockActiveRepo{
+		getFunc: func(_ context.Context, _, _ string) (*domain.ActiveDeployment, error) {
+			return &domain.ActiveDeployment{
+				TenantID:            "t_test",
+				AppName:             "myapp",
+				DeploymentID:        "d_v1",
+				AutoRollbackEnabled: true,
+				StableSince:         &armedAt, // armed but app is now crashed
+			}, nil
+		},
+		clearStableSinceFunc: func(_ context.Context, _, _ string) error {
+			clearStableSinceCalled = true
+			return nil
+		},
+		promoteToLastGoodFunc: func(_ context.Context, _, _, _ string) error {
+			t.Fatal("PromoteToLastGood must NOT be called for a non-running app")
+			return nil
+		},
+	}
+	svc := workerSvcForStabilityTest(ar)
+
+	svc.evaluateStability(context.Background(), "t_test", appsPayload(map[string]struct {
+		Status       string
+		DeploymentID string
+	}{"myapp": {Status: "crashed", DeploymentID: "d_v1"}}))
+
+	if !clearStableSinceCalled {
+		t.Error("ClearStableSince was not called on non-running observation")
+	}
+}
+
+// TestEvaluateStability_AutoRollbackDisabledSkipsPromotion pins
+// the contract that even a long-stable deployment is NOT promoted
+// when the tenant opted out of auto-rollback. The reasoning is in
+// the doc on evaluateStability: without an auto-rollback consumer
+// of last_good, flipping the pointer could surprise a manual
+// rollback.
+func TestEvaluateStability_AutoRollbackDisabledSkipsPromotion(t *testing.T) {
+	armedAt := time.Now().Add(-2 * time.Second)
+	ar := &mockActiveRepo{
+		getFunc: func(_ context.Context, _, _ string) (*domain.ActiveDeployment, error) {
+			return &domain.ActiveDeployment{
+				TenantID:            "t_test",
+				AppName:             "myapp",
+				DeploymentID:        "d_v1",
+				AutoRollbackEnabled: false, // opted out
+				StableSince:         &armedAt,
+			}, nil
+		},
+		promoteToLastGoodFunc: func(_ context.Context, _, _, _ string) error {
+			t.Fatal("PromoteToLastGood must NOT be called when auto_rollback_enabled=false")
+			return nil
+		},
+	}
+	svc := workerSvcForStabilityTest(ar)
+
+	svc.evaluateStability(context.Background(), "t_test", appsPayload(map[string]struct {
+		Status       string
+		DeploymentID string
+	}{"myapp": {Status: "running", DeploymentID: "d_v1"}}))
+
+	// Nothing to assert beyond the absence of the Fatal call above;
+	// the test passing IS the assertion. (If we add an event channel
+	// to the mock later, this test would assert on it.)
 }
 
 func TestWorkerService_Register_InvalidWorkerID(t *testing.T) {

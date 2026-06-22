@@ -75,6 +75,24 @@ func (r *ActiveDeploymentRepository) ClearStableSince(ctx context.Context, tenan
 	return err
 }
 
+// PromoteToLastGood sets last_good_deployment_id = $3 on the row
+// identified by (tenant, app). Only fires when last_good is
+// currently NULL — the goal is to capture the first time a freshly-
+// activated deployment becomes the safety net, not to keep
+// overwriting an already-set last_good pointer (which would
+// silently undo a manual rollback). Used by the stability-window
+// evaluator after a deployment has been observed running for
+// `STABLE_WINDOW_SECONDS`.
+//
+// Stable_since is preserved unchanged on a successful promote — the
+// currently-active deployment is the one we just observed running,
+// so its clock is still meaningful for the next stability check.
+func (r *ActiveDeploymentRepository) PromoteToLastGood(ctx context.Context, tenantID, appName, deploymentID string) error {
+	query := `UPDATE active_deployments SET last_good_deployment_id = $3 WHERE tenant_id = $1 AND app_name = $2 AND last_good_deployment_id IS NULL`
+	_, err := r.db.ExecContext(ctx, query, tenantID, appName, deploymentID)
+	return err
+}
+
 // ResetStableSinceForRollback is the single source of truth for the
 // "swap deployment_id ↔ last_good_deployment_id" mutation, used by
 // both the manual `edge rollback` path and the worker-driven

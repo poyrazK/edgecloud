@@ -38,19 +38,52 @@ type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 }
 
+// activeRepoInterface defines the active_deployments methods used by
+// the stability-window evaluator. Kept narrow so the evaluator can be
+// unit-tested with a sqlmock without standing up the full
+// ActiveDeploymentRepository (DB, query builder, etc.).
+type activeRepoInterface interface {
+	Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+	SetStableSince(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error
+	ClearStableSince(ctx context.Context, tenantID, appName string) error
+	PromoteToLastGood(ctx context.Context, tenantID, appName, deploymentID string) error
+}
+
+// defaultStableWindowSeconds is the default for `STABLE_WINDOW_SECONDS`
+// when the env var is unset or unparseable. Set to 30 to match the
+// worker's heartbeat_interval_secs default — promotion can fire on the
+// second heartbeat after activation. Tunable downward for tenants who
+// want faster promotion; tunable upward for noisy apps where a single
+// successful heartbeat isn't enough signal.
+const defaultStableWindowSeconds = 30
+
 // WorkerService handles worker lifecycle business logic.
 type WorkerService struct {
-	workerRepo workerRepoInterface
-	quotaRepo  quotaRepoInterface
-	nc         *nats.Conn
+	workerRepo   workerRepoInterface
+	quotaRepo    quotaRepoInterface
+	activeRepo   activeRepoInterface
+	nc           *nats.Conn
+	stableWindow time.Duration
 }
 
 // NewWorkerService creates a new WorkerService.
-func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, nc *nats.Conn) *WorkerService {
+//
+// `stableWindow` is the minimum time a deployment must be observed
+// running before it becomes eligible for promotion to
+// last_good_deployment_id (the safety-net pointer). Pass 0 to use
+// the default (30s, configurable via STABLE_WINDOW_SECONDS env). The
+// CLI accepts any non-negative integer; sub-second precision is not
+// supported.
+func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration) *WorkerService {
+	if stableWindow <= 0 {
+		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
+	}
 	return &WorkerService{
-		workerRepo: workerRepo,
-		quotaRepo:  quotaRepo,
-		nc:         nc,
+		workerRepo:   workerRepo,
+		quotaRepo:    quotaRepo,
+		activeRepo:   activeRepo,
+		nc:           nc,
+		stableWindow: stableWindow,
 	}
 }
 
@@ -149,6 +182,11 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 		Region     string          `json:"region"`
 		WorkerAddr string          `json:"worker_addr"`
 		Apps       json.RawMessage `json:"apps"`
+		// TenantID is sent by the worker so the control plane can
+		// scope stability evaluation to the right row. Heartbeats
+		// from the same worker may carry different tenants (the
+		// worker hosts multiple tenants in multi-tenant mode).
+		TenantID string `json:"tenant_id"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
 		return
@@ -173,6 +211,15 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
 		log.Printf("heartbeat: failed to upsert status for %s: %v", hb.WorkerID, err)
 	}
+
+	// Stability-window evaluate. Only fires when the heartbeat
+	// carries a tenant_id and apps — the AppSpec on the wire is the
+	// source of truth for "which apps is this worker serving for
+	// this tenant right now?". Heartbeats without apps are treated
+	// as the worker's "I'm idle" signal — nothing to evaluate.
+	if hb.TenantID != "" && len(hb.Apps) > 0 {
+		s.evaluateStability(ctx, hb.TenantID, hb.Apps)
+	}
 }
 
 // GetAppTarget returns the running target for a single
@@ -190,4 +237,118 @@ func (s *WorkerService) GetAppTarget(ctx context.Context, tenantID, appName stri
 		return nil, nil
 	}
 	return &targets[0], nil
+}
+
+// evaluateStability drives the "promote running deployment to
+// last_good" rule. Per heartbeat, for every app the worker reports:
+//
+//   - if status == "running" and stable_since IS NULL on the active
+//     row, arm the clock (SetStableSince NOW).
+//   - if status != "running", clear the clock (ClearStableSince) so
+//     a fresh arming is needed after the next recovery. This makes
+//     flapping apps never get promoted — a single unhealthy blip
+//     resets the window.
+//   - if status == "running" and stable_since is older than
+//     s.stableWindow AND auto_rollback_enabled = true, promote the
+//     currently-active deployment to last_good so a future crash
+//     can roll back to it. This is the "auto-promote to last-good"
+//     rule from issue #74 step 3.
+//
+// Promotion is metadata-only — no TaskMessage is published because
+// the worker is already serving the same deployment_id. The only
+// effect is that `last_good_deployment_id` flips to the new active
+// id, ready to be swapped in by the next rollback or auto-rollback.
+//
+// Resolution is heartbeat-bound: with the default 30s window and
+// 30s heartbeat interval, the worst-case latency from "first
+// running observation" to "promoted" is ~60s (next heartbeat +
+// window). Tenants needing faster promotion can lower both.
+//
+// On any per-app error, log and continue — the stability check is
+// best-effort. A DB hiccup on one app must not block the heartbeat
+// path for other apps on the same worker.
+func (s *WorkerService) evaluateStability(ctx context.Context, tenantID string, appsJSON json.RawMessage) {
+	var apps map[string]struct {
+		Status       string `json:"status"`
+		DeploymentID string `json:"deployment_id"`
+	}
+	if err := json.Unmarshal(appsJSON, &apps); err != nil {
+		log.Printf("stability: failed to parse apps JSON: %v", err)
+		return
+	}
+
+	now := time.Now()
+	for appName, app := range apps {
+		ad, err := s.activeRepo.Get(ctx, tenantID, appName)
+		if err != nil {
+			log.Printf("stability: Get(%s, %s) failed: %v", tenantID, appName, err)
+			continue
+		}
+		if ad == nil {
+			// Heartbeat mentions an app that has no active row.
+			// Could be a fresh deploy that hasn't been activated
+			// yet; the activate path handles arming the clock,
+			// nothing to do here.
+			continue
+		}
+		// The deployment_id reported by the heartbeat is the
+		// ground truth — if it doesn't match the active row's
+		// deployment_id, an Activate landed between heartbeats
+		// and the active row is ahead of the worker. The next
+		// heartbeat (after the worker reconciles) will match;
+		// in the meantime, skip stability work for this app.
+		if ad.DeploymentID != app.DeploymentID {
+			continue
+		}
+
+		switch app.Status {
+		case "running":
+			if ad.StableSince == nil {
+				// First observation of "running" — arm the clock.
+				if err := s.activeRepo.SetStableSince(ctx, tenantID, appName, app.DeploymentID, now); err != nil {
+					log.Printf("stability: SetStableSince(%s, %s) failed: %v", tenantID, appName, err)
+				}
+				continue
+			}
+			// Already armed. Has it been long enough?
+			if now.Sub(*ad.StableSince) < s.stableWindow {
+				continue
+			}
+			// Stable long enough. Promote, but only if the
+			// tenant opted in. (Without the auto-rollback flag
+			// there's no automatic consumer of last_good — the
+			// tenant would have to roll back manually, and
+			// flipping last_good without auto-rollback could
+			// surprise a manual rollback by overwriting the
+			// pointer with a deployment the user hasn't
+			// validated.)
+			if !ad.AutoRollbackEnabled {
+				continue
+			}
+			// Promote the currently-active deployment to
+			// last_good. PromoteToLastGood's WHERE clause
+			// (last_good_deployment_id IS NULL) ensures a
+			// concurrent manual rollback isn't clobbered —
+			// the call is a no-op when last_good already
+			// points somewhere (e.g. a freshly-activated v2
+			// trying to "promote itself" while v1 is still
+			// the previous-good).
+			if err := s.activeRepo.PromoteToLastGood(ctx, tenantID, appName, app.DeploymentID); err != nil {
+				log.Printf("stability: PromoteToLastGood(%s, %s) failed: %v", tenantID, appName, err)
+			}
+		default:
+			// Any non-running status (starting, stopping,
+			// crashed, hung) resets the clock so the next
+			// "running" observation has to start the window
+			// from scratch. We don't bail out — there's no
+			// auto-rollback promotion on this branch — but we
+			// do ClearStableSince so a flapping app doesn't
+			// accumulate partial-window credit across flaps.
+			if ad.StableSince != nil {
+				if err := s.activeRepo.ClearStableSince(ctx, tenantID, appName); err != nil {
+					log.Printf("stability: ClearStableSince(%s, %s) failed: %v", tenantID, appName, err)
+				}
+			}
+		}
+	}
 }

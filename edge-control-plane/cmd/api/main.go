@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +30,31 @@ import (
 // exists solely for //go:embed (which resolves paths relative to this file).
 // Run `go generate` after updating the spec to keep them in sync.
 var openAPISpec embed.FS
+
+// stableWindowFromEnv reads STABLE_WINDOW_SECONDS from the
+// environment, returning 0 (= "use service default") when unset or
+// unparseable. Defaults live in service.NewWorkerService; this
+// helper is purely an env → Duration bridge so cmd/api/main.go
+// doesn't have to repeat the strconv + log-on-error dance inline.
+//
+// The env var is the operator-facing knob for the auto-rollback
+// stability window. Lowering it (e.g. to 5s) makes freshly-activated
+// deployments eligible to be promoted to last_good faster, at the
+// cost of being more sensitive to transient blips. The default
+// (30s) matches the worker's heartbeat_interval_secs default so
+// promotion can fire on the second heartbeat after activation.
+func stableWindowFromEnv() time.Duration {
+	raw := os.Getenv("STABLE_WINDOW_SECONDS")
+	if raw == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs < 0 {
+		log.Printf("STABLE_WINDOW_SECONDS=%q invalid; using service default", raw)
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
 
 func main() {
 	// Load configuration
@@ -88,7 +114,7 @@ func main() {
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
-	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
+	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
