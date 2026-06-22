@@ -393,6 +393,15 @@ func TestIngestLogs_TenantIDAndWorkerOverwritten(t *testing.T) {
 // supplied levels outside the canonical set are rejected with 400 before
 // any row is written. Without this guard, a guest that emits "critical"
 // or "fatal" would land a row the query endpoint cannot filter on.
+//
+// The mock captures `lastEntries` so this test also pins the
+// ordering invariant: level validation runs BEFORE the JWT overwrite
+// loop. A future maintainer who reorders the two loops (e.g. "for
+// clarity" — putting all validations after the overwrites) would
+// cause a rejected-level batch to still be (briefly) attributed to
+// the JWT's tenant/worker/region in the repo entries. Even if the
+// InsertBatch is gated, capturing the entries here protects against
+// that reorder reaching production.
 func TestIngestLogs_RejectsInvalidLevel(t *testing.T) {
 	repo := &mockLogEntryRepo{}
 	server := newIngestLogsServer(repo)
@@ -415,6 +424,17 @@ func TestIngestLogs_RejectsInvalidLevel(t *testing.T) {
 	}
 	if repo.calls != 0 {
 		t.Errorf("repo must not be called when any entry has an invalid level, got %d calls", repo.calls)
+	}
+	// Ordering invariant: the level validation loop must run BEFORE
+	// the JWT overwrite loop. If it didn't, the mock would have
+	// captured the (overwritten) entries even though InsertBatch
+	// wasn't called. lastEntries == nil means nothing reached the
+	// mock at all — the level check fired first.
+	if repo.lastEntries != nil {
+		t.Errorf(
+			"level validation must run before JWT overwrite; got lastEntries=%d entries (reorder?)",
+			len(repo.lastEntries),
+		)
 	}
 }
 
