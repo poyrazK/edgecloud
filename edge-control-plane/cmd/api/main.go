@@ -53,6 +53,7 @@ func main() {
 	appEnvRepo := repository.NewAppEnvRepository(db)
 	appRepo := repository.NewAppRepository(db)
 	workerRepo := repository.NewWorkerRepository(db)
+	trafficSplitRepo := repository.NewTrafficSplitRepository(db)
 
 	// Initialize NATS publisher
 	publisher, err := nats.NewNATSPublisher(cfg.NATS.URL)
@@ -91,6 +92,7 @@ func main() {
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, publisher.Conn())
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
+	trafficSvc := service.NewTrafficService(trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
@@ -103,6 +105,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+	trafficHandler := handler.NewTrafficHandler(trafficSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -228,6 +231,8 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
+	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
+	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
 
