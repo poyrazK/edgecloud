@@ -303,6 +303,18 @@ components:
           type: string
           example: activated
 
+    RollbackResponse:
+      type: object
+      properties:
+        deployment_id:
+          type: string
+          example: d_prev
+          description: |
+            Deployment id now active after the rollback — i.e., the
+            prior `last_good_deployment_id`. Callers can persist this
+            into local state so subsequent commands (e.g. `edge open`)
+            target the rolled-back version.
+
     # -------------------------------------------------------------------------
     # Ingress
     # -------------------------------------------------------------------------
@@ -1079,6 +1091,58 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/rollback:
+    post:
+      operationId: rollbackDeployment
+      summary: Roll back the active deployment to the stored last-good deployment
+      description: |
+        Replaces the currently active deployment of `appName` with the
+        deployment recorded as the most recent `last_good_deployment_id`.
+        Used after a bad activation to put the app back on a known-good
+        version. The previously active deployment becomes the new
+        `last_good_deployment_id`, so the operation is itself reversible.
+        A NATS task update is published to every region the deployment
+        is replicated to so workers re-converge.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Deployment rolled back.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RollbackResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            No prior `last_good_deployment_id` is recorded for this app,
+            so there is nothing to roll back to. Returned when the app
+            has only ever had one deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: |
+            The post-commit NATS publish of the task update failed for
+            every region the deployment is replicated to. The control
+            plane has already committed the new active deployment, but
+            workers may not converge until the publish is retried.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
