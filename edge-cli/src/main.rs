@@ -69,6 +69,7 @@ enum Command {
         ///     `running` for ≥ `STABLE_WINDOW_SECONDS` (default 30s),
         ///     it is promoted to `last_good_deployment_id` so future
         ///     crashes roll back to it instead of an older build.
+        ///
         /// Ignored when --id is set (auto-rollback is a deployment-time
         /// property, not a session toggle).
         #[arg(long)]
