@@ -1108,6 +1108,100 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
+  # Traffic Splits
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/traffic:
+    get:
+      operationId: getTrafficSplits
+      summary: Get the current traffic split configuration for an app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Traffic split configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  app_name:
+                    type: string
+                    example: my-app
+                  splits:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        deployment_id:
+                          type: string
+                          example: d_abc123
+                        weight:
+                          type: integer
+                        created_at:
+                          type: string
+                          format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: setTrafficSplits
+      summary: Set the traffic split configuration for an app (canary/blue-green)
+      description: |
+        Atomically sets the traffic split for an app. Sum of weights must equal 100.
+        Publishes a task update to workers so they start all deployments concurrently.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [splits]
+              properties:
+                splits:
+                  type: array
+                  items:
+                    type: object
+                    required: [deployment_id, weight]
+                    properties:
+                      deployment_id:
+                        type: string
+                        example: d_abc123
+                      weight:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+      responses:
+        '200':
+          description: Traffic split configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: traffic_set
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
   # Ingress
   # -------------------------------------------------------------------------
   /api/v1/apps/{appName}/ingress:
