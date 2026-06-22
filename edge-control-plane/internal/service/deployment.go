@@ -114,6 +114,17 @@ var (
 	// infrastructure failure. Handler maps to HTTP 502. The wrapped
 	// cause (using Go 1.20+ multi-%w) is preserved for logs.
 	ErrPublishFailed = fmt.Errorf("publishing task update failed")
+	// ErrAutoRollbackDisabled is returned by RollbackDeployment (via
+	// the repo's ResetStableSinceForRollback SQL guard) when the
+	// active_deployments row has auto_rollback_enabled=false. The
+	// string MUST stay in sync with `errAutoRollbackDisabledSentinel`
+	// in `internal/repository/active_deployment.go`; the handler
+	// matches it via errors.Is. Returned only by the worker-driven
+	// auto-rollback path (POST /api/internal/apps/{appName}/auto-rollback);
+	// the manual `edge rollback` path bypasses this guard because a
+	// tenant should always be able to manually reverse their own
+	// activation, even if they opted out of auto-rollback.
+	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
 
 // DeploymentService handles deployment business logic.
@@ -440,26 +451,35 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		},
 	}
 
-	// Resolve the effective regions list to publish to:
-	//   - deployment.Regions if non-empty (post-migration-008 row),
-	//   - otherwise the control plane's default region (handles
-	//     pre-migration rows AND any caller that wrote the row via a
-	//     path that left Regions nil).
+	// Resolve the effective regions list to publish to via the
+	// shared helper. publishSwap is also used by RollbackDeployment,
+	// which previously published to "global" only — a silent
+	// multi-region regression. Keeping both paths through one helper
+	// guarantees they fan out identically.
 	regions := domain.StringArrayTo(deployment.Regions)
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
+	return s.publishSwap(ctx, msg, regions, deploymentID)
+}
 
-	// Fan out: publish one TaskMessage per region. Failures are
-	// logged but do NOT abort the loop — if a tenant activated to
-	// three regions and one publish fails (e.g. NATS blip), the
-	// other two should still get the message. The error returned
-	// here is a summary wrapped with ErrPublishFailed so the HTTP
-	// layer can match via errors.Is and surface a 502 — the DB row
-	// has already committed by this point, so workers may still be
-	// serving the prior deployment; the client should treat this
-	// as a transient infrastructure failure and retry the failed
-	// regions.
+// publishSwap fans a TaskMessage out to every region in `regions`.
+// Used by ActivateDeployment and RollbackDeployment so they cannot
+// drift in their region-fanout behavior (the prior Rollback path
+// published to "global" only, leaving multi-region deployments
+// stuck on the broken version until the next heartbeat).
+//
+// Failures in a single region are logged and accumulated into the
+// returned error — we keep publishing to the remaining regions
+// rather than aborting on the first failure, so a transient NATS
+// blip in one region doesn't starve the others. If at least one
+// region fails the error is wrapped with ErrPublishFailed (matched
+// by the HTTP layer for 502); the per-region list is preserved
+// through Go's multi-%w error wrapping so logs can show the full
+// picture. The DB row has already committed by the time we get
+// here, so workers may still be serving the prior deployment; the
+// caller surfaces this as a transient failure to the client.
+func (s *DeploymentService) publishSwap(ctx context.Context, msg *nats.TaskMessage, regions []string, deploymentID string) error {
 	var failedRegions []string
 	for _, region := range regions {
 		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
@@ -470,7 +490,6 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(failedRegions) > 0 {
 		return fmt.Errorf("%w: %d region(s) failed: %s", ErrPublishFailed, len(failedRegions), strings.Join(failedRegions, ","))
 	}
-
 	return nil
 }
 
@@ -485,6 +504,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error) {
 	var rolledBackID string
 	var deploymentHash string
+	var regions []string
 	var tenant *domain.Tenant
 	var envs []domain.AppEnv
 	var maxMemoryMB int
@@ -514,6 +534,16 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("previous deployment %s not found", rolledBackID)
 		}
 		deploymentHash = dep.Hash
+		// Use the rolled-BACK-TO deployment's regions so we publish
+		// to exactly the regions where this artifact was originally
+		// destined. Previously this published to "global" only, which
+		// silently left multi-region tenants running the broken
+		// version on their non-default regions (workers there had no
+		// signal to swap).
+		regions = domain.StringArrayTo(dep.Regions)
+		if len(regions) == 0 {
+			regions = []string{s.defaultRegion}
+		}
 
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
@@ -590,8 +620,8 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			},
 		},
 	}
-	if err := s.publisher.PublishTaskUpdate("global", msg); err != nil {
-		return "", fmt.Errorf("%w: %w", ErrPublishFailed, err)
+	if err := s.publishSwap(ctx, msg, regions, rolledBackID); err != nil {
+		return "", err
 	}
 
 	return rolledBackID, nil

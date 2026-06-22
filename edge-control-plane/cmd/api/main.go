@@ -258,6 +258,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
+	// Worker-driven auto-rollback: an edge-worker POSTs here when its
+	// supervisor exhausts the restart cap on a tenant app. The
+	// handler swaps the active deployment back to last_good and
+	// publishes a TaskMessage so all regions reconcile. Like every
+	// other /api/internal/* endpoint, this is currently
+	// unauthenticated — see the comment on internalMux above.
+	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
