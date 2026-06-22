@@ -98,7 +98,7 @@ func main() {
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
 	appHandler := handler.NewAppHandler(appSvc)

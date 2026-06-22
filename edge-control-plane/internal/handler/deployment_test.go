@@ -39,7 +39,7 @@ func (m *mockAppTargetLookup) GetAppTarget(_ context.Context, tenantID, appName 
 // service contract.
 func newAppIngressMux(lookup *mockAppTargetLookup) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/apps/{appName}/ingress", NewDeploymentHandler(nil, lookup).AppIngress)
+	mux.HandleFunc("GET /api/v1/apps/{appName}/ingress", NewDeploymentHandler(nil, lookup, nil).AppIngress)
 	return mux
 }
 
@@ -310,7 +310,7 @@ func equalSlices(a, b []string) bool {
 // panic on the nil pointer deref.
 func newDeployMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/deploy/{appName}", NewDeploymentHandler(nil, nil).Deploy)
+	mux.HandleFunc("POST /api/deploy/{appName}", NewDeploymentHandler(nil, nil, nil).Deploy)
 	return mux
 }
 

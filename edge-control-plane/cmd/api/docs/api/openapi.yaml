@@ -1050,12 +1050,21 @@ paths:
   /api/v1/apps/{appName}/activate/{deploymentID}:
     post:
       operationId: activateDeployment
-      summary: Activate a specific deployment as the live version
+      summary: Activate a deployment, optionally as a canary
       description: |
         Publishes a task update over NATS JetStream so subscribed workers
-        start serving the specified deployment. Only one deployment per app
-        can be active at a time — activating a new one replaces the current
-        live deployment atomically.
+        start serving the specified deployment.
+
+        When `?weight=100` (default): atomically replaces the live deployment —
+        all traffic switches to the new version.
+
+        When `?weight=N` (0 < N < 100): activates the deployment as a canary
+        at N% traffic. The currently active deployment absorbs the remaining
+        (100-N)% so traffic always sums to 100. Both deployments run
+        concurrently on workers.
+
+        Use `PUT /api/v1/apps/{appName}/traffic` for full control over
+        weighted routing between multiple deployments.
       parameters:
         - name: appName
           in: path
@@ -1068,9 +1077,19 @@ paths:
           required: true
           schema:
             type: string
+        - name: weight
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+          description: |
+            Traffic weight for this deployment (0–100). Omit or use 100 for
+            atomic cutover. Values 0–99 trigger canary mode.
       responses:
         '200':
-          description: Deployment activated.
+          description: Deployment activated (or traffic split set for canary).
           content:
             application/json:
               schema:

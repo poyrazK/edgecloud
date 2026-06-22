@@ -21,10 +21,11 @@ import (
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
+	trafficSvc   *service.TrafficService
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
-	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc}
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
+	return &DeploymentHandler{deploymentSvc: deploymentSvc, workerSvc: workerSvc, trafficSvc: trafficSvc}
 }
 
 // deployResponse is the JSON shape returned by `POST /api/deploy/{appName}`.
@@ -200,14 +201,47 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 	deploymentID := r.PathValue("deploymentID")
 
-	if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+	weightStr := r.URL.Query().Get("weight")
+	if weightStr == "" {
+		// Default weight=100: atomic activation (existing behavior).
+		if err := h.deploymentSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+			log.Printf("internal error: %v", err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+		return
+	}
+
+	weight, err := strconv.Atoi(weightStr)
+	if err != nil || weight < 0 || weight > 100 {
+		httperror.BadRequestCtx(w, r, "weight must be an integer between 0 and 100")
+		return
+	}
+
+	// Partial weight: canary activation.
+	// Get the currently active deployment (if any) to build the traffic split.
+	current, _ := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
+	splits := []domain.TrafficSplitEntry{
+		{DeploymentID: deploymentID, Weight: weight},
+	}
+	if current != nil && weight < 100 {
+		// Keep existing deployment at the remaining weight.
+		splits = append(splits, domain.TrafficSplitEntry{
+			DeploymentID: current.ID,
+			Weight:       100 - weight,
+		})
+	}
+
+	if err := h.trafficSvc.SetTraffic(r.Context(), tenantID, appName, splits); err != nil {
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"})
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
