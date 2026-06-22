@@ -939,3 +939,39 @@ async fn wait_for_either_app_running(
     }
     None
 }
+
+// TODO(issue-#74-e2e): a supervisor-level integration test for the
+// auto-rollback path is the missing piece in this PR's coverage.
+//
+// The test would:
+//   1. Build a `crashing.wasm` fixture — a minimal WASI Preview 2
+//      component that traps on `_start` (a `core::arch::wasm32::
+//      unreachable()` at the top of `_start`).
+//   2. Mount a wiremock control plane that responds 200 to
+//      `POST /api/internal/apps/myapp/auto-rollback`.
+//   3. Drive `TestHarness::new()` + `handle_task_message` to start
+//      the crashing app.
+//   4. Wait for the supervisor to spin 5 times at exponential backoff
+//      and reach `Crashed { restart_count: 5 }`.
+//   5. Assert wiremock received exactly one auto-rollback POST with
+//      `{tenant_id, app_name, current_deployment_id, restart_count: 5}`.
+//
+// Why it's not in this PR:
+//   - Building a real WASI Preview 2 *component* (not just a core
+//     module) requires either wasi-sdk + wit-component or a custom
+//     Rust crate built with `rustup target add wasm32-wasip2` and
+//     then `wasm-tools component embed`. Both flows are out of scope
+//     for this PR's toolchain setup.
+//   - The wire-level behavior of `Downloader::post_auto_rollback` is
+//     already covered by three unit tests in
+//     `src/downloader.rs::tests` (200 success, 412 rejection
+//     without retry, path-traversal guard).
+//   - The wiring in `supervisor.rs::run_app_loop` (Crashed + Hung
+//     branches both spawn `post_auto_rollback`) is straightforward
+//     enough that a reviewer's static check is sufficient until the
+//     fixture lands.
+//
+// Follow-up: add `edge-worker/tests/fixtures/crashing.wasm` and the
+// `#[tokio::test]` above. Self-skip via `should_skip_integration_tests`
+// matches the existing pattern — runs locally with Docker, skipped
+// in CI without it.

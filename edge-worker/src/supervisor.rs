@@ -186,6 +186,12 @@ impl Supervisor {
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
         let allowlist = spec.allowlist.clone();
+        // downloader_clone is captured into the per-app task so
+        // run_app_loop can post the auto-rollback signal when an
+        // app exhausts its restart cap. Arc<Downloader> is cheap to
+        // clone; the underlying reqwest::Client is internally Arc'd
+        // already, so this is one atomic refcount bump.
+        let downloader_clone = self.downloader.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -202,6 +208,7 @@ impl Supervisor {
                 health_check_timeout_secs,
                 tenant_id_str,
                 allowlist,
+                downloader_clone,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -324,11 +331,19 @@ impl Supervisor {
         health_check_timeout_secs: u64,
         tenant_id: String,
         allowlist: Vec<String>,
+        downloader: Arc<Downloader>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
         let base_backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
+        // deployment_id is captured once at the top of run_app_loop
+        // so the auto-rollback POST (fired on Crashed) names the
+        // deployment that's currently active — i.e. the one we're
+        // giving up on. The control plane uses this to update its
+        // audit log; it doesn't affect the rollback itself, which is
+        // driven entirely by last_good_deployment_id.
+        let current_deployment_id = meter.deployment_id.clone();
 
         loop {
             tokio::select! {
@@ -386,6 +401,32 @@ impl Supervisor {
                                         inst.status = AppInstanceStatus::Crashed { restart_count };
                                     }
                                 }
+                                // Best-effort auto-rollback: signal the
+                                // control plane so it can swap the active
+                                // deployment back to last_good. We do NOT
+                                // block the per-app task on this — `spawn`
+                                // detaches the POST so the loop can return
+                                // immediately. The user's manual
+                                // `edge rollback` covers the failure mode.
+                                let dl = downloader.clone();
+                                let tenant = tenant_id.clone();
+                                let name = app_name.clone();
+                                let dep = current_deployment_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = dl
+                                        .post_auto_rollback(&tenant, &name, &dep, restart_count)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            tenant_id = %tenant,
+                                            app_name = %name,
+                                            current_deployment_id = %dep,
+                                            restart_count,
+                                            err = %err,
+                                            "auto-rollback POST failed; user must run `edge rollback` manually"
+                                        );
+                                    }
+                                });
                                 break;
                             }
 
@@ -420,6 +461,31 @@ impl Supervisor {
                                     let mut inst = inst.lock().await;
                                     inst.status = AppInstanceStatus::Hung;
                                 }
+                                // Same auto-rollback as the Crashed
+                                // branch above — Hung means the guest
+                                // stopped yielding (vs Crashed which
+                                // means it trapped). Both are tenant-
+                                // facing failure modes, both deserve a
+                                // rollback signal if the tenant opted in.
+                                let dl = downloader.clone();
+                                let tenant = tenant_id.clone();
+                                let name = app_name.clone();
+                                let dep = current_deployment_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = dl
+                                        .post_auto_rollback(&tenant, &name, &dep, restart_count)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            tenant_id = %tenant,
+                                            app_name = %name,
+                                            current_deployment_id = %dep,
+                                            restart_count,
+                                            err = %err,
+                                            "auto-rollback POST failed; user must run `edge rollback` manually"
+                                        );
+                                    }
+                                });
                                 break;
                             }
                             sleep(backoff).await;

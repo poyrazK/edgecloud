@@ -92,6 +92,96 @@ impl Downloader {
     fn cache_path(&self, deployment_id: &str) -> PathBuf {
         self.cache_dir.join(format!("{}.wasm", deployment_id))
     }
+
+    /// Notify the control plane that the worker has exhausted the
+    /// restart cap on a tenant app and wants the active deployment
+    /// swapped to `last_good_deployment_id`. Best-effort: returns
+    /// `Err` on any failure (network, non-2xx, malformed response)
+    /// so the caller can log it. The supervisor does NOT block on
+    /// this — `tokio::spawn` is the caller's responsibility so the
+    /// supervisor's per-app task can exit immediately. The user can
+    /// fall back to `edge rollback` if the auto-rollback POST fails.
+    ///
+    /// The control-plane endpoint is documented in
+    /// `edge-control-plane/internal/handler/internal.go::AutoRollback`.
+    /// It enforces `auto_rollback_enabled=true` server-side; if the
+    /// tenant opted out, the response is 412 — the worker logs and
+    /// moves on (no retry, no escalation).
+    pub async fn post_auto_rollback(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        current_deployment_id: &str,
+        restart_count: u32,
+    ) -> anyhow::Result<()> {
+        // Path-traversal guard: appName flows into the URL path
+        // (`/api/internal/apps/{appName}/auto-rollback`). A "../"
+        // would let one tenant's worker signal auto-rollback for a
+        // different app on the same control plane. tenant_id is
+        // already validated upstream (see start_app in supervisor.rs);
+        // we still check it here so this method is safe to call from
+        // anywhere without depending on the caller's checks.
+        if app_name.is_empty()
+            || app_name.contains('/')
+            || app_name.contains('\\')
+            || app_name.contains("..")
+        {
+            anyhow::bail!("refusing to POST auto-rollback for unsafe app_name {app_name:?}");
+        }
+
+        let url = format!(
+            "{}/api/internal/apps/{}/auto-rollback",
+            self.control_plane_url, app_name
+        );
+        let body = serde_json::json!({
+            "tenant_id": tenant_id,
+            "app_name": app_name,
+            "current_deployment_id": current_deployment_id,
+            "restart_count": restart_count,
+        });
+
+        tracing::info!(
+            url = %url,
+            tenant_id,
+            app_name,
+            current_deployment_id,
+            restart_count,
+            "posting auto-rollback to control plane"
+        );
+
+        // Use send() rather than error_for_status() so we can log
+        // the response status code on non-2xx without short-circuiting
+        // the post — the caller treats both 2xx and 4xx as "we got our
+        // signal across" and only escalates on transport errors.
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("failed to POST {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // 4xx means the control plane got the signal but rejected
+            // it (e.g. 412 auto-rollback disabled, 409 no last-good,
+            // 404 no active deployment). Log and return Err so the
+            // caller's tracing captures the failure, but DON'T
+            // retry — these are tenant-config issues, not transient
+            // outages, and a retry would just hit the same rejection.
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                url = %url,
+                status = %status,
+                body = %body,
+                "auto-rollback POST rejected by control plane"
+            );
+            anyhow::bail!("auto-rollback POST {url} returned {status}: {body}");
+        }
+
+        tracing::info!(url = %url, status = %status, "auto-rollback POST accepted");
+        Ok(())
+    }
 }
 
 /// Verify that `sha256(bytes)` equals `expected_hex` (a bare lowercase hex digest).
@@ -405,6 +495,156 @@ mod tests {
         assert!(
             !cache_path.exists(),
             "cache file should not be recreated on download failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // post_auto_rollback tests (no Docker needed — run in CI).
+    //
+    // The supervisor-level integration test (driving a real crashing
+    // wasm through the full lifecycle to verify the POST fires on
+    // Crashed) requires a wasi-sdk-built crashing fixture that's out
+    // of scope for this PR to build. The behavior under test is split:
+    //
+    //   - Downloader::post_auto_rollback itself — covered here with
+    //     wiremock (the wire shape, retry semantics, rejection
+    //     handling).
+    //   - The Crashed-branch wiring (which calls post_auto_rollback) —
+    //     a hand-crafted component or an InstancePre mock would be
+    //     needed, both of which require a non-trivial test fixture.
+    //     See TODO comment in tests/integration_tests.rs for the
+    //     follow-up to land a crashing.wasm and exercise the full
+    //     loop.
+    // -----------------------------------------------------------------------
+
+    /// Happy path: 200 from the control plane is treated as success
+    /// and `Ok(())` is returned. The worker supervisor treats both
+    /// 2xx and 4xx-with-our-signal-across as "delivered"; only 5xx and
+    /// transport errors are escalated.
+    #[tokio::test]
+    async fn post_auto_rollback_success_returns_ok() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Match on path + method only. Body shape is asserted below by
+        // parsing the captured request body — `serde_json::json!{}`
+        // doesn't guarantee key ordering, so a literal body_string
+        // matcher is brittle.
+        Mock::given(method("POST"))
+            .and(path("/api/internal/apps/myapp/auto-rollback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deployment_id": "d_prev",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+
+        let result = downloader
+            .post_auto_rollback("t_test", "myapp", "d_broken", 5)
+            .await;
+        assert!(
+            result.is_ok(),
+            "200 from server must return Ok, got: {result:?}"
+        );
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(received.len(), 1, "expected exactly one POST");
+        // Assert the parsed body shape rather than a literal byte
+        // match — restart_count is the field that drives the audit
+        // log, so dropping it from the JSON would be a contract
+        // regression worth catching.
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("body must be valid JSON");
+        assert_eq!(body["tenant_id"], "t_test");
+        assert_eq!(body["app_name"], "myapp");
+        assert_eq!(body["current_deployment_id"], "d_broken");
+        assert_eq!(body["restart_count"], 5);
+    }
+
+    /// 4xx rejection (e.g. 412 auto-rollback disabled, 409 no last-good):
+    /// the supervisor does NOT retry — it logs and continues. The
+    /// method returns Err so the supervisor's tracing captures the
+    /// failure, but the supervisor's run_app_loop is not blocked on
+    /// the response (it `tokio::spawn`s the call).
+    #[tokio::test]
+    async fn post_auto_rollback_412_returns_err_without_retry() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Mount exactly one expectation; the test fails if the
+        // downloader issues a second POST (i.e. retries).
+        Mock::given(method("POST"))
+            .and(path("/api/internal/apps/myapp/auto-rollback"))
+            .respond_with(
+                ResponseTemplate::new(412)
+                    .set_body_string(r#"{"error": "auto-rollback disabled for this app"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+
+        let err = downloader
+            .post_auto_rollback("t_test", "myapp", "d_broken", 5)
+            .await
+            .expect_err("412 must propagate as Err");
+        assert!(
+            err.to_string().contains("412"),
+            "expected 412 in error message, got: {err}"
+        );
+
+        // Brief delay to let any (incorrect) retry land before we
+        // assert received_requests().await.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            1,
+            "412 must NOT trigger a retry — got {} requests",
+            received.len()
+        );
+    }
+
+    /// Path traversal in app_name is rejected client-side: we never
+    /// reach the network. The control plane would 400 a malformed
+    /// path, but it's cheaper to fail fast in the worker and avoid
+    /// polluting server logs.
+    #[tokio::test]
+    async fn post_auto_rollback_rejects_path_traversal() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        // No mock mounted — a request would surface as
+        // "expected mock not matched" and fail the test.
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+
+        for bad_name in ["../etc", "foo/bar", "foo\\bar", "..", ""] {
+            let err = downloader
+                .post_auto_rollback("t_test", bad_name, "d_broken", 5)
+                .await
+                .expect_err(&format!("{bad_name:?} must be rejected"));
+            assert!(
+                err.to_string().contains("unsafe app_name"),
+                "expected rejection for {bad_name:?}, got: {err}"
+            );
+        }
+
+        let received = server.received_requests().await.expect("received");
+        assert!(
+            received.is_empty(),
+            "no request should reach the server for path-traversal app_names"
         );
     }
 }
