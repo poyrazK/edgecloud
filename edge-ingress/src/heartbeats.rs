@@ -92,18 +92,37 @@ pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> boo
         return false;
     }
     let mut changed = false;
-    for (app_name, app) in &hb.apps {
+    for (key, app) in &hb.apps {
+        // Heartbeat key is now "app_name:deployment_id" to support canary
+        // (multiple concurrent deployments of the same app). Split to recover
+        // the two parts. AppStatus.deployment_id must match the key suffix.
+        let (app_name, deployment_id) = match key.split_once(':') {
+            Some((name, id)) => (name, Some(id)),
+            None => (key.as_str(), None),
+        };
         let port = app.port;
         debug!(
             app = %app_name,
+            deployment_id = %deployment_id.unwrap_or("(none)"),
             tenant = %app.tenant_id,
             worker_addr,
             port,
             status = %app.status,
             "updating route"
         );
+        // Weight is not in the heartbeat — the ingress fetches traffic splits
+        // from the control plane API at render time. Default to 100 so a
+        // single deployment always gets full traffic.
         table
-            .upsert(&app.tenant_id, app_name, worker_addr, port, &app.status)
+            .upsert(
+                &app.tenant_id,
+                app_name,
+                deployment_id.as_deref(),
+                100,
+                worker_addr,
+                port,
+                &app.status,
+            )
             .await;
         changed = true;
     }
@@ -289,5 +308,7 @@ mod tests {
         assert_eq!(snap[0].port, 8081);
         assert_eq!(snap[0].tenant_id, "t_a");
         assert_eq!(snap[0].app_name, "api");
+        assert_eq!(snap[0].deployment_id, None);
+        assert_eq!(snap[0].weight, 100);
     }
 }

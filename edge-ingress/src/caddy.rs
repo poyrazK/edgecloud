@@ -65,20 +65,64 @@ impl CaddyClient {
 ///
 /// Hosts are formatted as `<tenant_id>-<app_name>.edgecloud.dev` so two
 /// tenants creating an app named `api` don't collide on the shared wildcard.
+///
+/// When multiple entries exist for the same `(tenant_id, app_name)` (canary /
+/// blue-green), they are rendered as weighted upstreams in a single route:
+/// ```json
+/// "upstreams": [
+///   {"dial": "1.2.3.4:8081", "weight": 95},
+///   {"dial": "1.2.3.5:8082", "weight": 5}
+/// ]
+/// ```
+///
+/// A single entry omits the `weight` key, which Caddy defaults to `1` for
+/// that sole upstream — identical routing behaviour to the legacy path.
 pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
-    // Sort by (tenant_id, app_name) for deterministic output — also makes
-    // the diffs in the test assertions straightforward.
-    let mut sorted: Vec<&RouteEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.tenant_id
-            .cmp(&b.tenant_id)
-            .then_with(|| a.app_name.cmp(&b.app_name))
-    });
+    // Group entries by (tenant_id, app_name). Each entry in a group represents
+    // a different deployment_id for the same app (canary/blue-green).
+    let mut groups: std::collections::HashMap<
+        (&str, &str),
+        Vec<&RouteEntry>,
+    > = std::collections::HashMap::new();
+    for e in entries {
+        groups
+            .entry((e.tenant_id.as_str(), e.app_name.as_str()))
+            .or_default()
+            .push(e);
+    }
 
-    let routes: Vec<Value> = sorted
+    // Sort groups by (tenant_id, app_name) for deterministic output.
+    let mut group_keys: Vec<_> = groups.keys().collect();
+    group_keys.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+
+    let routes: Vec<Value> = group_keys
         .iter()
-        .map(|e| {
-            let host = ingress_host(&e.tenant_id, &e.app_name);
+        .map(|(tenant_id, app_name)| {
+            let host = ingress_host(tenant_id, app_name);
+            let group = &groups[&(*tenant_id, *app_name)];
+            // Sort group by deployment_id so output is deterministic.
+            let mut group_sorted = (*group).clone();
+            group_sorted.sort_by(|a, b| {
+                a.deployment_id
+                    .cmp(&b.deployment_id)
+                    .then_with(|| a.worker_addr.cmp(&b.worker_addr))
+            });
+
+            let upstreams: Value = if group_sorted.len() == 1 {
+                // Single deployment — no weight key needed.
+                let e = group_sorted[0];
+                serde_json::json!([{"dial": format!("{}:{}", e.worker_addr, e.port)}])
+            } else {
+                // Multiple deployments — weighted upstreams.
+                serde_json::json!(group_sorted.iter().map(|e| {
+                    let upstream = serde_json::json!({
+                        "dial": format!("{}:{}", e.worker_addr, e.port),
+                        "weight": e.weight,
+                    });
+                    upstream
+                }).collect::<Vec<_>>())
+            };
+
             json!({
                 "match": [{"host": [host]}],
                 "handle": [{
@@ -86,7 +130,7 @@ pub fn render_routes(entries: &[RouteEntry], cfg: &Config) -> Value {
                     "routes": [{
                         "handle": [{
                             "handler": "reverse_proxy",
-                            "upstreams": [{"dial": format!("{}:{}", e.worker_addr, e.port)}],
+                            "upstreams": upstreams,
                             "health_checks": {
                                 "active": {"uri": "/", "expect_status": 2}
                             }
@@ -149,6 +193,27 @@ mod tests {
         RouteEntry {
             tenant_id: tenant.to_string(),
             app_name: app.to_string(),
+            deployment_id: None,
+            weight: 100,
+            worker_addr: addr.to_string(),
+            port,
+            last_seen: Instant::now(),
+        }
+    }
+
+    fn canary_entry(
+        tenant: &str,
+        app: &str,
+        deployment_id: &str,
+        addr: &str,
+        port: u16,
+        weight: u8,
+    ) -> RouteEntry {
+        RouteEntry {
+            tenant_id: tenant.to_string(),
+            app_name: app.to_string(),
+            deployment_id: Some(deployment_id.to_string()),
+            weight,
             worker_addr: addr.to_string(),
             port,
             last_seen: Instant::now(),
@@ -231,6 +296,67 @@ mod tests {
             })
             .collect();
         assert_eq!(dials, vec!["1.2.3.4:8081", "1.2.3.4:8082", "5.6.7.8:9000"]);
+    }
+
+    /// Two entries for the same (tenant, app) with different deployment_ids
+    /// must be rendered as a single route with weighted upstreams.
+    #[test]
+    fn canary_two_deployments_rendered_as_weighted_upstreams() {
+        let cfg = test_cfg();
+        let entries = vec![
+            canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 95),
+            canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 5),
+        ];
+        let cfg_json = render_routes(&entries, &cfg);
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(routes.len(), 1, "only one route for t_acme/api");
+
+        // Host must be the same for both deployments.
+        let hosts: Vec<String> = routes[0]["match"][0]["host"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(hosts, vec!["t_acme-api.edgecloud.dev"]);
+
+        // Upstreams must include both dial addrs with correct weights.
+        let upstreams = &routes[0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        let upstreams_arr = upstreams.as_array().unwrap();
+        assert_eq!(upstreams_arr.len(), 2);
+
+        // Sort by dial for deterministic assertion.
+        let mut sorted = upstreams_arr.clone();
+        sorted.sort_by(|a, b| {
+            a["dial"]
+                .as_str()
+                .unwrap()
+                .cmp(&b["dial"].as_str().unwrap())
+        });
+        assert_eq!(sorted[0]["dial"], "1.2.3.4:8081");
+        assert_eq!(sorted[0]["weight"], 95);
+        assert_eq!(sorted[1]["dial"], "1.2.3.5:8082");
+        assert_eq!(sorted[1]["weight"], 5);
+    }
+
+    /// Single deployment omits the `weight` key so Caddy uses its default.
+    #[test]
+    fn single_deployment_omits_weight_key() {
+        let cfg = test_cfg();
+        let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
+        let cfg_json = render_routes(&entries, &cfg);
+        let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            [0]["handle"][0]["routes"][0]["handle"][0]["upstreams"];
+        assert_eq!(upstreams.as_array().unwrap().len(), 1);
+        let upstream = &upstreams[0];
+        assert_eq!(upstream["dial"], "1.2.3.4:8081");
+        // weight key must be absent (Caddy defaults to unweighted for single upstream)
+        assert!(
+            !upstream.as_object().unwrap().contains_key("weight"),
+            "single upstream should not have a weight key"
+        );
     }
 
     #[test]
