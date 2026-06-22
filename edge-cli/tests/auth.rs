@@ -98,7 +98,7 @@ async fn signup_writes_returned_key_to_config_file() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/api/tenants"))
+        .and(path("/api/v1/tenants"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "tenant_id": "t_abc123",
             "api_key": "k_returned_by_server",
@@ -167,7 +167,7 @@ async fn whoami_prints_tenant_info() {
     writeln!(f, "[default]\napi_key = \"k_seed\"\n").unwrap();
 
     Mock::given(method("GET"))
-        .and(path("/api/auth/whoami"))
+        .and(path("/api/v1/auth/whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "tenant_id": "t_xyz",
             "tenant_name": "Acme",
@@ -236,7 +236,7 @@ async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/api/auth/whoami"))
+        .and(path("/api/v1/auth/whoami"))
         .respond_with(ResponseTemplate::new(401).set_body_string("invalid key"))
         .mount(&server)
         .await;
@@ -271,7 +271,7 @@ async fn login_verifies_just_saved_key_not_env_var() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/api/auth/whoami"))
+        .and(path("/api/v1/auth/whoami"))
         .and(header("Authorization", "Bearer k_real"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "tenant_id": "t_xyz",
@@ -311,7 +311,7 @@ async fn signup_server_rejects_invalid_plan_does_not_write_key() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/api/tenants"))
+        .and(path("/api/v1/tenants"))
         .respond_with(ResponseTemplate::new(400).set_body_string("invalid plan"))
         .expect(1)
         .mount(&server)
@@ -363,7 +363,7 @@ async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
     // body contains the default role "developer" so a future refactor
     // that drops the `default_value` attribute would be caught.
     Mock::given(method("POST"))
-        .and(path("/api/keys"))
+        .and(path("/api/v1/keys"))
         .and(header("Authorization", "Bearer k_existing"))
         .and(body_string(r#"{"name":"ci-key","role":"developer"}"#))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -425,7 +425,7 @@ async fn keys_create_server_rejects_does_not_overwrite_key() {
     seed_api_key(&home, "k_existing");
 
     Mock::given(method("POST"))
-        .and(path("/api/keys"))
+        .and(path("/api/v1/keys"))
         .respond_with(ResponseTemplate::new(400).set_body_string("invalid role"))
         .mount(&server)
         .await;
@@ -492,7 +492,7 @@ target = "wasm32-wasip2"
     // requests and the test would time out on the `expect(1)` assertion
     // when checking received_requests.
     Mock::given(method("GET"))
-        .and(path("/api/status/d_xyz"))
+        .and(path("/api/v1/status/d_xyz"))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "d_xyz",
@@ -527,7 +527,7 @@ async fn signup_force_overwrites_saved_key_without_warning() {
     seed_api_key(&home, "k_old");
 
     Mock::given(method("POST"))
-        .and(path("/api/tenants"))
+        .and(path("/api/v1/tenants"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "tenant_id": "t_xyz",
             "api_key": "k_new",
@@ -567,7 +567,7 @@ async fn signup_warns_then_overwrites_when_saved_key_present() {
     seed_api_key(&home, "k_old");
 
     Mock::given(method("POST"))
-        .and(path("/api/tenants"))
+        .and(path("/api/v1/tenants"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "tenant_id": "t_xyz",
             "api_key": "k_new",

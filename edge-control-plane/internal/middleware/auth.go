@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -40,13 +41,13 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			http.Error(w, `{"error": "missing authorization header"}`, http.StatusUnauthorized)
+			httperror.UnauthorizedCtx(w, r, "missing authorization header")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-			http.Error(w, `{"error": "invalid authorization format"}`, http.StatusUnauthorized)
+			httperror.UnauthorizedCtx(w, r, "invalid authorization format")
 			return
 		}
 
@@ -55,7 +56,7 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 		// different value than "Bearer <key>" and reject a valid key.
 		rawKey := strings.TrimSpace(parts[1])
 		if rawKey == "" {
-			http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
+			httperror.UnauthorizedCtx(w, r, "invalid api key")
 			return
 		}
 
@@ -65,10 +66,10 @@ func (m *AuthMiddleware) Authenticate(next http.Handler) http.Handler {
 			// signal; any other error is an infrastructure failure and
 			// must surface as 500.
 			if errors.Is(err, service.ErrInvalidAPIKey) {
-				http.Error(w, `{"error": "invalid api key"}`, http.StatusUnauthorized)
+				httperror.UnauthorizedCtx(w, r, "invalid api key")
 				return
 			}
-			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			httperror.InternalErrorCtx(w, r)
 			return
 		}
 
@@ -85,7 +86,7 @@ func RequireRole(allowed ...string) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			role, ok := r.Context().Value(RoleKey).(string)
 			if !ok {
-				http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
+				httperror.UnauthorizedCtx(w, r, "unauthorized")
 				return
 			}
 
@@ -96,7 +97,7 @@ func RequireRole(allowed ...string) func(http.Handler) http.Handler {
 				}
 			}
 
-			http.Error(w, `{"error": "forbidden"}`, http.StatusForbidden)
+			httperror.ForbiddenCtx(w, r, "forbidden")
 		})
 	}
 }

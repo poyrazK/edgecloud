@@ -223,7 +223,7 @@ impl ApiClient {
     ) -> Result<DeployResponse> {
         use reqwest::blocking::multipart;
 
-        let mut url = format!("{}/api/deploy/{}", self.base_url, app_name);
+        let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         if !regions.is_empty() {
             // Use reqwest::Url to percent-encode the comma list so a
             // region with a stray `+` or non-ASCII char doesn't break
@@ -259,7 +259,7 @@ impl ApiClient {
 
     /// Get deployment status.
     pub fn status(&self, deployment_id: &str) -> Result<StatusResponse> {
-        let url = format!("{}/api/status/{}", self.base_url, deployment_id);
+        let url = format!("{}/api/v1/status/{}", self.base_url, deployment_id);
         let resp = self
             .http
             .get(&url)
@@ -278,7 +278,7 @@ impl ApiClient {
 
     /// List environment variables for an app.
     pub fn list_env(&self, app_name: &str) -> Result<Vec<EnvVar>> {
-        let url = format!("{}/api/apps/{}/env", self.base_url, app_name);
+        let url = format!("{}/api/v1/apps/{}/env", self.base_url, app_name);
         let resp = self
             .http
             .get(&url)
@@ -297,7 +297,7 @@ impl ApiClient {
 
     /// Set an environment variable.
     pub fn set_env(&self, app_name: &str, key: &str, value: &str) -> Result<()> {
-        let url = format!("{}/api/apps/{}/env", self.base_url, app_name);
+        let url = format!("{}/api/v1/apps/{}/env", self.base_url, app_name);
         #[derive(Serialize)]
         struct Payload<'a> {
             key: &'a str,
@@ -323,7 +323,7 @@ impl ApiClient {
     /// Activate a deployment.
     pub fn activate(&self, app_name: &str, deployment_id: &str) -> Result<()> {
         let url = format!(
-            "{}/api/apps/{}/activate/{}",
+            "{}/api/v1/apps/{}/activate/{}",
             self.base_url, app_name, deployment_id
         );
         let resp = self
@@ -343,7 +343,7 @@ impl ApiClient {
 
     /// List all deployments for an app.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        let url = format!("{}/api/list/{}", self.base_url, app_name);
+        let url = format!("{}/api/v1/list/{}", self.base_url, app_name);
         let resp = self
             .http
             .get(&url)
@@ -368,14 +368,14 @@ pub struct Tenants<'a> {
 }
 
 impl<'a> Tenants<'a> {
-    /// POST `/api/tenants` — self-signup. No `Authorization` header sent.
+    /// POST `/api/v1/tenants` — self-signup. No `Authorization` header sent.
     /// Returns the new tenant id and the raw API key (shown only once).
     ///
     /// `key_name` controls the human-readable label on the API key
     /// minted for the new tenant. The CLI defaults this to `"default"`
     /// (single-tenant model) but callers can override.
     pub fn create(&self, name: &str, plan: &str, key_name: &str) -> Result<TenantCreated> {
-        let url = format!("{}/api/tenants", self.client.base_url);
+        let url = format!("{}/api/v1/tenants", self.client.base_url);
         #[derive(Serialize)]
         struct Payload<'b> {
             name: &'b str,
@@ -407,12 +407,12 @@ pub struct Keys<'a> {
 }
 
 impl<'a> Keys<'a> {
-    /// POST `/api/keys` — create an additional API key for the caller's
+    /// POST `/api/v1/keys` — create an additional API key for the caller's
     /// tenant. The raw `token` in the response is shown only once and is
     /// NOT persisted to the local config by the CLI — the caller is
     /// responsible for storing it.
     pub fn create(&self, name: &str, role: &str) -> Result<CreateAPIKeyResponse> {
-        let url = format!("{}/api/keys", self.client.base_url);
+        let url = format!("{}/api/v1/keys", self.client.base_url);
         #[derive(Serialize)]
         struct Payload<'b> {
             name: &'b str,
@@ -443,7 +443,7 @@ pub struct Auth<'a> {
 }
 
 impl<'a> Auth<'a> {
-    /// GET `/api/auth/whoami` — returns the tenant + API key info
+    /// GET `/api/v1/auth/whoami` — returns the tenant + API key info
     /// associated with the caller's Bearer token.
     ///
     /// Returns `ApiError` so callers (e.g. `edge auth login`) can
@@ -451,7 +451,7 @@ impl<'a> Auth<'a> {
     /// react accordingly. Use `whoami_anyhow` for the simple
     /// `Result<WhoamiResponse>` shape.
     pub fn whoami(&self) -> Result<WhoamiResponse, ApiError> {
-        let url = format!("{}/api/auth/whoami", self.client.base_url);
+        let url = format!("{}/api/v1/auth/whoami", self.client.base_url);
         let resp = self
             .client
             .http
