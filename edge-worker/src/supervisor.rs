@@ -323,7 +323,7 @@ impl Supervisor {
         epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
         tenant_id: String,
-        allowlist: Vec<String>,
+        allowlist: Option<Vec<String>>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -442,12 +442,17 @@ impl Supervisor {
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
         tenant_id: &str,
-        allowlist: Vec<String>,
+        allowlist: Option<Vec<String>>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
-        // Build per-deployment egress policy from the tenant's allowlist.
-        let egress = Arc::new(EgressPolicy::new(allowlist));
+        // Build per-deployment egress policy.
+        // None = field absent or [] on the wire (old control plane) → allow-all.
+        // Some(list) = explicit allowlist → enforce it.
+        let egress = match allowlist {
+            None => Arc::new(EgressPolicy::allow_all()),
+            Some(list) => Arc::new(EgressPolicy::new(list)),
+        };
 
         // Create a fresh RuntimeState with per-app env vars, metering, and tenant-scoped
         // persistent stores (KV, cache, scheduling) so data never leaks across tenants.

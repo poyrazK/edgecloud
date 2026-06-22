@@ -103,6 +103,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -230,6 +231,8 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
+	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
+	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
