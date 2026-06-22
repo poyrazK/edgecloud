@@ -369,12 +369,12 @@ impl HttpClientHost for RuntimeState {
             tracestate,
         ));
 
-        // Count buffered response bytes immediately. Streaming response bytes
-        // (body_bytes == 0) are counted per-chunk in streams_impl::read_chunk.
-        if resp.body_bytes > 0 {
-            if let Some(ref meter) = self.http_server.meter {
-                meter.record_outbound_bytes(resp.body_bytes);
-            }
+        // Record buffered response bytes. Streaming responses set body_bytes=0
+        // here; their bytes are counted per-chunk in streams_impl::read_chunk
+        // via IncomingEntry::count_as_outbound. record_outbound_bytes(0) is a
+        // no-op so calling it unconditionally is safe and avoids ambiguity.
+        if let Some(ref meter) = self.http_server.meter {
+            meter.record_outbound_bytes(resp.body_bytes);
         }
 
         let body = match resp.body {

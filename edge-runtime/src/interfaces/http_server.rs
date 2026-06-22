@@ -1067,7 +1067,6 @@ impl HttpServer {
             res = timeout_at(deadline, ch_rx) => {
                 match res {
                     Ok(Ok(HttpResponse { status, headers, body })) => {
-                        let body_len = body.len() as u64;
                         match Self::write_response(
                             &mut write_half,
                             status,
@@ -1078,9 +1077,9 @@ impl HttpServer {
                         )
                         .await
                         {
-                            Ok(()) => {
+                            Ok(wire_bytes) => {
                                 if let Some(ref m) = meter {
-                                    m.record_outbound_bytes(body_len);
+                                    m.record_outbound_bytes(wire_bytes);
                                 }
                             }
                             Err(e) => {
@@ -1400,6 +1399,7 @@ impl HttpServer {
     }
 
     /// Write an HTTP/1.1 response back to the socket, with optional gzip compression.
+    /// Returns the number of body bytes actually written on the wire (post-compression).
     async fn write_response(
         stream: &mut SharedWriteHalf,
         status: u16,
@@ -1407,12 +1407,13 @@ impl HttpServer {
         body: &[u8],
         deadline: Instant,
         request_headers: &[(String, String)],
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<u64, std::io::Error> {
         let accept_gzip = request_headers
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Encoding") && v.contains("gzip"));
 
         let (body_to_send, is_compressed) = try_compress(body, accept_gzip);
+        let wire_bytes = body_to_send.len() as u64;
 
         let status_line = format!("HTTP/1.1 {} {}\r\n", status, Self::status_text(status));
         let mut response = status_line.into_bytes();
@@ -1428,7 +1429,7 @@ impl HttpServer {
 
         timeout_at(deadline, stream.write_all(&response)).await??;
         timeout_at(deadline, stream.flush()).await??;
-        Ok(())
+        Ok(wire_bytes)
     }
 
     fn status_text(status: u16) -> &'static str {
