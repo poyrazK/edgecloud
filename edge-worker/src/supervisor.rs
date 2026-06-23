@@ -555,6 +555,13 @@ impl Supervisor {
         for (app_name, status) in &heartbeat.apps {
             if let Some(inst) = state.apps.get(app_name) {
                 let inst = inst.lock().await;
+                // Guard on deployment_id: if the app was stopped and a new
+                // deployment with the same name started between build_heartbeat
+                // and here, the new instance's meter must not be subtracted for
+                // the old deployment's counts — fetch_sub would wrap to u64::MAX.
+                if inst.deployment_id != status.deployment_id {
+                    continue;
+                }
                 inst.meter
                     .subtract_delta(status.request_count, status.outbound_bytes);
             }

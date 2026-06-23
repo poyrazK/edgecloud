@@ -1202,6 +1202,10 @@ impl HttpServer {
         // instead of pinning a connection task indefinitely. The
         // `biased;` modifier matches the rest of this file and prefers
         // making progress on chunks before checking the timer.
+        // Include the header block already written above so the wire-byte total
+        // is consistent with write_response (which returns response.len() after
+        // full assembly including status line + headers + body).
+        let header_bytes = response.len() as u64;
         let mut body_bytes: u64 = 0;
         loop {
             let chunk_fut = adapter.next();
@@ -1222,7 +1226,7 @@ impl HttpServer {
             }
         }
         timeout_at(deadline, stream.flush()).await??;
-        Ok(body_bytes)
+        Ok(header_bytes + body_bytes)
     }
 
     /// Read and parse the HTTP headers only — the body is consumed by

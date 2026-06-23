@@ -179,7 +179,10 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 	// max_outbound_mb quota. Old workers omit outbound_bytes (defaults to 0),
 	// which we treat as "no data" — we log but do not act on a 0-byte total
 	// so a single old worker cannot cause a false quota violation.
-	s.checkOutboundQuota(ctx, hb.Apps)
+	// Dispatched in a separate goroutine so DB round-trips in quota enforcement
+	// do not block the NATS heartbeat drain goroutine (which has a fixed 100-msg
+	// buffer and will drop overflow messages if the drain stalls).
+	go s.checkOutboundQuota(ctx, hb.Apps)
 }
 
 // checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
