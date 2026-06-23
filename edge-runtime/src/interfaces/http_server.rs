@@ -1137,6 +1137,7 @@ impl HttpServer {
     /// - Hop-by-hop / host-reserved headers (RFC 7230 §6.1) are stripped
     ///   from the guest's set before writing, to avoid response splitting
     ///   and spoofing.
+    ///
     /// Returns the number of body bytes written on success.
     async fn write_streaming_response(
         stream: &mut SharedWriteHalf,
