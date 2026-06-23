@@ -389,7 +389,13 @@ impl HttpClientHost for RuntimeState {
                     self.incoming_streams
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(rep, IncomingEntry { stream, count_as_outbound: true });
+                        .insert(
+                            rep,
+                            IncomingEntry {
+                                stream,
+                                count_as_outbound: true,
+                            },
+                        );
                     let handle = wasmtime::component::Resource::<
                         crate::edge::cloud::streams::Incoming,
                     >::new_own(rep);
@@ -601,7 +607,13 @@ impl HttpServerHost for RuntimeState {
                         self.incoming_streams
                             .lock()
                             .unwrap()
-                            .insert(rep, IncomingEntry { stream, count_as_outbound: false });
+                            .insert(
+                            rep,
+                            IncomingEntry {
+                                stream,
+                                count_as_outbound: false,
+                            },
+                        );
                         let handle = wasmtime::component::Resource::<
                             crate::edge::cloud::streams::Incoming,
                         >::new_own(rep);
