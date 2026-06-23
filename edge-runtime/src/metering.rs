@@ -59,7 +59,8 @@ impl RequestMeter {
     /// the snapshot was taken — those will appear in the next heartbeat interval.
     pub fn subtract_delta(&self, count_delta: u64, bytes_delta: u64) {
         self.count.fetch_sub(count_delta, Ordering::Relaxed);
-        self.outbound_bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
+        self.outbound_bytes
+            .fetch_sub(bytes_delta, Ordering::Relaxed);
     }
 
     /// Get a snapshot of the meter state for reporting.

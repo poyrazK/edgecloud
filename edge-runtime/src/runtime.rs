@@ -604,10 +604,7 @@ impl HttpServerHost for RuntimeState {
                         let rep = self
                             .next_stream_rep
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.incoming_streams
-                            .lock()
-                            .unwrap()
-                            .insert(
+                        self.incoming_streams.lock().unwrap().insert(
                             rep,
                             IncomingEntry {
                                 stream,

@@ -154,7 +154,10 @@ async fn read_remaining(stream: &mut edge_runtime::streams::IncomingStream) -> V
 #[test]
 fn test_incoming_entry_construction() {
     let (producer, stream) = streams::incoming_pair(streams::DEFAULT_STREAM_CAPACITY);
-    let _entry = IncomingEntry { stream, count_as_outbound: false };
+    let _entry = IncomingEntry {
+        stream,
+        count_as_outbound: false,
+    };
     drop(producer); // drops sender; consumer would observe Closed
 }
 
