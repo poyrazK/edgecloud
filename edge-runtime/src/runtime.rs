@@ -100,19 +100,31 @@ impl RuntimeState {
         }
     }
 
-    /// Create a RuntimeState with per-app environment variables for tenant isolation.
+    /// Create a RuntimeState with per-app environment variables, log sink,
+    /// and app context for tenant isolation. `log_sink` receives every record
+    /// emitted by `edge:observe.emit_log`; `app_ctx` is stamped onto each
+    /// forwarded record so downstream sinks know the tenant/app/deployment.
+    /// Tenant isolation derives from `app_ctx.tenant_id`. `egress` is the
+    /// per-tenant outbound allowlist enforced by `edge:http-client.fetch`
+    /// (see `EgressPolicy`).
     pub fn with_env(
         env: std::collections::HashMap<String, String>,
-        tenant_id: String,
+        log_sink: Arc<dyn observe::LogSink>,
+        app_ctx: observe::AppLogContext,
         egress: Arc<EgressPolicy>,
     ) -> Self {
+        let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::new(),
+            observe: observe::Observer::from_config(
+                observe::ObserveConfig::new()
+                    .with_log_sink(log_sink)
+                    .with_app_ctx(app_ctx),
+            ),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
@@ -130,20 +142,29 @@ impl RuntimeState {
         }
     }
 
-    /// Create a RuntimeState with per-app env vars and a request meter.
+    /// Create a RuntimeState with per-app env vars, request meter, log sink,
+    /// and app context. The worker's per-app `execute_app` path uses this.
+    /// Tenant isolation is derived from `app_ctx.tenant_id` so the call site
+    /// doesn't have to thread `tenant_id` as a separate parameter.
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
-        tenant_id: String,
+        log_sink: Arc<dyn observe::LogSink>,
+        app_ctx: observe::AppLogContext,
         egress: Arc<EgressPolicy>,
     ) -> Self {
+        let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::new(),
+            observe: observe::Observer::from_config(
+                observe::ObserveConfig::new()
+                    .with_log_sink(log_sink)
+                    .with_app_ctx(app_ctx),
+            ),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
@@ -825,10 +846,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn egress_check_returns_403_in_fetch() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),
@@ -859,10 +882,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn egress_check_denies_non_allowlisted_host() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),
@@ -885,10 +910,12 @@ mod egress_http_tests {
 
     #[tokio::test]
     async fn hard_deny_loopback_returns_403_even_with_star_allowlist() {
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec!["*".to_string()]));
         let env = std::collections::HashMap::new();
+        let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
         let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
 
         let req = Request {
             method: "GET".into(),
@@ -916,9 +943,21 @@ mod egress_http_tests {
     #[test]
     fn resolve_blocked_when_empty_allowlist() {
         use crate::edge::cloud::networking::Host as NetworkingHost;
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let env = std::collections::HashMap::new();
-        let mut rs = RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+        let app_ctx = AppLogContext {
+            app_name: "test".to_string(),
+            tenant_id: "t_test".to_string(),
+            deployment_id: "test".to_string(),
+        };
+        let mut rs = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
+            app_ctx,
+            egress,
+        );
         let ips = NetworkingHost::resolve(&mut rs, "example.com".to_string());
         assert!(
             ips.is_empty(),
@@ -929,9 +968,21 @@ mod egress_http_tests {
     #[test]
     fn resolve_blocked_for_disallowed_host() {
         use crate::edge::cloud::networking::Host as NetworkingHost;
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
         let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
         let env = std::collections::HashMap::new();
-        let mut rs = RuntimeState::with_env_and_meter(env, None, "t_test".to_string(), egress);
+        let app_ctx = AppLogContext {
+            app_name: "test".to_string(),
+            tenant_id: "t_test".to_string(),
+            deployment_id: "test".to_string(),
+        };
+        let mut rs = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
+            app_ctx,
+            egress,
+        );
         let ips = NetworkingHost::resolve(&mut rs, "evil.com".to_string());
         assert!(
             ips.is_empty(),

@@ -13,6 +13,7 @@ use wasmtime::component::InstancePre;
 
 use crate::config::Config;
 use crate::downloader::Downloader;
+use crate::log_forwarder::LogForwarder;
 use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
@@ -25,6 +26,10 @@ pub struct Supervisor {
     pub downloader: Arc<Downloader>,
     pub port_pool: Arc<Mutex<PortPool>>,
     pub nats: Arc<dyn NatsClient>,
+    /// Per-worker log shipper. Shared across all apps — the per-app
+    /// `AppLogContext` travels with each `emit_log` call so the forwarder
+    /// knows which tenant/app/deployment the record belongs to.
+    pub log_forwarder: Arc<LogForwarder>,
 }
 
 impl Supervisor {
@@ -217,7 +222,6 @@ impl Supervisor {
 
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
-        let tenant_id_str = tenant_id.to_string();
         let meter_clone = meter.clone();
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
@@ -232,6 +236,16 @@ impl Supervisor {
         let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
         let allowlist = spec.allowlist.clone();
+        let log_forwarder = self.log_forwarder.clone();
+        // Own tenant_id before the spawn — `start_app` borrows it as &str, but
+        // the tokio::spawn future must be 'static, so we move an owned String
+        // into the closure. The PR-side signature change already adds
+        // tenant_id to run_app_loop; this binding satisfies the borrow
+        // checker without changing the public surface. The original is moved
+        // into the closure; tenant_id_for_instance is the second copy used by
+        // the AppInstance registration below.
+        let tenant_id = tenant_id.to_string();
+        let tenant_id_for_instance = tenant_id.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -248,8 +262,9 @@ impl Supervisor {
                 max_memory_mb,
                 epoch_deadline_ticks,
                 health_check_timeout_secs,
-                tenant_id_str,
+                tenant_id,
                 allowlist,
+                log_forwarder,
             )
             .await;
             tracing::info!(app_name = %app_name_str, "app task exited");
@@ -259,7 +274,7 @@ impl Supervisor {
         let instance = Arc::new(std::sync::Mutex::new(AppInstance {
             deployment_id: spec.deployment_id.clone(),
             app_name: app_name.to_string(),
-            tenant_id: tenant_id.to_string(),
+            tenant_id: tenant_id_for_instance,
             port: raw_port,
             status: AppInstanceStatus::Running,
             meter,
@@ -373,6 +388,7 @@ impl Supervisor {
         health_check_timeout_secs: u64,
         tenant_id: String,
         allowlist: Option<Vec<String>>,
+        log_forwarder: Arc<LogForwarder>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -405,6 +421,8 @@ impl Supervisor {
                         epoch_deadline_ticks,
                         &tenant_id,
                         allowlist.clone(),
+                        &app_name,
+                        &log_forwarder,
                     ),
                 ) => {
                     match result {
@@ -484,6 +502,7 @@ impl Supervisor {
     /// Returns `Ok(true)` if the component wants to keep running (blocking call
     /// returned normally). Returns `Ok(false)` if the guest explicitly called
     /// `process.exit`. Returns `Err` on a wasm trap/error.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_app(
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
@@ -492,6 +511,8 @@ impl Supervisor {
         epoch_deadline_ticks: u64,
         tenant_id: &str,
         allowlist: Option<Vec<String>>,
+        app_name: &str,
+        log_forwarder: &Arc<LogForwarder>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -503,12 +524,25 @@ impl Supervisor {
             Some(list) => Arc::new(EgressPolicy::new(list)),
         };
 
-        // Create a fresh RuntimeState with per-app env vars, metering, and tenant-scoped
-        // persistent stores (KV, cache, scheduling) so data never leaks across tenants.
+        // Build per-app LogContext — stamped onto every record this app emits
+        // so the LogForwarder knows which tenant/app/deployment to attribute
+        // the record to (worker_id/region are added inside the forwarder).
+        // tenant_id is taken from the execute_app parameter (which matches
+        // meter.tenant_id — they are both derived from the task message's
+        // tenant_id in start_app) so the parameter is meaningfully used.
+        let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
+            app_name: app_name.to_string(),
+            tenant_id: tenant_id.to_string(),
+            deployment_id: meter.deployment_id.clone(),
+        };
+
+        // Create a fresh RuntimeState with per-app env vars, metering, log
+        // sink, app context, and tenant_id for tenant isolation.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
-            tenant_id.to_string(),
+            log_forwarder.clone(),
+            app_ctx,
             egress,
         );
 
