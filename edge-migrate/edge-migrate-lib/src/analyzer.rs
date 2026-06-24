@@ -227,7 +227,7 @@ impl CAnalyzer {
                                 ) {
                                     let found = found
                                         .min(m.original_start_byte + SEARCH_BUDGET)
-                                        .min(source.len().saturating_sub(1));
+                                        .min(source.len());
                                     let len = m.end_byte.saturating_sub(m.start_byte);
                                     m.original_start_byte = found;
                                     m.original_end_byte =
@@ -261,39 +261,76 @@ impl CAnalyzer {
                         }
                         // Sparse-coverage refinement for the
                         // declaration: search forward for the
-                        // `int <name> = <head>` pattern (e.g. `int
-                        // fd = socket`) which uniquely identifies
-                        // the declaration line in the original
-                        // source. The byte_map hint lands at byte 0
-                        // for all user code lines; this search
-                        // refines to the actual declaration.
-                        // Including the `int ` prefix matches the
-                        // `SocketDeclContext::Simple` case (the
-                        // supported transform case). Other cases
-                        // (`static`, `auto`, etc.) are routed to
-                        // `Unsupported` upstream and never reach
-                        // this path.
+                        // `<name> = ` pattern (e.g. `fd = `) which
+                        // uniquely identifies the assignment in the
+                        // original source. The byte_map hint lands
+                        // at byte 0 for all user code lines; this
+                        // search refines to the actual declaration.
+                        // The walk-back from `<name>` to the
+                        // declaration start (`find_decl_start`)
+                        // handles any C type prefix (`int`, `long`,
+                        // `uint32_t`, `static int`, etc.) without
+                        // coupling the needle to a specific type.
+                        // The walk-forward to the statement-ending
+                        // `;` (`find_stmt_end`) gives the original's
+                        // full declaration length so we don't
+                        // borrow the expanded source's longer
+                        // length (which would over-slice into the
+                        // next statement for macro-expanded calls).
+                        //
+                        // Search uses `<name> = ` rather than
+                        // `<name> = <head>` because `<head>` comes
+                        // from `m.snippet` — the EXPANDED source's
+                        // function name. For the macro case
+                        // (`#define socket(...) make_socket(...)`),
+                        // the expanded snippet is `make_socket(...)`
+                        // and the original has `socket(...)` (the
+                        // macro invocation), so `<name> = <head>`
+                        // would not match. The `<name> = ` anchor
+                        // is stable across the expansion.
                         if bv.original_decl_start_byte <= source.len() {
-                            let head = snippet_head_token(&m.snippet).unwrap_or("");
-                            let needle = format!("int {} = {}", bv.name, head);
-                            if !head.is_empty()
-                                && !source[bv.original_decl_start_byte..]
-                                    .starts_with(needle.as_str())
+                            // The previous version searched for
+                            // `int <name> = <head>` where `<head>` came
+                            // from `m.snippet` — the EXPANDED source's
+                            // function name. For the macro case
+                            // (`#define socket(...) make_socket(...)`),
+                            // the expanded snippet is `make_socket(...)`
+                            // and the original source has `socket(...)`
+                            // (the macro invocation), so the needle
+                            // `int fd = make_socket` does not exist in
+                            // the original and the refinement silently
+                            // does nothing.
+                            //
+                            // The robust fix searches for the
+                            // assignment signature using the ORIGINAL
+                            // source's identifier pattern (`<name> = `).
+                            // That anchor is always present, and the
+                            // walk-back to the declaration start handles
+                            // any C type prefix (`int`, `long`,
+                            // `uint32_t`, `static int`, etc.) without
+                            // coupling the needle to a specific type.
+                            // The walk-forward to the statement-ending
+                            // `;` gives us the original's full
+                            // declaration length, so we don't borrow
+                            // the expanded source's longer length (which
+                            // would over-slice into the next statement
+                            // for macro-expanded calls).
+                            let needle = format!("{} = ", bv.name);
+                            if !source[bv.original_decl_start_byte..]
+                                .starts_with(needle.as_str())
                             {
-                                if let Some(found) = find_snippet_in_source(
+                                if let Some(name_pos) = find_snippet_in_source(
                                     source,
                                     &needle,
                                     bv.original_decl_start_byte.min(source.len()),
                                 ) {
-                                    let found = found
+                                    let name_pos = name_pos
                                         .min(bv.original_decl_start_byte + SEARCH_BUDGET)
-                                        .min(source.len().saturating_sub(1));
-                                    let len = bv
-                                        .decl_end_byte
-                                        .saturating_sub(bv.decl_start_byte);
-                                    bv.original_decl_start_byte = found;
-                                    bv.original_decl_end_byte =
-                                        (found + len).min(source.len());
+                                        .min(source.len());
+                                    let decl_start = find_decl_start(source, name_pos);
+                                    let decl_end = find_stmt_end(source, decl_start);
+                                    bv.original_decl_start_byte = decl_start;
+                                    bv.original_decl_end_byte = decl_end;
                                 }
                             }
                         }
@@ -516,6 +553,64 @@ fn find_snippet_in_source(source: &str, needle: &str, from_byte: usize) -> Optio
         return None;
     }
     source[from_byte..].find(needle).map(|i| from_byte + i)
+}
+
+/// Walk back from `name_pos` (which must point at the start of a
+/// declared variable name) to find the start of the surrounding C
+/// declaration — the first non-whitespace character on the same
+/// line, with the line being the line containing the variable or
+/// any later line. The declaration starts at the beginning of the
+/// line (after leading whitespace) or after a `;`, `{`, or `}`.
+///
+/// Used by the bound_var refinement to compute the slice start for
+/// the original source when the byte_map's remap is unreliable.
+/// Tree-sitter's `decl.start_byte()` would be ideal but its value
+/// is in expanded-source coordinates; this helper operates purely
+/// on the original text.
+fn find_decl_start(source: &str, name_pos: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = name_pos;
+    while pos > 0 {
+        let prev = bytes[pos - 1];
+        if prev == b'\n' || prev == b';' || prev == b'{' || prev == b'}' {
+            // Found the boundary — skip leading whitespace on the
+            // current line so the slice starts at the first
+            // non-whitespace character of the declaration (the
+            // type token: `int`, `long`, `static int`, etc.).
+            let mut start = pos;
+            while start < bytes.len()
+                && (bytes[start] == b' ' || bytes[start] == b'\t')
+            {
+                start += 1;
+            }
+            return start;
+        }
+        pos -= 1;
+    }
+    // At the start of the file. Skip leading whitespace so the slice
+    // starts at the first non-whitespace character.
+    let mut start = 0;
+    while start < bytes.len()
+        && (bytes[start] == b' ' || bytes[start] == b'\t')
+    {
+        start += 1;
+    }
+    start
+}
+
+/// Find the byte offset just past the `;` that ends the C statement
+/// starting at `decl_start`. Bounded to 2 KiB so pathological inputs
+/// can't run the search unbounded. Returns `decl_start` if no `;`
+/// is found (caller can fall back to manual_review).
+fn find_stmt_end(source: &str, decl_start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let limit = (decl_start + 2048).min(bytes.len());
+    for (i, &b) in bytes[decl_start..limit].iter().enumerate() {
+        if b == b';' {
+            return decl_start + i + 1; // exclusive end (just past `;`)
+        }
+    }
+    decl_start
 }
 
 /// Result of inspecting the parent context of a `socket(...)`
