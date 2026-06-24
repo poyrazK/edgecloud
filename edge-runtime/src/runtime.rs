@@ -106,25 +106,30 @@ impl RuntimeState {
     /// forwarded record so downstream sinks know the tenant/app/deployment.
     /// Tenant isolation derives from `app_ctx.tenant_id`. `egress` is the
     /// per-tenant outbound allowlist enforced by `edge:http-client.fetch`
-    /// (see `EgressPolicy`).
+    /// (see `EgressPolicy`). `metrics_acc` is a shared accumulator the
+    /// supervisor holds to snapshot metrics at heartbeat time; pass `None`
+    /// for tests or callers that don't export metrics.
     pub fn with_env(
         env: std::collections::HashMap<String, String>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
         egress: Arc<EgressPolicy>,
+        metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
+        let mut obs_cfg = observe::ObserveConfig::new()
+            .with_log_sink(log_sink)
+            .with_app_ctx(app_ctx);
+        if let Some(acc) = metrics_acc {
+            obs_cfg = obs_cfg.with_metrics_accumulator(acc);
+        }
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::from_config(
-                observe::ObserveConfig::new()
-                    .with_log_sink(log_sink)
-                    .with_app_ctx(app_ctx),
-            ),
+            observe: observe::Observer::from_config(obs_cfg),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
@@ -146,25 +151,30 @@ impl RuntimeState {
     /// and app context. The worker's per-app `execute_app` path uses this.
     /// Tenant isolation is derived from `app_ctx.tenant_id` so the call site
     /// doesn't have to thread `tenant_id` as a separate parameter.
+    /// `metrics_acc` is a shared accumulator the supervisor holds to snapshot
+    /// metrics at heartbeat time; pass `None` for tests.
     pub fn with_env_and_meter(
         env: std::collections::HashMap<String, String>,
         meter: Option<Arc<RequestMeter>>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
         egress: Arc<EgressPolicy>,
+        metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
         let exit_code = Arc::new(AtomicU32::new(0));
         let networking = networking::NetworkingState::new();
+        let mut obs_cfg = observe::ObserveConfig::new()
+            .with_log_sink(log_sink)
+            .with_app_ctx(app_ctx);
+        if let Some(acc) = metrics_acc {
+            obs_cfg = obs_cfg.with_metrics_accumulator(acc);
+        }
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
             cache: Self::make_cache_for_tenant(&tenant_id),
-            observe: observe::Observer::from_config(
-                observe::ObserveConfig::new()
-                    .with_log_sink(log_sink)
-                    .with_app_ctx(app_ctx),
-            ),
+            observe: observe::Observer::from_config(obs_cfg),
             time: time::Clock::new(),
             scheduling: Self::make_scheduler_for_tenant(&tenant_id),
             process: process::Process::with_env_and_exit_code(Arc::new(env), exit_code.clone()),
@@ -850,8 +860,14 @@ mod egress_http_tests {
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let env = std::collections::HashMap::new();
         let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
-        let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
+        let mut runtime_state = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            log_sink,
+            AppLogContext::empty(),
+            egress,
+            None,
+        );
 
         let req = Request {
             method: "GET".into(),
@@ -886,8 +902,14 @@ mod egress_http_tests {
         let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
         let env = std::collections::HashMap::new();
         let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
-        let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
+        let mut runtime_state = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            log_sink,
+            AppLogContext::empty(),
+            egress,
+            None,
+        );
 
         let req = Request {
             method: "GET".into(),
@@ -914,8 +936,14 @@ mod egress_http_tests {
         let egress = Arc::new(EgressPolicy::new(vec!["*".to_string()]));
         let env = std::collections::HashMap::new();
         let log_sink: Arc<dyn crate::interfaces::observe::LogSink> = Arc::new(NoopLogSink);
-        let mut runtime_state =
-            RuntimeState::with_env_and_meter(env, None, log_sink, AppLogContext::empty(), egress);
+        let mut runtime_state = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            log_sink,
+            AppLogContext::empty(),
+            egress,
+            None,
+        );
 
         let req = Request {
             method: "GET".into(),
@@ -957,6 +985,7 @@ mod egress_http_tests {
             Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
             app_ctx,
             egress,
+            None,
         );
         let ips = NetworkingHost::resolve(&mut rs, "example.com".to_string());
         assert!(
@@ -982,6 +1011,7 @@ mod egress_http_tests {
             Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
             app_ctx,
             egress,
+            None,
         );
         let ips = NetworkingHost::resolve(&mut rs, "evil.com".to_string());
         assert!(
