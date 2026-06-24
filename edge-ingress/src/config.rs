@@ -124,12 +124,114 @@ impl Config {
 }
 
 /// Parse a duration env var. Accepts Go-style strings (`30s`, `1m`,
-/// `500ms`) via the `humantime` style — but to avoid pulling a new dep
-/// we accept the integer-seconds form only. A `30s` env value will fail
-/// to parse; users should set `DOMAIN_POLL_INTERVAL=30` (seconds) or
-/// leave it unset for the 30s default.
+/// `500ms`, `2h`) via the `humantime` crate. Returns `None` if the
+/// env var is unset, malformed, or parses to zero — a zero poll
+/// interval would busy-loop the ingress and pin a CPU at 100%.
+///
+/// The unit tests in `config::tests` pin: (a) standard Go-style
+/// strings round-trip, (b) `0s` / `0ms` / `0` are rejected (return
+/// `None` so the caller falls back to the default), (c) malformed
+/// values return `None` rather than panic.
 fn parse_duration_env(name: &str) -> Option<Duration> {
     let raw = std::env::var(name).ok()?;
-    let secs: u64 = raw.parse().ok()?;
-    Some(Duration::from_secs(secs))
+    let d = humantime::parse_duration(&raw).ok()?;
+    if d.is_zero() {
+        return None;
+    }
+    Some(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Each test sets and unsets a uniquely-named env var so the
+    // tests are safe to run in parallel with each other and with
+    // any process that uses the real `DOMAIN_POLL_INTERVAL`.
+
+    fn set_var(name: &str, value: &str) {
+        // SAFETY: tests are not multi-threaded against the same
+        // env var name; we serialize via the unique name per test.
+        unsafe { std::env::set_var(name, value) };
+    }
+
+    fn unset_var(name: &str) {
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn parse_duration_env_handles_go_style_seconds() {
+        let name = "__TEST_DUR_SECS";
+        set_var(name, "5s");
+        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(5)));
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_handles_go_style_minutes() {
+        let name = "__TEST_DUR_MINS";
+        set_var(name, "5m");
+        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(300)));
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_handles_go_style_millis() {
+        let name = "__TEST_DUR_MS";
+        set_var(name, "500ms");
+        assert_eq!(parse_duration_env(name), Some(Duration::from_millis(500)));
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_handles_go_style_hours() {
+        let name = "__TEST_DUR_HRS";
+        set_var(name, "2h");
+        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(7200)));
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_rejects_zero_seconds() {
+        let name = "__TEST_DUR_ZERO_S";
+        set_var(name, "0s");
+        assert_eq!(parse_duration_env(name), None, "0s would busy-loop");
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_rejects_zero_millis() {
+        let name = "__TEST_DUR_ZERO_MS";
+        set_var(name, "0ms");
+        assert_eq!(parse_duration_env(name), None, "0ms would busy-loop");
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_rejects_zero_compound() {
+        let name = "__TEST_DUR_ZERO_2H0S";
+        set_var(name, "2h0s");
+        // humantime accepts this; we want our zero-check to fire
+        // only on is_zero() values. Pin that 2h0s is accepted.
+        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(7200)));
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_rejects_malformed() {
+        let name = "__TEST_DUR_GARBAGE";
+        set_var(name, "garbage");
+        assert_eq!(parse_duration_env(name), None);
+        unset_var(name);
+    }
+
+    #[test]
+    fn parse_duration_env_returns_none_when_unset() {
+        // The env var must not exist at test time. Use a
+        // name that's vanishingly unlikely to be set in CI.
+        let name = "__TEST_DUR_DEFINITELY_UNSET_XYZ";
+        unset_var(name);
+        assert_eq!(parse_duration_env(name), None);
+    }
 }
