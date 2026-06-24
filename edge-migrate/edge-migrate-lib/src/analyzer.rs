@@ -1027,6 +1027,33 @@ int main(void) {
                     bv.original_decl_start_byte,
                     bv.original_decl_end_byte
                 );
+                // Stronger assertion (review finding #2): the
+                // remapped decl range must slice to the FULL
+                // original declaration, not a fragment. The
+                // preprocessor's sparse-linemarker behavior makes
+                // the byte_map's linear-interp remap land at
+                // byte 0 for all user code lines; the
+                // `<name> = ` search + walk-back/forward must
+                // refine to the type prefix and statement end.
+                let decl_slice =
+                    &source_bytes[bv.original_decl_start_byte..bv.original_decl_end_byte];
+                let decl_str = std::str::from_utf8(decl_slice)
+                    .expect("decl slice is valid UTF-8");
+                assert!(
+                    decl_str.starts_with("int fd = "),
+                    "remapped decl range should start at the type prefix `int fd = `; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.contains("socket("),
+                    "remapped decl range should contain the `socket(` call site; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.trim_end().ends_with(';'),
+                    "remapped decl range should end at the statement-terminating `;`; got: {:?}",
+                    decl_str
+                );
             }
         }
     }

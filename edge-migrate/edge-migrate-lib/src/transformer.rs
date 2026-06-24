@@ -1180,8 +1180,62 @@ int main() {
             .join("testdata")
             .join("macro_socket.c");
         let source = std::fs::read_to_string(&fixture_path).expect("read fixture");
+        let source_bytes = source.as_bytes();
         let mut analyzer = CAnalyzer::with_preprocessor(pp);
         let (matches, _pp_info) = analyzer.analyze_with_preprocessor_info(&source);
+        // Stronger bound_var assertion (only fires when a SocketTcp
+        // match is actually detected — the fixture's macro expands
+        // `socket` to `make_socket`, which is a non-POSIX function
+        // name, so the analyzer usually doesn't classify it as
+        // SocketTcp; in that case the bound_var refinement is
+        // dormant and this assertion is skipped).
+        //
+        // The previous version of the bound_var refinement searched
+        // for `int <name> = <head>` where `<head>` came from
+        // `m.snippet` (the EXPANDED source's function name). For
+        // the macro case that needle would be `int fd = make_socket`
+        // and would not exist in the original `int fd = socket(...)`
+        // — the refinement silently did nothing, the byte_map's
+        // byte-0 hint leaked through, and the transformer sliced
+        // the wrong region. The post-fix refinement searches for
+        // `<name> = ` and walks back/forward to find the full
+        // declaration in the original source.
+        if let Some(socket_match) = matches.iter().find(|m| {
+            matches!(
+                m.pattern,
+                crate::patterns::PatternKind::Posix(crate::patterns::PosixPattern::SocketTcp)
+            )
+        }) {
+            if let Some(bv) = socket_match.bound_var.as_ref() {
+                let decl_slice =
+                    &source_bytes[bv.original_decl_start_byte..bv.original_decl_end_byte];
+                let decl_str = std::str::from_utf8(decl_slice)
+                    .expect("decl slice is valid UTF-8");
+                // The slice must start at the type prefix (no leading
+                // whitespace, no `;` from a previous statement) and
+                // end at the statement-terminating `;`.
+                assert!(
+                    decl_str.starts_with("int fd = "),
+                    "remapped decl range should start at the type prefix; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.contains("socket("),
+                    "remapped decl range should contain the ORIGINAL `socket(` call, not the expanded `make_socket`; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    !decl_str.contains("make_socket"),
+                    "remapped decl range leaked the EXPANDED `make_socket` name; got: {:?}",
+                    decl_str
+                );
+                assert!(
+                    decl_str.trim_end().ends_with(';'),
+                    "remapped decl range should end at the statement-terminating `;`; got: {:?}",
+                    decl_str
+                );
+            }
+        }
         // The transformer must NOT panic on the remapped byte
         // ranges. Pre-fix this panicked at
         // `output.extend_from_slice(&source_bytes[prev_end..orig_start])`
