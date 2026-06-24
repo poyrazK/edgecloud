@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use edge_runtime::linker::create_component_linker;
-use edge_runtime::{EgressPolicy, RequestMeter};
+use edge_runtime::{EgressPolicy, MetricsAccumulator, RequestMeter};
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
@@ -14,7 +14,9 @@ use wasmtime::component::InstancePre;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
-use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
+use crate::messages::{
+    AppSpec, AppStatus, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
+};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -174,9 +176,16 @@ impl Supervisor {
             spec.deployment_id.clone(),
         ));
 
+        // Create shared metrics accumulator. The supervisor holds this Arc and
+        // snapshots it at heartbeat time; the RuntimeState Observer inside the
+        // Wasmtime Store holds another Arc clone and writes to it on every
+        // edge:observe call — same pattern as RequestMeter.
+        let metrics_acc = Arc::new(MetricsAccumulator::new());
+
         let instance_pre_clone = instance_pre.clone();
         let app_name_str = app_name.to_string();
         let meter_clone = meter.clone();
+        let metrics_acc_clone = metrics_acc.clone();
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
         let state_clone = self.state.clone();
@@ -213,6 +222,7 @@ impl Supervisor {
             Self::run_app_loop(
                 instance_pre_clone,
                 meter_clone,
+                metrics_acc_clone,
                 env,
                 state_clone,
                 app_name_str.clone(),
@@ -237,6 +247,7 @@ impl Supervisor {
             port: raw_port,
             status: AppInstanceStatus::Running,
             meter,
+            metrics: metrics_acc,
             shutdown_tx: Some(shutdown_tx),
             instance_pre,
             handle: Some(std::sync::Arc::new(handle)),
@@ -337,6 +348,7 @@ impl Supervisor {
     async fn run_app_loop(
         instance_pre: InstancePre<edge_runtime::RuntimeState>,
         meter: Arc<RequestMeter>,
+        metrics_acc: Arc<MetricsAccumulator>,
         env: HashMap<String, String>,
         state: Arc<RwLock<WorkerState>>,
         app_name: String,
@@ -382,6 +394,7 @@ impl Supervisor {
                     Self::execute_app(
                         &instance_pre,
                         &meter,
+                        &metrics_acc,
                         env.clone(),
                         max_memory_mb,
                         epoch_deadline_ticks,
@@ -523,6 +536,7 @@ impl Supervisor {
     async fn execute_app(
         instance_pre: &InstancePre<edge_runtime::RuntimeState>,
         meter: &Arc<RequestMeter>,
+        metrics_acc: &Arc<MetricsAccumulator>,
         env: HashMap<String, String>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
@@ -554,13 +568,16 @@ impl Supervisor {
         };
 
         // Create a fresh RuntimeState with per-app env vars, metering, log
-        // sink, app context, and tenant_id for tenant isolation.
+        // sink, app context, tenant_id for tenant isolation, and the shared
+        // metrics accumulator so edge:observe calls are visible to the
+        // supervisor's heartbeat snapshot.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
             log_forwarder.clone(),
             app_ctx,
             egress,
+            Some(Arc::clone(metrics_acc)),
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
@@ -629,6 +646,37 @@ impl Supervisor {
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
             let snap = inst.meter.snapshot();
+            let metrics_snap = inst.metrics.snapshot();
+
+            // Convert MetricsSnapshot into the wire-format Vec<MetricSample>.
+            let mut observer_metrics: Vec<MetricSample> = Vec::new();
+            for (name, (count, labels)) in &metrics_snap.counters {
+                observer_metrics.push(MetricSample {
+                    name: name.clone(),
+                    kind: MetricKind::Counter,
+                    value: *count as f64,
+                    labels: labels.clone(),
+                });
+            }
+            for (name, (value, labels)) in &metrics_snap.gauges {
+                observer_metrics.push(MetricSample {
+                    name: name.clone(),
+                    kind: MetricKind::Gauge,
+                    value: *value,
+                    labels: labels.clone(),
+                });
+            }
+            for (name, samples) in &metrics_snap.histograms {
+                for (value, labels) in samples {
+                    observer_metrics.push(MetricSample {
+                        name: name.clone(),
+                        kind: MetricKind::HistogramSample,
+                        value: *value,
+                        labels: labels.clone(),
+                    });
+                }
+            }
+
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
@@ -639,6 +687,7 @@ impl Supervisor {
                     outbound_bytes: snap.outbound_bytes,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
+                    observer_metrics,
                 },
             );
         }
