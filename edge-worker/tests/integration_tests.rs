@@ -27,8 +27,11 @@ use tokio::time::timeout;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use edge_runtime::interfaces::observe::LogSink;
+use edge_worker::auth::WorkerJwtSigner;
 use edge_worker::config::Config;
 use edge_worker::downloader::Downloader;
+use edge_worker::log_forwarder::LogForwarder;
 use edge_worker::messages::{AppSpec, HeartbeatMessage, TaskMessage};
 use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
 use edge_worker::port_pool::PortPool;
@@ -65,6 +68,42 @@ fn test_component_hash() -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Shared HMAC secret used by every test JWT signer so the verifier side
+/// of `test_emit_log_reaches_log_ingest_endpoint` can decode the token the
+/// worker attaches. Production code uses `WORKER_JWT_SECRET` from env.
+const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret";
+
+/// Construct a `Config` matching the worker's runtime expectations, with the
+/// JWT fields populated to known test values.
+#[allow(dead_code)]
+fn test_config(
+    worker_id: &str,
+    region: &str,
+    nats_url: String,
+    control_plane_url: String,
+) -> Config {
+    Config {
+        worker_id: worker_id.to_string(),
+        region: region.to_string(),
+        nats_url,
+        control_plane_url,
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-cache"),
+        heartbeat_interval_secs: 30,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: "test-group".to_string(),
+        consumer_name: format!("test-{}", worker_id),
+        worker_addr: "test-host:0".to_string(),
+        worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
+    }
 }
 
 /// Timeout for subscribing to heartbeats.
@@ -319,13 +358,26 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         epoch_deadline_ticks: 100,
         queue_group: "test-heartbeat-group".to_string(),
         consumer_name: "test-heartbeat-consumer".to_string(),
+        worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
+
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
+        jwt_signer.clone(),
     ));
     let port_pool = Arc::new(TokioMutex::new(PortPool::new(
         config.starting_port,
@@ -338,12 +390,20 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
             .context("connect nats")?,
     ) as Arc<dyn NatsClientTrait>;
 
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer,
+    );
+
     let supervisor = Arc::new(Supervisor {
         config,
         state,
         downloader,
         port_pool,
         nats,
+        log_forwarder,
     });
 
     // Build and publish a heartbeat manually
@@ -459,26 +519,47 @@ async fn build_supervisor(
         epoch_deadline_ticks: 100,
         queue_group: queue_group.to_string(),
         consumer_name: consumer_name.to_string(),
+        // JWT secret + tenant id are required by Config::from_env but in
+        // tests we construct Config directly and never hit the auth path
+        // against a real control plane (the mock server accepts anything
+        // on /api/internal/*). Any non-empty placeholder works.
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
     };
 
     let engine = edge_runtime::create_engine()?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
+    let jwt_signer = WorkerJwtSigner::new(
+        config.worker_jwt_secret.clone(),
+        config.worker_jwt_issuer.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        config.worker_tenant_id.clone(),
+    );
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
+        jwt_signer.clone(),
     ));
     let port_pool = Arc::new(TokioMutex::new(PortPool::new(
         config.starting_port,
         config.port_cooldown_secs,
     )));
-
     let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
+    let log_forwarder = LogForwarder::new(
+        config.control_plane_url.clone(),
+        config.worker_id.clone(),
+        config.region.clone(),
+        jwt_signer,
+    );
     Ok(Arc::new(Supervisor {
         config,
         state,
         downloader,
         port_pool,
         nats,
+        log_forwarder,
     }))
 }
 
@@ -940,6 +1021,21 @@ async fn wait_for_either_app_running(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Log ingest pipeline (#76)
+//
+// End-to-end: app is started by the supervisor → runtime's LogSink (the
+// supervisor's `log_forwarder`) receives a record → flush_now() POSTs to the
+// mocked `/api/internal/logs` → request carries the worker's JWT, the body
+// has the right shape.
+//
+// We don't have a guest that emits a log on demand, so the test injects a
+// `LogRecord` directly through the `LogSink::push` interface — exactly what
+// `Observer::emit_log_record_inner` does inside the runtime. The runtime's
+// observe.rs unit tests already prove the `emit_log → push(record, ctx)`
+// wiring; this test proves the worker's downstream path reaches the wire.
+// ---------------------------------------------------------------------------
+
 // TODO(issue-#74-e2e): a supervisor-level integration test for the
 // auto-rollback path is the missing piece in this PR's coverage.
 //
@@ -975,3 +1071,133 @@ async fn wait_for_either_app_running(
 // `#[tokio::test]` above. Self-skip via `should_skip_integration_tests`
 // matches the existing pattern — runs locally with Docker, skipped
 // in CI without it.
+
+#[tokio::test]
+async fn test_emit_log_reaches_log_ingest_endpoint() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // The artifact endpoint must serve the fixture so the app reaches
+    // Running — we then know the supervisor constructed an AppLogContext
+    // for this app and would forward its logs through `log_forwarder`.
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_log_emit"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // The log ingest endpoint — captures the request for inspection.
+    Mock::given(method("POST"))
+        .and(path("/api/internal/logs"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&harness.mock_server)
+        .await;
+
+    let spec = AppSpec {
+        deployment_id: "d_log_emit".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: Some(vec![]),
+        max_memory_mb: 0,
+    };
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-18T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("log-emit-app".to_string(), spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    let running = wait_for_app_running(&harness.supervisor, "log-emit-app", 10).await;
+    assert!(
+        running,
+        "app should reach Running within 10s — proves supervisor wiring is healthy"
+    );
+
+    // Inject a LogRecord through the supervisor's LogSink (the LogForwarder).
+    // The runtime's Observer::emit_log_record_inner calls `push(record, ctx)`
+    // in exactly this shape; bypassing the runtime means we don't need a
+    // guest that emits a log on demand.
+    let record = edge_runtime::interfaces::observe::LogRecord {
+        timestamp_ms: 0,
+        level: edge_runtime::interfaces::observe::LogLevel::Info,
+        message: "hello from worker".to_string(),
+        labels: vec![
+            ("request_id".to_string(), "abc".to_string()),
+            ("path".to_string(), "/api/foo".to_string()),
+        ],
+    };
+    let ctx = edge_runtime::interfaces::observe::AppLogContext {
+        app_name: "log-emit-app".to_string(),
+        tenant_id: "t_test".to_string(),
+        deployment_id: "d_log_emit".to_string(),
+    };
+    harness.supervisor.log_forwarder.push(record, ctx);
+
+    // The forwarder's flush_loop drives the ticker (1s) + the size-triggered
+    // notify; we call `flush_now` directly so the test doesn't depend on
+    // wall-clock time. The loop's shutdown branch already covers the
+    // graceful-flush path — no need to re-test it here.
+    harness.supervisor.log_forwarder.flush_now().await;
+
+    // Assert the mock received exactly one POST to /api/internal/logs.
+    let received = harness
+        .mock_server
+        .received_requests()
+        .await
+        .expect("received");
+    let posts: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/api/internal/logs" && r.method == "POST")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "expected exactly one POST to /api/internal/logs, got {}",
+        posts.len()
+    );
+
+    // The request must carry an Authorization: Bearer <jwt> header that
+    // decodes to the worker's identity (worker_id + tenant_id).
+    let auth = posts[0]
+        .headers
+        .get("authorization")
+        .expect("Authorization header must be present")
+        .to_str()
+        .expect("Authorization must be valid ASCII");
+    let token = auth
+        .strip_prefix("Bearer ")
+        .expect("Authorization must start with 'Bearer '");
+    let claims = edge_worker::auth::verify_for_test_only(TEST_JWT_SECRET, "edgecloud", token)
+        .expect("verify should succeed");
+    assert_eq!(claims.worker_id, "test-worker");
+    assert_eq!(claims.tenant_id, "t_test");
+    assert_eq!(claims.region, "test-region");
+
+    // Body shape: JSON with `entries` array containing one entry whose
+    // identity fields come from AppLogContext and the record's message.
+    assert!(!posts[0].body.is_empty(), "POST body must not be empty");
+    let parsed: serde_json::Value = serde_json::from_slice(&posts[0].body).expect("body is JSON");
+    let entries = parsed["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(entries.len(), 1, "expected one entry");
+    let entry = &entries[0];
+    assert_eq!(entry["app_name"], "log-emit-app");
+    assert_eq!(entry["tenant_id"], "t_test");
+    assert_eq!(entry["deployment_id"], "d_log_emit");
+    assert_eq!(entry["worker_id"], "test-worker");
+    assert_eq!(entry["region"], "test-region");
+    assert_eq!(entry["level"], "info");
+    assert_eq!(entry["message"], "hello from worker");
+    assert_eq!(entry["labels"]["request_id"], "abc");
+    assert_eq!(entry["labels"]["path"], "/api/foo");
+}

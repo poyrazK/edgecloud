@@ -91,9 +91,9 @@ func run() error {
 }
 
 // isInfrastructure returns true for:
-// - /openapi.yaml, /docs, /docs/ (spec/doc serving infrastructure)
-// - /api/... redirect routes (deprecated old paths that redirect to /api/v1/)
-//   These are not part of the OpenAPI contract because they are not real endpoints.
+//   - /openapi.yaml, /docs, /docs/ (spec/doc serving infrastructure)
+//   - /api/... redirect routes (deprecated old paths that redirect to /api/v1/)
+//     These are not part of the OpenAPI contract because they are not real endpoints.
 func isInfrastructure(route string) bool {
 	if route == "GET /openapi.yaml" || route == "GET /docs" || route == "GET /docs/" {
 		return true

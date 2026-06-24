@@ -79,6 +79,7 @@ func main() {
 	appEnvRepo := repository.NewAppEnvRepository(db)
 	appRepo := repository.NewAppRepository(db)
 	workerRepo := repository.NewWorkerRepository(db)
+	logEntryRepo := repository.NewLogEntryRepository(db)
 
 	// Initialize NATS publisher
 	publisher, err := nats.NewNATSPublisher(cfg.NATS.URL)
@@ -124,7 +125,7 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, logEntryRepo)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -287,6 +288,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
 	internalMux.HandleFunc("GET /api/internal/workers", internalHandler.ListWorkers)
+	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	// Worker-driven auto-rollback: an edge-worker POSTs here when its
 	// supervisor exhausts the restart cap on a tenant app. The
 	// handler swaps the active deployment back to last_good and
@@ -312,12 +314,27 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		}
 	}()
 
+	// rootCtx is the parent context for every background goroutine spawned
+	// by main(); cancelling it makes them exit cleanly when the HTTP server
+	// shuts down. Using context.Background() here would leak the goroutines
+	// across reloads/restarts — the goroutines would only exit when main()
+	// returned, by which point the DB and NATS connections are already
+	// closed and the next iteration of the loop would error.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+
 	// Start NATS heartbeat subscriber for worker lifecycle management
 	go func() {
-		if err := workerSvc.SubscribeHeartbeats(context.Background()); err != nil {
+		if err := workerSvc.SubscribeHeartbeats(rootCtx); err != nil {
 			log.Printf("Worker heartbeat subscription error: %v", err)
 		}
 	}()
+
+	// Start log retention GC. Tunable via env (LOG_GC_INTERVAL, LOG_RETENTION);
+	// defaults to a 1-hour sweep with 7-day retention.
+	logGC := service.NewLogGCService(logEntryRepo)
+	logGCInterval := parseDurationEnv("LOG_GC_INTERVAL", time.Hour)
+	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
+	go logGC.Run(rootCtx, logGCInterval, logRetention)
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
@@ -328,5 +345,28 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	if err := srv.Shutdown(context.Background()); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+	// Cancel the root context so the background goroutines (log GC, NATS
+	// heartbeat subscriber) exit before main() returns and closes the DB
+	// and NATS connections out from under them.
+	rootCancel()
 	log.Println("Server exited")
+}
+
+// parseDurationEnv reads a duration-valued env var or returns the default.
+// On a missing, malformed, or non-positive value it logs a warning and
+// returns the default — the GC service should never busy-loop or wipe
+// the logs table because of an operator typo. Non-positive values
+// (including zero and negative durations) are rejected in addition to
+// malformed strings; LogGCService.Run also defends against them.
+func parseDurationEnv(envName string, def time.Duration) time.Duration {
+	v := os.Getenv(envName)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Printf("%s=%q is not a valid positive duration; using default %s", envName, v, def)
+		return def
+	}
+	return d
 }

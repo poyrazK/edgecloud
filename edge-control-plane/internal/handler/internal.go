@@ -17,12 +17,14 @@ import (
 type InternalHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     *service.WorkerService
+	logEntryRepo  logEntryRepo
 }
 
-func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService) *InternalHandler {
+func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService, logEntryRepo logEntryRepo) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
+		logEntryRepo:  logEntryRepo,
 	}
 }
 

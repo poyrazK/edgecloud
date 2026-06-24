@@ -51,6 +51,22 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// HMAC secret the worker uses to sign outbound JWTs to the control
+    /// plane's internal endpoints. Must match `JWT_SECRET` on the Go side.
+    ///
+    /// Optional at startup: a missing/empty value loads as `""` and main()
+    /// logs a warning. With no secret, /api/internal/* calls will 401
+    /// until the secret is provisioned (e.g. via a bootstrap handshake —
+    /// see follow-up issue D). NATS heartbeats and the deployment
+    /// supervisor keep working regardless.
+    pub worker_jwt_secret: String,
+    /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
+    /// Defaults to `edgecloud`.
+    pub worker_jwt_issuer: String,
+    /// The tenant this worker is authorized for. Loaded once at startup;
+    /// a worker is per-tenant in this design (whitepaper §9.3 calls for
+    /// tenant-agnostic workers — file a follow-up to revisit).
+    pub worker_tenant_id: String,
 }
 
 impl Config {
@@ -63,6 +79,8 @@ impl Config {
     /// - `EDGE_WORKER_ADDR` (e.g., `203.0.113.10`) — the routable address of
     ///   this worker for the public ingress. Required: silent defaults have
     ///   produced every past "URL works for me but not for users" incident.
+    /// - `WORKER_JWT_SECRET` (HMAC secret shared with the control plane)
+    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`)
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -72,6 +90,12 @@ impl Config {
     /// - `EPOCH_DEADLINE_TICKS` (default: 100)
     /// - `EDGE_QUEUE_GROUP` (default: `edgecloud-workers`)
     /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
+    /// - `WORKER_JWT_ISSUER` (default: `edgecloud`)
+    /// - `WORKER_JWT_SECRET` (default: empty — see warning in main.rs)
+    /// - `EDGE_WORKER_LOG_LEVEL` (default: `info`) — minimum level the
+    ///   worker log layer ships to the control plane via `LogForwarder`.
+    ///   Independent of `RUST_LOG`, which still controls local stdout
+    ///   verbosity via `EnvFilter`. See `forwarder_log_level`.
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -118,7 +142,37 @@ impl Config {
             max_memory_mb: parse_env_u64("APP_MAX_MEMORY_MB", 256)?,
             epoch_tick_ms: parse_env_u64("EPOCH_TICK_MS", 10)?,
             epoch_deadline_ticks: parse_env_u64("EPOCH_DEADLINE_TICKS", 100)?,
+            worker_jwt_secret: std::env::var("WORKER_JWT_SECRET").unwrap_or_default(),
+            worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
+                .unwrap_or_else(|_| "edgecloud".into()),
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID")
+                .context("WORKER_TENANT_ID not set")?,
         })
+    }
+
+    /// Returns the minimum level the worker log layer ships to the
+    /// control plane. Default: `info`. Override via `EDGE_WORKER_LOG_LEVEL`
+    /// (one of `trace`, `debug`, `info`, `warn`, `error`; unknown values
+    /// fall back to `info`). Independent of `RUST_LOG`, which still
+    /// controls local stdout verbosity via the `EnvFilter`.
+    ///
+    /// The two knobs deliberately diverge: `RUST_LOG=info,edge_worker=debug`
+    /// sets *stdout* to debug for the worker crate, while
+    /// `EDGE_WORKER_LOG_LEVEL=debug` sets the *forwarder* threshold to
+    /// debug. Most operators will leave both at `info`.
+    pub fn forwarder_log_level(&self) -> tracing::Level {
+        match std::env::var("EDGE_WORKER_LOG_LEVEL")
+            .unwrap_or_else(|_| "info".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "info" => tracing::Level::INFO,
+            "warn" => tracing::Level::WARN,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
+        }
     }
 }
 
@@ -263,6 +317,7 @@ mod tests {
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
             ("APP_MAX_MEMORY_MB", Some("64")),
         ]);
         let cfg = Config::from_env().expect("from_env");
@@ -280,6 +335,7 @@ mod tests {
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
             ("EPOCH_TICK_MS", Some("5")),
             ("EPOCH_DEADLINE_TICKS", Some("50")),
         ]);
@@ -301,6 +357,7 @@ mod tests {
             ("REGION", Some("fra")),
             ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
             ("APP_MAX_MEMORY_MB", None),
             ("EPOCH_TICK_MS", None),
             ("EPOCH_DEADLINE_TICKS", None),
@@ -312,5 +369,37 @@ mod tests {
             cfg.epoch_deadline_ticks, 100,
             "default epoch_deadline_ticks is 100"
         );
+    }
+
+    /// `WORKER_JWT_SECRET` is intentionally optional (see main.rs warning):
+    /// when unset the worker still starts, with every `/api/internal/*`
+    /// call returning 401 until the secret is provisioned. This test pins
+    /// the optional behavior so a future "fix" can't silently make it
+    /// required again without a conscious decision.
+    #[test]
+    fn worker_jwt_secret_is_optional() {
+        // Take the same lock as the EnvGuard-based tests above so env
+        // mutations don't race with them. We acquire the lock once for
+        // the whole test instead of across two `lock_and_set` calls —
+        // shadowing `let _g = lock_and_set(...)` would deadlock because
+        // Rust evaluates the RHS before dropping the old binding.
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("WORKER_JWT_SECRET", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no JWT secret");
+        assert_eq!(
+            cfg.worker_jwt_secret, "",
+            "missing WORKER_JWT_SECRET must load as empty string (not error)"
+        );
+
+        // Round-trip: setting the env var flows through to the config.
+        // SAFETY: serialized by ENV_LOCK above (held in `_g`).
+        unsafe { std::env::set_var("WORKER_JWT_SECRET", "round-trip-secret") };
+        let cfg = Config::from_env().expect("from_env with JWT secret");
+        assert_eq!(cfg.worker_jwt_secret, "round-trip-secret");
     }
 }

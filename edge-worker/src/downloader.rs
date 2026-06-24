@@ -3,20 +3,29 @@
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::auth::WorkerJwtSigner;
 
 /// Downloads Wasm artifacts from the control plane with local cache.
 pub struct Downloader {
     client: reqwest::Client,
     control_plane_url: String,
     cache_dir: PathBuf,
+    jwt_signer: Arc<WorkerJwtSigner>,
 }
 
 impl Downloader {
-    pub fn new(control_plane_url: String, cache_dir: PathBuf) -> Self {
+    pub fn new(
+        control_plane_url: String,
+        cache_dir: PathBuf,
+        jwt_signer: Arc<WorkerJwtSigner>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             control_plane_url,
             cache_dir,
+            jwt_signer,
         }
     }
 
@@ -60,16 +69,20 @@ impl Downloader {
             }
         }
 
-        // Download from control plane
+        // Download from control plane. Sign the request with the worker's
+        // bearer JWT — the control plane's WorkerAuth middleware will reject
+        // any unsigned /api/internal/* request with 401.
         let url = format!(
             "{}/api/internal/download/{}",
             self.control_plane_url, deployment_id
         );
+        let token = self.jwt_signer.sign();
         tracing::info!(url, "downloading artifact");
 
         let response = self
             .client
             .get(&url)
+            .bearer_auth(token)
             .send()
             .await
             .with_context(|| format!("failed to download {}", url))?
@@ -153,9 +166,16 @@ impl Downloader {
         // the response status code on non-2xx without short-circuiting
         // the post — the caller treats both 2xx and 4xx as "we got our
         // signal across" and only escalates on transport errors.
+        //
+        // Sign the request with the worker's bearer JWT (see main's
+        // PR #98 for the broader JWT middleware rollout): the control
+        // plane's WorkerAuth middleware will reject any unsigned
+        // /api/internal/* request with 401.
+        let token = self.jwt_signer.sign();
         let response = self
             .client
             .post(&url)
+            .bearer_auth(token)
             .json(&body)
             .send()
             .await
@@ -378,7 +398,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
 
         let bytes: Vec<u8> = b"some test bytes".to_vec();
         let hash = sha256_hex(&bytes);
@@ -420,7 +440,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
 
         // Pre-populate the cache with content that won't match the expected hash.
         tokio::fs::write(cache_dir.join("d_unit_redownload.wasm"), b"tampered bytes")
@@ -468,7 +488,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
 
         // Pre-populate the cache with tampered bytes so the cache fast-path
         // is exercised, then invalidated, forcing the download path.
@@ -542,7 +562,7 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
 
         let result = downloader
             .post_auto_rollback("t_test", "myapp", "d_broken", 5)
@@ -591,7 +611,7 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
 
         let err = downloader
             .post_auto_rollback("t_test", "myapp", "d_broken", 5)
@@ -628,7 +648,7 @@ mod tests {
         // "expected mock not matched" and fail the test.
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf());
+        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
 
         for bad_name in ["../etc", "foo/bar", "foo\\bar", "..", ""] {
             let err = downloader
@@ -646,5 +666,79 @@ mod tests {
             received.is_empty(),
             "no request should reach the server for path-traversal app_names"
         );
+    }
+
+    /// Every outbound GET must carry an `Authorization: Bearer <jwt>` header.
+    /// The control plane's WorkerAuth middleware rejects unsigned requests
+    /// with 401; this test is the worker-side half of that contract.
+    #[tokio::test]
+    async fn download_attaches_bearer_token() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let good_bytes: Vec<u8> = b"the real artifact".to_vec();
+        let good_hash = sha256_hex(&good_bytes);
+
+        // Mount a mock that matches ANY request to the URL — we don't try
+        // to assert the Authorization header value at the mock level (the
+        // signer's token is non-deterministic across runs because of jti).
+        // Instead we inspect received_requests() below to extract the token
+        // and verify it parses with the worker's identity.
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_unit_auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(good_bytes.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test",
+            "t_test",
+        );
+        let downloader = Downloader::new(server.uri(), cache_dir, signer);
+
+        let _ = downloader
+            .get_artifact("d_unit_auth", &good_hash)
+            .await
+            .expect("download should succeed");
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(received.len(), 1, "expected exactly one download");
+        let auth_header = received[0]
+            .headers
+            .get("authorization")
+            .expect("Authorization header must be present")
+            .to_str()
+            .expect("Authorization must be valid ASCII");
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .expect("Authorization must start with 'Bearer '");
+
+        // Token must parse with the same secret the signer used and carry
+        // the worker's identity. This is what the control plane's
+        // WorkerAuth middleware does.
+        let claims = crate::auth::verify_for_test_only(b"test-secret", "edgecloud", token)
+            .expect("verify should succeed");
+        assert_eq!(claims.worker_id, "w_test");
+        assert_eq!(claims.tenant_id, "t_test");
+        assert_eq!(claims.region, "test");
+    }
+
+    fn test_signer() -> std::sync::Arc<crate::auth::WorkerJwtSigner> {
+        crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test",
+            "t_test",
+        )
     }
 }
