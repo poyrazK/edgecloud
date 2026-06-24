@@ -109,6 +109,25 @@ func NewLogService(repo LogEntryLister) *LogService {
 	return &LogService{repo: repo}
 }
 
+// ResolveLimit is the canonical limit clamp, exported so the handler can
+// echo the post-clamp value in the response envelope without re-implementing
+// the policy. Single source of truth — adding a new caller or a new bucket
+// means editing exactly one place.
+//
+//	≤0    → DefaultLogLimit
+//	>max  → MaxLogLimit
+//	else  → requested unchanged
+func ResolveLimit(requested int) int {
+	switch {
+	case requested <= 0:
+		return DefaultLogLimit
+	case requested > MaxLogLimit:
+		return MaxLogLimit
+	default:
+		return requested
+	}
+}
+
 // ListByTenantApp validates and normalizes q, then forwards to the repository.
 //
 // Defaults / clamps (issue #77 §3):
@@ -120,14 +139,20 @@ func NewLogService(repo LogEntryLister) *LogService {
 //   - MinLvl: empty → no filter (Levels slice nil). Unknown → ErrInvalidLevel.
 //   - Limit: ≤0 → DefaultLogLimit (100). >MaxLogLimit (1000) → MaxLogLimit.
 //
+// The second return value is the *effective* limit — the post-clamp value
+// actually applied to the query. Callers (the HTTP handler) echo it back in
+// the response envelope so a client that asked for `limit=2000` sees the
+// real bound. Deriving it here, not in the handler, keeps the policy in
+// one place: changing the clamp buckets later only touches this file.
+//
 // The returned entries are ordered newest-first; the index
 // idx_logs_tenant_app_ts (tenant_id, app_name, ts DESC) covers the WHERE +
 // ORDER BY.
 func (s *LogService) ListByTenantApp(
 	ctx context.Context, tenantID, appName string, q LogQuery,
-) ([]domain.LogEntry, error) {
+) ([]domain.LogEntry, int, error) {
 	if q.MinLvl != "" && LogLevelOrdinal(q.MinLvl) < 0 {
-		return nil, fmt.Errorf("%w: %q", ErrInvalidLevel, q.MinLvl)
+		return nil, 0, fmt.Errorf("%w: %q", ErrInvalidLevel, q.MinLvl)
 	}
 
 	since := q.Since
@@ -135,22 +160,20 @@ func (s *LogService) ListByTenantApp(
 		since = DefaultLogSince
 	}
 
-	limit := q.Limit
-	switch {
-	case limit <= 0:
-		limit = DefaultLogLimit
-	case limit > MaxLogLimit:
-		limit = MaxLogLimit
-	}
+	limit := ResolveLimit(q.Limit)
 
 	levels := []string(nil)
 	if q.MinLvl != "" {
 		levels = LevelsAtOrAbove(q.MinLvl)
 	}
 
-	return s.repo.ListByTenantApp(ctx, tenantID, appName, repository.LogListFilter{
+	entries, err := s.repo.ListByTenantApp(ctx, tenantID, appName, repository.LogListFilter{
 		Since:  since,
 		Levels: levels,
 		Limit:  limit,
 	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return entries, limit, nil
 }

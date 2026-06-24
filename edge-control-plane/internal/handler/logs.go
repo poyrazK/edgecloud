@@ -83,7 +83,7 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := h.logSvc.ListByTenantApp(r.Context(), tenantID, appName, service.LogQuery{
+	entries, effectiveLimit, err := h.logSvc.ListByTenantApp(r.Context(), tenantID, appName, service.LogQuery{
 		Since:  since,
 		MinLvl: minLvl,
 		Limit:  limit,
@@ -98,7 +98,7 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	resp := LogListResponse{
 		Items: entries,
-		Limit: effectiveLimit(limit),
+		Limit: effectiveLimit,
 		Since: effectiveSinceRFC3339(since),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -112,10 +112,12 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 // time.Duration the service expects.
 //
 // Returns (0, nil) when the param is absent — the service substitutes
-// its own default in that case. Returns (0, error) only for malformed
-// timestamps; a future-dated `since` is clamped to 0 with no error so a
-// client with a clock slightly ahead of the server gets a useful
-// response (the default window) rather than a 400.
+// its own default in that case. Returns an error for both malformed
+// timestamps AND future-dated values: silently clamping a `since` in
+// the future to "now" would let a client with a clock slightly ahead
+// of the server request "everything from now" and get the default
+// window without ever knowing their bound was ignored. A 400 surfaces
+// the mistake early.
 //
 // Why RFC3339 (absolute) on the wire rather than a duration string:
 //
@@ -135,13 +137,15 @@ func parseSinceParam(raw string) (time.Duration, error) {
 	if err != nil {
 		return 0, errors.New("expected RFC3339 timestamp")
 	}
-	d := time.Until(t)
-	if d < 0 {
-		// Future-dated: clamp so the service applies its default
-		// window instead of returning an unbounded result.
-		return 0, nil
+	// Check "is in the future" BEFORE computing time.Until. The latter
+	// returns a time.Duration (int64 nanoseconds), which saturates at
+	// math.MaxInt64 / 1e9 ≈ 292 years; a `since=` value a thousand
+	// years out would otherwise look indistinguishable from one
+	// a few seconds out, since both yield a positive Duration.
+	if t.After(time.Now()) {
+		return 0, errors.New("since must not be in the future")
 	}
-	return d, nil
+	return time.Until(t), nil
 }
 
 // parseLimitParam returns the user-supplied limit, or 0 when absent.
@@ -160,21 +164,6 @@ func parseLimitParam(raw string) (int, error) {
 		return 0, errors.New("must be non-negative")
 	}
 	return n, nil
-}
-
-// effectiveLimit mirrors the service's clamp logic so the response can
-// echo the limit the server actually applied. Keeping this in one place
-// (handler) means the API contract is documented next to the handler,
-// not buried in the service.
-func effectiveLimit(requested int) int {
-	switch {
-	case requested <= 0:
-		return service.DefaultLogLimit
-	case requested > service.MaxLogLimit:
-		return service.MaxLogLimit
-	default:
-		return requested
-	}
 }
 
 // effectiveSinceRFC3339 converts the service-bound Duration back to the

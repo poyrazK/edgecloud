@@ -183,25 +183,16 @@ pub struct LogEntry {
 
 /// Envelope returned by `GET /api/v1/apps/{appName}/logs`. The
 /// `since` field carries the RFC3339 cutoff the server actually
-/// applied; the CLI's `--follow` mode uses it to advance the next
-/// poll's `since` (plus 1ms) so it does not re-fetch the rows it
-/// just printed.
+/// applied; the CLI's `--follow` mode reads it once at startup to
+/// prime the loop and then advances the cutoff from the newest
+/// returned entry's `ts` (with client-side dedup by id to hide the
+/// boundary row the server returns on every poll).
 #[derive(Debug, Deserialize)]
 pub struct LogListResponse {
     pub items: Vec<LogEntry>,
     pub limit: u32,
     #[serde(default)]
     pub since: String,
-}
-
-/// Body of GET `/api/v1/apps/{appName}/active`. Mirrors the
-/// `Deployment` row from the control plane. We only need `status`
-/// (for the "app is crashed" hint) so we declare just the field
-/// we use — adding more fields is a wire-shape pin, not a
-/// necessity.
-#[derive(Debug, Deserialize)]
-pub struct ActiveDeployment {
-    pub status: String,
 }
 
 impl ApiClient {
@@ -250,6 +241,53 @@ impl ApiClient {
         &self.base_url
     }
 
+    /// GET helper: build a URL, send an authenticated GET, check the
+    /// response, decode JSON. Used by every endpoint that just reads a
+    /// JSON resource (`status`, `list_env`, `list_deployments`,
+    /// `whoami`, `logs::list`).
+    ///
+    /// `format_url` is a closure that takes the base URL and returns the
+    /// full path (with query params when relevant). Extracting this lets
+    /// callers that need query params (`logs::list`) keep that logic
+    /// local while still hitting the auth + check + decode pipeline.
+    ///
+    /// Returns `Result<T, ApiError>` so callers that care about the
+    /// distinction (e.g. `edge auth login`) can branch on Rejected vs
+    /// Transient. Callers that don't can use [`get_json_anyhow`] for a
+    /// flat `Result<T>`.
+    fn get_json<T, F>(&self, format_url: F) -> Result<T, ApiError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(&str) -> String,
+    {
+        let url = format_url(&self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+        let resp = check_response(resp)?;
+        serde_json::from_str(&resp.text()?).map_err(ApiError::from)
+    }
+
+    /// Helper for the GET endpoints that surface as `anyhow::Error`
+    /// instead of `ApiError`. Flattens `Rejected` into
+    /// `anyhow!("{op} failed: {status} {body}")` and `Transient` into
+    /// its source. Lets every existing call site keep returning
+    /// `Result<T>` without each one re-writing the same match.
+    fn get_json_anyhow<T, F>(&self, op: &str, format_url: F) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(&str) -> String,
+    {
+        self.get_json(format_url).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("{op} failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })
+    }
+
     /// Group accessor for tenant-management endpoints (e.g. signup).
     pub fn tenants(&self) -> Tenants<'_> {
         Tenants { client: self }
@@ -271,36 +309,6 @@ impl ApiClient {
     /// `GET /api/v1/apps/{appName}/logs`.
     pub fn logs(&self) -> Logs<'_> {
         Logs { client: self }
-    }
-
-    /// Fetch the currently active deployment for `app_name`.
-    /// Returns `Ok(None)` when the server reports 404 (no active
-    /// deployment). All other errors propagate as `anyhow::Error`.
-    ///
-    /// This exists so the `edge logs` command can show a one-shot
-    /// "app is crashed" hint when the active row's status says so
-    /// — a separate `logs` call would needlessly couple the
-    /// read path to a write-shape row.
-    pub fn get_active(&self, app_name: &str) -> Result<Option<ActiveDeployment>> {
-        let url = format!("{}/api/v1/apps/{}/active", self.base_url, app_name);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let status = resp.status();
-        if status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("get active failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-        let body: ActiveDeployment = serde_json::from_str(&resp.text()?)?;
-        Ok(Some(body))
     }
 
     /// Upload a deployment artifact.
@@ -374,40 +382,16 @@ impl ApiClient {
 
     /// Get deployment status.
     pub fn status(&self, deployment_id: &str) -> Result<StatusResponse> {
-        let url = format!("{}/api/v1/status/{}", self.base_url, deployment_id);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("status failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        self.get_json_anyhow("status", |base| {
+            format!("{base}/api/v1/status/{deployment_id}")
+        })
     }
 
     /// List environment variables for an app.
     pub fn list_env(&self, app_name: &str) -> Result<Vec<EnvVar>> {
-        let url = format!("{}/api/v1/apps/{}/env", self.base_url, app_name);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("list env failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        self.get_json_anyhow("list env", |base| {
+            format!("{base}/api/v1/apps/{app_name}/env")
+        })
     }
 
     /// Set an environment variable.
@@ -481,21 +465,9 @@ impl ApiClient {
 
     /// List all deployments for an app.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        let url = format!("{}/api/v1/list/{}", self.base_url, app_name);
-        let resp = self
-            .http
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("list deployments failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-
-        serde_json::from_str(&resp.text()?).map_err(Into::into)
+        self.get_json_anyhow("list deployments", |base| {
+            format!("{base}/api/v1/list/{app_name}")
+        })
     }
 }
 
@@ -589,16 +561,8 @@ impl<'a> Auth<'a> {
     /// react accordingly. Use `whoami_anyhow` for the simple
     /// `Result<WhoamiResponse>` shape.
     pub fn whoami(&self) -> Result<WhoamiResponse, ApiError> {
-        let url = format!("{}/api/v1/auth/whoami", self.client.base_url);
-        let resp = self
-            .client
-            .http
-            .get(&url)
-            .header("Authorization", self.client.auth_header())
-            .send()?;
-
-        let resp = check_response(resp)?;
-        serde_json::from_str(&resp.text()?).map_err(ApiError::from)
+        self.client
+            .get_json(|base| format!("{base}/api/v1/auth/whoami"))
     }
 
     /// Convenience wrapper around [`whoami`] that flattens the
@@ -643,9 +607,15 @@ impl<'a> Logs<'a> {
         level: Option<&str>,
         limit: Option<u32>,
     ) -> Result<LogListResponse> {
-        let mut url = format!("{}/api/v1/apps/{}/logs", self.client.base_url, app_name);
-        let mut parsed =
-            reqwest::Url::parse(&url).map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
+        // Build the URL with optional query params locally, then
+        // hand the formatted string to `get_json_anyhow` for the
+        // auth + check + decode pipeline. The URL build is the only
+        // call-site-specific piece; the rest is generic.
+        let mut parsed = reqwest::Url::parse(&format!(
+            "{}/api/v1/apps/{}/logs",
+            self.client.base_url, app_name
+        ))
+        .map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
         if let Some(since) = since_rfc3339 {
             if !since.is_empty() {
                 parsed.query_pairs_mut().append_pair("since", since);
@@ -666,23 +636,9 @@ impl<'a> Logs<'a> {
                     .append_pair("limit", &n.to_string());
             }
         }
-        url = parsed.to_string();
+        let url = parsed.to_string();
 
-        let resp = self
-            .client
-            .http
-            .get(&url)
-            .header("Authorization", self.client.auth_header())
-            .send()?;
-
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("logs failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-        let body: LogListResponse = serde_json::from_str(&resp.text()?)?;
-        Ok(body)
+        self.client.get_json_anyhow("logs", |_| url.clone())
     }
 }
 

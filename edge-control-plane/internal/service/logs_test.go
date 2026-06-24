@@ -77,7 +77,8 @@ func TestLogService_LevelsAtOrAbove(t *testing.T) {
 // TestLogService_ClampsLimit pins the limit policy: ≤0 → default,
 // >MaxLogLimit → max, in-between → unchanged. The service's clamp is
 // the only defense against a hostile caller asking for the whole logs
-// table.
+// table. The effective-limit second return value MUST match what the
+// repo got (handler echoes it back without re-clamping).
 func TestLogService_ClampsLimit(t *testing.T) {
 	cases := []struct {
 		name string
@@ -94,7 +95,7 @@ func TestLogService_ClampsLimit(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			repo := &stubLister{}
 			svc := NewLogService(repo)
-			_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+			_, got, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 				Limit: c.in,
 			})
 			if err != nil {
@@ -103,7 +104,34 @@ func TestLogService_ClampsLimit(t *testing.T) {
 			if repo.lastFilter.Limit != c.want {
 				t.Errorf("repo limit = %d, want %d", repo.lastFilter.Limit, c.want)
 			}
+			if got != c.want {
+				t.Errorf("effective limit = %d, want %d", got, c.want)
+			}
 		})
+	}
+}
+
+// TestService_ResolveLimit pins the exported helper's contract directly
+// (the handler calls it... no, the handler echoes the value from
+// ListByTenantApp; ResolveLimit is the function the service itself
+// delegates to). Pinning it separately means a refactor that swaps the
+// implementation can keep the contract.
+func TestService_ResolveLimit(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{-1, DefaultLogLimit},
+		{0, DefaultLogLimit},
+		{1, 1},
+		{DefaultLogLimit, DefaultLogLimit},
+		{MaxLogLimit, MaxLogLimit},
+		{MaxLogLimit + 1, MaxLogLimit},
+	}
+	for _, c := range cases {
+		if got := ResolveLimit(c.in); got != c.want {
+			t.Errorf("ResolveLimit(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }
 
@@ -115,7 +143,7 @@ func TestLogService_ClampsLimit(t *testing.T) {
 func TestLogService_AppliesDefaultSince(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Since: 0,
 		Limit: 10,
 	})
@@ -133,7 +161,7 @@ func TestLogService_AppliesDefaultSince(t *testing.T) {
 func TestLogService_RejectsUnknownLevel(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		MinLvl: "critical",
 		Limit:  10,
 	})
@@ -148,7 +176,7 @@ func TestLogService_RejectsUnknownLevel(t *testing.T) {
 func TestLogService_TranslatesLevelToLevelSet(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		MinLvl: "warn",
 		Limit:  10,
 	})
@@ -168,7 +196,7 @@ func TestLogService_TranslatesLevelToLevelSet(t *testing.T) {
 func TestLogService_NoLevelFilterOmitsLevels(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Limit: 10,
 	})
 	if err != nil {
@@ -186,7 +214,7 @@ func TestLogService_PropagatesRepoError(t *testing.T) {
 	wantErr := errors.New("db unreachable")
 	repo := &stubLister{err: wantErr}
 	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Limit: 10,
 	})
 	if !errors.Is(err, wantErr) {

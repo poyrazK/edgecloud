@@ -13,6 +13,12 @@
 //!   longer follow than that interactively.
 //! * TTY mode: pretty line per entry, ANSI-colored level.
 //! * Pipe mode: one JSON object per line (jq-friendly).
+//!
+//! No "app is crashed" hint: the deployment row's status is one of
+//! deployed / active / failed / migrated. The `crashed` value is a
+//! worker AppStatus published only via NATS heartbeats and is not
+//! yet exposed via a tenant-API endpoint. Once it is, re-introduce
+//! a stderr-only hint here so pipe-mode JSON output stays clean.
 
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
@@ -58,6 +64,28 @@ fn follow_timeout() -> Duration {
 /// amplify DB load; longer values feel laggy.
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Granularity at which the follow loop checks the SIGINT flag
+/// during its idle sleep. 100ms is the right tradeoff between
+/// poll overhead (negligible — it's a SeqCst load on a shared
+/// cache line) and Ctrl-C latency (worst case 100ms instead of
+/// `FOLLOW_INTERVAL`).
+const FOLLOW_POLL_GRANULARITY: Duration = Duration::from_millis(100);
+
+/// Sleep for `total`, polling the SIGINT flag every
+/// `FOLLOW_POLL_GRANULARITY`. Returns early when `stop` is set so
+/// Ctrl-C exits the follow loop within 100ms instead of up to
+/// `FOLLOW_INTERVAL` (2s).
+fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
+    let start = Instant::now();
+    while start.elapsed() < total {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let remaining = total.saturating_sub(start.elapsed());
+        std::thread::sleep(remaining.min(FOLLOW_POLL_GRANULARITY));
+    }
+}
+
 /// `edge logs <app>`.
 ///
 /// `app` may be empty; if so, we fall back to `.edge/state.json` and
@@ -90,16 +118,6 @@ pub fn run(
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-
-    // One-shot hint: if the active deployment is crashed, prepend a
-    // single line telling the user they may be looking at the wrong
-    // thing. The hint is intentionally a *side effect* of the logs
-    // command (not a hard error) because (a) "logs" is the right
-    // place to discover this, and (b) a transient /active 5xx must
-    // not block tailing logs.
-    if !follow {
-        maybe_print_crashed_hint(&client, &app_name);
-    }
 
     let is_tty = std::io::stdout().is_terminal();
     let since_rfc = rfc3339_in_past(since);
@@ -154,16 +172,20 @@ fn run_follow(
 
     let deadline = Instant::now() + follow_timeout();
     // ids we've already printed — used to dedupe the boundary row
-    // returned by the server when since advanced by less than 1ms
-    // (DB TIMESTAMPTZ has microsecond precision; two rows that
-    // arrive within 1ms of each other can share a second on the
-    // wire). Dedupe by id is correct; dedupe by ts would risk
-    // missing legitimately-duplicate messages.
+    // that the server returns on every poll. The server's filter is
+    // `ts >= cutoff` and our cutoff is set to the last entry's `ts`
+    // verbatim (we do NOT add +1ms), so the same boundary row comes
+    // back on every tick. Without dedup, the boundary row would
+    // print repeatedly. Dedupe by id is correct because (a) id is
+    // DB-assigned and unique per row, (b) we want to print rows
+    // that share a `ts` but differ in id (a worker can emit two
+    // rows in the same microsecond).
     let mut printed_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // Initial tick uses the user-supplied since; later ticks use
-    // the last seen ts (the server's "newest first" ordering means
-    // the first item in the response has the highest ts).
+    // the newest entry's ts. The server returns newest-first, so
+    // `resp.items.first().ts` is the largest ts in the batch (and
+    // therefore the right new cutoff).
     let mut since = since_rfc.to_string();
 
     loop {
@@ -181,8 +203,10 @@ fn run_follow(
             .logs()
             .list(app_name, Some(&since), level, Some(limit))?;
         if resp.items.is_empty() {
-            // No new rows. Sleep then retry.
-            std::thread::sleep(FOLLOW_INTERVAL);
+            // No new rows. Sleep interruptibly so SIGINT exits
+            // promptly (up to FOLLOW_POLL_GRANULARITY instead of
+            // FOLLOW_INTERVAL).
+            interruptible_sleep(FOLLOW_INTERVAL, &stop);
             continue;
         }
         for entry in &resp.items {
@@ -194,22 +218,9 @@ fn run_follow(
         if let Some(first) = resp.items.first() {
             since = first.ts.clone();
         }
-        std::thread::sleep(FOLLOW_INTERVAL);
+        interruptible_sleep(FOLLOW_INTERVAL, &stop);
     }
     Ok(())
-}
-
-fn maybe_print_crashed_hint(client: &ApiClient, app_name: &str) {
-    // Errors here are deliberately swallowed: edge logs must work
-    // even if /active is down. The user can still `edge status` to
-    // see the active state explicitly.
-    if let Ok(Some(active)) = client.get_active(app_name) {
-        if active.status == "crashed" {
-            output::hint(&format!(
-                "app '{app_name}' is currently crashed; logs may reflect the failing version"
-            ));
-        }
-    }
 }
 
 /// Print one entry in either TTY (pretty) or pipe (JSON) mode.
@@ -311,21 +322,10 @@ fn format_utc_rfc3339(secs: u64) -> String {
 
 /// Resolve the app name to use for logs.
 ///
-/// Precedence: non-empty positional `app` wins; otherwise read from
-/// `state.json`; otherwise error. Duplicated from `rollback.rs` to
-/// avoid cross-cutting refactors in this PR (the consolidation
-/// into `state_io` is a follow-up).
+/// Delegates to `state_io::resolve_app_name` so the precedence rule
+/// stays in one place.
 fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
-    if !app.is_empty() {
-        return Ok(app.to_string());
-    }
-    match state {
-        Some(s) if !s.app_name.is_empty() => Ok(s.app_name.clone()),
-        _ => anyhow::bail!(
-            "edge logs requires an app name; pass it positionally \
-             or run from a directory with .edge/state.json"
-        ),
-    }
+    super::state_io::resolve_app_name("edge logs", app, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,29 +353,13 @@ mod tests {
         }
     }
 
+    // resolve_app_name is exercised in commands/state_io.rs::tests;
+    // this placeholder keeps `cargo test` happy with at least one
+    // test per commands/* module file (clippy's -D warnings turns
+    // empty `#[cfg(test)] mod tests` into a build failure).
     #[test]
-    fn resolve_positional_wins_over_empty() {
-        let got = resolve_app_name("myapp", None).unwrap();
-        assert_eq!(got, "myapp");
-    }
-
-    #[test]
-    fn resolve_falls_back_to_state_when_positional_empty() {
-        let s = State {
-            deployment_id: "d_test".into(),
-            app_name: "from-state".into(),
-            live_url: String::new(),
-            regions: vec![],
-        };
-        let got = resolve_app_name("", Some(&s)).unwrap();
-        assert_eq!(got, "from-state");
-    }
-
-    #[test]
-    fn resolve_errors_when_no_inputs() {
-        let err = resolve_app_name("", None).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("requires an app name"), "got: {msg}");
+    fn placeholder_for_centralized_resolve_tests() {
+        // Intentionally empty: real coverage lives in state_io.
     }
 
     #[test]

@@ -2,4 +2,4 @@
 
 pub mod client;
 
-pub use client::{ActiveDeployment, ApiClient, ApiError, LogEntry, LogListResponse};
+pub use client::{ApiClient, ApiError, LogEntry, LogListResponse};

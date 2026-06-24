@@ -34,10 +34,16 @@ type stubLogService struct {
 
 func (s *stubLogService) ListByTenantApp(
 	_ context.Context, _, _ string, q service.LogQuery,
-) ([]domain.LogEntry, error) {
+) ([]domain.LogEntry, int, error) {
 	s.called = true
 	s.lastQuery = q
-	return s.entries, s.err
+	// Echo the limit through. Handler tests assert the *echoed* limit
+	// matched the requested one, so for the happy path we just pass
+	// the requested value back — production behavior is "echo the
+	// post-clamp limit", and the clamp is exercised in service tests.
+	// If a test wants to drive the service's clamp directly, it
+	// should use a real *service.LogService.
+	return s.entries, q.Limit, s.err
 }
 
 // newLogsMux wires a single GET /api/v1/apps/{appName}/logs route
@@ -182,7 +188,11 @@ func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
 
-	sinceRFC := "2026-06-24T11:00:00Z"
+	// Past timestamp: 2020-01-01, unambiguously behind any clock the
+	// test runner could have. The handler's parseSinceParam rejects
+	// future-dated values with 400, so picking a date "today" risks
+	// flakiness around midnight UTC.
+	sinceRFC := "2020-01-01T00:00:00Z"
 	url := "/api/v1/apps/myapp/logs?level=warn&limit=50&since=" + sinceRFC
 	req := httptest.NewRequest("GET", url, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
@@ -260,6 +270,44 @@ func TestLogsList_RejectsInvalidSince(t *testing.T) {
 	}
 	if stub.called {
 		t.Error("service should not have been called for invalid since")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// List — 400 (future-dated since)
+// ---------------------------------------------------------------------------
+
+// TestLogsList_RejectsFutureDatedSince pins the contract change from
+// PR #138 review finding #7: a `since` whose RFC3339 value lies after
+// `time.Now()` must be rejected with 400 (not silently clamped to 0,
+// which would let the request succeed against the default 5m window
+// while the client thought it was pinning a specific past bound).
+func TestLogsList_RejectsFutureDatedSince(t *testing.T) {
+	stub := &stubLogService{}
+	mux := newLogsMux(stub)
+
+	// Year 9000 — far enough in the future that RFC3339's
+	// seconds-precision rounding (which floors to the whole
+	// second on Format→Parse round-trip) cannot cause the parsed
+	// value to land in the past. Using "now + small offset" is a
+	// footgun: sub-second drift across the format/parse round
+	// trip can flip a +1h offset into a value that's effectively
+	// already past when the handler measures `time.Until(t)`.
+	// RFC3339 accepts any year in 0001..9999.
+	future := time.Date(9000, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?since="+future, nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "future") {
+		t.Errorf("body should mention 'future', got: %s", rr.Body.String())
+	}
+	if stub.called {
+		t.Error("service should not have been called for future-dated since")
 	}
 }
 

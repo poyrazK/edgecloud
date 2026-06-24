@@ -180,56 +180,6 @@ async fn logs_emits_one_json_object_per_line_in_pipe_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Crashed hint: when /active says status=crashed, the CLI prepends
-// a hint line before printing any entries.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn logs_prints_crashed_hint_when_active_is_crashed() {
-    let home = common::isolated_home();
-    let project = common::isolated_home();
-    let server = MockServer::start().await;
-
-    common::seed_api_key(&home, "k_seed");
-    seed_project(&project, "myapp");
-
-    Mock::given(method("GET"))
-        .and(path("/api/v1/apps/myapp/active"))
-        .and(header("Authorization", "Bearer k_seed"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "d_a",
-            "status": "crashed",
-            "created_at": "2026-06-24T11:00:00Z",
-            "url": "https://myapp.example.test",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/api/v1/apps/myapp/logs"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "items": [],
-            "limit": 100,
-            "since": "",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
-    common::set_platform_env(&mut cmd, &home);
-    cmd.env("EDGE_API_URL", server.uri());
-    cmd.current_dir(project.path());
-    cmd.arg("logs");
-    cmd.arg("myapp");
-
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("currently crashed"));
-}
-
-// ---------------------------------------------------------------------------
 // 400 from server: invalid level → CLI must exit non-zero with a
 // useful message (not a panic).
 // ---------------------------------------------------------------------------
