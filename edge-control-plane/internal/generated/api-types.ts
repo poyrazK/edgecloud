@@ -207,6 +207,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/apps/{appName}/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Roll back the active deployment to the stored last-good deployment
+         * @description Replaces the currently active deployment of `appName` with the
+         *     deployment recorded as the most recent `last_good_deployment_id`.
+         *     Used after a bad activation to put the app back on a known-good
+         *     version. The previously active deployment becomes the new
+         *     `last_good_deployment_id`, so the operation is itself reversible.
+         *     A NATS task update is published to every region the deployment
+         *     is replicated to so workers re-converge.
+         */
+        post: operations["rollbackDeployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/active": {
         parameters: {
             query?: never;
@@ -728,6 +754,16 @@ export interface components {
         ActivateResponse: {
             /** @example activated */
             status?: string;
+        };
+        RollbackResponse: {
+            /**
+             * @description Deployment id now active after the rollback — i.e., the
+             *     prior `last_good_deployment_id`. Callers can persist this
+             *     into local state so subsequent commands (e.g. `edge open`)
+             *     target the rolled-back version.
+             * @example d_prev
+             */
+            deployment_id?: string;
         };
         IngressResponseReady: {
             /** @example true */
@@ -1407,6 +1443,59 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
+        };
+    };
+    rollbackDeployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deployment rolled back. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RollbackResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            /**
+             * @description No prior `last_good_deployment_id` is recorded for this app,
+             *     so there is nothing to roll back to. Returned when the app
+             *     has only ever had one deployment.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /**
+             * @description The post-commit NATS publish of the task update failed for
+             *     every region the deployment is replicated to. The control
+             *     plane has already committed the new active deployment, but
+             *     workers may not converge until the publish is retried.
+             */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     getActiveDeployment: {
