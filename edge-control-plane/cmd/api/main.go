@@ -119,6 +119,7 @@ func main() {
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
+	logSvc := service.NewLogService(logEntryRepo)
 
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
@@ -131,6 +132,7 @@ func main() {
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
+	logHandler := handler.NewLogHandler(logSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -215,6 +217,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("POST /api/apps/{appName}/env", redirectTo("/api/v1/apps/"+"{appName}/env"))
 	mux.HandleFunc("DELETE /api/apps/{appName}/env/{key}", redirectTo("/api/v1/apps/"+"{appName}/env/"+"{key}"))
 	mux.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", redirectTo("/api/v1/apps/"+"{appName}/activate/"+"{deploymentID}"))
+	mux.HandleFunc("GET /api/apps/{appName}/logs", redirectTo("/api/v1/apps/"+"{appName}/logs"))
 	// Deploy & status
 	mux.HandleFunc("POST /api/deploy/{appName}", redirectTo("/api/v1/deploy/"+"{appName}"))
 	mux.HandleFunc("GET /api/status/{deploymentID}", redirectTo("/api/v1/status/"+"{deploymentID}"))
@@ -262,6 +265,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
+	api.HandleFunc("GET /api/v1/apps/{appName}/logs", logHandler.List)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
