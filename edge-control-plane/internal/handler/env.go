@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -28,16 +29,16 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 
 	var req SetEnvRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Key == "" {
-		http.Error(w, `{"error": "key is required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "key is required")
 		return
 	}
 
 	if err := h.envSvc.SetEnv(r.Context(), tenantID, appName, req.Key, req.Value); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -50,7 +51,7 @@ func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	envs, err := h.envSvc.ListEnv(r.Context(), tenantID, appName)
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -70,7 +71,7 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
 	if err := h.envSvc.DeleteEnv(r.Context(), tenantID, appName, key); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

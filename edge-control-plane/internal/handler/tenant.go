@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -39,11 +40,11 @@ type BootstrapResponse struct {
 func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	var req BootstrapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	if req.KeyName == "" {
@@ -57,7 +58,7 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	tenant, rawKey, err := h.tenantSvc.BootstrapTenant(r.Context(), req.Name, plan, req.KeyName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -72,11 +73,11 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req CreateTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	plan := req.Plan
@@ -87,7 +88,7 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	tenant, err := h.tenantSvc.CreateTenant(r.Context(), req.Name, plan)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -100,11 +101,11 @@ func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if tenant == nil {
-		http.Error(w, `{"error": "tenant not found"}`, http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 
@@ -115,7 +116,7 @@ func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenants, err := h.tenantSvc.ListTenants(r.Context())
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -137,13 +138,13 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 
 	var req UpdateTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 
 	tenant, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
 	if err != nil || tenant == nil {
-		http.Error(w, `{"error": "tenant not found"}`, http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 
@@ -162,7 +163,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -173,7 +174,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	if err := h.tenantSvc.DeleteTenant(r.Context(), tenantID); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

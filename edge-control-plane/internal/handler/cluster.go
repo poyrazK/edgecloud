@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -24,7 +25,7 @@ func (h *ClusterHandler) Get(w http.ResponseWriter, r *http.Request) {
 	view, err := h.clusterSvc.List(r.Context())
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

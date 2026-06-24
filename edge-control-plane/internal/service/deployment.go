@@ -365,7 +365,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 				DeploymentID:   deploymentID,
 				DeploymentHash: deployment.Hash,
 				Env:            envMap,
-				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
+				Allowlist:      tenant.AllowlistedDestinations,
 				MaxMemoryMB:    maxMemoryMB,
 			},
 		},
@@ -376,7 +376,7 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	//   - otherwise the control plane's default region (handles
 	//     pre-migration rows AND any caller that wrote the row via a
 	//     path that left Regions nil).
-	regions := domain.StringArrayTo(deployment.Regions)
+	regions := deployment.Regions
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
@@ -401,6 +401,87 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("publishing task update failed for %d region(s): %s", len(failedRegions), strings.Join(failedRegions, ","))
 	}
 
+	return nil
+}
+
+// RepublishActiveDeployments re-sends a TaskMessage for every currently-active
+// deployment belonging to tenantID. Called after an egress allowlist change so
+// workers pick up the new policy without a manual re-activate.
+func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tenantID string) error {
+	activeList, err := s.activeRepo.ListByTenant(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("listing active deployments: %w", err)
+	}
+	if len(activeList) == 0 {
+		return nil
+	}
+
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return fmt.Errorf("tenant not found")
+	}
+
+	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
+	maxMemoryMB := 256
+	if quota != nil && quota.MaxMemoryMB > 0 {
+		maxMemoryMB = quota.MaxMemoryMB
+	}
+
+	var failedApps []string
+	for _, ad := range activeList {
+		deployment, err := s.deploymentRepo.GetByID(ctx, ad.DeploymentID)
+		if err != nil || deployment == nil {
+			log.Printf("republish: skipping app %q — deployment %s not found", ad.AppName, ad.DeploymentID)
+			failedApps = append(failedApps, ad.AppName)
+			continue
+		}
+
+		envs, err := s.appEnvRepo.List(ctx, tenantID, ad.AppName)
+		if err != nil {
+			failedApps = append(failedApps, ad.AppName)
+			continue
+		}
+		envMap := make(map[string]string, len(envs))
+		for _, e := range envs {
+			envMap[e.EnvKey] = e.EnvValue
+		}
+
+		msg := &nats.TaskMessage{
+			Type:      "task_update",
+			Timestamp: time.Now(),
+			TenantID:  tenantID,
+			Apps: map[string]nats.AppConfig{
+				ad.AppName: {
+					DeploymentID:   ad.DeploymentID,
+					DeploymentHash: deployment.Hash,
+					Env:            envMap,
+					Allowlist:      tenant.AllowlistedDestinations,
+					MaxMemoryMB:    maxMemoryMB,
+				},
+			},
+		}
+
+		regions := deployment.Regions
+		if len(regions) == 0 {
+			regions = []string{s.defaultRegion}
+		}
+		for _, region := range regions {
+			if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
+				log.Printf("republish: publishing task update failed for app %q region %q: %v", ad.AppName, region, err)
+				failedApps = append(failedApps, ad.AppName)
+			}
+		}
+	}
+
+	if len(failedApps) > 0 {
+		return fmt.Errorf("republish failed for apps: %s", strings.Join(failedApps, ", "))
+	}
 	return nil
 }
 

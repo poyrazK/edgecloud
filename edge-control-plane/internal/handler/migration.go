@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -74,25 +75,25 @@ func NewMigrationHandler(migrationSvc *service.MigrationService) *MigrationHandl
 func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	if tenantID == "" {
-		http.Error(w, `{"error":"missing tenant ID"}`, http.StatusUnauthorized)
+		httperror.UnauthorizedCtx(w, r, "missing tenant ID")
 		return
 	}
 
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
-		http.Error(w, `{"error":"failed to parse multipart form"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "failed to parse multipart form")
 		return
 	}
 
 	filename := r.MultipartForm.Value["filename"]
 	if len(filename) == 0 || filename[0] == "" {
-		http.Error(w, `{"error":"missing filename field"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "missing filename field")
 		return
 	}
 	// Reject path-traversal early — derived app_name is what actually gets
 	// written to the DB and used in the registry path. The service has a
 	// defense-in-depth check; this one gives a clear 400 to the client.
 	if containsPathTraversal(strings.TrimSuffix(filename[0], ".c")) {
-		http.Error(w, `{"error":"filename must not contain path-traversal characters"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "filename must not contain path-traversal characters")
 		return
 	}
 
@@ -104,20 +105,20 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 
 	fileParts := r.MultipartForm.File["file"]
 	if len(fileParts) == 0 {
-		http.Error(w, `{"error":"missing file field"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "missing file field")
 		return
 	}
 
 	srcFile, err := fileParts[0].Open()
 	if err != nil {
-		http.Error(w, `{"error": "failed to open file"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	defer srcFile.Close()
 
 	source, err := io.ReadAll(srcFile)
 	if err != nil {
-		http.Error(w, `{"error": "failed to read file"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -141,7 +142,7 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(report); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 	}
 }
 

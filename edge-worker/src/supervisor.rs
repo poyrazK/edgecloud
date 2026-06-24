@@ -191,6 +191,15 @@ impl Supervisor {
         let health_check_timeout_secs = self.config.health_check_timeout_secs;
         let allowlist = spec.allowlist.clone();
         let log_forwarder = self.log_forwarder.clone();
+        // Own tenant_id before the spawn — `start_app` borrows it as &str, but
+        // the tokio::spawn future must be 'static, so we move an owned String
+        // into the closure. The PR-side signature change already adds
+        // tenant_id to run_app_loop; this binding satisfies the borrow
+        // checker without changing the public surface. The original is moved
+        // into the closure; tenant_id_for_instance is the second copy used by
+        // the AppInstance registration below.
+        let tenant_id = tenant_id.to_string();
+        let tenant_id_for_instance = tenant_id.clone();
 
         // Spawn the per-app task and store the JoinHandle so we can
         // propagate panics when the app is stopped.
@@ -205,6 +214,7 @@ impl Supervisor {
                 max_memory_mb,
                 epoch_deadline_ticks,
                 health_check_timeout_secs,
+                tenant_id,
                 allowlist,
                 log_forwarder,
             )
@@ -216,7 +226,7 @@ impl Supervisor {
         let instance = Arc::new(Mutex::new(AppInstance {
             deployment_id: spec.deployment_id.clone(),
             app_name: app_name.to_string(),
-            tenant_id: tenant_id.to_string(),
+            tenant_id: tenant_id_for_instance,
             port: raw_port,
             status: AppInstanceStatus::Running,
             meter,
@@ -327,7 +337,8 @@ impl Supervisor {
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
         health_check_timeout_secs: u64,
-        allowlist: Vec<String>,
+        tenant_id: String,
+        allowlist: Option<Vec<String>>,
         log_forwarder: Arc<LogForwarder>,
     ) {
         let mut restart_count = 0u32;
@@ -359,6 +370,7 @@ impl Supervisor {
                         env.clone(),
                         max_memory_mb,
                         epoch_deadline_ticks,
+                        &tenant_id,
                         allowlist.clone(),
                         &app_name,
                         &log_forwarder,
@@ -448,21 +460,30 @@ impl Supervisor {
         env: HashMap<String, String>,
         max_memory_mb: u64,
         epoch_deadline_ticks: u64,
-        allowlist: Vec<String>,
+        tenant_id: &str,
+        allowlist: Option<Vec<String>>,
         app_name: &str,
         log_forwarder: &Arc<LogForwarder>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
-        // Build per-deployment egress policy from the tenant's allowlist.
-        let egress = Arc::new(EgressPolicy::new(allowlist));
+        // Build per-deployment egress policy.
+        // None = field absent or [] on the wire (old control plane) → allow-all.
+        // Some(list) = explicit allowlist → enforce it.
+        let egress = match allowlist {
+            None => Arc::new(EgressPolicy::allow_all()),
+            Some(list) => Arc::new(EgressPolicy::new(list)),
+        };
 
         // Build per-app LogContext — stamped onto every record this app emits
         // so the LogForwarder knows which tenant/app/deployment to attribute
         // the record to (worker_id/region are added inside the forwarder).
+        // tenant_id is taken from the execute_app parameter (which matches
+        // meter.tenant_id — they are both derived from the task message's
+        // tenant_id in start_app) so the parameter is meaningfully used.
         let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
             app_name: app_name.to_string(),
-            tenant_id: meter.tenant_id.clone(),
+            tenant_id: tenant_id.to_string(),
             deployment_id: meter.deployment_id.clone(),
         };
 

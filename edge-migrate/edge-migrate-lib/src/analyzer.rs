@@ -9,7 +9,7 @@
 //! analyzer silently falls back to the unexpanded source — never
 //! fail analysis because the preprocessor failed.
 
-use crate::patterns::{PatternKind, PatternMatch, PosixPattern, Transformability};
+use crate::patterns::{BoundVarDecl, PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::{Preprocessor, PreprocessorInfo};
 use tree_sitter::Parser;
 
@@ -182,12 +182,20 @@ impl CAnalyzer {
 
         let pattern = match func_name {
             "socket" => {
-                // Check if we can determine TCP vs UDP from arguments
+                // Check if we can determine TCP vs UDP from arguments.
+                // The POSIX signature is `socket(int domain, int type, int protocol)`
+                // so the type token (SOCK_STREAM / SOCK_DGRAM) is the
+                // SECOND argument. The previous version inspected the
+                // first arg because `get_call_args` returned the entire
+                // argument list as a single string (so the first "arg"
+                // was actually `(AF_INET, SOCK_STREAM, 0)`); that hack
+                // stopped working once `get_call_args` started returning
+                // individual args.
                 let args = self.get_call_args(source, node);
-                let p = if let Some(first_arg) = args.first() {
-                    if first_arg.contains("SOCK_STREAM") {
+                let p = if let Some(type_arg) = args.get(1) {
+                    if type_arg.contains("SOCK_STREAM") {
                         PosixPattern::SocketTcp
-                    } else if first_arg.contains("SOCK_DGRAM") {
+                    } else if type_arg.contains("SOCK_DGRAM") {
                         PosixPattern::SocketUdp
                     } else {
                         PosixPattern::SocketTcp // default to TCP
@@ -228,6 +236,26 @@ impl CAnalyzer {
         let end_byte = node.end_byte();
         let arg_nodes = self.get_call_args(source, node);
 
+        // For socket calls, classify the parent declaration context
+        // so we can either (a) capture a clean binding to rewrite the
+        // whole `int fd = socket(...)` line, or (b) flip the match
+        // to NotTransformable when the declaration is too complex to
+        // safely rewrite (e.g. `static int fd = socket(...)` — we
+        // can't drop the `static` without changing semantics).
+        let (bound_var, transformability) = if matches!(
+            pattern,
+            PatternKind::Posix(PosixPattern::SocketTcp | PosixPattern::SocketUdp)
+        ) {
+            match classify_socket_declaration_context(source, node) {
+                SocketDeclContext::Simple(bv) => (Some(bv), pattern.transformability()),
+                SocketDeclContext::Unsupported => (None, Transformability::NotTransformable),
+                SocketDeclContext::InsideOtherCall => (None, Transformability::NotTransformable),
+                SocketDeclContext::Bare => (None, pattern.transformability()),
+            }
+        } else {
+            (None, pattern.transformability())
+        };
+
         let mut results = vec![PatternMatch {
             line,
             column: Some(column),
@@ -236,7 +264,8 @@ impl CAnalyzer {
             pattern,
             snippet: snippet.clone(),
             arg_nodes: arg_nodes.clone(),
-            transformability: pattern.transformability(),
+            transformability,
+            bound_var,
         }];
 
         // Check for O_NONBLOCK in socket calls — adds a second PatternMatch
@@ -255,6 +284,11 @@ impl CAnalyzer {
                     snippet,
                     arg_nodes,
                     transformability: Transformability::NotTransformable,
+                    // NonBlocking is a side-effect match — there's
+                    // no socket declaration to bind. Reuse the
+                    // socket call's bound_var if it had one (so the
+                    // socket emission still rewrites the whole line).
+                    bound_var: None,
                 });
             }
         }
@@ -264,20 +298,135 @@ impl CAnalyzer {
 
     fn get_call_args(&self, source: &str, node: tree_sitter::Node) -> Vec<String> {
         let mut args = Vec::new();
-        // The call_expression structure: function arg1 arg2 ...
-        // child(0) = function, child(1..) = arguments
-        let _cursor = node.walk();
-        for i in 1..node.child_count() {
-            if let Some(arg_node) = node.child(i) {
-                let arg_text = arg_node
-                    .utf8_text(source.as_bytes())
-                    .unwrap_or("")
-                    .to_string();
-                args.push(arg_text);
+        // tree-sitter's C grammar structures a `call_expression` as:
+        //   child(0): the function expression (e.g. `accept`)
+        //   child(1): an `argument_list` node wrapping the parenthesized
+        //             arg list (e.g. `(fd, NULL, NULL)`)
+        //
+        // The previous version of this function iterated over
+        // `call_expression` children starting at index 1 and pushed the
+        // entire `argument_list` node (including its outer parens) as a
+        // single string. The transformer then emitted calls like
+        // `wasi_socket_tcp_accept((fd, NULL, NULL))` — the leading `(` is
+        // the original POSIX call's outer paren. Walk into the
+        // `argument_list` node and skip its `(` / `)` / `,` punctuation
+        // children so each emitted arg is a single C expression.
+        let Some(arg_list_node) = node.child(1) else {
+            return args;
+        };
+        if arg_list_node.kind() != "argument_list" {
+            return args;
+        }
+        for i in 0..arg_list_node.child_count() {
+            let Some(arg_node) = arg_list_node.child(i) else {
+                continue;
+            };
+            if matches!(arg_node.kind(), "(" | ")" | ",") {
+                continue;
             }
+            let arg_text = arg_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            args.push(arg_text);
         }
         args
     }
+}
+
+/// Result of inspecting the parent context of a `socket(...)`
+/// `call_expression`. See `classify_socket_declaration_context`.
+enum SocketDeclContext {
+    /// `socket(AF_INET, SOCK_STREAM, 0);` as a standalone statement
+    /// — no declaration to bind to.
+    Bare,
+    /// `int fd = socket(...)` — clean binding; rewrite the whole
+    /// declaration with the WASI return type.
+    Simple(BoundVarDecl),
+    /// `static int fd = socket(...)`, complex declarators
+    /// (`int arr[10] = socket(...)`, `int (*fp)() = socket(...)`),
+    /// etc. — the transformer cannot produce a valid emit. Caller
+    /// flips `transformability` to `NotTransformable` so the call
+    /// lands in `manual_review` with the original source preserved.
+    Unsupported,
+    /// `socket(...)` as the argument of an outer function call
+    /// (e.g. `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`).
+    /// The bare-expression emit form would leave the surrounding
+    /// `int fd = ...` with a stale `int` type — same class of bug
+    /// as #129, different syntactic shape. Caller flips
+    /// `transformability` to `NotTransformable`.
+    InsideOtherCall,
+}
+
+/// Classifies the parent context of a `socket(...)` call so the
+/// analyzer can decide what binding info (if any) to attach and
+/// whether to mark the match as `NotTransformable`. The MVP fix
+/// for #129 only handles the `Simple` case — everything in a
+/// `declaration` is rewritten as a single line with the right
+/// WASI return type. Other declaration contexts (complex
+/// declarators, storage-class qualifiers) are routed to
+/// `manual_review` rather than producing invalid C.
+fn classify_socket_declaration_context(
+    source: &str,
+    call_node: tree_sitter::Node,
+) -> SocketDeclContext {
+    let Some(parent) = call_node.parent() else {
+        return SocketDeclContext::Bare;
+    };
+    // `socket(...)` as the argument of an outer function call (e.g.
+    // `int fd = wrap(socket(AF_INET, SOCK_STREAM, 0));`) — the
+    // surrounding `int fd = ...` would end up with a stale `int` type
+    // if we emitted the bare `wasi_socket_tcp_create(...)` form.
+    // Same class of bug as #129, different syntactic shape. In
+    // tree-sitter's C grammar, the parent of an arg-position
+    // `call_expression` is an `argument_list` node (the whole
+    // parenthesized list); the `arguments` node is for definitions
+    // like `int f(int x)`.
+    if parent.kind() == "argument_list" {
+        return SocketDeclContext::InsideOtherCall;
+    }
+    if parent.kind() != "init_declarator" {
+        return SocketDeclContext::Bare;
+    }
+    let init = parent;
+    let Some(decl) = init.parent() else {
+        return SocketDeclContext::Bare;
+    };
+    if decl.kind() != "declaration" {
+        return SocketDeclContext::Bare;
+    }
+    // We're inside an `init_declarator` of a `declaration`.
+    // Determine whether the declaration is "simple enough" to
+    // safely rewrite.
+    //
+    // The init_declarator's first child should be the declarator.
+    // For simple cases it's an `identifier` (e.g. `fd`). For complex
+    // declarators it's a `pointer_declarator` / `array_declarator` /
+    // `function_declarator` — those we don't attempt to handle in MVP.
+    let Some(name_node) = init.child(0) else {
+        return SocketDeclContext::Unsupported;
+    };
+    if name_node.kind() != "identifier" {
+        return SocketDeclContext::Unsupported;
+    }
+    // Storage-class or type qualifiers on the surrounding declaration
+    // (static, extern, volatile, const, ...) would be silently dropped
+    // by a type-only rewrite. Conservatively refuse.
+    for i in 0..decl.child_count() {
+        if let Some(child) = decl.child(i) {
+            if matches!(child.kind(), "storage_class_specifier" | "type_qualifier") {
+                return SocketDeclContext::Unsupported;
+            }
+        }
+    }
+    let Ok(name) = name_node.utf8_text(source.as_bytes()) else {
+        return SocketDeclContext::Unsupported;
+    };
+    SocketDeclContext::Simple(BoundVarDecl {
+        name: name.to_string(),
+        decl_start_byte: decl.start_byte(),
+        decl_end_byte: decl.end_byte(),
+    })
 }
 
 impl Default for CAnalyzer {
@@ -545,5 +694,83 @@ int main(void) {
             .expect("socket match should be present");
         let col = socket_match.column.expect("column must be populated");
         assert_eq!(col, 13, "expected column 13, got {}", col);
+    }
+
+    #[test]
+    fn test_get_call_args_extracts_individual_arguments() {
+        // Regression test for the pre-fix `get_call_args` bug: the
+        // old version returned the entire argument list as a single
+        // string, so a call like `bind(fd, (struct sockaddr*)&addr,
+        // sizeof(addr))` produced `arg_nodes = ["(fd, (struct
+        // sockaddr*)&addr, sizeof(addr))"]` — including the outer
+        // parens. The transformer then emitted calls like
+        // `wasi_socket_tcp_start_bind((fd, ...), ...)` with extra
+        // parens that the clang syntax check would reject.
+        let mut analyzer = CAnalyzer::new();
+        let source = "int main() {\n    bind(fd, (struct sockaddr*)&addr, sizeof(addr));\n}\n";
+        let matches = analyzer.analyze(source);
+        let bind_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::Bind)))
+            .expect("bind match should be present");
+        assert_eq!(
+            bind_match.arg_nodes,
+            vec![
+                "fd".to_string(),
+                "(struct sockaddr*)&addr".to_string(),
+                "sizeof(addr)".to_string(),
+            ],
+            "arg_nodes must hold three individual C expressions, \
+             NOT a single string containing the outer parens"
+        );
+    }
+
+    #[test]
+    fn test_get_call_args_three_arg_socket_call() {
+        // `socket(AF_INET, SOCK_STREAM, 0)` — three primitive args.
+        // Each should be returned verbatim with no leading/trailing
+        // parens or commas.
+        let mut analyzer = CAnalyzer::new();
+        let source = "int main() {\n    int fd = socket(AF_INET, SOCK_STREAM, 0);\n}\n";
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)))
+            .expect("socket match should be present");
+        assert_eq!(
+            socket_match.arg_nodes,
+            vec![
+                "AF_INET".to_string(),
+                "SOCK_STREAM".to_string(),
+                "0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_analyzer_socket_inside_outer_call_is_not_transformable() {
+        // Follow-up to #129: when `socket(...)` is the argument of
+        // an outer function call, the surrounding `int fd = ...`
+        // would end up with a stale `int` type if we emitted the
+        // bare `wasi_socket_tcp_create(...)` form. The classifier
+        // must detect this and flip the match to NotTransformable
+        // so it lands in manual_review.
+        let mut analyzer = CAnalyzer::new();
+        let source =
+            "int main() { int fd = wrap(socket(AF_INET, SOCK_STREAM, 0)); return 0; }\n";
+        let matches = analyzer.analyze(source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)))
+            .expect("socket match should be present");
+        assert_eq!(
+            socket_match.transformability,
+            Transformability::NotTransformable,
+            "socket inside outer call must be NotTransformable"
+        );
+        assert!(
+            socket_match.bound_var.is_none(),
+            "socket inside outer call must NOT have a bound_var (no declaration to bind to)"
+        );
     }
 }

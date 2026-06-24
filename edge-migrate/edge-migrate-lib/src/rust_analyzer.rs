@@ -145,6 +145,7 @@ impl RustAnalyzer {
             snippet,
             arg_nodes,
             transformability: pattern.transformability(),
+            bound_var: None,
         }
     }
 }

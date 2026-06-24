@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -27,28 +28,28 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	if appName == "" {
-		http.Error(w, `{"error": "app name required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	var req domain.CreateAppRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 
 	app, err := h.appSvc.Create(r.Context(), tenantID, appName, &req)
 	if err != nil {
 		if errors.Is(err, service.ErrAppAlreadyExists) {
-			http.Error(w, `{"error": "app already exists"}`, http.StatusConflict)
+			httperror.ConflictCtx(w, r, "app already exists")
 			return
 		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
-			http.Error(w, `{"error": "max apps quota exceeded"}`, http.StatusTooManyRequests)
+			httperror.QuotaExceededCtx(w, r, "max apps quota exceeded")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -77,7 +78,7 @@ func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	apps, err := h.appSvc.List(r.Context(), tenantID, limit, offset)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -98,11 +99,11 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 	app, err := h.appSvc.Get(r.Context(), tenantID, appName)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if app == nil {
-		http.Error(w, `{"error": "app not found"}`, http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "app not found")
 		return
 	}
 
@@ -116,18 +117,18 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	appName := r.PathValue("appName")
 
 	if appName == "" {
-		http.Error(w, `{"error": "app name required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "app name required")
 		return
 	}
 
 	err := h.appSvc.Delete(r.Context(), tenantID, appName)
 	if err != nil {
 		if errors.Is(err, service.ErrAppNotFound) {
-			http.Error(w, `{"error": "app not found"}`, http.StatusNotFound)
+			httperror.NotFoundCtx(w, r, "app not found")
 			return
 		}
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 

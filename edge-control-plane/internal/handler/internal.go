@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -35,13 +36,13 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
 	if err != nil || deployment == nil {
-		http.Error(w, "not found", http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "not found")
 		return
 	}
 
 	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID)
 	if err != nil {
-		http.Error(w, "artifact not found", http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "artifact not found")
 		return
 	}
 	defer artifact.Close()
@@ -59,25 +60,25 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	var req domain.RegisterWorkerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	// Validate required fields.
 	if req.WorkerID == "" || req.Region == "" {
-		http.Error(w, "worker_id and region are required", http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "worker_id and region are required")
 		return
 	}
 	if err := h.workerSvc.Register(r.Context(), tenantID, &req); err != nil {
 		switch {
 		case errors.Is(err, service.ErrInvalidWorkerID):
-			http.Error(w, `{"error": "invalid worker ID"}`, http.StatusBadRequest)
+			httperror.BadRequestCtx(w, r, "invalid worker ID")
 		case errors.Is(err, service.ErrRegionMismatch):
-			http.Error(w, `{"error": "region mismatch"}`, http.StatusBadRequest)
+			httperror.BadRequestCtx(w, r, "region mismatch")
 		case errors.Is(err, service.ErrQuotaExceeded):
-			http.Error(w, `{"error": "quota exceeded"}`, http.StatusTooManyRequests)
+			httperror.QuotaExceededCtx(w, r, "quota exceeded")
 		default:
 			log.Printf("internal error: %v", err)
-			http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+			httperror.InternalErrorCtx(w, r)
 		}
 		return
 	}
@@ -89,7 +90,7 @@ func (h *InternalHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	workers, err := h.workerSvc.ListByTenant(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, "failed to list workers", http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	resp := map[string]interface{}{"workers": workers}

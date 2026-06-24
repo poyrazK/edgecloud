@@ -36,11 +36,28 @@ impl EgressPolicy {
     }
 
     /// Unrestricted policy — allows any host that isn't hard-denied.
-    /// Used only in unit tests and `#[cfg(test)]` RuntimeState constructors.
-    #[cfg(test)]
-    pub(crate) fn allow_all() -> Self {
+    /// Used for rolling-upgrade backward compatibility when a TaskMessage has
+    /// no `allowlist` field (pre-enforcement control planes) and in tests.
+    pub fn allow_all() -> Self {
         Self {
             allowlist: vec!["*".to_string()],
+        }
+    }
+
+    /// Check whether a resolved IP address is in a hard-deny range.
+    ///
+    /// Called after DNS resolution to detect rebinding attacks: an allowlisted
+    /// hostname may be redirected to a private/metadata IP via a zero-TTL record.
+    /// Returns `Err(reason)` if the IP is blocked.
+    pub fn check_resolved_ip(&self, ip: IpAddr) -> Result<(), String> {
+        if is_blocked_ip(ip) {
+            Err(format!(
+                "egress denied: hostname resolved to blocked IP {} \
+                 (loopback/private/link-local/metadata)",
+                ip
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -109,11 +126,11 @@ impl EgressPolicy {
 
         // Match each allowlist entry against the request host.
         for entry in &self.allowlist {
-            if let Some(_bare) = entry.strip_prefix("*.") {
+            if let Some(bare) = entry.strip_prefix("*.") {
                 // Wildcard suffix pattern: *.stripe.com matches api.stripe.com
                 // but not a.b.stripe.com or evil-stripe.com.
                 let suffix = &entry[1..];
-                if host_str == _bare {
+                if host_str == bare {
                     // Bare apex: "stripe.com" matches "*.stripe.com".
                     return Ok(());
                 }
@@ -416,5 +433,53 @@ mod tests {
         let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
         // Port is part of authority but host_str() strips it.
         assert!(policy.check("https://api.example.com:8443/v1/").is_ok());
+    }
+
+    // ── check_resolved_ip: DNS rebinding guard ───────────────────────────
+
+    #[test]
+    fn resolved_ip_loopback_denied() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_resolved_ip("127.0.0.1".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn resolved_ip_link_local_denied() {
+        let policy = EgressPolicy::allow_all();
+        // AWS/GCP/Azure metadata endpoint
+        assert!(policy
+            .check_resolved_ip("169.254.169.254".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn resolved_ip_private_denied() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_resolved_ip("10.0.0.1".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_resolved_ip("192.168.1.1".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn resolved_ip_ipv6_ula_denied() {
+        let policy = EgressPolicy::allow_all();
+        // AWS IMDSv2 IPv6 endpoint
+        assert!(policy
+            .check_resolved_ip("fd00:ec2::254".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn resolved_ip_public_allowed() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_resolved_ip("93.184.216.34".parse().unwrap())
+            .is_ok());
+        assert!(policy.check_resolved_ip("8.8.8.8".parse().unwrap()).is_ok());
     }
 }

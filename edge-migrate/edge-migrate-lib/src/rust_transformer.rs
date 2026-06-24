@@ -219,25 +219,18 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
             "UdpSocket::new(AddressFamily::Ipv4)?.start_bind({})?.finish_bind()",
             arg(0)?
         ),
-        // BestEffort — wrap in poll loop. The receiver is bound to
-        // `_self` because the original expression was a method call
-        // (`listener.accept()`); we don't know its name statically.
-        RustPattern::TcpAccept => "\
-{
-    // TODO: replace busy-spin with wasi::io poll subscription
-    let _self = self;
-    loop {
-        match _self.accept() {
-            Ok((s, _addr)) => break s,
-            Err(_) => std::thread::yield_now(),
-        }
-    }
-}"
-        .to_string(),
         // NotTransformable variants should have been partitioned out
         // by the caller. If we reach them here, emit an empty string
         // (no replacement) and let the caller record nothing.
-        RustPattern::UdpConnect | RustPattern::ProcessExit => String::new(),
+        //
+        // #128: TcpAccept was BestEffort (busy-spin poll loop) and is
+        // now NotTransformable — the busy-spin was a placeholder for
+        // a real wasi:io pollable subscription that doesn't exist in
+        // MVP. We retain it in this catch-all so a partition bug
+        // surfaces as "no emit" rather than the broken busy-spin
+        // emit. The transformability flip in `patterns.rs` keeps the
+        // match out of `sorted` entirely.
+        RustPattern::TcpAccept | RustPattern::UdpConnect | RustPattern::ProcessExit => String::new(),
         RustPattern::FsOpen => format!("filesystem::open({})", arg(0)?),
         RustPattern::FsRead => format!("filesystem::read({})", arg(0)?),
         RustPattern::FsWrite => format!("filesystem::write({}, {})", arg(0)?, arg(1)?),
@@ -309,20 +302,45 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_accept_emits_poll_loop() {
+    fn test_transform_accept_not_transformable_in_mvp() {
+        // #128: TcpAccept was BestEffort (busy-spin poll loop) and is
+        // now NotTransformable. The previous emit referenced
+        // `std::thread::yield_now` as a placeholder for a real
+        // wasi:io pollable subscription that doesn't exist in MVP.
+        // The MVP fix: leave the original `listener.accept()` in the
+        // source verbatim and report it as manual_review.
         let src = "fn main() {\n    let _ = listener.accept();\n}\n";
         let m = match_at(
             src,
             "listener.accept()",
             RustPattern::TcpAccept,
-            Transformability::BestEffort,
+            Transformability::NotTransformable,
             vec![],
         );
         let r = RustTransformer::new().transform(src, vec![m]);
-        assert!(r.transformed_source.contains("loop"));
-        assert!(r.transformed_source.contains("match"));
-        assert!(r.transformed_source.contains("std::thread::yield_now"));
-        assert!(r.transformed_source.contains("TODO"));
+        // 0 transformations applied — the match was routed to
+        // manual_review by the partition.
+        assert_eq!(r.transformations_applied.len(), 0);
+        assert_eq!(r.manual_review.len(), 1);
+        assert_eq!(
+            r.manual_review[0].pattern,
+            PatternKind::Rust(RustPattern::TcpAccept)
+        );
+        // Original POSIX call preserved verbatim.
+        assert!(
+            r.transformed_source.contains("listener.accept()"),
+            "original accept() should be preserved; got:\n{}",
+            r.transformed_source
+        );
+        // Broken busy-spin emit is GONE.
+        assert!(
+            !r.transformed_source.contains("std::thread::yield_now"),
+            "the broken busy-spin emit should NOT appear"
+        );
+        assert!(
+            !r.transformed_source.contains("TODO"),
+            "the TODO placeholder should NOT appear in the output"
+        );
     }
 
     #[test]

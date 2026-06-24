@@ -327,6 +327,7 @@ mod tests {
                     "0".to_string(),
                 ],
                 transformability: Transformability::AutoTransformable,
+                bound_var: None,
             },
             PatternMatch {
                 line: 2,
@@ -337,6 +338,7 @@ mod tests {
                 snippet: "connect(fd, ...)".to_string(),
                 arg_nodes: vec!["fd".to_string(), "...".to_string()],
                 transformability: Transformability::AutoTransformable,
+                bound_var: None,
             },
         ];
         let report = MigrationReport::from_pattern_matches("hello_world", matches);
@@ -360,6 +362,7 @@ mod tests {
                     "0".to_string(),
                 ],
                 transformability: Transformability::AutoTransformable,
+                bound_var: None,
             },
             PatternMatch {
                 line: 2,
@@ -370,6 +373,7 @@ mod tests {
                 snippet: "poll(fds, 2, timeout)".to_string(),
                 arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
                 transformability: Transformability::NotTransformable,
+                bound_var: None,
             },
         ];
         let report = MigrationReport::from_pattern_matches("hello_world", matches);
@@ -389,6 +393,7 @@ mod tests {
             snippet: "fork()".to_string(),
             arg_nodes: vec![],
             transformability: Transformability::NotTransformable,
+            bound_var: None,
         }];
         let report = MigrationReport::from_pattern_matches("hello_world", matches);
         assert!(!report.is_migratable());
@@ -410,6 +415,7 @@ mod tests {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let report = MigrationReport::from_pattern_matches("hello", matches);
         let out = TransformOutput {
@@ -481,6 +487,7 @@ mod tests {
                 "0".to_string(),
             ],
             transformability: Transformability::AutoTransformable,
+            bound_var: None,
         }];
         let pp = PreprocessorInfo {
             clang_version: Some("clang version 17.0.0".to_string()),
