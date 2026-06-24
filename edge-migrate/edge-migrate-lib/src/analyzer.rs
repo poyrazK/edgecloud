@@ -95,19 +95,23 @@ impl CAnalyzer {
         // for the duration of tree-sitter parsing. We avoid `Box::leak`
         // by keeping the owned `String` in a local binding. The
         // `ExpandedSource` is captured by the `Ok` arm only; on error
-        // or no preprocessor, `line_map` is empty (identity mapping).
+        // or no preprocessor, `line_map`/`byte_map` are empty (identity
+        // mapping).
         let owned: String;
         let line_map: Vec<u32>;
+        let byte_map: Vec<(u32, u32)>;
         let pp_info: Option<PreprocessorInfo>;
         let parse_source: &str = match self.preprocessor.as_ref() {
             None => {
                 line_map = Vec::new();
+                byte_map = Vec::new();
                 pp_info = None;
                 source
             }
             Some(pp) => match pp.expand(source, DEFAULT_FILENAME_HINT) {
                 Ok(expanded) => {
                     line_map = expanded.line_map;
+                    byte_map = expanded.byte_map;
                     let macros = expanded.macros_expanded;
                     let clang_version = pp.clang_version();
                     owned = expanded.text;
@@ -124,6 +128,7 @@ impl CAnalyzer {
                         e
                     );
                     line_map = Vec::new();
+                    byte_map = Vec::new();
                     pp_info = None;
                     source
                 }
@@ -136,20 +141,69 @@ impl CAnalyzer {
         let root = tree.root_node();
         let mut matches = Vec::new();
         self.walk_node(parse_source, root, &mut matches);
-        // Remap line numbers back to the original source. Matches
-        // whose line is synthetic (line_map entry is 0) keep their
-        // expanded line number — a known limitation of clang's
-        // best-effort linemarker output.
+        // Remap line numbers and byte ranges back to the original
+        // source. Matches whose expanded line is synthetic (line_map
+        // entry is 0) keep their expanded line number — a known
+        // limitation of clang's best-effort linemarker output. Same
+        // applies to byte ranges: synthetic lines (byte_map entry has
+        // u32::MAX for original_byte) keep their expanded byte values.
         if !line_map.is_empty() {
             for m in &mut matches {
-                if m.line >= 1 {
-                    let idx = m.line - 1;
-                    if let Some(&orig) = line_map.get(idx) {
-                        if orig >= 1 {
-                            m.line = orig as usize;
+                let expanded_row = m.line.saturating_sub(1);
+                // 1. Line remap.
+                if let Some(&orig_line) = line_map.get(expanded_row) {
+                    if orig_line >= 1 {
+                        m.line = orig_line as usize;
+                    }
+                }
+                // 2. Byte remap. For the common case (single-line
+                // matches) we use the same expanded_row for both start
+                // and end; this is exact via linear interpolation.
+                // For multi-line matches this is best-effort — the
+                // transformer has a sanity guard for the synthetic
+                // case.
+                if !byte_map.is_empty() {
+                    if let Some(&(exp_start, orig_start)) = byte_map.get(expanded_row) {
+                        if orig_start != u32::MAX {
+                            let col_start = m.start_byte.saturating_sub(exp_start as usize);
+                            m.original_start_byte = orig_start as usize + col_start;
+                        }
+                    }
+                    if let Some(&(exp_end, orig_end)) = byte_map.get(expanded_row) {
+                        if orig_end != u32::MAX {
+                            let col_end = m.end_byte.saturating_sub(exp_end as usize);
+                            m.original_end_byte = orig_end as usize + col_end;
+                        }
+                    }
+                    // Also remap bound_var decl bytes if present.
+                    if let Some(bv) = m.bound_var.as_mut() {
+                        // bound_var uses decl_start_byte/decl_end_byte
+                        // captured from the same decl node. For
+                        // single-line declarations (the common case
+                        // for `int fd = socket(...);`) the same
+                        // expanded_row works. For multi-line decls
+                        // (e.g. with macro-spanning initializers) this
+                        // is best-effort.
+                        if let Some(&(exp_start, orig_start)) = byte_map.get(expanded_row) {
+                            if orig_start != u32::MAX {
+                                let col_start =
+                                    bv.decl_start_byte.saturating_sub(exp_start as usize);
+                                bv.original_decl_start_byte = orig_start as usize + col_start;
+                            }
+                        }
+                        if let Some(&(exp_end, orig_end)) = byte_map.get(expanded_row) {
+                            if orig_end != u32::MAX {
+                                let col_end =
+                                    bv.decl_end_byte.saturating_sub(exp_end as usize);
+                                bv.original_decl_end_byte = orig_end as usize + col_end;
+                            }
                         }
                     }
                 }
+                // else: byte_map is empty (no preprocessor / fallback),
+                // original_start_byte and original_end_byte stay equal
+                // to start_byte / end_byte (the values set in
+                // match_call_node and classify_socket_declaration_context).
             }
         }
         matches.sort_by_key(|m| m.line);
@@ -261,6 +315,8 @@ impl CAnalyzer {
             column: Some(column),
             start_byte,
             end_byte,
+            original_start_byte: start_byte,
+            original_end_byte: end_byte,
             pattern,
             snippet: snippet.clone(),
             arg_nodes: arg_nodes.clone(),
@@ -280,6 +336,8 @@ impl CAnalyzer {
                     column: Some(column),
                     start_byte,
                     end_byte,
+                    original_start_byte: start_byte,
+                    original_end_byte: end_byte,
                     pattern: PatternKind::Posix(PosixPattern::NonBlocking),
                     snippet,
                     arg_nodes,
@@ -426,6 +484,8 @@ fn classify_socket_declaration_context(
         name: name.to_string(),
         decl_start_byte: decl.start_byte(),
         decl_end_byte: decl.end_byte(),
+        original_decl_start_byte: decl.start_byte(),
+        original_decl_end_byte: decl.end_byte(),
     })
 }
 

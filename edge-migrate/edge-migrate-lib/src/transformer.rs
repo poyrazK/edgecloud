@@ -86,15 +86,16 @@ impl Transformer {
 
         manual_review.extend(not_transformable);
 
-        // Sort by start_byte ASCENDING — process from start of file forward.
-        // The previous version sorted DESCENDING and APPENDED each
-        // match's gap+replacement to the output, which produced a
-        // REVERSED output (the source's beginning ended up at the end
-        // of the file). The Rust `RustTransformer::transform` already
-        // uses this correct ASCENDING order; the C transformer is
-        // now aligned with it.
+        // Sort by ORIGINAL start_byte ASCENDING — process from start of
+        // file forward. We use `original_start_byte` (not `start_byte`)
+        // because `start_byte` is in expanded-source coordinates when a
+        // preprocessor is attached; slicing the ORIGINAL source with
+        // expanded bytes overflows the source length and panics.
+        // `original_start_byte` equals `start_byte` when no preprocessor
+        // is attached (identity mapping), so the no-preprocessor path is
+        // unchanged.
         let mut sorted = transformable;
-        sorted.sort_by_key(|m| m.start_byte);
+        sorted.sort_by_key(|m| m.original_start_byte);
 
         let source_bytes = source.as_bytes();
 
@@ -117,7 +118,8 @@ impl Transformer {
             // the whole `int fd = socket(...)` line — replacing the
             // stale `int` type with `wasi_socket_tcp_t *` to match
             // the WASI create() return type. Otherwise replace just
-            // the call itself.
+            // the call itself. All byte ranges here are in ORIGINAL
+            // source coordinates (post-remap through the preprocessor).
             let (orig_start, orig_end) = match &m.bound_var {
                 Some(bv)
                     if matches!(
@@ -125,10 +127,31 @@ impl Transformer {
                         PatternKind::Posix(PosixPattern::SocketTcp | PosixPattern::SocketUdp)
                     ) =>
                 {
-                    (bv.decl_start_byte, bv.decl_end_byte)
+                    (bv.original_decl_start_byte, bv.original_decl_end_byte)
                 }
-                _ => (m.start_byte, m.end_byte),
+                _ => (m.original_start_byte, m.original_end_byte),
             };
+
+            // Sanity guard for synthetic-line matches (byte_map entry
+            // was `u32::MAX`, couldn't be remapped). Such matches are
+            // best-effort and should not be sliced — route to
+            // manual_review instead. Without this guard, orig_end
+            // would be `usize::MAX` (overflow) or some out-of-range
+            // value, and the `extend_from_slice` below would panic.
+            if orig_end > source_bytes.len()
+                || orig_start > orig_end
+                || orig_start == usize::MAX
+                || orig_end == usize::MAX
+            {
+                tracing::warn!(
+                    "skipping match on synthetic line (orig_start={}, orig_end={}, source_len={}); routing to manual_review",
+                    orig_start,
+                    orig_end,
+                    source_bytes.len()
+                );
+                manual_review.push(m.clone());
+                continue;
+            }
 
             // Copy original content from prev_end to orig_start — the
             // gap between the previous match's end and this match's
@@ -362,6 +385,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec![
@@ -393,6 +418,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Poll),
             snippet: "poll(fds, 2, timeout)".to_string(),
             arg_nodes: vec!["fds".to_string(), "2".to_string(), "timeout".to_string()],
@@ -419,6 +446,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec![
@@ -454,6 +483,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Connect),
             snippet: "connect(fd, (struct sockaddr*)&addr, sizeof(addr))".to_string(),
             arg_nodes: vec![
@@ -489,6 +520,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Recv),
             snippet: "recv(fd, buf, len, 0)".to_string(),
             arg_nodes: vec![
@@ -520,6 +553,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Send),
             snippet: "send(fd, buf, len, 0)".to_string(),
             arg_nodes: vec![
@@ -562,6 +597,8 @@ int main() {
             column: None,
             start_byte: call_start,
             end_byte: call_end,
+            original_start_byte: call_start,
+            original_end_byte: call_end,
             pattern: PatternKind::Posix(PosixPattern::Accept),
             snippet: "accept(fd, NULL, NULL)".to_string(),
             arg_nodes: vec!["fd".to_string(), "NULL".to_string(), "NULL".to_string()],
@@ -606,6 +643,8 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::SocketTcp),
             snippet: "socket(AF_INET, SOCK_STREAM, 0)".to_string(),
             arg_nodes: vec![
@@ -623,6 +662,8 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
@@ -639,6 +680,8 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::Bind),
             snippet: "bind(fd, &addr, len)".to_string(),
             arg_nodes: vec!["fd".to_string(), "&addr".to_string(), "len".to_string()],
@@ -652,6 +695,8 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::Listen),
             snippet: "listen(fd, 128)".to_string(),
             arg_nodes: vec!["fd".to_string(), "128".to_string()],
@@ -669,6 +714,8 @@ int main() {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::Fopen),
             snippet: r#"fopen("foo,bar", "r")"#.to_string(),
             arg_nodes: vec![r#"foo,bar"#.to_string(), r#""r""#.to_string()],
