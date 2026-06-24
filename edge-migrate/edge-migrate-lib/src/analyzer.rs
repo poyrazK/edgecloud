@@ -218,17 +218,77 @@ impl CAnalyzer {
                     // The search is bounded by `SEARCH_BUDGET` bytes
                     // so a worst-case fallback never overruns.
                     if m.original_start_byte <= source.len() {
-                        if let Some(head) = snippet_head_token(&m.snippet) {
-                            if !source[m.original_start_byte..].starts_with(head) {
-                                if let Some(found) =
-                                    find_snippet_in_source(source, head, m.original_start_byte)
-                                {
-                                    let found = found
-                                        .min(m.original_start_byte + SEARCH_BUDGET)
-                                        .min(source.len());
+                        // Use the args-tail (everything from the first
+                        // `(` to the end of the snippet) as the search
+                        // needle rather than the function-name head.
+                        // Across macro expansion the function name
+                        // changes (`socket(...)` → `make_socket(...)`)
+                        // but the parenthesized argument list is the
+                        // same in the expanded source. This makes the
+                        // call-site search robust to function-name
+                        // renames while still anchoring to a unique
+                        // substring of the call.
+                        //
+                        // After locating the args-tail in the original
+                        // source, walk back to the start of the
+                        // identifier preceding the `(` so the slice
+                        // still includes the function name (needed
+                        // for the transformer's gap-copy logic to
+                        // recognize the call). If no identifier
+                        // precedes the `(`, fall back to the
+                        // args-only span.
+                        //
+                        // If the args-tail can't be located in the
+                        // original source (typical when nested macros
+                        // expand the arguments themselves — e.g.
+                        // `AF_INET` → `2` inside `socket(2, 1, 0)`),
+                        // route to `manual_review` via the synthetic
+                        // `u32::MAX` sentinel: the transformer's
+                        // sanity guard at `transformer.rs` skips the
+                        // match and puts it in `manual_review`. This
+                        // is safer than letting a wrong-but-in-bounds
+                        // range silently slice into adjacent code.
+                        if let Some(args) = snippet_args_tail(&m.snippet) {
+                            // Only refine when the args-tail is not
+                            // already at or very near the byte_map
+                            // hint. Using `contains` would mask the
+                            // sparse-linemarker case where the hint
+                            // points at byte 0 but the actual call
+                            // site is elsewhere in the source.
+                            let hint = m.original_start_byte;
+                            let already_at_hint = hint + SEARCH_BUDGET <= source.len()
+                                && source[hint..hint + SEARCH_BUDGET].contains(args);
+                            if !already_at_hint {
+                                if let Some(found) = find_snippet_in_source(
+                                    source,
+                                    args,
+                                    hint,
+                                ) {
+                                    let found = found.min(source.len());
+                                    // Walk back from the args-tail
+                                    // start to find the identifier
+                                    // (function name) preceding the
+                                    // `(`. The walk skips whitespace
+                                    // and stops at the first
+                                    // non-identifier byte. This gives
+                                    // us the full call expression in
+                                    // the original source.
+                                    let call_start =
+                                        walk_back_to_call_start(source, found);
                                     let len = m.end_byte.saturating_sub(m.start_byte);
-                                    m.original_start_byte = found;
-                                    m.original_end_byte = (found + len).min(source.len());
+                                    m.original_start_byte = call_start;
+                                    m.original_end_byte =
+                                        (call_start + len).min(source.len());
+                                } else {
+                                    // Args-tail not found in original.
+                                    // Likely nested macro expansion in
+                                    // the arguments themselves. Route
+                                    // to manual_review via the
+                                    // synthetic-line sentinel; the
+                                    // transformer's sanity guard will
+                                    // skip the match.
+                                    m.original_start_byte = u32::MAX as usize;
+                                    m.original_end_byte = u32::MAX as usize;
                                 }
                             }
                         }
@@ -522,19 +582,48 @@ impl CAnalyzer {
     }
 }
 
-/// Extract the head token of a snippet — the function name up to the
-/// first `(` or whitespace. Used by the byte-remap fallback to search
-/// the original source for the call site. Returns `None` if the
-/// snippet is empty.
-fn snippet_head_token(snippet: &str) -> Option<&str> {
+/// Extract the parenthesized argument tail of a snippet — everything
+/// from the first `(` to the end. Used by the call-site refinement
+/// as a more stable anchor than the function name across macro
+/// expansion: `make_socket(2, 1, 0)` and `socket(2, 1, 0)` both
+/// contain `(2, 1, 0)`. Returns `None` if the snippet has no `(` or
+/// is empty.
+fn snippet_args_tail(snippet: &str) -> Option<&str> {
     let trimmed = snippet.trim();
-    if trimmed.is_empty() {
-        return None;
+    let paren_idx = trimmed.find('(')?;
+    Some(&trimmed[paren_idx..])
+}
+
+/// Walk back from `paren_byte` (which must point at the `(` of a
+/// call expression) to find the start of the preceding identifier
+/// (the function name). Skips ASCII whitespace; stops at the first
+/// non-identifier, non-whitespace byte. Returns `paren_byte` itself
+/// if no identifier precedes it (e.g. parenthesized expressions
+/// like `(a)(b)`). Used by the args-tail call-site refinement to
+/// produce a slice that includes the call's function name as well
+/// as its argument list.
+fn walk_back_to_call_start(source: &str, paren_byte: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = paren_byte;
+    // Skip whitespace between identifier and `(`.
+    while pos > 0 && bytes[pos - 1].is_ascii_whitespace() {
+        pos -= 1;
     }
-    let end = trimmed
-        .find(|c: char| c == '(' || c.is_whitespace())
-        .unwrap_or(trimmed.len());
-    Some(&trimmed[..end])
+    // Walk back over the identifier characters.
+    let mut end = pos;
+    while end > 0 {
+        let c = bytes[end - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    if end < pos {
+        end // walked at least one identifier char
+    } else {
+        paren_byte // no identifier before `(`
+    }
 }
 
 /// Search `source` for the first occurrence of `needle` at or after
@@ -1045,6 +1134,85 @@ int main(void) {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_analyzer_bare_macro_routes_to_manual_review() {
+        // Regression test for finding #3 (Bare+macro call-site). The
+        // previous call-site refinement searched for the snippet's
+        // **head token** (the function name) in the original source.
+        // For the `Bare` case (no `bound_var`) where a macro
+        // renames the function — `#define socket(...) make_socket(...)`
+        // — the expanded snippet is `make_socket(...)` but the
+        // original source has `socket(...)`. The head-token search
+        // missed the call site and the byte_map's linear-interp
+        // result leaked through, slicing into adjacent code.
+        //
+        // The post-fix refinement uses the **args-tail**
+        // (everything from the first `(` onward), which is stable
+        // across function-name renames. If the args-tail can't be
+        // located in the original (typical when nested macros
+        // expand arguments themselves, e.g. `AF_INET` → `2`),
+        // the match is routed to `manual_review` via the `u32::MAX`
+        // sentinel — the transformer's sanity guard then skips it.
+        //
+        // Skipped without clang. The fixture's macro expands
+        // `socket` to `make_socket`, a non-POSIX name, so the
+        // analyzer may not detect a SocketTcp match at all. The
+        // assertions therefore gate on a match being found.
+        let Some(pp) = crate::preprocessor::Preprocessor::discover() else {
+            eprintln!("skipping: clang not found");
+            return;
+        };
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("testdata")
+            .join("macro_bare_socket.c");
+        let source = std::fs::read_to_string(&fixture_path).expect("read fixture");
+        let source_bytes = source.as_bytes();
+        let mut analyzer = CAnalyzer::with_preprocessor(pp);
+        let (matches, _pp_info) = analyzer.analyze_with_preprocessor_info(&source);
+        let socket_match = matches
+            .iter()
+            .find(|m| matches!(m.pattern, PatternKind::Posix(PosixPattern::SocketTcp)));
+        if let Some(m) = socket_match {
+            // The match's byte range must either:
+            //   1. Be in-bounds and within the original source, OR
+            //   2. Be the u32::MAX sentinel (routed to manual_review).
+            let is_in_bounds =
+                m.original_end_byte <= source_bytes.len()
+                    && m.original_start_byte <= m.original_end_byte;
+            let is_sentinel = m.original_start_byte == u32::MAX as usize
+                && m.original_end_byte == u32::MAX as usize;
+            assert!(
+                is_in_bounds || is_sentinel,
+                "Bare+macro match has neither in-bounds range nor u32::MAX sentinel: \
+                 original_start_byte={}, original_end_byte={}, source_len={}",
+                m.original_start_byte,
+                m.original_end_byte,
+                source_bytes.len()
+            );
+            // If the match was NOT routed to manual_review, the byte
+            // range must contain the call site in the original source.
+            // We test by slicing (only safe when in-bounds).
+            if is_in_bounds {
+                let sliced = &source_bytes[m.original_start_byte..m.original_end_byte];
+                let sliced_str = std::str::from_utf8(sliced).unwrap_or("");
+                assert!(
+                    sliced_str.contains("socket("),
+                    "remapped range {:?} does not contain the call site",
+                    sliced_str
+                );
+            }
+        }
+        // Additionally: the transformer must not panic on this
+        // fixture (defense against the byte-range panic).
+        let result = crate::transformer::Transformer::transform(&source, matches, None);
+        assert!(
+            !result.transformed_source.is_empty(),
+            "transformer produced empty output for Bare+macro fixture"
+        );
     }
 
     #[test]

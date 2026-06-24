@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -288,5 +289,64 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 	}
 	if dep == nil || !strings.HasPrefix(dep.ID, "d_") {
 		t.Errorf("deployment.ID = %v, want prefix 'd_'", dep)
+	}
+}
+
+// TestDeploy_ArtifactSaveFailure_RollsBackDeployment verifies the
+// compensating-write path for the Deploy service. When the artifact
+// save fails after the deployment row is inserted, the row must be
+// removed via DELETE so we don't leave a deployment pointing at no
+// artifact. Without this rollback, the activation path would 404
+// on download.
+//
+// We exercise this by setting up sqlmock to expect the deployment
+// INSERT followed by a DELETE FROM deployments WHERE id = $1, then
+// configuring the artifact store with an unwritable path so Save
+// returns an error.
+func TestDeploy_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	// Quota lookup happens first.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// Deployment INSERT succeeds.
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	// Compensating DELETE — the rollback. We don't pin the exact
+	// argument (the deployment ID is a uuid generated at runtime);
+	// sqlmock's AnyArg matches.
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM deployments`)).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// Artifact store pointed at a path that does not exist and
+	// cannot be created (parent is a file, not a directory).
+	tmpDir := t.TempDir()
+	blocker := tmpDir + "/blocker"
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	badDir := blocker + "/subdir"
+
+	svc := &DeploymentService{
+		deploymentRepo: repository.NewDeploymentRepository(db),
+		quotaRepo:      repository.NewQuotaRepository(db),
+		artifactStore:  storage.NewArtifactStore(badDir),
+	}
+
+	good := bytes.NewReader(validWasmBytes)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	if err == nil {
+		t.Fatal("expected Deploy to fail when artifact save fails")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (the compensating DELETE may not have been issued): %v", err)
 	}
 }

@@ -82,3 +82,12 @@ func (r *DeploymentRepository) DeleteByApp(ctx context.Context, tenantID, appNam
 	_, err := r.db.ExecContext(ctx, `DELETE FROM deployments WHERE tenant_id = $1 AND app_name = $2`, tenantID, appName)
 	return err
 }
+
+// DeleteByID removes a deployment row by its ID. Idempotent on missing
+// row: returns nil if no row was deleted. Used as the compensating
+// write in the Create-then-Save services (Migrate, MigrateTree,
+// Deploy) when the artifact save fails after the row was inserted.
+func (r *DeploymentRepository) DeleteByID(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM deployments WHERE id = $1`, id)
+	return err
+}

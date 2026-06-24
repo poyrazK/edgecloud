@@ -23,6 +23,13 @@ import (
 type mockDeploymentRepo struct {
 	deployments []*domain.Deployment
 	createErr   error
+	// deleteCalls records each DeleteByID invocation. Used by the
+	// rollback tests to assert the compensating write fired.
+	deleteCalls []string
+	// deleteErr returns this error from DeleteByID if non-nil.
+	deleteErr error
+	// saveErr returns this error from Save if non-nil. The artifact
+	// store mock reads it via the `saveErr` field below.
 }
 
 func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
@@ -38,10 +45,14 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 // no-ops — they exist so the mock satisfies the wider interface
 // (introduced by issue #127, when ArtifactStoreInterface was
 // folded into storage.ArtifactStore).
-type mockArtifactStore struct{}
+type mockArtifactStore struct {
+	// saveErr makes Save return this error if non-nil. Used by the
+	// rollback tests to trigger the compensating-write path.
+	saveErr error
+}
 
 func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
-	return nil
+	return m.saveErr
 }
 
 func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -43,6 +44,19 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
+	// DeleteByID removes a deployment row by ID. Idempotent on missing
+	// row. Used as the compensating write when the artifact save
+	// fails after the row was inserted.
+	DeleteByID(ctx context.Context, id string) error
+}
+
+// ArtifactStoreInterface abstracts wasm artifact storage for testing.
+type ArtifactStoreInterface interface {
+	Save(tenantID, appName, deploymentID string, r io.Reader) error
+	// Delete removes an artifact. Idempotent on missing file. Used as
+	// the compensating write when the row insert fails after the
+	// artifact was written.
+	Delete(tenantID, appName, deploymentID string) error
 }
 
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.
@@ -395,6 +409,14 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 
 	// Store wasm artifact
 	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+		// Compensating write: remove the row we just inserted so we
+		// don't leave a deployment pointing at no artifact. Log the
+		// rollback error (don't swallow) but return the original
+		// save error to preserve the handler's existing error
+		// mapping.
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
 		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
 
@@ -881,6 +903,14 @@ func (s *MigrationService) MigrateTree(
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
 	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+		// Compensating write: remove the row we just inserted so we
+		// don't leave a deployment pointing at no artifact. Log the
+		// rollback error (don't swallow) but return the original
+		// save error to preserve the handler's existing error
+		// mapping.
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", depID, delErr)
+		}
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
 

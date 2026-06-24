@@ -18,6 +18,11 @@ import (
 type mockDeploymentRepo struct {
 	deployments []*domain.Deployment
 	createErr   error
+	// deleteCalls records each DeleteByID invocation. Used by the
+	// rollback tests to assert the compensating write fired.
+	deleteCalls []string
+	// deleteErr returns this error from DeleteByID if non-nil.
+	deleteErr error
 }
 
 func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
@@ -28,12 +33,29 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	return nil
 }
 
-// mockArtifactStore implements storage.ArtifactStore for testing.
+func (m *mockDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
+	m.deleteCalls = append(m.deleteCalls, id)
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	for i, d := range m.deployments {
+		if d.ID == id {
+			m.deployments = append(m.deployments[:i], m.deployments[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+// mockArtifactStore implements ArtifactStoreInterface for testing.
 // Migrate / MigrateTree only call Save, so Open and Delete are
 // no-ops (Delete just evicts from the in-memory map so callers
 // can assert cleanup behavior).
 type mockArtifactStore struct {
 	artifacts map[string][]byte // key: "tenantID/appName/depID"
+	// saveErr makes Save return this error if non-nil. Used by the
+	// rollback tests to trigger the compensating-write path.
+	saveErr error
 }
 
 func newMockArtifactStore() *mockArtifactStore {
@@ -41,6 +63,9 @@ func newMockArtifactStore() *mockArtifactStore {
 }
 
 func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -937,5 +962,42 @@ func TestDetectTransformedPatternsRust_OnHttpServerFixture(t *testing.T) {
 	}
 	if !hasConnect {
 		t.Errorf("expected TcpConnect detection, got: %+v", detections)
+	}
+}
+
+// TestMigrate_ArtifactSaveFailure_RollsBackDeployment verifies the
+// compensating-write path: when the artifact save fails after the
+// deployment row is inserted, the service must remove the row so we
+// don't leave a deployment pointing at no artifact. The activation
+// path would 404 on download otherwise.
+//
+// The full Migrate path requires edge-migrate + clang to produce a
+// wasm blob; we gate the test on those being available (mirrors
+// TestMigrationService_Migrate_RustSuccess). We then point the
+// artifact store at a saveErr so Save fails; the row is created,
+// then DeleteByID must be called as compensation.
+func TestMigrate_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{saveErr: errors.New("disk full (test)")}
+	svc := migrationSvcForTest(repo, store)
+
+	_, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c",
+		"int main(){return 0;}\n")
+	if err == nil {
+		t.Fatal("expected Migrate to fail when artifact save fails")
+	}
+
+	// The deployment row must have been created (Create succeeded)
+	// and then rolled back (DeleteByID called with that ID).
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected deployment to be rolled back; %d remain",
+			len(repo.deployments))
+	}
+	if len(repo.deleteCalls) != 1 {
+		t.Errorf("expected DeleteByID to be called once, got %d calls",
+			len(repo.deleteCalls))
 	}
 }

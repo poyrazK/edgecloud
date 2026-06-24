@@ -1299,6 +1299,63 @@ int main() {
         );
     }
 
+    /// Regression for finding #3 (Bare+macro call-site). When a Bare
+    /// socket call (no `bound_var`) is hidden behind a macro that
+    /// renames the function (`#define socket(...) make_socket(...)`),
+    /// the call-site refinement's args-tail search either locates the
+    /// original `socket(...)` call or, failing that, routes the match
+    /// to `manual_review` via the `u32::MAX` sentinel. Either way, the
+    /// transformer must NOT panic when asked to transform the result.
+    ///
+    /// Skipped without `EDGE_TEST_CLANG=1` and a `clang` binary.
+    #[test]
+    fn test_transform_with_preprocessor_bare_macro_does_not_panic() {
+        if !clang_available() {
+            eprintln!("skipping: clang not available or EDGE_TEST_CLANG unset");
+            return;
+        }
+        use crate::analyzer::CAnalyzer;
+        use crate::preprocessor::Preprocessor;
+        let Some(pp) = Preprocessor::discover() else {
+            eprintln!("skipping: clang not found");
+            return;
+        };
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("testdata")
+            .join("macro_bare_socket.c");
+        let source = std::fs::read_to_string(&fixture_path).expect("read fixture");
+        let mut analyzer = CAnalyzer::with_preprocessor(pp);
+        let (matches, _pp_info) = analyzer.analyze_with_preprocessor_info(&source);
+        // The transformer must NOT panic on the remapped byte
+        // ranges. Pre-fix this panicked at
+        // `output.extend_from_slice(&source_bytes[prev_end..orig_start])`
+        // because orig_start was an expanded-source offset past the
+        // end of the original source. Post-fix the call completes
+        // for both the Simple (`bound_var` present) and Bare
+        // (`bound_var = None`) cases.
+        let result = Transformer::transform(&source, matches, None);
+        // The transformed source must contain the WASI header
+        // (emitted unconditionally by `WASI_INCLUDES`) and the
+        // macro definition lines preserved verbatim from the
+        // original (the gap-copy logic copies unchanged regions).
+        assert!(
+            !result.transformed_source.is_empty(),
+            "transformer produced empty output for Bare+macro fixture"
+        );
+        assert!(
+            result.transformed_source.contains("<wasi/sockets.h>"),
+            "transformer dropped WASI header; got:\n{}",
+            result.transformed_source
+        );
+        assert!(
+            result.transformed_source.contains("#define socket("),
+            "transformer should have copied the macro definition verbatim; got:\n{}",
+            result.transformed_source
+        );
+    }
+
     /// Returns true iff `EDGE_TEST_CLANG=1` is set in the environment
     /// AND a `clang` binary is reachable on PATH and responds to
     /// `--version`. Mirrors the gate on the marker-substring test

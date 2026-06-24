@@ -355,6 +355,14 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 
 	// Save artifact
 	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
+		// Compensating write: remove the row we just inserted so we
+		// don't leave a deployment pointing at no artifact. Log the
+		// rollback error (don't swallow) but return the original
+		// save error to preserve the handler's existing error
+		// mapping.
+		if delErr := s.deploymentRepo.DeleteByID(ctx, deployment.ID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after artifact save error: deployment_id=%s error=%v", deployment.ID, delErr)
+		}
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
 
