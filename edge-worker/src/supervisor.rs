@@ -650,20 +650,20 @@ impl Supervisor {
 
             // Convert MetricsSnapshot into the wire-format Vec<MetricSample>.
             let mut observer_metrics: Vec<MetricSample> = Vec::new();
-            for (name, (count, labels)) in &metrics_snap.counters {
+            for e in &metrics_snap.counters {
                 observer_metrics.push(MetricSample {
-                    name: name.clone(),
+                    name: e.name.clone(),
                     kind: MetricKind::Counter,
-                    value: *count as f64,
-                    labels: labels.clone(),
+                    value: e.value as f64,
+                    labels: e.labels.clone(),
                 });
             }
-            for (name, (value, labels)) in &metrics_snap.gauges {
+            for e in &metrics_snap.gauges {
                 observer_metrics.push(MetricSample {
-                    name: name.clone(),
+                    name: e.name.clone(),
                     kind: MetricKind::Gauge,
-                    value: *value,
-                    labels: labels.clone(),
+                    value: e.value,
+                    labels: e.labels.clone(),
                 });
             }
             for (name, samples) in &metrics_snap.histograms {
