@@ -7,6 +7,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // newLogEntryMockRepo wires a sqlmock-backed sqlx.DB into a
@@ -196,5 +197,166 @@ func TestLogEntryRepository_DeleteOlderThanBatches_BoundInt64(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations (LIMIT $2 was not bound as int64): %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListByTenantApp — issue #77 read path
+// ---------------------------------------------------------------------------
+
+// logEntryTestRow produces one sqlmock.Row shaped like a `SELECT … FROM logs`
+// result, used by the ListByTenantApp tests below. Columns match the ORDER
+// in ListByTenantApp's SELECT clause:
+// id, tenant_id, deployment_id, app_name, worker_id, region, level,
+// message, labels, ts.
+func logEntryTestRow(id int64, ts time.Time) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "tenant_id", "deployment_id", "app_name",
+		"worker_id", "region", "level", "message", "labels", "ts",
+	}).AddRow(
+		id, "t_test", "d_x", "myapp",
+		"w_us-east-1_h01", "us-east-1", "info",
+		"hello", []byte(`{}`), ts,
+	)
+}
+
+// TestLogEntryRepository_ListByTenantApp_FilterByAppAndTenant pins the
+// minimum SQL shape: tenant and app must always be the first two bound
+// args (in that order) and the SELECT must cover every column from
+// domain.LogEntry. A regression that swapped them would let a tenant
+// read another tenant's logs.
+func TestLogEntryRepository_ListByTenantApp_FilterByAppAndTenant(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	ts := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT id, tenant_id, deployment_id, app_name, worker_id, region, level, message, labels, ts`).
+		WithArgs("t_test", "myapp", int64(100)).
+		WillReturnRows(logEntryTestRow(1, ts))
+
+	out, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if out[0].TenantID != "t_test" || out[0].AppName != "myapp" {
+		t.Errorf("got tenant=%q app=%q, want t_test/myapp", out[0].TenantID, out[0].AppName)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_AppliesSinceAndLimit pins the
+// since-bound SQL: when filter.Since is positive, the SQL must add
+// `AND ts >= NOW() - make_interval(secs => $N)` and bind Seconds().
+// Without the make_interval, a clock-skewed server could return rows
+// older than the caller asked for.
+func TestLogEntryRepository_ListByTenantApp_AppliesSinceAndLimit(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	ts := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT .* WHERE tenant_id = \$1 AND app_name = \$2`).
+		WithArgs("t_test", "myapp", 300.0, int64(50)).
+		WillReturnRows(logEntryTestRow(2, ts))
+
+	out, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Since: 5 * time.Minute,
+		Limit: 50,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (since/limit SQL wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_AppliesLevelFilter pins the
+// level filter: when filter.Levels is non-empty, the SQL must add
+// `AND level = ANY($N::text[])` and bind the slice via pq.Array. The
+// test also verifies the slice is bound — sqlmock's regex matcher
+// enforces the placeholder position, but the arg list is what catches
+// "forgot to pass the levels".
+func TestLogEntryRepository_ListByTenantApp_AppliesLevelFilter(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	ts := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	levels := []string{"warn", "error"}
+	mock.ExpectQuery(`SELECT .* WHERE tenant_id = \$1 AND app_name = \$2`).
+		WithArgs("t_test", "myapp", pq.Array(levels), int64(25)).
+		WillReturnRows(logEntryTestRow(3, ts))
+
+	out, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Levels: levels,
+		Limit:  25,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (level filter SQL wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_RejectsNonPositiveLimit pins
+// the up-front guard: a zero or negative Limit returns an error
+// without issuing any DB query. The service layer also clamps ≤0 to
+// DefaultLogLimit, so this is a belt-and-suspenders defense against
+// a future caller forgetting to validate.
+func TestLogEntryRepository_ListByTenantApp_RejectsNonPositiveLimit(t *testing.T) {
+	repo, _, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	if _, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit: 0,
+	}); err == nil {
+		t.Error("expected error for limit=0, got nil")
+	}
+	if _, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit: -1,
+	}); err == nil {
+		t.Error("expected error for limit=-1, got nil")
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_OrdersByTsDesc pins the ORDER BY:
+// the SQL must end with `ORDER BY ts DESC LIMIT $N`. A regression that
+// forgot DESC would return oldest-first, defeating the "latest logs"
+// use case the index exists to support.
+func TestLogEntryRepository_ListByTenantApp_OrdersByTsDesc(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	// No rows needed; we only assert the SQL shape via ExpectQuery's
+	// regex matcher. mock.ExpectationsWereMet then fails if the
+	// query was never issued.
+	mock.ExpectQuery(`SELECT .* ORDER BY ts DESC LIMIT \$3`).
+		WithArgs("t_test", "myapp", int64(10)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "deployment_id", "app_name",
+			"worker_id", "region", "level", "message", "labels", "ts",
+		}))
+
+	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (ORDER BY/LIMIT shape wrong): %v", err)
 	}
 }
