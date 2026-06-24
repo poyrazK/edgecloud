@@ -32,6 +32,9 @@ func NewTrafficHandler(trafficSvc TrafficServiceInterface) *TrafficHandler {
 func (h *TrafficHandler) SetTraffic(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
 
 	var req domain.TrafficSplitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -53,6 +56,9 @@ func (h *TrafficHandler) SetTraffic(w http.ResponseWriter, r *http.Request) {
 func (h *TrafficHandler) GetTraffic(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
 
 	splits, err := h.trafficSvc.GetTraffic(r.Context(), tenantID, appName)
 	if err != nil {
@@ -75,9 +81,24 @@ func (h *TrafficHandler) GetTraffic(w http.ResponseWriter, r *http.Request) {
 // comes from the URL path because the ingress is a service-to-service caller,
 // not a tenant. The split query is the same as GetTraffic's; only the
 // authentication and how the tenant is identified differ.
+//
+// Both `tenantID` and `appName` are validated as if they came from a tenant —
+// the internal caller must be authenticated by the shared-secret header, but
+// the URL path is still attacker-controlled (a misconfigured ingress proxy
+// could let an untrusted tenant construct this URL). The downstream SQL
+// query treats them as opaque, but a path-traversal app_name would also
+// land in the published TaskMessage.Apps map key — same exposure as the
+// tenant-authenticated handler, so we validate the same way.
 func (h *TrafficHandler) GetTrafficInternal(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		http.Error(w, `{"error": "invalid tenant id"}`, http.StatusBadRequest)
+		return
+	}
 
 	splits, err := h.trafficSvc.GetTraffic(r.Context(), tenantID, appName)
 	if err != nil {

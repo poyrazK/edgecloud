@@ -282,8 +282,26 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	weightStr := r.URL.Query().Get("weight")
-	if weightStr == "" {
-		// Default weight=100: atomic activation (existing behavior).
+	// Omitting ?weight entirely means atomic activation (weight=100) — the
+	// legacy default. Parsing only overrides the value when the query
+	// string is non-empty, so weight=100 also covers the `?weight=100`
+	// explicit case (which is the same operation, not a canary).
+	weight := 100
+	if weightStr != "" {
+		parsed, err := strconv.Atoi(weightStr)
+		if err != nil || parsed < 0 || parsed > 100 {
+			httperror.BadRequestCtx(w, r, "weight must be an integer between 0 and 100")
+			return
+		}
+		weight = parsed
+	}
+
+	// weight == 100 (explicit or omitted): atomic activation. Goes through
+	// deploymentSvc.ActivateDeployment so active_deployments is updated and
+	// rollback / auto-rollback stability evaluation target the right row.
+	// Treats ?weight=100 as identical to omitting ?weight= entirely (the
+	// canary path is for partial weights only).
+	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 			if errors.Is(err, service.ErrPublishFailed) {
 				http.Error(w,
@@ -300,28 +318,29 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	weight, err := strconv.Atoi(weightStr)
-	if err != nil || weight < 0 || weight > 100 {
-		httperror.BadRequestCtx(w, r, "weight must be an integer between 0 and 100")
-		return
-	}
-
-	// Partial weight: canary activation.
-	// Get the currently active deployment (if any) to build the traffic split.
+	// Partial weight: canary activation. Requires an existing active
+	// deployment to act as the remainder — a canary staged against
+	// nothing is the same as a plain activation, which is what
+	// ActivateDeployment above already does. Reject with 400 rather than
+	// silently producing a single-entry split whose sum != 100 (which
+	// would 500 at ValidateSum).
 	current, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
 	if err != nil {
-		log.Printf("warning: GetActiveDeployment failed: %v; proceeding without current", err)
-		// continue without current — new deployment gets 100% traffic
+		log.Printf("internal error: GetActiveDeployment: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if current == nil {
+		httperror.BadRequestCtx(w, r, "canary activation requires an existing active deployment; activate one first")
+		return
+	}
+	if current.ID == deploymentID {
+		httperror.BadRequestCtx(w, r, "deployment is already active; pick a different deployment for the canary")
+		return
 	}
 	splits := []domain.TrafficSplitEntry{
 		{DeploymentID: deploymentID, Weight: weight},
-	}
-	if current != nil && weight < 100 {
-		// Keep existing deployment at the remaining weight.
-		splits = append(splits, domain.TrafficSplitEntry{
-			DeploymentID: current.ID,
-			Weight:       100 - weight,
-		})
+		{DeploymentID: current.ID, Weight: 100 - weight},
 	}
 
 	if err := h.trafficSvc.SetTraffic(r.Context(), tenantID, appName, splits); err != nil {

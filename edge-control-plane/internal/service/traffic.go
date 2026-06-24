@@ -10,10 +10,12 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/jmoiron/sqlx"
 )
 
 // TrafficService handles traffic split business logic.
 type TrafficService struct {
+	db             *sqlx.DB
 	splitRepo      *repository.TrafficSplitRepository
 	deploymentRepo *repository.DeploymentRepository
 	activeRepo     *repository.ActiveDeploymentRepository
@@ -30,6 +32,7 @@ type TrafficService struct {
 
 // NewTrafficService creates a TrafficService.
 func NewTrafficService(
+	db *sqlx.DB,
 	splitRepo *repository.TrafficSplitRepository,
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
@@ -40,6 +43,7 @@ func NewTrafficService(
 	defaultRegion string,
 ) *TrafficService {
 	return &TrafficService{
+		db:             db,
 		splitRepo:      splitRepo,
 		deploymentRepo: deploymentRepo,
 		activeRepo:     activeRepo,
@@ -66,13 +70,23 @@ func ValidateSum(splits []*domain.TrafficSplit) error {
 // SetTraffic atomically sets the traffic splits for an app.
 // Each deployment_id is validated to belong to the tenant and app.
 // Sum of weights must equal 100.
+//
+// With len(entries) == 0, this is a "clear" — all splits are deleted and a
+// legacy single-deployment TaskMessage is published so workers stop any
+// canary deployment and revert to the active deployment only. Without that
+// publish, workers keep the stale `Routes` from the last non-empty
+// TaskMessage and continue splitting traffic on a deployment the control
+// plane considers inactive.
 func (s *TrafficService) SetTraffic(ctx context.Context, tenantID, appName string, entries []domain.TrafficSplitEntry) error {
 	if len(entries) == 0 {
-		// Clearing all splits is a valid operation — equivalent to no canary.
-		return s.splitRepo.DeleteAllForApp(ctx, tenantID, appName)
+		if err := s.splitRepo.DeleteAllForApp(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("clearing traffic splits: %w", err)
+		}
+		return s.publishClearTaskUpdate(ctx, tenantID, appName)
 	}
 
 	splits := make([]*domain.TrafficSplit, len(entries))
+	deployments := make(map[string]*domain.Deployment, len(entries))
 	for i, e := range entries {
 		d, err := s.deploymentRepo.GetByID(ctx, e.DeploymentID)
 		if err != nil || d == nil {
@@ -81,6 +95,7 @@ func (s *TrafficService) SetTraffic(ctx context.Context, tenantID, appName strin
 		if d.TenantID != tenantID || d.AppName != appName {
 			return fmt.Errorf("deployment %q not found", e.DeploymentID)
 		}
+		deployments[e.DeploymentID] = d
 		splits[i] = &domain.TrafficSplit{
 			TenantID:     tenantID,
 			AppName:      appName,
@@ -93,12 +108,12 @@ func (s *TrafficService) SetTraffic(ctx context.Context, tenantID, appName strin
 		return err
 	}
 
-	if err := s.splitRepo.Set(ctx, splits); err != nil {
+	if err := repository.SetTrafficSplits(ctx, s.db, splits); err != nil {
 		return fmt.Errorf("setting traffic split: %w", err)
 	}
 
 	// Publish task update to activate all deployments in the split concurrently.
-	return s.publishTaskUpdate(ctx, tenantID, appName)
+	return s.publishTaskUpdate(ctx, tenantID, appName, deployments)
 }
 
 // GetTraffic returns the current traffic splits for an app.
@@ -110,14 +125,103 @@ func (s *TrafficService) GetTraffic(ctx context.Context, tenantID, appName strin
 	return splits, nil
 }
 
-// ClearTraffic removes all traffic splits for an app.
+// ClearTraffic removes all traffic splits for an app and republishes a
+// TaskMessage so workers reconcile back to the active deployment (otherwise
+// they'd keep the stale Routes from the previous canary TaskMessage).
 func (s *TrafficService) ClearTraffic(ctx context.Context, tenantID, appName string) error {
-	return s.splitRepo.DeleteAllForApp(ctx, tenantID, appName)
+	if err := s.splitRepo.DeleteAllForApp(ctx, tenantID, appName); err != nil {
+		return fmt.Errorf("clearing traffic splits: %w", err)
+	}
+	return s.publishClearTaskUpdate(ctx, tenantID, appName)
+}
+
+// publishClearTaskUpdate publishes a single-deployment TaskMessage for the
+// currently-active deployment (per active_deployments), so any worker
+// running a canary route stops it and reverts to the active deployment.
+// If no active deployment exists yet, nothing is published — workers
+// haven't been told to run the app in the first place, so they have
+// nothing to fall back from.
+func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, appName string) error {
+	active, err := s.activeRepo.Get(ctx, tenantID, appName)
+	if err != nil {
+		return fmt.Errorf("getting active deployment: %w", err)
+	}
+	if active == nil {
+		return nil
+	}
+	dep, err := s.deploymentRepo.GetByID(ctx, active.DeploymentID)
+	if err != nil || dep == nil {
+		return fmt.Errorf("active deployment %q not found", active.DeploymentID)
+	}
+
+	envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
+	if err != nil {
+		return fmt.Errorf("listing env vars: %w", err)
+	}
+	envMap := make(map[string]string)
+	for _, e := range envs {
+		envMap[e.EnvKey] = e.EnvValue
+	}
+
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil || tenant == nil {
+		return fmt.Errorf("tenant not found")
+	}
+
+	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("getting quota: %w", err)
+	}
+	maxMemoryMB := 256
+	if quota != nil && quota.MaxMemoryMB > 0 {
+		maxMemoryMB = quota.MaxMemoryMB
+	}
+
+	regions := domain.StringArrayTo(dep.Regions)
+	if len(regions) == 0 {
+		regions = []string{s.defaultRegion}
+	}
+
+	msg := &nats.TaskMessage{
+		Type:      "task_update",
+		Timestamp: time.Now(),
+		TenantID:  tenantID,
+		Apps: map[string]nats.AppConfig{
+			appName: {
+				DeploymentID:   dep.ID,
+				DeploymentHash: dep.Hash,
+				Routes:         nil, // legacy single-deployment shape
+				Env:            envMap,
+				Allowlist:      domain.StringArrayTo(tenant.AllowlistedDestinations),
+				MaxMemoryMB:    maxMemoryMB,
+			},
+		},
+	}
+
+	var failedRegions []string
+	for _, region := range regions {
+		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
+			log.Printf("publishing clear task update failed for region %q (tenant %s, app %s): %v", region, tenantID, appName, err)
+			failedRegions = append(failedRegions, region)
+		}
+	}
+	if len(failedRegions) > 0 {
+		return fmt.Errorf("publishing clear task update failed for region(s): %s", strings.Join(failedRegions, ","))
+	}
+	return nil
 }
 
 // publishTaskUpdate sends a TaskMessage that tells workers to run all
 // deployments in the traffic split concurrently.
-func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appName string) error {
+//
+// `deployments` is the cache of split deployments fetched during SetTraffic's
+// validation pass, keyed by deployment_id. Reusing it cuts the redundant
+// `deploymentRepo.GetByID` roundtrips that the previous implementation made
+// in the route-building and region-fanout loops (3N → N lookups per
+// SetTraffic call). It also removes the split-brain window where a
+// deployment's Hash could differ between the route entry and the regions
+// fanout (each loop saw a different snapshot).
+func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appName string, deployments map[string]*domain.Deployment) error {
 	splits, err := s.splitRepo.Get(ctx, tenantID, appName)
 	if err != nil {
 		return fmt.Errorf("fetching splits: %w", err)
@@ -157,8 +261,8 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	var primaryHash string
 	routes := make([]nats.DeploymentRoute, len(splits))
 	for i, sp := range splits {
-		d, err := s.deploymentRepo.GetByID(ctx, sp.DeploymentID)
-		if err != nil || d == nil {
+		d, ok := deployments[sp.DeploymentID]
+		if !ok || d == nil {
 			return fmt.Errorf("deployment %q not found", sp.DeploymentID)
 		}
 		routes[i] = nats.DeploymentRoute{
@@ -174,16 +278,8 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	// Fan out the TaskMessage to the union of regions declared by every
 	// split's deployment. A worker subscribed to one of those regions will
 	// pick up the message via its `filter_subject` and reconcile.
-	// Previously this hardcoded `"global"`, which works for the wildcard
-	// `edgecloud.tasks.>` subject but means no worker actually consumes
-	// the message in a multi-region setup (their consumers are filtered
-	// to their own region subject).
-	regionSet := make(map[string]struct{}, len(splits))
-	for _, sp := range splits {
-		d, err := s.deploymentRepo.GetByID(ctx, sp.DeploymentID)
-		if err != nil || d == nil {
-			continue
-		}
+	regionSet := make(map[string]struct{}, len(deployments))
+	for _, d := range deployments {
 		for _, r := range domain.StringArrayTo(d.Regions) {
 			regionSet[r] = struct{}{}
 		}

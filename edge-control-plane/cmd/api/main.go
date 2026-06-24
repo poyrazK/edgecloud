@@ -119,7 +119,7 @@ func main() {
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
-	trafficSvc := service.NewTrafficService(trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
+	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 
 	// Initialize handlers
