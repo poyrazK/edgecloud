@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -23,11 +24,11 @@ func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 
 	quota, err := h.tenantSvc.GetQuota(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	if quota == nil {
-		http.Error(w, `{"error": "quota not found"}`, http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "quota not found")
 		return
 	}
 

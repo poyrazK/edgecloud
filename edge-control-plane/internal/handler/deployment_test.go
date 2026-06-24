@@ -39,7 +39,7 @@ func (m *mockAppTargetLookup) GetAppTarget(_ context.Context, tenantID, appName 
 // service contract.
 func newAppIngressMux(lookup *mockAppTargetLookup) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/apps/{appName}/ingress", NewDeploymentHandler(nil, lookup).AppIngress)
+	mux.HandleFunc("GET /api/v1/apps/{appName}/ingress", NewDeploymentHandler(nil, lookup).AppIngress)
 	return mux
 }
 
@@ -59,7 +59,7 @@ func TestAppIngress_Found_Returns200AndFullTarget(t *testing.T) {
 	lookup := &mockAppTargetLookup{target: want}
 	mux := newAppIngressMux(lookup)
 
-	req := httptest.NewRequest("GET", "/api/apps/myapp/ingress", nil)
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/ingress", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -108,7 +108,7 @@ func TestAppIngress_NotFound_Returns404AndStructuredBody(t *testing.T) {
 	lookup := &mockAppTargetLookup{target: nil}
 	mux := newAppIngressMux(lookup)
 
-	req := httptest.NewRequest("GET", "/api/apps/missing/ingress", nil)
+	req := httptest.NewRequest("GET", "/api/v1/apps/missing/ingress", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -142,7 +142,7 @@ func TestAppIngress_ServiceError_Returns500(t *testing.T) {
 	lookup := &mockAppTargetLookup{err: errors.New("db unreachable")}
 	mux := newAppIngressMux(lookup)
 
-	req := httptest.NewRequest("GET", "/api/apps/myapp/ingress", nil)
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/ingress", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -194,7 +194,7 @@ func TestAppIngress_PathTraversal_Returns400(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			lookup := &mockAppTargetLookup{}
 			mux := newAppIngressMux(lookup)
-			url := "/api/apps/" + tt.appName + "/ingress"
+			url := "/api/v1/apps/" + tt.appName + "/ingress"
 			req := httptest.NewRequest("GET", url, nil)
 			req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 			rr := httptest.NewRecorder()

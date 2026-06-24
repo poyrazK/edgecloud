@@ -45,12 +45,19 @@ fn test_transform_json_outputs_envelope() {
     );
 
     let report = &v["report"];
+    // #128: http_client.c contains an `accept(fd, NULL, NULL)` call.
+    // The MVP fix downgrades accept from BestEffort to
+    // NotTransformable so it lands in manual_review. The overall
+    // status is therefore `partial` (not `success`) — the honest
+    // answer is "we transformed what we could; accept needs manual
+    // attention". `partial` is already a documented `MigrationStatus`
+    // variant; the wire envelope shape is unchanged.
     assert_eq!(
         report["status"]
             .as_str()
             .expect("report.status is a string"),
-        "success",
-        "http_client.c is fully transformable, expect status=success"
+        "partial",
+        "http_client.c has accept() which is not transformable in MVP, expect status=partial"
     );
 
     let detected = report["patterns_detected"]

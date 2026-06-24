@@ -267,6 +267,74 @@ impl HttpClientHost for RuntimeState {
             });
         }
 
+        // DNS rebinding guard: resolve the destination hostname and verify none
+        // of the returned IPs fall in a hard-deny range. Catches the common
+        // attack where an allowlisted domain is redirected to a metadata/private
+        // IP via a zero-TTL DNS record.
+        //
+        // Known residual race (TOCTOU): reqwest performs its own DNS query when
+        // it opens the TCP connection. A TTL-0 record can change between our
+        // check and that dial. Eliminating this gap requires a custom reqwest
+        // Resolve impl that both checks and reuses the same resolved address.
+        //
+        // Fail-closed: any DNS error or empty result set is treated as a denial
+        // so an attacker cannot force a lookup failure to bypass the guard.
+        {
+            use url::Url;
+            if let Ok(parsed) = Url::parse(url) {
+                if let Some(url::Host::Domain(hostname)) = parsed.host() {
+                    let resolved = match self.networking.resolve(hostname) {
+                        Ok(ips) if !ips.is_empty() => ips,
+                        Ok(_) => {
+                            return Some(Response {
+                                status: 403,
+                                headers: Vec::new(),
+                                body: ResponseBodySource::Buffered(Vec::new()),
+                                error: Some(
+                                    "egress denied: DNS resolution returned no addresses"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            return Some(Response {
+                                status: 403,
+                                headers: Vec::new(),
+                                body: ResponseBodySource::Buffered(Vec::new()),
+                                error: Some("egress denied: DNS resolution failed".to_string()),
+                            });
+                        }
+                    };
+                    for ip_str in &resolved {
+                        match ip_str.parse::<std::net::IpAddr>() {
+                            Ok(ip) => {
+                                if let Err(reason) = self.egress.check_resolved_ip(ip) {
+                                    return Some(Response {
+                                        status: 403,
+                                        headers: Vec::new(),
+                                        body: ResponseBodySource::Buffered(Vec::new()),
+                                        error: Some(reason),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                // Unparseable IP string (e.g. scoped IPv6 zone ID).
+                                // Fail-closed: deny rather than skip the check.
+                                return Some(Response {
+                                    status: 403,
+                                    headers: Vec::new(),
+                                    body: ResponseBodySource::Buffered(Vec::new()),
+                                    error: Some(format!(
+                                        "egress denied: unparseable IP in DNS response: {ip_str}"
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let method = req.method.as_str();
         let headers: Vec<(String, String)> = req.headers.to_vec();
         let trace_context = req.trace_context.as_ref().map(|tc| tc.traceparent.as_str());
@@ -510,6 +578,16 @@ impl ProcessHost for RuntimeState {
 
 impl NetworkingHost for RuntimeState {
     fn resolve(&mut self, hostname: String) -> Vec<String> {
+        // Enforce egress policy on DNS lookups: deny resolution of hostnames
+        // that wouldn't be permitted for outbound HTTP. This prevents tenants
+        // with an empty allowlist from using DNS to enumerate internal services.
+        if self
+            .egress
+            .check(&format!("https://{}/", hostname))
+            .is_err()
+        {
+            return Vec::new();
+        }
         self.networking.resolve(&hostname).unwrap_or_default()
     }
 }
@@ -835,5 +913,57 @@ mod egress_http_tests {
         let policy = EgressPolicy::new(vec!["example.com".to_string()]);
         let result = policy.check("http://example.com/");
         assert!(result.is_ok());
+    }
+
+    // ── NetworkingHost::resolve egress gate ───────────────────────────────
+
+    #[test]
+    fn resolve_blocked_when_empty_allowlist() {
+        use crate::edge::cloud::networking::Host as NetworkingHost;
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
+        let egress = Arc::new(EgressPolicy::new(vec![]));
+        let env = std::collections::HashMap::new();
+        let app_ctx = AppLogContext {
+            app_name: "test".to_string(),
+            tenant_id: "t_test".to_string(),
+            deployment_id: "test".to_string(),
+        };
+        let mut rs = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
+            app_ctx,
+            egress,
+        );
+        let ips = NetworkingHost::resolve(&mut rs, "example.com".to_string());
+        assert!(
+            ips.is_empty(),
+            "deny-all policy must return empty vec from resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_blocked_for_disallowed_host() {
+        use crate::edge::cloud::networking::Host as NetworkingHost;
+        use crate::interfaces::observe::{AppLogContext, NoopLogSink};
+        let egress = Arc::new(EgressPolicy::new(vec!["api.stripe.com".to_string()]));
+        let env = std::collections::HashMap::new();
+        let app_ctx = AppLogContext {
+            app_name: "test".to_string(),
+            tenant_id: "t_test".to_string(),
+            deployment_id: "test".to_string(),
+        };
+        let mut rs = RuntimeState::with_env_and_meter(
+            env,
+            None,
+            Arc::new(NoopLogSink) as Arc<dyn crate::interfaces::observe::LogSink>,
+            app_ctx,
+            egress,
+        );
+        let ips = NetworkingHost::resolve(&mut rs, "evil.com".to_string());
+        assert!(
+            ips.is_empty(),
+            "host not in allowlist must return empty vec from resolve"
+        );
     }
 }

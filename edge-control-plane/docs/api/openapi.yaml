@@ -1,0 +1,1713 @@
+openapi: 3.0.3
+info:
+  title: edgeCloud Control Plane API
+  version: 1.0.0
+  description: |
+    HTTP API for the edgeCloud managed WebAssembly edge computing platform.
+    Supports tenant and worker authentication. Tenants authenticate via
+    Bearer API key. Workers authenticate via Bearer JWT (HMAC-SHA256).
+
+servers:
+  - url: https://api.edgecloud.dev
+    description: Production
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: Tenant API key (Bearer token). Obtain via POST /api/v1/keys.
+    WorkerJWTAuth:
+      type: http
+      scheme: bearer
+      description: Worker JWT (HMAC-SHA256). Issued to workers by the control plane.
+
+  schemas:
+    # -------------------------------------------------------------------------
+    # Shared
+    # -------------------------------------------------------------------------
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              example: NOT_FOUND
+            message:
+              type: string
+              description: Human-readable error detail. Always "internal error" for 5xx.
+              example: deployment not found
+
+    # -------------------------------------------------------------------------
+    # Health
+    # -------------------------------------------------------------------------
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+
+    # -------------------------------------------------------------------------
+    # Tenants
+    # -------------------------------------------------------------------------
+    BootstrapRequest:
+      type: object
+      required: [name, key_name]
+      properties:
+        name:
+          type: string
+          description: Unique tenant name.
+          example: acme
+        plan:
+          type: string
+          default: free
+          description: Subscription plan.
+          example: free
+        key_name:
+          type: string
+          description: Name for the first API key.
+          example: default
+
+    BootstrapResponse:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+          description: The new tenant's ID.
+          example: t_abc123
+        api_key:
+          type: string
+          description: |
+            The raw API key. Shown only once — store it securely.
+            Use Authorization: Bearer <api_key> for all subsequent requests.
+          example: ek_...
+
+    CreateTenantRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          example: acme
+        plan:
+          type: string
+          example: free
+
+    Tenant:
+      type: object
+      properties:
+        id:
+          type: string
+          example: t_abc123
+        name:
+          type: string
+          example: acme
+        plan:
+          type: string
+          example: free
+        allowlisted_destinations:
+          type: array
+          items:
+            type: string
+          example: ["api.stripe.com"]
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-01-02T03:04:05Z"
+
+    UpdateTenantRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          example: acme-inc
+        plan:
+          type: string
+          example: pro
+        allowlisted_destinations:
+          type: array
+          items:
+            type: string
+          example: ["api.stripe.com", "api.github.com"]
+
+    # -------------------------------------------------------------------------
+    # API Keys
+    # -------------------------------------------------------------------------
+    CreateAPIKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          example: ci-key
+        role:
+          type: string
+          default: developer
+          description: "Role for this key: 'developer' or 'owner'."
+          example: developer
+
+    CreateAPIKeyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: k_abc123
+        name:
+          type: string
+          example: ci-key
+        role:
+          type: string
+          example: developer
+        token:
+          type: string
+          description: Raw key shown only once.
+          example: ek_...
+
+    APIKeyInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          example: k_abc123
+        name:
+          type: string
+          example: ci-key
+        role:
+          type: string
+          example: developer
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-01-02T03:04:05Z"
+
+    # -------------------------------------------------------------------------
+    # Apps
+    # -------------------------------------------------------------------------
+    CreateAppRequest:
+      type: object
+      properties:
+        description:
+          type: string
+          description: Optional human-readable description.
+          example: Main web app
+
+    App:
+      type: object
+      properties:
+        id:
+          type: string
+          example: a_abc123
+        tenant_id:
+          type: string
+          example: t_abc123
+        name:
+          type: string
+          example: web-app
+        description:
+          type: string
+          nullable: true
+          example: Main web app
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-01-02T03:04:05Z"
+
+    AppListResponse:
+      type: object
+      properties:
+        apps:
+          type: array
+          items:
+            $ref: '#/components/schemas/App'
+        limit:
+          type: integer
+          example: 50
+        offset:
+          type: integer
+          example: 0
+
+    # -------------------------------------------------------------------------
+    # Deployments
+    # -------------------------------------------------------------------------
+    Deployment:
+      type: object
+      properties:
+        id:
+          type: string
+          example: d_abc123
+        tenant_id:
+          type: string
+          example: t_abc123
+        app_name:
+          type: string
+          example: web-app
+        status:
+          type: string
+          enum: [deployed, active, failed, migrated]
+          example: deployed
+        hash:
+          type: string
+          description: SHA-256 of the Wasm artifact (lowercase hex).
+          example: 3a2f5e4b6c1d...
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-01-02T03:04:05Z"
+
+    DeployResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: The new deployment ID.
+          example: d_abc123
+        hash:
+          type: string
+          description: SHA-256 of the uploaded artifact.
+          example: 3a2f5e4b6c1d...
+        url:
+          type: string
+          description: The target ingress URL for this deployment.
+          example: https://web-app.t_abc123.edgecloud.dev
+
+    DeploymentListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deployment'
+        total:
+          type: integer
+          example: 3
+        limit:
+          type: integer
+          example: 20
+        offset:
+          type: integer
+          example: 0
+
+    ActivateResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: activated
+
+    # -------------------------------------------------------------------------
+    # Ingress
+    # -------------------------------------------------------------------------
+    IngressResponseReady:
+      type: object
+      properties:
+        ready:
+          type: boolean
+          example: true
+        app_name:
+          type: string
+          example: web-app
+        tenant_id:
+          type: string
+          example: t_abc123
+        worker_id:
+          type: string
+          example: w_us-east1_01
+        region:
+          type: string
+          example: us-east1
+        worker_addr:
+          type: string
+          example: 203.0.113.42
+        port:
+          type: integer
+          example: 8080
+
+    IngressResponseNotReady:
+      type: object
+      properties:
+        ready:
+          type: boolean
+          example: false
+        app_name:
+          type: string
+          example: web-app
+        reason:
+          type: string
+          example: no running app found for this tenant
+
+    # -------------------------------------------------------------------------
+    # Environment Variables
+    # -------------------------------------------------------------------------
+    SetEnvRequest:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+          example: LOG_LEVEL
+        value:
+          type: string
+          example: debug
+
+    EnvMap:
+      type: object
+      additionalProperties:
+        type: string
+      example:
+        LOG_LEVEL: debug
+        NODE_ENV: production
+
+    # -------------------------------------------------------------------------
+    # Egress
+    # -------------------------------------------------------------------------
+    EgressAllowlist:
+      type: object
+      properties:
+        allowlist:
+          type: array
+          items:
+            type: string
+          description: >
+            Outbound hostname allowlist. Empty array means allow-all (no restriction).
+            Each entry is either an exact FQDN (`api.stripe.com`) or a single-level
+            wildcard pattern (`*.sendgrid.net`). Entries are stored lowercase.
+          example:
+            - api.stripe.com
+            - "*.sendgrid.net"
+
+    # -------------------------------------------------------------------------
+    # Quotas
+    # -------------------------------------------------------------------------
+    Quota:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        max_deployments:
+          type: integer
+          description: Maximum deployments per app.
+          example: 10
+        max_apps:
+          type: integer
+          description: Maximum apps for this tenant.
+          example: 5
+        max_workers:
+          type: integer
+          description: Maximum workers for this tenant.
+          example: 3
+        max_memory_mb:
+          type: integer
+          description: Memory limit in MB per worker.
+          example: 256
+        max_outbound_mb:
+          type: integer
+          description: Outbound egress cap in MB per month.
+          example: 1000
+
+    # -------------------------------------------------------------------------
+    # Migration
+    # -------------------------------------------------------------------------
+    MigrationReport:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [migrated, failed]
+          example: migrated
+        wasm_stored:
+          type: boolean
+          example: true
+        deployment_id:
+          type: string
+          nullable: true
+          example: d_abc123
+        app_name:
+          type: string
+          example: hello-world
+        patterns_detected:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternInfo'
+        patterns_transformed:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternInfo'
+        patterns_manual_review:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternInfo'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorInfo'
+
+    # FullPatternInfo mirrors the Go PatternInfo struct (line-level detail
+    # with snippet and wasi_equivalent). Used by FileReport in the tree
+    # migration response.
+    FullPatternInfo:
+      type: object
+      properties:
+        line:
+          type: integer
+          example: 42
+        pattern:
+          type: string
+          example: socket
+        snippet:
+          type: string
+          example: int fd = socket(AF_INET, SOCK_STREAM, 0);
+        wasi_equivalent:
+          type: string
+          example: wasi:network/tcp-socket
+        transformability:
+          type: string
+          enum: [auto-transformable, best-effort, not-transformable]
+
+    # FileReport is the per-file result in a tree migration response.
+    FileReport:
+      type: object
+      properties:
+        path:
+          type: string
+          example: src/main.c
+        status:
+          type: string
+          enum: [success, partial, failed]
+        patterns_detected:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        transformations:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        manual_review:
+          type: array
+          items:
+            $ref: '#/components/schemas/FullPatternInfo'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorInfo'
+
+    # TreeMigrationReport is the JSON response returned by POST /api/v1/migrate-tree.
+    TreeMigrationReport:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success, partial, failed]
+        wasm_stored:
+          type: boolean
+          example: true
+        deployment_id:
+          type: string
+          nullable: true
+          example: d_abc123
+        app_name:
+          type: string
+          example: hello-world
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileReport'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorInfo'
+        files_total:
+          type: integer
+          example: 5
+        files_transformed:
+          type: integer
+          example: 3
+        files_manual_review:
+          type: integer
+          example: 1
+
+    PatternInfo:
+      type: object
+      properties:
+        pattern:
+          type: string
+          example: socket
+        count:
+          type: integer
+          example: 3
+        description:
+          type: string
+          example: BSD socket abstraction layer
+
+    ErrorInfo:
+      type: object
+      properties:
+        line:
+          type: integer
+          example: 42
+        message:
+          type: string
+          example: unhandled macro expansion
+
+    # -------------------------------------------------------------------------
+    # Workers (internal)
+    # -------------------------------------------------------------------------
+    RegisterWorkerRequest:
+      type: object
+      required: [worker_id, region]
+      properties:
+        worker_id:
+          type: string
+          example: w_us-east1_01
+        region:
+          type: string
+          example: us-east1
+        ip:
+          type: string
+          example: 203.0.113.42
+        memory_mb:
+          type: integer
+          example: 512
+
+    Worker:
+      type: object
+      properties:
+        id:
+          type: string
+          example: w_us-east1_01
+        tenant_id:
+          type: string
+          example: t_abc123
+        region:
+          type: string
+          example: us-east1
+        ip:
+          type: string
+          example: 203.0.113.42
+        memory_mb:
+          type: integer
+          example: 512
+
+    WorkerListResponse:
+      type: object
+      properties:
+        workers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Worker'
+
+    # -------------------------------------------------------------------------
+    # Auth
+    # -------------------------------------------------------------------------
+    WhoamiResponse:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        tenant_name:
+          type: string
+          example: acme
+        plan:
+          type: string
+          example: free
+        api_key_id:
+          type: string
+          example: k_abc123
+        api_key_name:
+          type: string
+          example: default
+        role:
+          type: string
+          example: owner
+        created_at:
+          type: string
+          format: date-time
+          description: When the tenant account was created.
+          example: "2026-01-02T03:04:05Z"
+
+    # -------------------------------------------------------------------------
+    # Cluster (admin)
+    # -------------------------------------------------------------------------
+    ClusterView:
+      type: object
+      description: Per-region snapshot of cluster state.
+      properties:
+        regions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RegionView'
+
+    RegionView:
+      type: object
+      properties:
+        name:
+          type: string
+          example: us-east1
+        workers:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkerStatus'
+
+    WorkerStatus:
+      type: object
+      properties:
+        worker_id:
+          type: string
+          example: w_us-east1_01
+        apps:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppStatus'
+
+    AppStatus:
+      type: object
+      properties:
+        app_name:
+          type: string
+          example: web-app
+        request_count:
+          type: integer
+          format: int64
+          description: Total requests handled by this app on this worker.
+          example: 9821
+
+  responses:
+    BadRequest:
+      description: Bad request — invalid or missing parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: BAD_REQUEST
+              message: name is required
+
+    Unauthorized:
+      description: Unauthorized — missing or invalid credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: invalid api key
+
+    Forbidden:
+      description: Forbidden — insufficient permissions.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: FORBIDDEN
+              message: forbidden
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: NOT_FOUND
+              message: deployment not found
+
+    Conflict:
+      description: Conflict — resource already exists.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: CONFLICT
+              message: app already exists
+
+    QuotaExceeded:
+      description: Quota exceeded — too many resources.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: QUOTA_EXCEEDED
+              message: max apps quota exceeded
+
+    InternalError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: internal error
+
+paths:
+  # -------------------------------------------------------------------------
+  # Public
+  # -------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      description: Returns 200 if the control plane is running. No auth required.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/tenants:
+    post:
+      operationId: bootstrapTenant
+      summary: Self-signup — create tenant and first API key
+      description: |
+        Creates a new tenant and atomically issues the first API key.
+        No authentication required. The returned raw API key is shown only once.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BootstrapRequest'
+            example:
+              name: acme
+              key_name: default
+      responses:
+        '201':
+          description: Tenant and API key created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BootstrapResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/keys:
+    post:
+      operationId: createAPIKey
+      summary: Create a new API key for the authenticated tenant
+      description: |
+        Issues a new API key scoped to the authenticated tenant.
+        The raw key is returned only once — store it securely.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAPIKeyRequest'
+            example:
+              name: ci-key
+              role: developer
+      responses:
+        '201':
+          description: API key created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAPIKeyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listAPIKeys
+      summary: List all API keys for the authenticated tenant
+      responses:
+        '200':
+          description: List of API key metadata (raw keys not included).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/APIKeyInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Auth
+  # -------------------------------------------------------------------------
+  /api/v1/auth/whoami:
+    get:
+      operationId: whoami
+      summary: Return the authenticated tenant and API key identity
+      responses:
+        '200':
+          description: Authenticated identity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhoamiResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Apps
+  # -------------------------------------------------------------------------
+  /api/v1/apps:
+    get:
+      operationId: listApps
+      summary: List all apps for the authenticated tenant
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 500
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated list of apps.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}:
+    post:
+      operationId: createApp
+      summary: Create a new app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAppRequest'
+      responses:
+        '201':
+          description: App created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: getApp
+      summary: Get a specific app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: App details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Deployments
+  # -------------------------------------------------------------------------
+  /api/v1/deploy/{appName}:
+    post:
+      operationId: deploy
+      summary: Upload and deploy a Wasm artifact
+      description: |
+        Stores the artifact, registers a new deployment, and auto-creates
+        the app record if it does not already exist. The artifact is
+        validated as a WebAssembly binary before storage.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+            description: Raw Wasm artifact bytes.
+      responses:
+        '201':
+          description: Deployment created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeployResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/status/{deploymentID}:
+    get:
+      operationId: getDeploymentStatus
+      summary: Get deployment details by ID
+      parameters:
+        - name: deploymentID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The deployment ID returned by the deploy endpoint.
+      responses:
+        '200':
+          description: Deployment details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/list/{appName}:
+    get:
+      operationId: listDeployments
+      summary: List deployments for an app with pagination
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated deployment list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/activate/{deploymentID}:
+    post:
+      operationId: activateDeployment
+      summary: Activate a specific deployment as the live version
+      description: |
+        Publishes a task update over NATS JetStream so subscribed workers
+        start serving the specified deployment. Only one deployment per app
+        can be active at a time — activating a new one replaces the current
+        live deployment atomically.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+        - name: deploymentID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deployment activated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActivateResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/active:
+    get:
+      operationId: getActiveDeployment
+      summary: Get the currently active deployment for an app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Active deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Ingress
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/ingress:
+    get:
+      operationId: appIngress
+      summary: Get the routing target for an app
+      description: |
+        Returns whether the app is currently running on a worker and, if so,
+        the worker address and port. Used by the CLI to validate that a live
+        URL is actually routable. Only returns data for the authenticated
+        tenant's own apps.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: App is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngressResponseReady'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: App not running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngressResponseNotReady'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Environment Variables
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/env:
+    get:
+      operationId: listEnvVars
+      summary: List all environment variables for an app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Map of environment variable key-value pairs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvMap'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: setEnvVar
+      summary: Set or update an environment variable
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetEnvRequest'
+            example:
+              key: LOG_LEVEL
+              value: debug
+      responses:
+        '204':
+          description: Environment variable set.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/env/{key}:
+    delete:
+      operationId: deleteEnvVar
+      summary: Delete an environment variable
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The environment variable key to delete.
+      responses:
+        '204':
+          description: Environment variable deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Migration
+  # -------------------------------------------------------------------------
+  /api/v1/migrate:
+    post:
+      operationId: migrate
+      summary: Submit C source code for auto-transformation and WASI compilation
+      description: |
+        Accepts a C source file, applies tree-sitter analysis to detect
+        POSIX/WASI migration patterns, auto-transforms safe patterns, and
+        compiles the result to a WebAssembly component via wasi-sdk.
+        The resulting artifact is stored and a deployment record is created.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, filename, language]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The C source file to migrate.
+                filename:
+                  type: string
+                  description: Original filename (used to derive the app name).
+                  example: hello_world.c
+                language:
+                  type: string
+                  enum: [c]
+                  description: Currently only "c" is supported.
+      responses:
+        '200':
+          description: Migration report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationReport'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/migrate-tree:
+    post:
+      operationId: migrateTree
+      summary: Submit a multi-file source tree for auto-transformation and WASI compilation
+      description: |
+        Accepts either a zip archive or multipart parts + JSON manifest
+        containing C or Rust source files. Each file is analyzed for
+        POSIX/WASI migration patterns, auto-transformed where safe, and
+        compiled to a WebAssembly component. The resulting artifact is
+        stored and a deployment record is created.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [tree, app_name, language]
+              properties:
+                app_name:
+                  type: string
+                  pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+                  description: Unique app name (alphanumeric, hyphens, 1-63 chars).
+                  example: my-app
+                language:
+                  type: string
+                  enum: [c, rust]
+                  description: Source language.
+                tree:
+                  type: string
+                  format: binary
+                  description: |
+                    Either a zip archive (Content-Type application/zip) or a
+                    JSON manifest `{"files":["path1","path2",...]}` referencing
+                    individual `file` parts. Zip is the recommended format.
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    One `file` part per entry in the tree manifest. Required
+                    when `tree` is a JSON manifest. Ignored when `tree` is zip.
+      responses:
+        '200':
+          description: Tree migration report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeMigrationReport'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Request body too large.
+        '422':
+          description: Migration failed (source errors or compile failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreeMigrationReport'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Quotas
+  # -------------------------------------------------------------------------
+  /api/v1/quotas:
+    get:
+      operationId: getQuota
+      summary: Get the authenticated tenant's resource quota limits
+      responses:
+        '200':
+          description: Quota limits and current usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quota'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/keys/{keyID}:
+    delete:
+      operationId: deleteAPIKey
+      summary: Revoke an API key
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The API key ID to revoke.
+      responses:
+        '204':
+          description: API key revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Egress allowlist
+  # -------------------------------------------------------------------------
+  /api/v1/egress:
+    get:
+      operationId: getEgressAllowlist
+      summary: Get the authenticated tenant's outbound egress allowlist
+      responses:
+        '200':
+          description: Current egress allowlist. Empty array means allow-all (no restriction).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: updateEgressAllowlist
+      summary: Replace the authenticated tenant's outbound egress allowlist
+      description: >
+        Replaces the tenant's allowlist and immediately republishes TaskMessages
+        to all running workers so they enforce the new policy without a manual
+        re-activate. An empty array clears the list (allow-all). A non-empty
+        array restricts outbound HTTP to only the listed hostnames or wildcard
+        patterns (e.g. `api.stripe.com`, `*.sendgrid.net`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EgressAllowlist'
+      responses:
+        '200':
+          description: Updated allowlist (normalized to lowercase).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EgressAllowlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Admin: Tenants
+  # -------------------------------------------------------------------------
+  /api/v1/admin/tenants:
+    get:
+      operationId: listTenants
+      summary: List all tenants (admin only)
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: List of all tenants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    post:
+      operationId: createTenant
+      summary: Create a tenant (admin only)
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+      responses:
+        '201':
+          description: Tenant created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/admin/tenants/{tenantID}:
+    get:
+      operationId: getTenant
+      summary: Get a tenant by ID (admin only)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tenant details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    put:
+      operationId: updateTenant
+      summary: Update a tenant (admin only)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTenantRequest'
+      responses:
+        '200':
+          description: Tenant updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: deleteTenant
+      summary: Delete a tenant and all its data (admin only)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Tenant deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Admin: Apps
+  # -------------------------------------------------------------------------
+  /api/v1/admin/apps/{appName}:
+    delete:
+      operationId: adminDeleteApp
+      summary: Force-delete any tenant's app (admin only)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '204':
+          description: App deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Admin: Cluster
+  # -------------------------------------------------------------------------
+  /api/v1/admin/cluster:
+    get:
+      operationId: getClusterView
+      summary: Get a cluster-wide snapshot of all workers and apps (admin only)
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Cluster state snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Internal: Worker-facing
+  # -------------------------------------------------------------------------
+  /api/internal/download/{deploymentID}:
+    get:
+      operationId: downloadArtifact
+      summary: Download the Wasm artifact for a deployment
+      description: Used by workers to download artifact content after a task update.
+        Requires a valid worker JWT.
+      security:
+        - WorkerJWTAuth: []
+      parameters:
+        - name: deploymentID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Wasm artifact binary.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/internal/workers:
+    post:
+      operationId: registerWorker
+      summary: Register a worker with the control plane
+      description: |
+        Called by a worker on startup. The worker's JWT contains its identity
+        (worker_id, tenant_id, apps). This call persists worker metadata and
+        subscribes the control plane to the worker's heartbeat stream.
+      security:
+        - WorkerJWTAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterWorkerRequest'
+      responses:
+        '201':
+          description: Worker registered.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: listWorkers
+      summary: List all registered workers for the tenant
+      security:
+        - WorkerJWTAuth: []
+      responses:
+        '200':
+          description: List of workers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+parameters:
+  appName:
+    name: appName
+    in: path
+    required: true
+    schema:
+      type: string
+    description: Unique name of the app within the tenant.

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -44,11 +45,11 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateAPIKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
 	if req.Name == "" {
-		http.Error(w, `{"error": "name is required"}`, http.StatusBadRequest)
+		httperror.BadRequestCtx(w, r, "name is required")
 		return
 	}
 	role := req.Role
@@ -59,7 +60,7 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	apiKey, rawKey, err := h.apiKeySvc.CreateAPIKey(r.Context(), tenantID, req.Name, role)
 	if err != nil {
 		log.Printf("internal error: %v", err)
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -78,7 +79,7 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	keys, err := h.apiKeySvc.ListAPIKeys(r.Context(), tenantID)
 	if err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
@@ -106,7 +107,7 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	keyID := r.PathValue("keyID")
 	if err := h.apiKeySvc.DeleteAPIKey(r.Context(), keyID); err != nil {
-		http.Error(w, `{"error": "internal error"}`, http.StatusInternalServerError)
+		httperror.InternalErrorCtx(w, r)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

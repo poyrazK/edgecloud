@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -77,13 +78,13 @@ func WorkerAuth(cfg WorkerJWTConfig) func(http.Handler) http.Handler {
 			// likely than a leak of the header — would expose a 24h bearer.)
 			token := r.Header.Get("Authorization")
 			if token == "" {
-				http.Error(w, `{"error": "missing worker token"}`, http.StatusUnauthorized)
+				httperror.UnauthorizedCtx(w, r, "missing worker token")
 				return
 			}
 			token = strings.TrimPrefix(token, "Bearer ")
 			claims, err := VerifyWorkerJWT(token, cfg)
 			if err != nil {
-				http.Error(w, `{"error": "invalid worker token"}`, http.StatusUnauthorized)
+				httperror.UnauthorizedCtx(w, r, "invalid worker token")
 				return
 			}
 			ctx := context.WithValue(r.Context(), WorkerIDKey, claims.WorkerID)

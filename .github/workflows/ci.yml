@@ -247,6 +247,124 @@ jobs:
           SKIP_INTEGRATION_TESTS=1 cargo test --manifest-path edge-ingress/Cargo.toml
 
   # ============================================================
+  # TEST-EDGE-MIGRATE-LIB — unit tests for edge-migrate-lib
+  # ============================================================
+  test-edge-migrate-lib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/
+          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-edge-migrate-lib-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # TODO: once a wasi-sdk CI image is available, install clang + wasi-sdk
+      # and set `EDGE_TEST_CLANG=1` so the new `test_transform_e2e_wasi_stubs_compile`
+      # regression net runs end-to-end on every PR. Tracked as a follow-up.
+      - name: Run tests
+        run: cargo test --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml
+
+  # ============================================================
+  # TEST-EDGE-MIGRATE-BIN — integration tests for edge-migrate binary
+  # ============================================================
+  test-edge-migrate-bin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml || true
+
+      - name: Install system clang
+        # System clang is sufficient for the bin's preprocessor test
+        # skip path; EDGE_TEST_CLANG stays unset so the lib's gated
+        # regression net is a no-op here.
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo bin
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/
+          key: cargo-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-edge-migrate-bin-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml
+  # OPENAPI-VALIDATE — verify all mux routes are covered by the spec
+  # ============================================================
+  openapi-validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Validate spec coverage
+        run: go run ./scripts/openapi_check.go
+
+  # ============================================================
+  # TS-CLIENT — generate and diff TypeScript client from OpenAPI spec
+  # ============================================================
+  ts-client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate TypeScript client
+        run: bash ./scripts/generate_tsc.sh
+
+      - name: Check for drift
+        run: git diff --exit-code internal/generated/api-types.ts
+
+  # ============================================================
   # GO-FMT — gofmt on edge-control-plane
   # ============================================================
   go-fmt:
