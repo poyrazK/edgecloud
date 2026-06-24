@@ -37,9 +37,17 @@ target = "wasm32-wasip2"
     .unwrap();
     // Drop the wasm artifact at the expected location so the CLI's
     // upload path finds it.
-    let artifact_dir = project.path().join("target").join("wasm32-wasip2").join("release");
+    let artifact_dir = project
+        .path()
+        .join("target")
+        .join("wasm32-wasip2")
+        .join("release");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    std::fs::write(artifact_dir.join(format!("{app_name}.wasm")), VALID_WASM_HEADER).unwrap();
+    std::fs::write(
+        artifact_dir.join(format!("{app_name}.wasm")),
+        VALID_WASM_HEADER,
+    )
+    .unwrap();
 }
 
 /// `edge deploy --auto-rollback` MUST append `?auto-rollback=true`

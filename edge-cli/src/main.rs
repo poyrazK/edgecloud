@@ -144,9 +144,12 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
         Command::Build => commands::build::run(&cli.path),
-        Command::Deploy { app, id, regions, auto_rollback } => {
-            commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback)
-        }
+        Command::Deploy {
+            app,
+            id,
+            regions,
+            auto_rollback,
+        } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),

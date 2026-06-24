@@ -23,7 +23,13 @@ use crate::state::State;
 /// ignores it because the flag was already set at upload time and
 /// is read from the deployment row by ActivateDeployment.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, app: &str, id: Option<&str>, regions: &[String], auto_rollback: bool) -> Result<()> {
+pub fn run(
+    path: &Path,
+    app: &str,
+    id: Option<&str>,
+    regions: &[String],
+    auto_rollback: bool,
+) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
@@ -156,7 +162,13 @@ fn resolve_app_name(app: &str, state: Option<&State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _app: &str, _id: Option<&str>, _regions: &[String], _auto_rollback: bool) -> Result<()> {
+pub fn run(
+    _path: &Path,
+    _app: &str,
+    _id: Option<&str>,
+    _regions: &[String],
+    _auto_rollback: bool,
+) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
 
