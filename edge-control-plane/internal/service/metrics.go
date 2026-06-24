@@ -67,14 +67,40 @@ func (a *MetricsAggregator) RenderTenant(tenantID string) string {
 
 // RenderAll returns a Prometheus text-format string containing metrics for
 // all tenants. Used by the unauthenticated GET /metrics operator endpoint.
+//
+// All tenants are collected into shared per-family line slices before emitting
+// so each `# TYPE` declaration appears exactly once across the full output —
+// Prometheus parsers reject a metric family name whose TYPE line appears more
+// than once in a single scrape response.
 func (a *MetricsAggregator) RenderAll() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	var b strings.Builder
+	var fl familyLines
 	for tenantID, apps := range a.data {
-		renderApps(&b, tenantID, apps)
+		collectFamilyLines(&fl, tenantID, apps)
 	}
+	var b strings.Builder
+	fl.emit(&b)
 	return b.String()
+}
+
+// familyLines holds accumulated series lines for each Prometheus metric family.
+// Collecting across all tenants/apps before emitting ensures each `# TYPE`
+// appears exactly once in the final output.
+type familyLines struct {
+	reqCount  []string
+	outBytes  []string
+	counters  []string
+	gauges    []string
+	histogram []string
+}
+
+func (fl *familyLines) emit(b *strings.Builder) {
+	emitFamily(b, "edge_request_count", "gauge", fl.reqCount)
+	emitFamily(b, "edge_outbound_bytes", "gauge", fl.outBytes)
+	emitFamily(b, "edge_counter", "counter", fl.counters)
+	emitFamily(b, "edge_gauge", "gauge", fl.gauges)
+	emitFamily(b, "edge_histogram_sample", "untyped", fl.histogram)
 }
 
 // renderApps writes Prometheus text-format output for every app belonging to
@@ -85,43 +111,33 @@ func (a *MetricsAggregator) RenderAll() string {
 // per-interval deltas, not monotonically increasing totals, and Prometheus
 // `counter` type requires monotonic values.
 func renderApps(b *strings.Builder, tenantID string, apps map[string]appMetrics) {
-	// Collect series per family across all apps in one pass, then emit
-	// families in a second pass so each `# TYPE` appears exactly once.
-	var (
-		reqCountLines  []string
-		outBytesLines  []string
-		counterLines   []string
-		gaugeLines     []string
-		histogramLines []string
-	)
+	var fl familyLines
+	collectFamilyLines(&fl, tenantID, apps)
+	fl.emit(b)
+}
 
+// collectFamilyLines appends series strings for every app in one tenant into
+// fl. Callers that need to merge multiple tenants call this once per tenant
+// before a single fl.emit — guaranteeing one TYPE line per family.
+func collectFamilyLines(fl *familyLines, tenantID string, apps map[string]appMetrics) {
 	for appName, m := range apps {
 		baseLabels := "tenant_id=" + promQuoteLabelValue(tenantID) + ",app=" + promQuoteLabelValue(appName)
-		reqCountLines = append(reqCountLines, fmt.Sprintf("edge_request_count{%s} %d", baseLabels, m.requestCount))
-		outBytesLines = append(outBytesLines, fmt.Sprintf("edge_outbound_bytes{%s} %d", baseLabels, m.outboundBytes))
+		fl.reqCount = append(fl.reqCount, fmt.Sprintf("edge_request_count{%s} %d", baseLabels, m.requestCount))
+		fl.outBytes = append(fl.outBytes, fmt.Sprintf("edge_outbound_bytes{%s} %d", baseLabels, m.outboundBytes))
 
 		for _, s := range m.samples {
 			labelStr := buildLabelStr(baseLabels, s.Labels)
 			metricLabel := "metric=" + promQuoteLabelValue(s.Name)
 			switch s.Kind {
 			case domain.MetricKindCounter:
-				counterLines = append(counterLines, fmt.Sprintf("edge_counter{%s,%s} %g", labelStr, metricLabel, s.Value))
+				fl.counters = append(fl.counters, fmt.Sprintf("edge_counter{%s,%s} %g", labelStr, metricLabel, s.Value))
 			case domain.MetricKindGauge:
-				gaugeLines = append(gaugeLines, fmt.Sprintf("edge_gauge{%s,%s} %g", labelStr, metricLabel, s.Value))
+				fl.gauges = append(fl.gauges, fmt.Sprintf("edge_gauge{%s,%s} %g", labelStr, metricLabel, s.Value))
 			case domain.MetricKindHistogramSample:
-				histogramLines = append(histogramLines, fmt.Sprintf("edge_histogram_sample{%s,%s} %g", labelStr, metricLabel, s.Value))
+				fl.histogram = append(fl.histogram, fmt.Sprintf("edge_histogram_sample{%s,%s} %g", labelStr, metricLabel, s.Value))
 			}
 		}
 	}
-
-	// Emit each family: one TYPE declaration followed by all series.
-	// Built-in metrics are delta values (reset each heartbeat) → gauge type.
-	// Guest edge_counter is cumulative across app lifetime → counter type.
-	emitFamily(b, "edge_request_count", "gauge", reqCountLines)
-	emitFamily(b, "edge_outbound_bytes", "gauge", outBytesLines)
-	emitFamily(b, "edge_counter", "counter", counterLines)
-	emitFamily(b, "edge_gauge", "gauge", gaugeLines)
-	emitFamily(b, "edge_histogram_sample", "untyped", histogramLines)
 }
 
 // emitFamily writes a Prometheus text-format metric family: one TYPE line

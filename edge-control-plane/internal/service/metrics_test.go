@@ -101,7 +101,7 @@ func TestMetricsAggregator_IngestAndRenderTenant(t *testing.T) {
 }
 
 // TestMetricsAggregator_RenderAll checks the operator-scoped render covers all
-// tenants.
+// tenants and emits each TYPE line exactly once across the full output.
 func TestMetricsAggregator_RenderAll(t *testing.T) {
 	agg := NewMetricsAggregator()
 	agg.Ingest("t_1", "app-a", 1, 0, nil)
@@ -113,6 +113,18 @@ func TestMetricsAggregator_RenderAll(t *testing.T) {
 	}
 	if !strings.Contains(out, `tenant_id="t_2"`) {
 		t.Error("RenderAll must include tenant t_2")
+	}
+
+	// Each TYPE line must appear exactly once — Prometheus parsers reject
+	// a metric family name whose TYPE line is repeated in a single scrape.
+	for _, typeLine := range []string{
+		"# TYPE edge_request_count gauge",
+		"# TYPE edge_outbound_bytes gauge",
+	} {
+		count := strings.Count(out, typeLine)
+		if count != 1 {
+			t.Errorf("RenderAll emitted %q %d times (want 1); both tenants share one TYPE declaration\ngot:\n%s", typeLine, count, out)
+		}
 	}
 }
 
