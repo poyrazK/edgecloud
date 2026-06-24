@@ -809,6 +809,68 @@ components:
           description: Total requests handled by this app on this worker.
           example: 9821
 
+    # -------------------------------------------------------------------------
+    # Custom domains (issue #83)
+    # -------------------------------------------------------------------------
+    Domain:
+      type: object
+      description: |
+        A tenant-owned FQDN bound to a specific app. The status field is
+        server-driven: `pending` is the default, `active` is set by a v2
+        Caddy webhook on successful ACME issuance, `failed` is set on
+        permanent ACME failure. Tenants cannot mutate status directly.
+      properties:
+        id:
+          type: string
+          example: dom_3f4a1c9e
+        tenant_id:
+          type: string
+          example: t_acme
+        app_name:
+          type: string
+          example: api
+        fqdn:
+          type: string
+          example: api.acme.com
+        status:
+          type: string
+          enum: [pending, active, failed]
+          example: pending
+        last_error:
+          type: string
+          nullable: true
+          description: Set by the (v2) Caddy event webhook when ACME fails.
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-06-22T12:34:56Z'
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+      required: [id, tenant_id, app_name, fqdn, status, created_at]
+
+    DomainListResponse:
+      type: object
+      properties:
+        domains:
+          type: array
+          items:
+            $ref: '#/components/schemas/Domain'
+
+    AddDomainRequest:
+      type: object
+      properties:
+        fqdn:
+          type: string
+          description: |
+            Fully-qualified domain name. Must be RFC 1035 shape (lowercase,
+            ≤253 chars, ≤63 chars per label, no leading/trailing hyphens),
+            no wildcards, and not ending in `.edgecloud.dev` (platform-managed
+            host).
+          example: api.acme.com
+      required: [fqdn]
+
   responses:
     BadRequest:
       description: Bad request — invalid or missing parameters.
@@ -2053,6 +2115,136 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Custom domains (issue #83)
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/domains:
+    post:
+      operationId: addDomain
+      summary: Bind a custom FQDN to an existing app
+      description: |
+        Validates the FQDN shape (RFC 1035, lowercase, ≤253 chars, no
+        wildcards, no `.edgecloud.dev` suffix), enforces a per-app quota
+        (50 by default), and inserts a row in `pending` state. The ingress
+        picks up the new row on its next 30 s poll and Caddy begins ACME
+        issuance on the first request to that host.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDomainRequest'
+      responses:
+        '201':
+          description: Domain row created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: App not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      operationId: listDomains
+      summary: List all custom FQDNs bound to an app
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+      responses:
+        '200':
+          description: List of domain rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/domains/{fqdn}:
+    get:
+      operationId: getDomain
+      summary: Fetch one domain row by FQDN
+      description: |
+        Returns the row including its `status`, `last_error` (if the v2
+        Caddy webhook has populated it), and `verified_at`. Use this to
+        diagnose a `failed` row.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+        - name: fqdn
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The FQDN to look up.
+      responses:
+        '200':
+          description: Domain row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domain'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No row matches (app, fqdn).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      operationId: removeDomain
+      summary: Unbind a custom FQDN from an app
+      description: |
+        Deletes the row. The ingress drops the FQDN route on its next
+        30 s poll and Caddy's cert for that host is not renewed on expiry.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/appName'
+        - name: fqdn
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The FQDN to remove.
+      responses:
+        '204':
+          description: Domain row removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No row matches (app, fqdn).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
