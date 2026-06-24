@@ -94,8 +94,16 @@ impl Transformer {
         // `original_start_byte` equals `start_byte` when no preprocessor
         // is attached (identity mapping), so the no-preprocessor path is
         // unchanged.
+        //
+        // The secondary key (`Reverse(original_end_byte)`) breaks ties
+        // deterministically: when two matches share a start byte (e.g.
+        // a bound declaration and the call it wraps), the wider range
+        // comes first so the narrower match lands inside it. The
+        // overlap-detection guard below routes the contained match to
+        // `manual_review` rather than slicing an inverted range and
+        // panicking.
         let mut sorted = transformable;
-        sorted.sort_by_key(|m| m.original_start_byte);
+        sorted.sort_by_key(|m| (m.original_start_byte, std::cmp::Reverse(m.original_end_byte)));
 
         let source_bytes = source.as_bytes();
 
@@ -135,18 +143,32 @@ impl Transformer {
             // Sanity guard for synthetic-line matches (byte_map entry
             // was `u32::MAX`, couldn't be remapped). Such matches are
             // best-effort and should not be sliced — route to
-            // manual_review instead. Without this guard, orig_end
-            // would be `usize::MAX` (overflow) or some out-of-range
-            // value, and the `extend_from_slice` below would panic.
+            // manual_review instead. Without this guard, `orig_end`
+            // would exceed `source_bytes.len()` (since `u32::MAX as
+            // usize` is far past any realistic file size) and the
+            // `extend_from_slice` below would panic. The `usize::MAX`
+            // comparison is intentionally absent: `u32::MAX` cast to
+            // `usize` is `4_294_967_295` on 64-bit, not `usize::MAX`,
+            // and the `> source_bytes.len()` clause already covers it.
+            //
+            // The `orig_start < prev_end` clause catches the
+            // sort-tie/overlap case: after the secondary sort key,
+            // a contained match (e.g. a `socket` call inside a
+            // `bind(fd, ...)` argument list that happens to share a
+            // start byte) is fully enclosed by the previous emit's
+            // range. Slicing `source_bytes[prev_end..orig_start]`
+            // with `prev_end > orig_start` would panic. Route to
+            // `manual_review` instead — the surrounding emit has
+            // already covered the original source content.
             if orig_end > source_bytes.len()
                 || orig_start > orig_end
-                || orig_start == usize::MAX
-                || orig_end == usize::MAX
+                || orig_start < prev_end
             {
                 tracing::warn!(
-                    "skipping match on synthetic line (orig_start={}, orig_end={}, source_len={}); routing to manual_review",
+                    "skipping match that overlaps a prior emit (orig_start={}, orig_end={}, prev_end={}, source_len={}); routing to manual_review",
                     orig_start,
                     orig_end,
+                    prev_end,
                     source_bytes.len()
                 );
                 manual_review.push(m.clone());
