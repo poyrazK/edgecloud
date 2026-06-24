@@ -8,6 +8,7 @@ pub mod deployments;
 pub mod dev;
 pub mod env;
 pub mod init;
+pub mod logs;
 pub mod migrate;
 pub mod open;
 pub mod rollback;
