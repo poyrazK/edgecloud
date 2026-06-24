@@ -196,8 +196,9 @@ async fn push_now(
     traffic_cache: &SharedCache,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
+    let fqdns = table.fqdn_snapshot().await;
     let traffic_cache = traffic_cache.read().await;
-    let json = render_routes(&snap, cfg, &traffic_cache);
+    let json = render_routes(&snap, &fqdns, cfg, &traffic_cache);
     caddy.load_config(&json).await
 }
 

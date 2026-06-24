@@ -8,6 +8,7 @@
 
 mod caddy;
 mod config;
+mod domains;
 pub mod heartbeats;
 mod messages;
 mod routing;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
@@ -66,6 +68,25 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Custom-domain poller (issue #83). Spawned as a fire-and-forget
+    // task; if the control plane rejects our token repeatedly
+    // (rotated JWT secret, revoked ingest token) the poller returns
+    // Err and we exit non-zero so the orchestrator restarts us with a
+    // fresh token. Heartbeats keep running in parallel.
+    if !cfg.control_plane_url.is_empty() {
+        let dom_cfg = cfg.clone();
+        let dom_table = table.clone();
+        let dom_notify = Arc::new(Notify::new());
+        tokio::spawn(async move {
+            if let Err(e) = domains::run(dom_cfg, dom_table, dom_notify).await {
+                tracing::error!(err = %e, "domain poller exited; restarting process");
+                std::process::exit(1);
+            }
+        });
+    } else {
+        tracing::info!("CONTROL_PLANE_URL unset; running in default-only mode (no custom domains)");
+    }
 
     // The heartbeat subscription can drop on NATS reconnect; mirror the
     // worker's pattern of re-subscribing with backoff.
