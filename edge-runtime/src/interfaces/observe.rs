@@ -36,6 +36,20 @@ type MetricLabels = Vec<(String, String)>;
 /// the Wasmtime `Store`.
 type HistogramMap = HashMap<String, Vec<(f64, MetricLabels)>>;
 
+/// Build a composite key that uniquely identifies one (metric_name, label_set)
+/// time series. The null byte separator can't appear in a valid metric name or
+/// label value, so no two distinct (name, labels) pairs can collide.
+fn series_key(name: &str, labels: &[(String, String)]) -> String {
+    let mut key = name.to_string();
+    for (k, v) in labels {
+        key.push('\x00');
+        key.push_str(k);
+        key.push('=');
+        key.push_str(v);
+    }
+    key
+}
+
 pub struct MetricsAccumulator {
     counters: Arc<RwLock<HashMap<String, (u64, MetricLabels)>>>,
     gauges: Arc<RwLock<HashMap<String, (f64, MetricLabels)>>>,
@@ -52,29 +66,86 @@ impl MetricsAccumulator {
     }
 
     /// Snapshot current metric state for heartbeat shipping.
+    ///
+    /// Counters and gauges are read non-destructively: counters are cumulative
+    /// across the app's lifetime (correct Prometheus `counter` semantics);
+    /// gauges hold last-known value. Histograms are **drained** atomically —
+    /// they are per-interval observations and must not accumulate across
+    /// heartbeats (unbounded growth → OOM and oversized NATS messages).
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let counters = self
+            .counters
+            .read()
+            .map(|c| {
+                c.iter()
+                    .map(|(key, (val, lbls))| {
+                        // Strip the composite series key back to the metric name
+                        // (everything before the first \x00 separator).
+                        let name = key
+                            .split_once('\x00')
+                            .map(|(n, _)| n)
+                            .unwrap_or(key.as_str())
+                            .to_string();
+                        MetricEntry {
+                            name,
+                            value: *val,
+                            labels: lbls.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let gauges = self
+            .gauges
+            .read()
+            .map(|g| {
+                g.iter()
+                    .map(|(key, (val, lbls))| {
+                        let name = key
+                            .split_once('\x00')
+                            .map(|(n, _)| n)
+                            .unwrap_or(key.as_str())
+                            .to_string();
+                        MetricEntry {
+                            name,
+                            value: *val,
+                            labels: lbls.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let histograms = self
+            .histograms
+            .write()
+            .map(|mut h| std::mem::take(&mut *h))
+            .unwrap_or_default();
+
         MetricsSnapshot {
-            counters: self.counters.read().map(|c| c.clone()).unwrap_or_default(),
-            gauges: self.gauges.read().map(|g| g.clone()).unwrap_or_default(),
-            histograms: self
-                .histograms
-                .read()
-                .map(|h| h.clone())
-                .unwrap_or_default(),
+            counters,
+            gauges,
+            histograms,
         }
     }
 
     pub(crate) fn increment(&self, name: &str, labels: &[(String, String)]) {
         if let Ok(mut c) = self.counters.write() {
-            let entry = c.entry(name.to_string()).or_insert_with(|| (0, Vec::new()));
+            // Key by (name, labels) so different label sets produce separate
+            // Prometheus time series. The \x00 separator can't appear in a
+            // valid metric name or label value, so no key collision is possible.
+            let key = series_key(name, labels);
+            let entry = c.entry(key).or_insert_with(|| (0, labels.to_vec()));
             entry.0 += 1;
-            entry.1 = labels.to_vec();
         }
     }
 
     pub(crate) fn set_gauge(&self, name: &str, value: f64, labels: &[(String, String)]) {
         if let Ok(mut g) = self.gauges.write() {
-            g.insert(name.to_string(), (value, labels.to_vec()));
+            // Key by (name, labels) for the same multi-dimensional reason as counters.
+            let key = series_key(name, labels);
+            g.insert(key, (value, labels.to_vec()));
         }
     }
 
@@ -104,10 +175,22 @@ impl Default for MetricsAccumulator {
     }
 }
 
+/// One metric series entry in a snapshot.
+pub struct MetricEntry<V> {
+    pub name: String,
+    pub value: V,
+    pub labels: MetricLabels,
+}
+
 /// Point-in-time snapshot of all metrics for one app instance.
+///
+/// `counters` and `gauges` are flat `Vec`s (not keyed maps) so the metric
+/// name is preserved even though the backing store uses a composite
+/// `(name, labels)` key. `histograms` remain name-keyed because all samples
+/// for a name are drained together.
 pub struct MetricsSnapshot {
-    pub counters: HashMap<String, (u64, MetricLabels)>,
-    pub gauges: HashMap<String, (f64, MetricLabels)>,
+    pub counters: Vec<MetricEntry<u64>>,
+    pub gauges: Vec<MetricEntry<f64>>,
     pub histograms: HashMap<String, Vec<(f64, MetricLabels)>>,
 }
 
@@ -557,7 +640,19 @@ mod tests {
         let observer = Observer::new();
         observer.increment_counter("requests_total", &[]);
         observer.increment_counter("requests_total", &[("method".into(), "GET".into())]);
-        assert_eq!(observer.get_counter("requests_total"), Some(2));
+        // Different label sets produce separate series; get_counter looks up
+        // the zero-label series only, so it returns 1, not 2.
+        assert_eq!(observer.get_counter("requests_total"), Some(1));
+        // Confirm the labeled series also exists independently.
+        let snap = observer.accumulator();
+        let total: u64 = snap
+            .counters
+            .read()
+            .unwrap()
+            .values()
+            .map(|(v, _)| *v)
+            .sum();
+        assert_eq!(total, 2);
     }
 
     #[test]
@@ -805,19 +900,47 @@ mod tests {
         let observer =
             Observer::from_config(ObserveConfig::new().with_metrics_accumulator(Arc::clone(&acc)));
 
+        // Two increments with different label sets produce two separate series.
         observer.increment_counter("hits", &[("route".into(), "/api".into())]);
         observer.increment_counter("hits", &[]);
         observer.record_gauge("active_conns", 7.0, &[]);
         observer.record_histogram("latency_ms", 12.5, &[]);
 
         let snap = acc.snapshot();
-        assert_eq!(snap.counters.get("hits").map(|(v, _)| *v), Some(2));
-        assert_eq!(snap.gauges.get("active_conns").map(|(v, _)| *v), Some(7.0));
+
+        // Counter: two distinct label sets → two separate series, each with value 1.
+        let hits_total: u64 = snap
+            .counters
+            .iter()
+            .filter(|e| e.name == "hits")
+            .map(|e| e.value)
+            .sum();
+        assert_eq!(hits_total, 2, "both hits series should sum to 2");
+        assert_eq!(
+            snap.counters.iter().filter(|e| e.name == "hits").count(),
+            2,
+            "should have 2 distinct series for hits"
+        );
+
+        // Gauge and histogram: single series, accessed by name.
+        let gauge_val = snap
+            .gauges
+            .iter()
+            .find(|e| e.name == "active_conns")
+            .map(|e| e.value);
+        assert_eq!(gauge_val, Some(7.0));
         assert_eq!(
             snap.histograms
                 .get("latency_ms")
                 .map(|v| v.iter().map(|(x, _)| *x).collect::<Vec<_>>()),
             Some(vec![12.5])
+        );
+
+        // Histograms are drained on snapshot; a second snapshot yields empty.
+        let snap2 = acc.snapshot();
+        assert!(
+            snap2.histograms.is_empty(),
+            "histograms must be drained after snapshot"
         );
     }
 }

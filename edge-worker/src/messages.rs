@@ -297,6 +297,7 @@ mod tests {
             outbound_bytes: 512,
             tenant_id: "t_1".into(),
             port: 8080,
+            observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(
