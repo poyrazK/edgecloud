@@ -40,6 +40,20 @@ pub struct ExpandedSource {
     /// expanded line `i + 1`. When `# <lineno> "<file>"` markers are
     /// absent or cannot be parsed, the entry is `i + 1` (identity).
     pub line_map: Vec<u32>,
+    /// Per-line byte remap, parallel to `line_map`. For each expanded
+    /// line (0-indexed): `(expanded_byte_start_of_line, original_byte_start_of_line)`.
+    /// The expanded byte is the byte offset of the start of that line
+    /// within `text`. The original byte is the byte offset of the
+    /// corresponding user-file line within the original source.
+    ///
+    /// Synthetic lines (linemarkers, `<built-in>`, `<command line>`)
+    /// have `u32::MAX` for the original byte — the analyzer skips
+    /// remapping for matches that fall on such lines.
+    ///
+    /// When no preprocessor is attached, expansion fails, or the
+    /// callers don't need byte remap, callers pass `Vec::new()` —
+    /// the analyzer treats an empty map as identity.
+    pub byte_map: Vec<(u32, u32)>,
     /// Number of macro substitutions observed (heuristic, may be 0).
     pub macros_expanded: usize,
 }
@@ -176,11 +190,14 @@ impl Preprocessor {
         // Match against the full temp path so clang's `# "<file>"`
         // markers (which reference the full path) align.
         let line_map = build_line_map(&text, &temp_path_str);
+        // Parallel byte-offset remap; see `build_byte_map` for semantics.
+        let byte_map = build_byte_map(&text, &line_map, source);
         let macros_expanded = count_macros(source);
 
         Ok(ExpandedSource {
             text,
             line_map,
+            byte_map,
             macros_expanded,
         })
     }
@@ -260,6 +277,64 @@ fn build_line_map(text: &str, filename_hint: &str) -> Vec<u32> {
     }
     map
 }
+/// Build a `byte_map` parallel to `line_map`. For each expanded line
+/// (0-indexed), the entry is `(expanded_byte_start_of_line, original_byte_start_of_line)`.
+///
+/// The expanded byte is the byte offset within `expanded_text` where
+/// that line starts (computed by walking the text once). The original
+/// byte is the byte offset within `original_source` where the
+/// corresponding user-file line starts. Lines whose `line_map[i]` is
+/// `0` (synthetic — linemarkers, `<built-in>`, etc.) get `u32::MAX`
+/// for the original byte so the analyzer can skip remapping.
+///
+/// This is the byte-range counterpart to `line_map`. The analyzer
+/// uses it to remap tree-sitter byte ranges (which are in expanded
+/// coordinates) back to original-source coordinates before the
+/// transformer slices the original source.
+///
+/// **Limitations:** the same as `line_map` — clang emits linemarkers
+/// at file boundaries, not at every source line, so a match on a
+/// synthetic line is not remappable. Single-line matches on user-file
+/// lines are exact.
+fn build_byte_map(
+    expanded_text: &str,
+    line_map: &[u32],
+    original_source: &str,
+) -> Vec<(u32, u32)> {
+    // Precompute original-source line starts: line_starts_orig[0] = 0,
+    // line_starts_orig[i] = byte offset of the i-th line (0-indexed).
+    // A line starts at the byte after each `\n` in the original.
+    let mut line_starts_orig: Vec<u32> = Vec::with_capacity(line_map.len().max(1));
+    line_starts_orig.push(0);
+    for (i, b) in original_source.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts_orig.push((i + 1) as u32);
+        }
+    }
+
+    // Walk expanded text line by line, tracking running byte offset.
+    let mut result = Vec::with_capacity(line_map.len());
+    let mut expanded_byte: u32 = 0;
+    for (i, line) in expanded_text.split('\n').enumerate() {
+        let line_len = (line.len() + 1) as u32; // include the trailing `\n`
+        let user_line = line_map.get(i).copied().unwrap_or(0);
+        let original_byte = if user_line == 0 {
+            u32::MAX // synthetic
+        } else {
+            // user_line is 1-indexed; convert to 0-indexed for the
+            // line_starts_orig lookup. If the original source is
+            // shorter than the line_map claims (should not happen,
+            // but defensive), fall back to u32::MAX.
+            let idx = (user_line - 1) as usize;
+            line_starts_orig.get(idx).copied().unwrap_or(u32::MAX)
+        };
+        result.push((expanded_byte, original_byte));
+        expanded_byte = expanded_byte.saturating_add(line_len);
+    }
+    result
+}
+
+
 
 /// Heuristic count of `#define` directives in the original source.
 /// Used for `PreprocessorInfo.macros_expanded` — not exact, but a
@@ -497,6 +572,58 @@ foo
     }
 
     #[test]
+    fn test_build_byte_map_marks_synthetic_lines_max() {
+        // Same input shape as test_build_line_map_synthetic_markers:
+        // a clang-style expanded output with linemarker lines.
+        let text = "\
+# 1 \"user.c\"
+int main() {
+# 3 \"user.c\"
+    return 0;
+# 1 \"<built-in>\"
+foo
+";
+        let line_map = build_line_map(text, "user.c");
+        // Original source has 3 user lines: line 1 at byte 0,
+        // line 2 at byte 13, line 3 at byte 27.
+        let original = "int main() {\n    return 0;\n}\n";
+        let byte_map = build_byte_map(text, &line_map, original);
+        // Synthetic linemarker lines (entries 0, 2, 4) get u32::MAX
+        // for the original byte.
+        assert_eq!(byte_map[0].1, u32::MAX, "linemarker line should be synthetic");
+        assert_eq!(byte_map[2].1, u32::MAX, "linemarker line should be synthetic");
+        assert_eq!(byte_map[4].1, u32::MAX, "linemarker line should be synthetic");
+        // User-file source lines map to actual byte offsets in the
+        // original source. line_map[1]=1 → byte 0; line_map[3]=3 → byte 27.
+        assert_eq!(byte_map[1].1, 0, "line 1 maps to original byte 0");
+        assert_eq!(byte_map[3].1, 27, "line 3 maps to original byte 27");
+        // The expanded byte offsets must be monotonically increasing.
+        for win in byte_map.windows(2) {
+            assert!(win[1].0 > win[0].0, "expanded byte must be increasing");
+        }
+    }
+
+    #[test]
+    fn test_build_byte_map_identity_when_no_expansion() {
+        // When the expanded text is identical to the original (no
+        // macros, no linemarkers), byte_map[i] should map each
+        // expanded line to the same byte offset as the corresponding
+        // original line.
+        let text = "int main() {\n    return 0;\n}\n";
+        // Identity line_map: each expanded line is from user file at
+        // the same 1-indexed line number.
+        let line_map = vec![1, 2, 3, 4];
+        let byte_map = build_byte_map(text, &line_map, text);
+        // "int main() {" = 12 chars (line 1, byte 0)
+        // "    return 0;" = 13 chars (line 2, byte 13)
+        // "}" = 1 char (line 3, byte 27)
+        // "" trailing (line 4, byte 29 — after "}\n")
+        assert_eq!(byte_map[0], (0, 0));
+        assert_eq!(byte_map[1], (13, 13));
+        assert_eq!(byte_map[2], (27, 27));
+        assert_eq!(byte_map[3], (29, 29));
+    }
+
     fn test_parse_linemarker_basic() {
         let (n, f) = parse_linemarker("# 1 \"foo.c\"").unwrap();
         assert_eq!(n, 1);
