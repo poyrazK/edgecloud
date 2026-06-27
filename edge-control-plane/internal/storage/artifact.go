@@ -41,6 +41,14 @@ type FSArtifactStore struct {
 	basePath string
 }
 
+// BasePath returns the filesystem root the store writes to. Used by
+// RemoteArtifactStore (which embeds an FSArtifactStore as its cache
+// layer) to know where to put the pull-through staging directory.
+// Not on the ArtifactStore interface — pure-FS detail.
+func (s *FSArtifactStore) BasePath() string {
+	return s.basePath
+}
+
 // NewFSArtifactStore constructs an FSArtifactStore rooted at basePath.
 func NewFSArtifactStore(basePath string) *FSArtifactStore {
 	return &FSArtifactStore{basePath: basePath}

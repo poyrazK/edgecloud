@@ -334,6 +334,17 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
 	}
+	// /api/internal/download is mounted under a separate middleware
+	// chain that accepts either a worker JWT (existing behavior) OR
+	// an X-Internal-Token header (new — lets a peer control plane
+	// pull artifacts through this CP for its own region). Other
+	// /api/internal/* routes stay WorkerAuth-only; the token lane is
+	// intentionally narrow (issue #127 step 3).
+	downloadMux := http.NewServeMux()
+	downloadMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	mux.Handle("GET /api/internal/download/", middleware.InternalOrWorkerAuth(
+		workerJWTConfig, cfg.InternalToken,
+	)(downloadMux))
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
 	// Start server with graceful shutdown
