@@ -491,3 +491,70 @@ func TestRemoteArtifactStore_PullFromPeer_RejectsOversizedResponse(t *testing.T)
 		}
 	}
 }
+
+// TestRemoteArtifactStore_Open_CapEnforcedOnCacheMissPostRename covers
+// the cache-miss post-rename path: the on-disk guard from
+// TestRemoteArtifactStore_PullFromPeer_RejectsOversizedResponse
+// (Commit 1) catches most oversize peer responses before any read
+// happens, but if a file larger than MaxArtifactSize ever lands in
+// the cache through any other path (operator import, future backend,
+// concurrent truncation race), the limitReadCloser wrapper must
+// still stop the read at the cap.
+//
+// Mirrors TestS3ArtifactStore_Open_CapEnforcedDuringRead at s3_test.go.
+func TestRemoteArtifactStore_Open_CapEnforcedOnCacheMissPostRename(t *testing.T) {
+	oversize := MaxArtifactSize + 4096
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/wasm")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, oversize))
+	})
+	s := mustNewRemote(t, peer, "tok", t.TempDir())
+
+	rc, err := s.Open(t.Context(), "t_x", "a", "d_z")
+	if err != nil {
+		// The on-disk guard (Commit 1) may surface ErrArtifactTooLarge
+		// directly from Open when the peer stream exceeds the cap.
+		// Either path satisfies the test — the cache-miss return
+		// must not bypass the cap on either code path.
+		if errors.Is(err, ErrArtifactTooLarge) {
+			return
+		}
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if !errors.Is(err, ErrArtifactTooLarge) {
+		t.Errorf("ReadAll: want ErrArtifactTooLarge, got %v (got %d bytes)", err, len(got))
+	}
+	if int64(len(got)) > MaxArtifactSize {
+		t.Errorf("ReadAll received %d bytes past the cap (max %d)", len(got), MaxArtifactSize)
+	}
+}
+
+// TestRemoteArtifactStore_Open_UnderCapRoundTrip pins the complement:
+// an under-cap payload must round-trip cleanly through the
+// pull-through + limitReadCloser path. Mirrors
+// TestS3ArtifactStore_Open_UnderCapRoundTrip at s3_test.go.
+func TestRemoteArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
+	payload := []byte("\x00asmremote-undercap-roundtrip")
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/wasm")
+		w.Write(payload)
+	})
+	s := mustNewRemote(t, peer, "tok", t.TempDir())
+
+	rc, err := s.Open(t.Context(), "t_x", "a", "d_z")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload mismatch: got %q, want %q", got, payload)
+	}
+}

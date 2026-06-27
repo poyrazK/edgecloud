@@ -174,7 +174,19 @@ func (s *RemoteArtifactStore) Open(ctx context.Context, tenantID, appName, deplo
 	if err != nil {
 		return nil, fmt.Errorf("RemoteArtifactStore.Open: cache path: %w", err)
 	}
-	return os.Open(finalPath)
+	// Wrap in newLimitReadCloser so the read-side cap matches what
+	// FSArtifactStore.Open (artifact.go:144) and S3ArtifactStore.Open
+	// (s3.go:150) apply. Without this, the cache-miss post-rename path
+	// returns a raw *os.File and the Download handler's io.Copy
+	// (handler/internal.go:57) streams unbounded bytes into the
+	// worker's response. The limitReadCloser is the live guard: it
+	// stops reading at MaxArtifactSize even if a concurrent writer
+	// inflates the file after we open it.
+	f, err := os.Open(finalPath)
+	if err != nil {
+		return nil, fmt.Errorf("RemoteArtifactStore.Open: open cache: %w", err)
+	}
+	return newLimitReadCloser(f, MaxArtifactSize), nil
 }
 
 // Delete removes the local cache entry only. Cross-CP GC is a
