@@ -137,7 +137,7 @@ func main() {
 	envSvc := service.NewEnvService(appEnvRepo)
 	metricsAgg := service.NewMetricsAggregator()
 	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv(), metricsAgg)
-	clusterSvc := service.NewClusterService(workerRepo)
+	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
 	// ReconcileService is constructed here (alongside the other
@@ -309,6 +309,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// Admin: apps & cluster
 	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
+	mux.HandleFunc("GET /api/admin/cluster/events", redirectTo("/api/v1/admin/cluster/events"))
 	// Internal: redirect old /api/internal/ paths to the new unversioned /api/internal/
 	mux.HandleFunc("GET /api/internal/download/{deploymentID}", redirectTo("/api/internal/download/"+"{deploymentID}"))
 	mux.HandleFunc("POST /api/internal/workers", redirectTo("/api/internal/workers"))
@@ -362,6 +363,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
+	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)
 
 	// Chain auth + role middleware
 	apiWithAuth := authMiddleware.Authenticate(api)

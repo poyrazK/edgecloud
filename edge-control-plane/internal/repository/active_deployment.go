@@ -260,7 +260,6 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 	return ads, err
 }
 
-<<<<<<< HEAD
 // AppendRegionsPublished atomically merges `regions` into the
 // `regions_published` array on the (tenant, app) active row, AND
 // removes them from `regions_failed` (a region that succeeds on

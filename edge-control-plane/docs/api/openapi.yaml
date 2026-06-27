@@ -781,21 +781,33 @@ components:
       type: object
       description: Per-region snapshot of cluster state.
       properties:
+        generated_at:
+          type: string
+          format: date-time
+          description: Server-side timestamp when this view was assembled.
+        # Map keyed by region name (`fra`, `us-east1`, etc.) — preferred
+        # over an array because the wire shape is unordered today and
+        # the Go handler encodes it as `map[string]RegionView`. Operators
+        # consuming this endpoint should iterate `Object.keys()`.
         regions:
-          type: array
-          items:
+          type: object
+          additionalProperties:
             $ref: '#/components/schemas/RegionView'
 
     RegionView:
       type: object
       properties:
-        name:
-          type: string
-          example: us-east1
         workers:
           type: array
           items:
             $ref: '#/components/schemas/WorkerStatus'
+        apps_per_worker_avg:
+          type: integer
+          description: |
+            Mean number of apps hosted per worker in this region, rounded
+            down to the nearest integer. Useful to spot fleet skew
+            (one worker pinned at 100 apps while peers sit at 5).
+            Set to 0 when the region has no workers yet.
 
     WorkerStatus:
       type: object
@@ -803,22 +815,79 @@ components:
         worker_id:
           type: string
           example: w_us-east1_01
-        apps:
-          type: array
-          items:
-            $ref: '#/components/schemas/AppStatus'
-
-    AppStatus:
-      type: object
-      properties:
-        app_name:
+        region:
           type: string
-          example: web-app
-        request_count:
+          example: us-east1
+        ip:
+          type: string
+          description: Worker public IP. Omitted when the worker has not reported one yet.
+          example: 203.0.113.42
+        last_seen:
+          type: string
+          format: date-time
+          description: Last heartbeat timestamp.
+        app_count:
+          type: integer
+          description: Number of apps the worker reported on its latest heartbeat.
+          example: 12
+        memory_mb:
+          type: integer
+          description: Worker-allocated memory budget.
+          example: 4096
+
+    # -------------------------------------------------------------------------
+    # Autoscale events (issue #85)
+    # -------------------------------------------------------------------------
+    AutoscaleEvent:
+      type: object
+      description: One row in the `autoscale_events` table — a single decision tick.
+      properties:
+        id:
           type: integer
           format: int64
-          description: Total requests handled by this app on this worker.
-          example: 9821
+        created_at:
+          type: string
+          format: date-time
+        region:
+          type: string
+          example: fra
+        action:
+          type: string
+          enum: [scale_up, scale_down, noop]
+        from_count:
+          type: integer
+          description: Fleet size before the action.
+        to_count:
+          type: integer
+          description: Fleet size the autoscaler targeted.
+        reason:
+          type: string
+          description: Machine-readable explanation (e.g., "free_slots=0 needed=5").
+        provider_kind:
+          type: string
+          example: noop
+        succeeded:
+          type: boolean
+        error_message:
+          type: string
+          nullable: true
+          description: Cloud-provider error text when `succeeded=false`; null otherwise.
+
+    AutoscaleEventList:
+      type: object
+      description: Envelope returned by `GET /api/v1/admin/cluster/events`.
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AutoscaleEvent'
+        limit:
+          type: integer
+          description: The limit that was applied server-side.
+        region:
+          type: string
+          nullable: true
+          description: The region filter (echoed back). Null when listing all regions.
 
     # -------------------------------------------------------------------------
     # Custom domains (issue #83)
@@ -2131,6 +2200,47 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ClusterView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/admin/cluster/events:
+    get:
+      operationId: listAutoscaleEvents
+      summary: List recent cluster autoscaler events (admin only)
+      description: |
+        Returns the most-recent `autoscale_events` rows, newest first.
+        Operators use this to answer "why did the fleet size change?".
+        Both the cluster handler and the `edge cluster events` CLI consume
+        this endpoint.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: query
+          name: region
+          required: false
+          schema:
+            type: string
+          description: Restrict to a single region (e.g., `fra`). Omit for all regions.
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 50
+          description: Maximum rows to return. Server clamps to [1, 500].
+      responses:
+        '200':
+          description: Event list, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutoscaleEventList'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
