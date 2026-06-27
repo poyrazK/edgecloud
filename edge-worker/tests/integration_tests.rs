@@ -1127,7 +1127,7 @@ async fn test_log_forwarder_survives_outage() {
     // The 503 response triggered `persist_failure` → spool append.
     // The in-memory buffer is drained (drain happens at swap time,
     // before the POST) and the spool now holds the failed batch.
-    let drained = spool.drain().await.expect("drain spool");
+    let drained = spool.drain(None).await.expect("drain spool");
     assert_eq!(
         drained.len(),
         1,
@@ -1240,7 +1240,7 @@ async fn test_log_forwarder_survives_worker_restart() {
     );
 
     // Spool is empty — replay drained it, flush succeeded.
-    let drained = spool.drain().await.expect("drain");
+    let drained = spool.drain(None).await.expect("drain");
     assert!(
         drained.is_empty(),
         "spool must be empty after successful replay + flush"

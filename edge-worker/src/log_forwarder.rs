@@ -75,6 +75,18 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// will reject with 400. Over-estimating is harmless; under-estimating is
 /// bounded by the server-side cap.
 const BYTE_NOTIFY_THRESHOLD: usize = 768 * 1024;
+/// Maximum bytes of spool to replay into the in-memory buffer on
+/// worker startup (finding C2). 16 MiB is roughly 16× the control
+/// plane's 1 MiB body cap, so it holds one full batch flush worth
+/// of pre-restart backlog without parsing the entire spool at boot.
+/// Any older entries stay on disk; the normal `flush_now` path
+/// picks them up via `drain(None)` once the control plane recovers.
+///
+/// Without this cap, a worker that restarts after a 1 GiB-capped
+/// outage window spends seconds JSON-parsing every line before
+/// serving traffic. With it, the boot cost is bounded regardless
+/// of outage duration.
+const SPOOL_REPLAY_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// Conservative byte estimate for the per-entry JSON envelope (the other
 /// fields, brackets, and a small safety margin). The exact JSON size is
 /// not worth computing on the hot path — see `push()` for the full
@@ -219,10 +231,15 @@ impl LogForwarder {
     /// — a fresh drain returns everything to memory), rotate to drop
     /// the oldest lines.
     async fn replay_spool(&self) -> anyhow::Result<()> {
-        // Drain any pending batches from disk. Each batch is an
-        // IngestLogsRequest JSON value; iterate its entries and push
-        // them into the in-memory buffer.
-        let pending = self.spool.drain().await?;
+        // Drain up to SPOOL_REPLAY_MAX_BYTES (16 MiB) from the tail
+        // of the spool (finding C2). Older entries stay on disk in a
+        // new active file and are picked up by the next
+        // `flush_now` → `drain(None)` cycle once the control plane
+        // recovers. This bounds the boot cost to "parse at most
+        // 16 MiB of JSONL" regardless of how big the spool grew
+        // during a sustained outage.
+        let pending = self.spool.drain(Some(SPOOL_REPLAY_MAX_BYTES)).await?;
+        let spool_size = self.spool.size();
 
         let mut total_entries = 0usize;
         let mut total_batches = 0usize;
@@ -251,6 +268,8 @@ impl LogForwarder {
             tracing::info!(
                 batches = total_batches,
                 entries = total_entries,
+                remaining_spool_bytes = spool_size,
+                replay_cap_bytes = SPOOL_REPLAY_MAX_BYTES,
                 "log_forwarder: replayed spool contents into in-memory buffer"
             );
         }
@@ -323,7 +342,7 @@ impl LogForwarder {
         // take priority over fresh in-memory entries so an outage is
         // drained before newer logs are sent (preserves in-order
         // delivery within a tenant's stream).
-        let mut entries: Vec<WireEntry> = match self.spool.drain().await {
+        let mut entries: Vec<WireEntry> = match self.spool.drain(None).await {
             Ok(pending) => {
                 let mut out = Vec::with_capacity(pending.len() * 4);
                 for batch_json in pending {
@@ -775,7 +794,7 @@ mod tests {
         // After flush, the buffer is empty and the spool is empty
         // (successful flush leaves no disk state).
         assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
-        let spool_drained = spool.drain().await.expect("drain spool");
+        let spool_drained = spool.drain(None).await.expect("drain spool");
         assert!(
             spool_drained.is_empty(),
             "successful flush must not leave the spool with pending batches"
@@ -822,7 +841,7 @@ mod tests {
         // In-memory buffer is drained (drain happens at swap time,
         // before the POST). The spool now holds the failed batch.
         assert_eq!(f.state.lock().unwrap().buffer.len(), 0);
-        let spool_drained = spool.drain().await.expect("drain spool");
+        let spool_drained = spool.drain(None).await.expect("drain spool");
         assert_eq!(
             spool_drained.len(),
             1,
@@ -855,7 +874,7 @@ mod tests {
         f.push(record(LogLevel::Info, "happy"), ctx());
         f.flush_now().await;
 
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert!(drained.is_empty(), "2xx leaves spool empty");
     }
 
@@ -878,7 +897,7 @@ mod tests {
         f.push(record(LogLevel::Info, "bad"), ctx());
         f.flush_now().await;
 
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert!(drained.is_empty(), "4xx must not spool");
     }
 
@@ -900,7 +919,7 @@ mod tests {
         f.push(record(LogLevel::Info, "backpressure"), ctx());
         f.flush_now().await;
 
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert_eq!(drained.len(), 1, "429 must spool for retry");
     }
 
@@ -962,7 +981,7 @@ mod tests {
         }
 
         // Spool is now empty (replay drained it).
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert!(drained.is_empty(), "replay should empty the spool");
     }
 
@@ -1007,6 +1026,99 @@ mod tests {
 
         // Spool is now under cap (rotation ran during construction).
         assert!(spool.size() <= 512, "replay must rotate over-cap spool");
+    }
+
+    #[tokio::test]
+    async fn replay_spool_respects_limit() {
+        // Finding C2: replay is bounded by SPOOL_REPLAY_MAX_BYTES
+        // (16 MiB). Pre-populate the spool past the cap so the cap
+        // binds, then construct a fresh LogForwarder. The buffer
+        // must contain only the tail-most batches; the rest stays on
+        // disk for the next flush_now cycle to pick up.
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+
+        // 100 batches of ~200 KiB each → ~20 MiB total (exceeds the
+        // 16 MiB replay cap so the cap actually binds).
+        let total_batches = 100usize;
+        let padding = "x".repeat(200 * 1024);
+        for i in 0..total_batches {
+            let batch = json!({
+                "entries": [{
+                    "tenant_id": "t_test",
+                    "deployment_id": "d_xyz",
+                    "app_name": "my-app",
+                    "worker_id": "w_test",
+                    "region": "test-region",
+                    "level": "info",
+                    "message": format!("msg-{}", i),
+                    "labels": {},
+                }],
+                "padding": padding.clone(),
+            });
+            spool.append(&batch).await.expect("append");
+        }
+        let total = spool.size();
+        assert!(
+            total > SPOOL_REPLAY_MAX_BYTES,
+            "test setup: spool must exceed the 16 MiB replay cap so the limit binds; got {}",
+            total
+        );
+
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let f = LogForwarder::new(
+            "http://127.0.0.1:0",
+            "w_test",
+            "test-region",
+            signer,
+            test_client(),
+            spool.clone(),
+            1u64 << 30, // spool_max_bytes — generous; replay cap is the binding limit
+        )
+        .await;
+
+        // The buffer contains the replayed tail — fewer than total_batches.
+        let buffered: Vec<String> = {
+            let state = f.state.lock().unwrap();
+            state.buffer.iter().map(|e| e.message.clone()).collect()
+        };
+        assert!(
+            !buffered.is_empty(),
+            "replay must put at least one batch in the buffer"
+        );
+        assert!(
+            buffered.len() < total_batches,
+            "replay must NOT return all batches (cap binds); got {}/{}",
+            buffered.len(),
+            total_batches
+        );
+        // The most recent batch must be present (it fits in the tail).
+        let last_msg = format!("msg-{}", total_batches - 1);
+        assert_eq!(
+            buffered.last().unwrap(),
+            &last_msg,
+            "most recent batch must be in the replayed tail"
+        );
+
+        // Spool still has entries on disk — the head of the spool
+        // was preserved for the next flush_now cycle.
+        let remaining = spool.size();
+        assert!(
+            remaining > 0,
+            "head must remain on disk after a bounded replay"
+        );
+        assert!(
+            remaining < total,
+            "head must be strictly smaller than pre-drain total; got {} vs {}",
+            remaining,
+            total
+        );
     }
 
     #[tokio::test]

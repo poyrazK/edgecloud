@@ -155,9 +155,30 @@ impl Spool {
     /// Atomically move all pending batches out of the spool and return
     /// them. Subsequent `append` calls land in a fresh active file.
     ///
+    /// `limit_bytes` bounds how much of the spool is returned (and
+    /// therefore how much is loaded into memory). When `None`, the
+    /// full file is drained — the pre-C2 behavior, used by
+    /// `flush_now`'s normal path where we want to ship everything to
+    /// the control plane.
+    ///
+    /// When `Some(n)`:
+    ///   - if the file is `<= n` bytes, behaves like `None` (no head
+    ///     to preserve)
+    ///   - otherwise, only the **last** `n` bytes are returned; the
+    ///     older head is copied back to the active file (via streaming
+    ///     copy, bounded memory) so the next drain picks it up.
+    ///
+    /// The `Some(n)` path is used by `LogForwarder::replay_spool` on
+    /// worker startup (finding C2) so a worker that restarts during
+    /// an extended control-plane outage doesn't spend seconds
+    /// JSON-parsing every line of a near-cap spool before it can
+    /// accept traffic. The pre-limit head stays on disk and is
+    /// drained by `flush_now`'s normal path once the control plane
+    /// recovers.
+    ///
     /// Returns `Ok(Vec::new())` if the active file is missing (the
     /// first `drain` on a brand-new spool is a no-op).
-    pub async fn drain(&self) -> Result<Vec<serde_json::Value>> {
+    pub async fn drain(&self, limit_bytes: Option<u64>) -> Result<Vec<serde_json::Value>> {
         let _guard = self.inner.lock.lock().await;
 
         if !self.inner.path.exists() {
@@ -180,15 +201,167 @@ impl Spool {
                 )
             })?;
 
-        let raw = match tokio::fs::read(&draining).await {
-            Ok(b) => b,
-            // If the read fails, try to put the file back so the next
-            // drain can retry — silently losing the contents is worse
-            // than a noisy log line.
+        let metadata = match tokio::fs::metadata(&draining).await {
+            Ok(m) => m,
             Err(e) => {
+                // Put the file back so the next drain can retry —
+                // silently losing the contents is worse than a noisy
+                // log line.
                 let _ = tokio::fs::rename(&draining, &self.inner.path).await;
                 return Err(e)
-                    .with_context(|| format!("read draining spool file: {}", draining.display()));
+                    .with_context(|| format!("stat draining spool file: {}", draining.display()));
+            }
+        };
+        let total = metadata.len();
+
+        // Decide whether to apply the limit. A non-positive limit is
+        // treated as "no limit" — same as `None`. A limit larger than
+        // the file degenerates to "drain everything".
+        let effective_limit = limit_bytes.filter(|n| *n > 0 && *n < total);
+
+        let raw = if let Some(limit) = effective_limit {
+            // Copy the head (the bytes we're NOT returning) back to
+            // the active file via streaming copy. The active file
+            // holds the older pending entries; the next drain picks
+            // them up. Memory stays bounded by the 8 KiB tokio copy
+            // buffer.
+            //
+            // Open two handles because `AsyncReadExt::take` moves
+            // its receiver; we need separate handles for the head
+            // copy and the tail read.
+            let head_bytes = total - limit;
+            let mut head_src = tokio::fs::File::open(&draining).await.with_context(|| {
+                format!("open draining spool for head copy: {}", draining.display())
+            })?;
+            let tmp = self.inner.dir.join("spool.jsonl.tmp");
+            // Find the offset of the last newline within the first
+            // `head_bytes` bytes — the head copy must be line-aligned
+            // so the preserved file contains only complete lines. If
+            // there's no newline in the head (a single batch straddles
+            // the split), `head_end` is 0 and we copy nothing — the
+            // batch's bytes in the tail slice will be the partial
+            // first line and get dropped there.
+            let head_end = find_last_newline_in_range(&mut head_src, head_bytes).await?;
+            // Rewind head_src to the start of the file so the
+            // streaming copy below reads bytes 0..head_end.
+            head_src
+                .seek(SeekFrom::Start(0))
+                .await
+                .with_context(|| format!("rewind head_src: {}", draining.display()))?;
+            {
+                let mut dst = tokio::fs::File::create(&tmp)
+                    .await
+                    .with_context(|| format!("create tmp spool for head: {}", tmp.display()))?;
+                if head_end > 0 {
+                    let mut limited_src = (&mut head_src).take(head_end);
+                    tokio::io::copy(&mut limited_src, &mut dst)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "copy spool head to tmp: src={} dst={}",
+                                draining.display(),
+                                tmp.display()
+                            )
+                        })?;
+                }
+                // head_end == 0: tmp file is empty (just created).
+                dst.flush()
+                    .await
+                    .with_context(|| format!("flush tmp spool head: {}", tmp.display()))?;
+                // dst dropped here so the rename below doesn't fail
+                // on platforms that hold the file open.
+            }
+            tokio::fs::rename(&tmp, &self.inner.path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "rename head tmp {} -> {}",
+                        tmp.display(),
+                        self.inner.path.display()
+                    )
+                })?;
+
+            // Second handle for the tail. Seek to (total - limit) and
+            // read exactly `limit` bytes. `total` was stat'd above so
+            // `SeekFrom::End(-limit)` is exact.
+            let mut tail_src = tokio::fs::File::open(&draining).await.with_context(|| {
+                format!("open draining spool for tail read: {}", draining.display())
+            })?;
+            let tail_offset = total - limit;
+            tail_src
+                .seek(SeekFrom::Start(tail_offset))
+                .await
+                .with_context(|| {
+                    format!(
+                        "seek draining spool to tail offset {}: {}",
+                        tail_offset,
+                        draining.display()
+                    )
+                })?;
+            let mut buf = vec![0u8; limit as usize];
+            tail_src
+                .read_exact(&mut buf)
+                .await
+                .with_context(|| format!("read draining spool tail: {}", draining.display()))?;
+            // The split point may fall in the middle of a line —
+            // `limit` is a byte count, not a line count. Drop the
+            // partial first line so the returned slice is line-aligned
+            // and the parser below doesn't choke on a truncated JSON
+            // value. We detect "mid-line" by reading the byte at
+            // `tail_offset - 1`: if it's a newline (or `tail_offset`
+            // is 0), the split is at a line boundary and we keep the
+            // entire tail slice. Otherwise, skip up to and including
+            // the first newline in the slice.
+            let at_line_boundary = if tail_offset == 0 {
+                true
+            } else {
+                let mut boundary_src =
+                    tokio::fs::File::open(&draining).await.with_context(|| {
+                        format!(
+                            "open draining spool for boundary check: {}",
+                            draining.display()
+                        )
+                    })?;
+                boundary_src
+                    .seek(SeekFrom::Start(tail_offset - 1))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "seek draining spool for boundary check: {}",
+                            draining.display()
+                        )
+                    })?;
+                let mut prev = [0u8; 1];
+                boundary_src.read_exact(&mut prev).await.with_context(|| {
+                    format!(
+                        "read boundary byte before tail offset: {}",
+                        draining.display()
+                    )
+                })?;
+                prev[0] == b'\n'
+            };
+            if !at_line_boundary {
+                if let Some(skip) = buf.iter().position(|&b| b == b'\n').map(|i| i + 1) {
+                    buf.drain(..skip);
+                } else {
+                    // No newline at all in the tail slice (limit < one
+                    // line). Emit nothing for this drain — the next
+                    // full drain will pick the line up.
+                    buf.clear();
+                }
+            }
+            buf
+        } else {
+            // Unlimited drain (or limit not binding): existing
+            // behavior — read the whole file.
+            match tokio::fs::read(&draining).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tokio::fs::rename(&draining, &self.inner.path).await;
+                    return Err(e).with_context(|| {
+                        format!("read draining spool file: {}", draining.display())
+                    });
+                }
             }
         };
 
@@ -385,6 +558,40 @@ impl Spool {
     }
 }
 
+/// Find the byte offset of the last newline in the first `range_bytes`
+/// of `src`, returning the offset IMMEDIATELY AFTER that newline
+/// (i.e. the byte offset where the next line begins). Returns 0 if no
+/// newline exists in the range.
+///
+/// Used by `Spool::drain` to line-align the head copy so the preserved
+/// file contains only complete lines. Memory is bounded by the 8 KiB
+/// tokio read buffer — we don't load the whole range into memory.
+async fn find_last_newline_in_range(src: &mut tokio::fs::File, range_bytes: u64) -> Result<u64> {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(src).take(range_bytes);
+    let mut last_newline_offset: u64 = 0;
+    let mut absolute_pos: u64 = 0;
+    let mut buf = Vec::with_capacity(8 * 1024);
+    loop {
+        buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .await
+            .context("read_until in find_last_newline_in_range")?;
+        if n == 0 {
+            break;
+        }
+        // The buf returned by `read_until(b'\n', ...)` ends with '\n'
+        // if a newline was present in the range (or at EOF). The
+        // absolute offset of that newline is `absolute_pos + n - 1`.
+        if buf.last() == Some(&b'\n') {
+            last_newline_offset = absolute_pos + n as u64;
+        }
+        absolute_pos += n as u64;
+    }
+    Ok(last_newline_offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,14 +617,14 @@ mod tests {
         spool.append(&b2).await.expect("append 2");
         spool.append(&b3).await.expect("append 3");
 
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert_eq!(drained.len(), 3, "all three batches round-trip");
         assert_eq!(drained[0], b1);
         assert_eq!(drained[1], b2);
         assert_eq!(drained[2], b3);
 
         // After drain, the file is gone — a second drain is a no-op.
-        let drained2 = spool.drain().await.expect("drain 2");
+        let drained2 = spool.drain(None).await.expect("drain 2");
         assert!(
             drained2.is_empty(),
             "second drain on empty spool returns empty vec"
@@ -430,12 +637,141 @@ mod tests {
         // Brand-new spool — no file yet.
         assert!(!spool.path().exists(), "no file before any append");
 
-        let drained = spool.drain().await.expect("drain empty");
+        let drained = spool.drain(None).await.expect("drain empty");
         assert!(drained.is_empty());
 
         // After drain, still no file (drain is read-only when empty).
         assert!(!spool.path().exists());
         assert_eq!(spool.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_with_limit_bytes_returns_only_tail() {
+        let (_dir, spool) = fresh_spool().await;
+
+        // 10 batches of ~1 KiB+overhead each → ~10 KiB+overhead on
+        // disk. Use a representative batch to size the limit
+        // deterministically. The serialized length excludes the
+        // trailing newline that `Spool::append` adds.
+        let representative = json!({
+            "entries": [{"id": 0, "msg": "x".repeat(1024)}],
+        });
+        let batch_payload_size = serde_json::to_vec(&representative).unwrap().len();
+        let line_size = batch_payload_size + 1; // +1 for the trailing '\n'
+        assert!(
+            line_size > 1024,
+            "test setup: line must be >1 KiB to exercise limit; got {}",
+            line_size
+        );
+
+        let mut all = Vec::new();
+        for i in 0..10 {
+            let b = json!({
+                "entries": [{"id": i, "msg": "x".repeat(1024)}],
+            });
+            all.push(b);
+            spool.append(all.last().unwrap()).await.expect("append");
+        }
+        let total = spool.size();
+        assert_eq!(
+            total,
+            (line_size as u64) * 10,
+            "10 lines of {} bytes each = total",
+            line_size
+        );
+
+        // Limit to the last 3 lines worth of bytes. tail_offset = total
+        // - limit = 7 * line_size, which lands at the START of line 7
+        // (a line boundary).
+        let limit = (line_size as u64) * 3;
+        let drained = spool.drain(Some(limit)).await.expect("drain with limit");
+        assert_eq!(
+            drained.len(),
+            3,
+            "limit to last 3 lines worth must return 3 lines"
+        );
+        assert_eq!(drained[0], all[7]);
+        assert_eq!(drained[1], all[8]);
+        assert_eq!(drained[2], all[9]);
+
+        // The head (batches 0..7) survives on disk for the next drain.
+        let remaining = spool.size();
+        assert!(
+            remaining > 0,
+            "head must remain on disk for next drain; got {}",
+            remaining
+        );
+        assert!(
+            remaining < total,
+            "head must be strictly smaller than pre-drain total; got {} vs {}",
+            remaining,
+            total
+        );
+
+        // Second drain (no limit) picks up the remaining head.
+        let rest = spool.drain(None).await.expect("drain head");
+        assert_eq!(
+            rest.len(),
+            7,
+            "second drain returns the surviving head (batches 0..7)"
+        );
+        for i in 0..7 {
+            assert_eq!(rest[i], all[i], "order preserved across splits");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_with_limit_drops_line_that_straddles_split() {
+        let (_dir, spool) = fresh_spool().await;
+
+        // 5 batches of ~1 KiB each ≈ 5 KiB total. Use limit that
+        // puts the split mid-line on the 4th batch — bytes
+        // 0..head_bytes complete lines 0..2 (3 lines), bytes
+        // head_bytes..total contains line 3 (partial), line 4
+        // (complete). Tail slice returns line 4 only; line 3 is
+        // dropped because it straddles the split.
+        let representative = json!({
+            "entries": [{"id": 0, "msg": "x".repeat(1024)}],
+        });
+        let line_size = serde_json::to_vec(&representative).unwrap().len() + 1;
+
+        let mut all = Vec::new();
+        for i in 0..5 {
+            let b = json!({
+                "entries": [{"id": i, "msg": "x".repeat(1024)}],
+            });
+            all.push(b);
+            spool.append(all.last().unwrap()).await.expect("append");
+        }
+        let total = spool.size();
+
+        // Limit sized to land 100 bytes BEFORE the end of line 3.
+        // The tail slice's first 100 bytes are the tail end of
+        // line 3 (which gets dropped — it's a partial first line).
+        // Line 4 sits entirely after the split and survives.
+        let limit = total - (3 * line_size as u64) - (line_size as u64 - 100);
+        let drained = spool
+            .drain(Some(limit))
+            .await
+            .expect("drain with mid-line limit");
+        assert_eq!(
+            drained.len(),
+            1,
+            "tail slice has line 4 (the only fully-tail line); line 3 dropped"
+        );
+        assert_eq!(drained[0], all[4], "line 4 is the only survivor");
+
+        // The head file now contains lines 0..2 (3 complete lines).
+        // Line 3's first part (bytes 3*line_size..4*line_size - 100)
+        // is also in the head bytes 0..head_end, but head_end
+        // truncates at the last newline (end of line 2). So line 3's
+        // first part is also dropped — the alternative would be to
+        // keep a partial line that fails to parse.
+        let rest = spool.drain(None).await.expect("drain head");
+        assert_eq!(rest.len(), 3, "lines 0..2 must survive on disk");
+        for i in 0..3 {
+            assert_eq!(rest[i], all[i], "head order preserved");
+        }
     }
 
     #[tokio::test]
@@ -463,7 +799,7 @@ mod tests {
         );
 
         // Survivors are the most recent entries.
-        let survivors = spool.drain().await.expect("drain");
+        let survivors = spool.drain(None).await.expect("drain");
         assert_eq!(survivors.len(), 10 - dropped);
         // The first survivor's `i` should be `dropped` (we dropped
         // lines [0..dropped]).
@@ -485,7 +821,7 @@ mod tests {
         let dropped = spool.rotate_when_over(1_000_000).await.expect("rotate");
         assert_eq!(dropped, 0, "no drops when under cap");
         // The line is still there.
-        let survivors = spool.drain().await.expect("drain");
+        let survivors = spool.drain(None).await.expect("drain");
         assert_eq!(survivors.len(), 1);
     }
 
@@ -512,14 +848,14 @@ mod tests {
         // First drain: the worker attempts to POST both. The "good"
         // one succeeds (worker drops it); the "bad" one fails (worker
         // re-appends).
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert_eq!(drained.len(), 2);
 
         // Simulate the worker's re-append of the failed batch.
         spool.append(&drained[1]).await.expect("re-append bad");
 
         // Second drain: only the failed batch remains.
-        let drained2 = spool.drain().await.expect("drain 2");
+        let drained2 = spool.drain(None).await.expect("drain 2");
         assert_eq!(drained2.len(), 1, "only the re-appended batch remains");
         assert_eq!(drained2[0], bad);
     }
@@ -550,7 +886,7 @@ mod tests {
             h.await.expect("task join");
         }
 
-        let drained = spool.drain().await.expect("drain");
+        let drained = spool.drain(None).await.expect("drain");
         assert_eq!(
             drained.len(),
             1000,
@@ -579,14 +915,14 @@ mod tests {
             .append(&json!({"first": true}))
             .await
             .expect("append 1");
-        let drained = spool.drain().await.expect("drain 1");
+        let drained = spool.drain(None).await.expect("drain 1");
         assert_eq!(drained.len(), 1);
 
         spool
             .append(&json!({"second": true}))
             .await
             .expect("append 2");
-        let drained2 = spool.drain().await.expect("drain 2");
+        let drained2 = spool.drain(None).await.expect("drain 2");
         assert_eq!(drained2.len(), 1);
         assert_eq!(drained2[0], json!({"second": true}));
     }
@@ -650,7 +986,7 @@ mod tests {
         );
 
         // Sanity: survivors must be the most recent entries (FIFO).
-        let survivors = spool.drain().await.expect("drain");
+        let survivors = spool.drain(None).await.expect("drain");
         let expected_count = n_batches - dropped;
         assert_eq!(
             survivors.len(),
