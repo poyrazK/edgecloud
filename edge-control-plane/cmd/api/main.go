@@ -106,13 +106,20 @@ func main() {
 
 	// Initialize artifact storage via the backend factory. An empty
 	// ArtifactBackend selects the filesystem implementation so existing
-	// deployments need no config change. cfg.Storage.ArtifactPath stays
-	// the canonical cache dir for FS and Remote backends; S3 ignores it.
-	//
-	// Step 4 adds the per-backend fields (S3*, Peer*) to
-	// config.StorageConfig and wires them here.
+	// deployments need no config change. The per-backend fields
+	// (S3*, Peer*) are forwarded as-is; the factory and per-backend
+	// constructors are responsible for validating them. Load() already
+	// rejected unknown backends and missing required fields at startup.
 	artifactStore, err := storage.New(context.Background(), storage.BackendConfig{
-		ArtifactPath: cfg.Storage.ArtifactPath,
+		ArtifactBackend:               cfg.Storage.ArtifactBackend,
+		ArtifactPath:                  cfg.Storage.ArtifactPath,
+		S3Bucket:                      cfg.Storage.S3Bucket,
+		S3Region:                      cfg.Storage.S3Region,
+		S3Endpoint:                    cfg.Storage.S3Endpoint,
+		S3PathStyle:                   cfg.Storage.S3PathStyle,
+		S3KeyPrefix:                   cfg.Storage.S3KeyPrefix,
+		PeerControlPlaneURL:           cfg.Storage.PeerControlPlaneURL,
+		PeerControlPlaneInternalToken: cfg.Storage.PeerControlPlaneInternalToken,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize artifact storage: %v", err)
