@@ -10,11 +10,11 @@
 -- 1. id — prefixed `dom_`; minted by the service layer (idempotency
 --    keys aren't part of the v1 contract).
 -- 2. tenant_id / app_name — the (tenant, app) this FQDN binds to.
---    No FK cascade from apps: an orphaned `domains` row whose
---    underlying app was deleted will keep authorizing TLS issuance
---    until v2 ships the cascade migration. The existing
---    TestInternal_TlsAllowed_OrphanedDomain_KnownGap test pins this
---    behaviour so the v2 fix has a clear pass/fail signal.
+--    Cascading FK to apps(tenant_id, name) is added in
+--    011_domains_cascade.up.sql — deleting an app now removes its
+--    domains rows in the same transaction, so Caddy's on_demand.ask
+--    callback no longer authorizes TLS issuance for an app that no
+--    longer exists.
 -- 3. fqdn — the tenant-owned hostname. Globally unique (UNIQUE
 --    constraint). Lowercased on write; the service layer rejects
 --    mixed-case before INSERT.

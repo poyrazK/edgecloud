@@ -128,29 +128,33 @@ func TestInternal_TlsAllowed_NotFound(t *testing.T) {
 	}
 }
 
-// TestInternal_TlsAllowed_OrphanedDomain_KnownGap pins the documented
-// gap: a domain row whose underlying (tenant, app) was deleted still
-// returns 200 from TlsAllowed, because there's no FK cascade from
-// `apps` to `domains` (adding one requires a new composite unique
-// index — deferred to a v2 follow-up).
+// TestInternal_TlsAllowed_AppDeletionCascadesToDomainRow pins the
+// post-fix behaviour (PR #133 review finding #4, migration
+// 011_domains_cascade.up.sql). Previously an orphaned domain row
+// whose underlying (tenant, app) was deleted returned 200 from
+// TlsAllowed, because there was no FK cascade from `apps` to
+// `domains` — letting Caddy issue a cert for a hostname whose app
+// no longer existed.
 //
-// The test asserts the CURRENT behaviour so the v2 fix has a clear
-// pass/fail signal. Without it, a future fix would silently land and
-// no test would tell the difference.
-func TestInternal_TlsAllowed_OrphanedDomain_KnownGap(t *testing.T) {
+// The cascade now removes the domain row in the same transaction
+// as the app deletion. `IsTlsAllowed` therefore sees no row, returns
+// false, and the handler must answer 404. The mock here simulates
+// the post-cascade state (no row → false); the migration is the
+// real-world trigger.
+func TestInternal_TlsAllowed_AppDeletionCascadesToDomainRow(t *testing.T) {
 	svc := &mockInternalDomainSvc{
 		isTlsAllowedFn: func(ctx context.Context, fqdn string) (bool, error) {
-			// Underlying app is gone (no row in `apps`), but the
-			// `domains` row survives because the FK doesn't cascade.
-			return true, nil
+			// App deleted → cascade removed the domains row → no
+			// match in `GetByFQDN` → IsTlsAllowed returns false.
+			return false, nil
 		},
 	}
 	h := newInternalHandler(svc)
 	req := httptest.NewRequest("GET", "/api/internal/tls-allowed?fqdn=api.acme.com", nil)
 	rec := httptest.NewRecorder()
 	h.TlsAllowed(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (KNOWN GAP — the v2 fix must turn this into 404)", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (app deletion must cascade to the domain row)", rec.Code)
 	}
 }
 
