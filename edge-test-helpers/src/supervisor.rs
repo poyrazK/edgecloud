@@ -169,11 +169,23 @@ async fn build_supervisor_inner(
             .with_context(|| format!("open spool at {}", config.spool_dir.display()))?,
     );
 
+    // Shared reqwest::Client for the test supervisor's outbound HTTP.
+    // In production main() constructs the client once and shares it
+    // across the bootstrap callback + LogForwarder (finding B2). Tests
+    // keep the same shape so the helper exercises the production API.
+    let http_client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .with_context(|| "build test reqwest client".to_string())?,
+    );
+
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
         jwt_signer,
+        http_client,
         spool,
         config.spool_max_bytes,
     )

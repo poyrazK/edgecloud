@@ -1096,6 +1096,7 @@ async fn test_log_forwarder_survives_outage() {
         "w_test",
         "test-region",
         signer,
+        std::sync::Arc::new(reqwest::Client::new()),
         spool.clone(),
         1u64 << 30,
     )
@@ -1214,6 +1215,7 @@ async fn test_log_forwarder_survives_worker_restart() {
         "w_test",
         "test-region",
         signer,
+        std::sync::Arc::new(reqwest::Client::new()),
         spool.clone(),
         1u64 << 30,
     )

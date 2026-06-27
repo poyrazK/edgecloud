@@ -69,8 +69,6 @@ const DEFAULT_MAX_BUFFER_LEN: usize = 100;
 const HARD_CAP_MULT: usize = 10;
 /// Default flush interval — drives the periodic flush in `flush_loop`.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-/// Per-request timeout for the HTTP POST.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Early-flush byte threshold: 75% of the control-plane 1 MiB body cap
 /// (`MaxLogBatchSize` in the Go handler). Crossing this signals an early
 /// flush so a burst of large messages doesn't produce a batch the server
@@ -140,7 +138,7 @@ pub struct LogForwarder {
     state: Mutex<ForwarderState>,
     /// Signals `flush_loop` when an early flush should be considered.
     notify: Notify,
-    client: reqwest::Client,
+    client: Arc<reqwest::Client>,
     control_plane_url: String,
     worker_id: String,
     region: String,
@@ -175,14 +173,10 @@ impl LogForwarder {
         worker_id: impl Into<String>,
         region: impl Into<String>,
         jwt_signer: Arc<WorkerJwtSigner>,
+        client: Arc<reqwest::Client>,
         spool: Arc<Spool>,
         spool_max_bytes: u64,
     ) -> Arc<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("reqwest client builder should not fail");
-
         let max_buffer_len = DEFAULT_MAX_BUFFER_LEN;
         let hard_cap = max_buffer_len * HARD_CAP_MULT;
         let me = Arc::new(Self {
@@ -606,6 +600,19 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    /// Build a fresh `reqwest::Client` for tests that need a `LogForwarder`.
+    /// Production workers construct the client once in `main()` and pass it
+    /// into `LogForwarder::new` (finding B2); tests construct one per test
+    /// for isolation.
+    fn test_client() -> Arc<reqwest::Client> {
+        Arc::new(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("test reqwest client"),
+        )
+    }
+
     /// Synchronous-build helper: a `LogForwarder` with a fresh
     /// per-test spool rooted in a tempdir. Returns the tempdir
     /// (keeps the dir alive for the test's lifetime) plus both
@@ -627,6 +634,7 @@ mod tests {
             "w_test",
             "test-region",
             signer,
+            test_client(),
             spool.clone(),
             1u64 << 30, // 1 GiB cap
         )
@@ -658,6 +666,7 @@ mod tests {
             "w_test",
             "test-region",
             signer,
+            test_client(),
             spool,
             1u64 << 30,
         )
@@ -938,6 +947,7 @@ mod tests {
             "w_test",
             "test-region",
             signer,
+            test_client(),
             spool.clone(),
             1u64 << 30,
         )
@@ -989,6 +999,7 @@ mod tests {
             "w_test",
             "test-region",
             signer,
+            test_client(),
             spool.clone(),
             512, // 512-byte cap
         )
@@ -1035,6 +1046,7 @@ mod tests {
                 "w_test",
                 "test-region",
                 signer,
+                test_client(),
                 spool,
                 1u64 << 30,
             )

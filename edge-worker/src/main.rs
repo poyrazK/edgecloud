@@ -42,6 +42,21 @@ async fn main() -> anyhow::Result<()> {
     // and every tracing call that follows.
     let config = Config::from_env()?;
 
+    // Construct the shared reqwest::Client ONCE (finding B2). Every
+    // outbound HTTP request — bootstrap POST, log forwarder flush,
+    // downloader artifact fetch — reuses this client. Building a new
+    // client per request (the old behavior, fixed in commit d2399f4)
+    // avoids a blocking-client panic but still pays TLS pool init on
+    // every cache miss and lets the runtime panic if the builder
+    // returns from an async context. Holding one Arc<Client> across
+    // the worker process eliminates both costs.
+    let http_client: Arc<reqwest::Client> = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))?,
+    );
+
     // Initialize JWT signer — signs outbound calls to the control plane's
     // /api/internal/* endpoints. Worker is per-tenant in this design; the
     // JWT carries the worker's tenant_id claim.
@@ -84,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 config.region.clone(),
                 config.worker_tenant_id.clone(),
                 make_bootstrap_callback(
+                    http_client.clone(),
                     bootstrap_control_plane_url.clone(),
                     bootstrap_psk.clone(),
                     bootstrap_worker_id.clone(),
@@ -107,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     config.region.clone(),
                     config.worker_tenant_id.clone(),
                     make_bootstrap_callback(
+                        http_client.clone(),
                         bootstrap_control_plane_url.clone(),
                         Some(psk.clone()),
                         bootstrap_worker_id.clone(),
@@ -175,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         config.worker_id.clone(),
         config.region.clone(),
         jwt_signer.clone(),
+        http_client.clone(),
         spool,
         config.spool_max_bytes,
     )
@@ -423,6 +441,7 @@ enum DrainOutcome {
 /// `String`s so the closure owns them — `config` is dropped when
 /// `main` returns, well before any `sign()` call would happen.
 fn make_bootstrap_callback(
+    client: Arc<reqwest::Client>,
     control_plane_url: String,
     psk: Option<String>,
     worker_id: String,
@@ -439,14 +458,12 @@ fn make_bootstrap_callback(
                 ));
             }
         };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))?;
         // We're in a sync closure (the signer calls `sign()` outside
         // an await point), but the bootstrap is async. Bridge via
         // tokio's block_on — only the signer's slow path takes this
         // hit, and only on cache miss (every REFRESH_LEAD, ~24h).
+        // The `client` is shared with the LogForwarder (finding B2):
+        // both reuse the same connection pool, no per-call TLS init.
         let bundle = tokio::runtime::Handle::current().block_on(bootstrap::fetch_token(
             &control_plane_url,
             &client,
