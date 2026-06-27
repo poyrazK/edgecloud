@@ -110,17 +110,11 @@ func main() {
 	// (S3*, Peer*) are forwarded as-is; the factory and per-backend
 	// constructors are responsible for validating them. Load() already
 	// rejected unknown backends and missing required fields at startup.
-	artifactStore, err := storage.New(context.Background(), storage.BackendConfig{
-		ArtifactBackend:               cfg.Storage.ArtifactBackend,
-		ArtifactPath:                  cfg.Storage.ArtifactPath,
-		S3Bucket:                      cfg.Storage.S3Bucket,
-		S3Region:                      cfg.Storage.S3Region,
-		S3Endpoint:                    cfg.Storage.S3Endpoint,
-		S3PathStyle:                   cfg.Storage.S3PathStyle,
-		S3KeyPrefix:                   cfg.Storage.S3KeyPrefix,
-		PeerControlPlaneURL:           cfg.Storage.PeerControlPlaneURL,
-		PeerControlPlaneInternalToken: cfg.Storage.PeerControlPlaneInternalToken,
-	})
+	//
+	// Pass cfg.Storage directly — storage.New takes config.StorageConfig
+	// so there's no drift surface between the operator-facing struct and
+	// what the constructors see.
+	artifactStore, err := storage.New(context.Background(), cfg.Storage)
 	if err != nil {
 		log.Fatalf("Failed to initialize artifact storage: %v", err)
 	}
