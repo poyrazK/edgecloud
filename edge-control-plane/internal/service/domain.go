@@ -259,16 +259,13 @@ func (s *DomainService) RemoveDomain(ctx context.Context, tenantID, appName, fqd
 // would just fail again — the operator needs to fix the upstream
 // issue first).
 //
-// KNOWN GAP: this does NOT check that the underlying (tenant, app)
-// still exists. If the tenant is deleted, the FK cascade removes the
-// domain row and we correctly return false. But if the *app* is
-// deleted (no FK cascade), the domain row survives and we incorrectly
-// return true. Pinned by
-// `handler.TestInternal_TlsAllowed_OrphanedDomain_KnownGap`. The
-// fix requires a composite FK on (tenant_id, app_name) → apps, which
-// in turn requires a new `apps(tenant_id, name)` unique index —
-// deferred to a follow-up that bundles the index migration, the FK
-// addition, and a v2 test that flips the assertion to `404`.
+// The cascading FK added in 011_domains_cascade.up.sql (PR #133
+// review finding #4) ensures that when an app is deleted, its
+// domain rows are removed in the same transaction — so this method
+// correctly returns false (no row → 404 from the handler) instead
+// of authorizing TLS issuance for a hostname whose app no longer
+// exists. Pinned by
+// `handler.TestInternal_TlsAllowed_AppDeletionCascadesToDomainRow`.
 func (s *DomainService) IsTlsAllowed(ctx context.Context, fqdn string) (bool, error) {
 	d, err := s.domainRepo.GetByFQDN(ctx, fqdn)
 	if err != nil {
