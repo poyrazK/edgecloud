@@ -23,6 +23,11 @@ tree-sitter-c = "0.21"
 syn = "2.0"
 walkdir = "2.5"
 dirs = "5.0"
+# Used by `edge logs --follow` to install a SIGINT handler so the
+# polling loop exits cleanly on Ctrl-C. Pulled in unconditionally
+# rather than feature-gated so the binary shape matches what the
+# docs / smoke tests expect.
+ctrlc = "3"
 edge-config = { path = "../edge-config" }
 
 [features]

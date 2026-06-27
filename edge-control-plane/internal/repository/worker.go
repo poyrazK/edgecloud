@@ -113,6 +113,49 @@ func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, a
 	return targets, nil
 }
 
+// GetAppStatus returns the worker-reported status for one of the
+// tenant's apps, or `nil, nil` when no worker has reported on this
+// (tenant, app) pair yet. Powers GET /api/v1/apps/{appName}/status.
+//
+// The query deliberately drops the `status = 'running'` and `port` /
+// `ip IS NOT NULL` filters that ListRunningAppTarget uses, because the
+// caller (WorkerStatusHandler) wants to surface ANY worker-reported
+// state — including `crashed`, `hung`, `starting`, `stopping` — so the
+// tenant can debug a broken app. Port/ip filters would mask a crashed
+// app whose worker has lost its routable address.
+//
+// The cross-tenant guard is `apps.value->>'tenant_id' = $1`: the JSONB
+// key match alone (`apps.key = $2`) is necessary but not sufficient,
+// because the same `app_name` can exist on multiple workers hosting
+// apps from different tenants. A t_evil request for an app_name that
+// happens to be deployed by t_victim returns no rows here, which the
+// service translates to "unknown" (no information leak).
+func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error) {
+	const query = `
+		SELECT
+			apps.key                                    AS app_name,
+			apps.value->>'status'                       AS status,
+			worker_status.last_report                   AS last_heartbeat,
+			workers.region                              AS region,
+			workers.id                                  AS worker_id,
+			NULLIF(apps.value->>'exit_code', '')::int4  AS exit_code
+		FROM workers
+		JOIN worker_status ON worker_status.worker_id = workers.id
+		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
+		WHERE apps.key = $1
+		  AND apps.value->>'tenant_id' = $2
+		ORDER BY worker_status.last_report DESC
+		LIMIT 1`
+	var row domain.AppWorkerStatus
+	if err := r.db.GetContext(ctx, &row, query, appName, tenantID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &row, nil
+}
+
 func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
 	memoryMB := req.MemoryMB
 	if memoryMB == 0 {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // LogEntryRepository persists tenant log records (issue #76).
@@ -168,4 +169,77 @@ func (r *LogEntryRepository) GetByID(ctx context.Context, id int64) (*domain.Log
 		return nil, err
 	}
 	return &e, nil
+}
+
+// LogListFilter scopes ListByTenantApp. The repository itself applies no
+// defaults — the service layer is responsible for substituting a non-zero
+// Since and clamping Limit. A zero Since or nil Levels means "no filter".
+//
+// Why this lives in the repository layer rather than the handler:
+//
+//   - Since: the cutoff is computed server-side as `NOW() - make_interval(secs => $1)`
+//     to defend against control-plane/DB clock skew (same defense as
+//     DeleteOlderThanBatched). Pushing this into SQL keeps the Go-side value
+//     strictly a duration, not a wall-clock time the handler has to compute.
+//
+//   - Levels: the level = ANY($4::text[]) filter is a recheck after the
+//     (tenant_id, app_name, ts DESC) index range scan. Documenting this here
+//     so a future contributor doesn't try to "optimize" the level into the
+//     index — adding more index columns would slow down ingest (PR #98) for
+//     marginal read-path gain.
+type LogListFilter struct {
+	Since  time.Duration
+	Levels []string
+	Limit  int
+}
+
+// ListByTenantApp returns the most recent log entries for (tenantID, appName),
+// newest first. The (tenant_id, app_name, ts DESC) index covers the WHERE +
+// ORDER BY; the optional level filter is applied as a recheck.
+//
+// Returns an empty slice (never nil) when no rows match. The service layer
+// enforces a positive Limit before calling; this method does not silently
+// default to "no limit" because an unbounded query on a logging table is
+// the kind of foot-gun that takes a control plane down at 3am.
+func (r *LogEntryRepository) ListByTenantApp(
+	ctx context.Context, tenantID, appName string, filter LogListFilter,
+) ([]domain.LogEntry, error) {
+	if filter.Limit <= 0 {
+		return nil, fmt.Errorf("limit must be positive, got %d", filter.Limit)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`SELECT id, tenant_id, deployment_id, app_name, worker_id, region, level, message, labels, ts
+FROM logs
+WHERE tenant_id = $1 AND app_name = $2`)
+
+	args := []any{tenantID, appName}
+	// nextPlaceholder returns the $N for the next bound arg. Centralizing the
+	// index math keeps the SQL builder honest — adding a clause means
+	// appending to args and asking nextPlaceholder for the new position.
+	nextPlaceholder := func() string {
+		return fmt.Sprintf("$%d", len(args)+1)
+	}
+
+	if filter.Since > 0 {
+		sb.WriteString(" AND ts >= NOW() - make_interval(secs => ")
+		sb.WriteString(nextPlaceholder())
+		sb.WriteString(")")
+		args = append(args, filter.Since.Seconds())
+	}
+	if len(filter.Levels) > 0 {
+		sb.WriteString(" AND level = ANY(")
+		sb.WriteString(nextPlaceholder())
+		sb.WriteString("::text[])")
+		args = append(args, pq.Array(filter.Levels))
+	}
+	sb.WriteString(" ORDER BY ts DESC LIMIT ")
+	sb.WriteString(nextPlaceholder())
+	args = append(args, filter.Limit)
+
+	out := make([]domain.LogEntry, 0, filter.Limit)
+	if err := r.db.SelectContext(ctx, &out, sb.String(), args...); err != nil {
+		return nil, fmt.Errorf("listing logs: %w", err)
+	}
+	return out, nil
 }

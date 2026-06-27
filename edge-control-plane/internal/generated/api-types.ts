@@ -272,6 +272,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/apps/{appName}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent log entries for an app
+         * @description Returns the most recent log entries for the named app within
+         *     the caller's tenant, newest first. Supports `since` (RFC3339
+         *     cutoff), `level` (minimum severity), and `limit` (max items).
+         *
+         *     The cutoff is computed server-side against the database clock
+         *     (NOW() - interval), so wall-clock skew between this server
+         *     and the database does not affect what is returned.
+         */
+        get: operations["listLogsForApp"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/apps/{appName}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the worker-reported status of an app
+         * @description Returns the most recent worker-reported status for the named
+         *     app within the caller's tenant. The `status` field is the
+         *     same string the worker publishes in NATS heartbeats
+         *     (`running`, `starting`, `stopping`, `crashed`, `hung`), or
+         *     `unknown` when no worker has reported on this app yet.
+         *
+         *     A `crashed` status surfaces when the worker observed the
+         *     app's WASM component exit with a non-zero code or fail
+         *     health checks. The CLI's `edge logs` uses this status to
+         *     print a rollback hint when fresh (< 5 minutes old).
+         *
+         *     There is no server-side TTL on heartbeats — a dead worker
+         *     leaves its last-known status behind indefinitely. The
+         *     client should treat a `last_heartbeat` older than a few
+         *     minutes as stale.
+         */
+        get: operations["getAppWorkerStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/traffic": {
         parameters: {
             query?: never;
@@ -808,6 +868,113 @@ export interface components {
              * @example d_prev
              */
             deployment_id?: string;
+        };
+        /**
+         * @description A single tenant log record. Populated by worker-side
+         *     `edge:observe.emit_log` calls and forwarded to the control
+         *     plane via `POST /api/internal/logs` (issue #76 / PR #98).
+         *     Read back to tenants via `GET /api/v1/apps/{appName}/logs`.
+         */
+        LogEntry: {
+            /**
+             * Format: int64
+             * @example 12345
+             */
+            id?: number;
+            /** @example t_abc123 */
+            tenant_id?: string;
+            /** @example d_xyz */
+            deployment_id?: string;
+            /** @example myapp */
+            app_name?: string;
+            /** @example w_us-east-1_h01 */
+            worker_id?: string;
+            /** @example us-east-1 */
+            region?: string;
+            /**
+             * @example info
+             * @enum {string}
+             */
+            level?: "trace" | "debug" | "info" | "warn" | "error";
+            /** @example request handled in 12ms */
+            message?: string;
+            /**
+             * @example {
+             *       "request_id": "req_42",
+             *       "status": 200
+             *     }
+             */
+            labels?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Format: date-time
+             * @description RFC3339 timestamp at which the log was recorded (server clock).
+             * @example 2026-06-24T12:00:00.123456Z
+             */
+            ts?: string;
+        };
+        /**
+         * @description Envelope returned by `GET /api/v1/apps/{appName}/logs`. Items
+         *     are ordered newest-first (by `ts` DESC). `limit` echoes the
+         *     effective ceiling the server applied (after clamping the
+         *     request to [1, 1000]); `since` echoes the cutoff timestamp
+         *     when one was supplied or applied as a default.
+         */
+        LogListResponse: {
+            items?: components["schemas"]["LogEntry"][];
+            /**
+             * @description Effective limit (clamped to [1, 1000]).
+             * @example 100
+             */
+            limit?: number;
+            /**
+             * Format: date-time
+             * @description RFC3339 cutoff the server applied as the lower bound on
+             *     `ts`. Empty when no `since` was supplied AND no default
+             *     was applied (clients should not pin follow-on requests
+             *     to a specific ts in that case).
+             * @example 2026-06-24T11:55:00Z
+             */
+            since?: string;
+        };
+        /**
+         * @description Tenant-facing projection of the worker-reported status of one
+         *     app, returned by `GET /api/v1/apps/{appName}/status`. `status`
+         *     is the same string the worker publishes in NATS heartbeats
+         *     (one of `running`, `starting`, `stopping`, `crashed`, `hung`),
+         *     plus `unknown` when no worker has reported on this app yet.
+         *
+         *     `last_heartbeat` is null when no worker has ever reported on
+         *     the app. There is no server-side TTL on heartbeats — a dead
+         *     worker leaves its last-known status behind indefinitely. The
+         *     client should treat a heartbeat older than a few minutes
+         *     (the worker default is 30s) as stale.
+         */
+        AppWorkerStatus: {
+            /** @example myapp */
+            app_name?: string;
+            /**
+             * @example running
+             * @enum {string}
+             */
+            status?: "running" | "starting" | "stopping" | "crashed" | "hung" | "unknown";
+            /**
+             * Format: date-time
+             * @example 2026-06-24T12:00:00Z
+             */
+            last_heartbeat?: string | null;
+            /** @example us-east-1 */
+            region?: string;
+            /** @example w_us-east-1_h01 */
+            worker_id?: string;
+            /**
+             * Format: int32
+             * @description Process exit code from the worker's last observation of
+             *     this app. Set on `crashed` statuses, absent otherwise.
+             * @example 137
+             */
+            exit_code?: number | null;
         };
         IngressResponseReady: {
             /** @example true */
@@ -1585,6 +1752,74 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listLogsForApp: {
+        parameters: {
+            query?: {
+                /**
+                 * @description RFC3339 cutoff; missing → server default (5m). Future-dated
+                 *     values are clamped to the default window.
+                 */
+                since?: string;
+                /**
+                 * @description Minimum severity. Filter is inclusive: `level=warn` returns
+                 *     `warn` and `error`. Unknown values → 400.
+                 */
+                level?: "trace" | "debug" | "info" | "warn" | "error";
+                /**
+                 * @description Maximum items to return. Values outside [1, 1000] are
+                 *     clamped; absent or zero → server default (100).
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Log entries. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogListResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getAppWorkerStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Worker-reported status (or "unknown" if no worker has reported). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppWorkerStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
         };
     };

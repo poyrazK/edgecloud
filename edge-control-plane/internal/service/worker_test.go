@@ -21,6 +21,7 @@ type mockWorkerRepo struct {
 	updateAddrFunc           func(ctx context.Context, id, addr string) error
 	upsertStatusFunc         func(ctx context.Context, ws *domain.WorkerStatus) error
 	listRunningAppTargetFunc func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
+	getAppStatusFunc         func(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -52,6 +53,12 @@ func (m *mockWorkerRepo) ListRunningAppTarget(ctx context.Context, tenantID, app
 		return nil, nil
 	}
 	return m.listRunningAppTargetFunc(ctx, tenantID, appName)
+}
+func (m *mockWorkerRepo) GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error) {
+	if m.getAppStatusFunc == nil {
+		return nil, nil
+	}
+	return m.getAppStatusFunc(ctx, tenantID, appName)
 }
 
 // mockQuotaRepo implements quotaRepoInterface for testing.
@@ -710,5 +717,107 @@ func TestWorkerService_GetAppTarget(t *testing.T) {
 				t.Errorf("GetAppTarget() = %+v, want %+v", *got, *tt.wantFirst)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetAppStatus — the read path behind GET /api/v1/apps/{appName}/status
+// ---------------------------------------------------------------------------
+
+// TestWorkerService_GetAppStatus_PassesThroughRow pins the
+// happy path: repo returns a row, service echoes it with AppName
+// normalized to the input. The CLI's `edge logs` crashed-hint
+// logic depends on Status == "crashed" reaching the wire verbatim.
+func TestWorkerService_GetAppStatus_PassesThroughRow(t *testing.T) {
+	hb := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	repoRow := &domain.AppWorkerStatus{
+		// AppName intentionally empty to verify the service
+		// normalizes it from the input parameter.
+		Status:        "crashed",
+		LastHeartbeat: &hb,
+		Region:        "us-east-1",
+		WorkerID:      "w_us-east-1_h01",
+	}
+	var gotTenant, gotApp string
+	wr := &mockWorkerRepo{
+		getAppStatusFunc: func(_ context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error) {
+			gotTenant, gotApp = tenantID, appName
+			return repoRow, nil
+		},
+	}
+	svc := workerSvcForTest(wr, &mockQuotaRepo{})
+
+	got, err := svc.GetAppStatus(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("GetAppStatus: %v", err)
+	}
+	if gotTenant != "t_test" || gotApp != "myapp" {
+		t.Errorf("repo called with (%q, %q), want (t_test, myapp)", gotTenant, gotApp)
+	}
+	if got == nil {
+		t.Fatal("got nil, want *AppWorkerStatus")
+	}
+	if got.AppName != "myapp" {
+		t.Errorf("AppName = %q, want myapp (normalized from input)", got.AppName)
+	}
+	if got.Status != "crashed" {
+		t.Errorf("Status = %q, want crashed", got.Status)
+	}
+	if got.LastHeartbeat == nil || !got.LastHeartbeat.Equal(hb) {
+		t.Errorf("LastHeartbeat = %v, want %v", got.LastHeartbeat, hb)
+	}
+}
+
+// TestWorkerService_GetAppStatus_NilRowYieldsUnknown pins the
+// no-data path: when the repo returns nil (no worker has reported
+// on this app, OR a cross-tenant request), the service returns
+// `{AppName: <input>, Status: "unknown"}` with everything else
+// zero. The handler encodes this as 200 — a probing tenant cannot
+// distinguish "no such app" from "not yours" because both paths
+// produce the same envelope.
+func TestWorkerService_GetAppStatus_NilRowYieldsUnknown(t *testing.T) {
+	wr := &mockWorkerRepo{
+		getAppStatusFunc: func(_ context.Context, _, _ string) (*domain.AppWorkerStatus, error) {
+			return nil, nil
+		},
+	}
+	svc := workerSvcForTest(wr, &mockQuotaRepo{})
+
+	got, err := svc.GetAppStatus(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("GetAppStatus: %v", err)
+	}
+	if got == nil {
+		t.Fatal("got nil, want *AppWorkerStatus{Status: unknown}")
+	}
+	if got.Status != "unknown" {
+		t.Errorf("Status = %q, want unknown", got.Status)
+	}
+	if got.AppName != "myapp" {
+		t.Errorf("AppName = %q, want myapp", got.AppName)
+	}
+	if got.Region != "" {
+		t.Errorf("Region = %q, want empty (zero-value on unknown)", got.Region)
+	}
+	if got.LastHeartbeat != nil {
+		t.Errorf("LastHeartbeat = %v, want nil on unknown", got.LastHeartbeat)
+	}
+}
+
+// TestWorkerService_GetAppStatus_PropagatesRepoError pins the
+// pass-through: any non-nil error from the repo (DB outage, etc.)
+// reaches the handler unchanged so the handler can map to 500.
+func TestWorkerService_GetAppStatus_PropagatesRepoError(t *testing.T) {
+	wantErr := errors.New("db unreachable")
+	wr := &mockWorkerRepo{
+		getAppStatusFunc: func(_ context.Context, _, _ string) (*domain.AppWorkerStatus, error) {
+			return nil, wantErr
+		},
+	}
+	svc := workerSvcForTest(wr, &mockQuotaRepo{})
+
+	_, err := svc.GetAppStatus(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v, want %v", err, wantErr)
 	}
 }

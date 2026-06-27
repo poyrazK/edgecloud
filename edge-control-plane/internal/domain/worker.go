@@ -84,6 +84,36 @@ type AppTarget struct {
 	Port       int    `json:"port"`
 }
 
+// AppWorkerStatus is the tenant-facing projection of one app's current
+// worker-reported status. Returned by GET /api/v1/apps/{appName}/status.
+//
+// `Status` is the same string the worker publishes in NATS heartbeats
+// (see edge-worker/src/supervisor.rs build_heartbeat), projected to
+// tenants verbatim so they can match on the documented set:
+//
+//	"running" | "starting" | "stopping" | "crashed" | "hung" | "unknown"
+//
+// `"unknown"` is the zero-value returned when no worker has reported on
+// this app yet (the JSONB blob in `worker_status` does not contain a
+// key for `appName`). It distinguishes "no data" from "last reported
+// `running` 3s ago" — both would be a bare `""` otherwise.
+//
+// `LastHeartbeat` is nil when no worker has ever reported on the app;
+// tenants can use the age of this timestamp to detect a dead worker
+// (no TTL is enforced server-side; see the staleness note in
+// WorkerStatusHandler.Get). `Region` and `WorkerID` are also empty
+// in that case.
+//
+// The `db` tags are for sqlx scan; the `json` tags are the wire format.
+type AppWorkerStatus struct {
+	AppName       string     `db:"app_name"       json:"app_name"`
+	Status        string     `db:"status"          json:"status"`
+	LastHeartbeat *time.Time `db:"last_heartbeat"  json:"last_heartbeat"`
+	Region        string     `db:"region"          json:"region"`
+	WorkerID      string     `db:"worker_id"       json:"worker_id"`
+	ExitCode      *int32     `db:"exit_code"       json:"exit_code,omitempty"`
+}
+
 // IsValidWorkerID checks that worker ID matches the format w_<region>_<uuid>.
 // The whitepaper specifies: Worker IDs are validated with format w_<region>_<uuid>.
 func IsValidWorkerID(id string) bool {

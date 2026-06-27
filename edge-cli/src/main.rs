@@ -7,7 +7,7 @@ mod migrate;
 mod output;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -136,6 +136,42 @@ enum Command {
     /// List all deployments for the app.
     Deployments,
 
+    /// Read recent log entries for the app (issue #77).
+    ///
+    /// Calls `GET /api/v1/apps/{appName}/logs` and prints the most
+    /// recent entries, newest first. With `--follow`, polls every
+    /// 2s and prints new entries as they arrive. With no flags,
+    /// prints the last 5 minutes; use `--since 1h` for a longer
+    /// window. Pipe mode (`edge logs myapp | jq`) emits one JSON
+    /// object per line.
+    Logs {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+
+        /// Lower bound on the entry timestamp, expressed as a
+        /// relative duration. Accepts `<n>s`, `<n>m`, `<n>h`,
+        /// `<n>d` (e.g. `5m`, `1h`, `30s`). Default: 5m.
+        #[arg(long, default_value = "5m")]
+        since: String,
+
+        /// Minimum severity filter. `warn` returns `warn` + `error`.
+        /// Unknown values are rejected by the server with a 400.
+        #[arg(long)]
+        level: Option<String>,
+
+        /// Poll for new entries instead of printing once and
+        /// exiting. Stops on Ctrl-C, after 30 minutes, or when
+        /// the process is killed.
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Maximum entries to return per request. Server clamps
+        /// to [1, 1000]; default 100.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+
     /// Manage authentication (signup, login, whoami, logout).
     Auth {
         #[command(subcommand)]
@@ -185,6 +221,16 @@ fn main() -> Result<()> {
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Logs {
+            app,
+            since,
+            level,
+            follow,
+            limit,
+        } => {
+            let since_dur = parse_since(&since)?;
+            commands::logs::run(&cli.path, &app, since_dur, level.as_deref(), follow, limit)
+        }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
             TrafficAction::Show => commands::traffic::get(&cli.path),
@@ -201,4 +247,35 @@ fn main() -> Result<()> {
             }
         },
     }
+}
+
+/// Parse a relative duration like `30s`, `5m`, `1h`, `7d` into a
+/// [`std::time::Duration`]. The server accepts the result as a
+/// relative offset from "now" (computed locally before the request
+/// goes out), so the wire format ends up as an absolute RFC3339
+/// timestamp. Keeping the parser stdlib-only avoids adding a
+/// `humantime` dep for this one command.
+fn parse_since(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--since cannot be empty; pass e.g. 5m, 1h, 30s");
+    }
+    // Find the boundary between the digits and the unit suffix.
+    // Iterating bytes is fine: we only accept ASCII digits and a
+    // single ASCII suffix char.
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| anyhow::anyhow!("--since {s:?} is missing a unit (s/m/h/d)"))?;
+    let (n_str, unit) = s.split_at(split);
+    let n: u64 = n_str
+        .parse()
+        .with_context(|| format!("--since {s:?} has non-numeric magnitude {n_str:?}"))?;
+    let mult: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        other => anyhow::bail!("--since unit {other:?} not supported (use s/m/h/d)"),
+    };
+    Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
 }

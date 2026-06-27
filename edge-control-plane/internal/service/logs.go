@@ -1,0 +1,179 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+)
+
+// ErrInvalidLevel is returned by LogService when the requested minimum level
+// is not one of the canonical {trace, debug, info, warn, error}. The handler
+// maps this to a 400; tests pin the mapping.
+var ErrInvalidLevel = errors.New("invalid log level")
+
+// DefaultLogLimit is the limit applied when the caller does not specify one.
+// Picked to be a useful single screenful (≈ one second of verbose output) and
+// small enough that a follow-on --follow tick can stream a meaningful new
+// batch without immediately re-hitting the default ceiling.
+const DefaultLogLimit = 100
+
+// MaxLogLimit caps the limit at the service layer so a hostile or buggy
+// client cannot request an unbounded result. 1000 is enough to span a full
+// minute of bursty output; tenants needing more should paginate via since
+// (issue #77 deferred offset for v1).
+const MaxLogLimit = 1000
+
+// DefaultLogSince is the time window applied when the caller omits `since`.
+// Five minutes matches the worker's LogForwarder flush interval closely, so
+// "edge logs myapp" on a freshly-running app returns the most recent batch.
+const DefaultLogSince = 5 * time.Minute
+
+// LogLevelOrdinal maps a level string to its canonical numeric rank. Higher
+// = more severe. Unknown levels return -1 — callers should treat that as
+// ErrInvalidLevel rather than silently matching "everything".
+func LogLevelOrdinal(level string) int {
+	switch level {
+	case "trace":
+		return 0
+	case "debug":
+		return 1
+	case "info":
+		return 2
+	case "warn":
+		return 3
+	case "error":
+		return 4
+	default:
+		return -1
+	}
+}
+
+// canonicalLogLevels is the ordered set of levels LogLevelOrdinal recognizes.
+// Exposed as a package var so tests can iterate it without hardcoding the
+// list twice.
+var canonicalLogLevels = []string{"trace", "debug", "info", "warn", "error"}
+
+// LevelsAtOrAbove returns the subset of canonicalLogLevels whose ordinal is
+// >= min's ordinal. An empty result means the caller asked for everything
+// (min == "trace" — the lowest severity). minLevel must be one of the
+// canonical strings; pass-through of an unknown level is a programming error
+// (the handler validates first via LogLevelOrdinal).
+func LevelsAtOrAbove(minLevel string) []string {
+	min := LogLevelOrdinal(minLevel)
+	if min < 0 {
+		return nil
+	}
+	out := make([]string, 0, len(canonicalLogLevels)-min)
+	for _, l := range canonicalLogLevels {
+		if LogLevelOrdinal(l) >= min {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// LogQuery is the validated, defaulted shape the handler hands the service.
+// All fields are required (no pointers / no zero ambiguity) so the service
+// layer can never accidentally query for "everything in the table".
+//
+// Levels is set by the service as a side-effect of MinLvl and is what the
+// repository consumes (level = ANY($N::text[])). Exposed here so callers
+// that need to inspect the post-translation filter (tests, observability)
+// can do so without re-implementing LevelsAtOrAbove.
+type LogQuery struct {
+	Since  time.Duration
+	MinLvl string // canonical level string; "" = no filter
+	Levels []string
+	Limit  int
+}
+
+// LogEntryLister is the repository subset LogService consumes. Defined locally
+// so tests can stub it without a live DB.
+type LogEntryLister interface {
+	ListByTenantApp(ctx context.Context, tenantID, appName string, filter repository.LogListFilter) ([]domain.LogEntry, error)
+}
+
+// LogService serves the read path for issue #77: a tenant asks for the last N
+// log entries of one of their apps since some timestamp. It applies defaults
+// and clamps so a malformed client request cannot turn into an unbounded
+// DB query.
+type LogService struct {
+	repo LogEntryLister
+}
+
+func NewLogService(repo LogEntryLister) *LogService {
+	return &LogService{repo: repo}
+}
+
+// ResolveLimit is the canonical limit clamp, exported so the handler can
+// echo the post-clamp value in the response envelope without re-implementing
+// the policy. Single source of truth — adding a new caller or a new bucket
+// means editing exactly one place.
+//
+//	≤0    → DefaultLogLimit
+//	>max  → MaxLogLimit
+//	else  → requested unchanged
+func ResolveLimit(requested int) int {
+	switch {
+	case requested <= 0:
+		return DefaultLogLimit
+	case requested > MaxLogLimit:
+		return MaxLogLimit
+	default:
+		return requested
+	}
+}
+
+// ListByTenantApp validates and normalizes q, then forwards to the repository.
+//
+// Defaults / clamps (issue #77 §3):
+//
+//   - Since: zero → DefaultLogSince (5m). Negative values are clamped to 0
+//     before the default kicks in — the CLI is supposed to parse the duration
+//     before this, but a negative from any caller (e.g. a clock-skewed `since=`
+//     in the future) should not blow up the query.
+//   - MinLvl: empty → no filter (Levels slice nil). Unknown → ErrInvalidLevel.
+//   - Limit: ≤0 → DefaultLogLimit (100). >MaxLogLimit (1000) → MaxLogLimit.
+//
+// The second return value is the *effective* limit — the post-clamp value
+// actually applied to the query. Callers (the HTTP handler) echo it back in
+// the response envelope so a client that asked for `limit=2000` sees the
+// real bound. Deriving it here, not in the handler, keeps the policy in
+// one place: changing the clamp buckets later only touches this file.
+//
+// The returned entries are ordered newest-first; the index
+// idx_logs_tenant_app_ts (tenant_id, app_name, ts DESC) covers the WHERE +
+// ORDER BY.
+func (s *LogService) ListByTenantApp(
+	ctx context.Context, tenantID, appName string, q LogQuery,
+) ([]domain.LogEntry, int, error) {
+	if q.MinLvl != "" && LogLevelOrdinal(q.MinLvl) < 0 {
+		return nil, 0, fmt.Errorf("%w: %q", ErrInvalidLevel, q.MinLvl)
+	}
+
+	since := q.Since
+	if since <= 0 {
+		since = DefaultLogSince
+	}
+
+	limit := ResolveLimit(q.Limit)
+
+	levels := []string(nil)
+	if q.MinLvl != "" {
+		levels = LevelsAtOrAbove(q.MinLvl)
+	}
+
+	entries, err := s.repo.ListByTenantApp(ctx, tenantID, appName, repository.LogListFilter{
+		Since:  since,
+		Levels: levels,
+		Limit:  limit,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return entries, limit, nil
+}

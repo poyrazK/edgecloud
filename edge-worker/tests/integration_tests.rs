@@ -1222,3 +1222,181 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     assert_eq!(entry["labels"]["request_id"], "abc");
     assert_eq!(entry["labels"]["path"], "/api/foo");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #77 §6 — end-to-end timing SLA.
+//
+// Asserts that a guest-emitted log entry reaches the control-plane
+// ingest endpoint within 5 seconds of emission. The plan's contract:
+// 1s forwarder flush interval + ~1s network round-trip is well within
+// budget; 5s is generous for CI.
+//
+// Why this test exists separately from
+// `test_emit_log_reaches_log_ingest_endpoint` above: that test calls
+// `flush_now()` synchronously, which proves the wire contract but
+// says nothing about the *ticker-driven* path. This test exercises
+// the real `flush_loop` ticker — the path production runs on — and
+// measures wall-clock time from `push()` to the POST landing at
+// WireMock.
+//
+// Why it injects via `log_forwarder.push()` rather than driving a
+// real guest: hand-crafting a wasi-p2 component requires a
+// `wasm-tools` + `wit-component` toolchain that isn't in this PR's
+// CI lane (see `fixtures/log-emit.c` for the rebuild path). The
+// wire shape from `push()` to WireMock is byte-identical to a real
+// `edge:observe.emit_log` call, so the SLA this test pins is the
+// same SLA a guest-driven test would pin. The future migration to a
+// real fixture is mechanical: drop the `push()` and replace the
+// fixture.
+//
+// Self-skip: gated by the same `should_skip_integration_tests()`
+// rule as the other tests — Docker + testcontainers is required
+// for the NATS harness.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_emit_log_reaches_ingest_within_5s() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // Spawn the flush_loop explicitly — the supervisor does not run
+    // it (production spawns it in main.rs; tests construct the
+    // supervisor without main.rs and so must drive the loop
+    // themselves). The shutdown channel lets us stop it cleanly on
+    // test exit. We clone the sender so we can `drop(_)` the
+    // original at the end of the test (signals shutdown) without
+    // moving it into the spawn closure.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let shutdown_tx_for_loop = shutdown_tx.clone();
+    let forwarder_for_loop = harness.supervisor.log_forwarder.clone();
+    tokio::spawn(async move {
+        forwarder_for_loop
+            .flush_loop(shutdown_tx_for_loop.subscribe())
+            .await;
+    });
+
+    // Mount the artifact endpoint so the supervisor can move the app
+    // to Running. We don't actually execute the guest — the test
+    // injects through the forwarder directly.
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_log_emit_sla"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // Capture the POST for timing + body assertions. Use a
+    // generous deadline so the test does not flake under
+    // slow-CI load — the SLA is what we measure, not what we
+    // hand to wiremock.
+    Mock::given(method("POST"))
+        .and(path("/api/internal/logs"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&harness.mock_server)
+        .await;
+
+    let spec = AppSpec {
+        deployment_id: "d_log_emit_sla".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: Some(vec![]),
+        max_memory_mb: 0,
+        routes: None,
+    };
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-26T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("log-emit-sla".to_string(), spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    // Wait until the app is Running so the forwarder has a live
+    // AppLogContext for it. Once it is, any record we push with
+    // that context will produce a POST to /api/internal/logs.
+    let running = wait_for_app_running(&harness.supervisor, "log-emit-sla", 10).await;
+    assert!(running, "app should reach Running within 10s");
+
+    // Wall-clock measurement: the SLA is from `push()` to the
+    // WireMock request landing, NOT from `wait_for_app_running`.
+    // The `push` happens after Running, so the SLA budget covers
+    // ticker + POST only.
+    let start = std::time::Instant::now();
+
+    // Inject one record. The forwarder's internal state will
+    // surface this to WireMock on the next 1s ticker tick.
+    let record = edge_runtime::interfaces::observe::LogRecord {
+        timestamp_ms: 0,
+        level: edge_runtime::interfaces::observe::LogLevel::Info,
+        message: "hello-from-guest".to_string(),
+        labels: vec![("source".to_string(), "log-emit".to_string())],
+    };
+    let ctx = edge_runtime::interfaces::observe::AppLogContext {
+        app_name: "log-emit-sla".to_string(),
+        tenant_id: "t_test".to_string(),
+        deployment_id: "d_log_emit_sla".to_string(),
+    };
+    harness.supervisor.log_forwarder.push(record, ctx);
+
+    // Poll WireMock for the request. We don't know exactly when
+    // the 1s ticker will fire (it skipped the immediate-tick on
+    // construction), so poll up to the 5s SLA window. Polling
+    // every 100ms is fine — it's a local HTTP query, not a DB hit.
+    let mut posts: Vec<wiremock::Request> = Vec::new();
+    let sla = Duration::from_secs(5);
+    while start.elapsed() < sla {
+        let received = harness
+            .mock_server
+            .received_requests()
+            .await
+            .expect("received");
+        posts = received
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/internal/logs" && r.method == "POST")
+            .collect();
+        if !posts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let elapsed = start.elapsed();
+    assert!(
+        !posts.is_empty(),
+        "no POST to /api/internal/logs within {sla:?} — SLA violated"
+    );
+    assert!(
+        elapsed < sla,
+        "POST took {elapsed:?} which exceeds the {sla:?} SLA"
+    );
+
+    // Body shape sanity check (mirrors the wire assertions in
+    // test_emit_log_reaches_log_ingest_endpoint).
+    let parsed: serde_json::Value = serde_json::from_slice(&posts[0].body).expect("body is JSON");
+    let entries = parsed["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(entries.len(), 1, "expected one entry");
+    let entry = &entries[0];
+    assert_eq!(entry["app_name"], "log-emit-sla");
+    assert_eq!(entry["tenant_id"], "t_test");
+    assert_eq!(entry["deployment_id"], "d_log_emit_sla");
+    assert_eq!(entry["level"], "info");
+    assert_eq!(entry["message"], "hello-from-guest");
+    assert_eq!(entry["labels"]["source"], "log-emit");
+
+    // Stop the flush_loop task cleanly by dropping the shutdown
+    // sender — the loop observes the channel close on the next
+    // `shutdown.recv()` poll and exits. We don't `await` the
+    // JoinHandle because the test is already done and the harness
+    // is about to drop; the in-flight task gets cancelled along
+    // with the rest of the tokio runtime when the test fn returns.
+    drop(shutdown_tx);
+}
