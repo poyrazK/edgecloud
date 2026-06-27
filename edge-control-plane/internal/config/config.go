@@ -54,6 +54,23 @@ type JWTConfig struct {
 	Secret string `yaml:"secret"`
 	TTL    int    `yaml:"ttl_hours"`
 	Issuer string `yaml:"issuer"`
+	// BootstrapPSK is the pre-shared key workers use to enroll via
+	// `POST /api/internal/auth/token` (Phase 4). Must match
+	// `WORKER_BOOTSTRAP_PSK` on the worker side.
+	//
+	// Empty disables the bootstrap endpoint entirely (the route
+	// returns 503). Operators wanting strict enrollment-only auth
+	// can run with `BootstrapPSK` set and `Secret` set to a strong
+	// random value used only for token verification — the two
+	// paths are independent at the server level.
+	//
+	// Validated like Secret: non-empty + ≥32 bytes when set. We
+	// skip the "known placeholder" check (the one on Secret)
+	// because operators typically source PSKs from a secrets
+	// manager rather than a config file — a placeholder check
+	// would generate false positives on short randomly-generated
+	// keys that happen to collide with a known-bad value.
+	BootstrapPSK string `yaml:"bootstrap_psk"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -131,6 +148,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
 	}
+	if v := os.Getenv("BOOTSTRAP_PSK"); v != "" {
+		cfg.JWT.BootstrapPSK = v
+	}
 	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
 		cfg.Region = v
 	}
@@ -173,6 +193,16 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Bootstrap PSK is optional; when set, it must be ≥32 bytes (same
+	// floor as the JWT secret — short keys make HMAC-SHA256 brute-force
+	// feasible). Empty PSK leaves the bootstrap endpoint disabled; the
+	// route still exists but returns 503 from the middleware, so
+	// operators can roll out the worker side before the server side
+	// without a config mismatch producing confusing 401s.
+	if err := validateBootstrapPSK(cfg.JWT.BootstrapPSK); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
@@ -209,6 +239,24 @@ func validateJWTSecret(s string) error {
 	}
 	if len(s) < 32 {
 		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(s))
+	}
+	return nil
+}
+
+// validateBootstrapPSK enforces two rules (in priority order):
+//  1. when set, the PSK must be at least 32 bytes,
+//  2. (no placeholder check — see JWTConfig.BootstrapPSK doc for the
+//     rationale).
+//
+// Empty is allowed: the bootstrap endpoint is opt-in. An empty PSK
+// causes the route to return 503 instead of 401 so the failure mode
+// is distinguishable from a wrong-PSK submission.
+func validateBootstrapPSK(s string) error {
+	if s == "" {
+		return nil
+	}
+	if len(s) < 32 {
+		return fmt.Errorf("jwt.bootstrap_psk must be at least 32 bytes when set (got %d)", len(s))
 	}
 	return nil
 }

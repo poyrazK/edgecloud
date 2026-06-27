@@ -267,6 +267,26 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	}
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
+	// Bootstrap endpoint (Phase 4): PSK-authenticated JWT mint for
+	// fresh workers. Registered on the OUTER mux (NOT inside
+	// internalMux) so the PSKAuth middleware — not WorkerAuth —
+	// handles authentication. Go 1.22+ ServeMux matches the most
+	// specific pattern first, so this concrete `POST /api/internal/auth/token`
+	// wins over the `/api/internal/` prefix despite living on the
+	// same mux. The bootstrap path is opt-in: when BOOTSTRAP_PSK
+	// is unset, the middleware returns 503 on every request so
+	// misconfigured workers see the difference between
+	// "wrong-PSK" (401) and "server-side disabled" (503).
+	workerJWTMinter := service.NewWorkerJWTMinter(cfg.JWT)
+	bootstrapHandler := handler.NewBootstrapHandler(workerJWTMinter)
+	if bootstrapHandler != nil {
+		bootstrapCfg := middleware.BootstrapAuthConfig{
+			PSK: []byte(cfg.JWT.BootstrapPSK),
+		}
+		mux.Handle("POST /api/internal/auth/token",
+			middleware.PSKAuth(bootstrapCfg)(http.HandlerFunc(bootstrapHandler.MintToken)))
+	}
+
 	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
 	// Wrap with request ID tracing — outermost middleware runs for every request.
