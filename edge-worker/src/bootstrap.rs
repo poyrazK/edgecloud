@@ -217,7 +217,6 @@ pub async fn save_to_disk(path: &Path, bundle: &JwtBundle) -> Result<()> {
     // applies — workers don't run on Windows in production.)
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
