@@ -9,7 +9,7 @@
 //! * `edge status runtime <app>`: worker-reported runtime view —
 //!   `running` / `starting` / `stopping` / `crashed` / `hung` /
 //!   `unknown`. Sourced from
-//!   `GET /api/v1/apps/{appName}/status` via `ApiClient::get_app_status`.
+//!   `GET /api/v1/apps/{appName}/status` via `ApiClient::app_status`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -61,12 +61,12 @@ pub fn runtime(path: &Path, app: &str) -> Result<()> {
     // inspecting a peer's app by name).
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name("edge status runtime", app, state.as_ref())?;
-    let edge_toml = EdgeToml::from_path(path)?;
+    let edge_toml = EdgeToml::from_path(path).with_context(|| {
+        "edge status runtime requires edge.toml with [deployment] api = \"<url>\""
+    })?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
 
-    let s = client
-        .get_app_status(&app_name)
-        .with_context(|| format!("fetch runtime status for {app_name}"))?;
+    let s = client.app_status(&app_name)?;
 
     output::section(&format!("Runtime Status — {app_name}"));
     println!("Status:         {}", s.status);
