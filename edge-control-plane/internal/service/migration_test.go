@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -54,8 +55,9 @@ func (m *mockDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
 // can assert cleanup behavior).
 type mockArtifactStore struct {
 	artifacts map[string][]byte // key: "tenantID/appName/depID"
-	// saveErr makes Save return this error if non-nil. Used by the
-	// rollback tests to trigger the compensating-write path.
+	// saveErr makes Save/SaveAndHash return this error if non-nil.
+	// Used by the rollback tests to trigger the compensating-write
+	// path.
 	saveErr error
 	// deleteCalls records each Delete invocation. Used by the
 	// rollback tests to assert the artifact-blob compensating write
@@ -79,6 +81,32 @@ func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploym
 	}
 	m.artifacts[tenantID+"/"+appName+"/"+deploymentID] = data
 	return nil
+}
+
+// SaveAndHash implements ArtifactStoreInterface. Returns
+// sha256.Sum256(bytes) so callers that compare the hash against a
+// known-good digest (rare in tests) get the real digest. Honors
+// saveErr for the failure path.
+func (m *mockArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	if m.saveErr != nil {
+		return nil, m.saveErr
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	m.artifacts[tenantID+"/"+appName+"/"+deploymentID] = data
+	return sha256Bytes(data), nil
+}
+
+// sha256Bytes is a tiny helper so SaveAndHash's hash doesn't pull
+// crypto/sha256 into every test file. The migration_test.go file
+// already imports crypto/sha256 elsewhere; keeping the call local
+// avoids confusion about which sha256 is which.
+func sha256Bytes(b []byte) []byte {
+	h := sha256.New()
+	h.Write(b)
+	return h.Sum(nil)
 }
 
 func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {

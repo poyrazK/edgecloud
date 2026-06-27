@@ -55,6 +55,10 @@ func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploym
 	return m.saveErr
 }
 
+func (m *mockArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	return nil, m.saveErr
+}
+
 func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
 	return nil, nil
 }

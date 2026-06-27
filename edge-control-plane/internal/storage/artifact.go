@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,15 @@ type ArtifactStore interface {
 	Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error
 	Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
 	Delete(ctx context.Context, tenantID, appName, deploymentID string) error
+	// SaveAndHash streams the artifact to disk and returns its SHA-256
+	// in a single io.Copy pass (no intermediate buffer). The hash and
+	// the file are written concurrently via io.MultiWriter; the final
+	// path either contains the full artifact (with a verified hash) or
+	// doesn't exist (atomic via temp-rename). ctx is ignored — os.* and
+	// hash.* don't take a context. Forward-ported here so commit
+	// 0e08a32 (Migrate/MigrateTree streaming) can call it before
+	// 26578b2 lands; the latter commit will be a no-op for this method.
+	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
 }
 
 // FSArtifactStore is the filesystem-backed implementation of
@@ -121,6 +131,54 @@ func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 		return fmt.Errorf("writing artifact: %w", err)
 	}
 	return nil
+}
+
+// SaveAndHash streams the artifact to disk and returns its SHA-256
+// in a single pass. The hash and the file are written concurrently
+// via io.MultiWriter; the final path either contains the full
+// artifact (with a verified hash) or doesn't exist (atomic via
+// temp-rename). ctx is ignored — `os.*` and `sha256` don't take a
+// context.
+//
+// Equivalent to Save followed by sha256 over the resulting file, but
+// avoids the intermediate buffer: the artifact is read once from r,
+// written to disk AND folded into the hasher, in one io.Copy call.
+// Forward-ported here from commit 26578b2 so commit 0e08a32
+// (Migrate/MigrateTree streaming) can call it.
+func (s *FSArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	path, err := s.Path(tenantID, appName, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid artifact path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("creating artifact dir: %w", err)
+	}
+
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	f, err := os.Create(tmp)
+	if err != nil {
+		return nil, fmt.Errorf("creating artifact temp file: %w", err)
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, hasher), r); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("writing artifact: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("syncing artifact: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("closing artifact: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("renaming artifact: %w", err)
+	}
+	return hasher.Sum(nil), nil
 }
 
 // Open reads a Wasm artifact from disk. ctx is ignored — `os.Open`
