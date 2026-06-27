@@ -242,32 +242,38 @@ impl RoutingTable {
 
     /// Apply a fresh poll snapshot atomically: union of (old, new) minus
     /// (old minus new). Returns `(added, removed)` so the caller can
-    /// log the churn without re-snapshotting. Two-phase: compute diff
-    /// while holding the read lock, then apply under the write lock —
-    /// the read lock is dropped before the write lock is acquired, so
-    /// other readers aren't blocked on the I/O.
+    /// log the churn without re-snapshotting.
+    ///
+    /// Single-write-lock invariant (PR #133 review finding #2): the
+    /// diff and the mutation are computed and applied under ONE
+    /// `by_fqdn.write()` guard. Two concurrent callers — e.g. a poll
+    /// interleaving with a `register_fqdn` call, or two overlapping
+    /// polls at startup — would otherwise both observe the same
+    /// baseline, each compute a diff against that baseline, and on
+    /// sequential application lose entries that one of them had
+    /// intended to keep. Holding the write lock for the full
+    /// diff-then-apply window eliminates the lost-update race.
+    ///
+    /// The lock is held for O(|new| + |current|) HashMap lookups —
+    /// microseconds even at 50,000 entries — well below the 30s poll
+    /// cadence, so blocking `fqdn_snapshot()` (the renderer's reader)
+    /// for that long is acceptable.
     pub async fn apply_poll_snapshot(&self, domains: Vec<Domain>) -> (Vec<String>, Vec<String>) {
         let new_fqdns: HashMap<String, Domain> =
             domains.into_iter().map(|d| (d.fqdn.clone(), d)).collect();
 
-        // Compute added + removed under the read lock.
-        let (added, removed) = {
-            let current = self.by_fqdn.read().await;
-            let added: Vec<String> = new_fqdns
-                .keys()
-                .filter(|fqdn| !current.contains_key(*fqdn))
-                .cloned()
-                .collect();
-            let removed: Vec<String> = current
-                .keys()
-                .filter(|fqdn| !new_fqdns.contains_key(*fqdn))
-                .cloned()
-                .collect();
-            (added, removed)
-        };
-
-        // Apply under the write lock.
+        // Compute diff AND apply under a single write lock.
         let mut current = self.by_fqdn.write().await;
+        let added: Vec<String> = new_fqdns
+            .keys()
+            .filter(|fqdn| !current.contains_key(*fqdn))
+            .cloned()
+            .collect();
+        let removed: Vec<String> = current
+            .keys()
+            .filter(|fqdn| !new_fqdns.contains_key(*fqdn))
+            .cloned()
+            .collect();
         for fqdn in &removed {
             current.remove(fqdn);
         }
@@ -283,7 +289,6 @@ impl RoutingTable {
                 );
             }
         }
-
         (added, removed)
     }
 }
@@ -509,5 +514,121 @@ mod tests {
         let snap = t.fqdn_snapshot().await;
         assert_eq!(snap.len(), 2);
 
+    }
+
+    /// Regression test for PR #133 review finding #2: the two-phase
+    /// read/drop/write pattern in `apply_poll_snapshot` could lose
+    /// entries when two polls ran concurrently and both computed
+    /// their diffs against the same baseline. With the single-write-
+    /// lock fix, the polls serialize: whichever runs second observes
+    /// the first's mutations and computes its diff against the
+    /// post-first state. So the final state must be one of the two
+    /// valid SEQUENTIAL outcomes — not the lost-update outcome that
+    /// the two-phase bug produces.
+    ///
+    /// Scenario: pre-populate `{a, b, c, d}` via `apply_poll_snapshot`
+    /// itself (so the test exercises the same path). Then drive two
+    /// concurrent polls:
+    ///   - Poll A: keep `{a, b}` (wants to remove `c, d`)
+    ///   - Poll B: keep `{b, c}` (wants to remove `a, d`)
+    ///
+    /// Valid sequential outcomes:
+    ///   A then B: A → `{a, b}`, B → `{b, c}`. Final: `{b, c}`.
+    ///   B then A: B → `{b, c}`, A → `{a, b}`. Final: `{a, b}`.
+    ///
+    /// Two-phase-bug outcome (both reads see `{a, b, c, d}`, each
+    /// computes its own diff against that baseline, sequential apply):
+    ///   A removes `c, d` → `{a, b}`; B removes `a, d` (d no-op) →
+    ///   `{b}`. Entries `a` AND `c` are lost — neither valid.
+    ///
+    /// `tokio::join!` does not guarantee which poll runs first, so
+    /// the test asserts the final state is one of the two valid
+    /// outcomes — never the lost-update `{b}` outcome.
+    #[tokio::test]
+    async fn apply_poll_snapshot_concurrent_polls_dont_lose_entries() {
+        use std::collections::HashSet;
+
+        let t = std::sync::Arc::new(RoutingTable::new());
+
+        // Seed: {a, b, c, d}
+        t.apply_poll_snapshot(vec![
+            Domain { id: "d_a".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "a.acme.com".into() },
+            Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
+            Domain { id: "d_c".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "c.acme.com".into() },
+            Domain { id: "d_d".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "d.acme.com".into() },
+        ]).await;
+
+        let snap_before: HashSet<String> = t
+            .fqdn_snapshot()
+            .await
+            .into_iter()
+            .map(|b| b.fqdn)
+            .collect();
+        assert_eq!(
+            snap_before,
+            HashSet::from([
+                "a.acme.com".to_string(),
+                "b.acme.com".to_string(),
+                "c.acme.com".to_string(),
+                "d.acme.com".to_string(),
+            ]),
+            "test setup: seed must contain {{a, b, c, d}}"
+        );
+
+        // Poll A: keep {a, b}
+        let t_a = t.clone();
+        let poll_a = tokio::spawn(async move {
+            t_a.apply_poll_snapshot(vec![
+                Domain { id: "d_a".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "a.acme.com".into() },
+                Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
+            ])
+            .await
+        });
+
+        // Poll B: keep {b, c}
+        let t_b = t.clone();
+        let poll_b = tokio::spawn(async move {
+            t_b.apply_poll_snapshot(vec![
+                Domain { id: "d_b".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "b.acme.com".into() },
+                Domain { id: "d_c".into(), tenant_id: "t_a".into(), app_name: "api".into(), fqdn: "c.acme.com".into() },
+            ])
+            .await
+        });
+
+        let (res_a, res_b) = tokio::join!(poll_a, poll_b);
+        res_a.expect("poll A task panicked");
+        res_b.expect("poll B task panicked");
+
+        // The single-write-lock fix serializes the two polls. The
+        // final state must match one of the two valid sequential
+        // outcomes — not the lost-update `{b}` outcome that the
+        // two-phase bug would produce.
+        let snap_after: HashSet<String> = t
+            .fqdn_snapshot()
+            .await
+            .into_iter()
+            .map(|b| b.fqdn)
+            .collect();
+        let valid_a_then_b = HashSet::from([
+            "b.acme.com".to_string(),
+            "c.acme.com".to_string(),
+        ]);
+        let valid_b_then_a = HashSet::from([
+            "a.acme.com".to_string(),
+            "b.acme.com".to_string(),
+        ]);
+        let lost_update = HashSet::from([
+            "b.acme.com".to_string(),
+        ]);
+        assert_ne!(
+            snap_after, lost_update,
+            "concurrent polls lost entries that one of them intended to keep \
+             — this is the read/drop/write race from PR #133 review finding #2"
+        );
+        assert!(
+            snap_after == valid_a_then_b || snap_after == valid_b_then_a,
+            "final state {snap_after:?} is neither of the two valid sequential \
+             outcomes {{a, b}} / {{b, c}}; the single-write-lock fix has regressed"
+        );
     }
 }
