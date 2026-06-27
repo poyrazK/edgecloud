@@ -9,7 +9,8 @@ use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
 
-/// Activate a specific deployment.
+/// Activate a specific deployment.  If --weight is given, performs a canary
+/// activation (partial traffic split); weight=100 means atomic cutover.
 ///
 /// If `.edge/state.json` exists and matches the app being activated,
 /// update its `deployment_id` so subsequent commands (status, open,
@@ -18,7 +19,7 @@ use crate::state::State;
 /// to return the new URL in the activate response body, which is
 /// deferred to a follow-up (issue #74 follow-up).
 #[cfg(feature = "network")]
-pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
+pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(&state)?;
 
@@ -26,7 +27,7 @@ pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    client.activate(&app_name, deployment_id)?;
+    client.activate(&app_name, deployment_id, weight)?;
 
     // Update state.json if it exists for this app. Never overwrite
     // state for a different app.
@@ -37,7 +38,17 @@ pub fn run(path: &Path, deployment_id: &str) -> Result<()> {
         }
     }
 
-    output::success(&format!("Deployment {} activated", deployment_id));
+    match weight {
+        Some(w) if w < 100 => output::success(&format!(
+            "Deployment {} activated with {}% traffic",
+            deployment_id, w
+        )),
+        Some(100) | None => output::success(&format!("Deployment {} activated", deployment_id)),
+        _ => output::success(&format!(
+            "Deployment {} draining (0% traffic)",
+            deployment_id
+        )),
+    }
     Ok(())
 }
 
@@ -51,7 +62,7 @@ fn resolve_app_name(state: &Option<State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _deployment_id: &str) -> Result<()> {
+pub fn run(_path: &Path, _deployment_id: &str, _weight: Option<u8>) -> Result<()> {
     anyhow::bail!("activate requires network support; rebuild with --features network")
 }
 

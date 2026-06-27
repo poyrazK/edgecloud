@@ -94,6 +94,11 @@ enum Command {
     Activate {
         /// Deployment ID to activate.
         deployment_id: String,
+        /// Weight for canary activation (0-100). Omit for atomic cutover (weight=100).
+        /// weight=0 drains the deployment; 0<weight<100 splits traffic between
+        /// this deployment and the currently active one.
+        #[arg(long)]
+        weight: Option<u8>,
     },
 
     /// Roll back to the previous deployment.
@@ -172,6 +177,24 @@ enum Command {
         #[command(subcommand)]
         action: crate::commands::auth::AuthAction,
     },
+
+    /// Get or set traffic splits for canary/blue-green deployments.
+    Traffic {
+        #[command(subcommand)]
+        action: TrafficAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrafficAction {
+    /// Show current traffic splits.
+    Show,
+    /// Set traffic splits. Example: `edge traffic set d_v1=95 d_v2=5`
+    Set {
+        /// Deployment splits as `deployment_id=weight` pairs.
+        /// Weights must sum to 100.
+        splits: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -189,7 +212,10 @@ fn main() -> Result<()> {
         Command::Status => commands::status::run(&cli.path),
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
-        Command::Activate { deployment_id } => commands::activate::run(&cli.path, &deployment_id),
+        Command::Activate {
+            deployment_id,
+            weight,
+        } => commands::activate::run(&cli.path, &deployment_id, weight),
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev => commands::dev::run(&cli.path),
@@ -206,6 +232,20 @@ fn main() -> Result<()> {
             commands::logs::run(&cli.path, &app, since_dur, level.as_deref(), follow, limit)
         }
         Command::Auth { action } => action.run(),
+        Command::Traffic { action } => match action {
+            TrafficAction::Show => commands::traffic::get(&cli.path),
+            TrafficAction::Set { splits } => {
+                let parsed: Vec<(String, u8)> = splits
+                    .iter()
+                    .filter_map(|s| {
+                        let (id, w) = s.split_once('=')?;
+                        let weight: u8 = w.parse().ok()?;
+                        Some((id.to_string(), weight))
+                    })
+                    .collect();
+                commands::traffic::set(&cli.path, &parsed)
+            }
+        },
     }
 }
 

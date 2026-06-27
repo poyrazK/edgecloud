@@ -32,6 +32,23 @@ type WorkerStatus struct {
 	LastReport time.Time       `db:"last_report"`
 }
 
+// MetricKind is the kind of metric in a MetricSample.
+type MetricKind string
+
+const (
+	MetricKindCounter        MetricKind = "counter"
+	MetricKindGauge          MetricKind = "gauge"
+	MetricKindHistogramSample MetricKind = "histogram_sample"
+)
+
+// MetricSample is a single metric observation shipped inside a heartbeat.
+type MetricSample struct {
+	Name   string            `json:"name"`
+	Kind   MetricKind        `json:"kind"`
+	Value  float64           `json:"value"`
+	Labels [][2]string       `json:"labels"`
+}
+
 // AppStatus represents the status of a single app on a worker.
 type AppStatus struct {
 	Status       string `json:"status"`
@@ -50,6 +67,9 @@ type AppStatus struct {
 	// Sourced from `AppInstance.port` in the worker; used by the public
 	// ingress to dial the upstream.
 	Port int `json:"port,omitempty"`
+	// Guest-emitted metrics from edge:observe. Absent from old workers;
+	// defaults to nil — control plane treats nil as "no metric data this interval".
+	ObserverMetrics []MetricSample `json:"observer_metrics,omitempty"`
 }
 
 // AppTarget describes a running app reachable on a worker — what the

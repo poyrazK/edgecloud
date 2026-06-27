@@ -10,3 +10,4 @@ pub mod config;
 pub mod heartbeats;
 pub mod messages;
 pub mod routing;
+pub mod traffic;

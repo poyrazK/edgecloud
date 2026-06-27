@@ -22,6 +22,7 @@ import (
 type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
+	trafficSvc    *service.TrafficService
 	// rollbackSvc is a narrow contract for the rollback handler so the
 	// test can stub it without standing up the full *service.DeploymentService
 	// (DB + NATS + publisher + artifact store). The concrete
@@ -46,10 +47,11 @@ type deploymentActivator interface {
 	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup) *DeploymentHandler {
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
+		trafficSvc:    trafficSvc,
 		// Concrete *service.DeploymentService satisfies the narrow interfaces.
 		// nil is also fine for tests that only exercise the workerSvc path
 		// (e.g. AppIngress) — those methods never touch rollbackSvc /
@@ -279,20 +281,76 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
-		if errors.Is(err, service.ErrPublishFailed) {
-			http.Error(w,
-				`{"error": "activation committed but worker notification failed; please retry"}`,
-				http.StatusBadGateway)
+	weightStr := r.URL.Query().Get("weight")
+	// Omitting ?weight entirely means atomic activation (weight=100) — the
+	// legacy default. Parsing only overrides the value when the query
+	// string is non-empty, so weight=100 also covers the `?weight=100`
+	// explicit case (which is the same operation, not a canary).
+	weight := 100
+	if weightStr != "" {
+		parsed, err := strconv.Atoi(weightStr)
+		if err != nil || parsed < 0 || parsed > 100 {
+			httperror.BadRequestCtx(w, r, "weight must be an integer between 0 and 100")
 			return
 		}
+		weight = parsed
+	}
+
+	// weight == 100 (explicit or omitted): atomic activation. Goes through
+	// deploymentSvc.ActivateDeployment so active_deployments is updated and
+	// rollback / auto-rollback stability evaluation target the right row.
+	// Treats ?weight=100 as identical to omitting ?weight= entirely (the
+	// canary path is for partial weights only).
+	if weight == 100 {
+		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+			if errors.Is(err, service.ErrPublishFailed) {
+				http.Error(w,
+					`{"error": "activation committed but worker notification failed; please retry"}`,
+					http.StatusBadGateway)
+				return
+			}
+			log.Printf("internal error: %v", err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+		return
+	}
+
+	// Partial weight: canary activation. Requires an existing active
+	// deployment to act as the remainder — a canary staged against
+	// nothing is the same as a plain activation, which is what
+	// ActivateDeployment above already does. Reject with 400 rather than
+	// silently producing a single-entry split whose sum != 100 (which
+	// would 500 at ValidateSum).
+	current, err := h.deploymentSvc.GetActiveDeployment(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("internal error: GetActiveDeployment: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if current == nil {
+		httperror.BadRequestCtx(w, r, "canary activation requires an existing active deployment; activate one first")
+		return
+	}
+	if current.ID == deploymentID {
+		httperror.BadRequestCtx(w, r, "deployment is already active; pick a different deployment for the canary")
+		return
+	}
+	splits := []domain.TrafficSplitEntry{
+		{DeploymentID: deploymentID, Weight: weight},
+		{DeploymentID: current.ID, Weight: 100 - weight},
+	}
+
+	if err := h.trafficSvc.SetTraffic(r.Context(), tenantID, appName, splits); err != nil {
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"})
 }
 
 // Rollback handles POST /api/apps/{appName}/rollback. Swaps the active

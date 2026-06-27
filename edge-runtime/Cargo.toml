@@ -27,8 +27,6 @@ parking_lot = "0.12"
 # DNS resolution for edge:networking
 trust-dns-resolver = { version = "0.23", features = ["tokio"], optional = true }
 
-# Metrics
-metrics = { version = "0.24", optional = true }
 
 # HTTP parsing for http-server
 httparse = { version = "1.10", optional = true }
@@ -71,7 +69,7 @@ default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", 
 http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "tokio/sync", "dep:bytes", "dep:futures"]
 kv-store = []
 cache = ["dep:lru"]
-observe = ["dep:metrics"]
+observe = []
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []

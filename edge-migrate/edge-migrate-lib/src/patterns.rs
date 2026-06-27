@@ -62,10 +62,39 @@ pub struct PatternMatch {
     /// starts. Populated by both `CAnalyzer` and `RustAnalyzer`.
     #[serde(default)]
     pub column: Option<usize>,
-    /// Start byte offset in the source (for replacement).
+    /// Start byte offset in the **expanded** source (for replacement).
+    ///
+    /// When the analyzer runs with a preprocessor attached and macro
+    /// expansion is successful, this is the byte offset within the
+    /// **expanded** C source — i.e. after `clang -E`. This is the
+    /// coordinate system that tree-sitter reports matches in.
+    ///
+    /// For slicing the **original** source (which is what
+    /// `Transformer::transform` does), use `original_start_byte`
+    /// instead. The two fields differ only when a preprocessor is
+    /// attached and expansion succeeded; otherwise they are equal.
     pub start_byte: usize,
-    /// End byte offset in the source (for replacement).
+    /// End byte offset in the expanded source. See `start_byte` for
+    /// the coordinate system distinction.
     pub end_byte: usize,
+    /// Start byte offset in the **original** source. This is what
+    /// `Transformer::transform` slices against — the bin's
+    /// `--transform` path passes the original source to the
+    /// transformer, so the byte ranges must be in original
+    /// coordinates.
+    ///
+    /// Populated by `CAnalyzer::analyze_with_preprocessor_info` via
+    /// the preprocessor's `byte_map`. When no preprocessor is
+    /// attached, expansion failed, or the match falls on a synthetic
+    /// line (linemarker / `<built-in>`), this equals `start_byte`.
+    /// For Rust analysis (no preprocessor in v1), this always equals
+    /// `start_byte`.
+    #[serde(default)]
+    pub original_start_byte: usize,
+    /// End byte offset in the original source. See
+    /// `original_start_byte` for semantics.
+    #[serde(default)]
+    pub original_end_byte: usize,
     /// The kind of pattern detected (POSIX or Rust). See `PatternKind`.
     pub pattern: PatternKind,
     /// The original source code snippet.
@@ -105,10 +134,25 @@ pub struct BoundVarDecl {
     /// function-pointer) are not captured — see `analyzer.rs::extract_socket_bound_var`.
     pub name: String,
     /// Byte offset of the start of the surrounding `declaration` node.
+    /// **Expanded-source coordinates** when a preprocessor is attached;
+    /// see `original_decl_start_byte` for the original-source pair.
     pub decl_start_byte: usize,
     /// Byte offset of the end of the surrounding `declaration` node
-    /// (past the trailing `;`).
+    /// (past the trailing `;`). **Expanded-source coordinates** when a
+    /// preprocessor is attached.
     pub decl_end_byte: usize,
+    /// Byte offset of the start of the surrounding `declaration` node
+    /// in the **original** source. This is what the transformer slices
+    /// when rewriting the whole `int fd = socket(...)` declaration.
+    /// Equals `decl_start_byte` when no preprocessor is attached or
+    /// expansion failed.
+    #[serde(default)]
+    pub original_decl_start_byte: usize,
+    /// Byte offset of the end of the surrounding `declaration` node in
+    /// the **original** source. Equals `decl_end_byte` when no
+    /// preprocessor is attached.
+    #[serde(default)]
+    pub original_decl_end_byte: usize,
 }
 
 impl Default for PatternMatch {
@@ -121,6 +165,8 @@ impl Default for PatternMatch {
             column: None,
             start_byte: 0,
             end_byte: 0,
+            original_start_byte: 0,
+            original_end_byte: 0,
             pattern: PatternKind::Posix(PosixPattern::Unknown),
             snippet: String::new(),
             arg_nodes: Vec::new(),
@@ -561,6 +607,8 @@ mod tests {
             column: Some(0),
             start_byte: 42,
             end_byte: 60,
+            original_start_byte: 42,
+            original_end_byte: 60,
             pattern: PatternKind::Posix(PosixPattern::Listen),
             snippet: "bind(...)".to_string(),
             arg_nodes: vec![],
@@ -580,6 +628,8 @@ mod tests {
             column: Some(0),
             start_byte: 100,
             end_byte: 145,
+            original_start_byte: 100,
+            original_end_byte: 145,
             pattern: PatternKind::Rust(RustPattern::TcpBind),
             snippet: "TcpListener::bind(\"127.0.0.1:8080\")".to_string(),
             arg_nodes: vec!["\"127.0.0.1:8080\"".to_string()],

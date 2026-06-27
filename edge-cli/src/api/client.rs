@@ -460,12 +460,19 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Activate a deployment.
-    pub fn activate(&self, app_name: &str, deployment_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/apps/{}/activate/{}",
-            self.base_url, app_name, deployment_id
-        );
+    /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
+    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
+        let url = if let Some(w) = weight {
+            format!(
+                "{}/api/v1/apps/{}/activate/{}?weight={}",
+                self.base_url, app_name, deployment_id, w
+            )
+        } else {
+            format!(
+                "{}/api/v1/apps/{}/activate/{}",
+                self.base_url, app_name, deployment_id
+            )
+        };
         let resp = self
             .http
             .post(&url)
@@ -479,6 +486,76 @@ impl ApiClient {
             ApiError::Transient { source } => source,
         })?;
         Ok(())
+    }
+
+    /// Set traffic splits for an app.
+    /// `splits` is a slice of (deployment_id, weight) pairs; weights must sum to 100.
+    pub fn set_traffic(&self, app_name: &str, splits: &[(String, u8)]) -> Result<()> {
+        #[derive(Serialize)]
+        struct SplitEntry {
+            deployment_id: String,
+            weight: u8,
+        }
+        #[derive(Serialize)]
+        struct TrafficRequest<'a> {
+            splits: &'a [SplitEntry],
+        }
+        let url = format!("{}/api/v1/apps/{}/traffic", self.base_url, app_name);
+        let body = serde_json::to_string(&TrafficRequest {
+            splits: &splits
+                .iter()
+                .map(|(id, w)| SplitEntry {
+                    deployment_id: id.clone(),
+                    weight: *w,
+                })
+                .collect::<Vec<_>>(),
+        })?;
+        let resp = self
+            .http
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()?;
+
+        check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("set_traffic failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        Ok(())
+    }
+
+    /// Get current traffic splits for an app.
+    pub fn get_traffic(&self, app_name: &str) -> Result<Vec<(String, u8)>> {
+        #[derive(Deserialize)]
+        struct SplitEntry {
+            deployment_id: String,
+            weight: u8,
+        }
+        #[derive(Deserialize)]
+        struct TrafficResponse {
+            splits: Vec<SplitEntry>,
+        }
+        let url = format!("{}/api/v1/apps/{}/traffic", self.base_url, app_name);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("get_traffic failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let v: TrafficResponse = serde_json::from_str(&resp.text()?)?;
+        Ok(v.splits
+            .into_iter()
+            .map(|s| (s.deployment_id, s.weight))
+            .collect())
     }
 
     /// Rollback the active deployment of `app_name` to the stored

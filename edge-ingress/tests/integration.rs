@@ -69,6 +69,8 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         refresh_debounce_ms: 50,
         http_to_https: false,
         admin_token: None,
+        control_plane_api_url: "http://localhost:8080".into(),
+        internal_token: None,
     }
 }
 

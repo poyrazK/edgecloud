@@ -78,6 +78,18 @@ fallback.
   linemarker) keep their expanded line number. For most real-world
   C code this is invisible because the re-entry linemarker for the
   user file is emitted near the top of the expanded source.
+- **Byte-range remap.** Beyond `line_map`, the analyzer maintains a
+  parallel `byte_map` (one entry per expanded line) so pattern
+  byte ranges can be brought back into original-source coordinates
+  before the transformer slices the original source. Without this,
+  byte offsets from the expanded source (which always lead with
+  ~135 bytes of `# <line> "<file>"` linemarkers) overflow the
+  original source's length and panic with "range end index N out
+  of range for slice of length M". When the linear-interpolation
+  remap produces a range that doesn't contain the match's snippet
+  text (typically because clang emitted only one linemarker for
+  the whole file), the analyzer falls back to a content search
+  bounded by 1 KiB.
 - `-nostdinc` means project-internal headers are not auto-included.
   A future `--include-dir` flag will close this gap; tracked as a
   follow-up issue.

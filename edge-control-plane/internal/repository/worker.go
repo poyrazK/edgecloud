@@ -79,6 +79,14 @@ func (r *WorkerRepository) UpdateAddr(ctx context.Context, id, addr string) erro
 // `(tenant_id, app_name)` pair, or an empty slice if none. The query
 // pushes the tenant + app filter into SQL so the handler does not have
 // to load the fleet-wide result and scan it in Go.
+//
+// The `apps.key` filter uses `split_part(key, ':', 1)` so both legacy
+// heartbeat keys (just `app_name`) and canary/blue-green keys
+// (`app_name:deployment_id`, written by edge-worker so the ingress can
+// distinguish concurrent instances of the same app) match the bare
+// `appName` argument. `split_part('app:d_abc', ':', 1)` returns `'app'`
+// and `split_part('app', ':', 1)` returns `'app'` — so this query works
+// against both key formats without any application-side branching.
 func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error) {
 	const query = `
 		SELECT
@@ -91,7 +99,7 @@ func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, a
 		FROM workers
 		JOIN worker_status ON worker_status.worker_id = workers.id
 		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
-		WHERE apps.key = $1
+		WHERE split_part(apps.key, ':', 1) = $1
 		  AND apps.value->>'tenant_id' = $2
 		  AND apps.value->>'status' = 'running'
 		  AND (apps.value->>'port') IS NOT NULL

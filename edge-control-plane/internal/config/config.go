@@ -25,6 +25,16 @@ type Config struct {
 	// its own region. See `service.ActivateDeployment` for the
 	// fallback path. (Issue #82, v1.)
 	Region string `yaml:"region"`
+	// InternalToken is a shared secret presented by trusted
+	// service-to-service callers (today: the edge-ingress, which
+	// fetches traffic splits to apply Caddy weights). When set, the
+	// `internalAuth` middleware requires the
+	// `X-Internal-Token: <value>` header on those endpoints. When
+	// unset, the middleware fail-closes (rejects all requests) — the
+	// ingress would then 401 and the canary split would not propagate
+	// to Caddy. Operators must set EDGE_INTERNAL_TOKEN on both the
+	// control plane and the ingress to the same value.
+	InternalToken string `yaml:"internal_token"`
 }
 
 type DatabaseConfig struct {
@@ -133,6 +143,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
 		cfg.Region = v
+	}
+	if v := os.Getenv("EDGE_INTERNAL_TOKEN"); v != "" {
+		cfg.InternalToken = v
 	}
 
 	// Override with migration config env vars

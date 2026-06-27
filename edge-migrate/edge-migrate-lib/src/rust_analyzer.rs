@@ -141,6 +141,8 @@ impl RustAnalyzer {
             column: Some(column),
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
+            original_start_byte: node.start_byte(),
+            original_end_byte: node.end_byte(),
             pattern,
             snippet,
             arg_nodes,
