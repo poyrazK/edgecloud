@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,17 +14,50 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
+// InternalDomainServiceInterface is the slice of *service.DomainService
+// that InternalHandler needs (issue #83). Distinct from the
+// tenant-facing `DomainServiceInterface` in `domain.go`; the two
+// interfaces have no methods in common. Defined as an interface so
+// handler tests can inject a mock without spinning up a real DB
+// (matching the pattern used by DeploymentServiceInterface /
+// WorkerServiceInterface in other handler files).
+type InternalDomainServiceInterface interface {
+	ListAllDomains(ctx context.Context) ([]domain.Domain, error)
+	IsTlsAllowed(ctx context.Context, fqdn string) (bool, error)
+	UpdateStatus(ctx context.Context, id string, status domain.DomainStatus, lastError *string) error
+}
+
+// Compile-time check that the service still satisfies the interface.
+// The error mapping for `service.ErrDomainNotFound → 404` in
+// `UpdateDomainStatus` depends on this contract; if a future refactor
+// changes the signature, the handler will fail to compile and the
+// 404 path will not silently regress to 204.
+var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
+
 // InternalHandler handles internal worker-facing endpoints.
+//
+// `domainSvc` is nil when the binary is built without custom-domain
+// support (default-only mode) — every method that needs it returns
+// 501. `logEntryRepo` is the worker log ingest path (issue #76);
+// required by AutoRollback's audit trail and any future log-bearing
+// endpoint.
 type InternalHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     *service.WorkerService
+	domainSvc     InternalDomainServiceInterface
 	logEntryRepo  logEntryRepo
 }
 
-func NewInternalHandler(deploymentSvc *service.DeploymentService, workerSvc *service.WorkerService, logEntryRepo logEntryRepo) *InternalHandler {
+func NewInternalHandler(
+	deploymentSvc *service.DeploymentService,
+	workerSvc *service.WorkerService,
+	domainSvc InternalDomainServiceInterface,
+	logEntryRepo logEntryRepo,
+) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
+		domainSvc:     domainSvc,
 		logEntryRepo:  logEntryRepo,
 	}
 }
@@ -196,4 +230,100 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"deployment_id": newID,
 	})
+}
+
+// ListDomains handles GET /api/internal/domains — full domain list
+// for the ingress poller. JWT-authenticated; the ingress uses a
+// `role: "ingest"` token, but we accept any valid worker JWT (the
+// data is non-tenant-scoped; only the ingress + admins ever call
+// this). Response is a flat JSON array — not paginated, because
+// domain counts per platform are small.
+//
+// 501 when the binary is built without custom-domain support.
+func (h *InternalHandler) ListDomains(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	domains, err := h.domainSvc.ListAllDomains(r.Context())
+	if err != nil {
+		log.Printf("ListDomains: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(domains)
+}
+
+// TlsAllowed handles GET /api/internal/tls-allowed?fqdn=X — Caddy's
+// `on_demand.ask` callback. Returns 200 if the FQDN is registered
+// (any status — pending still authorizes the challenge), 404
+// otherwise. Body is empty in both cases; Caddy only checks the
+// status code.
+//
+// 501 when the binary is built without custom-domain support.
+func (h *InternalHandler) TlsAllowed(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	fqdn := r.URL.Query().Get("fqdn")
+	if fqdn == "" {
+		http.Error(w, "fqdn query parameter required", http.StatusBadRequest)
+		return
+	}
+	allowed, err := h.domainSvc.IsTlsAllowed(r.Context(), fqdn)
+	if err != nil {
+		log.Printf("TlsAllowed(%s): %v", fqdn, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "fqdn not registered", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// UpdateDomainStatus handles POST /api/internal/domains/{id}/status —
+// server-driven status updates. v1 stub; v2 wires this to a Caddy
+// event hook so the platform learns about renewal failures.
+//
+// JWT-authenticated; the body is `{"status": "active"|"failed",
+// "last_error": "..."}`. The 404 path is critical for the v2 webhook:
+// a Caddy event for a deleted/stale domain id must NOT be silently
+// acknowledged, or the operator's "rows in failed state" alerts
+// become wrong.
+func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Request) {
+	if h.domainSvc == nil {
+		http.Error(w, "custom domains not enabled", http.StatusNotImplemented)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "id path parameter required", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Status    domain.DomainStatus `json:"status"`
+		LastError *string             `json:"last_error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.Status != domain.DomainStatusActive && body.Status != domain.DomainStatusFailed {
+		http.Error(w, "status must be 'active' or 'failed'", http.StatusBadRequest)
+		return
+	}
+	if err := h.domainSvc.UpdateStatus(r.Context(), id, body.Status, body.LastError); err != nil {
+		if errors.Is(err, service.ErrDomainNotFound) {
+			http.Error(w, `{"error": "domain not found"}`, http.StatusNotFound)
+			return
+		}
+		log.Printf("UpdateDomainStatus(%s): %v", id, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

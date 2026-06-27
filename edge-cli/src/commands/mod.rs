@@ -6,6 +6,7 @@ pub mod build;
 pub mod deploy;
 pub mod deployments;
 pub mod dev;
+pub mod domains;
 pub mod env;
 pub mod init;
 pub mod logs;

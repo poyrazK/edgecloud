@@ -20,6 +20,7 @@ type mockAppRepo struct {
 	countByTenantFunc     func(ctx context.Context, tenantID string) (int, error)
 	atomicDeleteFunc      func(ctx context.Context, tenantID, appName string) (bool, error)
 	insertIfNotExistsFunc func(ctx context.Context, app *domain.App) (bool, error)
+	getForUpdateFunc      func(ctx context.Context, tenantID, appName string) (*domain.App, error)
 }
 
 func (m *mockAppRepo) Create(ctx context.Context, app *domain.App) error {
@@ -62,6 +63,13 @@ func (m *mockAppRepo) InsertIfNotExists(ctx context.Context, app *domain.App) (b
 		return m.insertIfNotExistsFunc(ctx, app)
 	}
 	return false, nil
+}
+
+func (m *mockAppRepo) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	if m.getForUpdateFunc != nil {
+		return m.getForUpdateFunc(ctx, tenantID, appName)
+	}
+	return nil, nil
 }
 
 // mockQuotaRepoForApps implements quotaRepoInterface for testing.

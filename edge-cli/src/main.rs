@@ -21,6 +21,52 @@ struct Cli {
     path: std::path::PathBuf,
 }
 
+/// `edge domains <add|list|check|remove>` — manage custom FQDNs bound
+/// to a deployment (issue #83). The full subcommand surface is
+/// defined here (clap derives the help text from it) and dispatched
+/// through `commands::domains::DomainsAction::run`. Adding a new
+/// subcommand means one variant here + one match arm.
+#[derive(Subcommand)]
+enum DomainsCommand {
+    /// Bind a custom FQDN (e.g. `api.acme.com`) to an app.
+    Add {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to bind.
+        fqdn: String,
+    },
+    /// List all custom FQDNs bound to an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Show a single FQDN's status (incl. any `last_error`).
+    Check {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to inspect.
+        fqdn: String,
+    },
+    /// Unbind a custom FQDN from an app.
+    Remove {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to unbind.
+        fqdn: String,
+    },
+}
+
+impl From<DomainsCommand> for commands::domains::DomainsAction {
+    fn from(cmd: DomainsCommand) -> Self {
+        match cmd {
+            DomainsCommand::Add { app, fqdn } => Self::Add { app, fqdn },
+            DomainsCommand::List { app } => Self::List { app },
+            DomainsCommand::Check { app, fqdn } => Self::Check { app, fqdn },
+            DomainsCommand::Remove { app, fqdn } => Self::Remove { app, fqdn },
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Scaffold a new project.
@@ -190,20 +236,11 @@ enum Command {
     /// Get or set traffic splits for canary/blue-green deployments.
     Traffic {
         #[command(subcommand)]
-        action: TrafficAction,
+        action: commands::traffic::TrafficAction,
     },
-}
-
-#[derive(Subcommand)]
-enum TrafficAction {
-    /// Show current traffic splits.
-    Show,
-    /// Set traffic splits. Example: `edge traffic set d_v1=95 d_v2=5`
-    Set {
-        /// Deployment splits as `deployment_id=weight` pairs.
-        /// Weights must sum to 100.
-        splits: Vec<String>,
-    },
+    /// Manage custom FQDNs bound to a deployment (issue #83).
+    #[command(subcommand)]
+    Domains(DomainsCommand),
 }
 
 #[derive(Subcommand)]
@@ -266,8 +303,8 @@ fn main() -> Result<()> {
         }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
-            TrafficAction::Show => commands::traffic::get(&cli.path),
-            TrafficAction::Set { splits } => {
+            commands::traffic::TrafficAction::Show => commands::traffic::get(&cli.path),
+            commands::traffic::TrafficAction::Set { splits } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
                     .filter_map(|s| {
@@ -279,6 +316,10 @@ fn main() -> Result<()> {
                 commands::traffic::set(&cli.path, &parsed)
             }
         },
+        Command::Domains(cmd) => {
+            let action: commands::domains::DomainsAction = cmd.into();
+            action.run(&cli.path)
+        }
     }
 }
 

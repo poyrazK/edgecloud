@@ -23,6 +23,10 @@ type appRepoInterface interface {
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
+	// GetForUpdate locks the (tenant, app) row with `SELECT … FOR UPDATE`.
+	// Added for the v2 quota-race fix in AddDomain (issue #83 second-pass
+	// review); the lock is held for the caller's tx lifetime.
+	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error)
 }
 
 // AppService handles app business logic.
@@ -146,6 +150,17 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 // Get returns an app by name, or nil if not found.
 func (s *AppService) Get(ctx context.Context, tenantID, appName string) (*domain.App, error) {
 	return s.appRepo.Get(ctx, tenantID, appName)
+}
+
+// GetForUpdate locks the (tenant, app) row with `SELECT … FOR UPDATE`
+// for the lifetime of the surrounding tx and returns it. Used by
+// `DomainService.AddDomain` to serialize concurrent domain inserts
+// against the same parent app so the per-app quota
+// (MaxDomainsPerApp) cannot be overshot. Pass-through to
+// `AppRepository.GetForUpdate` — the lock is held until the caller's
+// tx commits or rolls back. Returns (nil, nil) when no app exists.
+func (s *AppService) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	return s.appRepo.GetForUpdate(ctx, tenantID, appName)
 }
 
 // List returns apps for a tenant with pagination.
