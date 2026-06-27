@@ -27,6 +27,9 @@ pub struct Config {
     pub worker_addr: String,
     pub nats_url: String,
     pub control_plane_url: String,
+    /// Filesystem directory for caching downloaded wasm artifacts.
+    /// Default `/var/lib/edge-worker/cache` (absolute). Override via
+    /// `CACHE_DIR`; the override can be relative for dev runs.
     pub cache_dir: PathBuf,
     pub heartbeat_interval_secs: u64,
     pub health_check_timeout_secs: u64,
@@ -51,8 +54,20 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// Max redeliveries the NATS server will attempt for a single message
+    /// before parking it. Default 20. Tunable via `NATS_MAX_DELIVER`. A
+    /// persistently-failing message that hits this cap stalls the
+    /// consumer until an operator investigates or the worker `term()`s
+    /// it (parse failures are already terminated on receipt).
+    pub nats_max_deliver: i64,
     /// HMAC secret the worker uses to sign outbound JWTs to the control
     /// plane's internal endpoints. Must match `JWT_SECRET` on the Go side.
+    ///
+    /// **Deprecated.** New deployments should set `WORKER_BOOTSTRAP_PSK`
+    /// and let the worker self-provision a JWT on startup (Phase 4).
+    /// This field is kept as a fallback so existing deployments don't
+    /// break; main.rs logs a deprecation warning when it's the only
+    /// configured source.
     ///
     /// Optional at startup: a missing/empty value loads as `""` and main()
     /// logs a warning. With no secret, /api/internal/* calls will 401
@@ -67,6 +82,41 @@ pub struct Config {
     /// a worker is per-tenant in this design (whitepaper §9.3 calls for
     /// tenant-agnostic workers — file a follow-up to revisit).
     pub worker_tenant_id: String,
+    /// Pre-shared key the worker uses to enroll with the control plane
+    /// via `POST /api/internal/auth/token` (Phase 4). Must match
+    /// `BOOTSTRAP_PSK` on the Go side. When set, the worker self-provisions
+    /// a JWT on first `sign()` and caches it to disk at `jwt_cache_path`.
+    ///
+    /// `None` and empty-string are treated identically: "no bootstrap
+    /// configured". Priority order at startup is `jwt_cache_path` file →
+    /// `WORKER_BOOTSTRAP_PSK` → `WORKER_JWT_SECRET` (deprecated fallback).
+    pub worker_bootstrap_psk: Option<String>,
+    /// Path to the cached JWT file. The worker reads this on startup and
+    /// uses the cached token for `sign()` until it crosses the refresh
+    /// threshold (5 min before expiry). On cache miss / expiry the
+    /// worker re-bootstraps via `WORKER_BOOTSTRAP_PSK`.
+    ///
+    /// Default `/var/lib/edge-worker/jwt-cache.json` (absolute, mode
+    /// `0600`). Override via `JWT_CACHE_PATH`. The path must be writable
+    /// by the worker; a read-only mount is logged but not fatal (the
+    /// worker falls back to in-memory caching for the current boot).
+    pub jwt_cache_path: PathBuf,
+    /// Filesystem directory for the log-forwarder disk spool. Holds
+    /// `emit_log` batches that the control plane refused (5xx, network
+    /// timeout) so they can be retried on the next flush. Survives
+    /// worker restarts.
+    ///
+    /// Default `/var/lib/edge-worker/spool` (absolute). Override via
+    /// `SPOOL_DIR`. Operators must ensure the directory is writable
+    /// and persists across restarts; a tmpfs-backed dir is fine for
+    /// dev but loses the durability guarantee on reboot.
+    pub spool_dir: PathBuf,
+    /// Maximum on-disk size of the spool before the oldest batches are
+    /// dropped (FIFO) to make room for new failures. Default 1 GiB.
+    /// Override via `SPOOL_MAX_BYTES`. When the cap is exceeded during
+    /// `rotate_when_over`, the oldest lines are dropped silently and
+    /// a count is returned to the caller for logging.
+    pub spool_max_bytes: u64,
 }
 
 impl Config {
@@ -84,7 +134,7 @@ impl Config {
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
-    /// - `CACHE_DIR` (default: `.worker-cache`)
+    /// - `CACHE_DIR` (default: `/var/lib/edge-worker/cache`)
     /// - `APP_MAX_MEMORY_MB` (default: 256)
     /// - `EPOCH_TICK_MS` (default: 10)
     /// - `EPOCH_DEADLINE_TICKS` (default: 100)
@@ -92,6 +142,12 @@ impl Config {
     /// - `EDGE_CONSUMER_NAME` (default: derived from `WORKER_ID`)
     /// - `WORKER_JWT_ISSUER` (default: `edgecloud`)
     /// - `WORKER_JWT_SECRET` (default: empty — see warning in main.rs)
+    /// - `WORKER_BOOTSTRAP_PSK` (default: unset) — pre-shared key for the
+    ///   Phase 4 bootstrap handshake. When set, the worker self-provisions
+    ///   a JWT on first `sign()` and caches it to `JWT_CACHE_PATH`. Takes
+    ///   priority over `WORKER_JWT_SECRET` (the deprecated fallback).
+    /// - `JWT_CACHE_PATH` (default: `/var/lib/edge-worker/jwt-cache.json`)
+    ///   — path to the on-disk JWT cache.
     /// - `EDGE_WORKER_LOG_LEVEL` (default: `info`) — minimum level the
     ///   worker log layer ships to the control plane via `LogForwarder`.
     ///   Independent of `RUST_LOG`, which still controls local stdout
@@ -123,6 +179,7 @@ impl Config {
             queue_group: std::env::var("EDGE_QUEUE_GROUP")
                 .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
             consumer_name,
+            nats_max_deliver: parse_env_u64("NATS_MAX_DELIVER", 20)? as i64,
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             worker_addr: std::env::var("EDGE_WORKER_ADDR").context("EDGE_WORKER_ADDR not set")?,
@@ -131,7 +188,14 @@ impl Config {
                 .context("CONTROL_PLANE_URL not set")?,
             cache_dir: std::env::var("CACHE_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(".worker-cache")),
+                // Default is an absolute path. A relative default like
+                // `.worker-cache` is a footgun in containers where CWD is
+                // the image root — the worker silently writes to a path
+                // that disappears on container restart. Operators can
+                // still override with `CACHE_DIR=./local-dev` for dev
+                // runs; the absolute default just removes the silent
+                // failure mode for production-style deploys.
+                .unwrap_or_else(|_| PathBuf::from("/var/lib/edge-worker/cache")),
             heartbeat_interval_secs: 30,
             health_check_timeout_secs: std::env::var("EDGE_HEALTH_CHECK_TIMEOUT_SECS")
                 .unwrap_or_else(|_| "60".into())
@@ -147,6 +211,22 @@ impl Config {
                 .unwrap_or_else(|_| "edgecloud".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
+            worker_bootstrap_psk: parse_env_string("WORKER_BOOTSTRAP_PSK"),
+            // Absolute default matches the cache_dir / spool_dir
+            // policy: a relative default in a container silently
+            // writes to the image root and disappears on restart,
+            // defeating the cache durability guarantee.
+            jwt_cache_path: std::env::var("JWT_CACHE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/var/lib/edge-worker/jwt-cache.json")),
+            spool_dir: std::env::var("SPOOL_DIR")
+                .map(PathBuf::from)
+                // Absolute default matches the cache_dir policy: a
+                // relative default in a container silently writes to
+                // the image root and disappears on restart, defeating
+                // the durability guarantee.
+                .unwrap_or_else(|_| PathBuf::from("/var/lib/edge-worker/spool")),
+            spool_max_bytes: parse_env_u64("SPOOL_MAX_BYTES", 1 << 30)?,
         })
     }
 
@@ -188,6 +268,21 @@ fn parse_env_u64(name: &str, default: u64) -> anyhow::Result<u64> {
             .parse::<u64>()
             .with_context(|| format!("{} must be a non-negative integer (got {:?})", name, s)),
     }
+}
+
+/// Parse an optional string-valued environment variable. Returns
+/// `None` when unset or set to an empty string — both signal
+/// "this feature is not configured" and shouldn't be distinguishable
+/// at the call site (an empty `WORKER_BOOTSTRAP_PSK` would HMAC-SHA256
+/// against a zero-length key, which is technically valid but
+/// operationally identical to "not set").
+///
+/// Unlike `parse_env_u64`, this helper never errors — a malformed
+/// string value is just an empty string. We can't validate against
+/// a schema (length, charset) without coupling the config to a
+/// specific use case; validation lives at the call site.
+fn parse_env_string(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -401,5 +496,210 @@ mod tests {
         unsafe { std::env::set_var("WORKER_JWT_SECRET", "round-trip-secret") };
         let cfg = Config::from_env().expect("from_env with JWT secret");
         assert_eq!(cfg.worker_jwt_secret, "round-trip-secret");
+    }
+
+    /// The default cache directory must be absolute. A relative default
+    /// silently writes to the process's CWD — fine for dev, but in a
+    /// container that's the image root, which disappears on container
+    /// restart (artifacts are re-downloaded on every boot, defeating the
+    /// cache). Pinning the absolute default makes that failure mode
+    /// impossible without an explicit operator override.
+    #[test]
+    fn cache_dir_default_is_absolute() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("CACHE_DIR", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no CACHE_DIR");
+        assert!(
+            cfg.cache_dir.is_absolute(),
+            "default cache_dir must be absolute; got {:?}",
+            cfg.cache_dir
+        );
+    }
+
+    /// `nats_max_deliver` defaults to 20. JetStream parks a message once
+    /// it has been redelivered this many times; the operator must then
+    /// either investigate or restart the consumer. 20 is a generous
+    /// default — even a slow-failing message gets many chances before
+    /// parking. Pinning the default catches regressions where a future
+    /// refactor changes it.
+    #[test]
+    fn nats_max_deliver_default_is_20() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("NATS_MAX_DELIVER", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no NATS_MAX_DELIVER");
+        assert_eq!(
+            cfg.nats_max_deliver, 20,
+            "default nats_max_deliver must be 20; got {}",
+            cfg.nats_max_deliver
+        );
+    }
+
+    /// `spool_dir` defaults to an absolute path. Same rationale as
+    /// `cache_dir_default_is_absolute` — a relative default in a
+    /// container silently writes to the image root and the spool
+    /// disappears on restart, defeating the durability guarantee. The
+    /// test pins the absolute default so a future "fix" can't silently
+    /// make it relative without a conscious decision.
+    #[test]
+    fn spool_dir_default_is_absolute() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("SPOOL_DIR", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no SPOOL_DIR");
+        assert!(
+            cfg.spool_dir.is_absolute(),
+            "default spool_dir must be absolute; got {:?}",
+            cfg.spool_dir
+        );
+    }
+
+    /// `spool_max_bytes` defaults to 1 GiB. At 1 GiB the spool holds
+    /// ~1M small log batches before the oldest are dropped — well
+    /// beyond any plausible outage window (a 5-day control-plane
+    /// outage at 100 entries/s would produce ~43M entries; the cap
+    /// drops the oldest). Pinning the default catches regressions
+    /// where a future refactor changes the cap.
+    #[test]
+    fn spool_max_bytes_default_is_1_gib() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("SPOOL_MAX_BYTES", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no SPOOL_MAX_BYTES");
+        assert_eq!(
+            cfg.spool_max_bytes,
+            1u64 << 30,
+            "default spool_max_bytes must be 1 GiB ({}); got {}",
+            1u64 << 30,
+            cfg.spool_max_bytes
+        );
+    }
+
+    /// `SPOOL_MAX_BYTES` round-trips through `from_env` like every other
+    /// env var. Without this test the env-var knob could regress to
+    /// "always use the default" without the unit tests catching it.
+    #[test]
+    fn spool_max_bytes_parses_override() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("SPOOL_MAX_BYTES", Some("536870912")), // 512 MiB
+        ]);
+        let cfg = Config::from_env().expect("from_env with SPOOL_MAX_BYTES=512MiB");
+        assert_eq!(
+            cfg.spool_max_bytes,
+            512 * 1024 * 1024,
+            "SPOOL_MAX_BYTES override should be 512 MiB"
+        );
+    }
+
+    /// `WORKER_BOOTSTRAP_PSK` defaults to `None`. The whole point of
+    /// the bootstrap path is being opt-in: a worker without a PSK must
+    /// still start (with the deprecation warning + 401s on outbound
+    /// calls) so existing deployments upgrade without downtime.
+    #[test]
+    fn worker_bootstrap_psk_defaults_to_none() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("WORKER_BOOTSTRAP_PSK", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no PSK");
+        assert!(
+            cfg.worker_bootstrap_psk.is_none(),
+            "missing WORKER_BOOTSTRAP_PSK must load as None"
+        );
+    }
+
+    /// `WORKER_BOOTSTRAP_PSK=hello` must flow through into the config
+    /// field. The string is the PSK bytes as-is — the bootstrap layer
+    /// computes HMAC-SHA256 over them.
+    #[test]
+    fn worker_bootstrap_psk_round_trips() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("WORKER_BOOTSTRAP_PSK", Some("my-32-byte-secret-psk-12345")),
+        ]);
+        let cfg = Config::from_env().expect("from_env with PSK");
+        assert_eq!(
+            cfg.worker_bootstrap_psk.as_deref(),
+            Some("my-32-byte-secret-psk-12345")
+        );
+    }
+
+    /// `WORKER_BOOTSTRAP_PSK=` (empty) is treated identically to
+    /// unset. An operator who briefly clears the env var during a
+    /// rotation would otherwise get an HMAC computation against a
+    /// zero-length key — same outcome as "not set" but with a
+    /// different code path that's harder to debug.
+    #[test]
+    fn worker_bootstrap_psk_empty_string_is_none() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("WORKER_BOOTSTRAP_PSK", Some("")),
+        ]);
+        let cfg = Config::from_env().expect("from_env with empty PSK");
+        assert!(
+            cfg.worker_bootstrap_psk.is_none(),
+            "empty WORKER_BOOTSTRAP_PSK must load as None"
+        );
+    }
+
+    /// `jwt_cache_path` defaults to an absolute path. Same rationale
+    /// as `cache_dir_default_is_absolute`: a relative default silently
+    /// writes to CWD and disappears on container restart. The cache
+    /// holds a 24h JWT — losing it on every restart forces a
+    /// re-bootstrap on every boot, defeating the durability goal.
+    #[test]
+    fn jwt_cache_path_default_is_absolute() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("JWT_CACHE_PATH", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with no JWT_CACHE_PATH");
+        assert!(
+            cfg.jwt_cache_path.is_absolute(),
+            "default jwt_cache_path must be absolute; got {:?}",
+            cfg.jwt_cache_path
+        );
     }
 }

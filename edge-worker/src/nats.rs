@@ -45,11 +45,19 @@ pub trait NatsClient: Send + Sync + 'static {
     /// a stable name (typically derived from `worker_id`) so that on restart
     /// they resume from their last ack position rather than re-processing
     /// the entire stream.
+    ///
+    /// `max_deliver` bounds the number of redeliveries the server will
+    /// attempt before stopping delivery of a poison-pill message. Set high
+    /// enough that transient failures (e.g., slow artifact download) have
+    /// room to recover; set low enough that a stuck message doesn't park
+    /// the consumer. Today the worker calls `term()` on parse failures so
+    /// this is a belt-and-suspenders limit. Default in `Config` is 20.
     async fn subscribe_tasks(
         &self,
         region: &str,
         queue_group: &str,
         consumer_name: &str,
+        max_deliver: i64,
     ) -> anyhow::Result<TaskMessageStream>;
 
     /// Acknowledge successful processing of a task message.
@@ -107,6 +115,7 @@ impl NatsClient for NatsClientImpl {
         region: &str,
         queue_group: &str,
         consumer_name: &str,
+        max_deliver: i64,
     ) -> anyhow::Result<TaskMessageStream> {
         // Idempotent — works whether or not the control plane already
         // created the stream.
@@ -133,10 +142,12 @@ impl NatsClient for NatsClientImpl {
             // Bound re-deliveries so a persistently-failing message can't
             // dead-letter the whole consumer. After this many redeliveries
             // the server stops sending the message and the worker is
-            // expected to `term()` it. Set high enough that transient
-            // failures (e.g., slow artifact download) have room to recover
-            // before the consumer stalls.
-            max_deliver: 20,
+            // expected to `term()` it. Configurable via
+            // `NATS_MAX_DELIVER` (default 20). The previous hardcoded
+            // value was 20; this knob exists so operators can tighten it
+            // for tenants with tight SLOs or loosen it for noisy
+            // deployments.
+            max_deliver,
             ..Default::default()
         };
         let consumer: jetstream::consumer::PushConsumer = stream
