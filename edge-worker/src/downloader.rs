@@ -76,7 +76,10 @@ impl Downloader {
             "{}/api/internal/download/{}",
             self.control_plane_url, deployment_id
         );
-        let token = self.jwt_signer.sign();
+        let token = self
+            .jwt_signer
+            .sign()
+            .context("signing JWT for outbound request")?;
         tracing::info!(url, "downloading artifact");
 
         let response = self

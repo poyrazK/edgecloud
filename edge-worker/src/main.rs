@@ -1,6 +1,7 @@
 //! edge-worker — Worker Supervisor entry point.
 
 mod auth;
+mod bootstrap;
 mod config;
 mod downloader;
 mod log_forwarder;
@@ -20,9 +21,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+use edge_spool::Spool;
 use edge_worker::tracing_layer::WorkerLogLayer;
 
 use crate::auth::WorkerJwtSigner;
+use crate::bootstrap::JwtBundle;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -42,38 +45,146 @@ async fn main() -> anyhow::Result<()> {
     // Initialize JWT signer — signs outbound calls to the control plane's
     // /api/internal/* endpoints. Worker is per-tenant in this design; the
     // JWT carries the worker's tenant_id claim.
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
+    //
+    // Provisioning priority (Phase 4):
+    //   1. Disk cache (`JWT_CACHE_PATH`) — if the cached JWT is still
+    //      fresh, seed the signer without contacting the control plane.
+    //   2. Bootstrap (`WORKER_BOOTSTRAP_PSK`) — on first `sign()`, fetch
+    //      a JWT via `POST /api/internal/auth/token` and cache it.
+    //   3. Legacy secret (`WORKER_JWT_SECRET`) — deprecated fallback so
+    //      existing deployments keep working. Surfaces a deprecation
+    //      warning so operators see it.
+    //   4. No source configured — signer constructed with a callback
+    //      that always errors; every outbound call returns 401. A
+    //      startup warning makes the missing-config visible.
+    let bootstrap_psk = config.worker_bootstrap_psk.clone();
+    let bootstrap_control_plane_url = config.control_plane_url.clone();
+    let bootstrap_worker_id = config.worker_id.clone();
+    let bootstrap_region = config.region.clone();
+    let bootstrap_tenant_id = config.worker_tenant_id.clone();
+    let bootstrap_cache_path = config.jwt_cache_path.clone();
+    let issuer = config.worker_jwt_issuer.clone();
+    let jwt_signer = match bootstrap::load_from_disk(&config.jwt_cache_path).await {
+        Ok(Some(cached)) => {
+            // Try to seed from disk; with_seeded_token drops expired
+            // caches and falls through to the bootstrap path on the
+            // next `sign()`.
+            let bundle = JwtBundle {
+                token: cached.token,
+                expires_at_unix: cached.expires_at_unix,
+            };
+            tracing::info!(
+                path = %config.jwt_cache_path.display(),
+                expires_at_unix = bundle.expires_at_unix,
+                "jwt_signer: seeded from disk cache"
+            );
+            WorkerJwtSigner::new_with_callback(
+                issuer.clone(),
+                config.worker_id.clone(),
+                config.region.clone(),
+                config.worker_tenant_id.clone(),
+                make_bootstrap_callback(
+                    bootstrap_control_plane_url.clone(),
+                    bootstrap_psk.clone(),
+                    bootstrap_worker_id.clone(),
+                    bootstrap_region.clone(),
+                    bootstrap_tenant_id.clone(),
+                    bootstrap_cache_path.clone(),
+                ),
+            )
+            .with_seeded_token(bundle)
+        }
+        Ok(None) | Err(_) => {
+            // Either no cache file, or the cache was unreadable /
+            // corrupt. The corrupt-cache path is logged inside
+            // `load_from_disk`; we just fall through to the bootstrap
+            // path (or the env fallback).
+            if let Some(psk) = &bootstrap_psk {
+                tracing::info!("jwt_signer: no disk cache; will bootstrap via PSK on first sign()");
+                WorkerJwtSigner::new_with_callback(
+                    issuer.clone(),
+                    config.worker_id.clone(),
+                    config.region.clone(),
+                    config.worker_tenant_id.clone(),
+                    make_bootstrap_callback(
+                        bootstrap_control_plane_url.clone(),
+                        Some(psk.clone()),
+                        bootstrap_worker_id.clone(),
+                        bootstrap_region.clone(),
+                        bootstrap_tenant_id.clone(),
+                        bootstrap_cache_path.clone(),
+                    ),
+                )
+            } else if !config.worker_jwt_secret.is_empty() {
+                tracing::warn!(
+                    "WORKER_JWT_SECRET is set but WORKER_BOOTSTRAP_PSK is not; \
+                     the secret is deprecated. Migrate to WORKER_BOOTSTRAP_PSK \
+                     so the worker can self-provision a per-boot JWT."
+                );
+                #[allow(deprecated)]
+                WorkerJwtSigner::new(
+                    config.worker_jwt_secret.clone(),
+                    issuer.clone(),
+                    config.worker_id.clone(),
+                    config.region.clone(),
+                    config.worker_tenant_id.clone(),
+                )
+            } else {
+                tracing::warn!(
+                    "No JWT source configured (neither WORKER_BOOTSTRAP_PSK nor \
+                     WORKER_JWT_SECRET is set, and no cached JWT exists); \
+                     /api/internal/* calls will return 401 until provisioning \
+                     is fixed. NATS heartbeats and the deployment supervisor \
+                     keep running."
+                );
+                // Construct a signer with a callback that always errors
+                // so every `sign()` returns Err and the downloader /
+                // log forwarder can log the failure cleanly instead of
+                // panicking.
+                WorkerJwtSigner::new_with_callback(
+                    issuer.clone(),
+                    config.worker_id.clone(),
+                    config.region.clone(),
+                    config.worker_tenant_id.clone(),
+                    || {
+                        Err(anyhow::anyhow!(
+                            "no JWT source configured: set WORKER_BOOTSTRAP_PSK \
+                             or WORKER_JWT_SECRET"
+                        ))
+                    },
+                )
+            }
+        }
+    };
 
     // Initialize LogForwarder — receives tenant `emit_log` records from the
     // runtime AND worker-side `tracing` events via WorkerLogLayer. One per
     // worker; per-app AppLogContext travels with each guest record.
+    //
+    // The disk spool must be opened before the LogForwarder is
+    // constructed, because the constructor drains any pending batches
+    // (from a previous worker's crash or a control-plane outage).
+    // Failing to open the spool is a hard error — a worker that can't
+    // durably forward logs shouldn't start, since silent data loss is
+    // worse than a refused boot.
+    let spool = Arc::new(Spool::open(&config.spool_dir).await.map_err(|e| {
+        anyhow::anyhow!("opening log spool at {}: {e}", config.spool_dir.display())
+    })?);
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
         jwt_signer.clone(),
-    );
+        spool,
+        config.spool_max_bytes,
+    )
+    .await;
 
-    // Without a JWT secret the worker can still run — NATS heartbeats and
-    // the deployment supervisor don't need it — but every outbound call
-    // to /api/internal/* will 401 until the secret is provisioned. Warn
-    // loudly so an operator notices instead of discovering it from a
-    // silent drop in log forwarding. A real fix needs a JWT bootstrap
-    // handshake (see follow-up issue D).
-    if config.worker_jwt_secret.is_empty() {
-        tracing::warn!(
-            "WORKER_JWT_SECRET is not set; /api/internal/* calls will return 401 \
-             until the secret is provisioned. NATS heartbeats and the deployment \
-             supervisor keep running — only the log forwarder and downloader are \
-             affected. See follow-up issue D for the bootstrap handshake."
-        );
-    }
+    // The warnings above (deprecation + no-source) replace the old
+    // "WORKER_JWT_SECRET is not set" message: with Phase 4 the
+    // no-secret state is the "no source configured" case, and the
+    // secret case is the "deprecated fallback" case. The combined
+    // messaging keeps the visibility operators had before.
 
     // Initialize tracing. The Registry stack is:
     //   - EnvFilter (RUST_LOG-controlled; default info)
@@ -297,6 +408,68 @@ enum DrainOutcome {
     Clean,
     Panic,
     Timeout,
+}
+
+/// Build the closure that the `WorkerJwtSigner` invokes on cache miss
+/// during the bootstrap path. The closure:
+///   1. POSTs to the control plane's `POST /api/internal/auth/token`
+///      with the PSK-derived HMAC signature.
+///   2. Persists the resulting bundle to the JWT cache file so the
+///      next restart skips the round trip.
+///   3. Returns the bundle to the signer for caching in memory.
+///
+/// Returns a `'static + Send + Sync` closure suitable for
+/// `WorkerJwtSigner::new_with_callback`. We clone the captured
+/// `String`s so the closure owns them — `config` is dropped when
+/// `main` returns, well before any `sign()` call would happen.
+fn make_bootstrap_callback(
+    control_plane_url: String,
+    psk: Option<String>,
+    worker_id: String,
+    region: String,
+    tenant_id: String,
+    cache_path: std::path::PathBuf,
+) -> impl Fn() -> anyhow::Result<JwtBundle> + Send + Sync + 'static {
+    move || {
+        let psk = match &psk {
+            Some(s) => s.as_bytes().to_vec(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "bootstrap callback invoked but WORKER_BOOTSTRAP_PSK is unset"
+                ));
+            }
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))?;
+        // We're in a sync closure (the signer calls `sign()` outside
+        // an await point), but the bootstrap is async. Bridge via
+        // tokio's block_on — only the signer's slow path takes this
+        // hit, and only on cache miss (every REFRESH_LEAD, ~24h).
+        let bundle = tokio::runtime::Handle::current().block_on(bootstrap::fetch_token(
+            &control_plane_url,
+            &client,
+            &psk,
+            &worker_id,
+            &region,
+            &tenant_id,
+        ))?;
+        // Best-effort cache write. A failure here is logged but not
+        // fatal — the in-memory bundle is still valid for the rest
+        // of this boot.
+        if let Err(e) = tokio::runtime::Handle::current()
+            .block_on(bootstrap::save_to_disk(&cache_path, &bundle))
+        {
+            tracing::warn!(
+                err = %e,
+                path = %cache_path.display(),
+                "jwt_signer: failed to persist bootstrap bundle to disk; \
+                 next restart will re-bootstrap"
+            );
+        }
+        Ok(bundle)
+    }
 }
 
 /// drain_logs_task waits up to `timeout` for `logs_task` to finish. Pulled
