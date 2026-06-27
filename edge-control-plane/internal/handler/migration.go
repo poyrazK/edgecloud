@@ -18,12 +18,14 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
-// Tree upload limits.
+// Migrate upload limits (shared by single-file /api/migrate and
+// multi-file /api/migrate-tree).
 const (
-	// maxTreeBodyBytes is the hard cap on the request body for
-	// POST /api/migrate-tree. Larger bodies are rejected mid-stream
-	// by http.MaxBytesReader.
-	maxTreeBodyBytes int64 = 50 << 20 // 50 MiB
+	// maxMigrateBodyBytes is the hard cap on the request body for
+	// both POST /api/migrate (single-file) and POST /api/migrate-tree
+	// (tree uploads). Larger bodies are rejected mid-stream by
+	// http.MaxBytesReader.
+	maxMigrateBodyBytes int64 = 50 << 20 // 50 MiB
 	// maxTreeFiles is the cap on the number of files in a single tree
 	// upload. Larger trees are rejected with 400.
 	maxTreeFiles = 256
@@ -85,9 +87,9 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	// single-file Migrate path previously only relied on
 	// ParseMultipartForm's "max memory" hint, which doesn't cap the
 	// underlying body read.
-	r.Body = http.MaxBytesReader(w, r.Body, maxTreeBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxMigrateBodyBytes)
 
-	if err := r.ParseMultipartForm(maxTreeBodyBytes); err != nil {
+	if err := r.ParseMultipartForm(maxMigrateBodyBytes); err != nil {
 		// MaxBytesReader returns *http.MaxBytesError once the cap is
 		// hit. Detect via errors.As so we don't string-match the
 		// error message.
@@ -188,9 +190,9 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 
 	// Cap the request body up front so a malicious caller can't pin
 	// a 10 GB upload mid-stream.
-	r.Body = http.MaxBytesReader(w, r.Body, maxTreeBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxMigrateBodyBytes)
 
-	if err := r.ParseMultipartForm(maxTreeBodyBytes); err != nil {
+	if err := r.ParseMultipartForm(maxMigrateBodyBytes); err != nil {
 		// MaxBytesReader returns *http.MaxBytesError once the cap is
 		// hit. Detect via errors.As so we don't string-match the
 		// error message.
@@ -227,7 +229,7 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 	var entries []domain.FileEntry
 	if len(treeFiles) > 0 {
 		// Variant B: zip.
-		e, err := readZipEntries(treeFiles[0], maxTreeFiles, maxTreeBodyBytes)
+		e, err := readZipEntries(treeFiles[0], maxTreeFiles, maxMigrateBodyBytes)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusBadRequest)
 			return

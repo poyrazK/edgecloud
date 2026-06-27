@@ -550,26 +550,29 @@ func itoa(i int) string {
 func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
 	h := NewMigrationHandler(svc)
-	// Build a valid multipart body that's over the cap. We use a
-	// single large file part padded past maxTreeBodyBytes.
-	body := &bytes.Buffer{}
-	w := multipart.NewWriter(body)
-	_ = w.WriteField("app_name", "hello")
-	_ = w.WriteField("language", "c")
-	_ = w.WriteField("tree", `{"files":["main.c"]}`)
-	fw, _ := w.CreateFormFile("file", "main.c")
-	padding := make([]byte, maxTreeBodyBytes+1024)
-	for i := range padding {
-		padding[i] = 'a'
-	}
-	if _, err := fw.Write(padding); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+// Build a valid multipart body that's over the cap, but stream
+	// it through io.Pipe + zeroReader so we never allocate the full
+	// ~50 MiB up front. The multipart envelope (form fields + part
+	// headers + trailing boundary) writes eagerly into the pipe;
+	// the file-part payload streams from io.LimitReader, so the
+	// server hits MaxBytesReader mid-stream and returns 413 before
+	// we ever fill more than ~32 KiB of pipe buffer.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = mw.WriteField("app_name", "hello")
+		_ = mw.WriteField("language", "c")
+		_ = mw.WriteField("tree", `{"files":["main.c"]}`)
+		fw, _ := mw.CreateFormFile("file", "main.c")
+		_, _ = io.Copy(fw, io.LimitReader(zeroReader{}, maxMigrateBodyBytes+1024))
+		_ = mw.Close()
+	}()
+	req := httptest.NewRequest("POST", "/api/migrate-tree", pr)
+	// FormDataContentType() must be called in the main goroutine
+	// BEFORE the goroutine writes (boundary is set lazily on first
+	// WriteField).
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
 	h.MigrateTree(rr, req)
@@ -836,32 +839,33 @@ func TestMigrateTree_ZipSlip(t *testing.T) {
 }
 
 // TestMigrate_RejectsOversizedBody verifies that the single-file
-// Migrate handler caps the request body at maxTreeBodyBytes (50 MiB)
-// via http.MaxBytesReader. A multipart body that exceeds the cap
-// returns 413, before the migration service is ever called.
+// Migrate handler caps the request body at maxMigrateBodyBytes
+// (50 MiB) via http.MaxBytesReader. A multipart body that exceeds
+// the cap returns 413, before the migration service is ever called.
 //
 // Pre-fix this parsed the multipart form with a 50 MiB "max memory"
 // hint that didn't actually cap the underlying body read; the
 // service-layer cap was too late. Now the handler wraps the body
 // with MaxBytesReader up front.
+//
+// The body is streamed via io.Pipe + zeroReader rather than
+// allocated eagerly — see TestMigrateTree_RejectsOversizedBody for
+// the streaming pattern's rationale.
 func TestMigrate_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
 	h := NewMigrationHandler(svc)
-	// Build a valid multipart body that's over the cap. We use a
-	// single large file part padded past maxTreeBodyBytes.
-	body := &bytes.Buffer{}
-	w := multipart.NewWriter(body)
-	_ = w.WriteField("filename", "hello.c")
-	_ = w.WriteField("language", "c")
-	fw, _ := w.CreateFormFile("file", "hello.c")
-	padding := make([]byte, maxTreeBodyBytes+1024)
-	for i := range padding {
-		padding[i] = 'a'
-	}
-	fw.Write(padding)
-	w.Close()
-	req := httptest.NewRequest("POST", "/api/migrate", body)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = mw.WriteField("filename", "hello.c")
+		_ = mw.WriteField("language", "c")
+		fw, _ := mw.CreateFormFile("file", "hello.c")
+		_, _ = io.Copy(fw, io.LimitReader(zeroReader{}, maxMigrateBodyBytes+1024))
+		_ = mw.Close()
+	}()
+	req := httptest.NewRequest("POST", "/api/migrate", pr)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
 	h.Migrate(rr, req)
