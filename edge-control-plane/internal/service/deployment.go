@@ -81,7 +81,12 @@ func IsValidRegion(r string) bool {
 }
 
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
-const MaxArtifactSize = 100 * 1024 * 1024
+//
+// The canonical constant lives in internal/storage so the read-side cap
+// (used by ArtifactStore.Open) and the upload-side cap (used by the
+// migration handler) stay colocated. This alias preserves the existing
+// in-package reference for upload-side callers.
+const MaxArtifactSize = storage.MaxArtifactSize
 
 // MaxRegionsPerDeployment caps the number of regions a single deployment
 // can target. Defensive ceiling against fan-out abuse; realistic tenants
@@ -630,14 +635,28 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	// happened, and the operator would rather see the structured
 	// 502 envelope than a misleading 500 caused by an audit-log
 	// write failing.
-	if len(published) > 0 {
-		if err := s.activeRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
-			log.Printf("warning: persisting regions_published for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
-		}
-	}
-	if len(failed) > 0 {
-		if err := s.activeRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
-			log.Printf("warning: persisting regions_failed for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
+	//
+	// Both appends share one tx so the row's (regions_published,
+	// regions_failed, last_publish_at, last_publish_attempt_id) stay
+	// consistent even if the process crashes mid-write. Within the
+	// closure, returning the first error aborts the tx and Rollback
+	// discards the first append — the desired atomicity.
+	if len(published) > 0 || len(failed) > 0 {
+		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+			txRepo := s.activeRepo.WithTx(tx)
+			if len(published) > 0 {
+				if err := txRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_published: %w", err)
+				}
+			}
+			if len(failed) > 0 {
+				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_failed: %w", err)
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Printf("warning: persisting publish state for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
 		}
 	}
 
