@@ -41,7 +41,7 @@ func NewBootstrapHandler(minter *service.WorkerJWTMinter) *BootstrapHandler {
 //
 //	X-Worker-Id:             w_fra_abc123
 //	X-Worker-Region:         fra
-//	X-Bootstrap-Signature:   hex(HMAC-SHA256(psk, "{worker_id}:{region}"))
+//	X-Bootstrap-Signature:   hex(HMAC-SHA256(psk, "{worker_id}:{region}:{tenant_id}"))
 //
 // Response body (200):
 //
@@ -52,21 +52,23 @@ func NewBootstrapHandler(minter *service.WorkerJWTMinter) *BootstrapHandler {
 //	}
 //
 // Failure modes:
-//   - 400 BAD_REQUEST — missing/empty fields in the body; body
-//     disagrees with the headers (defense-in-depth: an attacker who
-//     forges a header signature can't pivot to minting a token for
-//     a different worker by editing the body).
+//   - 400 BAD_REQUEST — handled by PSKAuth (missing headers, malformed
+//     JSON, missing fields, identity format violation). The signature
+//     payload includes tenant_id (finding A1), so a forged body
+//     tenant_id cannot pass signature verification.
 //   - 500 INTERNAL_ERROR — `minter.Mint` failure (e.g. HMAC key
 //     zero-length, which would be a config bug caught at startup
 //     but guarded here defensively).
 func (h *BootstrapHandler) MintToken(w http.ResponseWriter, r *http.Request) {
 	// PSKAuth has already validated the signature and placed
-	// worker_id + region into the request context. Reading them
-	// from the context (not the body) is the source of truth — the
-	// body is allowed to disagree, but doing so returns 400.
-	signedWorkerID := middleware.GetBootstrapWorkerID(r.Context())
-	signedRegion := middleware.GetBootstrapRegion(r.Context())
-	if signedWorkerID == "" || signedRegion == "" {
+	// worker_id + region + tenant_id into the request context.
+	// Reading them from the context (not the body) is the source of
+	// truth — the body is allowed to disagree, but doing so returns
+	// 400 in PSKAuth before reaching this handler.
+	workerID := middleware.GetBootstrapWorkerID(r.Context())
+	region := middleware.GetBootstrapRegion(r.Context())
+	tenantID := middleware.GetBootstrapTenantID(r.Context())
+	if workerID == "" || region == "" || tenantID == "" {
 		// PSKAuth should have populated these; if not, the route
 		// was wired wrong (e.g. handler reached without
 		// middleware). Surface as a 500 because it's a server
@@ -75,29 +77,7 @@ func (h *BootstrapHandler) MintToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
-		WorkerID string `json:"worker_id"`
-		Region   string `json:"region"`
-		TenantID string `json:"tenant_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httperror.BadRequestCtx(w, r, "invalid JSON body")
-		return
-	}
-	if body.WorkerID == "" || body.Region == "" || body.TenantID == "" {
-		httperror.BadRequestCtx(w, r, "worker_id, region, and tenant_id are required")
-		return
-	}
-	if body.WorkerID != signedWorkerID || body.Region != signedRegion {
-		// Body / header mismatch: an attacker who somehow obtained
-		// a valid signature for one worker is trying to mint a
-		// token for another. Reject before the minter sees the
-		// inputs.
-		httperror.BadRequestCtx(w, r, "body worker_id or region does not match signed headers")
-		return
-	}
-
-	token, exp, err := h.minter.Mint(body.WorkerID, body.TenantID, body.Region)
+	token, exp, err := h.minter.Mint(workerID, tenantID, region)
 	if err != nil {
 		// Logging here would be the caller's job (the handler
 		// returns 500 with a generic message; the server log
