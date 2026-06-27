@@ -1,10 +1,9 @@
 //! App state tracking for running instances.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use edge_runtime::RequestMeter;
-use tokio::sync::Mutex;
+use edge_runtime::{MetricsAccumulator, RequestMeter};
 use wasmtime::component::InstancePre;
 use wasmtime::Engine;
 
@@ -32,6 +31,11 @@ pub struct AppInstance {
     pub port: u16,
     pub status: AppInstanceStatus,
     pub meter: Arc<RequestMeter>,
+    /// Shared metrics accumulator. Written by the Observer inside
+    /// RuntimeState on every `edge:observe` counter/gauge/histogram call;
+    /// read by `build_heartbeat` to produce the `observer_metrics` field
+    /// shipped to the control plane.
+    pub metrics: Arc<MetricsAccumulator>,
     /// Channel to signal graceful shutdown to the app task. Wrapped in Option so
     /// it can be taken out of the locked struct to call send().
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -51,9 +55,11 @@ pub struct AppInstance {
 /// Apps are stored behind Arc<Mutex<>> so individual fields can be mutated
 /// (e.g., status update to Crashed) without replacing the Arc entry.
 pub struct WorkerState {
-    /// Currently running app instances: app_name -> AppInstance (Arc-wrapped for
+    /// Currently running app instances: (app_name, deployment_id) -> AppInstance (Arc-wrapped for
     /// cheap clone, with Mutex for interior mutability of status/fields).
-    pub apps: HashMap<String, Arc<Mutex<AppInstance>>>,
+    /// The composite key allows multiple deployment IDs for the same app_name
+    /// to run concurrently (canary/blue-green).
+    pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
 }

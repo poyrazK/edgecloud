@@ -220,9 +220,9 @@ async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_s
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
-        if let Some(inst) = state.apps.get(app_name) {
-            let inst = inst.lock().await;
-            if matches!(inst.status, AppInstanceStatus::Running) {
+        for inst in state.apps.values() {
+            let inst = inst.lock().unwrap();
+            if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
                 return true;
             }
         }
@@ -236,7 +236,11 @@ async fn wait_for_app_gone(supervisor: &Supervisor, app_name: &str, timeout_secs
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
-        if !state.apps.contains_key(app_name) {
+        let gone = !state.apps.values().any(|inst| {
+            let inst = inst.lock().unwrap();
+            inst.app_name == app_name
+        });
+        if gone {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -271,6 +275,7 @@ async fn test_app_lifecycle() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
 
     let msg = TaskMessage::TaskUpdate {
@@ -292,13 +297,14 @@ async fn test_app_lifecycle() {
         "app should be Running within 10s (check NATS connectivity and component compilation)"
     );
 
-    // Step 3: heartbeat should include the app
+    // Step 3: heartbeat should include the app (keyed by app_name:deployment_id)
     let heartbeat = harness.supervisor.build_heartbeat().await;
+    let hb_key = "test-app:d_deploy_001";
     assert!(
-        heartbeat.apps.contains_key("test-app"),
-        "heartbeat should contain test-app"
+        heartbeat.apps.contains_key(hb_key),
+        "heartbeat should contain {hb_key}"
     );
-    let app_status = heartbeat.apps.get("test-app").unwrap();
+    let app_status = heartbeat.apps.get(hb_key).unwrap();
     assert_eq!(
         app_status.status, "running",
         "app status should be 'running'"
@@ -452,6 +458,7 @@ async fn test_stop_all_apps() {
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
+            routes: None,
         };
         let msg = TaskMessage::TaskUpdate {
             timestamp: "2026-06-15T00:00:00Z".to_string(),
@@ -594,6 +601,7 @@ async fn test_artifact_hash_match_starts_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -645,6 +653,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let bad_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -660,7 +669,9 @@ async fn test_artifact_hash_mismatch_rejects_app() {
     {
         let state = harness.supervisor.state.read().await;
         assert!(
-            !state.apps.contains_key("bad-hash-app"),
+            !state
+                .apps
+                .contains_key(&("bad-hash-app".to_string(), "d_hash_bad".to_string())),
             "tampered-hash app must NOT be registered"
         );
     }
@@ -674,6 +685,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let good_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:01Z".to_string(),
@@ -735,6 +747,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -800,6 +813,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -814,7 +828,10 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state.apps.contains_key("cache-dbl-bad-app"),
+        !state.apps.contains_key(&(
+            "cache-dbl-bad-app".to_string(),
+            "d_cache_dbl_bad".to_string()
+        )),
         "app must NOT be registered when both cache and fresh download fail verification"
     );
     drop(state);
@@ -848,6 +865,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -862,7 +880,9 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state.apps.contains_key("download-500-app"),
+        !state
+            .apps
+            .contains_key(&("download-500-app".to_string(), "d_download_500".to_string())),
         "app must NOT be registered when the control plane returns 500"
     );
     drop(state);
@@ -1009,9 +1029,9 @@ async fn wait_for_either_app_running(
     while tokio::time::Instant::now() < deadline {
         for (i, sup) in supervisors.iter().enumerate() {
             let state = sup.state.read().await;
-            if let Some(inst) = state.apps.get(app_name) {
-                let inst = inst.lock().await;
-                if matches!(inst.status, AppInstanceStatus::Running) {
+            for inst in state.apps.values() {
+                let inst = inst.lock().unwrap();
+                if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
                     return Some(i);
                 }
             }
@@ -1101,6 +1121,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     let spec = AppSpec {
         deployment_id: "d_log_emit".to_string(),
         deployment_hash: test_component_hash(),
+        routes: None,
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
@@ -1284,6 +1305,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-26T00:00:00Z".to_string(),

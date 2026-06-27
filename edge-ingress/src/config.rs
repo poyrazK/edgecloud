@@ -27,6 +27,15 @@ pub struct Config {
     pub refresh_debounce_ms: u64,
     pub http_to_https: bool,
     pub admin_token: Option<String>,
+    pub control_plane_api_url: String,
+    /// Shared secret presented in `X-Internal-Token` when fetching traffic
+    /// splits from the control plane. Must match the control plane's
+    /// `EDGE_INTERNAL_TOKEN`; otherwise the control plane's
+    /// `internalAuth` middleware returns 401 and the Caddy weights
+    /// never get applied (canary/blue-green silently no-ops). `None`
+    /// means the header is omitted — which the control plane treats
+    /// as a 401, so a production deployment must set this.
+    pub internal_token: Option<String>,
 }
 
 impl Config {
@@ -45,6 +54,8 @@ impl Config {
     /// - `CADDY_ADMIN_TOKEN` (if set, must match the value on the Caddy process)
     /// - `REFRESH_DEBOUNCE_MS` (default: `1000`)
     /// - `HTTP_TO_HTTPS` (default: `true`) — 308-redirect :80 → :443
+    /// - `CONTROL_PLANE_API_URL` (default: `http://localhost:8080`) — used
+    ///   by the ingress to fetch canary traffic splits at render time
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Config {
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
@@ -63,6 +74,11 @@ impl Config {
                 .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
                 .unwrap_or(true),
             admin_token: std::env::var("CADDY_ADMIN_TOKEN")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            control_plane_api_url: std::env::var("CONTROL_PLANE_API_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
+            internal_token: std::env::var("EDGE_INTERNAL_TOKEN")
                 .ok()
                 .filter(|v| !v.is_empty()),
         })

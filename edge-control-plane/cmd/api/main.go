@@ -79,6 +79,7 @@ func main() {
 	appEnvRepo := repository.NewAppEnvRepository(db)
 	appRepo := repository.NewAppRepository(db)
 	workerRepo := repository.NewWorkerRepository(db)
+	trafficSplitRepo := repository.NewTrafficSplitRepository(db)
 	logEntryRepo := repository.NewLogEntryRepository(db)
 
 	// Initialize NATS publisher
@@ -115,25 +116,29 @@ func main() {
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
-	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv())
+	metricsAgg := service.NewMetricsAggregator()
+	workerSvc := service.NewWorkerService(workerRepo, quotaRepo, activeDeploymentRepo, publisher.Conn(), stableWindowFromEnv(), metricsAgg)
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
+	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
 	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, logEntryRepo)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+	trafficHandler := handler.NewTrafficHandler(trafficSvc)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
 	workerStatusHandler := handler.NewWorkerStatusHandler(workerSvc)
+	metricsHandler := handler.NewMetricsHandler(metricsAgg)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -142,6 +147,10 @@ func main() {
 
 	// Setup router
 	mux := http.NewServeMux()
+
+	// Global Prometheus metrics scrape endpoint — unauthenticated, intended for
+	// internal operator access only. Do not expose this path on the public LB.
+	mux.HandleFunc("GET /metrics", metricsHandler.GetAllMetrics)
 
 	// Health check
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -264,11 +273,14 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
 	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
+	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
+	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
 	api.HandleFunc("GET /api/v1/apps/{appName}/logs", logHandler.List)
+	api.HandleFunc("GET /api/v1/metrics", metricsHandler.GetTenantMetrics)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
@@ -288,6 +300,17 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 
 	mux.Handle("/api/v1/", apiWithAuth)
 	mux.Handle("/api/v1/admin/", apiWithOwner)
+
+	// Service-to-service read endpoint that the edge-ingress polls to
+	// apply Caddy weights for canary/blue-green traffic splits. Registered
+	// on the parent mux with a more specific pattern than the /api/v1/
+	// catch-all so Go 1.22's longest-match rule routes the request here
+	// rather than into apiWithAuth (where an unauthenticated ingress
+	// would 401 and the canary split would never reach Caddy).
+	mux.Handle(
+		"GET /api/v1/internal/traffic/{tenantID}/{appName}",
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)),
+	)
 
 	// Internal endpoints (worker-facing, JWT auth)
 	// Workers consume the latest contract; these paths are intentionally unversioned.

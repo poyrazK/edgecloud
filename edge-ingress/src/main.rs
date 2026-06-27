@@ -8,9 +8,10 @@
 
 mod caddy;
 mod config;
-mod heartbeats;
+pub mod heartbeats;
 mod messages;
 mod routing;
+pub mod traffic;
 
 use std::process::ExitCode;
 use std::sync::Arc;

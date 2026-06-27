@@ -891,6 +891,23 @@ paths:
   # -------------------------------------------------------------------------
   # Public
   # -------------------------------------------------------------------------
+  /metrics:
+    get:
+      operationId: getAllMetrics
+      summary: Prometheus metrics scrape endpoint (all tenants)
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for all tenants.
+        Unauthenticated — intended for internal operator/Prometheus scrape access
+        only. Do not expose on the public load balancer.
+      security: []
+      responses:
+        '200':
+          description: Prometheus text-format metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /health:
     get:
       operationId: health
@@ -1196,12 +1213,21 @@ paths:
   /api/v1/apps/{appName}/activate/{deploymentID}:
     post:
       operationId: activateDeployment
-      summary: Activate a specific deployment as the live version
+      summary: Activate a deployment, optionally as a canary
       description: |
         Publishes a task update over NATS JetStream so subscribed workers
-        start serving the specified deployment. Only one deployment per app
-        can be active at a time — activating a new one replaces the current
-        live deployment atomically.
+        start serving the specified deployment.
+
+        When `?weight=100` (default): atomically replaces the live deployment —
+        all traffic switches to the new version.
+
+        When `?weight=N` (0 < N < 100): activates the deployment as a canary
+        at N% traffic. The currently active deployment absorbs the remaining
+        (100-N)% so traffic always sums to 100. Both deployments run
+        concurrently on workers.
+
+        Use `PUT /api/v1/apps/{appName}/traffic` for full control over
+        weighted routing between multiple deployments.
       parameters:
         - name: appName
           in: path
@@ -1214,9 +1240,19 @@ paths:
           required: true
           schema:
             type: string
+        - name: weight
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+          description: |
+            Traffic weight for this deployment (0–100). Omit or use 100 for
+            atomic cutover. Values 0–99 trigger canary mode.
       responses:
         '200':
-          description: Deployment activated.
+          description: Deployment activated (or traffic split set for canary).
           content:
             application/json:
               schema:
@@ -1400,6 +1436,100 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppWorkerStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Traffic Splits
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/traffic:
+    get:
+      operationId: getTrafficSplits
+      summary: Get the current traffic split configuration for an app
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Traffic split configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  app_name:
+                    type: string
+                    example: my-app
+                  splits:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        deployment_id:
+                          type: string
+                          example: d_abc123
+                        weight:
+                          type: integer
+                        created_at:
+                          type: string
+                          format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: setTrafficSplits
+      summary: Set the traffic split configuration for an app (canary/blue-green)
+      description: |
+        Atomically sets the traffic split for an app. Sum of weights must equal 100.
+        Publishes a task update to workers so they start all deployments concurrently.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [splits]
+              properties:
+                splits:
+                  type: array
+                  items:
+                    type: object
+                    required: [deployment_id, weight]
+                    properties:
+                      deployment_id:
+                        type: string
+                        example: d_abc123
+                      weight:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+      responses:
+        '200':
+          description: Traffic split configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: traffic_set
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -1720,6 +1850,24 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  /api/v1/metrics:
+    get:
+      operationId: getTenantMetrics
+      summary: Prometheus metrics for the authenticated tenant
+      description: |
+        Returns Prometheus text-format (0.0.4) metrics for the calling tenant only.
+        Includes request counts, outbound bytes, and any guest-emitted counters,
+        gauges, and histogram samples from `edge:observe`.
+      responses:
+        '200':
+          description: Prometheus text-format metrics for this tenant
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   # -------------------------------------------------------------------------
   # Admin: Tenants

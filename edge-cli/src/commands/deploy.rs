@@ -107,7 +107,7 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    client.activate(&app_name, deployment_id)?;
+    client.activate(&app_name, deployment_id, None)?;
 
     // Capture the URL we'll print BEFORE `state` is moved into the save
     // block below. The save only mutates `deployment_id`, so the URL we
