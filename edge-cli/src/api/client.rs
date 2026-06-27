@@ -356,6 +356,22 @@ impl ApiClient {
         self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
     }
 
+    /// GET `/api/v1/apps/{appName}/status` with anyhow-typed errors.
+    /// The same endpoint as [`Self::get_app_status`], but routes through
+    /// `get_json_anyhow` so 4xx/5xx surfaces as `runtime status failed:
+    /// {status} {body}` — HTTP status and body in the top frame, not
+    /// buried in a `Caused by:` chain.
+    ///
+    /// Used by `edge status runtime` where the user explicitly asked
+    /// for the data and a 404/401/500 should be diagnostically useful.
+    /// `edge logs` continues to use `get_app_status` because its hint
+    /// path silently swallows failures (logs are the primary goal).
+    pub fn app_status(&self, app_name: &str) -> Result<AppWorkerStatus> {
+        self.get_json_anyhow("runtime status", |base| {
+            format!("{base}/api/v1/apps/{app_name}/status")
+        })
+    }
+
     pub(crate) fn http(&self) -> &Client {
         &self.http
     }

@@ -122,8 +122,17 @@ enum Command {
         auto_rollback: bool,
     },
 
-    /// Get deployment status.
-    Status,
+    /// Inspect runtime and deployment status.
+    ///
+    /// `runtime` surfaces the worker-reported status (running /
+    /// starting / stopping / crashed / hung / unknown). `deployment`
+    /// (default for the no-arg form) is the legacy DB-row view.
+    /// The subcommand is optional so bare `edge status` keeps
+    /// working as a backward-compat alias for `edge status deployment`.
+    Status {
+        #[command(subcommand)]
+        action: Option<StatusAction>,
+    },
 
     /// Set an environment variable.
     EnvSet {
@@ -234,6 +243,27 @@ enum Command {
     Domains(DomainsCommand),
 }
 
+#[derive(Subcommand)]
+enum StatusAction {
+    /// Show the worker-reported runtime status of an app.
+    ///
+    /// Surfaces `running` | `starting` | `stopping` | `crashed` |
+    /// `hung` | `unknown`, plus the region / worker_id /
+    /// `last_heartbeat` and (for `crashed`) the worker's exit code.
+    /// Hits `GET /api/v1/apps/{appName}/status`; no server-side
+    /// filtering of stale heartbeats — the `last_heartbeat` field
+    /// is surfaced verbatim so users can decide.
+    Runtime {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+    },
+    /// Show the deployment-row status (DB-side: deployed / active /
+    /// failed / migrated). Equivalent to the legacy `edge status`
+    /// form for backward compatibility.
+    Deployment,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -246,7 +276,10 @@ fn main() -> Result<()> {
             regions,
             auto_rollback,
         } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
-        Command::Status => commands::status::run(&cli.path),
+        Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
+            StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
+            StatusAction::Deployment => commands::status::run(&cli.path),
+        },
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
         Command::Activate {
