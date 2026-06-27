@@ -227,12 +227,11 @@ enum Command {
     /// Get or set traffic splits for canary/blue-green deployments.
     Traffic {
         #[command(subcommand)]
-        action: TrafficAction,
+        action: commands::traffic::TrafficAction,
     },
     /// Manage custom FQDNs bound to a deployment (issue #83).
     #[command(subcommand)]
     Domains(DomainsCommand),
-
 }
 
 fn main() -> Result<()> {
@@ -271,8 +270,8 @@ fn main() -> Result<()> {
         }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
-            TrafficAction::Show => commands::traffic::get(&cli.path),
-            TrafficAction::Set { splits } => {
+            commands::traffic::TrafficAction::Show => commands::traffic::get(&cli.path),
+            commands::traffic::TrafficAction::Set { splits } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
                     .filter_map(|s| {
@@ -288,7 +287,6 @@ fn main() -> Result<()> {
             let action: commands::domains::DomainsAction = cmd.into();
             action.run(&cli.path)
         }
-
     }
 }
 
