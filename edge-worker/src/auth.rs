@@ -10,12 +10,31 @@
 //! refreshed when within 5 minutes of expiry. This keeps signing off the
 //! hot path of every HTTP request while staying well ahead of the clock
 //! skew between worker and control plane.
+//!
+//! Two ways to provision the signing secret (Phase 4):
+//!
+//! - **Static** (legacy / fallback): a fixed `Vec<u8>` shared with the
+//!   control plane via the `WORKER_JWT_SECRET` env var. Used for the
+//!   deprecation fallback so existing deployments keep working.
+//! - **Callback** (recommended): the signer holds an
+//!   `Arc<dyn Fn() -> Result<JwtBundle>>` that, on cache miss, calls
+//!   `bootstrap::fetch_token` against the control plane's
+//!   `POST /api/internal/auth/token` endpoint and returns a fresh JWT.
+//!   Production workers (Phase 4) use this path; the cached bundle also
+//!   persists to disk via `bootstrap::save_to_disk` so a restart skips
+//!   re-bootstrapping as long as the JWT is still fresh.
+//!
+//! `sign()` returns `anyhow::Result<String>` rather than `String` because
+//! the callback path can fail (network error, server 401). Callers
+//! (Downloader, LogForwarder) propagate the error via `?`.
 
 use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+use crate::bootstrap::{self, JwtBundle};
 
 /// How long before the cached token's `exp` we re-sign. 5 minutes is well
 /// above typical NTP drift and gives a comfortable margin if a request
@@ -47,6 +66,21 @@ pub struct WorkerClaims {
     pub apps: Vec<String>,
 }
 
+/// Where the signing material comes from. The two variants correspond to
+/// the two provisioning paths described in the module-level doc comment.
+pub enum TokenSource {
+    /// Fixed secret (the legacy `WORKER_JWT_SECRET` path). New code
+    /// should use `Callback` instead — Phase 4 keeps this variant for
+    /// the deprecation fallback so existing deployments don't break.
+    Static(Vec<u8>),
+    /// Lazy callback invoked on cache miss. The callback is expected to
+    /// produce a fresh `JwtBundle` from the control plane's bootstrap
+    /// endpoint. Holding an `Arc<dyn Fn>` rather than the bundle itself
+    /// lets the signer re-bootstrap on cache expiry without needing a
+    /// `&mut self` API at the call sites.
+    Callback(Arc<dyn Fn() -> anyhow::Result<JwtBundle> + Send + Sync>),
+}
+
 /// Thread-safe JWT signer with token caching.
 ///
 /// `sign()` returns the same token for repeated calls as long as the cached
@@ -54,7 +88,7 @@ pub struct WorkerClaims {
 /// for the read/write of the (token, expires_at) tuple — JWT encoding
 /// (potentially expensive) happens outside the lock.
 pub struct WorkerJwtSigner {
-    secret: Vec<u8>,
+    source: TokenSource,
     issuer: String,
     worker_id: String,
     region: String,
@@ -71,6 +105,17 @@ struct CachedToken {
 }
 
 impl WorkerJwtSigner {
+    /// Legacy constructor: signs with a fixed secret loaded from the
+    /// `WORKER_JWT_SECRET` env var. **Deprecated** in Phase 4 — new
+    /// code should use `new_with_callback` and the bootstrap path.
+    /// The `#[cfg_attr(not(test), deprecated)]` attribute keeps every
+    /// existing test-only call site (5 in `auth.rs::tests` +
+    /// `edge-test-helpers/src/supervisor.rs`) warning-free while still
+    /// surfacing the deprecation in production builds.
+    #[cfg_attr(
+        not(test),
+        deprecated(note = "use new_with_callback for bootstrap support")
+    )]
     pub fn new(
         secret: impl Into<Vec<u8>>,
         issuer: impl Into<String>,
@@ -78,20 +123,90 @@ impl WorkerJwtSigner {
         region: impl Into<String>,
         tenant_id: impl Into<String>,
     ) -> Arc<Self> {
+        Self::from_source(
+            TokenSource::Static(secret.into()),
+            issuer.into(),
+            worker_id.into(),
+            region.into(),
+            tenant_id.into(),
+        )
+    }
+
+    /// Production constructor (Phase 4): the signer invokes `fetch` on
+    /// every cache miss. `fetch` is expected to call
+    /// `bootstrap::fetch_token` against the control plane's
+    /// `POST /api/internal/auth/token` endpoint and return a fresh
+    /// `JwtBundle`. The callback's `Arc` lets multiple signers (or a
+    /// signer + a separate caller) share one closure without cloning
+    /// the captured environment.
+    pub fn new_with_callback<F>(
+        issuer: impl Into<String>,
+        worker_id: impl Into<String>,
+        region: impl Into<String>,
+        tenant_id: impl Into<String>,
+        fetch: F,
+    ) -> Arc<Self>
+    where
+        F: Fn() -> anyhow::Result<JwtBundle> + Send + Sync + 'static,
+    {
+        Self::from_source(
+            TokenSource::Callback(Arc::new(fetch)),
+            issuer.into(),
+            worker_id.into(),
+            region.into(),
+            tenant_id.into(),
+        )
+    }
+
+    fn from_source(
+        source: TokenSource,
+        issuer: String,
+        worker_id: String,
+        region: String,
+        tenant_id: String,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            secret: secret.into(),
-            issuer: issuer.into(),
-            worker_id: worker_id.into(),
-            region: region.into(),
-            tenant_id: tenant_id.into(),
+            source,
+            issuer,
+            worker_id,
+            region,
+            tenant_id,
             ttl: DEFAULT_TTL,
             cache: Mutex::new(None),
         })
     }
 
+    /// Seed the cache from a JWT bundle loaded at startup (typically
+    /// from `bootstrap::load_from_disk`). The first `sign()` returns
+    /// the seeded token without invoking the callback; only after
+    /// expiry does the signer re-bootstrap.
+    pub fn with_seeded_token(self: Arc<Self>, bundle: JwtBundle) -> Arc<Self> {
+        let Some(expires_at) = bootstrap::derive_expires_at_instant(bundle.expires_at_unix) else {
+            // Already expired — don't seed. The next sign() will fall
+            // through to the callback path.
+            return self;
+        };
+        // Scope the lock guard so it's dropped before we move `self`
+        // back to the caller; otherwise the MutexGuard outlives the
+        // Arc clone we hand back (E0505).
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            *cache = Some(CachedToken {
+                token: bundle.token,
+                expires_at,
+            });
+        }
+        self
+    }
+
     /// Returns a current bearer token. Returns the cached value if it is
-    /// still fresh; otherwise encodes a fresh one and updates the cache.
-    pub fn sign(&self) -> String {
+    /// still fresh; otherwise re-encodes (Static) or re-bootstraps
+    /// (Callback) and updates the cache.
+    ///
+    /// Returns `Err` if the callback path fails (network error, server
+    /// 401). Callers should propagate; the Downloader / LogForwarder
+    /// path turns this into an HTTP error.
+    pub fn sign(&self) -> anyhow::Result<String> {
         let now = Instant::now();
 
         // Fast path: cached token is still fresh (more than REFRESH_LEAD
@@ -102,21 +217,37 @@ impl WorkerJwtSigner {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ct) = cache.as_ref() {
                 if ct.expires_at.saturating_duration_since(now) > REFRESH_LEAD {
-                    return ct.token.clone();
+                    return Ok(ct.token.clone());
                 }
             }
         }
 
-        // Slow path: encode a fresh token outside the lock, then swap it in.
-        let token = self.encode();
-        let expires_at = now + self.ttl;
+        // Slow path: acquire a fresh token. Two sources:
+        //   - Static:  encode with the fixed secret (no I/O).
+        //   - Callback: invoke the closure, then store the bundle's
+        //     token + expiry. Errors propagate.
+        let (token, expires_at) = match &self.source {
+            TokenSource::Static(_secret) => {
+                let token = self.encode()?;
+                let expires_at = now + self.ttl;
+                (token, expires_at)
+            }
+            TokenSource::Callback(fetch) => {
+                let bundle = fetch()?;
+                let token: String = bundle.token;
+                let expires_at = bootstrap::derive_expires_at_instant(bundle.expires_at_unix)
+                    .unwrap_or(now + self.ttl);
+                (token, expires_at)
+            }
+        };
 
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         *cache = Some(CachedToken {
             token: token.clone(),
             expires_at,
         });
-        token
+        drop(cache);
+        Ok(token)
     }
 
     /// Force the next `sign()` to re-encode. Useful in tests that want to
@@ -127,7 +258,7 @@ impl WorkerJwtSigner {
         *cache = None;
     }
 
-    fn encode(&self) -> String {
+    fn encode(&self) -> anyhow::Result<String> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -144,12 +275,24 @@ impl WorkerJwtSigner {
             apps: Vec::new(),
         };
 
-        encode(
+        // The Static variant is the only path that uses `self.secret`
+        // — extracted here so the Callback path doesn't borrow it.
+        let secret = match &self.source {
+            TokenSource::Static(s) => s.as_slice(),
+            TokenSource::Callback(_) => {
+                return Err(anyhow::anyhow!(
+                    "WorkerJwtSigner::encode called on Callback-backed signer; \
+                     use the callback path instead"
+                ));
+            }
+        };
+
+        Ok(encode(
             &Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(&self.secret),
+            &EncodingKey::from_secret(secret),
         )
-        .expect("HS256 signing should not fail")
+        .expect("HS256 signing should not fail"))
     }
 }
 
@@ -201,7 +344,9 @@ pub fn verify_for_test_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::JwtBundle;
 
+    #[allow(deprecated)]
     fn signer() -> Arc<WorkerJwtSigner> {
         WorkerJwtSigner::new(
             "test-secret",
@@ -215,7 +360,7 @@ mod tests {
     #[test]
     fn sign_produces_a_token() {
         let s = signer();
-        let t = s.sign();
+        let t = s.sign().expect("sign");
         assert!(!t.is_empty());
         // A JWT has 3 dot-separated segments.
         assert_eq!(t.matches('.').count(), 2);
@@ -224,8 +369,8 @@ mod tests {
     #[test]
     fn sign_is_deterministic_while_cached() {
         let s = signer();
-        let t1 = s.sign();
-        let t2 = s.sign();
+        let t1 = s.sign().expect("sign1");
+        let t2 = s.sign().expect("sign2");
         assert_eq!(
             t1, t2,
             "second sign() within cache window must return same token"
@@ -235,9 +380,9 @@ mod tests {
     #[test]
     fn sign_refreshes_after_cache_invalidated() {
         let s = signer();
-        let t1 = s.sign();
+        let t1 = s.sign().expect("sign1");
         s.expire_cache_for_test();
-        let t2 = s.sign();
+        let t2 = s.sign().expect("sign2");
         assert_ne!(
             t1, t2,
             "after expire_cache_for_test() the next token must be fresh"
@@ -247,7 +392,7 @@ mod tests {
     #[test]
     fn signed_token_parses_with_correct_claims() {
         let s = signer();
-        let t = s.sign();
+        let t = s.sign().expect("sign");
         let claims =
             verify_for_test_only(b"test-secret", "edgecloud", &t).expect("verify should succeed");
         assert_eq!(claims.iss, "edgecloud");
@@ -265,7 +410,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_secret() {
         let s = signer();
-        let t = s.sign();
+        let t = s.sign().expect("sign");
         assert!(verify_for_test_only(b"wrong-secret", "edgecloud", &t).is_err());
     }
 
@@ -276,7 +421,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_issuer() {
         let s = signer(); // mints with iss = "edgecloud"
-        let t = s.sign();
+        let t = s.sign().expect("sign");
         let err = verify_for_test_only(b"test-secret", "some-other-issuer", &t)
             .expect_err("verify with wrong expected_iss must fail");
         assert!(
@@ -285,5 +430,116 @@ mod tests {
             "error should mention issuer, got: {}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Callback-path tests (Phase 4)
+    // -----------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn far_future_unix() -> u64 {
+        // 2099-01-01 — far enough in the future that any reasonable test
+        // execution time can't push it past expiry.
+        4_070_448_000
+    }
+
+    /// Builds a `new_with_callback` signer whose callback increments a
+    /// shared counter on every call and returns a fixed bundle. Tests
+    /// assert the counter to verify the cache short-circuited the
+    /// callback.
+    fn callback_signer(counter: Arc<AtomicU32>) -> Arc<WorkerJwtSigner> {
+        WorkerJwtSigner::new_with_callback(
+            "edgecloud",
+            "w_fra_abc123",
+            "fra",
+            "t_tenant1",
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(JwtBundle {
+                    token: format!("callback-token-{}", counter.load(Ordering::SeqCst)),
+                    expires_at_unix: far_future_unix(),
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn new_with_callback_uses_callback_on_first_sign() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let t = s.sign().expect("sign");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(t, "callback-token-1");
+    }
+
+    #[test]
+    fn new_with_callback_uses_cached_token_on_second_sign() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let t1 = s.sign().expect("sign1");
+        let t2 = s.sign().expect("sign2");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "callback must fire once");
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn new_with_callback_refreshes_after_cache_invalidated() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let _ = s.sign().expect("sign1");
+        s.expire_cache_for_test();
+        let _ = s.sign().expect("sign2");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn new_with_callback_propagates_callback_error() {
+        let s = WorkerJwtSigner::new_with_callback(
+            "edgecloud",
+            "w_fra_abc123",
+            "fra",
+            "t_tenant1",
+            || Err(anyhow::anyhow!("synthetic bootstrap failure")),
+        );
+        let err = s.sign().expect_err("must error on callback failure");
+        assert!(err.to_string().contains("synthetic bootstrap failure"));
+    }
+
+    #[test]
+    fn with_seeded_token_skips_callback_on_first_sign() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let bundle = JwtBundle {
+            token: "seeded-token".to_string(),
+            expires_at_unix: far_future_unix(),
+        };
+        let s = s.with_seeded_token(bundle);
+        let t = s.sign().expect("sign");
+        assert_eq!(t, "seeded-token");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "callback must NOT fire when seeded bundle is fresh"
+        );
+    }
+
+    #[test]
+    fn with_seeded_token_does_not_seed_when_expired() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let s = callback_signer(counter.clone());
+        let bundle = JwtBundle {
+            token: "expired-token".to_string(),
+            // 1970 — long expired.
+            expires_at_unix: 1_000,
+        };
+        let s = s.with_seeded_token(bundle);
+        let t = s.sign().expect("sign");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "expired seed must not stick; callback must fire"
+        );
+        assert_eq!(t, "callback-token-1");
     }
 }
