@@ -4,8 +4,8 @@
 //! worker:
 //! 1. Reads its `WORKER_BOOTSTRAP_PSK` (a secret shared between worker
 //!    fleet and control plane, loaded from a secrets manager).
-//! 2. Computes `HMAC-SHA256(psk, "{worker_id}:{region}")` and sends it in
-//!    the `X-Bootstrap-Signature` header.
+//! 2. Computes `HMAC-SHA256(psk, "{worker_id}:{region}:{tenant_id}")` and
+//!    sends it in the `X-Bootstrap-Signature` header.
 //! 3. Receives a signed JWT (`{token, expires_at_unix}`) and caches it on
 //!    disk at `Config::jwt_cache_path` (default
 //!    `/var/lib/edge-worker/jwt-cache.json`, mode `0600`).
@@ -41,7 +41,10 @@ use sha2::Sha256;
 /// - `X-Worker-Id: <worker_id>` matches `body.worker_id`
 /// - `X-Worker-Region: <region>` matches `body.region`
 /// - `X-Bootstrap-Signature: <hex>` matches
-///   `hex(HMAC-SHA256(psk, "{worker_id}:{region}"))`
+///   `hex(HMAC-SHA256(psk, "{worker_id}:{region}:{tenant_id}"))` — the
+///   `tenant_id` is bound into the signed payload so an attacker who
+///   captures a valid signature for tenant A cannot replay it to mint
+///   a JWT for tenant B (finding A1).
 ///
 /// The body carries `tenant_id` because the worker already knows which
 /// tenant it serves (from `WORKER_TENANT_ID`); the server populates the
@@ -130,21 +133,31 @@ fn is_fresh(expires_at: Instant) -> bool {
     expires_at.saturating_duration_since(Instant::now()) > Duration::from_secs(5 * 60)
 }
 
-/// Compute `HMAC-SHA256(psk, "{worker_id}:{region}")` and return the
-/// 64-char lowercase hex digest.
+/// Compute `HMAC-SHA256(psk, "{worker_id}:{region}:{tenant_id}")` and
+/// return the 64-char lowercase hex digest.
 ///
-/// The signed string is `"{worker_id}:{region}"` (colon-separated, no
-/// surrounding whitespace). This is a simple canonical form: worker_id
-/// already validates against the format `^w_[a-z0-9_]+$` server-side
-/// and region against `^[a-z]{3,16}$`, so the canonical string can't
-/// contain a colon or be confused with another worker. Adding a nonce
-/// or timestamp is a follow-up; for MVP the 24h JWT TTL bounds replay.
-pub fn sign_with_psk(psk: &[u8], worker_id: &str, region: &str) -> String {
+/// The signed string is `"{worker_id}:{region}:{tenant_id}"`
+/// (colon-separated, no surrounding whitespace). This is a simple
+/// canonical form: worker_id already validates against the format
+/// `^w_[a-z0-9_]+$` server-side and region against `^[a-z]{3,16}$`,
+/// so the canonical string can't contain a colon or be confused with
+/// another worker. Adding a nonce or timestamp is a follow-up; for MVP
+/// the 24h JWT TTL bounds replay.
+///
+/// **Tenant binding (finding A1):** the canonical payload includes
+/// `tenant_id` so an attacker who captures one valid
+/// `X-Bootstrap-Signature` cannot replay it to mint a JWT for a
+/// different tenant. Without `tenant_id` in the payload, the attacker
+/// could submit any body tenant_id and the server would mint a JWT
+/// for that tenant.
+pub fn sign_with_psk(psk: &[u8], worker_id: &str, region: &str, tenant_id: &str) -> String {
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(psk).expect("HMAC-SHA256 accepts any key length");
     mac.update(worker_id.as_bytes());
     mac.update(b":");
     mac.update(region.as_bytes());
+    mac.update(b":");
+    mac.update(tenant_id.as_bytes());
     let tag = mac.finalize().into_bytes();
     hex::encode(tag)
 }
@@ -246,7 +259,7 @@ pub async fn fetch_token(
     region: &str,
     tenant_id: &str,
 ) -> Result<JwtBundle> {
-    let signature = sign_with_psk(psk, worker_id, region);
+    let signature = sign_with_psk(psk, worker_id, region, tenant_id);
     let url = format!("{}/api/internal/auth/token", control_plane_url);
     let body = BootstrapRequest {
         worker_id: worker_id.to_string(),
@@ -292,12 +305,13 @@ mod tests {
         // Vector computed with python:
         //   import hmac, hashlib
         //   hmac.new(b"0123456789abcdef0123456789abcdef",
-        //            b"w_fra_abc123:fra", hashlib.sha256).hexdigest()
+        //            b"w_fra_abc123:fra:t_tenant1", hashlib.sha256).hexdigest()
         // The exact value isn't important — what matters is determinism
         // and stability against an accidental algorithm change. If this
         // test breaks, check whether the input format or the algorithm
-        // drifted.
-        let sig = sign_with_psk(TEST_PSK, "w_fra_abc123", "fra");
+        // drifted. The payload was extended to include `tenant_id` in
+        // finding A1.
+        let sig = sign_with_psk(TEST_PSK, "w_fra_abc123", "fra", "t_tenant1");
         assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
         assert!(
             sig.chars()
@@ -305,33 +319,53 @@ mod tests {
             "signature must be lowercase hex"
         );
         // Determinism: same input -> same output.
-        assert_eq!(sig, sign_with_psk(TEST_PSK, "w_fra_abc123", "fra"));
+        assert_eq!(
+            sig,
+            sign_with_psk(TEST_PSK, "w_fra_abc123", "fra", "t_tenant1")
+        );
     }
 
     #[test]
     fn sign_with_psk_differs_when_worker_id_changes() {
-        let a = sign_with_psk(TEST_PSK, "w_fra_aaa", "fra");
-        let b = sign_with_psk(TEST_PSK, "w_fra_bbb", "fra");
+        let a = sign_with_psk(TEST_PSK, "w_fra_aaa", "fra", "t_tenant1");
+        let b = sign_with_psk(TEST_PSK, "w_fra_bbb", "fra", "t_tenant1");
         assert_ne!(a, b, "different worker_id must yield different signature");
     }
 
     #[test]
     fn sign_with_psk_differs_when_region_changes() {
-        let a = sign_with_psk(TEST_PSK, "w_fra_abc", "fra");
-        let b = sign_with_psk(TEST_PSK, "w_fra_abc", "nyc");
+        let a = sign_with_psk(TEST_PSK, "w_fra_abc", "fra", "t_tenant1");
+        let b = sign_with_psk(TEST_PSK, "w_fra_abc", "nyc", "t_tenant1");
         assert_ne!(a, b, "different region must yield different signature");
+    }
+
+    /// Regression for finding A1: the canonical payload must include
+    /// `tenant_id` so a signature captured for one tenant cannot be
+    /// replayed against another. Without `tenant_id` in the payload,
+    /// an attacker who captured `X-Bootstrap-Signature` for tenant A
+    /// could POST a body with `"tenant_id":"t_victim"` and the server
+    /// would mint a JWT for the victim.
+    #[test]
+    fn sign_with_psk_differs_when_tenant_id_changes() {
+        let a = sign_with_psk(TEST_PSK, "w_fra_abc", "fra", "t_alice");
+        let b = sign_with_psk(TEST_PSK, "w_fra_abc", "fra", "t_victim");
+        assert_ne!(
+            a, b,
+            "different tenant_id must yield different signature \
+             (otherwise A1 tenant-pivot is possible)"
+        );
     }
 
     #[test]
     fn sign_with_psk_differs_when_psk_changes() {
-        let a = sign_with_psk(b"psk-one-00000000000000000000000", "w", "r");
-        let b = sign_with_psk(b"psk-two-00000000000000000000000", "w", "r");
+        let a = sign_with_psk(b"psk-one-00000000000000000000000", "w", "r", "t");
+        let b = sign_with_psk(b"psk-two-00000000000000000000000", "w", "r", "t");
         assert_ne!(a, b, "different PSK must yield different signature");
     }
 
     #[test]
     fn sign_with_psk_uses_lowercase_hex() {
-        let sig = sign_with_psk(TEST_PSK, "w_fra_abc", "fra");
+        let sig = sign_with_psk(TEST_PSK, "w_fra_abc", "fra", "t_tenant1");
         assert_eq!(sig.to_lowercase(), sig, "must be lowercase hex");
     }
 
@@ -458,7 +492,7 @@ mod tests {
             .and(header("X-Worker-Region", "fra"))
             .and(header(
                 "X-Bootstrap-Signature",
-                sign_with_psk(TEST_PSK, "w_fra_abc", "fra"),
+                sign_with_psk(TEST_PSK, "w_fra_abc", "fra", "t_tenant1"),
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": "eyJ.fake.jwt",
