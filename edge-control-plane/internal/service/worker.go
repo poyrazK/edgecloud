@@ -167,7 +167,9 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				sub.Unsubscribe()
+				if err := sub.Unsubscribe(); err != nil {
+					log.Printf("SubscribeHeartbeats: failed to unsubscribe: %v", err)
+				}
 				close(ch)
 				return
 			case msg := <-ch:

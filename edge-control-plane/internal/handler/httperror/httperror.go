@@ -3,6 +3,7 @@ package httperror
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 )
 
@@ -36,7 +37,9 @@ type ErrorDetail struct {
 func write(w http.ResponseWriter, code ErrorCode, message string, httpStatus int, requestID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: ErrorDetail{Code: code, Message: message, RequestID: requestID}})
+	if err := json.NewEncoder(w).Encode(ErrorResponse{Error: ErrorDetail{Code: code, Message: message, RequestID: requestID}}); err != nil {
+		log.Printf("httperror: failed to encode error response: %v", err)
+	}
 }
 
 // requestIDKey is the context key for the request ID. It must match the

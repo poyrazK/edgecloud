@@ -104,5 +104,5 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, egressResponse{Allowlist: req.Allowlist})
+	writeJSON(w, http.StatusOK, egressResponse(req))
 }

@@ -114,7 +114,11 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
-	defer srcFile.Close()
+	defer func() {
+		if err := srcFile.Close(); err != nil {
+			log.Printf("MigrateFile: failed to close uploaded file: %v", err)
+		}
+	}()
 
 	source, err := io.ReadAll(srcFile)
 	if err != nil {
@@ -292,7 +296,9 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 			// the cap" vs "exceeded the cap" without reading the
 			// whole oversized blob into memory.
 			body, err := io.ReadAll(io.LimitReader(src, maxPartBytes+1))
-			src.Close()
+			if closeErr := src.Close(); closeErr != nil {
+				log.Printf("MigrateTree: failed to close file part: %v", closeErr)
+			}
 			if err != nil {
 				http.Error(w, `{"error":"failed to read file part"}`, http.StatusInternalServerError)
 				return
@@ -333,11 +339,6 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// multipartFilePart is intentionally a thin alias of
-// *multipart.FileHeader. Kept as a named type so the call sites read
-// naturally and the handler tests can substitute a stub.
-type multipartFilePart = multipart.FileHeader
-
 // readZipEntries opens the uploaded zip, validates each entry name
 // (zip-slip protection), and returns the supported source files as
 // FileEntry slices. The accepted extensions live in `treeUploadExts`
@@ -348,7 +349,11 @@ func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) (
 	if err != nil {
 		return nil, fmt.Errorf("opening zip part: %w", err)
 	}
-	defer src.Close()
+	defer func() {
+		if closeErr := src.Close(); closeErr != nil {
+			log.Printf("readZipEntries: failed to close file: %v", closeErr)
+		}
+	}()
 
 	zr, err := zip.NewReader(src, header.Size)
 	if err != nil {
@@ -381,7 +386,9 @@ func readZipEntries(header *multipart.FileHeader, maxFiles int, maxBody int64) (
 		// against a single zip-bomb entry consuming the whole
 		// budget before we ever reach the total check.
 		body, err := io.ReadAll(io.LimitReader(rc, maxPartBytes+1))
-		rc.Close()
+		if closeErr := rc.Close(); closeErr != nil {
+			return nil, fmt.Errorf("closing zip entry %q: %w", f.Name, closeErr)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("reading zip entry %q: %w", f.Name, err)
 		}

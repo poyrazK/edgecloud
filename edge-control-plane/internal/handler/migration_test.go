@@ -128,7 +128,9 @@ func TestMigrationHandler_Migrate_MissingFile(t *testing.T) {
 	if err := writer.WriteField("language", "c"); err != nil {
 		t.Fatalf("WriteField: %v", err)
 	}
-	writer.Close()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close(): %v", err)
+	}
 
 	req := httptest.NewRequest("POST", "/api/migrate", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -186,7 +188,9 @@ func TestMigrationHandler_Migrate_RejectsUnknownLanguage(t *testing.T) {
 	if err := writer.WriteField("language", "python"); err != nil {
 		t.Fatalf("WriteField: %v", err)
 	}
-	writer.Close()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close(): %v", err)
+	}
 
 	req := httptest.NewRequest("POST", "/api/migrate", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -350,8 +354,12 @@ func TestMigrateTree_RejectsMissingAppName(t *testing.T) {
 	_ = w.WriteField("language", "c")
 	_ = w.WriteField("tree", `{"files":["main.c"]}`)
 	fw, _ := w.CreateFormFile("file", "main.c")
-	fw.Write([]byte("x"))
-	w.Close()
+	if _, err := fw.Write([]byte("x")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req = withTenantID(req, "t_1")
@@ -531,8 +539,12 @@ func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	for i := range padding {
 		padding[i] = 'a'
 	}
-	fw.Write(padding)
-	w.Close()
+	if _, err := fw.Write(padding); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	req := httptest.NewRequest("POST", "/api/migrate-tree", body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req = withTenantID(req, "t_1")

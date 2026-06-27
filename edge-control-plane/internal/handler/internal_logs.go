@@ -101,7 +101,11 @@ func (h *InternalHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
 	// Cap request body before decoding. MaxBytesReader returns a
 	// *http.MaxBytesError when the (N+1)-th read past the cap is attempted.
 	r.Body = http.MaxBytesReader(w, r.Body, MaxLogBatchSize)
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			log.Printf("IngestLogs: failed to close request body: %v", err)
+		}
+	}()
 
 	var req IngestLogsRequest
 	// Lenient decode: unknown fields are accepted so a future worker struct

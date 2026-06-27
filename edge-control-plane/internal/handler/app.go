@@ -55,7 +55,9 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(app)
+	if err := json.NewEncoder(w).Encode(app); err != nil {
+		log.Printf("Create app: failed to encode response: %v", err)
+	}
 }
 
 // List handles GET /api/apps — list all apps for the tenant with pagination.
@@ -83,7 +85,9 @@ func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset})
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset}); err != nil {
+		log.Printf("List apps: failed to encode response: %v", err)
+	}
 }
 
 // Get handles GET /api/apps/{appName} — get a specific app.
@@ -108,7 +112,9 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(app)
+	if err := json.NewEncoder(w).Encode(app); err != nil {
+		log.Printf("Get app: failed to encode response: %v", err)
+	}
 }
 
 // Delete handles DELETE /api/apps/{appName} — delete an app and all its data.

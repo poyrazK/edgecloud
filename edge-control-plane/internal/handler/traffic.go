@@ -49,7 +49,9 @@ func (h *TrafficHandler) SetTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"})
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"}); err != nil {
+		log.Printf("SetTraffic: failed to encode response: %v", err)
+	}
 }
 
 // GetTraffic handles GET /api/v1/apps/{appName}/traffic.
@@ -68,10 +70,12 @@ func (h *TrafficHandler) GetTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"app_name": appName,
 		"splits":   splits,
-	})
+	}); err != nil {
+		log.Printf("GetTraffic: failed to encode response: %v", err)
+	}
 }
 
 // GetTrafficInternal handles GET /api/v1/internal/traffic/{tenantID}/{appName}.
@@ -108,8 +112,10 @@ func (h *TrafficHandler) GetTrafficInternal(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"app_name": appName,
 		"splits":   splits,
-	})
+	}); err != nil {
+		log.Printf("GetTrafficInternal: failed to encode response: %v", err)
+	}
 }

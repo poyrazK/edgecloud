@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -26,7 +27,9 @@ func NewMetricsHandler(agg *service.MetricsAggregator) *MetricsHandler {
 func (h *MetricsHandler) GetAllMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(h.agg.RenderAll()))
+	if _, err := w.Write([]byte(h.agg.RenderAll())); err != nil {
+		log.Printf("GetAllMetrics: failed to write response: %v", err)
+	}
 }
 
 // GetTenantMetrics handles GET /api/v1/metrics — returns only the calling
@@ -40,5 +43,7 @@ func (h *MetricsHandler) GetTenantMetrics(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(h.agg.RenderTenant(tenantID)))
+	if _, err := w.Write([]byte(h.agg.RenderTenant(tenantID))); err != nil {
+		log.Printf("GetTenantMetrics: failed to write response: %v", err)
+	}
 }

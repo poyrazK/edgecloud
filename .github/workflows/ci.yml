@@ -386,15 +386,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25.0'
 
       - name: Run gofmt
         run: go fmt ./...
 
   # ============================================================
-  # GO-VET — go vet on edge-control-plane
+  # GOLANGCI-LINT — lint edge-control-plane Go code
   # ============================================================
-  go-vet:
+  golangci-lint:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -405,10 +405,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25.0'
 
-      - name: Run go vet
-        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64
+          working-directory: edge-control-plane
 
   # ============================================================
   # GO-TEST — go test on edge-control-plane
@@ -424,7 +427,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25.0'
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -434,3 +437,32 @@ jobs:
 
       - name: Run go test
         run: go test ./...
+
+  # ============================================================
+  # CARGO-DENY — check Rust dependency licenses & advisories
+  # ============================================================
+  cargo-deny:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: ${{ matrix.crate }}/Cargo.toml
+
+  # ============================================================
+  # TYPOS — spell check source files
+  # ============================================================
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for typos
+        uses: crate-ci/typos@v1

@@ -75,7 +75,11 @@ func (s *AppService) Create(ctx context.Context, tenantID, appName string, req *
 		if err != nil {
 			return nil, fmt.Errorf("beginning transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				log.Printf("app service: failed to rollback transaction: %v", rollbackErr)
+			}
+		}()
 
 		// Lock the tenant row for the duration of this transaction.
 		// Acquire a row lock on the tenant row. The boolean result is unused;
@@ -229,7 +233,11 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 		if err != nil {
 			return fmt.Errorf("beginning transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+				log.Printf("app service: failed to rollback transaction: %v", rollbackErr)
+			}
+		}()
 
 		// Acquire a row lock on the tenant row. The boolean result is unused;
 		// only the lock (held until tx.Commit) matters for serializing concurrent creates.

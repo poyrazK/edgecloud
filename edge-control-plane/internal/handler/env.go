@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -32,6 +33,7 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 		httperror.BadRequestCtx(w, r, "invalid request body")
 		return
 	}
+
 	if req.Key == "" {
 		httperror.BadRequestCtx(w, r, "key is required")
 		return
@@ -62,7 +64,9 @@ func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		log.Printf("List envs: failed to encode response: %v", err)
+	}
 }
 
 func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {

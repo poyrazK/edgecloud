@@ -74,7 +74,7 @@ func (h *AuthHandler) Whoami(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(WhoamiResponse{
+	if err := json.NewEncoder(w).Encode(WhoamiResponse{
 		TenantID:   tenant.ID,
 		TenantName: tenant.Name,
 		Plan:       tenant.Plan,
@@ -82,5 +82,7 @@ func (h *AuthHandler) Whoami(w http.ResponseWriter, r *http.Request) {
 		APIKeyName: key.Name,
 		Role:       role,
 		CreatedAt:  tenant.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-	})
+	}); err != nil {
+		log.Printf("Whoami: failed to encode response: %v", err)
+	}
 }

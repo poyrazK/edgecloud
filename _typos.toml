@@ -1,0 +1,19 @@
+[default]
+extend-ignore-re = [
+    # Ignore hex/hash strings, tokens, and lockfiles if typos flags them
+]
+
+[default.extend-words]
+# Add project-specific terms here to ignore false positive typos
+edgecloud = "edgecloud"
+edgeclouderz = "edgeclouderz"
+wasmtime = "wasmtime"
+wasi = "wasi"
+clippy = "clippy"
+gofmt = "gofmt"
+golangci = "golangci"
+staticcheck = "staticcheck"
+errcheck = "errcheck"
+govet = "govet"
+ineffassign = "ineffassign"
+typecheck = "typecheck"

@@ -137,13 +137,15 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(deployResponse{
+	if err := json.NewEncoder(w).Encode(deployResponse{
 		ID:                  deployment.ID,
 		Hash:                deployment.Hash,
 		URL:                 "https://" + domain.IngressHost(tenantID, appName),
 		Regions:             domain.StringArrayTo(deployment.Regions),
 		AutoRollbackEnabled: deployment.AutoRollbackEnabled,
-	})
+	}); err != nil {
+		log.Printf("Deploy: failed to encode response: %v", err)
+	}
 }
 
 // parseRegions turns the `?regions=` query value into a deduped slice.
@@ -218,7 +220,9 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(deployment)
+	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+		log.Printf("GetStatus: failed to encode response: %v", err)
+	}
 }
 
 func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -246,12 +250,14 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"items":  deployments,
 		"total":  total,
 		"limit":  limit,
 		"offset": offset,
-	})
+	}); err != nil {
+		log.Printf("List deployments: failed to encode response: %v", err)
+	}
 }
 
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
@@ -314,7 +320,9 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "activated"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
+			log.Printf("Activate: failed to encode response: %v", err)
+		}
 		return
 	}
 
@@ -350,7 +358,9 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"})
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"}); err != nil {
+		log.Printf("Canary activate: failed to encode response: %v", err)
+	}
 }
 
 // Rollback handles POST /api/apps/{appName}/rollback. Swaps the active
@@ -396,7 +406,9 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
+	if err := json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID}); err != nil {
+		log.Printf("Rollback: failed to encode response: %v", err)
+	}
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
@@ -410,7 +422,9 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(deployment)
+	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+		log.Printf("GetActive: failed to encode response: %v", err)
+	}
 }
 
 // validateAppName writes a 400 with {"error": "invalid app name"} and
@@ -475,16 +489,18 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	if target == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"ready":    false,
 			"app_name": appName,
 			"reason":   "no running app found for this tenant",
-		})
+		}); err != nil {
+			log.Printf("AppIngress ready false: failed to encode response: %v", err)
+		}
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"ready":       true,
 		"app_name":    target.AppName,
 		"tenant_id":   target.TenantID,
@@ -492,5 +508,7 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 		"region":      target.Region,
 		"worker_addr": target.WorkerAddr,
 		"port":        target.Port,
-	})
+	}); err != nil {
+		log.Printf("AppIngress ready true: failed to encode response: %v", err)
+	}
 }

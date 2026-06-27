@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,7 +89,9 @@ func serveAutoRollbackWithStub(w http.ResponseWriter, r *http.Request, svc autoR
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID})
+	if err := json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID}); err != nil {
+		log.Printf("serveAutoRollbackWithStub: failed to encode response: %v", err)
+	}
 }
 
 // newInternalAutoRollbackMux wires the route through a real

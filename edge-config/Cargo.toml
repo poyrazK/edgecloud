@@ -3,6 +3,7 @@ name = "edge-config"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+publish = false
 description = "Shared edgeCloud user-config helpers (config file path, API key + URL loaders)"
 
 [dependencies]

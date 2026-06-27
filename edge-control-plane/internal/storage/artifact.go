@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,7 +69,11 @@ func (s *ArtifactStore) Save(tenantID, appName, deploymentID string, r io.Reader
 	if err != nil {
 		return fmt.Errorf("creating artifact file: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Printf("ArtifactStore.Save: failed to close file: %v", err)
+		}
+	}()
 
 	if _, err := io.Copy(f, r); err != nil {
 		return fmt.Errorf("writing artifact: %w", err)

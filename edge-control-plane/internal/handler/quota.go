@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -33,5 +34,7 @@ func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(quota)
+	if err := json.NewEncoder(w).Encode(quota); err != nil {
+		log.Printf("GetQuota: failed to encode response: %v", err)
+	}
 }

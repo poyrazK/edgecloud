@@ -68,7 +68,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Printf("Error closing database: %v", err)
+		}
+	}()
 
 	// Initialize repositories
 	tenantRepo := repository.NewTenantRepository(db)
@@ -155,7 +159,9 @@ func main() {
 	// Health check
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
+			log.Printf("Health check: failed to write response: %v", err)
+		}
 	})
 
 	// OpenAPI spec — served as raw YAML
@@ -165,9 +171,15 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				log.Printf("Failed to close OpenAPI spec file: %v", err)
+			}
+		}()
 		w.Header().Set("Content-Type", "application/x-yaml")
-		io.Copy(w, f)
+		if _, err := io.Copy(w, f); err != nil {
+			log.Printf("Failed to copy OpenAPI spec to response: %v", err)
+		}
 	})
 
 	// Swagger UI — serves the interactive API docs at /docs/
@@ -188,7 +200,9 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /docs/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(swaggerUIHTML))
+		if _, err := w.Write([]byte(swaggerUIHTML)); err != nil {
+			log.Printf("Docs check: failed to write swagger UI: %v", err)
+		}
 	})
 
 	// Public endpoints (no auth required)

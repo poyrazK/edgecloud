@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -136,12 +137,20 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("creating temp source file: %w", err)
 	}
 	tmpSrcPath := tmpSrc.Name()
-	defer os.Remove(tmpSrcPath)
+	defer func() {
+		if removeErr := os.Remove(tmpSrcPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp file: %v", removeErr)
+		}
+	}()
 	if _, err := tmpSrc.WriteString(source); err != nil {
-		tmpSrc.Close()
+		if closeErr := tmpSrc.Close(); closeErr != nil {
+			log.Printf("migration service: failed to close temp file: %v", closeErr)
+		}
 		return nil, fmt.Errorf("writing temp source: %w", err)
 	}
-	tmpSrc.Close()
+	if err := tmpSrc.Close(); err != nil {
+		log.Printf("migration service: failed to close temp file: %v", err)
+	}
 
 	// Run `edge-migrate --language <lang> --transform <path> --format json`.
 	// The binary emits a `transformEnvelope` with the structured report and
@@ -175,7 +184,6 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	var envelope transformEnvelope
 	var parseErr error
 	_ = json.Unmarshal(edgeMigOut.Bytes(), &envelope) // soft-parse; fall through to heuristic on error
-	parseErr = nil
 	if len(edgeMigOut.Bytes()) > 0 && len(edgeMigOut.Bytes()) < 4 {
 		parseErr = fmt.Errorf("edge-migrate output too short to be a valid envelope")
 	} else if !bytes.HasPrefix(bytes.TrimSpace(edgeMigOut.Bytes()), []byte("{")) {
@@ -241,8 +249,14 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("creating temp wasm file: %w", err)
 	}
 	tmpWasmPath := tmpWasm.Name()
-	tmpWasm.Close()
-	defer os.Remove(tmpWasmPath)
+	if err := tmpWasm.Close(); err != nil {
+		log.Printf("migration service: failed to close temp Wasm file: %v", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(tmpWasmPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp Wasm file: %v", removeErr)
+		}
+	}()
 
 	var compileErrMsg string
 	var compileSentinel error
@@ -255,12 +269,20 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 			return nil, fmt.Errorf("creating temp rs file: %w", err)
 		}
 		tmpRsPath := tmpRs.Name()
-		defer os.Remove(tmpRsPath)
+		defer func() {
+			if removeErr := os.Remove(tmpRsPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				log.Printf("migration service: failed to remove temp rs file: %v", removeErr)
+			}
+		}()
 		if _, err := tmpRs.WriteString(transformed); err != nil {
-			tmpRs.Close()
+			if closeErr := tmpRs.Close(); closeErr != nil {
+				log.Printf("migration service: failed to close temp rs file: %v", closeErr)
+			}
 			return nil, fmt.Errorf("writing temp rs: %w", err)
 		}
-		tmpRs.Close()
+		if err := tmpRs.Close(); err != nil {
+			log.Printf("migration service: failed to close temp rs file: %v", err)
+		}
 
 		rustcCmd := exec.CommandContext(ctx, s.rustcPath,
 			"--target", "wasm32-wasip2",
@@ -562,7 +584,11 @@ func (s *MigrationService) MigrateTree(
 	if err != nil {
 		return nil, fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
+			log.Printf("migration service: failed to remove temp dir: %v", removeErr)
+		}
+	}()
 
 	// Write each entry to <tmpDir>/<path>. Reject path traversal
 	// (defense-in-depth; handler also validates).
@@ -742,8 +768,14 @@ func (s *MigrationService) MigrateTree(
 		return nil, fmt.Errorf("creating temp wasm: %w", err)
 	}
 	tmpWasmPath := tmpWasm.Name()
-	tmpWasm.Close()
-	defer os.Remove(tmpWasmPath)
+	if err := tmpWasm.Close(); err != nil {
+		log.Printf("migration service: failed to close temp wasm: %v", err)
+	}
+	defer func() {
+		if removeErr := os.Remove(tmpWasmPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("migration service: failed to remove temp wasm: %v", removeErr)
+		}
+	}()
 
 	var compileErrMsg string
 	switch language {

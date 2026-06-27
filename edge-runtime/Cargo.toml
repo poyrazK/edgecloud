@@ -3,6 +3,7 @@ name = "edge-runtime"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
+publish = false
 description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces for edge computing"
 
 [dependencies]

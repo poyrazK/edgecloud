@@ -66,12 +66,14 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(CreateAPIKeyResponse{
+	if err := json.NewEncoder(w).Encode(CreateAPIKeyResponse{
 		ID:    apiKey.ID,
 		Name:  apiKey.Name,
 		Role:  apiKey.Role,
 		Token: rawKey,
-	})
+	}); err != nil {
+		log.Printf("Create API key: failed to encode response: %v", err)
+	}
 }
 
 func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +103,9 @@ func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(infos)
+	if err := json.NewEncoder(w).Encode(infos); err != nil {
+		log.Printf("List API keys: failed to encode response: %v", err)
+	}
 }
 
 func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {

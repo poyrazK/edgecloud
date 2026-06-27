@@ -64,10 +64,12 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(BootstrapResponse{
+	if err := json.NewEncoder(w).Encode(BootstrapResponse{
 		TenantID: tenant.ID,
 		APIKey:   rawKey,
-	})
+	}); err != nil {
+		log.Printf("Bootstrap tenant: failed to encode response: %v", err)
+	}
 }
 
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +96,9 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(tenant)
+	if err := json.NewEncoder(w).Encode(tenant); err != nil {
+		log.Printf("Create tenant: failed to encode response: %v", err)
+	}
 }
 
 func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +114,9 @@ func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tenant)
+	if err := json.NewEncoder(w).Encode(tenant); err != nil {
+		log.Printf("Get tenant: failed to encode response: %v", err)
+	}
 }
 
 func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +127,9 @@ func (h *TenantHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tenants)
+	if err := json.NewEncoder(w).Encode(tenants); err != nil {
+		log.Printf("List tenants: failed to encode response: %v", err)
+	}
 }
 
 type UpdateTenantRequest struct {
@@ -168,7 +176,9 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tenant)
+	if err := json.NewEncoder(w).Encode(tenant); err != nil {
+		log.Printf("Update tenant: failed to encode response: %v", err)
+	}
 }
 
 func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {

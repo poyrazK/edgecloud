@@ -45,7 +45,11 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 		httperror.NotFoundCtx(w, r, "artifact not found")
 		return
 	}
-	defer artifact.Close()
+	defer func() {
+		if err := artifact.Close(); err != nil {
+			log.Printf("Download: failed to close Wasm artifact: %v", err)
+		}
+	}()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
@@ -95,7 +99,9 @@ func (h *InternalHandler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{"workers": workers}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("ListWorkers: failed to encode response: %v", err)
+	}
 }
 
 // AutoRollbackRequest is the JSON body posted by an edge-worker when
@@ -193,7 +199,9 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	if err := json.NewEncoder(w).Encode(map[string]string{
 		"deployment_id": newID,
-	})
+	}); err != nil {
+		log.Printf("AutoRollback: failed to encode response: %v", err)
+	}
 }
