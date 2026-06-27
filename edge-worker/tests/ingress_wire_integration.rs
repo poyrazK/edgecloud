@@ -26,56 +26,18 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerRequest;
-use testcontainers::ImageExt;
-use testcontainers_modules::nats::Nats;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 
-use edge_worker::auth::WorkerJwtSigner;
-use edge_worker::config::Config;
-use edge_worker::downloader::Downloader;
-use edge_worker::log_forwarder::LogForwarder;
 use edge_worker::messages::HeartbeatMessage;
-use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
-use edge_worker::port_pool::PortPool;
-use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
 
 use edge_ingress::heartbeats::apply_heartbeat;
 use edge_ingress::routing::RoutingTable;
 
-// TODO(shared-test-harness): byte-for-byte duplicate of the same helpers
-// in `edge-worker/tests/integration_tests.rs` and `edge-ingress/tests/integration.rs`.
-// Extract `should_skip_integration_tests` and the NATS container startup
-// into a shared `edge-test-helpers` crate so changes to the skip policy
-// or NATS startup contract land in one place. Tracked separately to
-// avoid expanding the scope of this PR.
-
-fn should_skip_integration_tests() -> bool {
-    std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
-        || !std::path::Path::new("/var/run/docker.sock").exists()
-}
-
-async fn nats_container() -> (testcontainers::ContainerAsync<Nats>, String) {
-    let container: testcontainers::ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
-        .with_startup_timeout(std::time::Duration::from_secs(30))
-        .with_ready_conditions(vec![WaitFor::Duration {
-            length: std::time::Duration::from_secs(5),
-        }])
-        .start()
-        .await
-        .expect("start NATS container");
-    let host = container.get_host().await.expect("get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("get NATS port");
-    (container, format!("{}:{}", host, port))
-}
+// Phase 2: `should_skip_integration_tests` and `nats_container` were
+// extracted to the `edge-test-helpers` crate. Imported here so the
+// rest of the file can keep using the un-prefixed names.
+use edge_test_helpers::nats::{nats_container, should_skip_integration_tests};
 
 /// Build a minimal Supervisor pointed at the given NATS URL. No mock HTTP
 /// server is needed — this test never starts apps, it only verifies the
@@ -86,65 +48,28 @@ async fn build_supervisor(
     region: &str,
     worker_addr: &str,
 ) -> anyhow::Result<Arc<Supervisor>> {
-    let config = Config {
-        worker_id: worker_id.to_string(),
-        region: region.to_string(),
-        worker_addr: worker_addr.to_string(),
-        nats_url: nats_url.to_string(),
-        control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: std::path::PathBuf::from("/tmp/edge-worker-ingress-wire-test"),
-        heartbeat_interval_secs: 30,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 19_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: "ingress-wire-group".to_string(),
-        consumer_name: format!("ingress-wire-{}", worker_id),
-        // JWT fields: required by Config, but the wire tests construct
-        // Config directly and never hit the auth path against a real
-        // control plane (the mock server accepts anything). Any non-empty
-        // placeholder is fine.
-        worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-    };
-
-    let engine = edge_runtime::create_engine().context("create engine")?;
-    let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
-    let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
+    // Phase 2: build the Config via the shared test_config factory,
+    // then override the per-test fields the ingress-wire test cares
+    // about (worker_addr, control_plane_url, cache_dir, starting_port,
+    // queue_group, consumer_name). Defaults for the rest (mem cap,
+    // epoch tick, JWT placeholders) come from edge_test_helpers.
+    let mut cfg = edge_test_helpers::test_config(
+        worker_id,
+        region,
+        nats_url.to_string(),
+        // The mock server isn't actually used by this test (it never
+        // starts apps), but the supervisor wiring still needs a
+        // control_plane_url. The wire test parses the heartbeat
+        // directly, so a placeholder is fine.
+        "http://localhost:9999".to_string(),
     );
-    let downloader = Arc::new(Downloader::new(
-        config.control_plane_url.clone(),
-        config.cache_dir.clone(),
-        jwt_signer.clone(),
-    ));
-    let port_pool = Arc::new(TokioMutex::new(PortPool::new(
-        config.starting_port,
-        config.port_cooldown_secs,
-    )));
+    cfg.worker_addr = worker_addr.to_string();
+    cfg.cache_dir = std::path::PathBuf::from("/tmp/edge-worker-ingress-wire-test");
+    cfg.starting_port = 19_000;
+    cfg.queue_group = "ingress-wire-group".to_string();
+    cfg.consumer_name = format!("ingress-wire-{}", worker_id);
 
-    let nats = Arc::new(NatsClientImpl::connect(nats_url).await?) as Arc<dyn NatsClientTrait>;
-    let log_forwarder = LogForwarder::new(
-        config.control_plane_url.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        jwt_signer,
-    );
-    Ok(Arc::new(Supervisor {
-        config,
-        state,
-        downloader,
-        port_pool,
-        nats,
-        log_forwarder,
-    }))
+    edge_test_helpers::build_supervisor(cfg).await
 }
 
 /// The full #70 contract: worker emits a heartbeat with `worker_addr`,
