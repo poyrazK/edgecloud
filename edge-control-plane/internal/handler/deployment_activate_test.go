@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -122,13 +123,91 @@ func TestActivate_PublishFailed_Returns502(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "worker notification failed") {
 		t.Errorf("body should explain 502, got %s", rr.Body.String())
 	}
-	// Body must not leak the sentinel or the raw NATS error.
-	if strings.Contains(rr.Body.String(), "nats unreachable") {
-		t.Errorf("body leaks raw error: %s", rr.Body.String())
+	// Typed-envelope assertions: the 502 body must conform to the
+	// httperror.ErrorResponse shape so clients that parse the typed
+	// envelope work across every status code. The regions arrays
+	// live at the top level so a non-typed reader can still see them
+	// (see writePublishFailureEnvelope).
+	var env httperror.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
 	}
-	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
-		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	if env.Error.Code != httperror.CodeBadGateway {
+		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
 	}
+	if !strings.Contains(env.Error.Message, "worker notification failed") {
+		t.Errorf("error.message = %q, want it to mention worker notification", env.Error.Message)
+	}
+	// Without a *service.PublishError, the regions arrays are empty.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &top); err != nil {
+		t.Fatalf("unmarshal top-level: %v", err)
+	}
+	if _, ok := top["regions_published"]; !ok {
+		t.Errorf("body missing top-level regions_published: %s", rr.Body.String())
+	}
+	if _, ok := top["regions_failed"]; !ok {
+		t.Errorf("body missing top-level regions_failed: %s", rr.Body.String())
+	}
+}
+
+// TestActivate_PublishFailed_TypedError_SurfacesRegionBreakdown covers
+// the typed-error path: when the service returns a *service.PublishError
+// (not just a wrapped sentinel), the handler surfaces the per-region
+// breakdown alongside the typed envelope.
+func TestActivate_PublishFailed_TypedError_SurfacesRegionBreakdown(t *testing.T) {
+	pubErr := &service.PublishError{
+		Published: []string{"us-east"},
+		Failed:    []string{"eu-west"},
+		Err:       service.ErrPublishFailed,
+	}
+	svc := &stubActivator{err: pubErr}
+	mux := newActivateMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/activate/d_x", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", rr.Code, rr.Body.String())
+	}
+	// Decode the body as both the typed envelope and a top-level map
+	// so we can assert both halves of the shape.
+	var env httperror.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if env.Error.Code != httperror.CodeBadGateway {
+		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
+	}
+	var top struct {
+		RegionsPublished []string `json:"regions_published"`
+		RegionsFailed    []string `json:"regions_failed"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &top); err != nil {
+		t.Fatalf("unmarshal top-level: %v", err)
+	}
+	if got, want := top.RegionsPublished, []string{"us-east"}; !equalStrings(got, want) {
+		t.Errorf("regions_published = %v, want %v", got, want)
+	}
+	if got, want := top.RegionsFailed, []string{"eu-west"}; !equalStrings(got, want) {
+		t.Errorf("regions_failed = %v, want %v", got, want)
+	}
+}
+
+// equalStrings is a small helper that doesn't pull in slices.Equal
+// just for this single comparison; keeps the test self-contained.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

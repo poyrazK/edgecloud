@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -79,7 +80,8 @@ func serveAutoRollbackWithStub(w http.ResponseWriter, r *http.Request, svc autoR
 		case errors.Is(err, service.ErrAutoRollbackDisabled):
 			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
 		case errors.Is(err, service.ErrPublishFailed):
-			http.Error(w, `{"error": "rollback committed but worker notification failed; please retry"}`, http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 		default:
 			http.Error(w, `{"error": "auto-rollback failed"}`, http.StatusInternalServerError)
 		}
@@ -239,6 +241,19 @@ func TestInternalAutoRollback_PublishFailed_Returns502(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "worker notification failed") {
 		t.Errorf("body should explain 502, got %s", rr.Body.String())
+	}
+	// Typed-envelope assertions (issue #127 follow-ups): the 502
+	// body must conform to httperror.ErrorResponse so clients that
+	// parse the typed envelope work across every status code.
+	var env httperror.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if env.Error.Code != httperror.CodeBadGateway {
+		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Message, "worker notification failed") {
+		t.Errorf("error.message = %q, want it to mention worker notification", env.Error.Message)
 	}
 	if strings.Contains(rr.Body.String(), "nats unreachable") {
 		t.Errorf("body leaks raw error: %s", rr.Body.String())

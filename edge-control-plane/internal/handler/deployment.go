@@ -267,24 +267,16 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 // still matched by the caller before this helper is reached, so
 // callers don't need to repeat the sentinel check.
 func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadGateway)
-	body := map[string]any{"error": staticMessage}
+	details := map[string]any{
+		"regions_published": []string{},
+		"regions_failed":    []string{},
+	}
 	var pubErr *service.PublishError
 	if errors.As(err, &pubErr) {
-		body["regions_published"] = pubErr.Published
-		body["regions_failed"] = pubErr.Failed
-	} else {
-		// Defense-in-depth: a non-PublishError reaching this path
-		// would have bypassed the typed wrapper. Still emit the
-		// arrays as empty so the JSON shape stays stable for
-		// clients (the 502 contract is "always have these two keys").
-		body["regions_published"] = []string{}
-		body["regions_failed"] = []string{}
+		details["regions_published"] = pubErr.Published
+		details["regions_failed"] = pubErr.Failed
 	}
-	if encErr := json.NewEncoder(w).Encode(body); encErr != nil {
-		log.Printf("internal error: encoding publish failure envelope: %v", encErr)
-	}
+	httperror.BadGatewayCtx(w, r, staticMessage, details)
 }
 
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
