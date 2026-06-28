@@ -607,6 +607,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/cluster/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent cluster autoscaler events (admin only)
+         * @description Returns the most-recent `autoscale_events` rows, newest first.
+         *     Operators use this to answer "why did the fleet size change?".
+         *     Both the cluster handler and the `edge cluster events` CLI consume
+         *     this endpoint.
+         */
+        get: operations["listAutoscaleEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/domains": {
         parameters: {
             query?: never;
@@ -1241,27 +1264,80 @@ export interface components {
         };
         /** @description Per-region snapshot of cluster state. */
         ClusterView: {
-            regions?: components["schemas"]["RegionView"][];
+            /**
+             * Format: date-time
+             * @description Server-side timestamp when this view was assembled.
+             */
+            generated_at?: string;
+            regions?: {
+                [key: string]: components["schemas"]["RegionView"];
+            };
         };
         RegionView: {
-            /** @example us-east1 */
-            name?: string;
             workers?: components["schemas"]["WorkerStatus"][];
+            /**
+             * @description Mean number of apps hosted per worker in this region, rounded
+             *     down to the nearest integer. Useful to spot fleet skew
+             *     (one worker pinned at 100 apps while peers sit at 5).
+             *     Set to 0 when the region has no workers yet.
+             */
+            apps_per_worker_avg?: number;
         };
         WorkerStatus: {
             /** @example w_us-east1_01 */
             worker_id?: string;
-            apps?: components["schemas"]["AppStatus"][];
-        };
-        AppStatus: {
-            /** @example web-app */
-            app_name?: string;
+            /** @example us-east1 */
+            region?: string;
             /**
-             * Format: int64
-             * @description Total requests handled by this app on this worker.
-             * @example 9821
+             * @description Worker public IP. Omitted when the worker has not reported one yet.
+             * @example 203.0.113.42
              */
-            request_count?: number;
+            ip?: string;
+            /**
+             * Format: date-time
+             * @description Last heartbeat timestamp.
+             */
+            last_seen?: string;
+            /**
+             * @description Number of apps the worker reported on its latest heartbeat.
+             * @example 12
+             */
+            app_count?: number;
+            /**
+             * @description Worker-allocated memory budget.
+             * @example 4096
+             */
+            memory_mb?: number;
+        };
+        /** @description One row in the `autoscale_events` table — a single decision tick. */
+        AutoscaleEvent: {
+            /** Format: int64 */
+            id?: number;
+            /** Format: date-time */
+            created_at?: string;
+            /** @example fra */
+            region?: string;
+            /** @enum {string} */
+            action?: "scale_up" | "scale_down" | "noop";
+            /** @description Fleet size before the action. */
+            from_count?: number;
+            /** @description Fleet size the autoscaler targeted. */
+            to_count?: number;
+            /** @description Machine-readable explanation (e.g., "free_slots=0 needed=5"). */
+            reason?: string;
+            /** @example noop */
+            provider_kind?: string;
+            succeeded?: boolean;
+            /** @description Cloud-provider error text when `succeeded=false`; null otherwise. */
+            error_message?: string | null;
+        };
+        /** @description Envelope returned by `GET /api/v1/admin/cluster/events`. */
+        AutoscaleEventList: {
+            items?: components["schemas"]["AutoscaleEvent"][];
+            /** @description The limit that was applied server-side. */
+            limit?: number;
+            /** @description The region filter (echoed back). Null when listing all regions. */
+            region?: string | null;
         };
         /**
          * @description A tenant-owned FQDN bound to a specific app. The status field is
@@ -2529,6 +2605,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterView"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listAutoscaleEvents: {
+        parameters: {
+            query?: {
+                /** @description Restrict to a single region (e.g., `fra`). Omit for all regions. */
+                region?: string;
+                /** @description Maximum rows to return. Server clamps to [1, 500]. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Event list, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoscaleEventList"];
                 };
             };
             401: components["responses"]["Unauthorized"];
