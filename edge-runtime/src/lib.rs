@@ -26,3 +26,8 @@ pub use interfaces::observe::MetricsAccumulator;
 pub use metering::RequestMeter;
 pub use runtime::RuntimeState;
 pub use store::create_store;
+
+#[cfg(feature = "wasi-preview1")]
+pub use linker::build_wasi_p1_ctx;
+#[cfg(feature = "wasi-preview1")]
+pub use wasmtime_wasi::preview1::WasiP1Ctx;

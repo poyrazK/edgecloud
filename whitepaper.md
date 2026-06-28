@@ -484,7 +484,7 @@ The runtime exposes these WIT-defined interfaces:
 
 ### 6.3 WASI Preview 2 Component Model
 
-The runtime uses `wasmtime`'s WASI Preview 2 implementation with the component model enabled. Components are the preferred artifact format; plain `.wasm` modules are supported for backward compatibility with existing WASI P1 binaries.
+The runtime uses `wasmtime`'s WASI Preview 2 implementation with the component model enabled. Components are the preferred artifact format; plain `.wasm` modules are supported for backward compatibility with existing WASI P1 binaries via the `wasi-preview1` Cargo feature on `edge-runtime`, which wires `wasmtime-wasi`'s `add_to_linker_sync` into the P1 linker path.
 
 ### 6.4 Security Configuration
 
@@ -538,7 +538,7 @@ fn http_client_request(
 
 | Format | Extension | Description |
 |--------|-----------|-------------|
-| WASI Preview 1 Module | `.wasm` | Legacy plain wasm module, supports `wasi_unstable` |
+| WASI Preview 1 Module | `.wasm` | Legacy plain wasm module, supports `wasi_unstable`; requires `wasi-preview1` feature on `edge-runtime` |
 | WASI Preview 2 Module | `.wasm` | Modern wasm module with `wasi:http` interfaces |
 | WASI Preview 2 Component | `.wasm` | WIT-defined component with typed interfaces |
 
