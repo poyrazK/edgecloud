@@ -437,7 +437,16 @@ jobs:
           key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
 
       - name: Run go test
-        run: go test ./...
+        run: go test -coverprofile=cover.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=cover.out
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-cover
+          path: cover.out
 
   # ============================================================
   # CARGO-DENY — check Rust dependency licenses & advisories
@@ -548,3 +557,52 @@ jobs:
 
       - name: Run cargo-geiger
         run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
+
+  # ============================================================
+  # COVERAGE-RUST — cargo-llvm-cov for all crates
+  # ============================================================
+  coverage-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run coverage
+        run: |
+          cargo llvm-cov --lcov --output-path lcov-rust.info \
+            --manifest-path edge-config/Cargo.toml \
+            --manifest-path edge-cli/Cargo.toml \
+            --manifest-path edge-worker/Cargo.toml \
+            --manifest-path edge-ingress/Cargo.toml \
+            --manifest-path edge-migrate/Cargo.toml \
+            --manifest-path edge-migrate/edge-migrate-lib/Cargo.toml \
+            --manifest-path edge-migrate/edge-migrate-bin/Cargo.toml \
+            --manifest-path edge-runtime/Cargo.toml || true
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-rust
+          path: lcov-rust.info
