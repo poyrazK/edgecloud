@@ -1067,7 +1067,7 @@ func TestRollbackArtifactSave_DeletesBlob(t *testing.T) {
 	store := newMockArtifactStore()
 	saveErr := errors.New("disk full (test)")
 
-	gotErr := rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr)
+	gotErr := rollbackArtifactSave(context.Background(), &mockDeploymentRepo{}, store, "tenant-1", "myapp", "d_abc", saveErr)
 
 	if gotErr != saveErr {
 		t.Errorf("expected helper to return saveErr unchanged; got %v", gotErr)
@@ -1088,7 +1088,7 @@ func TestRollbackArtifactSave_TolerantOfDeleteErrors(t *testing.T) {
 	store := &mockArtifactStore{deleteErr: errors.New("fs gone (test)")}
 	saveErr := errors.New("disk full (test)")
 
-	gotErr := rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr)
+	gotErr := rollbackArtifactSave(context.Background(), &mockDeploymentRepo{}, store, "tenant-1", "myapp", "d_abc", saveErr)
 
 	if gotErr != saveErr {
 		t.Errorf("expected helper to return saveErr unchanged; got %v", gotErr)
@@ -1119,7 +1119,7 @@ func TestMigrate_ArtifactSaveFailure_ClassifiedAsClientError(t *testing.T) {
 	store := newMockArtifactStore()
 
 	wrapped := fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed,
-		rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr))
+		rollbackArtifactSave(context.Background(), &mockDeploymentRepo{}, store, "tenant-1", "myapp", "d_abc", saveErr))
 
 	if !errors.Is(wrapped, ErrMigrationFailed) {
 		t.Errorf("wrapped error %v does not match ErrMigrationFailed sentinel; handler will return 500 instead of 422", wrapped)
@@ -1136,7 +1136,7 @@ func TestMigrateTree_ArtifactSaveFailure_ClassifiedAsClientError(t *testing.T) {
 	store := newMockArtifactStore()
 
 	wrapped := fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed,
-		rollbackArtifactSave(store, "tenant-1", "myapp", "d_abc", saveErr))
+		rollbackArtifactSave(context.Background(), &mockDeploymentRepo{}, store, "tenant-1", "myapp", "d_abc", saveErr))
 
 	if !errors.Is(wrapped, ErrMigrateTreeFailed) {
 		t.Errorf("wrapped error %v does not match ErrMigrateTreeFailed sentinel; handler will return 500 instead of 422", wrapped)

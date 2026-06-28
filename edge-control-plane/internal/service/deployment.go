@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -376,7 +375,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
 				return ErrInvalidWasm
 			}
-			hash, saveErr := s.artifactStore.SaveAndHash(tenantID, appName, deployment.ID, r)
+			hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r)
 			if saveErr != nil {
 				return saveErr
 			}
@@ -412,7 +411,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			err = fmt.Errorf("reading wasm magic: %w", readErr)
 		} else if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
 			err = ErrInvalidWasm
-		} else if hash, saveErr := s.artifactStore.SaveAndHash(tenantID, appName, deployment.ID, r); saveErr != nil {
+		} else if hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r); saveErr != nil {
 			// Compensate in the same order as the tx branch's
 			// equivalent: apps-row cleanup BEFORE deployment-row
 			// cleanup, so the NOT EXISTS guard on
