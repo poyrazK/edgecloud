@@ -3,10 +3,14 @@
 //! Subscribes to `edgecloud.heartbeats.<region>`, maintains an in-memory
 //! routing table of `<tenant>-<app>.edgecloud.dev → worker:port`, and
 //! reloads a local Caddy process with the rendered Caddyfile-JSON on every
-//! change. See `edge-ingress/README.md` for the operator runbook.
+//! change. With `CONTROL_PLANE_URL` set, a second 30s poller fetches
+//! the tenant's custom FQDN bindings from
+//! `GET /api/internal/domains` and adds per-FQDN routes with on-demand
+//! TLS. See `edge-ingress/README.md` for the operator runbook.
 
 pub mod caddy;
 pub mod config;
+pub mod domains;
 pub mod heartbeats;
 pub mod messages;
 pub mod routing;

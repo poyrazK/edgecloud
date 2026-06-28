@@ -75,6 +75,8 @@ fn login_with_key_flag_writes_to_config() {
     assert_eq!(stored, "k_from_flag");
 }
 
+/// Default path: stdin read with echo on (issue #108). The --no-echo
+/// path is covered by `login_no_echo_*` tests below.
 #[test]
 fn login_from_stdin_writes_to_config() {
     let home = common::isolated_home();
@@ -87,6 +89,65 @@ fn login_from_stdin_writes_to_config() {
 
     let stored = read_api_key(&home).expect("config file should exist");
     assert_eq!(stored, "k_from_stdin");
+}
+
+/// `--no-echo` requires a controlling TTY. Without one (e.g. under
+/// `assert_cmd`, in a CI job with no TTY allocation), the secure read
+/// path must fail with a clear error AND must NOT write a (possibly
+/// empty) key to disk. The no-write assertion is the load-bearing
+/// platform-independent check; the exit-code assertion is secondary.
+///
+/// We deliberately do not assert on a specific stderr substring:
+/// `rpassword`'s `io::Error` text varies by OS (`os error 6`,
+/// `os error 25`, etc.). The "no config file written" assertion is
+/// the only platform-independent proof that the secure read path
+/// was actually taken — if a buggy implementation silently fell
+/// back to stdin, it would either succeed (no TTY mock) or write
+/// something to disk.
+#[test]
+fn login_no_echo_without_tty_fails_clearly_and_does_not_write_key() {
+    let home = common::isolated_home();
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    // No `--key`, so the no_echo branch is taken; rpassword reads
+    // from /dev/tty which is unavailable under assert_cmd.
+    cmd.arg("auth")
+        .arg("login")
+        .arg("--no-echo")
+        .write_stdin("k_x\n");
+
+    cmd.assert().failure();
+
+    // The load-bearing assertion: nothing was written to disk.
+    // Platform-independent — works on linux/macOS/Windows.
+    assert!(
+        read_api_key(&home).is_none(),
+        "--no-echo path must not write a key when /dev/tty is unavailable"
+    );
+}
+
+/// `--no-echo --key <KEY>` must save the explicit key, identical to
+/// `--key` alone. `--no_echo` is a no-op when `--key` is provided
+/// (no read happens), so this pins the contract that the flag does
+/// not affect the explicit-key path. Mirrors `login_with_key_flag_writes_to_config`
+/// above to make the no-op relationship explicit.
+#[test]
+fn login_no_echo_with_explicit_key_still_writes_to_config() {
+    let home = common::isolated_home();
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.arg("auth")
+        .arg("login")
+        .arg("--no-echo")
+        .arg("--key")
+        .arg("k_explicit");
+
+    cmd.assert().success();
+
+    let stored = read_api_key(&home).expect("config file should exist");
+    assert_eq!(stored, "k_explicit");
 }
 
 #[tokio::test]

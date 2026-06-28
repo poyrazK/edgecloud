@@ -30,15 +30,24 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Returns when the subscription ends (e.g., NATS disconnect). The caller
 /// is expected to re-invoke this in a loop with backoff, mirroring the
 /// worker's main loop.
-pub async fn run(cfg: Config, table: Arc<RoutingTable>, caddy: Arc<CaddyClient>) -> Result<()> {
+///
+/// `render_notify` is the shared `Notify` that the Caddy renderer awaits.
+/// It is passed in (rather than created here) so the domain poller in
+/// `main.rs` can signal the same channel — see PR #133 review finding #1.
+pub async fn run(
+    cfg: Config,
+    table: Arc<RoutingTable>,
+    caddy: Arc<CaddyClient>,
+    render_notify: Arc<Notify>,
+) -> Result<()> {
     let client = async_nats::connect(&cfg.nats_url)
         .await
         .with_context(|| format!("connecting to NATS at {}", cfg.nats_url))?;
     info!(url = %cfg.nats_url, region = %cfg.region, "connected to NATS");
 
-    // Spawn the renderer + the periodic pruner. Both share a `Notify` flag
-    // so we collapse bursts of heartbeats into a single Caddy reload.
-    let render_notify = Arc::new(Notify::new());
+    // Spawn the renderer + the periodic pruner. Both share the same
+    // `Notify` flag (passed in by the caller) so we collapse bursts of
+    // heartbeats into a single Caddy reload.
 
     // Traffic-split cache shared between the fetcher and the renderer.
     let traffic_cache: SharedCache = Default::default();
@@ -196,8 +205,9 @@ async fn push_now(
     traffic_cache: &SharedCache,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
+    let fqdns = table.fqdn_snapshot().await;
     let traffic_cache = traffic_cache.read().await;
-    let json = render_routes(&snap, cfg, &traffic_cache);
+    let json = render_routes(&snap, &fqdns, cfg, &traffic_cache);
     caddy.load_config(&json).await
 }
 

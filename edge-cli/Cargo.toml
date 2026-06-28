@@ -29,6 +29,10 @@ dirs = "5.0"
 # rather than feature-gated so the binary shape matches what the
 # docs / smoke tests expect.
 ctrlc = "3"
+# Reads the API key from /dev/tty with terminal echo disabled when
+# `edge auth login --no-echo` is used (issue #108). Default login
+# path (stdin paste, echo on) is preserved for CI/pipe ergonomics.
+rpassword = "7"
 edge-config = { path = "../edge-config" }
 
 [features]

@@ -36,17 +36,17 @@ type WorkerStatus struct {
 type MetricKind string
 
 const (
-	MetricKindCounter        MetricKind = "counter"
-	MetricKindGauge          MetricKind = "gauge"
+	MetricKindCounter         MetricKind = "counter"
+	MetricKindGauge           MetricKind = "gauge"
 	MetricKindHistogramSample MetricKind = "histogram_sample"
 )
 
 // MetricSample is a single metric observation shipped inside a heartbeat.
 type MetricSample struct {
-	Name   string            `json:"name"`
-	Kind   MetricKind        `json:"kind"`
-	Value  float64           `json:"value"`
-	Labels [][2]string       `json:"labels"`
+	Name   string      `json:"name"`
+	Kind   MetricKind  `json:"kind"`
+	Value  float64     `json:"value"`
+	Labels [][2]string `json:"labels"`
 }
 
 // AppStatus represents the status of a single app on a worker.

@@ -32,12 +32,22 @@ pub enum AuthAction {
         #[arg(long)]
         force: bool,
     },
-    /// Save an existing API key to the local config file. Reads from
-    /// stdin if `--key` is not provided.
+    /// Save an existing API key to the local config file.
+    ///
+    /// Reads from stdin if `--key` is not provided. For interactive use,
+    /// pass `--no-echo` to suppress terminal echo when pasting the key
+    /// (the pasted bytes stay out of scrollback and TTY captures). CI
+    /// and pipe scripts should leave `--no-echo` off and pipe the key
+    /// via stdin instead — `--no-echo` requires a controlling TTY.
     Login {
-        /// API key value. If omitted, read from stdin.
+        /// API key value. If omitted, read from stdin (or `/dev/tty`
+        /// when `--no-echo` is set).
         #[arg(long)]
         key: Option<String>,
+        /// Disable terminal echo when reading the key. Requires a
+        /// controlling TTY — incompatible with `<<<` and pipe stdin.
+        #[arg(long)]
+        no_echo: bool,
     },
     /// Show the currently-authenticated tenant and API key.
     Whoami,
@@ -76,7 +86,7 @@ impl AuthAction {
                 key_name,
                 force,
             } => signup(&name, &plan, &key_name, force),
-            AuthAction::Login { key } => login(key.as_deref()),
+            AuthAction::Login { key, no_echo } => login(key.as_deref(), no_echo),
             AuthAction::Whoami => whoami(),
             AuthAction::Logout => logout(),
             AuthAction::Keys { action } => keys_run(action),
@@ -157,15 +167,22 @@ fn signup(_name: &str, _plan: &str, _key_name: &str, _force: bool) -> Result<()>
     anyhow::bail!("auth signup requires network support; rebuild with --features network")
 }
 
-/// `edge auth login [--key <KEY>]`
+/// `edge auth login [--key <KEY>] [--no-echo]`
 ///
-/// Saves a key to the local config file. Reads from stdin if `--key` is
-/// not provided. After saving, attempts to call `whoami` to confirm the
-/// key works. If the server is unreachable, still succeeds on the local
-/// write (the user may be working offline).
-fn login(key: Option<&str>) -> Result<()> {
+/// After saving, calls `GET /api/v1/auth/whoami` to verify. Exits 1 if
+/// the server rejects the saved key; warns but succeeds if unreachable.
+fn login(key: Option<&str>, no_echo: bool) -> Result<()> {
     let key_value = match key {
         Some(k) => k.trim().to_string(),
+        // `--no-echo` is silently a no-op when `--key` is provided:
+        // `--key` short-circuits the read path, so the secure path
+        // never runs. Friendlier than a hard error for scripts that
+        // conditionally append flags (e.g. CI configs where
+        // `--no-echo "$NO_ECHO"` evaluates to `--no-echo ""`).
+        None if no_echo => rpassword::prompt_password("Paste your API key: ")
+            .context("failed to read API key from /dev/tty (is one attached?)")?
+            .trim()
+            .to_string(),
         None => {
             eprintln!("Paste your API key (input is read from stdin, Ctrl-D to cancel):");
             let mut buf = String::new();

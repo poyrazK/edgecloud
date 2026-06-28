@@ -1,12 +1,28 @@
 //! `edge traffic` — get or set traffic splits for an app.
 
 use anyhow::{Context, Result};
+use clap::Subcommand;
 use std::path::Path;
 
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
+
+/// Subcommand enum for `edge traffic`. Mirrors the dispatch in
+/// `main.rs::Command::Traffic`. Lives in this module so the
+/// subcommand variants stay next to their implementations.
+#[derive(Subcommand, Debug)]
+pub enum TrafficAction {
+    /// Print the current traffic split for the app.
+    Show,
+    /// Set a traffic split. Each argument is `deployment_id=weight`
+    /// (e.g. `d_v1=95 d_v2=5`); weights must sum to 100.
+    Set {
+        /// Space-separated `deployment_id=weight` pairs.
+        splits: Vec<String>,
+    },
+}
 
 /// Get current traffic splits for the app.
 #[cfg(feature = "network")]

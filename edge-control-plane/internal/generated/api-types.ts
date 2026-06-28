@@ -607,6 +607,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/apps/{appName}/domains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all custom FQDNs bound to an app */
+        get: operations["listDomains"];
+        put?: never;
+        /**
+         * Bind a custom FQDN to an existing app
+         * @description Validates the FQDN shape (RFC 1035, lowercase, ≤253 chars, no
+         *     wildcards, no `.edgecloud.dev` suffix), enforces a per-app quota
+         *     (50 by default), and inserts a row in `pending` state. The ingress
+         *     picks up the new row on its next 30 s poll and Caddy begins ACME
+         *     issuance on the first request to that host.
+         */
+        post: operations["addDomain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/apps/{appName}/domains/{fqdn}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fetch one domain row by FQDN
+         * @description Returns the row including its `status`, `last_error` (if the v2
+         *     Caddy webhook has populated it), and `verified_at`. Use this to
+         *     diagnose a `failed` row.
+         */
+        get: operations["getDomain"];
+        put?: never;
+        post?: never;
+        /**
+         * Unbind a custom FQDN from an app
+         * @description Deletes the row. The ingress drops the FQDN route on its next
+         *     30 s poll and Caddy's cert for that host is not renewed on expiry.
+         */
+        delete: operations["removeDomain"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/internal/download/{deploymentID}": {
         parameters: {
             query?: never;
@@ -1194,6 +1246,49 @@ export interface components {
              */
             request_count?: number;
         };
+        /**
+         * @description A tenant-owned FQDN bound to a specific app. The status field is
+         *     server-driven: `pending` is the default, `active` is set by a v2
+         *     Caddy webhook on successful ACME issuance, `failed` is set on
+         *     permanent ACME failure. Tenants cannot mutate status directly.
+         */
+        Domain: {
+            /** @example dom_3f4a1c9e */
+            id: string;
+            /** @example t_acme */
+            tenant_id: string;
+            /** @example api */
+            app_name: string;
+            /** @example api.acme.com */
+            fqdn: string;
+            /**
+             * @example pending
+             * @enum {string}
+             */
+            status: "pending" | "active" | "failed";
+            /** @description Set by the (v2) Caddy event webhook when ACME fails. */
+            last_error?: string | null;
+            /**
+             * Format: date-time
+             * @example 2026-06-22T12:34:56Z
+             */
+            created_at: string;
+            /** Format: date-time */
+            verified_at?: string | null;
+        };
+        DomainListResponse: {
+            domains?: components["schemas"]["Domain"][];
+        };
+        AddDomainRequest: {
+            /**
+             * @description Fully-qualified domain name. Must be RFC 1035 shape (lowercase,
+             *     ≤253 chars, ≤63 chars per label, no leading/trailing hyphens),
+             *     no wildcards, and not ending in `.edgecloud.dev` (platform-managed
+             *     host).
+             * @example api.acme.com
+             */
+            fqdn: string;
+        };
     };
     responses: {
         /** @description Bad request — invalid or missing parameters. */
@@ -1316,7 +1411,10 @@ export interface components {
             };
         };
     };
-    parameters: never;
+    parameters: {
+        /** @description Unique name of the app within the tenant. */
+        appName: string;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
@@ -2418,6 +2516,141 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listDomains: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: components["parameters"]["appName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of domain rows. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DomainListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    addDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: components["parameters"]["appName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddDomainRequest"];
+            };
+        };
+        responses: {
+            /** @description Domain row created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Domain"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description App not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            429: components["responses"]["QuotaExceeded"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: components["parameters"]["appName"];
+                /** @description The FQDN to look up. */
+                fqdn: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Domain row. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Domain"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No row matches (app, fqdn). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    removeDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: components["parameters"]["appName"];
+                /** @description The FQDN to remove. */
+                fqdn: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Domain row removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No row matches (app, fqdn). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };

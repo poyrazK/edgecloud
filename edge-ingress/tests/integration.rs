@@ -71,6 +71,9 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         admin_token: None,
         control_plane_api_url: "http://localhost:8080".into(),
         internal_token: None,
+        control_plane_url: String::new(),
+        service_token: String::new(),
+        domain_poll_interval: Duration::from_secs(30),
     }
 }
 
@@ -107,8 +110,15 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     let run_cfg = cfg.clone();
     let run_table = table.clone();
     let run_caddy = caddy.clone();
-    let pipeline =
-        tokio::spawn(async move { heartbeats::run(run_cfg, run_table, run_caddy).await });
+    // Pass a fresh Notify — the integration test doesn't have a
+    // second task to coordinate with, so this Notify is just to
+    // satisfy the post-#133 review signature. The renderer inside
+    // heartbeats::run awaits it; it never fires (no domain poller
+    // exists here) but the boot push fires from `push_now` directly.
+    let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let pipeline = tokio::spawn(async move {
+        heartbeats::run(run_cfg, run_table, run_caddy, pipeline_notify).await
+    });
 
     // Give the pipeline a beat to subscribe to NATS.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -198,8 +208,10 @@ async fn heartbeat_without_worker_addr_is_ignored() {
     let run_cfg = cfg.clone();
     let run_table = table.clone();
     let run_caddy = caddy.clone();
-    let pipeline =
-        tokio::spawn(async move { heartbeats::run(run_cfg, run_table, run_caddy).await });
+    let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let pipeline = tokio::spawn(async move {
+        heartbeats::run(run_cfg, run_table, run_caddy, pipeline_notify).await
+    });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 

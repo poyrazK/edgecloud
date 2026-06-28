@@ -21,6 +21,52 @@ struct Cli {
     path: std::path::PathBuf,
 }
 
+/// `edge domains <add|list|check|remove>` — manage custom FQDNs bound
+/// to a deployment (issue #83). The full subcommand surface is
+/// defined here (clap derives the help text from it) and dispatched
+/// through `commands::domains::DomainsAction::run`. Adding a new
+/// subcommand means one variant here + one match arm.
+#[derive(Subcommand)]
+enum DomainsCommand {
+    /// Bind a custom FQDN (e.g. `api.acme.com`) to an app.
+    Add {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to bind.
+        fqdn: String,
+    },
+    /// List all custom FQDNs bound to an app.
+    List {
+        /// App name.
+        app: String,
+    },
+    /// Show a single FQDN's status (incl. any `last_error`).
+    Check {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to inspect.
+        fqdn: String,
+    },
+    /// Unbind a custom FQDN from an app.
+    Remove {
+        /// App name.
+        app: String,
+        /// Fully-qualified domain name to unbind.
+        fqdn: String,
+    },
+}
+
+impl From<DomainsCommand> for commands::domains::DomainsAction {
+    fn from(cmd: DomainsCommand) -> Self {
+        match cmd {
+            DomainsCommand::Add { app, fqdn } => Self::Add { app, fqdn },
+            DomainsCommand::List { app } => Self::List { app },
+            DomainsCommand::Check { app, fqdn } => Self::Check { app, fqdn },
+            DomainsCommand::Remove { app, fqdn } => Self::Remove { app, fqdn },
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Scaffold a new project.
@@ -76,8 +122,17 @@ enum Command {
         auto_rollback: bool,
     },
 
-    /// Get deployment status.
-    Status,
+    /// Inspect runtime and deployment status.
+    ///
+    /// `runtime` surfaces the worker-reported status (running /
+    /// starting / stopping / crashed / hung / unknown). `deployment`
+    /// (default for the no-arg form) is the legacy DB-row view.
+    /// The subcommand is optional so bare `edge status` keeps
+    /// working as a backward-compat alias for `edge status deployment`.
+    Status {
+        #[command(subcommand)]
+        action: Option<StatusAction>,
+    },
 
     /// Set an environment variable.
     EnvSet {
@@ -181,20 +236,32 @@ enum Command {
     /// Get or set traffic splits for canary/blue-green deployments.
     Traffic {
         #[command(subcommand)]
-        action: TrafficAction,
+        action: commands::traffic::TrafficAction,
     },
+    /// Manage custom FQDNs bound to a deployment (issue #83).
+    #[command(subcommand)]
+    Domains(DomainsCommand),
 }
 
 #[derive(Subcommand)]
-enum TrafficAction {
-    /// Show current traffic splits.
-    Show,
-    /// Set traffic splits. Example: `edge traffic set d_v1=95 d_v2=5`
-    Set {
-        /// Deployment splits as `deployment_id=weight` pairs.
-        /// Weights must sum to 100.
-        splits: Vec<String>,
+enum StatusAction {
+    /// Show the worker-reported runtime status of an app.
+    ///
+    /// Surfaces `running` | `starting` | `stopping` | `crashed` |
+    /// `hung` | `unknown`, plus the region / worker_id /
+    /// `last_heartbeat` and (for `crashed`) the worker's exit code.
+    /// Hits `GET /api/v1/apps/{appName}/status`; no server-side
+    /// filtering of stale heartbeats — the `last_heartbeat` field
+    /// is surfaced verbatim so users can decide.
+    Runtime {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
     },
+    /// Show the deployment-row status (DB-side: deployed / active /
+    /// failed / migrated). Equivalent to the legacy `edge status`
+    /// form for backward compatibility.
+    Deployment,
 }
 
 fn main() -> Result<()> {
@@ -209,7 +276,10 @@ fn main() -> Result<()> {
             regions,
             auto_rollback,
         } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
-        Command::Status => commands::status::run(&cli.path),
+        Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
+            StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
+            StatusAction::Deployment => commands::status::run(&cli.path),
+        },
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
         Command::Activate {
@@ -233,8 +303,8 @@ fn main() -> Result<()> {
         }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
-            TrafficAction::Show => commands::traffic::get(&cli.path),
-            TrafficAction::Set { splits } => {
+            commands::traffic::TrafficAction::Show => commands::traffic::get(&cli.path),
+            commands::traffic::TrafficAction::Set { splits } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
                     .filter_map(|s| {
@@ -246,6 +316,10 @@ fn main() -> Result<()> {
                 commands::traffic::set(&cli.path, &parsed)
             }
         },
+        Command::Domains(cmd) => {
+            let action: commands::domains::DomainsAction = cmd.into();
+            action.run(&cli.path)
+        }
     }
 }
 

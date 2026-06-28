@@ -60,7 +60,11 @@ impl From<serde_json::Error> for ApiError {
 /// Inspect a response and split 2xx (return `Ok`) from 4xx (`Rejected`)
 /// and the rest (`Transient`, after reading whatever body is
 /// available). The body is read once on the non-2xx path.
-fn check_response(resp: Response) -> Result<Response, ApiError> {
+///
+/// `pub(crate)` so sibling accessor structs (`DomainClient`,
+/// `Tenants`, `Keys`, etc.) can reuse the same 2xx/4xx/5xx split
+/// instead of hand-rolling `if !status.is_success()` per method.
+pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
@@ -259,7 +263,7 @@ impl ApiClient {
         })
     }
 
-    fn auth_header(&self) -> String {
+    pub(crate) fn auth_header(&self) -> String {
         format!("Bearer {}", self.api_key.0)
     }
 
@@ -350,6 +354,26 @@ impl ApiClient {
     /// proceeding, because logs are the user's actual goal.
     pub fn get_app_status(&self, app_name: &str) -> Result<AppWorkerStatus, ApiError> {
         self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
+    }
+
+    /// GET `/api/v1/apps/{appName}/status` with anyhow-typed errors.
+    /// The same endpoint as [`Self::get_app_status`], but routes through
+    /// `get_json_anyhow` so 4xx/5xx surfaces as `runtime status failed:
+    /// {status} {body}` — HTTP status and body in the top frame, not
+    /// buried in a `Caused by:` chain.
+    ///
+    /// Used by `edge status runtime` where the user explicitly asked
+    /// for the data and a 404/401/500 should be diagnostically useful.
+    /// `edge logs` continues to use `get_app_status` because its hint
+    /// path silently swallows failures (logs are the primary goal).
+    pub fn app_status(&self, app_name: &str) -> Result<AppWorkerStatus> {
+        self.get_json_anyhow("runtime status", |base| {
+            format!("{base}/api/v1/apps/{app_name}/status")
+        })
+    }
+
+    pub(crate) fn http(&self) -> &Client {
+        &self.http
     }
 
     /// Upload a deployment artifact.
@@ -586,6 +610,16 @@ impl ApiClient {
         self.get_json_anyhow("list deployments", |base| {
             format!("{base}/api/v1/list/{app_name}")
         })
+    }
+
+    // ---- Custom-domain (issue #83) ----
+
+    /// Accessor for the `domains` namespace. The returned `DomainClient`
+    /// borrows this `ApiClient` so the API-key + base_url are shared
+    /// across all subcommands without cloning the underlying HTTP
+    /// client (which is already internally `Arc`-shared by reqwest).
+    pub fn domains(&self) -> crate::api::domains::DomainClient<'_> {
+        crate::api::domains::DomainClient { client: self }
     }
 }
 

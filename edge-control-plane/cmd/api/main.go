@@ -85,6 +85,7 @@ func main() {
 	workerRepo := repository.NewWorkerRepository(db)
 	trafficSplitRepo := repository.NewTrafficSplitRepository(db)
 	logEntryRepo := repository.NewLogEntryRepository(db)
+	domainRepo := repository.NewDomainRepository(db)
 
 	// Initialize NATS publisher
 	publisher, err := nats.NewNATSPublisher(cfg.NATS.URL)
@@ -127,13 +128,27 @@ func main() {
 	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
+	// Custom-domain service (issue #83). The migration from
+	// `apps`-FK-or-not is deferred; the service is built with the
+	// existing repos and the quota check (MaxDomainsPerApp=50) is
+	// enforced in the service layer. DomainService needs an
+	// appLookupForDomain (for the (tenant, app) existence check +
+	// row lock in AddDomain) AND a *sqlx.DB so it can wrap
+	// count+insert in a transaction that holds a SELECT … FOR
+	// UPDATE on the parent `apps` row. We pass the *AppRepository
+	// (not the *AppService wrapper) so WithTx binds the lock
+	// acquisition to the same tx that runs the count and the
+	// insert. Without the tx wrap, two concurrent AddDomain calls
+	// can both observe count==49 and both insert — closing that race
+	// is the fix from the second-pass PR #133 review.
+	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
 
 	// Initialize handlers
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, logEntryRepo)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -143,6 +158,7 @@ func main() {
 	logHandler := handler.NewLogHandler(logSvc)
 	workerStatusHandler := handler.NewWorkerStatusHandler(workerSvc)
 	metricsHandler := handler.NewMetricsHandler(metricsAgg)
+	domainHandler := handler.NewDomainHandler(domainSvc)
 
 	// Initialize middleware. The auth path delegates to APIKeyService
 	// (which dispatches to the algorithm-specific verifier) rather than
@@ -243,6 +259,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("POST /api/apps/{appName}/activate/{deploymentID}", redirectTo("/api/v1/apps/"+"{appName}/activate/"+"{deploymentID}"))
 	mux.HandleFunc("GET /api/apps/{appName}/logs", redirectTo("/api/v1/apps/"+"{appName}/logs"))
 	mux.HandleFunc("GET /api/apps/{appName}/status", redirectTo("/api/v1/apps/"+"{appName}/status"))
+	// Custom domains (issue #83)
+	mux.HandleFunc("POST /api/apps/{appName}/domains", redirectTo("/api/v1/apps/"+"{appName}/domains"))
+	mux.HandleFunc("GET /api/apps/{appName}/domains", redirectTo("/api/v1/apps/"+"{appName}/domains"))
+	mux.HandleFunc("GET /api/apps/{appName}/domains/{fqdn}", redirectTo("/api/v1/apps/"+"{appName}/domains/"+"{fqdn}"))
+	mux.HandleFunc("DELETE /api/apps/{appName}/domains/{fqdn}", redirectTo("/api/v1/apps/"+"{appName}/domains/"+"{fqdn}"))
 	// Deploy & status
 	mux.HandleFunc("POST /api/deploy/{appName}", redirectTo("/api/v1/deploy/"+"{appName}"))
 	mux.HandleFunc("GET /api/status/{deploymentID}", redirectTo("/api/v1/status/"+"{deploymentID}"))
@@ -296,6 +317,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/logs", logHandler.List)
 	api.HandleFunc("GET /api/v1/metrics", metricsHandler.GetTenantMetrics)
 
+	// Custom-domain routes (issue #83). Tenant-authenticated; the
+	// handler validates the FQDN shape and enforces the per-app
+	// quota. Routed through the same auth middleware as the rest of
+	// `/api/v1/`.
+	api.HandleFunc("POST /api/v1/apps/{appName}/domains", domainHandler.Add)
+	api.HandleFunc("GET /api/v1/apps/{appName}/domains", domainHandler.List)
+	api.HandleFunc("GET /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Get)
+	api.HandleFunc("DELETE /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
+
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
 	admin.HandleFunc("GET /api/v1/admin/tenants", tenantHandler.List)
@@ -326,8 +356,22 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)),
 	)
 
-	// Internal endpoints (worker-facing, JWT auth)
+	// Internal endpoints (worker-facing, JWT auth).
+	//
 	// Workers consume the latest contract; these paths are intentionally unversioned.
+	//
+	// The four custom-domain internal endpoints (`/api/internal/domains`,
+	// `/api/internal/tls-allowed`, `/api/internal/domains/{id}/status`)
+	// accept either `role: "worker"` or `role: "ingest"` tokens. The
+	// ingress uses a long-lived `ingest` JWT (printed at startup below);
+	// admins can also call them with a worker JWT.
+	// Workers consume the latest contract; these paths are intentionally unversioned.
+	//
+	// The four custom-domain internal endpoints (`/api/internal/domains`,
+	// `/api/internal/tls-allowed`, `/api/internal/domains/{id}/status`)
+	// accept either `role: "worker"` or `role: "ingest"` tokens. The
+	// ingress uses a long-lived `ingest` JWT (printed at startup below);
+	// admins can also call them with a worker JWT.
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
 	internalMux.HandleFunc("POST /api/internal/workers", internalHandler.RegisterWorker)
@@ -340,11 +384,59 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// other /api/internal/* endpoint, this is currently
 	// unauthenticated — see the comment on internalMux above.
 	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
+	// Custom-domain routes (issue #83). All three are gated to
+	// RoleIngest ONLY — the cross-tenant reads (ListDomains,
+	// TlsAllowed) return data for every tenant and would leak the
+	// entire tenant→FQDN→app mapping to any worker JWT in the
+	// platform (every v1 worker JWT defaults to RoleWorker, so
+	// RoleIngest+RoleWorker allowed = effectively no gate). The
+	// 30s ingress poller mints a long-lived ingest token at
+	// startup (cmd/api/mint.go), so no legitimate worker caller
+	// needs RoleWorker access here. UpdateDomainStatus is also
+	// Ingest-only because it mutates a row in any tenant's domain
+	// (intended receiver: the v2 Caddy event hook, which runs on
+	// the same ingress process as the poller).
+	internalMux.Handle("GET /api/internal/domains", middleware.RequireWorkerRole(
+		middleware.RoleIngest,
+	)(http.HandlerFunc(internalHandler.ListDomains)))
+	internalMux.Handle("GET /api/internal/tls-allowed", middleware.RequireWorkerRole(
+		middleware.RoleIngest,
+	)(http.HandlerFunc(internalHandler.TlsAllowed)))
+	internalMux.Handle("POST /api/internal/domains/{id}/status", middleware.RequireWorkerRole(
+		middleware.RoleIngest,
+	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 	workerJWTConfig := middleware.WorkerJWTConfig{
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
 	}
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
+
+	// Mint a long-lived service token for the edge-ingress poller
+	// (issue #83). The token is written to a 0600 file (NOT logged
+	// in plaintext) so the operator can copy it into the ingress's
+	// INGRESS_SERVICE_TOKEN env var. Region is sourced from the
+	// APP_REGION env var (the config file doesn't carry it because
+	// the control plane is region-agnostic — it's the ingress and
+	// workers that have region identity). If unset, skip — no
+	// ingress is going to talk to this control plane.
+	//
+	// The token file lands in the same dir as the artifact store
+	// (`cfg.Storage.ArtifactPath`) so operators have a single,
+	// predictable place to find all per-region secrets.
+	region := os.Getenv("APP_REGION")
+	if region != "" {
+		tok, err := mintIngressToken(cfg.JWT.Secret, cfg.JWT.Issuer, region)
+		if err != nil {
+			log.Fatalf("failed to mint ingress token: %v", err)
+		}
+		path, err := writeIngressTokenFile(cfg.Storage.ArtifactPath, region, tok)
+		if err != nil {
+			log.Fatalf("failed to write ingress token file: %v", err)
+		}
+		log.Printf("INGRESS_SERVICE_TOKEN written to %s (region=%s, expires in 1y, mode 0600)", path, region)
+	} else {
+		log.Printf("APP_REGION not set; skipping ingress service token mint (default-only mode)")
+	}
 
 	// Start server with graceful shutdown
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
