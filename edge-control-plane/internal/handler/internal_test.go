@@ -57,7 +57,7 @@ func newInternalHandler(svc handler.InternalDomainServiceInterface) *handler.Int
 	// We rely on the InternalHandler struct's `domainSvc` being the
 	// first thing the custom-domain routes read; the deployment
 	// service is only read by Download, which is not in this test set.
-	return handler.NewInternalHandler(nil, nil, svc, nil)
+	return handler.NewInternalHandler(nil, nil, svc, nil, nil)
 }
 
 // TestInternal_ListDomains_HappyPath pins the array-shape contract that
