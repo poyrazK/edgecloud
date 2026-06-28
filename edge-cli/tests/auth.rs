@@ -746,6 +746,49 @@ async fn keys_revoke_404_surfaces_in_stderr() {
         .stderr(predicate::str::contains("404"));
 }
 
+#[tokio::test]
+async fn keys_revoke_without_yes_in_non_tty_refuses_with_clear_error() {
+    // assert_cmd runs the child without a controlling TTY, so
+    // stderr.is_terminal() inside the CLI returns false. The TTY
+    // gate must fire BEFORE any prompt is read and BEFORE the DELETE
+    // is sent — refusing is friendlier than silently bypassing the
+    // confirmation in a non-interactive shell (CI, pipes, heredocs).
+    let home = common::isolated_home();
+    let keys = serde_json::json!([
+        {
+            "id": "k_other",
+            "name": "ci-deploy",
+            "role": "viewer",
+            "created_at": "2026-06-22T00:00:00Z",
+        },
+    ]);
+    let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+    // No DELETE mock. If the gate fires correctly, the child exits
+    // before sending any DELETE; if it does not, the unmounted
+    // route would panic the test (or a leftover 404 mock would
+    // give a misleading error message — neither is desired).
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_other");
+    // Note: no --yes, no --force.
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("pass --yes"));
+}
+
 /// D: when `edge.toml` `[deployment]` has no `api` key, the runtime
 /// must fall through to `EDGE_API_URL`. This pins the end-to-end
 /// behavior of the 7 call-site updates that switched from
