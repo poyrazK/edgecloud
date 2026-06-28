@@ -183,6 +183,31 @@ jobs:
         run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
 
   # ============================================================
+  # TEST-WASI-P1 — edge-runtime tests with the wasi-preview1 feature enabled
+  # The feature is absent from [features].default so the main test matrix
+  # never exercises it; this job fills that gap.
+  # ============================================================
+  test-wasi-p1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-edge-runtime-wasi-p1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run edge-runtime tests with wasi-preview1 feature
+        run: cargo test --manifest-path edge-runtime/Cargo.toml --features wasi-preview1
+
+  # ============================================================
   # TEST-EDGE-WORKER — integration tests for edge-worker (skipped in CI)
   # ============================================================
   test-edge-worker:

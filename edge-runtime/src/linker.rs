@@ -6,7 +6,13 @@ use anyhow::Result;
 use wasmtime::component::Linker as ComponentLinker;
 use wasmtime::Engine;
 #[cfg(feature = "wasi-preview1")]
-use wasmtime::Linker;
+use wasmtime::{Linker, Store};
+
+/// Number of epoch ticks before a P1 guest is interrupted.
+/// At the default 1 Hz background tick rate this is a 10-second wall-clock cap.
+/// Mirrors the guard the P2 path applies via the worker supervisor.
+#[cfg(feature = "wasi-preview1")]
+const P1_EPOCH_DEADLINE_TICKS: u64 = 10;
 
 /// Create a linker for core wasm modules (WASI Preview 1).
 ///
@@ -25,23 +31,50 @@ pub fn create_linker(
 /// Build a [`WasiP1Ctx`] suitable for use as the store data with [`create_linker`].
 ///
 /// stdout and stderr are inherited so guest output reaches the worker log.
-/// stdin is left empty — edge workers have no interactive input.
-///
-/// # Security
-/// Env vars are forwarded as-is; callers should strip sensitive keys
-/// (e.g. `AWS_*`, `*_SECRET`) before passing `env` here.
+/// stdin is left empty (EOF) — edge workers have no interactive input.
+/// Env vars are filtered through the same blocklist applied to P2 guests
+/// (`AWS_*`, `SECRET`, `API_KEY`, `DATABASE_URL`, etc.) before being
+/// forwarded to the guest.
 #[cfg(feature = "wasi-preview1")]
 pub fn build_wasi_p1_ctx(
     env: &[(impl AsRef<str>, impl AsRef<str>)],
     args: &[impl AsRef<str>],
 ) -> wasmtime_wasi::preview1::WasiP1Ctx {
+    use crate::interfaces::process::filter_env_vars;
     use wasmtime_wasi::WasiCtxBuilder;
+
+    let filtered: Vec<(String, String)> = filter_env_vars(
+        env.iter()
+            .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned())),
+    )
+    .collect();
+
     WasiCtxBuilder::new()
         .inherit_stdout()
         .inherit_stderr()
-        .envs(env)
+        .envs(&filtered)
         .args(args)
         .build_p1()
+}
+
+/// Create a [`Store`] for a WASI P1 module with memory limits and an epoch
+/// deadline pre-configured.
+///
+/// Epoch interruption is always enabled in [`create_engine`]; without a
+/// per-store deadline the engine never interrupts a runaway P1 guest.
+/// This function sets the deadline so callers get CPU-time limiting
+/// without any additional wiring.
+///
+/// [`create_engine`]: crate::engine::create_engine
+#[cfg(feature = "wasi-preview1")]
+pub fn create_p1_store(
+    engine: &Engine,
+    max_memory_mb: u64,
+    ctx: wasmtime_wasi::preview1::WasiP1Ctx,
+) -> Store<wasmtime_wasi::preview1::WasiP1Ctx> {
+    let mut store = crate::store::create_store(engine, max_memory_mb, ctx);
+    store.set_epoch_deadline(P1_EPOCH_DEADLINE_TICKS);
+    store
 }
 
 /// Create a linker for WASI Preview 2 components.
@@ -60,7 +93,6 @@ pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<Runtim
 mod tests {
     use super::*;
     use crate::engine::create_engine;
-    use crate::store::create_store;
     use wasmtime::Module;
 
     /// A P1 module whose sole import is `wasi_snapshot_preview1::proc_exit`.
@@ -86,7 +118,7 @@ mod tests {
         let module = Module::new(&engine, wat::parse_str(wat).expect("wat")).expect("module");
         let linker = create_linker(&engine).expect("linker");
         let ctx = build_wasi_p1_ctx(&[] as &[(&str, &str)], &["test-program"]);
-        let mut store = create_store(&engine, 64, ctx);
+        let mut store = create_p1_store(&engine, 64, ctx);
 
         let instance = linker
             .instantiate(&mut store, &module)
@@ -137,7 +169,7 @@ mod tests {
         let module = Module::new(&engine, wat::parse_str(wat).expect("wat")).expect("module");
         let linker = create_linker(&engine).expect("linker");
         let ctx = build_wasi_p1_ctx(&[] as &[(&str, &str)], &["my-app"]);
-        let mut store = create_store(&engine, 64, ctx);
+        let mut store = create_p1_store(&engine, 64, ctx);
 
         let instance = linker.instantiate(&mut store, &module).expect("instantiate");
         let check = instance

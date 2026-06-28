@@ -28,6 +28,6 @@ pub use runtime::RuntimeState;
 pub use store::create_store;
 
 #[cfg(feature = "wasi-preview1")]
-pub use linker::build_wasi_p1_ctx;
+pub use linker::{build_wasi_p1_ctx, create_linker, create_p1_store};
 #[cfg(feature = "wasi-preview1")]
 pub use wasmtime_wasi::preview1::WasiP1Ctx;
