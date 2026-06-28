@@ -9,10 +9,10 @@ use wasmtime::Engine;
 use wasmtime::{Linker, Store};
 
 /// Number of epoch ticks before a P1 guest is interrupted.
-/// At the default 1 Hz background tick rate this is a 10-second wall-clock cap.
-/// Mirrors the guard the P2 path applies via the worker supervisor.
+/// Matches the P2 worker default (`EPOCH_DEADLINE_TICKS=100`, `EPOCH_TICK_MS=10`),
+/// giving each guest call a ~1 s CPU budget at the default tick rate.
 #[cfg(feature = "wasi-preview1")]
-const P1_EPOCH_DEADLINE_TICKS: u64 = 10;
+const P1_EPOCH_DEADLINE_TICKS: u64 = 100;
 
 /// Create a linker for core wasm modules (WASI Preview 1).
 ///
@@ -40,14 +40,15 @@ pub fn build_wasi_p1_ctx(
     env: &[(impl AsRef<str>, impl AsRef<str>)],
     args: &[impl AsRef<str>],
 ) -> wasmtime_wasi::preview1::WasiP1Ctx {
-    use crate::interfaces::process::filter_env_vars;
     use wasmtime_wasi::WasiCtxBuilder;
 
-    let filtered: Vec<(String, String)> = filter_env_vars(
-        env.iter()
-            .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned())),
-    )
-    .collect();
+    // Filter on the key reference before cloning the value so blocked entries
+    // (AWS_*, SECRET, etc.) never reach a heap allocation for their value.
+    let filtered: Vec<(String, String)> = env
+        .iter()
+        .filter(|(k, _)| !crate::interfaces::process::is_blocked_env_key(k.as_ref()))
+        .map(|(k, v)| (k.as_ref().to_owned(), v.as_ref().to_owned()))
+        .collect();
 
     WasiCtxBuilder::new()
         .inherit_stdout()
@@ -60,18 +61,27 @@ pub fn build_wasi_p1_ctx(
 /// Create a [`Store`] for a WASI P1 module with memory limits and an epoch
 /// deadline pre-configured.
 ///
-/// Epoch interruption is always enabled in [`create_engine`]; without a
-/// per-store deadline the engine never interrupts a runaway P1 guest.
-/// This function sets the deadline so callers get CPU-time limiting
-/// without any additional wiring.
+/// Sets [`P1_EPOCH_DEADLINE_TICKS`] on the store so that a background thread
+/// calling `engine.increment_epoch()` (e.g. the worker's epoch ticker) will
+/// interrupt runaway guests. The deadline alone is not sufficient — a ticker
+/// thread must also be running.
 ///
-/// [`create_engine`]: crate::engine::create_engine
+/// # Panics (debug)
+/// Panics in debug builds when `max_memory_mb == 0`. Passing 0 would skip
+/// the memory limiter entirely (see [`create_store`]); always supply an
+/// explicit limit for P1 guests.
+///
+/// [`create_store`]: crate::store::create_store
 #[cfg(feature = "wasi-preview1")]
 pub fn create_p1_store(
     engine: &Engine,
     max_memory_mb: u64,
     ctx: wasmtime_wasi::preview1::WasiP1Ctx,
 ) -> Store<wasmtime_wasi::preview1::WasiP1Ctx> {
+    debug_assert!(
+        max_memory_mb > 0,
+        "max_memory_mb=0 skips the memory limiter; specify an explicit limit for P1 guests"
+    );
     let mut store = crate::store::create_store(engine, max_memory_mb, ctx);
     store.set_epoch_deadline(P1_EPOCH_DEADLINE_TICKS);
     store

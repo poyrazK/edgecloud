@@ -37,7 +37,7 @@ const BLOCKED_ENV_PREFIXES: &[&str] = &[
 ];
 
 /// Returns true if an env var name should not be exposed to the guest.
-fn is_blocked_env_key(key: &str) -> bool {
+pub(crate) fn is_blocked_env_key(key: &str) -> bool {
     BLOCKED_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 

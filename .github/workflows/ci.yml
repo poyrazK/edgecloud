@@ -192,6 +192,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile --manifest-path edge-runtime/Cargo.toml || true
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
