@@ -338,7 +338,7 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 		db:             db, // enable the tx-wrap path
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(badDir),
+		artifactStore:  storage.NewFSArtifactStore(badDir),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -408,7 +408,7 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 		db:             db, // enable the tx-wrap path
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(badDir),
+		artifactStore:  storage.NewFSArtifactStore(badDir),
 		appSvc:         appSvc,
 	}
 

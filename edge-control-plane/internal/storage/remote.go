@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"io/fs"
@@ -194,6 +195,19 @@ func (s *RemoteArtifactStore) Open(ctx context.Context, tenantID, appName, deplo
 // separate concern.
 func (s *RemoteArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	return s.cache.Delete(ctx, tenantID, appName, deploymentID)
+}
+
+// SaveAndHash writes the artifact to the local cache while computing
+// its SHA-256 in the same pass. Streams r through io.TeeReader to
+// both the cache.Save call and a sha256 hasher — no intermediate
+// buffer. Remote pull-through is the worker's job, not this method's.
+func (s *RemoteArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	hasher := sha256.New()
+	tee := io.TeeReader(r, hasher)
+	if err := s.cache.Save(ctx, tenantID, appName, deploymentID, tee); err != nil {
+		return nil, err
+	}
+	return hasher.Sum(nil), nil
 }
 
 // pullFromPeer GETs the artifact from the peer CP and writes it into

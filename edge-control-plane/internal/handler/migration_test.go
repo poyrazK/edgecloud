@@ -40,6 +40,20 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	return nil
 }
 
+func (m *mockDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
+	m.deleteCalls = append(m.deleteCalls, id)
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	for i, d := range m.deployments {
+		if d.ID == id {
+			m.deployments = append(m.deployments[:i], m.deployments[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
 // mockArtifactStore implements storage.ArtifactStore for testing.
 // Migrate / MigrateTree only call Save, so Open and Delete are
 // no-ops — they exist so the mock satisfies the wider interface

@@ -51,8 +51,11 @@ type DeploymentRepoInterface interface {
 }
 
 // ArtifactStoreInterface abstracts wasm artifact storage for testing.
+// Mirrors storage.ArtifactStore (ctx-aware) so rollbackArtifactSave
+// and test mocks can pass through to the production type without a
+// signature adapter.
 type ArtifactStoreInterface interface {
-	Save(tenantID, appName, deploymentID string, r io.Reader) error
+	Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error
 	// SaveAndHash streams the artifact to disk and returns its SHA-256
 	// in a single io.Copy pass (no intermediate buffer). Hash + write
 	// are concurrent via io.MultiWriter; the final path either
@@ -61,11 +64,11 @@ type ArtifactStoreInterface interface {
 	// caller needs the hash; the older Save was retained for callers
 	// that don't (and for the migration pre-compile path that
 	// already has the bytes hashed separately).
-	SaveAndHash(tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
+	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
 	// Delete removes an artifact. Idempotent on missing file. Used as
 	// the compensating write when the row insert fails after the
 	// artifact was written.
-	Delete(tenantID, appName, deploymentID string) error
+	Delete(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.

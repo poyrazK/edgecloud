@@ -159,6 +159,35 @@ func (s *S3ArtifactStore) Open(ctx context.Context, tenantID, appName, deploymen
 	return newLimitReadCloser(resp.Body, MaxArtifactSize), nil
 }
 
+// SaveAndHash streams the artifact to S3 while computing its
+// SHA-256 in the same io.MultiWriter pass. The streaming benefit
+// (no intermediate buffer) is preserved: the read fills the
+// hasher AND the request body concurrently. If Save fails the
+// hash is meaningless — caller treats it as best-effort.
+func (s *S3ArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	key, err := s.key(tenantID, appName, deploymentID)
+	if err != nil {
+		return nil, err
+	}
+	hasher := sha256.New()
+	body := io.TeeReader(r, hasher)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.objectURL(key), body)
+	if err != nil {
+		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/wasm")
+	signRequest(req, s.accessKey, s.secretKey, s.region, nil, "UNSIGNED-PAYLOAD")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: %w", key, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: status %d", key, resp.StatusCode)
+	}
+	return hasher.Sum(nil), nil
+}
+
 // Delete removes the artifact bytes from S3. Idempotent: a 404 (key
 // already gone) is treated as success so concurrent deletes don't
 // surface spurious errors, matching the FSArtifactStore contract.
