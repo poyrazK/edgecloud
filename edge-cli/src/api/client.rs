@@ -279,6 +279,17 @@ impl ApiClient {
         format!("Bearer {}", self.api_key.0)
     }
 
+    /// The raw bearer token this client authenticates with. Exposed
+    /// for CLI-side UX checks (e.g. `keys revoke`'s post-revoke
+    /// warning) that need to compare against a candidate key id
+    /// without going through a network round-trip. The value is
+    /// the same string the server echoes back as `api_key_id` in
+    /// `whoami`, so this accessor is the local equivalent of
+    /// `client.auth().whoami().api_key_id`.
+    pub(crate) fn bearer(&self) -> &str {
+        &self.api_key.0
+    }
+
     /// Returns the base URL this client targets. Useful for surfacing
     /// in error messages.
     pub fn base_url(&self) -> &str {

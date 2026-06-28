@@ -789,6 +789,80 @@ async fn keys_revoke_without_yes_in_non_tty_refuses_with_clear_error() {
         .stderr(predicate::str::contains("pass --yes"));
 }
 
+#[tokio::test]
+async fn keys_revoke_warning_omitted_when_env_key_unaffected() {
+    // PR #163 review finding F1: when EDGE_API_KEY env var differs
+    // from the on-disk saved key, the post-revoke warning must NOT
+    // fire for revoking the on-disk key — the env-backed bearer
+    // still works, so no re-login is needed.
+    let home = common::isolated_home();
+    common::seed_api_key(&home, "k_saved");
+
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_saved"))
+        .and(header("Authorization", "Bearer k_env"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .env("EDGE_API_KEY", "k_env")
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_saved")
+        .arg("--force")
+        .arg("--yes");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked key k_saved"))
+        // The bearer (k_env) was NOT revoked, so no re-login warning.
+        .stderr(predicate::str::contains("run `edge auth login`").not());
+}
+
+#[tokio::test]
+async fn keys_revoke_warning_fires_when_bearer_key_revoked() {
+    // PR #163 review finding F1: when the key just revoked IS the
+    // one the CLI session is authenticated with, the warning MUST
+    // fire — the user is about to be unable to run further CLI
+    // commands. The on-disk key here is the same as the bearer
+    // (no EDGE_API_KEY env), so ApiKey::load() returns the bearer.
+    let home = common::isolated_home();
+    common::seed_api_key(&home, "k_existing");
+
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_existing"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_existing")
+        .arg("--force")
+        .arg("--yes");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked key k_existing"))
+        // The bearer WAS revoked — warn the user.
+        .stderr(predicate::str::contains("run `edge auth login`"));
+}
+
 /// D: when `edge.toml` `[deployment]` has no `api` key, the runtime
 /// must fall through to `EDGE_API_URL`. This pins the end-to-end
 /// behavior of the 7 call-site updates that switched from

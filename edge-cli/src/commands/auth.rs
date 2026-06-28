@@ -489,20 +489,25 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
 
     output::success(&format!("Revoked key {id}"));
 
-    // If the user just revoked the key saved on disk, warn them —
-    // they will not be able to run further CLI commands until they
-    // re-login. We deliberately do NOT auto-clear the on-disk key
-    // here: --force users may be rotating intentionally (e.g. CI),
-    // and clearing the config could race with their intent.
-    if let Ok(saved) = ApiKey::load_without_env() {
-        if saved.0 == id {
-            if let Some(path) = ApiKey::config_path() {
-                output::warn(&format!(
-                    "the saved key at {} is the one you just revoked; \
-                     run `edge auth login` with a new key",
-                    path.display()
-                ));
-            }
+    // If the user just revoked the key this CLI session is
+    // authenticated with, warn them — they will not be able to run
+    // further CLI commands until they re-login. Compare against the
+    // bearer (which the self-guard at line 446-456 already read) so
+    // the warning and the guard agree on the source. When EDGE_API_KEY
+    // and the on-disk key differ, this fires only if the env-backed
+    // bearer is the one revoked — the prior `load_without_env()`-based
+    // warning misfired in that case (PR #163 review finding F1).
+    //
+    // We deliberately do NOT auto-clear the on-disk key here: --force
+    // users may be rotating intentionally (e.g. CI), and clearing the
+    // config could race with their intent.
+    if client.bearer() == id {
+        if let Some(path) = ApiKey::config_path() {
+            output::warn(&format!(
+                "the key just revoked is the one this CLI session is authenticated with \
+                 (saved at {}); run `edge auth login` with a new key",
+                path.display()
+            ));
         }
     }
 
