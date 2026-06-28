@@ -372,11 +372,13 @@ fn keys_list(as_json: bool) -> Result<()> {
     output::info(&format!("Endpoint: {base_url}"));
     let client = ApiClient::new(base_url)?;
 
-    // Best-effort: find the id of the key currently authenticating
-    // this CLI session so we can annotate the matching row. A
-    // transient whoami failure is swallowed; the table just loses
-    // the `(current)` marker for that run.
-    let current_id: Option<String> = client.auth().whoami().ok().map(|w| w.api_key_id);
+    // `current_id` is the bearer this CLI session is authenticated
+    // with — the same string `whoami.api_key_id` would echo back
+    // (server-side at edge-control-plane/internal/handler/auth.go).
+    // Reading from disk avoids a network round-trip; transient
+    // `ApiKey::load()` failures are swallowed (the table just loses
+    // the `(current)` marker for that run).
+    let current_id: Option<String> = ApiKey::load().ok().map(|k| k.0);
 
     let keys = client
         .keys()
@@ -429,16 +431,6 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
     output::info(&format!("Endpoint: {base_url}"));
     let client = ApiClient::new(base_url)?;
 
-    // Best-effort lookup of the target key's name (for the prompt
-    // and the post-revoke warning). On any failure (transient or
-    // 404), proceed with the id-only flow.
-    let target_name: Option<String> = client
-        .keys()
-        .list()
-        .ok()
-        .and_then(|keys| keys.into_iter().find(|k| k.id == id))
-        .map(|k| k.name);
-
     // Self-revoke guard. whoami tells us which key the bearer token
     // resolves to; if it matches the target, refuse unless --force.
     // If whoami itself fails, fall through and let the server decide
@@ -465,10 +457,7 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
                 "refusing to revoke without confirmation: pass --yes in non-interactive shells"
             );
         }
-        let label = target_name
-            .as_deref()
-            .map(|n| format!("{id} (\"{n}\")"))
-            .unwrap_or_else(|| id.to_string());
+        let label = id.to_string();
         let confirmed = output::confirm(&format!("Revoke key {label}? [y/N] "))?;
         if !confirmed {
             output::info("aborted");

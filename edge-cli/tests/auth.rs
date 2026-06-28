@@ -435,24 +435,11 @@ async fn keys_list_prints_table_with_current_marker() {
 
     common::seed_api_key(&home, "k_existing");
 
-    // whoami identifies the current key (matches the seeded one) so
-    // the matching row in the GET /api/v1/keys response should be
-    // annotated with "(current)".
-    Mock::given(method("GET"))
-        .and(path("/api/v1/auth/whoami"))
-        .and(header("Authorization", "Bearer k_existing"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "tenant_id": "t_seed",
-            "tenant_name": "Seed",
-            "plan": "free",
-            "api_key_id": "k_existing",
-            "api_key_name": "default",
-            "role": "developer",
-            "created_at": "2026-06-20T00:00:00Z",
-        })))
-        .mount(&server)
-        .await;
-
+    // The (current) marker is derived from the on-disk bearer via
+    // ApiKey::load() (not from a whoami round-trip) — see
+    // `keys_list_no_longer_calls_whoami` for the regression pin.
+    // The seeded key is "k_existing", so the matching row in the
+    // GET /api/v1/keys response should be annotated with "(current)".
     Mock::given(method("GET"))
         .and(path("/api/v1/keys"))
         .and(header("Authorization", "Bearer k_existing"))
@@ -1070,4 +1057,104 @@ async fn signup_warns_then_overwrites_when_saved_key_present() {
         stored, "k_new",
         "warn-then-proceed branch must still overwrite the saved key"
     );
+}
+
+#[tokio::test]
+async fn keys_list_no_longer_calls_whoami() {
+    // PR #163 review finding F4: `keys_list` used to call
+    // /api/v1/auth/whoami to compute the (current) marker. That
+    // round-trip is redundant — the on-disk bearer via
+    // ApiKey::load() is the same value the whoami response would
+    // echo (server-side at edge-control-plane/internal/handler/auth.go).
+    // This test mounts ONLY the list endpoint and asserts the CLI
+    // does not hit whoami (F5 silent-`.ok()`-swallow also goes away
+    // for free: whoami was never called in this path).
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_existing");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/keys"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "k_existing",
+                "name": "default",
+                "role": "developer",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+        ])))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("list");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("k_existing"))
+        .stdout(predicate::str::contains("(current)"));
+
+    // Pin: no whoami call was made. If `keys_list` regresses to
+    // call /api/v1/auth/whoami again, this assertion fires.
+    let received = server.received_requests().await.unwrap();
+    for req in &received {
+        assert!(
+            !req.url.path().contains("whoami"),
+            "keys_list must not call whoami (F4 regression): {}",
+            req.url
+        );
+    }
+}
+
+#[tokio::test]
+async fn keys_revoke_no_longer_calls_list_endpoint() {
+    // PR #163 review finding F4: `keys_revoke` used to call
+    // GET /api/v1/keys just to look up the target key's name for
+    // the prompt label. That round-trip is redundant — the id
+    // alone is enough context, and the call added a silent
+    // `.ok()` swallow on a future 4xx. This test mounts ONLY the
+    // DELETE endpoint and asserts the CLI does not hit list.
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_existing");
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_target"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_target")
+        .arg("--force")
+        .arg("--yes");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked key k_target"));
+
+    // Pin: no GET /api/v1/keys call was made. If `keys_revoke`
+    // regresses to look up the target name via list, this fires.
+    let received = server.received_requests().await.unwrap();
+    for req in &received {
+        assert!(
+            !(req.method == wiremock::http::Method::GET && req.url.path() == "/api/v1/keys"),
+            "keys_revoke must not call GET /api/v1/keys (F4 regression): {}",
+            req.url
+        );
+    }
 }
