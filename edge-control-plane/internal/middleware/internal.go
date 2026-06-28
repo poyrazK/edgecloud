@@ -49,3 +49,51 @@ func InternalAuth(expectedToken string) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// InternalOrWorkerAuth accepts either a valid worker JWT (Bearer in
+// Authorization) OR an X-Internal-Token header matching `expectedToken`.
+// It exists so the artifact download endpoint at
+// `/api/internal/download/{deploymentID}` can serve BOTH:
+//   - edge-workers, which present a 24h HMAC JWT (zero changes to the
+//     worker — same flow as today), AND
+//   - peer control planes, which present the operator-configured shared
+//     secret via RemoteArtifactStore's pull-through cache.
+//
+// The two lanes are independent: a worker presenting only the JWT still
+// gets through, a peer CP presenting only the token still gets through,
+// and a request presenting both is accepted (worker first, token as
+// fallback for requests without Authorization).
+//
+// Fail-closed: if `expectedToken` is empty, the token lane is disabled —
+// only worker JWTs are accepted. This means a misconfigured operator
+// (forgot to set EDGE_INTERNAL_TOKEN on the receiving CP) cannot
+// accidentally widen access; the token lane silently refuses every
+// request and the peer CP's pull-through just 404s on the missing
+// artifact. Workers are unaffected.
+//
+// The handler-level tenant scoping (worker.JWT.TenantID must match the
+// deployment's tenant_id) is NOT enforced here — it's the download
+// handler's responsibility. This middleware only authenticates the
+// caller; authorization lives one layer up where the deployment row
+// can be looked up.
+func InternalOrWorkerAuth(workerCfg WorkerJWTConfig, expectedToken string) func(http.Handler) http.Handler {
+	workerGate := WorkerAuth(workerCfg)
+	tokenGate := InternalAuth(expectedToken)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Lane 1: worker JWT. If the request has an Authorization
+			// header, let WorkerAuth decide (it 401s on missing/invalid
+			// token — we don't fall through to the token lane in that
+			// case, since presenting an Authorization header is an
+			// explicit "I am a worker" signal).
+			if r.Header.Get("Authorization") != "" {
+				workerGate(next).ServeHTTP(w, r)
+				return
+			}
+			// Lane 2: shared-secret internal token. Delegated entirely
+			// to InternalAuth, which already fail-closes on empty
+			// expectedToken and does the constant-time compare.
+			tokenGate(next).ServeHTTP(w, r)
+		})
+	}
+}

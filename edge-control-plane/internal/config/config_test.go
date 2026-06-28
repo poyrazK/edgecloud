@@ -153,3 +153,343 @@ func TestBundledConfig_FailsStartup(t *testing.T) {
 		t.Errorf("error %q should mention 'placeholder'", err.Error())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Storage backend selection — issue #127 (cross-region artifact replication)
+//
+// Load() runs validateStorageConfig after env-var overrides. These tests
+// pin the per-backend required-field matrix so a future relaxation
+// (e.g. dropping the remote token check) is caught by CI rather than
+// reaching production.
+// ---------------------------------------------------------------------------
+
+// TestLoad_StorageBackend_DefaultsToFS pins the backwards-compat
+// behavior: a config block with only `artifact_path` set (the existing
+// shipped config) is interpreted as the FS backend with no error.
+// Removing this contract would silently break every existing deployment.
+func TestLoad_StorageBackend_DefaultsToFS(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("STORAGE_ARTIFACT_BACKEND", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_path: "/tmp/artifacts"
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load with default FS backend: %v", err)
+	}
+	if cfg.Storage.ArtifactBackend != "" {
+		t.Errorf("ArtifactBackend = %q, want empty (defaults to fs)", cfg.Storage.ArtifactBackend)
+	}
+	if cfg.Storage.ArtifactPath != "/tmp/artifacts" {
+		t.Errorf("ArtifactPath = %q, want %q", cfg.Storage.ArtifactPath, "/tmp/artifacts")
+	}
+}
+
+// TestLoad_StorageBackend_AcceptsExplicitFS pins that selecting "fs"
+// explicitly is equivalent to leaving the field empty. The factory
+// treats both as FSArtifactStore.
+func TestLoad_StorageBackend_AcceptsExplicitFS(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("STORAGE_ARTIFACT_BACKEND", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "fs"
+  artifact_path: "/tmp/artifacts"
+`
+	_, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load with explicit fs backend: %v", err)
+	}
+}
+
+// TestLoad_StorageBackend_RejectsUnknown pins the typo-guard: an
+// unrecognized backend name fails startup rather than silently
+// falling through to fs. A typo like "s33" or "remote-storage" would
+// otherwise land the operator on the filesystem backend without
+// warning.
+func TestLoad_StorageBackend_RejectsUnknown(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "s33"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for unknown backend, got nil")
+	}
+	if !strings.Contains(err.Error(), "s33") {
+		t.Errorf("error %q should mention the offending backend name 's33'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "not a recognized backend") {
+		t.Errorf("error %q should mention 'not a recognized backend'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_S3 covers the S3 happy path: bucket + region
+// in YAML, no env-var overrides. This is the contract the S3ArtifactStore
+// constructor relies on at startup.
+func TestLoad_StorageBackend_S3(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("STORAGE_ARTIFACT_BACKEND", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "s3"
+  s3_bucket: "my-wasm-bucket"
+  s3_region: "us-east-1"
+  s3_endpoint: "http://localhost:9000"
+  s3_path_style: true
+  s3_key_prefix: "tenants/"
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load with S3 backend: %v", err)
+	}
+	if cfg.Storage.ArtifactBackend != "s3" {
+		t.Errorf("ArtifactBackend = %q, want %q", cfg.Storage.ArtifactBackend, "s3")
+	}
+	if cfg.Storage.S3Bucket != "my-wasm-bucket" {
+		t.Errorf("S3Bucket = %q, want %q", cfg.Storage.S3Bucket, "my-wasm-bucket")
+	}
+	if cfg.Storage.S3PathStyle != true {
+		t.Error("S3PathStyle = false, want true (minio)")
+	}
+	if cfg.Storage.S3KeyPrefix != "tenants/" {
+		t.Errorf("S3KeyPrefix = %q, want %q", cfg.Storage.S3KeyPrefix, "tenants/")
+	}
+}
+
+// TestLoad_StorageBackend_S3_RequiresBucket pins the missing-bucket
+// error. The S3 constructor would also reject this, but Load() catches
+// it earlier so the operator gets a config-validation error at startup
+// rather than a runtime error on first deploy.
+func TestLoad_StorageBackend_S3_RequiresBucket(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "s3"
+  s3_region: "us-east-1"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for s3 backend without bucket, got nil")
+	}
+	if !strings.Contains(err.Error(), "s3_bucket") {
+		t.Errorf("error %q should mention 's3_bucket'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_S3_RequiresRegion pins the missing-region
+// error. S3 SDK requires a region even for custom endpoints (minio).
+func TestLoad_StorageBackend_S3_RequiresRegion(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "s3"
+  s3_bucket: "my-wasm-bucket"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for s3 backend without region, got nil")
+	}
+	if !strings.Contains(err.Error(), "s3_region") {
+		t.Errorf("error %q should mention 's3_region'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_Remote covers the Remote happy path: all
+// three required fields (peer URL, peer token, local cache dir) set
+// in YAML.
+func TestLoad_StorageBackend_Remote(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("STORAGE_ARTIFACT_BACKEND", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "remote"
+  artifact_path: "/var/cache/edgecloud"
+  peer_control_plane_url: "https://cp-us-east.edgecloud.example"
+  peer_control_plane_internal_token: "shared-secret-at-least-thirty-two-bytes-long"
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load with Remote backend: %v", err)
+	}
+	if cfg.Storage.PeerControlPlaneURL != "https://cp-us-east.edgecloud.example" {
+		t.Errorf("PeerControlPlaneURL = %q, want cp-us-east URL", cfg.Storage.PeerControlPlaneURL)
+	}
+	if cfg.Storage.PeerControlPlaneInternalToken == "" {
+		t.Error("PeerControlPlaneInternalToken is empty after Load")
+	}
+}
+
+// TestLoad_StorageBackend_Remote_RequiresURL pins the missing-URL error.
+func TestLoad_StorageBackend_Remote_RequiresURL(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "remote"
+  artifact_path: "/var/cache/edgecloud"
+  peer_control_plane_internal_token: "shared-secret-at-least-thirty-two-bytes-long"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for remote backend without URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "peer_control_plane_url") {
+		t.Errorf("error %q should mention 'peer_control_plane_url'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_Remote_RequiresToken pins the fail-closed
+// token rule. An empty PeerControlPlaneInternalToken would let the
+// RemoteArtifactStore present an empty X-Internal-Token to the peer,
+// and the peer's middleware (which rejects empty tokens) would 401 —
+// but better to reject at this CP's startup so the operator gets a
+// clear config error rather than a per-deploy 502.
+func TestLoad_StorageBackend_Remote_RequiresToken(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "remote"
+  artifact_path: "/var/cache/edgecloud"
+  peer_control_plane_url: "https://cp-us-east.edgecloud.example"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for remote backend without token, got nil")
+	}
+	if !strings.Contains(err.Error(), "peer_control_plane_internal_token") {
+		t.Errorf("error %q should mention 'peer_control_plane_internal_token'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "fail-closed") {
+		t.Errorf("error %q should mention 'fail-closed'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_Remote_RequiresArtifactPath pins the
+// missing-cache-dir rule. The remote backend wraps an FSArtifactStore
+// for the local cache; without a path it can't construct one.
+func TestLoad_StorageBackend_Remote_RequiresArtifactPath(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "remote"
+  peer_control_plane_url: "https://cp-us-east.edgecloud.example"
+  peer_control_plane_internal_token: "shared-secret-at-least-thirty-two-bytes-long"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for remote backend without artifact_path, got nil")
+	}
+	if !strings.Contains(err.Error(), "artifact_path") {
+		t.Errorf("error %q should mention 'artifact_path'", err.Error())
+	}
+}
+
+// TestLoad_StorageBackend_EnvVarOverrides pins that STORAGE_*
+// env vars override YAML values. Mirrors the JWT_SECRET override test
+// at the top of this file; kept separate so a regression in the new
+// env-var handlers is caught even if the JWT ones pass.
+func TestLoad_StorageBackend_EnvVarOverrides(t *testing.T) {
+	// Reset every env var this test exercises so neither the host
+	// environment nor a prior sub-test leaks into it.
+	for _, k := range []string{
+		"JWT_SECRET", "STORAGE_ARTIFACT_BACKEND",
+		"STORAGE_S3_BUCKET", "STORAGE_S3_REGION",
+		"STORAGE_S3_ENDPOINT", "STORAGE_S3_PATH_STYLE",
+		"STORAGE_PEER_CONTROL_PLANE_URL",
+	} {
+		t.Setenv(k, "")
+	}
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "fs"
+  artifact_path: "/yaml/path"
+`
+	t.Setenv("STORAGE_ARTIFACT_BACKEND", "s3")
+	t.Setenv("STORAGE_S3_BUCKET", "env-bucket")
+	t.Setenv("STORAGE_S3_REGION", "eu-west-1")
+	t.Setenv("STORAGE_S3_ENDPOINT", "https://env.example")
+	t.Setenv("STORAGE_S3_PATH_STYLE", "true")
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load with env-var overrides: %v", err)
+	}
+	if cfg.Storage.ArtifactBackend != "s3" {
+		t.Errorf("ArtifactBackend = %q, want %q (env override)", cfg.Storage.ArtifactBackend, "s3")
+	}
+	if cfg.Storage.S3Bucket != "env-bucket" {
+		t.Errorf("S3Bucket = %q, want %q (env override)", cfg.Storage.S3Bucket, "env-bucket")
+	}
+	if cfg.Storage.S3Region != "eu-west-1" {
+		t.Errorf("S3Region = %q, want %q (env override)", cfg.Storage.S3Region, "eu-west-1")
+	}
+	if cfg.Storage.S3Endpoint != "https://env.example" {
+		t.Errorf("S3Endpoint = %q, want env override", cfg.Storage.S3Endpoint)
+	}
+	if cfg.Storage.S3PathStyle != true {
+		t.Error("S3PathStyle = false, want true (env override)")
+	}
+	if cfg.Storage.ArtifactPath != "/yaml/path" {
+		t.Errorf("ArtifactPath = %q, want %q (not env-overridden)", cfg.Storage.ArtifactPath, "/yaml/path")
+	}
+}
+
+// TestLoad_StorageBackend_S3PathStyle_RejectsInvalid pins the bool
+// parse guard. A typo in STORAGE_S3_PATH_STYLE (e.g. "yes") should
+// fail at startup rather than silently default to false (which would
+// break a minio deployment that depends on path-style URLs).
+func TestLoad_StorageBackend_S3PathStyle_RejectsInvalid(t *testing.T) {
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("STORAGE_S3_PATH_STYLE", "yes")
+
+	body := `
+jwt:
+  secret: "` + validSecret + `"
+storage:
+  artifact_backend: "s3"
+  s3_bucket: "b"
+  s3_region: "r"
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("expected error for invalid STORAGE_S3_PATH_STYLE, got nil")
+	}
+	if !strings.Contains(err.Error(), "STORAGE_S3_PATH_STYLE") {
+		t.Errorf("error %q should mention 'STORAGE_S3_PATH_STYLE'", err.Error())
+	}
+}

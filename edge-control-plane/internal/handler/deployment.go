@@ -260,6 +260,31 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writePublishFailureEnvelope writes the 502 Bad Gateway response for
+// a partially-failed Activate / Rollback / AutoRollback publish. The
+// body carries the per-region breakdown so the operator can see
+// exactly which regions got the message and which are pending retry.
+//
+// Used by all three 502 sites in this file + handler/internal.go.
+// If err is not a *service.PublishError (e.g. a future regression
+// that bypasses the typed wrapper), the body falls back to an
+// empty arrays + the static error message — the 502 contract
+// holds regardless. errors.Is(err, service.ErrPublishFailed) is
+// still matched by the caller before this helper is reached, so
+// callers don't need to repeat the sentinel check.
+func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
+	details := map[string]any{
+		"regions_published": []string{},
+		"regions_failed":    []string{},
+	}
+	var pubErr *service.PublishError
+	if errors.As(err, &pubErr) {
+		details["regions_published"] = pubErr.Published
+		details["regions_failed"] = pubErr.Failed
+	}
+	httperror.BadGatewayCtx(w, r, staticMessage, details)
+}
+
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
 //
 // Status codes:
@@ -310,9 +335,8 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
 			if errors.Is(err, service.ErrPublishFailed) {
-				http.Error(w,
-					`{"error": "activation committed but worker notification failed; please retry"}`,
-					http.StatusBadGateway)
+				writePublishFailureEnvelope(w, r, err,
+					"activation committed but worker notification failed; please retry")
 				return
 			}
 			log.Printf("internal error: %v", err)
@@ -395,9 +419,8 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, service.ErrPublishFailed) {
-			http.Error(w,
-				`{"error": "rollback committed but worker notification failed; please retry"}`,
-				http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 			return
 		}
 		log.Printf("internal error: %v", err)

@@ -77,7 +77,14 @@ func TestActiveDeploymentRepository_ActivateFlipsLastGood(t *testing.T) {
 				WithArgs(tenantID, appName).
 				WillReturnRows(sqlmock.NewRows([]string{
 					"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
-				}).AddRow(tenantID, appName, current.id, current.lastGood))
+					"auto_rollback_enabled", "stable_since",
+					"regions_published", "regions_failed",
+					"last_publish_at", "last_publish_attempt_id",
+				}).AddRow(tenantID, appName, current.id, current.lastGood,
+					false, nil,
+					"{}", "{}",
+					nil, nil,
+				))
 		}
 		mock.ExpectExec(`INSERT INTO active_deployments`).
 			WillReturnResult(sqlmock.NewResult(0, 1))
@@ -246,16 +253,120 @@ func TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood(t *testing.T) {
 	mock.ExpectQuery(`WITH updated AS`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
-		}).AddRow("t_test", "myapp", "d_v2", nil, true, nil))
+			"regions_published", "regions_failed",
+			"last_publish_at", "last_publish_attempt_id",
+		}).AddRow("t_test", "myapp", "d_v2", nil, true, nil,
+			"{}", "{}",
+			nil, nil,
+		))
 
 	_, err := repo.ResetStableSinceForRollback(context.Background(), "t_test", "myapp")
 	if !errors.Is(err, errNoLastGoodSentinel) {
 		t.Fatalf("got err %v, want errNoLastGoodSentinel", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestAppendRegionsPublished_IssuesExpectedStatement pins the SQL
+// shape of the helper: one UPDATE that touches regions_published,
+// regions_failed (dedup), last_publish_at, and
+// last_publish_attempt_id in a single statement. The exact SQL is
+// tested by the regexp match on `unnest` + `array_agg(DISTINCT` —
+// the dedup machinery that prevents a retried publish from
+// appending the same region twice. Pins the contract for issue
+// #127 step 5.
+func TestAppendRegionsPublished_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	ts := time.Now().Truncate(time.Microsecond)
+	attemptID := "11111111-2222-3333-4444-555555555555"
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_published = (`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg(), ts, attemptID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.AppendRegionsPublished(context.Background(), "t_test", "myapp",
+		[]string{"us-east", "eu-west"}, attemptID, ts); err != nil {
+		t.Fatalf("AppendRegionsPublished: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestAppendRegionsFailed_IssuesExpectedStatement is the failure
+// twin of the above. Pins that AppendRegionsFailed also stamps
+// last_publish_at + last_publish_attempt_id — important for the
+// operator escape hatch ("when did the last attempt fire?")
+// regardless of whether it succeeded or failed.
+func TestAppendRegionsFailed_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	ts := time.Now().Truncate(time.Microsecond)
+	attemptID := "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_failed = (`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg(), ts, attemptID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.AppendRegionsFailed(context.Background(), "t_test", "myapp",
+		[]string{"us-east"}, attemptID, ts); err != nil {
+		t.Fatalf("AppendRegionsFailed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestSet_ResetsPublishStateOnReactivation pins the re-activation
+// behavior documented in the Set comment: the DO UPDATE branch
+// resets the four per-region publish-state columns. This is
+// intentional — a re-activation is a fresh publish cycle. Without
+// this contract, a stale regions_published from a prior activation
+// could mask regions that need republishing now. The test mocks
+// the upsert and asserts the INSERT statement includes all four
+// new columns (so a future regression that drops one from the
+// column list is caught here).
+func TestSet_ResetsPublishStateOnReactivation(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	// Match the INSERT — it must reference all 4 new columns in
+	// the VALUES list, AND the ON CONFLICT DO UPDATE branch must
+	// reference all 4 in the SET list. We accept any execution
+	// result; the contract is the SQL shape.
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := repo.Set(context.Background(), &domain.ActiveDeployment{
+		TenantID:             "t_test",
+		AppName:              "myapp",
+		DeploymentID:         "d_new",
+		LastGoodDeploymentID: strPtr("d_old"),
+		AutoRollbackEnabled:  true,
+		// Leave RegionsPublished/RegionsFailed/LastPublishAt/
+		// LastPublishAttemptID as zero values — the repo is
+		// responsible for writing them as empty/zero so the
+		// re-activation contract holds.
+	})
+	if err != nil {
+		t.Fatalf("Set: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)

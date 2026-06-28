@@ -42,8 +42,37 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	// overwritten on the next activate. That is the desired semantics
 	// for the v1 feature — tenants opt in via `edge deploy --auto-rollback`
 	// and the flag follows the deployment row, not the active slot.
-	query := `INSERT INTO active_deployments (tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (tenant_id, app_name) DO UPDATE SET deployment_id = $3, last_good_deployment_id = $4, auto_rollback_enabled = $5`
-	_, err := r.db.ExecContext(ctx, query, ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled)
+	//
+	// Per-region publish-state columns (regions_published,
+	// regions_failed, last_publish_at, last_publish_attempt_id) ARE in
+	// the DO UPDATE clause and are reset to their zero values on
+	// re-activation. This is intentional: a re-activation is a fresh
+	// publish cycle, so the prior activation's "regions already
+	// notified" history must not mask regions that need (re)publishing
+	// on this activation. AppendRegionsPublished /
+	// AppendRegionsFailed repopulate the columns after the publish loop.
+	query := `INSERT INTO active_deployments (
+		tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled,
+		regions_published, regions_failed, last_publish_at, last_publish_attempt_id
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	ON CONFLICT (tenant_id, app_name) DO UPDATE SET
+		deployment_id = $3,
+		last_good_deployment_id = $4,
+		auto_rollback_enabled = $5,
+		regions_published = $6,
+		regions_failed = $7,
+		last_publish_at = $8,
+		last_publish_attempt_id = $9`
+	// pq.StringArray must be non-nil for the NOT NULL DEFAULT '{}'
+	// columns to take a value rather than a SQL NULL. domain.StringArrayFrom
+	// converts nil → empty pq.StringArray. Same for the *time.Time and
+	// *string fields — passing nil pointer writes SQL NULL.
+	regionsPublished := domain.StringArrayFrom(ad.RegionsPublished)
+	regionsFailed := domain.StringArrayFrom(ad.RegionsFailed)
+	_, err := r.db.ExecContext(ctx, query,
+		ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled,
+		regionsPublished, regionsFailed, ad.LastPublishAt, ad.LastPublishAttemptID,
+	)
 	return err
 }
 
@@ -198,7 +227,7 @@ var (
 
 func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -211,7 +240,7 @@ func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName 
 // deployment_id ↔ last_good_deployment_id atomically. Pair with WithTx.
 func (r *ActiveDeploymentRepository) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -226,7 +255,72 @@ func (r *ActiveDeploymentRepository) Delete(ctx context.Context, tenantID, appNa
 
 func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
 	var ads []domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since FROM active_deployments WHERE tenant_id = $1`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1`
 	err := r.db.SelectContext(ctx, &ads, query, tenantID)
 	return ads, err
+}
+
+// AppendRegionsPublished atomically merges `regions` into the
+// `regions_published` array on the (tenant, app) active row, AND
+// removes them from `regions_failed` (a region that succeeds on
+// retry is no longer "failed"). Also stamps last_publish_at = NOW()
+// and last_publish_attempt_id to the supplied UUID. The whole
+// mutation happens in one UPDATE so a concurrent reader opening a
+// tx after this statement commits sees either the pre- or
+// post-state, never a half-applied merge.
+//
+// The (tenant, app) match is the only WHERE clause — there's no
+// guard on regions_published contents. Re-publishing the same
+// region is a no-op for the array contents (UNNEST + array_agg +
+// DISTINCT collapses dupes) but DOES bump last_publish_at /
+// last_publish_attempt_id, which is the correct audit-log semantic.
+//
+// Uses unnest() + array_agg(DISTINCT ...) rather than `||` to drop
+// dupes in one statement. `||` would happily append `us-east`
+// twice if the caller re-invoked with the same region.
+func (r *ActiveDeploymentRepository) AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error {
+	query := `
+		UPDATE active_deployments
+		SET regions_published = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_published || $3::text[]) AS r
+		),
+		regions_failed = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_failed) AS r
+			WHERE r <> ALL($3::text[])
+		),
+		last_publish_at = $4,
+		last_publish_attempt_id = $5
+		WHERE tenant_id = $1 AND app_name = $2
+	`
+	regionsArr := domain.StringArrayFrom(regions)
+	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr, ts, attemptID)
+	return err
+}
+
+// AppendRegionsFailed atomically merges `regions` into the
+// `regions_failed` array on the (tenant, app) active row. Does NOT
+// clear regions_published — a region that succeeded earlier in
+// the loop and then failed later is in BOTH arrays for the rest of
+// the call, but the service layer's union-then-dedup logic on the
+// next activate call treats them as "needs republish" regardless.
+//
+// Stamps last_publish_at = NOW() so the operator escape-hatch
+// `SELECT last_publish_at WHERE ...` reflects the failure even
+// when no region succeeded.
+func (r *ActiveDeploymentRepository) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error {
+	query := `
+		UPDATE active_deployments
+		SET regions_failed = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_failed || $3::text[]) AS r
+		),
+		last_publish_at = $4,
+		last_publish_attempt_id = $5
+		WHERE tenant_id = $1 AND app_name = $2
+	`
+	regionsArr := domain.StringArrayFrom(regions)
+	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr, ts, attemptID)
+	return err
 }

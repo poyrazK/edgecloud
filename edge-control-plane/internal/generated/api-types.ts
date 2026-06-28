@@ -668,7 +668,24 @@ export interface paths {
         };
         /**
          * Download the Wasm artifact for a deployment
-         * @description Used by workers to download artifact content after a task update. Requires a valid worker JWT.
+         * @description Used by workers to download artifact content after a task update,
+         *     AND by peer control planes to pull artifacts through this CP for
+         *     a remote region's worker. Auth is dual-lane:
+         *
+         *       - **Worker JWT** (existing): a valid 24h HMAC JWT in
+         *         `Authorization: Bearer <token>`. Used by every edge-worker
+         *         today.
+         *       - **Internal token** (new, issue #127 step 3): the
+         *         `X-Internal-Token: <value>` header matching the receiving
+         *         CP's `internal_token` config. Used by a peer CP whose local
+         *         cache is cold when a worker in its region calls. The peer
+         *         CP must use `https://` to protect the token in transit.
+         *
+         *     A request presenting `Authorization` is dispatched to the worker
+         *     lane (and rejected if the JWT is invalid); a request without
+         *     `Authorization` is dispatched to the internal-token lane. The
+         *     internal-token lane is fail-closed when `internal_token` is
+         *     unset, so a misconfigured CP cannot accidentally widen access.
          */
         get: operations["downloadArtifact"];
         put?: never;

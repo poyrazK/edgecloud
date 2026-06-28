@@ -12,6 +12,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
 // InternalDomainServiceInterface is the slice of *service.DomainService
@@ -36,20 +37,40 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 
 // InternalHandler handles internal worker-facing endpoints.
 //
+// `deploymentSvc` is held as the narrow autoRollbacker interface so
+// tests can stub AutoRollback without standing up the full
+// *service.DeploymentService (DB + NATS + publisher + artifact store).
+// Download uses two methods of the same underlying service
+// (GetDeployment, GetArtifact); these also live on the interface so
+// the production code path is unchanged. The concrete
+// *service.DeploymentService satisfies it, so the existing caller in
+// cmd/api/main.go compiles unchanged.
+//
 // `domainSvc` is nil when the binary is built without custom-domain
 // support (default-only mode) — every method that needs it returns
 // 501. `logEntryRepo` is the worker log ingest path (issue #76);
 // required by AutoRollback's audit trail and any future log-bearing
 // endpoint.
 type InternalHandler struct {
-	deploymentSvc *service.DeploymentService
+	deploymentSvc autoRollbacker
 	workerSvc     *service.WorkerService
 	domainSvc     InternalDomainServiceInterface
 	logEntryRepo  logEntryRepo
 }
 
+// autoRollbacker is the narrow contract InternalHandler's endpoints
+// need. Combines AutoRollback's RollbackDeployment with Download's
+// GetDeployment + GetArtifact so the production code path doesn't need
+// to switch field accessors. Mirrors the pattern in DeploymentHandler
+// (deploymentRollbacker in deployment.go).
+type autoRollbacker interface {
+	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
+	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
+}
+
 func NewInternalHandler(
-	deploymentSvc *service.DeploymentService,
+	deploymentSvc autoRollbacker,
 	workerSvc *service.WorkerService,
 	domainSvc InternalDomainServiceInterface,
 	logEntryRepo logEntryRepo,
@@ -76,6 +97,10 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 
 	artifact, err := h.deploymentSvc.GetArtifact(r.Context(), deployment.TenantID, deployment.AppName, deployment.ID)
 	if err != nil {
+		if errors.Is(err, storage.ErrArtifactTooLarge) {
+			httperror.PayloadTooLargeCtx(w, r, "artifact exceeds maximum size")
+			return
+		}
 		httperror.NotFoundCtx(w, r, "artifact not found")
 		return
 	}
@@ -223,7 +248,8 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, service.ErrAutoRollbackDisabled):
 			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
 		case errors.Is(err, service.ErrPublishFailed):
-			http.Error(w, `{"error": "rollback committed but worker notification failed; please retry"}`, http.StatusBadGateway)
+			writePublishFailureEnvelope(w, r, err,
+				"rollback committed but worker notification failed; please retry")
 		default:
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)

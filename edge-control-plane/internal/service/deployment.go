@@ -81,7 +81,12 @@ func IsValidRegion(r string) bool {
 }
 
 // MaxArtifactSize is the maximum allowed artifact size in bytes (100 MiB).
-const MaxArtifactSize = 100 * 1024 * 1024
+//
+// The canonical constant lives in internal/storage so the read-side cap
+// (used by ArtifactStore.Open) and the upload-side cap (used by the
+// migration handler) stay colocated. This alias preserves the existing
+// in-package reference for upload-side callers.
+const MaxArtifactSize = storage.MaxArtifactSize
 
 // MaxRegionsPerDeployment caps the number of regions a single deployment
 // can target. Defensive ceiling against fan-out abuse; realistic tenants
@@ -113,6 +118,12 @@ var (
 	// deployment; the client should treat this as a transient
 	// infrastructure failure. Handler maps to HTTP 502. The wrapped
 	// cause (using Go 1.20+ multi-%w) is preserved for logs.
+	//
+	// On issue #127 step 6, ActivateDeployment / RollbackDeployment
+	// additionally wrap this sentinel inside a *PublishError so the
+	// HTTP layer can surface the exact per-region breakdown via
+	// errors.As. errors.Is(err, ErrPublishFailed) continues to
+	// work — Unwrap() preserves the sentinel match.
 	ErrPublishFailed = fmt.Errorf("publishing task update failed")
 	// ErrAutoRollbackDisabled is returned by RollbackDeployment (via
 	// the repo's ResetStableSinceForRollback SQL guard) when the
@@ -127,6 +138,56 @@ var (
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
 
+// PublishError carries the per-region outcome of a fan-out
+// publish. Returned by ActivateDeployment / RollbackDeployment
+// when at least one region's NATS publish failed; the wrapped
+// Err is always ErrPublishFailed so existing
+// errors.Is(err, ErrPublishFailed) checks keep working.
+//
+// The HTTP layer matches via errors.As and writes the
+// regions_published / regions_failed arrays in the 502 body so the
+// operator can see exactly which regions got the message and which
+// are still pending retry. See handler/deployment.go for the
+// envelope shape.
+//
+// Published is the deduped set of regions whose publish succeeded
+// on THIS activation attempt (NOT the cumulative regions_published
+// column on the active_deployments row — that column is updated by
+// AppendRegionsPublished after the loop). Failed is the regions
+// whose publish failed this attempt; those are merged into
+// regions_failed by AppendRegionsFailed.
+//
+// Zero value is unusable; always construct via `&PublishError{...}`
+// so Unwrap is set.
+type PublishError struct {
+	Published []string
+	Failed    []string
+	Err       error
+}
+
+// Error renders the publish error in a stable human-readable form.
+// Includes the per-region breakdown so log lines are diagnostic
+// without needing to inspect the struct fields.
+func (e *PublishError) Error() string {
+	if e == nil {
+		return "<nil PublishError>"
+	}
+	return fmt.Sprintf("%s (published=%v, failed=%v)",
+		e.Err.Error(), e.Published, e.Failed)
+}
+
+// Unwrap returns the wrapped sentinel so errors.Is(err, ErrPublishFailed)
+// keeps matching. This is the contract that handler/deployment.go
+// (and the pre-step-6 string-error path) relies on — both the
+// wrapped sentinel AND the typed error must be reachable from the
+// returned value.
+func (e *PublishError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -135,7 +196,7 @@ type DeploymentService struct {
 	appEnvRepo     *repository.AppEnvRepository
 	quotaRepo      *repository.QuotaRepository
 	tenantRepo     *repository.TenantRepository
-	artifactStore  *storage.ArtifactStore
+	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
 	// defaultRegion is this control plane's own region. Used as the
@@ -155,7 +216,7 @@ func NewDeploymentService(
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
 	tenantRepo *repository.TenantRepository,
-	artifactStore *storage.ArtifactStore,
+	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
 ) *DeploymentService {
@@ -293,7 +354,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	}
 
 	// Save artifact
-	if err := s.artifactStore.Save(tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
+	if err := s.artifactStore.Save(ctx, tenantID, appName, deployment.ID, bytes.NewReader(data)); err != nil {
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
 
@@ -463,35 +524,148 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	return s.publishSwap(ctx, msg, regions, deploymentID)
+	return s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions)
 }
 
-// publishSwap fans a TaskMessage out to every region in `regions`.
-// Used by ActivateDeployment and RollbackDeployment so they cannot
-// drift in their region-fanout behavior (the prior Rollback path
-// published to "global" only, leaving multi-region deployments
-// stuck on the broken version until the next heartbeat).
+// publishSwap fans a TaskMessage out to every region in `regions`,
+// skipping regions that have already been published for this
+// (tenant, app) activation and always retrying regions in
+// regions_failed. Used by ActivateDeployment and RollbackDeployment
+// so they cannot drift in their region-fanout behavior (the prior
+// Rollback path published to "global" only, leaving multi-region
+// deployments stuck on the broken version until the next heartbeat).
+//
+// Idempotency (issue #127 step 6):
+//   - Reads the committed active_deployments row to discover
+//     regions_published (skip — already on the wire) and
+//     regions_failed (always retry — never let a stale
+//     regions_published mask a real failure; see Risk 3 in the
+//     issue #127 plan).
+//   - The publish set is (regions ∪ regions_failed) − regions_published.
+//   - If empty (every region already published), returns nil
+//     without touching the publisher or the DB.
 //
 // Failures in a single region are logged and accumulated into the
-// returned error — we keep publishing to the remaining regions
-// rather than aborting on the first failure, so a transient NATS
-// blip in one region doesn't starve the others. If at least one
-// region fails the error is wrapped with ErrPublishFailed (matched
-// by the HTTP layer for 502); the per-region list is preserved
-// through Go's multi-%w error wrapping so logs can show the full
-// picture. The DB row has already committed by the time we get
-// here, so workers may still be serving the prior deployment; the
-// caller surfaces this as a transient failure to the client.
-func (s *DeploymentService) publishSwap(ctx context.Context, msg *nats.TaskMessage, regions []string, deploymentID string) error {
-	var failedRegions []string
-	for _, region := range regions {
+// returned *PublishError — we keep publishing to the remaining
+// regions rather than aborting on the first failure, so a
+// transient NATS blip in one region doesn't starve the others.
+//
+// On success, persists the per-region outcome via
+// activeRepo.AppendRegionsPublished / AppendRegionsFailed so the
+// next retry call can short-circuit. The append is best-effort:
+// a DB write failure is logged but does not change the returned
+// error — the publish itself already succeeded and the operator
+// would rather see the per-region 502 envelope than a misleading
+// 500.
+//
+// The DB tx has already committed by the time we get here, so
+// workers may still be serving the prior deployment; the caller
+// surfaces this as a transient 502 to the client.
+//
+// Returns nil on full success, or *PublishError{Published, Failed}
+// wrapping ErrPublishFailed on any per-region failure.
+// errors.Is(err, ErrPublishFailed) matches via the *PublishError's
+// Unwrap, preserving the contract the pre-step-6 handler relied on.
+func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string) error {
+	// Read the committed row's publish state. The Set upsert at the
+	// start of Activate / Rollback wipes regions_published and
+	// regions_failed to empty (see ActiveDeploymentRepository.Set's
+	// DO UPDATE clause), so on a first attempt the toPublish set
+	// equals `regions`; on a retry of a partially-failed
+	// activation, prior successes are skipped and prior failures
+	// are included.
+	current, err := s.activeRepo.Get(ctx, tenantID, appName)
+	if err != nil {
+		return fmt.Errorf("reading publish state: %w", err)
+	}
+	alreadyPublished := make(map[string]struct{}, len(current.RegionsPublished))
+	for _, r := range current.RegionsPublished {
+		alreadyPublished[r] = struct{}{}
+	}
+	mustRetry := make(map[string]struct{}, len(current.RegionsFailed))
+	for _, r := range current.RegionsFailed {
+		mustRetry[r] = struct{}{}
+	}
+
+	// toPublish = (regions ∪ regions_failed) − regions_published
+	// Preserves input order for log determinism.
+	seen := make(map[string]struct{}, len(regions))
+	toPublish := make([]string, 0, len(regions)+len(mustRetry))
+	for _, r := range regions {
+		if _, ok := alreadyPublished[r]; ok {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		toPublish = append(toPublish, r)
+	}
+	for r := range mustRetry {
+		if _, ok := alreadyPublished[r]; ok {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		toPublish = append(toPublish, r)
+	}
+	if len(toPublish) == 0 {
+		// All requested regions already published. Short-circuit;
+		// do not bump last_publish_at since nothing happened.
+		return nil
+	}
+
+	attemptID := uuid.NewString()
+	now := time.Now()
+	var published []string
+	var failed []string
+	for _, region := range toPublish {
 		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
 			log.Printf("publishing task update failed for region %q (deployment %s): %v", region, deploymentID, err)
-			failedRegions = append(failedRegions, region)
+			failed = append(failed, region)
+			continue
+		}
+		published = append(published, region)
+	}
+
+	// Best-effort persistence. Failures here are logged but do
+	// not change the returned error — the publish itself already
+	// happened, and the operator would rather see the structured
+	// 502 envelope than a misleading 500 caused by an audit-log
+	// write failing.
+	//
+	// Both appends share one tx so the row's (regions_published,
+	// regions_failed, last_publish_at, last_publish_attempt_id) stay
+	// consistent even if the process crashes mid-write. Within the
+	// closure, returning the first error aborts the tx and Rollback
+	// discards the first append — the desired atomicity.
+	if len(published) > 0 || len(failed) > 0 {
+		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+			txRepo := s.activeRepo.WithTx(tx)
+			if len(published) > 0 {
+				if err := txRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_published: %w", err)
+				}
+			}
+			if len(failed) > 0 {
+				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
+					return fmt.Errorf("append regions_failed: %w", err)
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Printf("warning: persisting publish state for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
 		}
 	}
-	if len(failedRegions) > 0 {
-		return fmt.Errorf("%w: %d region(s) failed: %s", ErrPublishFailed, len(failedRegions), strings.Join(failedRegions, ","))
+
+	if len(failed) > 0 {
+		return &PublishError{
+			Published: published,
+			Failed:    failed,
+			Err:       ErrPublishFailed,
+		}
 	}
 	return nil
 }
@@ -623,7 +797,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			},
 		},
 	}
-	if err := s.publishSwap(ctx, msg, regions, rolledBackID); err != nil {
+	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
 		return "", err
 	}
 
@@ -728,5 +902,5 @@ func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, 
 	if deployment.TenantID != tenantID || deployment.AppName != appName {
 		return nil, fmt.Errorf("deployment not found")
 	}
-	return s.artifactStore.Open(tenantID, appName, deploymentID)
+	return s.artifactStore.Open(ctx, tenantID, appName, deploymentID)
 }

@@ -220,6 +220,37 @@ GET /api/internal/download/{deploymentID}
 Content-Type: `application/octet-stream`
 Response: Raw Wasm bytes
 
+#### Activation Idempotency & Multi-region Publish (issue #127)
+
+`POST /api/apps/{appName}/activate/{deploymentID}?regions=...` is
+idempotent across retries. The control plane tracks per-region
+publish state on `active_deployments` (see §4.3) so a retry skips
+regions already successfully published and always retries regions
+that failed on the prior attempt:
+
+```
+toPublish = (deployment.Regions ∪ regions_failed) − regions_published
+```
+
+If the computed `toPublish` is empty, the activation is a no-op — the
+row already flipped, which is the correct semantic. NATS JetStream
+workqueue retention dedupes by message id, so re-publishing an
+already-published region is a safe no-op on the worker side.
+
+When at least one region's publish fails, the control plane returns
+**HTTP 502** with a per-region breakdown:
+
+```json
+{
+  "error": "activation committed but worker notification failed; please retry",
+  "regions_published": ["us-east"],
+  "regions_failed": ["eu-west"]
+}
+```
+
+The tenant can re-issue the activate and only the failed regions will
+be re-published. Same envelope applies to the rollback path.
+
 ### 4.3 Data Model (PostgreSQL)
 
 ```sql
@@ -269,6 +300,15 @@ CREATE TABLE active_deployments (
     tenant_id   TEXT NOT NULL,
     app_name    TEXT NOT NULL,
     deployment_id TEXT NOT NULL REFERENCES deployments(id),
+    -- Per-region publish state (issue #127, migration 010).
+    -- regions_published / regions_failed make ActivateDeployment
+    -- idempotent: a retry skips regions already published, always
+    -- retries regions that failed previously. The DB row is the
+    -- recovery aid; the publish itself is the source of truth.
+    regions_published       TEXT[] NOT NULL DEFAULT '{}',
+    regions_failed          TEXT[] NOT NULL DEFAULT '{}',
+    last_publish_at         TIMESTAMPTZ,
+    last_publish_attempt_id UUID,
     PRIMARY KEY (tenant_id, app_name)
 );
 
@@ -364,6 +404,29 @@ On receiving a `TaskMessage`:
 - Cache hit: serve from local disk
 - Cache miss or hash changed: `GET /api/internal/download/{deploymentID}`
 - Invalidate cache entry when deployment hash changes
+
+#### 5.4.1 Multi-region artifact replication (issue #127)
+
+In a multi-region deployment, each regional control plane can be
+configured with one of three artifact backends (`storage.artifact_backend`):
+
+- `fs` (default) — local filesystem at `/registry/...`. Single-region only.
+- `s3` — `s3://<bucket>/<key>/<tenant>/<app>/<d>.wasm`. Every CP reads
+  directly from the shared bucket; no peer relationship needed.
+- `remote` — pull-through cache. Each CP has a local FS cache; on miss
+  it `GET`s the artifact from a configured peer CP over HTTPS using a
+  shared `X-Internal-Token` header. First request pays cross-region
+  latency once, then every subsequent request hits the local cache.
+
+Worker-side download is unchanged: workers always hit their local
+control plane via the JWT-authenticated
+`/api/internal/download/{deploymentID}` endpoint. The peer-pull path
+is invisible to workers. See `edge-control-plane/docs/storage.md`
+for the operator-facing config matrix.
+
+The `/api/internal/download/{deploymentID}` endpoint accepts EITHER
+a worker JWT (existing) OR an `X-Internal-Token` header (new) — the
+two lanes dispatch by which credential is presented.
 
 ### 5.5 Port Assignment
 

@@ -11,13 +11,15 @@ import (
 type ErrorCode string
 
 const (
-	CodeBadRequest    ErrorCode = "BAD_REQUEST"
-	CodeUnauthorized  ErrorCode = "UNAUTHORIZED"
-	CodeForbidden     ErrorCode = "FORBIDDEN"
-	CodeNotFound      ErrorCode = "NOT_FOUND"
-	CodeConflict      ErrorCode = "CONFLICT"
-	CodeQuotaExceeded ErrorCode = "QUOTA_EXCEEDED"
-	CodeInternalError ErrorCode = "INTERNAL_ERROR"
+	CodeBadRequest      ErrorCode = "BAD_REQUEST"
+	CodeUnauthorized    ErrorCode = "UNAUTHORIZED"
+	CodeForbidden       ErrorCode = "FORBIDDEN"
+	CodeNotFound        ErrorCode = "NOT_FOUND"
+	CodeConflict        ErrorCode = "CONFLICT"
+	CodeQuotaExceeded   ErrorCode = "QUOTA_EXCEEDED"
+	CodeInternalError   ErrorCode = "INTERNAL_ERROR"
+	CodeBadGateway      ErrorCode = "BAD_GATEWAY"
+	CodePayloadTooLarge ErrorCode = "PAYLOAD_TOO_LARGE"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -129,4 +131,50 @@ func InternalError(w http.ResponseWriter) {
 // InternalErrorCtx reports an unspecified server fault with trace context (HTTP 500).
 func InternalErrorCtx(w http.ResponseWriter, r *http.Request) {
 	write(w, CodeInternalError, "internal error", http.StatusInternalServerError, requestIDFromContext(r.Context()))
+}
+
+// PayloadTooLarge reports an oversize request body or response stream (HTTP 413).
+func PayloadTooLarge(w http.ResponseWriter, message string) {
+	write(w, CodePayloadTooLarge, message, http.StatusRequestEntityTooLarge, "")
+}
+
+// PayloadTooLargeCtx reports an oversize request body or response stream with trace context (HTTP 413).
+func PayloadTooLargeCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodePayloadTooLarge, message, http.StatusRequestEntityTooLarge, requestIDFromContext(r.Context()))
+}
+
+// writeWithDetails extends write() with arbitrary top-level fields
+// merged into the envelope alongside the typed error block. Used for
+// 502s (and any future error type) that carry extra structured detail
+// the client should see.
+//
+// The "error" key is reserved — callers MUST NOT pass a detail key
+// that would shadow it. Such keys are silently dropped so a caller
+// bug never produces a malformed envelope.
+func writeWithDetails(w http.ResponseWriter, code ErrorCode, message string, httpStatus int, requestID string, details map[string]any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	body := map[string]any{
+		"error": ErrorDetail{Code: code, Message: message, RequestID: requestID},
+	}
+	for k, v := range details {
+		if k == "error" {
+			continue
+		}
+		body[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// BadGateway reports an upstream-dependency failure (HTTP 502). Pass
+// nil for details to emit the standard shape; otherwise detail keys
+// are merged at the top level alongside the error block.
+func BadGateway(w http.ResponseWriter, message string, details map[string]any) {
+	writeWithDetails(w, CodeBadGateway, message, http.StatusBadGateway, "", details)
+}
+
+// BadGatewayCtx reports an upstream-dependency failure with trace context (HTTP 502).
+func BadGatewayCtx(w http.ResponseWriter, r *http.Request, message string, details map[string]any) {
+	writeWithDetails(w, CodeBadGateway, message, http.StatusBadGateway,
+		requestIDFromContext(r.Context()), details)
 }

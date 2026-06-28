@@ -33,10 +33,22 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	return nil
 }
 
-// mockArtifactStore implements service.ArtifactStoreInterface for testing.
+// mockArtifactStore implements storage.ArtifactStore for testing.
+// Migrate / MigrateTree only call Save, so Open and Delete are
+// no-ops — they exist so the mock satisfies the wider interface
+// (introduced by issue #127, when ArtifactStoreInterface was
+// folded into storage.ArtifactStore).
 type mockArtifactStore struct{}
 
-func (m *mockArtifactStore) Save(tenantID, appName, deploymentID string, r io.Reader) error {
+func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
+	return nil
+}
+
+func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	return nil
 }
 

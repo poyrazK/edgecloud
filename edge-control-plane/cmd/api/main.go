@@ -109,8 +109,20 @@ func main() {
 		log.Fatalf("Failed to ensure NATS stream: %v", err)
 	}
 
-	// Initialize artifact storage
-	artifactStore := storage.NewArtifactStore(cfg.Storage.ArtifactPath)
+	// Initialize artifact storage via the backend factory. An empty
+	// ArtifactBackend selects the filesystem implementation so existing
+	// deployments need no config change. The per-backend fields
+	// (S3*, Peer*) are forwarded as-is; the factory and per-backend
+	// constructors are responsible for validating them. Load() already
+	// rejected unknown backends and missing required fields at startup.
+	//
+	// Pass cfg.Storage directly — storage.New takes config.StorageConfig
+	// so there's no drift surface between the operator-facing struct and
+	// what the constructors see.
+	artifactStore, err := storage.New(context.Background(), cfg.Storage)
+	if err != nil {
+		log.Fatalf("Failed to initialize artifact storage: %v", err)
+	}
 
 	// Initialize services
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
@@ -409,6 +421,17 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		Secret: cfg.JWT.Secret,
 		Issuer: cfg.JWT.Issuer,
 	}
+	// /api/internal/download is mounted under a separate middleware
+	// chain that accepts either a worker JWT (existing behavior) OR
+	// an X-Internal-Token header (new — lets a peer control plane
+	// pull artifacts through this CP for its own region). Other
+	// /api/internal/* routes stay WorkerAuth-only; the token lane is
+	// intentionally narrow (issue #127 step 3).
+	downloadMux := http.NewServeMux()
+	downloadMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
+	mux.Handle("GET /api/internal/download/", middleware.InternalOrWorkerAuth(
+		workerJWTConfig, cfg.InternalToken,
+	)(downloadMux))
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
 	// Mint a long-lived service token for the edge-ingress poller

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -149,6 +148,12 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
 			AddRow(tenantID, 100, 50, 10, 512, 1024, 0, time.Now()))
 
+	// Issue #127 step 6: publishSwap reads the post-commit row to
+	// compute the idempotent publish set, then AppendRegionsPublished
+	// to persist the outcome. All 3 publishes succeed.
+	expectPostCommitReadAndAppend(mock, tenantID, appName,
+		[]string{"us-east", "eu-west", "ap-south"}, nil)
+
 	if err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
@@ -226,6 +231,9 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
 			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
+	// Issue #127 step 6: post-commit read + AppendRegionsPublished for
+	// the single publish to "global".
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"global"}, nil)
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -274,6 +282,8 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
 			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
+	// Issue #127 step 6: single publish to default region "us-east".
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"us-east"}, nil)
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", "d_x"); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -322,16 +332,33 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
 			AddRow("t_test", 100, 50, 10, 256, 1024, 0, time.Now()))
+	// Issue #127 step 6: eu-west fails, so AppendRegionsPublished
+	// covers us-east + ap-south and AppendRegionsFailed covers
+	// eu-west.
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp",
+		[]string{"us-east", "ap-south"},
+		[]string{"eu-west"},
+	)
 
 	err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID)
 	if err == nil {
 		t.Fatal("ActivateDeployment returned nil; want an error mentioning the failed region")
 	}
-	if !strings.Contains(err.Error(), "eu-west") {
-		t.Errorf("error %q should mention the failed region 'eu-west'", err.Error())
+	// Issue #127 step 6: error is now a *PublishError wrapping
+	// ErrPublishFailed. Both errors.Is (sentinel match) and
+	// errors.As (typed breakdown) must be reachable.
+	if !errors.Is(err, ErrPublishFailed) {
+		t.Errorf("err = %v, want errors.Is(err, ErrPublishFailed) == true", err)
 	}
-	if !strings.Contains(err.Error(), "1 region") {
-		t.Errorf("error %q should report the failed-region count", err.Error())
+	var pubErr *PublishError
+	if !errors.As(err, &pubErr) {
+		t.Fatalf("err = %T, want errors.As(err, &PublishError) == true", err)
+	}
+	if !equalStringSlices(pubErr.Failed, []string{"eu-west"}) {
+		t.Errorf("pubErr.Failed = %v, want [eu-west]", pubErr.Failed)
+	}
+	if !equalStringSlices(pubErr.Published, []string{"us-east", "ap-south"}) {
+		t.Errorf("pubErr.Published = %v, want [us-east ap-south]", pubErr.Published)
 	}
 
 	// All 3 publishes must have been ATTEMPTED — the failed region
@@ -386,6 +413,9 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
 			AddRow("t_test", 100, 50, 10, 0, 1024, 0, time.Now()))
+	// Issue #127 step 6: post-commit read + AppendRegionsPublished for
+	// the single publish to "us-east".
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"us-east"}, nil)
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -432,6 +462,9 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, used_outbound_bytes, quota_period_start FROM quotas WHERE tenant_id =`)).
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}))
+	// Issue #127 step 6: post-commit read + AppendRegionsPublished for
+	// the single publish to "us-east".
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"us-east"}, nil)
 
 	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
@@ -452,4 +485,159 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// expectPostCommitReadAndAppend mocks the post-tx publish-state
+// read + the two append calls that publishSwap issues on a
+// freshly-activated row. The Set upsert inside ActivateDeployment
+// resets regions_published / regions_failed to zero (see
+// ActiveDeploymentRepository.Set's DO UPDATE clause), so the
+// read returns empty arrays — which means the publish set
+// computed inside publishSwap equals the input regions list
+// (no idempotency skip). The test then asserts which regions
+// were appended to regions_published vs regions_failed by
+// passing those slices as expected. Pass nil for either to
+// suppress that expectation.
+//
+// Pinned by issue #127 step 6: the idempotency contract relies
+// on this read happening AFTER the tx commits, not before.
+// Reading inside the tx would not see the Set reset and would
+// return the prior activation's publish state — wrong.
+func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName string, expectPublished, expectFailed []string) {
+	// The post-commit read is the Get that publishSwap does to
+	// discover which regions are already done. On a fresh
+	// activation the row was just upserted with all four publish-
+	// state columns zeroed, so the read returns the empty values.
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+			"regions_published", "regions_failed",
+			"last_publish_at", "last_publish_attempt_id",
+		}).AddRow(
+			tenantID, appName, "d_xxx", nil, false, nil,
+			"{}", "{}",
+			nil, nil,
+		))
+
+	// AppendRegionsPublished / AppendRegionsFailed fire on a
+	// successful / failed per-region publish respectively, inside a
+	// single repository.Transaction (issue #127 follow-ups — both
+	// appends must succeed-or-rollback together so the row's
+	// publish-state columns stay consistent). The attempt ID is a
+	// UUID (any value) and the timestamp is time.Now(); both are
+	// passed via sqlmock.AnyArg.
+	if len(expectPublished) > 0 || len(expectFailed) > 0 {
+		mock.ExpectBegin()
+		if len(expectPublished) > 0 {
+			mock.ExpectExec(regexp.QuoteMeta(
+				`UPDATE active_deployments SET regions_published = (`,
+			)).
+				WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+		}
+		if len(expectFailed) > 0 {
+			mock.ExpectExec(regexp.QuoteMeta(
+				`UPDATE active_deployments SET regions_failed = (`,
+			)).
+				WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+		}
+		mock.ExpectCommit()
+	}
+}
+
+// TestPublishSwap_AppendsAreAtomic covers the issue #127 follow-up
+// atomicity fix: if AppendRegionsPublished fails inside the wrapping
+// tx, AppendRegionsFailed MUST NOT run (no second Exec) and the tx
+// must roll back. This is what guarantees the row's
+// (regions_published, regions_failed, last_publish_at,
+// last_publish_attempt_id) stay consistent across partial failures.
+func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			_ = err // sqlmock Close can return error if close is unexpected or other expectations are not fully met.
+		}
+	})
+	db := sqlx.NewDb(sqlDB, "postgres")
+
+	tenantID, appName := "t_atomic", "myapp"
+
+	// 1. Post-commit read returns empty arrays — publishSwap will
+	//    publish to both regions (us-east + eu-west).
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+			"regions_published", "regions_failed",
+			"last_publish_at", "last_publish_attempt_id",
+		}).AddRow(
+			tenantID, appName, "d_atomic", nil, false, nil,
+			"{}", "{}",
+			nil, nil,
+		))
+
+	pub := &RecordingPublisher{
+		// us-east succeeds, eu-west fails — so published=[us-east],
+		// failed=[eu-west] and BOTH appends run inside the tx.
+		failFor: map[string]error{"eu-west": errors.New("nats unreachable")},
+	}
+
+	mock.ExpectBegin()
+	// AppendRegionsPublished succeeds.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_published = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// AppendRegionsFailed fails — this is what we want to observe.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_failed = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(errors.New("simulated DB outage"))
+	mock.ExpectRollback()
+
+	activeRepo := repository.NewActiveDeploymentRepository(db)
+	svc := &DeploymentService{
+		db:         db,
+		activeRepo: activeRepo,
+		publisher:  pub,
+	}
+
+	msg := &nats.TaskMessage{
+		TenantID: tenantID,
+		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: "d_atomic"}},
+	}
+	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic", msg, []string{"us-east", "eu-west"})
+	if err == nil {
+		t.Fatal("publishSwap: want PublishError wrapping ErrPublishFailed, got nil")
+	}
+	if !errors.Is(err, ErrPublishFailed) {
+		t.Errorf("publishSwap err = %v, want errors.Is ErrPublishFailed", err)
+	}
+
+	// Assert the recorded publisher saw both regions (us-east OK,
+	// eu-west failed) — verifies the loop ran to completion before
+	// the tx.
+	if len(pub.calls) != 2 {
+		t.Errorf("publisher calls = %d, want 2", len(pub.calls))
+	}
+
+	// sqlmock has no further expectations — if Rollback was not
+	// issued, mock.ExpectationsWereMet would surface a "remaining
+	// expectation" error. We assert below for an explicit signal.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v (Rollback should have fired after the failed append)", err)
+	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 )
 
@@ -45,11 +45,6 @@ type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
 }
 
-// ArtifactStoreInterface abstracts wasm artifact storage for testing.
-type ArtifactStoreInterface interface {
-	Save(tenantID, appName, deploymentID string, r io.Reader) error
-}
-
 // transformEnvelope mirrors edge-migrate-lib's `TransformOutput`.
 // Emitted by `edge-migrate --transform --format json`. The Go control
 // plane is the only consumer in this repo. The `Version` field lets the
@@ -64,7 +59,7 @@ type transformEnvelope struct {
 // MigrationService transforms POSIX C source to WASI and compiles it to wasm.
 type MigrationService struct {
 	deploymentRepo  DeploymentRepoInterface
-	artifactStore   ArtifactStoreInterface
+	artifactStore   storage.ArtifactStore
 	edgeMigratePath string
 	wasiSdkPath     string
 	// rustcPath is the absolute path to a rustc binary capable of
@@ -75,7 +70,7 @@ type MigrationService struct {
 // NewMigrationService creates a MigrationService.
 func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
-	artifactStore ArtifactStoreInterface,
+	artifactStore storage.ArtifactStore,
 	edgeMigratePath, wasiSdkPath, rustcPath string,
 ) *MigrationService {
 	return &MigrationService{
@@ -399,7 +394,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	}
 
 	// Store wasm artifact
-	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
 		return nil, fmt.Errorf("saving wasm artifact: %w", err)
 	}
 
@@ -885,7 +880,7 @@ func (s *MigrationService) MigrateTree(
 	if err := s.deploymentRepo.Create(ctx, deployment); err != nil {
 		return nil, fmt.Errorf("creating deployment: %w", err)
 	}
-	if err := s.artifactStore.Save(tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
+	if err := s.artifactStore.Save(ctx, tenantID, appName, depID, bytes.NewReader(wasmBytes)); err != nil {
 		return nil, fmt.Errorf("saving artifact: %w", err)
 	}
 

@@ -78,6 +78,45 @@ type ActiveDeployment struct {
 	// service.ActivateDeployment / RollbackDeployment and
 	// repository.ResetStableSinceForRollback).
 	StableSince *time.Time `db:"stable_since"`
+
+	// RegionsPublished is the deduped set of regions that have been
+	// successfully notified for the CURRENT activation. Written by
+	// service.ActivateDeployment after each per-region publish
+	// succeeds; read at the start of the next activate call so a
+	// retry doesn't republish to regions that already received the
+	// TaskMessage (NATS JetStream workqueue dedupes by message id,
+	// but a redundant publish still wastes a round trip and a worker
+	// reconciliation pass).
+	//
+	// The DO UPDATE branch of ActiveDeploymentRepository.Set
+	// overwrites the four publish-state columns, so a re-activation
+	// starts with an empty history — matches the operator's mental
+	// model ("I just activated, so no regions have been notified
+	// yet for THIS activation").
+	//
+	// pq.StringArray for the same reason as Deployment.Regions:
+	// lib/pq's Scanner requires it for TEXT[].
+	RegionsPublished pq.StringArray `db:"regions_published"`
+	// RegionsFailed is the set of regions whose publish failed on
+	// the most recent activation attempt. Distinct from
+	// RegionsPublished because a publish may partially succeed. The
+	// service layer always re-publishes to RegionsFailed on the
+	// next activate (see issue #127 Risk 3 — a stale
+	// RegionsPublished must not mask a real failure).
+	RegionsFailed pq.StringArray `db:"regions_failed"`
+	// LastPublishAt is the wall-clock timestamp of the most recent
+	// (per-region) publish attempt, regardless of outcome. Useful
+	// for the operator escape hatch `SELECT last_publish_at FROM
+	// active_deployments WHERE ...` to see when the last attempt
+	// fired. Nullable because pre-migration-010 rows have no value.
+	LastPublishAt *time.Time `db:"last_publish_at"`
+	// LastPublishAttemptID is the UUID stamped onto the most recent
+	// publish. Lets the operator correlate an active_deployments
+	// row to a specific NATS message id when debugging "did the
+	// TaskMessage for this activation reach the workers?" — the
+	// NATS stream UI surfaces message ids, but the CP-side table
+	// needs a copy for the join to be useful.
+	LastPublishAttemptID *string `db:"last_publish_attempt_id"`
 }
 
 // AppEnv stores environment variables for an app.

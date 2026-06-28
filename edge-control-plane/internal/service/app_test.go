@@ -375,7 +375,7 @@ func TestAppService_CreateIfNotExists_InvalidName(t *testing.T) {
 // TestAppService_Delete_ArtifactCleanup verifies that Delete removes .wasm artifact files.
 func TestAppService_Delete_ArtifactCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
-	artifactStore := storage.NewArtifactStore(tmpDir)
+	artifactStore := storage.NewFSArtifactStore(tmpDir)
 
 	// Create some "deployment" artifacts on disk
 	deployments := []struct {
@@ -412,7 +412,7 @@ func TestAppService_Delete_ArtifactCleanup(t *testing.T) {
 // removes the file and returns nil when the file exists.
 func TestArtifactStore_Delete_RemovesFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	artifactStore := storage.NewArtifactStore(tmpDir)
+	artifactStore := storage.NewFSArtifactStore(tmpDir)
 
 	deployID := "d_test1"
 	path, err := artifactStore.Path("t_tenant1", "my-app", deployID)
@@ -426,7 +426,7 @@ func TestArtifactStore_Delete_RemovesFile(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	err = artifactStore.Delete("t_tenant1", "my-app", deployID)
+	err = artifactStore.Delete(context.Background(), "t_tenant1", "my-app", deployID)
 	if err != nil {
 		t.Errorf("Delete() error = %v, want nil", err)
 	}

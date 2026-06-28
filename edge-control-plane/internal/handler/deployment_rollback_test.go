@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -187,6 +188,19 @@ func TestRollback_PublishFailed_Returns502(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "worker notification failed") {
 		t.Errorf("body should explain 502, got %s", rr.Body.String())
+	}
+	// Typed-envelope assertions (issue #127 follow-ups): the 502
+	// body must conform to httperror.ErrorResponse so clients that
+	// parse the typed envelope work across every status code.
+	var env httperror.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if env.Error.Code != httperror.CodeBadGateway {
+		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Message, "worker notification failed") {
+		t.Errorf("error.message = %q, want it to mention worker notification", env.Error.Message)
 	}
 	// Body must not leak the sentinel or the raw NATS error.
 	if strings.Contains(rr.Body.String(), "nats unreachable") {

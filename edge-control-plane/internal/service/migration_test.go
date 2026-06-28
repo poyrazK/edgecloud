@@ -28,7 +28,10 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	return nil
 }
 
-// mockArtifactStore implements ArtifactStoreInterface for testing.
+// mockArtifactStore implements storage.ArtifactStore for testing.
+// Migrate / MigrateTree only call Save, so Open and Delete are
+// no-ops (Delete just evicts from the in-memory map so callers
+// can assert cleanup behavior).
 type mockArtifactStore struct {
 	artifacts map[string][]byte // key: "tenantID/appName/depID"
 }
@@ -37,12 +40,26 @@ func newMockArtifactStore() *mockArtifactStore {
 	return &mockArtifactStore{artifacts: make(map[string][]byte)}
 }
 
-func (m *mockArtifactStore) Save(tenantID, appName, deploymentID string, r io.Reader) error {
+func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
 	m.artifacts[tenantID+"/"+appName+"/"+deploymentID] = data
+	return nil
+}
+
+func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
+	key := tenantID + "/" + appName + "/" + deploymentID
+	data, ok := m.artifacts[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
+	delete(m.artifacts, tenantID+"/"+appName+"/"+deploymentID)
 	return nil
 }
 

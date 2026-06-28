@@ -36,7 +36,7 @@ type AppService struct {
 	appEnvRepo    *repository.AppEnvRepository
 	activeRepo    *repository.ActiveDeploymentRepository
 	deployRepo    *repository.DeploymentRepository
-	artifactStore *storage.ArtifactStore
+	artifactStore storage.ArtifactStore
 	quotaRepo     quotaRepoInterface
 }
 
@@ -46,7 +46,7 @@ func NewAppService(
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
-	artifactStore *storage.ArtifactStore,
+	artifactStore storage.ArtifactStore,
 	quotaRepo *repository.QuotaRepository,
 ) *AppService {
 	return &AppService{
@@ -194,7 +194,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 			log.Printf("warning: failed to list deployments for artifact cleanup: %v", err)
 		} else {
 			for _, d := range deployments {
-				if err := s.artifactStore.Delete(tenantID, appName, d.ID); err != nil {
+				if err := s.artifactStore.Delete(ctx, tenantID, appName, d.ID); err != nil {
 					delErr = fmt.Errorf("artifact cleanup failed for %s: %w", d.ID, err)
 				}
 			}

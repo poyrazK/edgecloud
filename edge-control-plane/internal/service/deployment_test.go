@@ -67,7 +67,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
@@ -110,7 +110,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -156,7 +156,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		// defaultRegion unset — defensive "global" default in the
 		// constructor doesn't matter for this test (validation
 		// fires before the default-region fallback is consulted).
@@ -189,7 +189,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 	}
 
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
@@ -220,7 +220,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 	}
 
 	// Build 17 valid regions (a..q) — the cap is 16.
@@ -270,7 +270,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 	svc := &DeploymentService{
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
-		artifactStore:  storage.NewArtifactStore(tmpDir),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 	}
 
 	regions := make([]string, 0, 16)
