@@ -106,9 +106,16 @@ mod tests {
     #[test]
     fn config_path_returns_something_on_supported_platform() {
         let p = config_path();
-        assert!(p.is_some(), "config_path should return Some on supported platforms");
+        assert!(
+            p.is_some(),
+            "config_path should return Some on supported platforms"
+        );
         let p = p.unwrap();
-        assert!(p.ends_with("config.toml"), "path should end with config.toml, got: {}", p.display());
+        assert!(
+            p.ends_with("config.toml"),
+            "path should end with config.toml, got: {}",
+            p.display()
+        );
     }
 
     #[test]
@@ -132,7 +139,10 @@ mod tests {
         let result = read_api_key();
         std::env::remove_var("EDGE_API_KEY");
         // Falls through to config file — if the real one doesn't exist, error
-        assert!(result.is_err(), "empty env var should fall through, real config likely missing");
+        assert!(
+            result.is_err(),
+            "empty env var should fall through, real config likely missing"
+        );
     }
 
     #[test]
@@ -141,9 +151,16 @@ mod tests {
         std::env::remove_var("EDGE_API_KEY");
         let result = read_api_key();
         std::env::remove_var("EDGE_API_KEY");
-        assert!(result.is_err(), "missing env var and no config file should error");
+        assert!(
+            result.is_err(),
+            "missing env var and no config file should error"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("EDGE_API_KEY"), "error should mention EDGE_API_KEY, got: {}", msg);
+        assert!(
+            msg.contains("EDGE_API_KEY"),
+            "error should mention EDGE_API_KEY, got: {}",
+            msg
+        );
     }
 
     #[test]
