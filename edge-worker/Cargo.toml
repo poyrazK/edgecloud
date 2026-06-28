@@ -28,6 +28,7 @@ wasmtime = { version = "25.0", features = ["component-model", "async"] }
 sha2 = "0.10"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
