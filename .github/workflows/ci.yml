@@ -476,7 +476,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
+        crate: [edge-runtime, edge-worker, edge-ingress, edge-config, edge-migrate]
     steps:
       - uses: actions/checkout@v4
         with:

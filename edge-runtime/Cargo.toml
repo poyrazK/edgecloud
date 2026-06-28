@@ -58,10 +58,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Time
-clock = { version = "0.4", optional = true }
 
 [dev-dependencies]
-wasmtime-environ = "25.0"
 wiremock = "0.6"
 wat = "1"
 
@@ -71,7 +69,7 @@ http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "to
 kv-store = []
 cache = ["dep:lru"]
 observe = []
-time = ["dep:clock"]
+time = []
 scheduling = ["dep:tokio"]
 process = []
 http-server = ["dep:tokio", "dep:httparse", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:flate2", "dep:bytes", "dep:futures"]
