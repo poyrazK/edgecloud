@@ -245,3 +245,41 @@ jobs:
         with:
           name: lcov-rust
           path: lcov-rust.info
+
+  # ============================================================
+  # GO-TEST-INTEGRATION — autoscaler regression (issue #85)
+  # ============================================================
+  # Runs the build-tag-gated regression test that exercises the
+  # live Service.Subscribe loop end-to-end against a real NATS
+  # testcontainer. The headline acceptance criterion for #85 is
+  # "100 RPS spike → new worker requested within 90s"; this job
+  # pins that wiring on every PR.
+  #
+  # The test uses testcontainers-go which requires Go 1.24+ (the
+  # core `go-test` job above stays on 1.23 since no other test
+  # needs the newer runtime).
+  go-test-integration:
+    runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod/
+          key: go-mod-int-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
+      - name: Run autoscaler regression tests
+        run: go test -tags=integration -v ./internal/autoscale/... -run TestRegression
