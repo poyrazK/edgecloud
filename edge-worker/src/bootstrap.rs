@@ -74,7 +74,7 @@ fn default_token_type() -> String {
 /// What the worker holds in memory after a successful bootstrap. The
 /// control plane's JWT TTL is 24h (`auth.rs::DEFAULT_TTL`), so the bundle
 /// is short-lived.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtBundle {
     pub token: String,
     /// Wall-clock expiry as a Unix timestamp (seconds). The signer
