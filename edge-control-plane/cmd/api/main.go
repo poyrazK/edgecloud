@@ -138,6 +138,14 @@ func main() {
 	clusterSvc := service.NewClusterService(workerRepo)
 	migrationSvc := service.NewMigrationService(deploymentRepo, artifactStore, cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath)
 	trafficSvc := service.NewTrafficService(db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, tenantRepo, quotaRepo, publisher, cfg.Region)
+	// ReconcileService is constructed here (alongside the other
+	// services) because InternalHandler needs a reference for the
+	// RegisterWorker hook (issue #53 on-register sync). The
+	// background loop is started later in runServer so the cancel
+	// from rootCancel actually tears it down.
+	reconcileSvc := service.NewReconcileService(
+		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+	)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	// Custom-domain service (issue #83). The migration from
@@ -160,7 +168,7 @@ func main() {
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
 	envHandler := handler.NewEnvHandler(envSvc)
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -500,9 +508,6 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// immediately so a fresh boot catches up workers that missed
 	// messages, then ticks on the configured interval. Idempotent —
 	// the worker-side diff treats identical AppConfig as a no-op.
-	reconcileSvc := service.NewReconcileService(
-		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
-	)
 	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
 	go reconcileSvc.Run(rootCtx, reconcileInterval)
 

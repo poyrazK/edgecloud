@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -51,11 +52,18 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // 501. `logEntryRepo` is the worker log ingest path (issue #76);
 // required by AutoRollback's audit trail and any future log-bearing
 // endpoint.
+//
+// `reconcileSvc` is the on-demand full_sync publisher used by
+// RegisterWorker (issue #53). When nil, registration does not trigger
+// a sync — the periodic timer in cmd/api/main.go will catch up
+// within RECONCILE_INTERVAL. Set via NewInternalHandler. Tests pass
+// nil so they don't have to wire a publisher.
 type InternalHandler struct {
 	deploymentSvc autoRollbacker
-	workerSvc     *service.WorkerService
+	workerSvc     workerRegisterer
 	domainSvc     InternalDomainServiceInterface
 	logEntryRepo  logEntryRepo
+	reconcileSvc  syncRequester
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -69,17 +77,45 @@ type autoRollbacker interface {
 	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
 }
 
+// workerRegisterer is the narrow contract the RegisterWorker endpoint
+// needs. Holding the concrete *service.WorkerService made it
+// impossible to test the success path without standing up the full
+// worker service (DB + NATS conn + metrics aggregator). Production
+// caller (cmd/api/main.go) still passes *service.WorkerService, which
+// satisfies the interface. ListWorkers isn't covered here because no
+// other endpoint currently exercises the worker service — if a future
+// endpoint needs ListByTenant, add it to this interface.
+type workerRegisterer interface {
+	Register(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
+}
+
+// syncRequester is the narrow contract RegisterWorker uses to trigger
+// an on-register full_sync (issue #53). Defining it as an interface
+// (instead of taking *service.ReconcileService directly) keeps handler
+// tests mockable without standing up the full ReconcileService — the
+// only production caller is `*service.ReconcileService`, set in
+// cmd/api/main.go.
+//
+// nil means "no on-register sync" — tests pass nil, the periodic
+// timer in cmd/api/main.go is the durable safety net.
+type syncRequester interface {
+	RequestSync(ctx context.Context, tenantID, region string)
+}
+
 func NewInternalHandler(
 	deploymentSvc autoRollbacker,
-	workerSvc *service.WorkerService,
+	workerSvc workerRegisterer,
 	domainSvc InternalDomainServiceInterface,
 	logEntryRepo logEntryRepo,
+	reconcileSvc syncRequester,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
 		domainSvc:     domainSvc,
 		logEntryRepo:  logEntryRepo,
+		reconcileSvc:  reconcileSvc,
 	}
 }
 
@@ -146,6 +182,26 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+
+	// Fire-and-forget full_sync so the worker comes up populated
+	// immediately instead of waiting up to RECONCILE_INTERVAL (issue #53).
+	// Best-effort: the periodic timer is the durable safety net, so a
+	// publish failure here is logged and dropped — the worker's next
+	// reconcile sweep (or the on-register fallback in cmd/api/main.go's
+	// process restart) catches up.
+	//
+	// We capture (tenantID, region) and use a fresh background ctx with
+	// a short deadline because r.Context() is cancelled the moment
+	// WriteHeader returns, and we don't want the publish to inherit
+	// that cancellation. NATS publishes have their own internal
+	// timeout; the 5s cap here just bounds the goroutine lifetime.
+	if h.reconcileSvc != nil {
+		go func(t, region string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			h.reconcileSvc.RequestSync(ctx, t, region)
+		}(tenantID, req.Region)
+	}
 }
 
 // ListWorkers handles GET /api/internal/workers — list workers for the authenticated tenant.
