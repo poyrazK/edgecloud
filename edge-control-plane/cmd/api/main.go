@@ -434,7 +434,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)(downloadMux))
 	mux.Handle("/api/internal/", middleware.WorkerAuth(workerJWTConfig)(internalMux))
 
-// Mint a long-lived service token for the edge-ingress poller
+	// Mint a long-lived service token for the edge-ingress poller
 	// (issue #83). The token is written to a 0600 file (NOT logged
 	// in plaintext) so the operator can copy it into the ingress's
 	// INGRESS_SERVICE_TOKEN env var. Region is sourced from the

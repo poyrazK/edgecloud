@@ -265,7 +265,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-// Validate the artifact-storage backend selection and its per-backend
+	// Validate the artifact-storage backend selection and its per-backend
 	// required fields. Run after env overrides so a STORAGE_ARTIFACT_BACKEND
 	// env var that names a backend whose required fields are missing from
 	// the YAML still fails startup with a clear message.
