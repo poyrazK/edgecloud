@@ -4,12 +4,44 @@ use crate::EdgeRuntime;
 use crate::RuntimeState;
 use anyhow::Result;
 use wasmtime::component::Linker as ComponentLinker;
-use wasmtime::{Engine, Linker};
+use wasmtime::Engine;
+#[cfg(feature = "wasi-preview1")]
+use wasmtime::Linker;
 
 /// Create a linker for core wasm modules (WASI Preview 1).
-pub fn create_linker(engine: &Engine) -> Result<Linker<()>> {
-    let linker: Linker<()> = Linker::new(engine);
+///
+/// Registers all `wasi_snapshot_preview1` and `wasi_unstable` host functions so
+/// that P1 modules can call them without trapping.  The store data type must be
+/// [`WasiP1Ctx`]; build one with [`build_wasi_p1_ctx`].
+#[cfg(feature = "wasi-preview1")]
+pub fn create_linker(
+    engine: &Engine,
+) -> Result<Linker<wasmtime_wasi::preview1::WasiP1Ctx>> {
+    let mut linker: Linker<wasmtime_wasi::preview1::WasiP1Ctx> = Linker::new(engine);
+    wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
     Ok(linker)
+}
+
+/// Build a [`WasiP1Ctx`] suitable for use as the store data with [`create_linker`].
+///
+/// stdout and stderr are inherited so guest output reaches the worker log.
+/// stdin is left empty — edge workers have no interactive input.
+///
+/// # Security
+/// Env vars are forwarded as-is; callers should strip sensitive keys
+/// (e.g. `AWS_*`, `*_SECRET`) before passing `env` here.
+#[cfg(feature = "wasi-preview1")]
+pub fn build_wasi_p1_ctx(
+    env: &[(impl AsRef<str>, impl AsRef<str>)],
+    args: &[impl AsRef<str>],
+) -> wasmtime_wasi::preview1::WasiP1Ctx {
+    use wasmtime_wasi::WasiCtxBuilder;
+    WasiCtxBuilder::new()
+        .inherit_stdout()
+        .inherit_stderr()
+        .envs(env)
+        .args(args)
+        .build_p1()
 }
 
 /// Create a linker for WASI Preview 2 components.
@@ -21,4 +53,98 @@ pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<Runtim
     EdgeRuntime::add_to_linker(&mut linker, |state: &mut RuntimeState| state)?;
 
     Ok(linker)
+}
+
+#[cfg(test)]
+#[cfg(feature = "wasi-preview1")]
+mod tests {
+    use super::*;
+    use crate::engine::create_engine;
+    use crate::store::create_store;
+    use wasmtime::Module;
+
+    /// A P1 module whose sole import is `wasi_snapshot_preview1::proc_exit`.
+    /// Before the fix, instantiation succeeded but the first call trapped with
+    /// "unknown import".  After the fix it must NOT trap on "unknown import" —
+    /// wasmtime surfaces proc_exit(0) as a clean `I32Exit(0)` trap instead.
+    ///
+    /// Skipped on Windows: wasmtime trap delivery triggers
+    /// STATUS_STACK_BUFFER_OVERRUN in the Windows test runner.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "wasmtime trap delivery triggers STATUS_STACK_BUFFER_OVERRUN on Windows"
+    )]
+    fn p1_module_does_not_trap_on_unknown_import() {
+        let wat = r#"
+            (module
+              (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+              (func (export "_start") (call $exit (i32.const 0)))
+            )
+        "#;
+        let engine = create_engine().expect("engine");
+        let module = Module::new(&engine, wat::parse_str(wat).expect("wat")).expect("module");
+        let linker = create_linker(&engine).expect("linker");
+        let ctx = build_wasi_p1_ctx(&[] as &[(&str, &str)], &["test-program"]);
+        let mut store = create_store(&engine, 64, ctx);
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate must succeed — all wasi imports are registered");
+
+        let start = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .expect("_start export");
+
+        // proc_exit(0) causes wasmtime to surface an I32Exit trap, not
+        // "unknown import". Verify the error is NOT about a missing import.
+        let err = start.call(&mut store, ()).expect_err("proc_exit always traps");
+        let msg = format!("{:?}", err).to_lowercase();
+        assert!(
+            !msg.contains("unknown import"),
+            "got 'unknown import' trap — wasi host functions not wired: {msg}"
+        );
+    }
+
+    /// Smoke test: env vars and args passed to build_wasi_p1_ctx reach the
+    /// guest via fd_environ_get / args_get.  We verify indirectly by running a
+    /// WAT module that calls args_sizes_get and checks the count is non-zero
+    /// (we passed one arg above).
+    ///
+    /// Skipped on Windows: wasmtime's WASI signal handler setup triggers
+    /// STATUS_STACK_BUFFER_OVERRUN in the Windows test runner.
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "wasmtime WASI signal handler triggers STATUS_STACK_BUFFER_OVERRUN on Windows"
+    )]
+    fn build_wasi_p1_ctx_passes_args() {
+        let wat = r#"
+            (module
+              (import "wasi_snapshot_preview1" "args_sizes_get"
+                (func $args_sizes_get (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "check_args") (result i32)
+                ;; write argc into offset 0, argv_buf_size into offset 4
+                (call $args_sizes_get (i32.const 0) (i32.const 4))
+                drop
+                ;; return argc (should be 1 — "my-app")
+                (i32.load (i32.const 0))
+              )
+            )
+        "#;
+        let engine = create_engine().expect("engine");
+        let module = Module::new(&engine, wat::parse_str(wat).expect("wat")).expect("module");
+        let linker = create_linker(&engine).expect("linker");
+        let ctx = build_wasi_p1_ctx(&[] as &[(&str, &str)], &["my-app"]);
+        let mut store = create_store(&engine, 64, ctx);
+
+        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let check = instance
+            .get_typed_func::<(), i32>(&mut store, "check_args")
+            .expect("check_args export");
+
+        let argc = check.call(&mut store, ()).expect("call");
+        assert_eq!(argc, 1, "expected 1 arg (my-app), got {argc}");
+    }
 }
