@@ -25,12 +25,10 @@ thiserror = "2.0"
 humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 edge-worker = { path = "../edge-worker" }
 
 [dev-dependencies]
-tokio-test = "0.4"
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"

@@ -467,3 +467,84 @@ jobs:
 
       - name: Check for typos
         uses: crate-ci/typos@v1
+
+  # ============================================================
+  # SEMVER-CHECKS — check public API backward compatibility
+  # ============================================================
+  semver-checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-worker, edge-ingress, edge-config, edge-migrate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+
+      - name: Run cargo-semver-checks
+        run: cargo semver-checks check-release --manifest-path ${{ matrix.crate }}/Cargo.toml --baseline-rev origin/main
+
+  # ============================================================
+  # UDEPS — check for unused dependencies
+  # ============================================================
+  udeps:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Cargo.lock
+        run: |
+          cargo generate-lockfile --manifest-path edge-cli/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-worker/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-ingress/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-config/Cargo.toml || true
+          cargo generate-lockfile --manifest-path edge-migrate/Cargo.toml || true
+
+      - name: Install Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-udeps
+        uses: taiki-e/install-action@cargo-udeps
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/index/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target/
+          key: cargo-target-${{ matrix.crate }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run cargo-udeps
+        run: cargo +nightly udeps --manifest-path ${{ matrix.crate }}/Cargo.toml --all-targets
+
+  # ============================================================
+  # GEIGER — analyze unsafe code usage
+  # ============================================================
+  geiger:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [edge-runtime, edge-cli, edge-worker, edge-ingress, edge-config, edge-migrate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-geiger
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-geiger
+
+      - name: Run cargo-geiger
+        run: cargo geiger --manifest-path ${{ matrix.crate }}/Cargo.toml || true
