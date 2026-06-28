@@ -80,3 +80,107 @@ pub fn read_api_url(fallback: &str) -> String {
     }
     fallback.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.lock().unwrap()
+    }
+
+    fn write_config(dir: &tempfile::TempDir, content: &str) -> std::path::PathBuf {
+        let dir_path = dir.path().join("edgecloud");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let config_path = dir_path.join("config.toml");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        config_path
+    }
+
+    #[test]
+    fn config_path_returns_something_on_supported_platform() {
+        let p = config_path();
+        assert!(p.is_some(), "config_path should return Some on supported platforms");
+        let p = p.unwrap();
+        assert!(p.ends_with("config.toml"), "path should end with config.toml, got: {}", p.display());
+    }
+
+    #[test]
+    fn read_api_key_env_var_takes_priority() {
+        let _guard = lock_env();
+        std::env::set_var("EDGE_API_KEY", "env-key-123");
+        let result = read_api_key().unwrap();
+        assert_eq!(result, "env-key-123");
+        std::env::remove_var("EDGE_API_KEY");
+    }
+
+    #[test]
+    fn read_api_key_env_var_empty_falls_through_to_config() {
+        let _guard = lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(&dir, "[default]\napi_key = \"file-key\"\n");
+        std::env::set_var("EDGE_API_KEY", "");
+        // We can't redirect config_path() in this test without mocking dirs,
+        // so when env is empty and config_path points to a real path that
+        // doesn't exist, we expect the final error.
+        let result = read_api_key();
+        std::env::remove_var("EDGE_API_KEY");
+        // Falls through to config file — if the real one doesn't exist, error
+        assert!(result.is_err(), "empty env var should fall through, real config likely missing");
+    }
+
+    #[test]
+    fn read_api_key_env_var_not_set_errors_when_no_config() {
+        let _guard = lock_env();
+        std::env::remove_var("EDGE_API_KEY");
+        let result = read_api_key();
+        std::env::remove_var("EDGE_API_KEY");
+        assert!(result.is_err(), "missing env var and no config file should error");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("EDGE_API_KEY"), "error should mention EDGE_API_KEY, got: {}", msg);
+    }
+
+    #[test]
+    fn read_api_url_env_var_takes_priority() {
+        let _guard = lock_env();
+        std::env::set_var("EDGE_API_URL", "https://api.example.com");
+        let result = read_api_url("https://fallback.example.com");
+        assert_eq!(result, "https://api.example.com");
+        std::env::remove_var("EDGE_API_URL");
+    }
+
+    #[test]
+    fn read_api_url_env_var_empty_falls_through() {
+        let _guard = lock_env();
+        std::env::set_var("EDGE_API_URL", "");
+        let result = read_api_url("https://fallback.example.com");
+        std::env::remove_var("EDGE_API_URL");
+        // Empty env + no real config file → falls through to fallback
+        assert_eq!(result, "https://fallback.example.com");
+    }
+
+    #[test]
+    fn read_api_url_no_env_returns_fallback() {
+        let _guard = lock_env();
+        std::env::remove_var("EDGE_API_URL");
+        let result = read_api_url("https://default.example.com");
+        std::env::remove_var("EDGE_API_URL");
+        assert_eq!(result, "https://default.example.com");
+    }
+
+    #[test]
+    fn read_api_url_env_var_is_not_set_uses_fallback() {
+        let _guard = lock_env();
+        // remove_var before and after to be safe
+        std::env::remove_var("EDGE_API_URL");
+        let result = read_api_url("fb");
+        std::env::remove_var("EDGE_API_URL");
+        assert_eq!(result, "fb");
+    }
+}
