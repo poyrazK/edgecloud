@@ -428,6 +428,143 @@ async fn keys_create_server_rejects_does_not_overwrite_key() {
     );
 }
 
+#[tokio::test]
+async fn keys_list_prints_table_with_current_marker() {
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_existing");
+
+    // whoami identifies the current key (matches the seeded one) so
+    // the matching row in the GET /api/v1/keys response should be
+    // annotated with "(current)".
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_existing",
+            "api_key_name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/keys"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "k_existing",
+                "name": "default",
+                "role": "developer",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": "k_other",
+                "name": "ci-deploy",
+                "role": "viewer",
+                "created_at": "2026-06-22T00:00:00Z",
+            },
+        ])))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("list");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("k_existing"))
+        .stdout(predicate::str::contains("k_other"))
+        .stdout(predicate::str::contains("default"))
+        .stdout(predicate::str::contains("ci-deploy"))
+        .stdout(predicate::str::contains("developer"))
+        .stdout(predicate::str::contains("viewer"))
+        .stdout(predicate::str::contains("(current)"));
+}
+
+#[tokio::test]
+async fn keys_list_json_emits_raw_array() {
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_existing");
+
+    // whoami may or may not be called depending on the path the code
+    // takes; mock both so either is fine.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_existing",
+            "api_key_name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "k_a",
+                "name": "alpha",
+                "role": "developer",
+                "created_at": "2026-06-20T00:00:00Z",
+            },
+            {
+                "id": "k_b",
+                "name": "beta",
+                "role": "viewer",
+                "created_at": "2026-06-22T00:00:00Z",
+            },
+        ])))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("list")
+        .arg("--json");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains(r#""id": "k_a""#))
+        .stdout(predicate::str::contains(r#""id": "k_b""#))
+        .stdout(predicate::str::contains(r#""role": "viewer""#))
+        // Table header should NOT be present in --json mode.
+        .stdout(predicate::str::contains("ID").not());
+}
+
+#[tokio::test]
+async fn keys_list_without_saved_key_exits_non_zero() {
+    let home = common::isolated_home();
+    // No seed_api_key → no key on disk, no EDGE_API_KEY env.
+    // The CLI must refuse to try to authenticate against /api/v1/keys.
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.arg("auth").arg("keys").arg("list");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("API key not found"));
+}
+
 /// D: when `edge.toml` `[deployment]` has no `api` key, the runtime
 /// must fall through to `EDGE_API_URL`. This pins the end-to-end
 /// behavior of the 7 call-site updates that switched from

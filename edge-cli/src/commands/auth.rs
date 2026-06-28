@@ -75,6 +75,14 @@ pub enum KeysAction {
         #[arg(long, default_value = "developer")]
         role: String,
     },
+    /// List all API keys for the current tenant. Marks the key used
+    /// to authenticate this CLI session with `* (current)`.
+    List {
+        /// Emit the raw JSON response to stdout (pretty-printed) for
+        /// piping into `jq` etc.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl AuthAction {
@@ -97,6 +105,7 @@ impl AuthAction {
 fn keys_run(action: KeysAction) -> Result<()> {
     match action {
         KeysAction::Create { name, role } => keys_create(&name, &role),
+        KeysAction::List { json } => keys_list(json),
     }
 }
 
@@ -325,5 +334,62 @@ fn keys_create(name: &str, role: &str) -> Result<()> {
 
 #[cfg(not(feature = "network"))]
 fn keys_create(_name: &str, _role: &str) -> Result<()> {
+    anyhow::bail!("auth keys requires network support; rebuild with --features network")
+}
+
+/// `edge auth keys list [--json]`
+///
+/// Calls `GET /api/v1/keys` and prints a 5-column table (ID / NAME /
+/// ROLE / CREATED / NOTE) for the current tenant's keys. The key used
+/// to authenticate this CLI session is annotated with `* (current)`
+/// so the user can see which one would be lost on self-revoke.
+///
+/// `--json` emits the raw `Vec<APIKeySummary>` pretty-printed — used
+/// by `edge keys list --json | jq '.[] | select(.role=="owner")'`.
+#[cfg(feature = "network")]
+fn keys_list(as_json: bool) -> Result<()> {
+    let base_url = load_api_url("https://api.edgecloud.dev");
+    output::info(&format!("Endpoint: {base_url}"));
+    let client = ApiClient::new(base_url)?;
+
+    // Best-effort: find the id of the key currently authenticating
+    // this CLI session so we can annotate the matching row. A
+    // transient whoami failure is swallowed; the table just loses
+    // the `(current)` marker for that run.
+    let current_id: Option<String> = client.auth().whoami().ok().map(|w| w.api_key_id);
+
+    let keys = client
+        .keys()
+        .list()
+        .with_context(|| "failed to list API keys")?;
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&keys)?);
+        return Ok(());
+    }
+
+    if keys.is_empty() {
+        println!("No API keys.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<20} {:<12} {:<22} NOTE",
+        "ID", "NAME", "ROLE", "CREATED"
+    );
+    println!("{}", "-".repeat(80));
+    for k in &keys {
+        let is_current = current_id.as_deref() == Some(k.id.as_str());
+        let note = if is_current { "(current)" } else { "" };
+        println!(
+            "{:<16} {:<20} {:<12} {:<22} {}",
+            k.id, k.name, k.role, k.created_at, note
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "network"))]
+fn keys_list(_as_json: bool) -> Result<()> {
     anyhow::bail!("auth keys requires network support; rebuild with --features network")
 }

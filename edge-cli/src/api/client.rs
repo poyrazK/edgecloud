@@ -139,6 +139,18 @@ pub struct CreateAPIKeyResponse {
     pub token: String,
 }
 
+/// One API key as returned by `GET /api/v1/keys`. Mirrors the Go
+/// `domain.APIKey` field-for-field, minus `last_used` which the
+/// server deliberately omits from the response even though it is
+/// stored in the DB (see issue #106 design notes).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct APIKeySummary {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,
@@ -692,6 +704,26 @@ impl<'a> Keys<'a> {
         let resp = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {
                 anyhow::anyhow!("keys create failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_str(&resp.text()?).map_err(Into::into)
+    }
+
+    /// GET `/api/v1/keys` — list all API keys for the caller's tenant.
+    /// Returns an inline array (no envelope); used by `edge auth keys list`.
+    pub fn list(&self) -> Result<Vec<APIKeySummary>> {
+        let url = format!("{}/api/v1/keys", self.client.base_url);
+        let resp = self
+            .client
+            .http
+            .get(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys list failed: {status} {body}")
             }
             ApiError::Transient { source } => source,
         })?;
