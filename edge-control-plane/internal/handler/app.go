@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -13,12 +14,20 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
-// AppHandler handles app HTTP requests.
-type AppHandler struct {
-	appSvc *service.AppService
+// AppServiceInterface is the subset of *service.AppService used by AppHandler.
+type AppServiceInterface interface {
+	Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error)
+	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	Delete(ctx context.Context, tenantID, appName string) error
 }
 
-func NewAppHandler(appSvc *service.AppService) *AppHandler {
+// AppHandler handles app HTTP requests.
+type AppHandler struct {
+	appSvc AppServiceInterface
+}
+
+func NewAppHandler(appSvc AppServiceInterface) *AppHandler {
 	return &AppHandler{appSvc: appSvc}
 }
 

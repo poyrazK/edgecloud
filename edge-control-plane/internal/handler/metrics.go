@@ -5,19 +5,24 @@ import (
 	"net/http"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
+
+// MetricsAggregatorInterface is the subset of *service.MetricsAggregator used by MetricsHandler.
+type MetricsAggregatorInterface interface {
+	RenderAll() string
+	RenderTenant(tenantID string) string
+}
 
 // MetricsHandler serves Prometheus-format metric scrape endpoints.
 //
 //   - GET /metrics         — all tenants, unauthenticated (operator / Prometheus scrape)
 //   - GET /api/v1/metrics  — caller's tenant only, requires Bearer API-key auth
 type MetricsHandler struct {
-	agg *service.MetricsAggregator
+	agg MetricsAggregatorInterface
 }
 
 // NewMetricsHandler creates a MetricsHandler backed by the given aggregator.
-func NewMetricsHandler(agg *service.MetricsAggregator) *MetricsHandler {
+func NewMetricsHandler(agg MetricsAggregatorInterface) *MetricsHandler {
 	return &MetricsHandler{agg: agg}
 }
 

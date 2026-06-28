@@ -1,21 +1,29 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
+
+// EnvServiceInterface is the subset of *service.EnvService used by EnvHandler.
+type EnvServiceInterface interface {
+	SetEnv(ctx context.Context, tenantID, appName, key, value string) error
+	ListEnv(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+	DeleteEnv(ctx context.Context, tenantID, appName, key string) error
+}
 
 // EnvHandler handles environment variable HTTP requests.
 type EnvHandler struct {
-	envSvc *service.EnvService
+	envSvc EnvServiceInterface
 }
 
-func NewEnvHandler(envSvc *service.EnvService) *EnvHandler {
+func NewEnvHandler(envSvc EnvServiceInterface) *EnvHandler {
 	return &EnvHandler{envSvc: envSvc}
 }
 

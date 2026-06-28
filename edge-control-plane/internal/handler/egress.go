@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -12,16 +13,27 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
+// EgressTenantServiceInterface is the tenant-service subset needed by EgressHandler.
+type EgressTenantServiceInterface interface {
+	GetEgressAllowlist(ctx context.Context, tenantID string) ([]string, error)
+	UpdateEgressAllowlist(ctx context.Context, tenantID string, allowlist []string) error
+}
+
+// EgressDeploymentServiceInterface is the deployment-service subset needed by EgressHandler.
+type EgressDeploymentServiceInterface interface {
+	RepublishActiveDeployments(ctx context.Context, tenantID string) error
+}
+
 // EgressHandler exposes the tenant self-service egress allowlist API.
 //
 // GET  /api/egress  — return the current allowlist for the authenticated tenant
 // PUT  /api/egress  — replace the allowlist; triggers republish of active deployments
 type EgressHandler struct {
-	tenantSvc     *service.TenantService
-	deploymentSvc *service.DeploymentService
+	tenantSvc     EgressTenantServiceInterface
+	deploymentSvc EgressDeploymentServiceInterface
 }
 
-func NewEgressHandler(tenantSvc *service.TenantService, deploymentSvc *service.DeploymentService) *EgressHandler {
+func NewEgressHandler(tenantSvc EgressTenantServiceInterface, deploymentSvc EgressDeploymentServiceInterface) *EgressHandler {
 	return &EgressHandler{tenantSvc: tenantSvc, deploymentSvc: deploymentSvc}
 }
 
