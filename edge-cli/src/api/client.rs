@@ -729,6 +729,22 @@ impl<'a> Keys<'a> {
         })?;
         serde_json::from_str(&resp.text()?).map_err(Into::into)
     }
+
+    /// DELETE `/api/v1/keys/{id}` — hard-delete the key with the given
+    /// id. Returns `Ok(())` on 204 No Content, `Err(ApiError::Rejected)`
+    /// on 4xx (caller can pattern-match for clean user-facing errors),
+    /// and `Err(ApiError::Transient)` on 5xx or network failure.
+    pub fn revoke(&self, id: &str) -> Result<(), ApiError> {
+        let url = format!("{}/api/v1/keys/{}", self.client.base_url, id);
+        let resp = self
+            .client
+            .http
+            .delete(&url)
+            .header("Authorization", self.client.auth_header())
+            .send()?;
+        let _ = check_response(resp)?;
+        Ok(())
+    }
 }
 
 /// Auth-related endpoints. Borrows the parent [`ApiClient`].

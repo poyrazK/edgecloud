@@ -565,6 +565,187 @@ async fn keys_list_without_saved_key_exits_non_zero() {
         .stderr(predicate::str::contains("API key not found"));
 }
 
+/// Shared wiremock setup for `keys_revoke` tests: seeds a saved key,
+/// mounts `GET /api/v1/auth/whoami` returning `whoami_id`, and mounts
+/// `GET /api/v1/keys` returning `keys`. Returns the mock server.
+async fn setup_revoke_mocks(
+    home: &TempDir,
+    whoami_id: &str,
+    keys: serde_json::Value,
+) -> MockServer {
+    let server = MockServer::start().await;
+    common::seed_api_key(home, "k_existing");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": whoami_id,
+            "api_key_name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/keys"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(keys))
+        .mount(&server)
+        .await;
+
+    server
+}
+
+#[tokio::test]
+async fn keys_revoke_by_id_sends_delete_with_bearer() {
+    let home = common::isolated_home();
+    let keys = serde_json::json!([
+        {
+            "id": "k_other",
+            "name": "ci-deploy",
+            "role": "viewer",
+            "created_at": "2026-06-22T00:00:00Z",
+        },
+    ]);
+    let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_other"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_other")
+        .arg("--yes");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked key k_other"));
+}
+
+#[tokio::test]
+async fn keys_revoke_self_refuses_without_force() {
+    let home = common::isolated_home();
+    // whoami reports k_existing — the same key the CLI is using —
+    // so the self-revoke guard must fire before any DELETE goes out.
+    let keys = serde_json::json!([
+        {
+            "id": "k_existing",
+            "name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        },
+    ]);
+    let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_existing")
+        .arg("--yes");
+
+    cmd.assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("refusing to revoke"));
+}
+
+#[tokio::test]
+async fn keys_revoke_self_proceeds_with_force() {
+    let home = common::isolated_home();
+    let keys = serde_json::json!([
+        {
+            "id": "k_existing",
+            "name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        },
+    ]);
+    let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_existing"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_existing")
+        .arg("--force")
+        .arg("--yes");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked key k_existing"));
+}
+
+#[tokio::test]
+async fn keys_revoke_404_surfaces_in_stderr() {
+    let home = common::isolated_home();
+    let keys = serde_json::json!([
+        {
+            "id": "k_other",
+            "name": "ci-deploy",
+            "role": "viewer",
+            "created_at": "2026-06-22T00:00:00Z",
+        },
+    ]);
+    let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_missing"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_missing")
+        .arg("--yes");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("keys revoke failed"))
+        .stderr(predicate::str::contains("404"));
+}
+
 /// D: when `edge.toml` `[deployment]` has no `api` key, the runtime
 /// must fall through to `EDGE_API_URL`. This pins the end-to-end
 /// behavior of the 7 call-site updates that switched from

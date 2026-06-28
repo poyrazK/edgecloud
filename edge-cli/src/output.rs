@@ -38,6 +38,19 @@ pub fn section(label: &str) {
     println!("\n{} {}", style("›").cyan(), style(label).bold());
 }
 
+/// Read a `y/N` confirmation from stdin. Returns true on "y" or "Y"
+/// (after trim); false on anything else (including EOF and empty
+/// input). Caller is responsible for the `is_terminal()` check —
+/// this helper does NOT verify stdin is a TTY, so it works the same
+/// whether or not the input is a terminal (only the safety of
+/// prompting interactively is the caller's concern).
+pub(crate) fn confirm(prompt: &str) -> std::io::Result<bool> {
+    eprint!("{prompt}");
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(matches!(buf.trim(), "y" | "Y"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

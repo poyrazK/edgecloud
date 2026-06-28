@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::env;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
@@ -83,6 +83,25 @@ pub enum KeysAction {
         #[arg(long)]
         json: bool,
     },
+    /// Revoke an API key by id. Refuses to revoke the key currently
+    /// authenticating this CLI session unless `--force` is passed;
+    /// prompts `y/N` unless `--yes` is passed in non-interactive shells.
+    Revoke {
+        /// API key id to revoke (e.g. `k_abc123`). Run
+        /// `edge auth keys list` to find ids.
+        #[arg(long)]
+        id: String,
+        /// Allow revoking the key currently used to authenticate
+        /// this CLI session. The CLI will lose access until you
+        /// re-login with another key.
+        #[arg(long)]
+        force: bool,
+        /// Skip the `y/N` confirmation prompt. Required in
+        /// non-interactive shells (CI, pipes, heredocs) where stdin
+        /// is not a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 impl AuthAction {
@@ -106,6 +125,7 @@ fn keys_run(action: KeysAction) -> Result<()> {
     match action {
         KeysAction::Create { name, role } => keys_create(&name, &role),
         KeysAction::List { json } => keys_list(json),
+        KeysAction::Revoke { id, force, yes } => keys_revoke(&id, force, yes),
     }
 }
 
@@ -391,5 +411,105 @@ fn keys_list(as_json: bool) -> Result<()> {
 
 #[cfg(not(feature = "network"))]
 fn keys_list(_as_json: bool) -> Result<()> {
+    anyhow::bail!("auth keys requires network support; rebuild with --features network")
+}
+
+/// `edge auth keys revoke --id <k_xxx> [--force] [--yes]`
+///
+/// Hard-deletes the API key with the given id via
+/// `DELETE /api/v1/keys/{id}`. Refuses to revoke the key currently
+/// used to authenticate this CLI session (unless `--force`) and
+/// prompts `y/N` (unless `--yes` or non-TTY). The on-disk saved key
+/// is NOT auto-cleared on self-revoke — if the user revoked the key
+/// their CLI was using, they must run `edge auth login` with a new
+/// key.
+#[cfg(feature = "network")]
+fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
+    let base_url = load_api_url("https://api.edgecloud.dev");
+    output::info(&format!("Endpoint: {base_url}"));
+    let client = ApiClient::new(base_url)?;
+
+    // Best-effort lookup of the target key's name (for the prompt
+    // and the post-revoke warning). On any failure (transient or
+    // 404), proceed with the id-only flow.
+    let target_name: Option<String> = client
+        .keys()
+        .list()
+        .ok()
+        .and_then(|keys| keys.into_iter().find(|k| k.id == id))
+        .map(|k| k.name);
+
+    // Self-revoke guard. whoami tells us which key the bearer token
+    // resolves to; if it matches the target, refuse unless --force.
+    // If whoami itself fails, fall through and let the server decide
+    // — the local check is a UX guard, not a security boundary.
+    if !force {
+        if let Ok(info) = client.auth().whoami() {
+            if info.api_key_id == id {
+                output::error(&format!(
+                    "refusing to revoke the key currently used to authenticate this CLI \
+                     session (id: {}, name: {}); pass --force to override",
+                    info.api_key_id, info.api_key_name
+                ));
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // Confirmation prompt. Only on a TTY (same precedent as
+    // `edge auth login --no-echo`). Non-interactive shells must
+    // pass --yes — refusing is friendlier than silently bypassing.
+    if !yes {
+        if !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "refusing to revoke without confirmation: pass --yes in non-interactive shells"
+            );
+        }
+        let label = target_name
+            .as_deref()
+            .map(|n| format!("{id} (\"{n}\")"))
+            .unwrap_or_else(|| id.to_string());
+        let confirmed = output::confirm(&format!("Revoke key {label}? [y/N] "))?;
+        if !confirmed {
+            output::info("aborted");
+            return Ok(());
+        }
+    }
+
+    client
+        .keys()
+        .revoke(id)
+        .map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("keys revoke failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })
+        .with_context(|| format!("revoking key {id}"))?;
+
+    output::success(&format!("Revoked key {id}"));
+
+    // If the user just revoked the key saved on disk, warn them —
+    // they will not be able to run further CLI commands until they
+    // re-login. We deliberately do NOT auto-clear the on-disk key
+    // here: --force users may be rotating intentionally (e.g. CI),
+    // and clearing the config could race with their intent.
+    if let Ok(saved) = ApiKey::load_without_env() {
+        if saved.0 == id {
+            if let Some(path) = ApiKey::config_path() {
+                output::warn(&format!(
+                    "the saved key at {} is the one you just revoked; \
+                     run `edge auth login` with a new key",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "network"))]
+fn keys_revoke(_id: &str, _force: bool, _yes: bool) -> Result<()> {
     anyhow::bail!("auth keys requires network support; rebuild with --features network")
 }
