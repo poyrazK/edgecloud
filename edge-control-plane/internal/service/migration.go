@@ -335,8 +335,11 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	if compileErrMsg != "" {
 		// Build failure report from envelope's structured Report (HEAD)
 		// when available; fall back to a fresh struct otherwise.
+		// Status is Failed: the analyzer ran fine, the toolchain refused
+		// to compile the transformed source. Partial is reserved for the
+		// analyzer-driven case (some patterns need manual review).
 		report := envelope.Report
-		report.Status = domain.MigrationStatusPartial
+		report.Status = domain.MigrationStatusFailed
 		report.WasmStored = false
 		report.AppName = appName
 		report.DeploymentID = nil
@@ -880,8 +883,12 @@ func (s *MigrationService) MigrateTree(
 	}
 
 	if compileErrMsg != "" {
+		// Status is Failed: the toolchain refused to compile. Partial
+		// is reserved for analyzer-driven classifications (some files
+		// need manual review); here every file's analyzer-side result
+		// is moot because the resulting wasm is unrunnable.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -905,7 +912,7 @@ func (s *MigrationService) MigrateTree(
 	}
 	if info.Size() > MaxArtifactSize {
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
@@ -933,8 +940,11 @@ func (s *MigrationService) MigrateTree(
 	}
 	if !bytes.HasPrefix(magic[:], []byte{0x00, 0x61, 0x73, 0x6d}) {
 		_ = magicFile.Close()
+		// Same Failed semantics as the compile-failure branch above —
+		// the toolchain emitted bytes that don't have the wasm magic;
+		// per-file analyzer status is irrelevant.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,

@@ -310,8 +310,10 @@ func TestMigrationService_Migrate_ClangFails(t *testing.T) {
 	if report == nil {
 		t.Fatal("expected non-nil report")
 	}
-	if report.Status != domain.MigrationStatusPartial {
-		t.Errorf("expected status partial, got: %s", report.Status)
+	// Toolchain failure surfaces as Failed; Partial is reserved for the
+	// analyzer-driven case (some patterns need manual review).
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status failed, got: %s", report.Status)
 	}
 	if report.WasmStored {
 		t.Error("expected WasmStored=false")
