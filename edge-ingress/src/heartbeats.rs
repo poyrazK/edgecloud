@@ -242,14 +242,10 @@ mod tests {
                 observer_metrics: vec![],
             },
         );
-        let hb = HeartbeatMessage {
-            msg_type: "heartbeat".to_string(),
-            timestamp: "2026-06-19T00:00:00Z".to_string(),
-            worker_id: "w_fra_abc".to_string(),
-            region: "fra".to_string(),
-            worker_addr: None,
-            apps,
-        };
+        let mut hb =
+            HeartbeatMessage::new("w_fra_abc".to_string(), "fra".to_string(), String::new());
+        hb.worker_addr = None;
+        hb.apps = apps;
 
         let changed = apply_heartbeat(&table, &hb).await;
         assert!(
@@ -286,14 +282,9 @@ mod tests {
                 observer_metrics: vec![],
             },
         );
-        let hb = HeartbeatMessage {
-            msg_type: "heartbeat".to_string(),
-            timestamp: "2026-06-19T00:00:00Z".to_string(),
-            worker_id: "w_fra_abc".to_string(),
-            region: "fra".to_string(),
-            worker_addr: Some(String::new()),
-            apps,
-        };
+        let mut hb =
+            HeartbeatMessage::new("w_fra_abc".to_string(), "fra".to_string(), String::new());
+        hb.apps = apps;
 
         let changed = apply_heartbeat(&table, &hb).await;
         assert!(
@@ -329,14 +320,12 @@ mod tests {
                 observer_metrics: vec![],
             },
         );
-        let hb = HeartbeatMessage {
-            msg_type: "heartbeat".to_string(),
-            timestamp: "2026-06-19T00:00:00Z".to_string(),
-            worker_id: "w_fra_abc".to_string(),
-            region: "fra".to_string(),
-            worker_addr: Some("203.0.113.10".to_string()),
-            apps,
-        };
+        let mut hb = HeartbeatMessage::new(
+            "w_fra_abc".to_string(),
+            "fra".to_string(),
+            "203.0.113.10".to_string(),
+        );
+        hb.apps = apps;
 
         let changed = apply_heartbeat(&table, &hb).await;
         assert!(
