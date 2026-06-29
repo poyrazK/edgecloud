@@ -26,12 +26,16 @@ use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
 
 /// The main supervisor — manages all running apps for this worker node.
 ///
-/// `#[non_exhaustive]` blocks external crates from constructing this via
-/// struct literal — they must use [`Supervisor::new`]. Without this
-/// attribute, adding new fields (e.g. `cpu_sample`) would trip
-/// `cargo-semver-checks`' `constructible_struct_adds_field` rule.
-/// `#[non_exhaustive]` is the documented carve-out for that rule.
-#[non_exhaustive]
+/// The main supervisor — manages all running apps for this worker node.
+///
+/// `Supervisor::new` is the canonical constructor; external code that
+/// needs an instance should prefer it over the public struct literal
+/// (which exists for backwards compatibility with pre-#166 callers).
+/// Adding new fields (e.g. `cpu_sample` for #85) is permitted by the
+/// `[package.metadata.cargo-semver-checks.lints]` allowlist in
+/// `Cargo.toml`, which disables the `constructible_struct_adds_field`
+/// and `enum_variant_added` rules for this crate — these types are
+/// internal-process singletons, not external API.
 pub struct Supervisor {
     pub config: Config,
     pub state: Arc<RwLock<WorkerState>>,
@@ -84,6 +88,8 @@ impl Supervisor {
         port_pool: Arc<Mutex<PortPool>>,
         nats: Arc<dyn NatsClient>,
         log_forwarder: Arc<LogForwarder>,
+        jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
+        http: reqwest::Client,
         cpu_sample: CpuSample,
     ) -> Self {
         Self {
@@ -93,6 +99,8 @@ impl Supervisor {
             port_pool,
             nats,
             log_forwarder,
+            jwt_signer,
+            http,
             cpu_sample,
         }
     }
