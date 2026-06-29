@@ -113,7 +113,7 @@ impl ApiKey {
         // Atomic write: tempfile in the same directory, fsync, rename.
         // Same-directory rename is atomic on POSIX and on Windows when
         // using `MoveFileEx` (which Rust's `rename` does for files).
-        let tmp = path.with_extension("toml.tmp");
+        let tmp = atomic_write_tmp_path(path);
         write_file_atomically(&tmp, path, serialized.as_bytes())?;
         Ok(())
     }
@@ -143,7 +143,7 @@ impl ApiKey {
             }
         }
         let serialized = toml::to_string(&doc).context("failed to serialize config")?;
-        let tmp = path.with_extension("toml.tmp");
+        let tmp = atomic_write_tmp_path(path);
         write_file_atomically(&tmp, path, serialized.as_bytes())?;
         Ok(())
     }
@@ -206,6 +206,19 @@ fn open_with_secure_mode(path: &Path) -> Result<std::fs::File> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// Compute the temp-file path used by `save_to` / `clear_at`.
+/// Appends `.tmp` to the basename instead of replacing the
+/// extension via `with_extension`, which breaks for any path
+/// without a `.toml` suffix (e.g. a user-renamed `config`).
+/// Issue #109 F8.
+fn atomic_write_tmp_path(path: &Path) -> PathBuf {
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!("{fname}.tmp"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,5 +311,75 @@ mod tests {
         let path = dir.path().join("does-not-exist.toml");
         ApiKey::clear_at(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    // F8: a config file without the `.toml` extension (e.g. a
+    // user-renamed `config`) used to produce a wrong tmp name with
+    // the old `with_extension("toml.tmp")` (which REPLACES the
+    // extension slot, breaking for "config" -> "config.tmp" — the
+    // .toml never gets re-added). The fix appends `.tmp` to the
+    // basename instead, so the tmp file is always a sibling and the
+    // rename completes cleanly.
+    #[test]
+    fn save_to_writes_tmp_inside_same_dir_for_extensionless_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // No extension — the bug case.
+        let path = dir.path().join("config");
+        ApiKey("k_no_ext".into()).save_to(&path).unwrap();
+
+        // The final file exists with the right key, and the wrong
+        // tmp from the old code path (`config.tmp`) does NOT remain
+        // — atomic_write_tmp_path returns it as a sibling that the
+        // rename consumes.
+        assert!(path.exists(), "final file should exist");
+        let parsed =
+            toml::from_str::<TomlConfig>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.default.api_key.as_deref(), Some("k_no_ext"));
+        assert!(
+            !dir.path().join("config.tmp").exists(),
+            "old-shape tmp must not be left behind"
+        );
+    }
+
+    #[test]
+    fn clear_at_writes_tmp_inside_same_dir_for_extensionless_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        ApiKey("k_seed".into()).save_to(&path).unwrap();
+        ApiKey::clear_at(&path).unwrap();
+
+        // api_key should be gone, the tmp should be cleaned up, and
+        // the file itself should still exist (clear preserves other
+        // top-level sections).
+        assert!(path.exists(), "file should still exist after clear");
+        let parsed =
+            toml::from_str::<TomlConfig>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.default.api_key.is_none());
+        assert!(
+            !dir.path().join("config.tmp").exists(),
+            "old-shape tmp must not be left behind"
+        );
+    }
+
+    #[test]
+    fn atomic_write_tmp_path_appends_tmp_to_basename() {
+        // The bug: `path.with_extension("toml.tmp")` replaces the
+        // extension. The fix: append `.tmp` to the file_name.
+        let normal = std::path::PathBuf::from("/x/y/config.toml");
+        let no_ext = std::path::PathBuf::from("/x/y/config");
+        let other_ext = std::path::PathBuf::from("/x/y/edge.toml");
+
+        assert_eq!(
+            atomic_write_tmp_path(&normal),
+            std::path::PathBuf::from("/x/y/config.toml.tmp"),
+        );
+        assert_eq!(
+            atomic_write_tmp_path(&no_ext),
+            std::path::PathBuf::from("/x/y/config.tmp"),
+        );
+        assert_eq!(
+            atomic_write_tmp_path(&other_ext),
+            std::path::PathBuf::from("/x/y/edge.toml.tmp"),
+        );
     }
 }
