@@ -241,6 +241,17 @@ func TestExecute_ScaleUp_Success(t *testing.T) {
 	if ev.ProviderKind != "mock" {
 		t.Errorf("ProviderKind = %q, want mock", ev.ProviderKind)
 	}
+	// CreatedAt must be set to roughly now() — applyCooldown reads it
+	// back from lastEventByRegion, and a zero value makes `now.Sub(zero)`
+	// a huge positive number that defeats the cooldown gate. Pin the
+	// upper-bound window so the test catches a regression where the
+	// field is left default-zero again.
+	if ev.CreatedAt.IsZero() {
+		t.Errorf("CreatedAt = zero time, want ~now() (applyCooldown depends on this)")
+	}
+	if delta := time.Since(ev.CreatedAt); delta < 0 || delta > 5*time.Second {
+		t.Errorf("CreatedAt off by %v, want within 5s of now()", delta)
+	}
 }
 
 // TestExecute_ScaleUp_Failure pins the error path: a CloudProvider

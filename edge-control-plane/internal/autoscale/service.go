@@ -261,6 +261,12 @@ func (s *Service) applyCooldown(d Decision, lastEvent *domain.AutoscaleEvent, no
 // Mutates lastEventByRegion[region] so the next tick's cooldown
 // check (per-region) sees this row.
 func (s *Service) execute(ctx context.Context, region string, workers []WorkerHeadroom, d Decision) {
+	// CreatedAt is set here (in addition to the DB default) so that
+	// lastEventByRegion carries the wall-clock time the decision was
+	// made. applyCooldown reads lastEvent.CreatedAt to compute the
+	// elapsed window; if we leave it zero-valued, `now.Sub(zero)` is
+	// a huge positive number and the cooldown gate never fires
+	// (every tick looks like it happened "ages ago").
 	ev := &domain.AutoscaleEvent{
 		Region:       region,
 		Action:       d.Action,
@@ -269,6 +275,7 @@ func (s *Service) execute(ctx context.Context, region string, workers []WorkerHe
 		Reason:       d.Reason,
 		ProviderKind: s.cloud.Kind(),
 		Succeeded:    true,
+		CreatedAt:    time.Now(),
 	}
 	switch d.Action {
 	case domain.AutoscaleUp:
