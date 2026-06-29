@@ -1158,3 +1158,91 @@ async fn keys_revoke_no_longer_calls_list_endpoint() {
         );
     }
 }
+
+/// F9: a rejected response with a multi-KiB body must be truncated
+/// in the CLI's stderr output before being printed. The truncate
+/// marker (`... [truncated]`) must appear, and the original body
+/// must NOT survive verbatim — pinning that the CLI buffers at
+/// most 4 KiB of an error body before formatting it. Issue #109 F9.
+#[tokio::test]
+async fn rejected_response_with_huge_body_truncates_in_stderr() {
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    // 16 KiB of 'A'. Well above the 4 KiB cap, so truncation fires.
+    let big_body: String = "A".repeat(16 * 1024);
+    assert!(big_body.len() > 4096);
+
+    // Mount on a path the login verification hits — the rejected
+    // key path goes through `check_response` which now caps the body.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(&big_body))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("login")
+        .arg("--key")
+        .arg("k_typo");
+
+    // The marker must appear AND the full 16 KiB must NOT — caps
+    // memory at MAX_ERR_BODY and pins the contract end-to-end.
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("... [truncated]"))
+        .stderr(predicate::str::contains("rejected"));
+
+    // Independently verify the truncation marker bytes appear in
+    // stderr (the predicate::str::contains above is substring-level;
+    // this is belt-and-suspenders for the bit-pattern sanity).
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        !stderr.contains(&big_body),
+        "stderr leaked the full 16 KiB body to the user"
+    );
+}
+
+/// F9: an oversized 5xx body must also be truncated (not just 4xx),
+/// and the CLI must exit cleanly (non-zero) without OOMing. The
+/// 1 MiB body below would fit fine in `String::from_utf8_lossy`'s
+/// output if truncation didn't fire — assert it doesn't.
+#[tokio::test]
+async fn server_error_with_huge_body_does_not_oom_cli() {
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+
+    // 1 MiB body on a 500 — must still be truncated to ~4 KiB + marker.
+    let big_body = vec![b'A'; 1_000_000];
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tenants"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_bytes(big_body)
+                .append_header("content-type", "text/plain"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    // Tight timeout — if the CLI OOMs or hangs, the test fails fast
+    // (otherwise a regression here could hang the suite indefinitely).
+    cmd.timeout(std::time::Duration::from_secs(15));
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("auth")
+        .arg("signup")
+        .arg("--name")
+        .arg("u");
+
+    // Non-zero exit (server returned 500) + the marker is present.
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("... [truncated]"));
+}

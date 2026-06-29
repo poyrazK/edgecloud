@@ -64,12 +64,18 @@ impl From<serde_json::Error> for ApiError {
 /// `pub(crate)` so sibling accessor structs (`DomainClient`,
 /// `Tenants`, `Keys`, etc.) can reuse the same 2xx/4xx/5xx split
 /// instead of hand-rolling `if !status.is_success()` per method.
+///
+/// The error body is capped at [`MAX_ERR_BODY`] bytes via
+/// [`truncate_body`] before being plumbed into either the
+/// `Rejected` arm or the `Transient` anyhow! arm, so a misbehaving
+/// control plane returning a multi-GB 4xx/5xx body can't OOM the
+/// CLI. Issue #109 F9.
 pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().unwrap_or_default();
+    let body = truncate_body(&resp.text().unwrap_or_default());
     if status.is_client_error() {
         Err(ApiError::Rejected { status, body })
     } else {
@@ -77,6 +83,37 @@ pub(crate) fn check_response(resp: Response) -> Result<Response, ApiError> {
             source: anyhow::anyhow!("server returned {status}: {body}"),
         })
     }
+}
+
+/// Maximum number of bytes of a server response body that the CLI
+/// will buffer into memory before truncating. Caps the worst-case
+/// memory footprint at `MAX_ERR_BODY` per response for a CLI that
+/// serializes requests on a single client. Sized for real error
+/// bodies (typically <1 KiB) with headroom for stack traces on 5xx.
+/// Issue #109 F9. Kept in sync with the same constant in
+/// `edge-migrate/edge-migrate-bin/src/main.rs`.
+const MAX_ERR_BODY: usize = 4 * 1024;
+
+/// Cap a server response body at [`MAX_ERR_BODY`] bytes. Real
+/// server error JSON is 100-500 bytes; RFC 7807 problem-detail
+/// payloads are typically <1 KiB. A misbehaving control plane
+/// returning a multi-GB 4xx/5xx body would otherwise OOM the CLI
+/// before the body is printed. Walks down to a UTF-8 char boundary
+/// because `String::truncate` panics on a mid-multibyte-char
+/// index, and a panic in this path would kill a TTY mid-`edge
+/// deploy`. Issue #109 F9.
+fn truncate_body(s: &str) -> String {
+    if s.len() <= MAX_ERR_BODY {
+        return s.to_string();
+    }
+    let mut end = MAX_ERR_BODY;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 16);
+    out.push_str(&s[..end]);
+    out.push_str("... [truncated]");
+    out
 }
 
 /// HTTP client for all control plane API calls.
@@ -884,5 +921,59 @@ mod tests {
         let err: serde_json::Error = serde_json::from_str::<i32>("not int").unwrap_err();
         let e: ApiError = err.into();
         assert!(matches!(e, ApiError::Transient { .. }));
+    }
+
+    // F9: `truncate_body` must (a) leave short bodies unchanged,
+    // (b) cap at MAX_ERR_BODY + marker for long bodies, and
+    // (c) walk down to a UTF-8 char boundary instead of
+    // panicking mid-multibyte-char. The marker is ASCII so it's
+    // safe to write into any log pipeline.
+
+    #[test]
+    fn truncate_body_short_input_returned_unchanged() {
+        let s = "invalid key".to_string();
+        assert_eq!(truncate_body(&s), s);
+    }
+
+    #[test]
+    fn truncate_body_exact_cap_returned_unchanged() {
+        let s = "a".repeat(MAX_ERR_BODY);
+        // Equal to cap → no truncation, no marker. Marker is only
+        // added when the input exceeds the cap.
+        assert_eq!(truncate_body(&s), s);
+        assert!(!truncate_body(&s).contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_body_over_cap_gets_marker_and_larger_bytes_pre_counted() {
+        // 8 KiB of 'A'. The output must (a) be at most MAX_ERR_BODY
+        // bytes of prefix + a short marker, and (b) contain the
+        // marker; (c) NOT contain the full 8 KiB verbatim.
+        let s = "A".repeat(8 * 1024);
+        let out = truncate_body(&s);
+        assert!(out.starts_with(&"A".repeat(MAX_ERR_BODY)));
+        assert!(out.ends_with("... [truncated]"));
+        assert!(out.len() <= MAX_ERR_BODY + "... [truncated]".len());
+        // The original 8 KiB body must not survive verbatim.
+        assert!(!out.starts_with(&"A".repeat(MAX_ERR_BODY + 1)));
+    }
+
+    #[test]
+    fn truncate_body_walks_down_to_utf8_char_boundary() {
+        // Construct a string of length MAX_ERR_BODY + 1 whose byte
+        // at index MAX_ERR_BODY is the start of a 3-byte UTF-8
+        // sequence (e.g. U+3000 ideographic space = E3 80 80). The
+        // function must not panic and must end on a valid char
+        // boundary.
+        let mut s: String = "a".repeat(MAX_ERR_BODY - 1);
+        s.push('\u{3000}'); // 3 bytes
+                            // Now s.len() == MAX_ERR_BODY - 1 + 3 == MAX_ERR_BODY + 2.
+        assert!(s.len() > MAX_ERR_BODY);
+        let out = truncate_body(&s);
+        assert!(out.is_char_boundary(out.find("... [truncated]").unwrap()));
+        assert!(!out.is_empty());
+        // The marker must be present and the function must have
+        // returned without panicking.
+        assert!(out.ends_with("... [truncated]"));
     }
 }

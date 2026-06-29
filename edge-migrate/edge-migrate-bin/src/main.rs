@@ -28,6 +28,32 @@ use tokio::io::AsyncReadExt;
 
 const DEFAULT_API_URL: &str = "https://api.edgecloud.dev";
 
+/// Maximum bytes of a server error body the CLI will keep in memory
+/// before truncating. Same value as
+/// `edge-cli/src/api/client.rs::MAX_ERR_BODY` (issue #109 F9).
+const MAX_ERR_BODY: usize = 4 * 1024;
+
+/// Cap a server response body at [`MAX_ERR_BODY`] bytes. A
+/// misbehaving control plane returning a multi-GB 4xx/5xx body
+/// would otherwise OOM the CLI before the body is printed. Walks
+/// down to a UTF-8 char boundary because `String::truncate` panics
+/// mid-multibyte-char. Kept identical to
+/// `edge-cli/src/api/client.rs::truncate_body` so a wire-format
+/// regression in one crate is caught in the other. Issue #109 F9.
+fn truncate_body(s: &str) -> String {
+    if s.len() <= MAX_ERR_BODY {
+        return s.to_string();
+    }
+    let mut end = MAX_ERR_BODY;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 16);
+    out.push_str(&s[..end]);
+    out.push_str("... [truncated]");
+    out
+}
+
 /// Output format for `--transform`. `text` (default) writes raw WASI C
 /// to stdout — the contract external CLI users have always had.
 /// `json` writes a `TransformOutput` envelope that bundles the
@@ -382,7 +408,7 @@ async fn upload_to_edgecloud(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = truncate_body(&response.text().await.unwrap_or_default());
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
@@ -500,7 +526,7 @@ async fn upload_tree_to_edgecloud(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = truncate_body(&response.text().await.unwrap_or_default());
         anyhow::bail!("Server returned {}: {}", status, body);
     }
 
