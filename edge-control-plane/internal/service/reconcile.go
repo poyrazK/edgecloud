@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -9,15 +10,25 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 )
 
+// ErrTenantNotFound is returned by BuildFullSync when the caller
+// (e.g. the /sync HTTP fallback handler) asks for a tenantID that has
+// no row in the tenants table. A worker that references a deleted
+// tenant is the only realistic production trigger — the handler maps
+// it to 500 so operators see the inconsistent state in their error
+// dashboards instead of silently receiving an empty payload.
+var ErrTenantNotFound = errors.New("tenant not found")
+
 // reconcileTenants is the subset of *repository.TenantRepository the
-// ReconcileService needs: enumerate every tenant so a fresh boot can
-// publish full_sync to all (tenant, region) pairs right away. The
-// existing TenantService.ListTenants already wraps this, but we take
-// the repo directly so the reconcile loop doesn't depend on the
-// TenantService lifecycle (e.g. during boot, before TenantService is
-// fully wired into the handler stack).
+// ReconcileService needs. List fans out across all tenants for the
+// periodic sweep; GetByID fetches one row by ID for the on-demand
+// RequestSync and the HTTP-fallback BuildFullSync paths. Without
+// GetByID, both callers would have to walk the full List and match
+// in memory — and the previous "len(tenant) == 0" guard didn't
+// actually detect "not found" because tenant is a slice that can be
+// empty for unrelated reasons (e.g. a fresh DB, or pagination later).
 type reconcileTenants interface {
 	List(ctx context.Context) ([]domain.Tenant, error)
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
 // reconcileActiveDeployments is the subset of
@@ -166,23 +177,23 @@ func (s *ReconcileService) RunOnce(ctx context.Context) error {
 // one region" — the on-register path uses this to scope the publish
 // to the freshly-registered worker's region.
 func (s *ReconcileService) RequestSync(ctx context.Context, tenantID, region string) {
-	tenant, err := s.tenantRepo.List(ctx)
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil {
-		log.Printf("reconcile: RequestSync(%s,%s): list tenants: %v", tenantID, region, err)
+		log.Printf("reconcile: RequestSync(%s,%s): get tenant: %v", tenantID, region, err)
 		return
 	}
-	var allowlist []string
-	for _, t := range tenant {
-		if t.ID == tenantID {
-			allowlist = t.AllowlistedDestinations
-			break
-		}
-	}
-	if allowlist == nil && len(tenant) == 0 {
+	if tenant == nil {
+		// The previously-implemented `len(tenant) == 0` check never
+		// fired — `tenant` was the whole List result, so an empty DB
+		// (or a deployment row written before tenant creation) would
+		// silently fall through with `allowlist = nil`. That stripped
+		// egress rules for a tenant whose allowlist we couldn't load
+		// — the wrong direction for a security boundary. Now we
+		// explicitly fail-closed.
 		log.Printf("reconcile: RequestSync(%s,%s): tenant not found", tenantID, region)
 		return
 	}
-	s.reconcileTenant(ctx, tenantID, allowlist, region)
+	s.reconcileTenant(ctx, tenantID, tenant.AllowlistedDestinations, region)
 }
 
 // reconcileTenant is the shared core: read active_deployments for one
@@ -281,17 +292,19 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 		region = s.defaultRegion
 	}
 
-	tenants, err := s.tenantRepo.List(ctx)
+	// Resolve tenant allowlist up front. A missing tenant row is an
+	// inconsistent-state error (worker registered but tenant deleted):
+	// return ErrTenantNotFound so the HTTP handler can surface a 500
+	// with a useful log line, instead of silently returning a payload
+	// stripped of egress rules.
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	var allowlist []string
-	for _, t := range tenants {
-		if t.ID == tenantID {
-			allowlist = t.AllowlistedDestinations
-			break
-		}
+	if tenant == nil {
+		return nil, ErrTenantNotFound
 	}
+	allowlist := tenant.AllowlistedDestinations
 
 	activeList, err := s.activeRepo.ListByTenant(ctx, tenantID)
 	if err != nil {

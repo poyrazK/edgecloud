@@ -17,12 +17,33 @@ import (
 // sqlmock) because the reconcile loop is mostly fan-out logic — the
 // repo behavior we want to exercise is "what does this query return",
 // not "did the SQL parse correctly".
+//
+// getByIDFunc lets individual tests inject a custom return (e.g.
+// `(nil, errors.New("db boom"))`) without mutating the static
+// `tenants` slice. Defaults to "look up by ID in the slice, return
+// (nil, nil) if missing" — matching the (nil, nil) contract of the
+// real TenantRepository.GetByID.
 type fakeTenantRepo struct {
-	tenants []domain.Tenant
+	tenants      []domain.Tenant
+	getByIDFunc  func(ctx context.Context, id string) (*domain.Tenant, error)
+	getByIDCalls []string // every ID looked up, in order — useful for asserting "was GetByID called?"
 }
 
 func (f *fakeTenantRepo) List(_ context.Context) ([]domain.Tenant, error) {
 	return f.tenants, nil
+}
+
+func (f *fakeTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
+	f.getByIDCalls = append(f.getByIDCalls, id)
+	if f.getByIDFunc != nil {
+		return f.getByIDFunc(ctx, id)
+	}
+	for i := range f.tenants {
+		if f.tenants[i].ID == id {
+			return &f.tenants[i], nil
+		}
+	}
+	return nil, nil
 }
 
 type fakeActiveRepo struct {
@@ -315,6 +336,58 @@ func TestRequestSync_NoMatchingRegion_PublishesNothing(t *testing.T) {
 	}
 }
 
+// TestRequestSync_TenantNotFound_NoPublish exercises the
+// tenant-not-found branch added in the GetByID refactor (review of
+// PR #166, finding #2). The previous implementation relied on the
+// broken predicate `len(tenant) == 0` (where `tenant` was the whole
+// List result, not a single row) — so this case silently fell
+// through with allowlist=nil, which would strip egress rules for a
+// tenant whose row was missing for any reason. Now: GetByID returns
+// (nil, nil), RequestSync logs and returns, publisher is never
+// called.
+func TestRequestSync_TenantNotFound_NoPublish(t *testing.T) {
+	pub := &capturingPublisher{}
+	// Even though the tenants slice contains t_a, we inject a
+	// getByIDFunc that returns (nil, nil) — simulating a tenant row
+	// the DB can't find for this ID (deleted between Register and
+	// the periodic sweep, or stale workerID).
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_other"}}, // t_a is NOT in the slice
+		nil, nil, nil, nil, pub)
+	svc.tenantRepo.(*fakeTenantRepo).getByIDFunc = func(_ context.Context, _ string) (*domain.Tenant, error) {
+		return nil, nil
+	}
+
+	svc.RequestSync(context.Background(), "t_a", "us-east")
+
+	if got := len(pub.calls); got != 0 {
+		t.Errorf("calls=%d, want 0 (tenant not found must not publish)", got)
+	}
+	// Verify GetByID was actually consulted (not just bypassed by a
+	// short-circuit).
+	if got := len(svc.tenantRepo.(*fakeTenantRepo).getByIDCalls); got != 1 {
+		t.Errorf("GetByID calls=%d, want 1", got)
+	}
+}
+
+// TestRequestSync_TenantRepoError_LogsAndReturns covers the
+// "GetByID returned an error" branch separately from the
+// "GetByID returned (nil, nil)" branch above. Both must fail closed
+// (no publish); the log line is the only signal an operator gets.
+func TestRequestSync_TenantRepoError_NoPublish(t *testing.T) {
+	pub := &capturingPublisher{}
+	svc := reconcileSvcForTest(t, nil, nil, nil, nil, nil, pub)
+	svc.tenantRepo.(*fakeTenantRepo).getByIDFunc = func(_ context.Context, _ string) (*domain.Tenant, error) {
+		return nil, errors.New("connection reset")
+	}
+
+	svc.RequestSync(context.Background(), "t_a", "us-east")
+
+	if got := len(pub.calls); got != 0 {
+		t.Errorf("calls=%d, want 0 (repo error must not publish)", got)
+	}
+}
+
 // --- BuildFullSync ----------------------------------------------------
 
 func TestBuildFullSync_ReturnsSameShapeAsPublish(t *testing.T) {
@@ -396,6 +469,57 @@ func TestBuildFullSync_NoActiveDeployments_ReturnsEmptyMap(t *testing.T) {
 	}
 	if len(apps) != 0 {
 		t.Errorf("apps=%v, want empty", apps)
+	}
+}
+
+// TestBuildFullSync_TenantNotFound_ReturnsError exercises the
+// tenant-not-found branch added in the GetByID refactor (review of
+// PR #166, finding #2). The previous implementation silently
+// proceeded with allowlist=nil when the tenant row was missing —
+// which would have stripped egress rules for an inconsistent
+// (worker registered, tenant deleted) state. Now: GetByID returns
+// (nil, nil), BuildFullSync returns ErrTenantNotFound so the HTTP
+// handler can map it to a logged error instead of a stripped
+// payload. We assert errors.Is (not ==) because the service wraps
+// no context, but a future revision might.
+func TestBuildFullSync_TenantNotFound_ReturnsError(t *testing.T) {
+	pub := &capturingPublisher{}
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_other"}}, // t_a deliberately absent
+		nil, nil, nil, nil, pub)
+	svc.tenantRepo.(*fakeTenantRepo).getByIDFunc = func(_ context.Context, _ string) (*domain.Tenant, error) {
+		return nil, nil
+	}
+
+	apps, err := svc.BuildFullSync(context.Background(), "t_a", "global")
+	if !errors.Is(err, ErrTenantNotFound) {
+		t.Errorf("err=%v, want ErrTenantNotFound", err)
+	}
+	if apps != nil {
+		t.Errorf("apps=%v, want nil on tenant-not-found", apps)
+	}
+	if got := len(pub.calls); got != 0 {
+		t.Errorf("calls=%d, want 0 (BuildFullSync doesn't publish)", got)
+	}
+}
+
+// TestBuildFullSync_TenantRepoError_Propagates ensures DB errors
+// from GetByID propagate cleanly to the caller (the HTTP handler
+// already maps them to 500 via httperror.InternalErrorCtx).
+func TestBuildFullSync_TenantRepoError_Propagates(t *testing.T) {
+	pub := &capturingPublisher{}
+	svc := reconcileSvcForTest(t, nil, nil, nil, nil, nil, pub)
+	want := errors.New("tenant table unreachable")
+	svc.tenantRepo.(*fakeTenantRepo).getByIDFunc = func(_ context.Context, _ string) (*domain.Tenant, error) {
+		return nil, want
+	}
+
+	apps, err := svc.BuildFullSync(context.Background(), "t_a", "global")
+	if !errors.Is(err, want) {
+		t.Errorf("err=%v, want %v", err, want)
+	}
+	if apps != nil {
+		t.Errorf("apps=%v, want nil on repo error", apps)
 	}
 }
 
