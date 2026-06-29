@@ -68,14 +68,10 @@ pub struct RuntimeState {
     /// `next_outgoing_rep` (which misleadingly suggested outgoing-only).
     #[cfg(any(feature = "http-client", feature = "http-server"))]
     pub next_stream_rep: AtomicU32,
-    /// WASI resource handle table required by wasmtime_wasi::WasiView.
     #[cfg(feature = "filesystem")]
-    pub wasi_table: ResourceTable,
-    /// WASI context holding preopened directories and stdio config.
-    /// Built per-tenant in `make_wasi_ctx_for_tenant`; empty when
-    /// `EDGE_FS_SCRATCH_PATH` is unset.
+    wasi_table: ResourceTable,
     #[cfg(feature = "filesystem")]
-    pub wasi_ctx: WasiCtx,
+    wasi_ctx: WasiCtx,
 }
 
 #[cfg(feature = "filesystem")]
@@ -151,22 +147,19 @@ impl RuntimeState {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
         #[cfg(feature = "filesystem")]
-        let (wasi_table, wasi_ctx) = match Self::make_wasi_ctx_for_deployment(
-            &tenant_id,
-            &deployment_id,
-            &env,
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!(
-                    tenant_id,
-                    deployment_id,
-                    "filesystem preopen failed, guest will see empty FS: {}",
-                    e
-                );
-                (ResourceTable::new(), WasiCtxBuilder::new().build())
-            }
-        };
+        let (wasi_table, wasi_ctx) =
+            match Self::make_wasi_ctx_for_deployment(&tenant_id, &deployment_id, &env) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(
+                        tenant_id,
+                        deployment_id,
+                        "filesystem preopen failed, guest will see empty FS: {}",
+                        e
+                    );
+                    (ResourceTable::new(), WasiCtxBuilder::new().build())
+                }
+            };
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
