@@ -617,9 +617,13 @@ impl LogForwarder {
             for entry in &body.entries {
                 if state.buffer.len() < self.hard_cap {
                     state.buffer.push(entry.clone());
-                    // Conservative byte estimate: a re-injected entry
-                    // is the same size it was on the way in.
-                    state.buffered_bytes += entry.message.len() + BYTE_OVERHEAD_PER_ENTRY;
+                    // Use the canonical byte estimate (same as
+                    // `push()` and `replay_spool`) so a re-injected
+                    // entry's label bytes are counted. The old inline
+                    // formula missed labels, which let `buffered_bytes`
+                    // drift low and stall the byte-based early-flush
+                    // threshold.
+                    state.buffered_bytes += entry.byte_estimate();
                 }
                 // else: drop with a warning. The buffer's hard_cap is
                 // the backpressure boundary; if a re-injection would
@@ -1541,6 +1545,151 @@ mod tests {
             assert_eq!(state.buffer[0].message, "re-inject me");
 
             // Restore permissions so TempDir can clean up.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod restore");
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_failure_reinject_includes_label_bytes_in_buffered_bytes() {
+        // PR #165 review finding F1: `persist_failure`'s re-injection
+        // must use the canonical `byte_estimate()` helper so a
+        // re-injected entry's label bytes are counted. The previous
+        // inline formula missed labels, which let `buffered_bytes`
+        // drift low and stall the byte-based early-flush threshold.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/internal/logs"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().expect("tempdir");
+            let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+                .expect("chmod");
+
+            let signer = crate::auth::WorkerJwtSigner::new(
+                b"test-secret".to_vec(),
+                "edgecloud",
+                "w_test",
+                "test-region",
+                "t_test",
+            );
+            let f = LogForwarder::new(
+                &server.uri(),
+                "w_test",
+                "test-region",
+                signer,
+                test_client(),
+                spool,
+                1u64 << 30,
+            )
+            .await;
+
+            // Push an entry with several non-empty labels so the
+            // label-byte contribution is materially large.
+            let rec = LogRecord {
+                timestamp_ms: 0,
+                level: LogLevel::Info,
+                message: "hello".into(),
+                labels: vec![
+                    ("app".into(), "checkout".into()),
+                    ("request_id".into(), "r-12345".into()),
+                    ("region".into(), "fra".into()),
+                ],
+            };
+            f.push(rec, ctx());
+            let bytes_after_push = f.state.lock().unwrap().buffered_bytes;
+
+            // Flush: 503 from control plane → respool → spool fails
+            // (read-only dir) → re-inject.
+            f.flush_now().await;
+
+            let state = f.state.lock().unwrap();
+            assert_eq!(state.buffer.len(), 1, "re-injected entry survives");
+            // After re-inject, buffered_bytes must equal what push
+            // counted (not `message.len() + OVERHEAD` which would be
+            // smaller by the label contribution).
+            assert_eq!(
+                state.buffered_bytes, bytes_after_push,
+                "buffered_bytes after persist_failure re-inject must equal \
+                 the push-time byte estimate; F1 drift would show here"
+            );
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod restore");
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_failure_reinject_byte_estimate_matches_push() {
+        // Same finding as above: assert equality between push-time
+        // and re-inject-time byte accounting, so a future regression
+        // in either path surfaces immediately.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/internal/logs"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let dir = TempDir::new().expect("tempdir");
+            let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+                .expect("chmod");
+
+            let signer = crate::auth::WorkerJwtSigner::new(
+                b"test-secret".to_vec(),
+                "edgecloud",
+                "w_test",
+                "test-region",
+                "t_test",
+            );
+            let f = LogForwarder::new(
+                &server.uri(),
+                "w_test",
+                "test-region",
+                signer,
+                test_client(),
+                spool,
+                1u64 << 30,
+            )
+            .await;
+
+            let rec = LogRecord {
+                timestamp_ms: 0,
+                level: LogLevel::Info,
+                message: "x".into(),
+                labels: vec![
+                    ("alpha".into(), "beta".into()),
+                    ("gamma".into(), "delta".into()),
+                    ("epsilon".into(), "zeta".into()),
+                ],
+            };
+
+            // First flush: push + flush + spool fail + re-inject.
+            f.push(rec.clone(), ctx());
+            let after_first = f.state.lock().unwrap().buffered_bytes;
+            f.flush_now().await;
+            let after_reinject = f.state.lock().unwrap().buffered_bytes;
+            assert_eq!(
+                after_first, after_reinject,
+                "push-time and re-inject-time byte accounting must match"
+            );
+
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("chmod restore");
         }
