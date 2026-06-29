@@ -656,6 +656,48 @@ func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *test
 	}
 }
 
+func TestMigrateTree_ToolchainFailure_ReturnsErrMigrateTreeFailed(t *testing.T) {
+	// Mirror of TestMigrationService_Migrate_ClangFails, but exercising
+	// MigrateTree's post-compile failure path (migration.go:885-902).
+	// The tree-level report must carry Status == Failed — Partial is
+	// reserved for analyzer-driven classifications (some files need
+	// manual review); a tree where the toolchain refused to compile
+	// shipped no wasm, so its tree-level status is Failed regardless of
+	// what any individual file's analyzer verdict was.
+	skipIfNoEdgeMigrate(t)
+	skipIfNoClang(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := migrationSvcForTest(repo, store)
+
+	// Source that edge-migrate will accept but clang will reject
+	// (syntax error — clang --target=wasm32-wasip2 will fail to compile).
+	badSource := `int main() { invalid syntax here }`
+
+	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
+		{Path: "main.c", Source: badSource},
+	})
+	if err == nil {
+		t.Fatal("expected ErrMigrateTreeFailed when tree compile fails")
+	}
+	if !errors.Is(err, ErrMigrateTreeFailed) {
+		t.Errorf("expected ErrMigrateTreeFailed, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report on tree failure (handler emits 422 with body)")
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected tree status Failed, got: %v", report.Status)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false on toolchain failure")
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected at least one error in the failure report")
+	}
+}
+
 func TestMigrateTree_RejectsInvalidArtifactSize_ReturnsErrMigrateTreeFailed(t *testing.T) {
 	// The MaxArtifactSize check is independent of the per-file
 	// subprocess. We can't easily trigger it in a unit test (would

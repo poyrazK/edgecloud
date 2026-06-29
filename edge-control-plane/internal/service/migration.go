@@ -810,8 +810,11 @@ func (s *MigrationService) MigrateTree(
 		}
 	}
 	if anyTransformFailed {
+		// Status is Failed: at least one file's transform subprocess died,
+		// so no wasm is produced. Partial is reserved for analyzer-driven
+		// classifications where the toolchain actually shipped an artifact.
 		return &domain.TreeMigrationReport{
-			Status:            status,
+			Status:            domain.MigrationStatusFailed,
 			WasmStored:        false,
 			AppName:           appName,
 			Files:             files,
