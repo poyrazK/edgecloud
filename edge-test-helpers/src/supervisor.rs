@@ -179,18 +179,23 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
                 // surrounding Config. Sync→async bridge.
                 //
                 // Production wires this through
-                // `Handle::current().block_on(...)` from main()'
-                // s non-async context. For tests, the closure may
-                // already be running on a thread inside an active
-                // tokio runtime (e.g. when a test calls `sign()`
-                // from inside its own `block_on`). In that case
-                // `Handle::current().block_on(...)` panics with
-                // "Cannot start a runtime from within a runtime".
-                // To handle both contexts, build a fresh
-                // single-threaded runtime on demand. This is
-                // strictly more expensive than the production
-                // path but acceptable for tests (which only fire
-                // the callback on cache miss).
+                // `Handle::current().block_on(...)` from main()'s
+                // non-async context. Tests may run in either
+                // context: a test that calls `sign()` from inside
+                // its own `block_on` is already on a tokio runtime
+                // thread (in which case building a fresh runtime
+                // here would panic with "Cannot start a runtime
+                // from within a runtime"). A test that calls
+                // `sign()` from a plain thread has no active
+                // runtime, so `Handle::current()` would also panic.
+                //
+                // F6 (PR #165 review): prefer the current runtime
+                // when one exists (`Handle::try_current`) and only
+                // build a fresh single-threaded runtime as a
+                // fallback. This matches the production code path
+                // for in-runtime callers (no extra runtime
+                // construction) and preserves correctness for the
+                // no-runtime case.
                 let url = format!("{control_plane_url}/api/internal/auth/token");
                 let req = http_client
                     .post(&url)
@@ -207,15 +212,25 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
                         "region": region,
                         "tenant_id": tenant_id,
                     }));
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build runtime for bootstrap callback");
-                rt.block_on(async move {
-                    let resp = req.send().await?;
-                    let bundle: edge_worker::bootstrap::JwtBundle = resp.json().await?;
-                    Ok(bundle)
-                })
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.block_on(async move {
+                        let resp = req.send().await?;
+                        let bundle: edge_worker::bootstrap::JwtBundle =
+                            resp.json().await?;
+                        Ok(bundle)
+                    })
+                } else {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build runtime for bootstrap callback");
+                    rt.block_on(async move {
+                        let resp = req.send().await?;
+                        let bundle: edge_worker::bootstrap::JwtBundle =
+                            resp.json().await?;
+                        Ok(bundle)
+                    })
+                }
             },
         )
     } else {
