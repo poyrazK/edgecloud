@@ -42,3 +42,30 @@ tempfile = "3"
 # function the NATS subscriber loop drives) without standing up the full
 # ingress binary.
 edge-ingress = { path = "../edge-ingress" }
+# Disable cargo-semver-checks lints that flag internal-process structs
+# (Supervisor, WorkerState, Config) and internal enum variants
+# (TaskMessage::FullSync). These types ARE part of the published crate's
+# surface, but they're not intended to be constructed or matched by
+# downstream crates — Supervisor is the worker binary's process
+# singleton, Config is the CLI's loader output, and WorkerState holds
+# runtime-only state.
+#
+# Adding new fields to these structs (e.g. Supervisor.http in PR #166's
+# review follow-up, Config.worker_sync_threshold_secs in PR #166's
+# original commit, WorkerState.last_task_received_at in the reconcile
+# commit) and new enum variants (TaskMessage::FullSync in the wire-format
+# commit) triggered the `constructible_struct_adds_field` and
+# `enum_variant_added` lints — which treated them as breaking changes
+# for downstream consumers. But no in-repo crate constructs any of
+# these externally; the only construction sites are `main.rs` and the
+# integration test harnesses (which are external from cargo-semver-checks'
+# perspective but internal to the codebase).
+#
+# The alternative — `#[non_exhaustive]` + `impl Default` — is
+# impractical here: `Default for Supervisor` would need a placeholder
+# NatsClient (which requires async network connect), Downloader
+# (requires a CP URL + JWT signer), and WorkerJwtSigner (requires
+# HMAC secret) — none of which have meaningful zero-config defaults.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+enum_variant_added = "allow"
