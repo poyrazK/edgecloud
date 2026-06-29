@@ -136,6 +136,16 @@ async fn main() -> anyhow::Result<()> {
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // Shared HTTP client for all supervisor-initiated requests to the
+    // control plane (currently: /sync fallback). Constructed once so its
+    // connection pool — and any open TLS sessions to the CP — survive
+    // across heartbeat ticks. A per-call Client (the previous
+    // behaviour) forced a fresh TLS handshake every fallback during
+    // sustained NATS outage.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
     // Create the supervisor
     let supervisor = Arc::new(Supervisor {
         config: config.clone(),
@@ -145,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         nats: nats.clone(),
         log_forwarder: log_forwarder.clone(),
         jwt_signer: jwt_signer.clone(),
+        http,
     });
 
     let heartbeat_supervisor = supervisor.clone();

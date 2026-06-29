@@ -38,6 +38,15 @@ pub struct Supervisor {
     /// fallback request. Issue #53. Cached internally so each call is
     /// cheap; reused across all fallback attempts.
     pub jwt_signer: Arc<WorkerJwtSigner>,
+    /// Shared HTTP client. Constructed once at startup so its TLS
+    /// connection pool survives across every /sync fallback tick
+    /// (issue #53 perf: rebuilding a fresh `reqwest::Client` per
+    /// `fetch_sync` call meant a brand-new TLS handshake every 30s
+    /// during a sustained NATS outage). The underlying client is
+    /// internally `Arc`-backed, so cloning is cheap — but a shared
+    /// instance also lets the connection pool coalesce concurrent
+    /// fallback requests to the same control-plane host.
+    pub http: reqwest::Client,
 }
 
 impl Supervisor {
@@ -221,10 +230,13 @@ impl Supervisor {
             "{}/api/internal/workers/{}/sync",
             self.config.control_plane_url, self.config.worker_id
         );
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        let resp = match client
+        // Use the shared HTTP client (constructed once in main.rs)
+        // so its connection pool — and any open TLS sessions — are
+        // reused across every fallback tick. Building a fresh
+        // reqwest::Client per call would discard the pool and force
+        // a fresh TLS handshake on every 30s heartbeat.
+        let resp = match self
+            .http
             .get(&url)
             .bearer_auth(self.jwt_signer.sign())
             .send()

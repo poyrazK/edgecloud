@@ -405,6 +405,10 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         jwt_signer.clone(),
     );
 
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
     let supervisor = Arc::new(Supervisor {
         config,
         state,
@@ -413,6 +417,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         nats,
         log_forwarder,
         jwt_signer,
+        http,
     });
 
     // Build and publish a heartbeat manually
@@ -564,6 +569,9 @@ async fn build_supervisor(
         config.region.clone(),
         jwt_signer.clone(),
     );
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     Ok(Arc::new(Supervisor {
         config,
         state,
@@ -572,6 +580,7 @@ async fn build_supervisor(
         nats,
         log_forwarder,
         jwt_signer,
+        http,
     }))
 }
 
@@ -1757,6 +1766,10 @@ async fn build_supervisor_only_with_cp(
         jwt_signer.clone(),
     );
 
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
     Ok(Arc::new(Supervisor {
         config,
         state,
@@ -1765,5 +1778,6 @@ async fn build_supervisor_only_with_cp(
         nats,
         log_forwarder,
         jwt_signer,
+        http,
     }))
 }
