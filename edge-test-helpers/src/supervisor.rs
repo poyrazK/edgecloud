@@ -215,8 +215,7 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.block_on(async move {
                         let resp = req.send().await?;
-                        let bundle: edge_worker::bootstrap::JwtBundle =
-                            resp.json().await?;
+                        let bundle: edge_worker::bootstrap::JwtBundle = resp.json().await?;
                         Ok(bundle)
                     })
                 } else {
@@ -226,8 +225,7 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
                         .expect("build runtime for bootstrap callback");
                     rt.block_on(async move {
                         let resp = req.send().await?;
-                        let bundle: edge_worker::bootstrap::JwtBundle =
-                            resp.json().await?;
+                        let bundle: edge_worker::bootstrap::JwtBundle = resp.json().await?;
                         Ok(bundle)
                     })
                 }

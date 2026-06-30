@@ -541,16 +541,14 @@ impl LogForwarder {
                 match tokio::time::timeout(DRAIN_TIMEOUT, resp.bytes()).await {
                     Ok(Ok(_)) => { /* drained cleanly */ }
                     Ok(Err(e)) => {
-                        self.drain_failures_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.drain_failures_total.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             err = %e,
                             "log_forwarder: failed to drain response body; connection may be leaked"
                         );
                     }
                     Err(_elapsed) => {
-                        self.drain_failures_total
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.drain_failures_total.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             "log_forwarder: response body drain timed out after 5s; connection likely leaked"
                         );
@@ -2150,11 +2148,9 @@ mod tests {
             let _ = sock.read(&mut buf).await;
             // Send headers advertising a 1MB body, send a few bytes,
             // then RST the connection.
-            sock.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nhello",
-            )
-            .await
-            .expect("write headers");
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nhello")
+                .await
+                .expect("write headers");
             sock.flush().await.ok();
             // Drop the socket without a clean shutdown — TCP RST mid-body.
             drop(sock);

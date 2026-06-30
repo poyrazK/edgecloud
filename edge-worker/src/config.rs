@@ -475,8 +475,14 @@ mod tests {
     /// and is non-reentrant, so creating more than one EnvGuard per test
     /// deadlocks. Direct mutation under a held lock is the only safe
     /// pattern for tests that need several env vars.
+    ///
+    /// `NATS_MAX_DELIVER` is forced to the default (20) for every test
+    /// so a leaked env value from another process can't break
+    /// `Config::from_env` after F3 made 0 an error. F3 PR #165.
     fn lock_and_set(vars: &[(&str, Option<&str>)]) -> std::sync::MutexGuard<'static, ()> {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized via ENV_LOCK above.
+        unsafe { std::env::set_var("NATS_MAX_DELIVER", "20") };
         for (k, v) in vars {
             match v {
                 Some(s) => unsafe { std::env::set_var(k, s) },
@@ -647,8 +653,7 @@ mod tests {
             ("WORKER_TENANT_ID", Some("t_test")),
             ("NATS_MAX_DELIVER", Some("0")),
         ]);
-        let err = Config::from_env()
-            .expect_err("NATS_MAX_DELIVER=0 must be rejected");
+        let err = Config::from_env().expect_err("NATS_MAX_DELIVER=0 must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("NATS_MAX_DELIVER") && msg.contains("unlimited"),

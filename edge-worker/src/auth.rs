@@ -574,12 +574,8 @@ mod tests {
     #[test]
     fn new_with_callback_errors_when_server_returns_past_expiry() {
         let counter = Arc::new(AtomicU32::new(0));
-        let s = WorkerJwtSigner::new_with_callback(
-            "edgecloud",
-            "w_fra_abc123",
-            "fra",
-            "t_tenant1",
-            {
+        let s =
+            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", {
                 let counter = counter.clone();
                 move || {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -589,8 +585,7 @@ mod tests {
                         expires_at_unix: 1_000,
                     })
                 }
-            },
-        );
+            });
         let err = s.sign().expect_err("must error on already-past expiry");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         let msg = err.to_string();
@@ -607,12 +602,8 @@ mod tests {
     #[test]
     fn new_with_callback_does_not_cache_when_server_returns_past_expiry() {
         let counter = Arc::new(AtomicU32::new(0));
-        let s = WorkerJwtSigner::new_with_callback(
-            "edgecloud",
-            "w_fra_abc123",
-            "fra",
-            "t_tenant1",
-            {
+        let s =
+            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", {
                 let counter = counter.clone();
                 move || {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -621,8 +612,7 @@ mod tests {
                         expires_at_unix: 1_000,
                     })
                 }
-            },
-        );
+            });
         let _ = s.sign().expect_err("sign1 must error");
         let _ = s.sign().expect_err("sign2 must error");
         assert_eq!(

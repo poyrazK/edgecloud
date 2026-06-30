@@ -274,15 +274,14 @@ impl Spool {
                         )
                     })?;
                 let mut buf = vec![0u8; (head_bytes - head_end) as usize];
-                head_src
-                    .read_exact(&mut buf)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "read dropped head suffix [{}, {}): {}",
-                            head_end, head_bytes, draining.display()
-                        )
-                    })?;
+                head_src.read_exact(&mut buf).await.with_context(|| {
+                    format!(
+                        "read dropped head suffix [{}, {}): {}",
+                        head_end,
+                        head_bytes,
+                        draining.display()
+                    )
+                })?;
                 buf
             } else {
                 Vec::new()
@@ -461,12 +460,14 @@ impl Spool {
                         )
                     })?;
             }
-            tokio::io::AsyncWriteExt::flush(&mut append).await.with_context(|| {
-                format!(
-                    "flush active spool after dropped-suffix append: {}",
-                    self.inner.path.display()
-                )
-            })?;
+            tokio::io::AsyncWriteExt::flush(&mut append)
+                .await
+                .with_context(|| {
+                    format!(
+                        "flush active spool after dropped-suffix append: {}",
+                        self.inner.path.display()
+                    )
+                })?;
         }
 
         // Best-effort unlink. If this fails (e.g. transient I/O), the
