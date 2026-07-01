@@ -79,12 +79,17 @@ mod tests {
     ///
     /// Skipped on Windows: wasmtime trap delivery triggers
     /// STATUS_STACK_BUFFER_OVERRUN in the Windows test runner.
-    #[test]
+    ///
+    /// `config.async_support(true)` is enabled in `create_engine()` (Phase C)
+    /// — required for `wasi:cli/command` wiring — so instantiation and the
+    /// function call must use the `_async` variants. wasmtime enforces this
+    /// at runtime: `must use async instantiation when async support is enabled`.
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
         windows,
         ignore = "wasmtime trap delivery triggers STATUS_STACK_BUFFER_OVERRUN on Windows"
     )]
-    fn limiter_traps_on_memory_grow() {
+    async fn limiter_traps_on_memory_grow() {
         let engine = create_engine().expect("engine");
         // 1 MiB cap. memory.grow of 1024 pages (64 MiB) must trap.
         let state = RuntimeState::new();
@@ -101,13 +106,16 @@ mod tests {
         "#;
         let module =
             Module::new(&engine, wat::parse_str(wat).expect("valid wat")).expect("compile module");
-        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+            .await
+            .expect("instantiate");
         let grow = instance
             .get_typed_func::<(), ()>(&mut store, "grow_huge")
             .expect("exported func");
 
         let trap = grow
-            .call(&mut store, ())
+            .call_async(&mut store, ())
+            .await
             .expect_err("must trap on memory cap");
         let debug_msg = format!("{:?}", trap).to_lowercase();
         assert!(
@@ -128,12 +136,15 @@ mod tests {
     ///
     /// Skipped on Windows: wasmtime's epoch signal delivery triggers
     /// STATUS_STACK_BUFFER_OVERRUN in the Windows test runner.
-    #[test]
+    ///
+    /// See `limiter_traps_on_memory_grow` for why we use the `_async`
+    /// instantiation + call variants (Phase C's `async_support(true)`).
+    #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(
         windows,
         ignore = "wasmtime epoch signals trigger STATUS_STACK_BUFFER_OVERRUN on Windows"
     )]
-    fn epoch_deadline_interrupts_infinite_loop() {
+    async fn epoch_deadline_interrupts_infinite_loop() {
         let engine = create_engine().expect("engine");
         let state = RuntimeState::new();
         let mut store = create_store(&engine, 64, state);
@@ -151,12 +162,17 @@ mod tests {
         "#;
         let module =
             Module::new(&engine, wat::parse_str(wat).expect("valid wat")).expect("compile module");
-        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+            .await
+            .expect("instantiate");
         let f = instance
             .get_typed_func::<(), ()>(&mut store, "loop")
             .expect("exported func");
 
-        let trap = f.call(&mut store, ()).expect_err("must trap on deadline");
+        let trap = f
+            .call_async(&mut store, ())
+            .await
+            .expect_err("must trap on deadline");
         let debug_msg = format!("{:?}", trap).to_lowercase();
         assert!(
             debug_msg.contains("interrupt"),
