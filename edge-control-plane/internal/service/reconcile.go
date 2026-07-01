@@ -8,6 +8,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
 // ErrTenantNotFound is returned by BuildFullSync when the caller
@@ -33,22 +34,21 @@ type reconcileTenants interface {
 
 // reconcileActiveDeployments is the subset of
 // *repository.ActiveDeploymentRepository the ReconcileService needs.
+// ListByTenantWithDeployment joins active_deployments with deployments
+// (hash + regions) in one round trip — see JoinedActiveDeployment.
+// The un-joined ListByTenant is kept for symmetry with the production
+// repo but is no longer called by ReconcileService (PR #166
+// follow-up #1 eliminated the N+1 in reconcileTenant / BuildFullSync).
 type reconcileActiveDeployments interface {
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
-}
-
-// reconcileDeployments is the subset of *repository.DeploymentRepository
-// the ReconcileService needs to enrich an active row with its deployment
-// hash and target regions.
-type reconcileDeployments interface {
-	GetByID(ctx context.Context, id string) (*domain.Deployment, error)
+	ListByTenantWithDeployment(ctx context.Context, tenantID string) ([]repository.JoinedActiveDeployment, error)
 }
 
 // reconcileAppEnvs is the subset of *repository.AppEnvRepository the
-// ReconcileService needs to attach per-app env vars to the published
-// TaskMessage.
+// ReconcileService needs. ListByApps fetches env vars for multiple
+// apps in one query, replacing the previous per-app List loop.
 type reconcileAppEnvs interface {
-	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+	ListByApps(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error)
 }
 
 // reconcileQuotas is the subset of *repository.QuotaRepository the
@@ -78,19 +78,17 @@ type reconcileQuotas interface {
 //     fallback endpoint (commit 4) so the GET /sync handler can return
 //     the same payload the periodic loop would publish.
 type ReconcileService struct {
-	tenantRepo     reconcileTenants
-	activeRepo     reconcileActiveDeployments
-	deploymentRepo reconcileDeployments
-	appEnvRepo     reconcileAppEnvs
-	quotaRepo      reconcileQuotas
-	publisher      nats.Publisher
-	defaultRegion  string
+	tenantRepo    reconcileTenants
+	activeRepo    reconcileActiveDeployments
+	appEnvRepo    reconcileAppEnvs
+	quotaRepo     reconcileQuotas
+	publisher     nats.Publisher
+	defaultRegion string
 }
 
 func NewReconcileService(
 	tenantRepo reconcileTenants,
 	activeRepo reconcileActiveDeployments,
-	deploymentRepo reconcileDeployments,
 	appEnvRepo reconcileAppEnvs,
 	quotaRepo reconcileQuotas,
 	publisher nats.Publisher,
@@ -100,13 +98,12 @@ func NewReconcileService(
 		defaultRegion = "global"
 	}
 	return &ReconcileService{
-		tenantRepo:     tenantRepo,
-		activeRepo:     activeRepo,
-		deploymentRepo: deploymentRepo,
-		appEnvRepo:     appEnvRepo,
-		quotaRepo:      quotaRepo,
-		publisher:      publisher,
-		defaultRegion:  defaultRegion,
+		tenantRepo:    tenantRepo,
+		activeRepo:    activeRepo,
+		appEnvRepo:    appEnvRepo,
+		quotaRepo:     quotaRepo,
+		publisher:     publisher,
+		defaultRegion: defaultRegion,
 	}
 }
 
@@ -204,19 +201,36 @@ func (s *ReconcileService) RequestSync(ctx context.Context, tenantID, region str
 // (RegisterWorker hook); when empty, every region is published
 // (periodic sweep + on-register with no scoped region).
 //
-// Per-app enrichment duplicates the per-row work in
-// DeploymentService.publishSwap / RepublishActiveDeployments. A future
-// refactor should extract a shared `buildAppConfig` helper so all
-// three callers (Activate, Republish, Reconcile) stay in sync —
-// filed as a follow-up because extracting it touches the hot path.
+// Query budget per tenant per sweep: 3 round trips (joined active +
+// deployment, bulk envs, quota). The previous implementation was
+// 2M+2 — one active list + one quota + M deployment lookups + M env
+// lists. See PR #166 follow-up #1.
 func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string, allowlist []string, regionFilter string) {
-	activeList, err := s.activeRepo.ListByTenant(ctx, tenantID)
+	joined, err := s.activeRepo.ListByTenantWithDeployment(ctx, tenantID)
 	if err != nil {
-		log.Printf("reconcile: tenant=%s: list active: %v", tenantID, err)
+		log.Printf("reconcile: tenant=%s: list active+deployment: %v", tenantID, err)
 		return
 	}
-	if len(activeList) == 0 {
+	if len(joined) == 0 {
 		return
+	}
+
+	// Bulk-fetch env vars for every active app in one round trip.
+	appNames := make([]string, len(joined))
+	for i, j := range joined {
+		appNames[i] = j.AppName
+	}
+	allEnvs, err := s.appEnvRepo.ListByApps(ctx, tenantID, appNames)
+	if err != nil {
+		log.Printf("reconcile: tenant=%s: list envs (bulk): %v; publishing without env", tenantID, err)
+		allEnvs = nil
+	}
+	envByApp := make(map[string]map[string]string, len(joined))
+	for _, e := range allEnvs {
+		if envByApp[e.AppName] == nil {
+			envByApp[e.AppName] = make(map[string]string)
+		}
+		envByApp[e.AppName][e.EnvKey] = e.EnvValue
 	}
 
 	maxMemoryMB := 256
@@ -226,31 +240,21 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 
 	// region -> { app_name: AppConfig }
 	byRegion := map[string]map[string]nats.AppConfig{}
-	for _, ad := range activeList {
-		deployment, err := s.deploymentRepo.GetByID(ctx, ad.DeploymentID)
-		if err != nil || deployment == nil {
-			log.Printf("reconcile: tenant=%s app=%s: deployment %s not found; skipping", tenantID, ad.AppName, ad.DeploymentID)
-			continue
-		}
-
-		envs, err := s.appEnvRepo.List(ctx, tenantID, ad.AppName)
-		if err != nil {
-			log.Printf("reconcile: tenant=%s app=%s: list env: %v; publishing without env", tenantID, ad.AppName, err)
-		}
-		envMap := make(map[string]string, len(envs))
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
+	for _, j := range joined {
+		envMap := envByApp[j.AppName] // nil if the bulk fetch errored
+		if envMap == nil {
+			envMap = map[string]string{}
 		}
 
 		cfg := nats.BuildAppConfig(
-			ad.DeploymentID,
-			deployment.Hash,
+			j.DeploymentID,
+			j.Hash,
 			envMap,
 			allowlist,
 			maxMemoryMB,
 		)
 
-		regions := deployment.Regions
+		regions := []string(j.Regions)
 		if len(regions) == 0 {
 			regions = []string{s.defaultRegion}
 		}
@@ -261,7 +265,7 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 			if byRegion[region] == nil {
 				byRegion[region] = map[string]nats.AppConfig{}
 			}
-			byRegion[region][ad.AppName] = cfg
+			byRegion[region][j.AppName] = cfg
 		}
 	}
 
@@ -287,6 +291,10 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 // returned. An empty region falls back to the control plane's default
 // region (matches reconcileTenant's behavior for legacy deployments
 // with no explicit regions).
+//
+// Query budget: 3 round trips (tenant + joined active+deployment +
+// bulk envs); the quota lookup is folded into the envs fetch path
+// when MaxMemoryMB is non-zero. See PR #166 follow-up #1.
 func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region string) (map[string]nats.AppConfig, error) {
 	if region == "" {
 		region = s.defaultRegion
@@ -306,12 +314,50 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 	}
 	allowlist := tenant.AllowlistedDestinations
 
-	activeList, err := s.activeRepo.ListByTenant(ctx, tenantID)
+	joined, err := s.activeRepo.ListByTenantWithDeployment(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if len(activeList) == 0 {
+	if len(joined) == 0 {
 		return map[string]nats.AppConfig{}, nil
+	}
+
+	// Bulk-fetch env vars for every active app in one round trip.
+	appNames := make([]string, 0, len(joined))
+	for _, j := range joined {
+		regions := []string(j.Regions)
+		if len(regions) == 0 {
+			regions = []string{s.defaultRegion}
+		}
+		matched := false
+		for _, r := range regions {
+			if r == region {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			appNames = append(appNames, j.AppName)
+		}
+	}
+	if len(appNames) == 0 {
+		return map[string]nats.AppConfig{}, nil
+	}
+	allEnvs, err := s.appEnvRepo.ListByApps(ctx, tenantID, appNames)
+	if err != nil {
+		// Mirror reconcileTenant: log-and-continue with empty env
+		// rather than failing the whole request. A transient env
+		// fetch error shouldn't 500 the /sync fallback that
+		// exists specifically to recover from outages.
+		log.Printf("reconcile: BuildFullSync tenant=%s: list envs (bulk): %v", tenantID, err)
+		allEnvs = nil
+	}
+	envByApp := make(map[string]map[string]string, len(appNames))
+	for _, e := range allEnvs {
+		if envByApp[e.AppName] == nil {
+			envByApp[e.AppName] = make(map[string]string)
+		}
+		envByApp[e.AppName][e.EnvKey] = e.EnvValue
 	}
 
 	maxMemoryMB := 256
@@ -320,13 +366,8 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 	}
 
 	out := map[string]nats.AppConfig{}
-	for _, ad := range activeList {
-		deployment, err := s.deploymentRepo.GetByID(ctx, ad.DeploymentID)
-		if err != nil || deployment == nil {
-			continue
-		}
-
-		regions := deployment.Regions
+	for _, j := range joined {
+		regions := []string(j.Regions)
 		if len(regions) == 0 {
 			regions = []string{s.defaultRegion}
 		}
@@ -341,22 +382,14 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 			continue
 		}
 
-		envs, err := s.appEnvRepo.List(ctx, tenantID, ad.AppName)
-		if err != nil {
-			// Mirror reconcileTenant: log-and-continue with empty env
-			// rather than failing the whole request. A transient env
-			// fetch error shouldn't 500 the /sync fallback that
-			// exists specifically to recover from outages.
-			log.Printf("reconcile: BuildFullSync tenant=%s app=%s: list env: %v", tenantID, ad.AppName, err)
-		}
-		envMap := make(map[string]string, len(envs))
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
+		envMap := envByApp[j.AppName]
+		if envMap == nil {
+			envMap = map[string]string{}
 		}
 
-		out[ad.AppName] = nats.BuildAppConfig(
-			ad.DeploymentID,
-			deployment.Hash,
+		out[j.AppName] = nats.BuildAppConfig(
+			j.DeploymentID,
+			j.Hash,
 			envMap,
 			allowlist,
 			maxMemoryMB,

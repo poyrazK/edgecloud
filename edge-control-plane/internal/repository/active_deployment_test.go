@@ -11,6 +11,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // newActiveDeploymentMockDB wires a sqlmock-backed sqlx.DB for the
@@ -367,6 +368,48 @@ func TestSet_ResetsPublishStateOnReactivation(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Set: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestListByTenantWithDeployment_HappyPath pins the new JOIN query
+// (PR #166 follow-up #1): one round trip returns each active row
+// enriched with its deployment's hash and regions. The query uses
+// INNER JOIN semantics — an active row whose deployment_id has no
+// match is dropped silently (matches the previous log-and-continue
+// behavior on the same case).
+func TestListByTenantWithDeployment_HappyPath(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
+		"auto_rollback_enabled", "stable_since", "regions_published",
+		"regions_failed", "last_publish_at", "last_publish_attempt_id",
+		"hash", "regions",
+	}).
+		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, "hash1", pq.StringArray{"global"}).
+		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"us-east", "eu-west"}, pq.StringArray{}, nil, nil, "hash2", pq.StringArray{"us-east", "eu-west"})
+
+	mock.ExpectQuery(`SELECT.*active_deployments ad.*JOIN deployments d`).
+		WithArgs("t_a").
+		WillReturnRows(rows)
+
+	got, err := repo.ListByTenantWithDeployment(context.Background(), "t_a")
+	if err != nil {
+		t.Fatalf("ListByTenantWithDeployment: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2", len(got))
+	}
+	if got[0].Hash != "hash1" || got[0].AppName != "app1" {
+		t.Errorf("got[0]=%+v", got[0])
+	}
+	if len(got[1].Regions) != 2 {
+		t.Errorf("got[1].Regions=%v, want 2", got[1].Regions)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)
