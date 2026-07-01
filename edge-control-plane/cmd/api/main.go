@@ -144,7 +144,7 @@ func main() {
 	// background loop is started later in runServer so the cancel
 	// from rootCancel actually tears it down.
 	reconcileSvc := service.NewReconcileService(
-		tenantRepo, activeDeploymentRepo, deploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)

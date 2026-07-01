@@ -8,6 +8,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // ActiveDeploymentRepository handles active deployment mappings.
@@ -258,6 +259,49 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1`
 	err := r.db.SelectContext(ctx, &ads, query, tenantID)
 	return ads, err
+}
+
+// JoinedActiveDeployment pairs an active_deployments row with its
+// referenced deployments row's `hash` and `regions` columns. The
+// ReconcileService uses this to fan out per-(tenant, app) in a single
+// round trip instead of an N+1 (one active-list + M deployment
+// lookups + M env lists). See ReconcileService.reconcileTenant /
+// BuildFullSync.
+type JoinedActiveDeployment struct {
+	domain.ActiveDeployment
+	Hash    string        `db:"hash"`
+	Regions pq.StringArray `db:"regions"`
+}
+
+// ListByTenantWithDeployment returns one row per active deployment
+// for the tenant, with the deployment's hash and regions joined in.
+//
+//	SELECT ad.*, d.hash, d.regions
+//	FROM active_deployments ad
+//	JOIN deployments d ON d.id = ad.deployment_id
+//	WHERE ad.tenant_id = $1
+//
+// INNER JOIN semantics: an active row whose referenced deployment_id
+// no longer exists is dropped silently. The periodic reconcile loop
+// used to log-and-continue on this case; if a deployment row is
+// missing, the active row is in a broken state that the operator must
+// resolve (re-activate or delete the active row). The previous
+// log-and-continue hid this from the operator; a future improvement
+// is to surface the broken (ad, missing-deployment) pair to a
+// metric/dashboard. Tracked separately.
+func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Context, tenantID string) ([]JoinedActiveDeployment, error) {
+	var rows []JoinedActiveDeployment
+	query := `
+		SELECT ad.tenant_id, ad.app_name, ad.deployment_id, ad.last_good_deployment_id,
+		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
+		       ad.regions_failed, ad.last_publish_at, ad.last_publish_attempt_id,
+		       d.hash, d.regions
+		FROM active_deployments ad
+		JOIN deployments d ON d.id = ad.deployment_id
+		WHERE ad.tenant_id = $1
+	`
+	err := r.db.SelectContext(ctx, &rows, query, tenantID)
+	return rows, err
 }
 
 // AppendRegionsPublished atomically merges `regions` into the

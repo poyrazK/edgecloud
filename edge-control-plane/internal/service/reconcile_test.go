@@ -9,13 +9,14 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
-// fakeTenantRepo, fakeActiveRepo, fakeDeploymentRepo, fakeAppEnvRepo,
-// fakeQuotaRepo are the in-memory test doubles for the narrow
-// interfaces ReconcileService depends on. Each is hand-rolled (no
-// sqlmock) because the reconcile loop is mostly fan-out logic — the
-// repo behavior we want to exercise is "what does this query return",
+// fakeTenantRepo, fakeActiveRepo, fakeAppEnvRepo, fakeQuotaRepo are
+// the in-memory test doubles for the narrow interfaces
+// ReconcileService depends on. Each is hand-rolled (no sqlmock)
+// because the reconcile loop is mostly fan-out logic — the repo
+// behavior we want to exercise is "what does this query return",
 // not "did the SQL parse correctly".
 //
 // getByIDFunc lets individual tests inject a custom return (e.g.
@@ -23,6 +24,11 @@ import (
 // `tenants` slice. Defaults to "look up by ID in the slice, return
 // (nil, nil) if missing" — matching the (nil, nil) contract of the
 // real TenantRepository.GetByID.
+//
+// The fakeActiveRepo backs BOTH ListByTenant and
+// ListByTenantWithDeployment from the same `byTenant` map so test
+// setup writes once and reads from either method. The JOIN'd shape
+// is derived on the fly from `byID` (a per-tenant deployment map).
 type fakeTenantRepo struct {
 	tenants      []domain.Tenant
 	getByIDFunc  func(ctx context.Context, id string) (*domain.Tenant, error)
@@ -48,26 +54,57 @@ func (f *fakeTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant
 
 type fakeActiveRepo struct {
 	byTenant map[string][]domain.ActiveDeployment
+	// byDeploymentID lets the JOIN'd fake look up the deployment
+	// hash + regions for an active row's deployment_id. Mirrors the
+	// production JOIN in the real repository.
+	byDeploymentID map[string]*domain.Deployment
 }
 
 func (f *fakeActiveRepo) ListByTenant(_ context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
 	return f.byTenant[tenantID], nil
 }
 
-type fakeDeploymentRepo struct {
-	byID map[string]*domain.Deployment
-}
-
-func (f *fakeDeploymentRepo) GetByID(_ context.Context, id string) (*domain.Deployment, error) {
-	return f.byID[id], nil
+// ListByTenantWithDeployment synthesizes the JOIN from the same
+// underlying maps. An active row whose deployment_id is missing from
+// `byDeploymentID` is dropped (mirrors the production INNER JOIN).
+func (f *fakeActiveRepo) ListByTenantWithDeployment(_ context.Context, tenantID string) ([]repository.JoinedActiveDeployment, error) {
+	ads := f.byTenant[tenantID]
+	out := make([]repository.JoinedActiveDeployment, 0, len(ads))
+	for _, ad := range ads {
+		d, ok := f.byDeploymentID[ad.DeploymentID]
+		if !ok {
+			continue
+		}
+		out = append(out, repository.JoinedActiveDeployment{
+			ActiveDeployment: ad,
+			Hash:             d.Hash,
+			Regions:          d.Regions,
+		})
+	}
+	return out, nil
 }
 
 type fakeAppEnvRepo struct {
 	byApp map[string][]domain.AppEnv
+	// listByAppsCalls records every (tenantID, appNames) lookup for
+	// tests that assert "was the bulk path taken?" — the N+1 path
+	// (per-app List) no longer exists on this fake.
+	listByAppsCalls []listByAppsCall
 }
 
-func (f *fakeAppEnvRepo) List(_ context.Context, tenantID, appName string) ([]domain.AppEnv, error) {
-	return f.byApp[tenantID+"/"+appName], nil
+type listByAppsCall struct {
+	tenantID string
+	appNames []string
+}
+
+func (f *fakeAppEnvRepo) ListByApps(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error) {
+	cp := append([]string(nil), appNames...)
+	f.listByAppsCalls = append(f.listByAppsCalls, listByAppsCall{tenantID: tenantID, appNames: cp})
+	var out []domain.AppEnv
+	for _, name := range appNames {
+		out = append(out, f.byApp[tenantID+"/"+name]...)
+	}
+	return out, nil
 }
 
 type fakeQuotaRepo struct {
@@ -116,6 +153,11 @@ func (p *capturingPublisher) callsByRegion() map[string]*nats.TaskMessage {
 
 // reconcileSvcForTest wires a ReconcileService against the fakes
 // with default sane values; individual tests override fields.
+//
+// `deps` is now passed into fakeActiveRepo (not a separate
+// fakeDeploymentRepo) — the JOIN'd fake synthesizes the deployment
+// hash + regions from the same map the per-row GetByID used to
+// read. See fakeActiveRepo.ListByTenantWithDeployment.
 func reconcileSvcForTest(t *testing.T, tenants []domain.Tenant, active map[string][]domain.ActiveDeployment, deps map[string]*domain.Deployment, envs map[string][]domain.AppEnv, quotas map[string]*domain.Quota, pub nats.Publisher) *ReconcileService {
 	t.Helper()
 	if pub == nil {
@@ -123,8 +165,7 @@ func reconcileSvcForTest(t *testing.T, tenants []domain.Tenant, active map[strin
 	}
 	return NewReconcileService(
 		&fakeTenantRepo{tenants: tenants},
-		&fakeActiveRepo{byTenant: active},
-		&fakeDeploymentRepo{byID: deps},
+		&fakeActiveRepo{byTenant: active, byDeploymentID: deps},
 		&fakeAppEnvRepo{byApp: envs},
 		&fakeQuotaRepo{byTenant: quotas},
 		pub,
@@ -614,4 +655,86 @@ func TestRequestSync_PublisherError_DoesNotPanic(t *testing.T) {
 
 	// Must not panic, must not propagate the error.
 	svc.RequestSync(context.Background(), "t_a", "global")
+}
+
+// --- N+1 regression guards ---------------------------------------------
+
+// TestRunOnce_BulkEnvFetch_OneCallNotN pins the new bulk-env
+// fetch path: reconcileTenant calls appEnvRepo.ListByApps exactly
+// once per (tenant, sweep), regardless of how many active
+// deployments the tenant has. The pre-PR #166 implementation called
+// List once per app (N+1); this test fails if a regression brings
+// that back.
+//
+// Catches: a refactor that moves the env loop inside the per-app
+// for-loop, or replaces ListByApps with a per-app List shim.
+func TestRunOnce_BulkEnvFetch_OneCallNotN(t *testing.T) {
+	pub := &capturingPublisher{}
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a"}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {
+				{TenantID: "t_a", AppName: "a1", DeploymentID: "d_1"},
+				{TenantID: "t_a", AppName: "a2", DeploymentID: "d_2"},
+				{TenantID: "t_a", AppName: "a3", DeploymentID: "d_3"},
+			},
+		},
+		map[string]*domain.Deployment{
+			"d_1": {ID: "d_1", Hash: "h1", Regions: []string{"global"}},
+			"d_2": {ID: "d_2", Hash: "h2", Regions: []string{"global"}},
+			"d_3": {ID: "d_3", Hash: "h3", Regions: []string{"global"}},
+		},
+		map[string][]domain.AppEnv{
+			"t_a/a1": {{TenantID: "t_a", AppName: "a1", EnvKey: "K", EnvValue: "v1"}},
+			"t_a/a2": {{TenantID: "t_a", AppName: "a2", EnvKey: "K", EnvValue: "v2"}},
+			"t_a/a3": {{TenantID: "t_a", AppName: "a3", EnvKey: "K", EnvValue: "v3"}},
+		},
+		nil, pub)
+
+	if err := svc.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	envRepo := svc.appEnvRepo.(*fakeAppEnvRepo)
+	if got := len(envRepo.listByAppsCalls); got != 1 {
+		t.Errorf("ListByApps calls=%d, want 1 (bulk path); calls=%+v", got, envRepo.listByAppsCalls)
+	}
+	// All three app names must be in the single call's appNames
+	// (order may vary but length must match).
+	got := envRepo.listByAppsCalls[0].appNames
+	if len(got) != 3 {
+		t.Errorf("ListByApps appNames=%v, want 3 apps", got)
+	}
+}
+
+// TestBuildFullSync_BulkEnvFetch_OneCallNotN mirrors the
+// RunOnce regression guard for the HTTP /sync fallback path.
+// BuildFullSync filters by region before fetching envs, so the
+// single bulk call must include only the matching apps (not every
+// active app).
+func TestBuildFullSync_BulkEnvFetch_OneCallNotN(t *testing.T) {
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a"}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {
+				{TenantID: "t_a", AppName: "in_region", DeploymentID: "d_in"},
+				{TenantID: "t_a", AppName: "other_region", DeploymentID: "d_other"},
+			},
+		},
+		map[string]*domain.Deployment{
+			"d_in":   {ID: "d_in", Hash: "h_in", Regions: []string{"global"}},
+			"d_other": {ID: "d_other", Hash: "h_other", Regions: []string{"asia"}},
+		},
+		nil, nil, nil)
+
+	if _, err := svc.BuildFullSync(context.Background(), "t_a", "global"); err != nil {
+		t.Fatalf("BuildFullSync: %v", err)
+	}
+	envRepo := svc.appEnvRepo.(*fakeAppEnvRepo)
+	if got := len(envRepo.listByAppsCalls); got != 1 {
+		t.Errorf("ListByApps calls=%d, want 1", got)
+	}
+	got := envRepo.listByAppsCalls[0].appNames
+	if len(got) != 1 || got[0] != "in_region" {
+		t.Errorf("ListByApps appNames=%v, want [in_region] (region filter must run before bulk fetch)", got)
+	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // AppEnvRepository handles app environment variable data access.
@@ -42,6 +43,23 @@ func (r *AppEnvRepository) List(ctx context.Context, tenantID, appName string) (
 	var envs []domain.AppEnv
 	query := `SELECT tenant_id, app_name, env_key, env_value FROM app_env WHERE tenant_id = $1 AND app_name = $2 ORDER BY env_key`
 	err := r.db.SelectContext(ctx, &envs, query, tenantID, appName)
+	return envs, err
+}
+
+// ListByApps returns env vars for multiple apps in a single round
+// trip. Uses `WHERE app_name = ANY($2)` with `pq.Array` for the
+// binding — the previous N+1 path (one List call per app in the
+// reconcile loop) becomes O(1). See ReconcileService.reconcileTenant /
+// BuildFullSync.
+//
+// An empty `appNames` slice produces a query that returns zero rows
+// (any empty array is false under ANY); the caller should treat that
+// as "no apps, no envs" rather than passing an empty slice in
+// production code paths.
+func (r *AppEnvRepository) ListByApps(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error) {
+	var envs []domain.AppEnv
+	query := `SELECT tenant_id, app_name, env_key, env_value FROM app_env WHERE tenant_id = $1 AND app_name = ANY($2) ORDER BY app_name, env_key`
+	err := r.db.SelectContext(ctx, &envs, query, tenantID, pq.Array(appNames))
 	return envs, err
 }
 
