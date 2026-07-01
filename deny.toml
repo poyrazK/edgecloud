@@ -26,6 +26,10 @@ ignore = [
     "RUSTSEC-2026-0096",
     "RUSTSEC-2026-0149",
     "RUSTSEC-2026-0182",
+    # wasmtime-wasi 25.x: WASI hard-link/rename bypasses FilePerms for
+    # destination. No patch in the 25.x series; upgrading to 24.0.11+
+    # or 36+ requires a major wasmtime version jump. Tracked to upgrade.
+    "RUSTSEC-2026-0188",
 ]
 
 [licenses]

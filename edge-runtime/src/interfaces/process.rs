@@ -62,7 +62,7 @@ impl Process {
     pub fn new() -> Self {
         Self {
             env: Arc::new(filter_env_vars(std::env::vars()).collect()),
-            exit_code: Arc::new(AtomicU32::new(0)),
+            exit_code: Arc::new(AtomicU32::new(u32::MAX)),
         }
     }
 
@@ -70,7 +70,7 @@ impl Process {
     pub fn with_env(env: Arc<HashMap<String, String>>) -> Self {
         Self {
             env,
-            exit_code: Arc::new(AtomicU32::new(0)),
+            exit_code: Arc::new(AtomicU32::new(u32::MAX)),
         }
     }
 
@@ -120,9 +120,10 @@ impl Process {
     }
 
     /// Returns `Some(code)` if the guest called process.exit, `None` otherwise.
+    /// u32::MAX is the "never called" sentinel so that exit(0) is detectable.
     pub fn exit_requested(&self) -> Option<u32> {
         let code = self.exit_code.load(Ordering::SeqCst);
-        if code == 0 {
+        if code == u32::MAX {
             None
         } else {
             Some(code)
@@ -176,7 +177,7 @@ mod tests {
     #[test]
     fn test_exit_stores_code() {
         let env = test_env();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let process = Process::with_env_and_exit_code(env, exit_code.clone());
         assert_eq!(process.exit_requested(), None);
         process.exit(42);
@@ -184,9 +185,23 @@ mod tests {
     }
 
     #[test]
+    fn test_exit_zero_is_detectable() {
+        let env = test_env();
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
+        let process = Process::with_env_and_exit_code(env, exit_code.clone());
+        assert_eq!(process.exit_requested(), None, "before exit");
+        process.exit(0);
+        assert_eq!(
+            process.exit_requested(),
+            Some(0),
+            "exit(0) must be Some(0), not None"
+        );
+    }
+
+    #[test]
     fn test_exit_code_persists_across_calls() {
         let env = test_env();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let process = Process::with_env_and_exit_code(env, exit_code.clone());
         process.exit(1);
         process.exit(2); // second call should overwrite

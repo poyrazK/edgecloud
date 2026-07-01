@@ -1,6 +1,6 @@
 [package]
 name = "edge-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
@@ -9,6 +9,7 @@ description = "Wasmtime-based runtime exposing WASI Preview 2 host interfaces fo
 [dependencies]
 # Core wasmtime runtime
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
+wasmtime-wasi = { version = "25.0", optional = true }
 
 # Async runtime
 tokio = { version = "1.45", features = ["full"], optional = true }
@@ -59,9 +60,12 @@ tracing = "0.1"
 [dev-dependencies]
 wiremock = "0.6"
 wat = "1"
+tempfile = "3"
+serial_test = "3"
 
 [features]
-default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking"]
+default = ["http-client", "kv-store", "cache", "observe", "time", "scheduling", "process", "http-server", "networking", "filesystem"]
+filesystem = ["dep:wasmtime-wasi"]
 http-client = ["dep:reqwest", "reqwest/blocking", "dep:tokio", "tokio/time", "tokio/sync", "dep:bytes", "dep:futures"]
 kv-store = []
 cache = ["dep:lru"]

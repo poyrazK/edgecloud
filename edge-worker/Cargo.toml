@@ -25,6 +25,7 @@ futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
 wasmtime = { version = "25.0", features = ["component-model", "async"] }
+wasmtime-wasi = { version = "25.0" }
 sha2 = "0.10"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }

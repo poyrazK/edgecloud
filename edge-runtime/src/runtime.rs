@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 use std::sync::Mutex as StdMutex;
+#[cfg(feature = "filesystem")]
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 pub struct RuntimeState {
     pub http_client: http_client::HttpClient,
@@ -66,6 +68,20 @@ pub struct RuntimeState {
     /// `next_outgoing_rep` (which misleadingly suggested outgoing-only).
     #[cfg(any(feature = "http-client", feature = "http-server"))]
     pub next_stream_rep: AtomicU32,
+    #[cfg(feature = "filesystem")]
+    wasi_table: ResourceTable,
+    #[cfg(feature = "filesystem")]
+    wasi_ctx: WasiCtx,
+}
+
+#[cfg(feature = "filesystem")]
+impl WasiView for RuntimeState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.wasi_table
+    }
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi_ctx
+    }
 }
 
 impl RuntimeState {
@@ -73,7 +89,7 @@ impl RuntimeState {
     /// unrestricted egress policy regardless of env vars.
     #[cfg(test)]
     pub fn new() -> Self {
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         Self {
             http_client: http_client::HttpClient::new(),
@@ -97,6 +113,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table: ResourceTable::new(),
+            #[cfg(feature = "filesystem")]
+            wasi_ctx: WasiCtxBuilder::new().build(),
         }
     }
 
@@ -117,7 +137,8 @@ impl RuntimeState {
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let deployment_id = app_ctx.deployment_id.clone();
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -125,6 +146,20 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "filesystem")]
+        let (wasi_table, wasi_ctx) =
+            match Self::make_wasi_ctx_for_deployment(&tenant_id, &deployment_id, &env) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(
+                        tenant_id,
+                        deployment_id,
+                        "filesystem preopen failed, guest will see empty FS: {}",
+                        e
+                    );
+                    (ResourceTable::new(), WasiCtxBuilder::new().build())
+                }
+            };
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -144,6 +179,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table,
+            #[cfg(feature = "filesystem")]
+            wasi_ctx,
         }
     }
 
@@ -162,7 +201,8 @@ impl RuntimeState {
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let tenant_id = app_ctx.tenant_id.clone();
-        let exit_code = Arc::new(AtomicU32::new(0));
+        let deployment_id = app_ctx.deployment_id.clone();
+        let exit_code = Arc::new(AtomicU32::new(u32::MAX));
         let networking = networking::NetworkingState::new();
         let mut obs_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -170,6 +210,20 @@ impl RuntimeState {
         if let Some(acc) = metrics_acc {
             obs_cfg = obs_cfg.with_metrics_accumulator(acc);
         }
+        #[cfg(feature = "filesystem")]
+        let (wasi_table, wasi_ctx) =
+            match Self::make_wasi_ctx_for_deployment(&tenant_id, &deployment_id, &env) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::error!(
+                        tenant_id,
+                        deployment_id,
+                        "filesystem preopen failed, guest will see empty FS: {}",
+                        e
+                    );
+                    (ResourceTable::new(), WasiCtxBuilder::new().build())
+                }
+            };
         Self {
             http_client: http_client::HttpClient::new(),
             kv_store: Self::make_kv_store_for_tenant(&tenant_id),
@@ -189,6 +243,10 @@ impl RuntimeState {
             outgoing_streams: StdMutex::new(std::collections::HashMap::new()),
             #[cfg(any(feature = "http-client", feature = "http-server"))]
             next_stream_rep: AtomicU32::new(1),
+            #[cfg(feature = "filesystem")]
+            wasi_table,
+            #[cfg(feature = "filesystem")]
+            wasi_ctx,
         }
     }
 
@@ -243,11 +301,31 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(feature = "filesystem")]
+    fn make_wasi_ctx_for_deployment(
+        tenant_id: &str,
+        deployment_id: &str,
+        env: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<(ResourceTable, WasiCtx)> {
+        use crate::interfaces::filesystem::scratch_dir_for_deployment;
+        use wasmtime_wasi::{DirPerms, FilePerms};
+
+        let table = ResourceTable::new();
+        let scratch = scratch_dir_for_deployment(tenant_id, deployment_id)?;
+        let mut builder = WasiCtxBuilder::new();
+        let env_pairs: Vec<_> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        builder.envs(&env_pairs);
+        if let Some(path) = scratch {
+            builder.preopened_dir(&path, "/", DirPerms::all(), FilePerms::all())?;
+        }
+        Ok((table, builder.build()))
+    }
+
     /// Returns `Some(code)` if the guest WASM component called `process.exit(code)`,
-    /// `None` if no exit was requested.
+    /// `None` if no exit was requested. u32::MAX is the "never called" sentinel.
     pub fn exit_requested(&self) -> Option<u32> {
         let code = self.exit_code.load(Ordering::SeqCst);
-        if code == 0 {
+        if code == u32::MAX {
             None
         } else {
             Some(code)

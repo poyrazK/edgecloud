@@ -1,0 +1,45 @@
+// edge-guest.wit — full host-interface declaration for guest tooling.
+//
+// This file declares every interface the edgeCloud host provides, including
+// both the custom edge:* interfaces and the standard wasi:* interfaces added
+// via wasmtime_wasi::add_to_linker_sync.
+//
+// Use this world with wasm-tools to validate a guest component:
+//
+//   wasm-tools validate --world edge:cloud/edge-guest component.wasm
+//
+// The host-side bindgen! macro still uses edge.wit (edge:cloud/edge-runtime)
+// to generate Rust trait impls for the edge:* interfaces only; wasi:*
+// implementations come from wasmtime-wasi's pre-generated bindings.
+
+package edge:cloud@0.2.0;
+
+world edge-guest {
+  // ── custom edge:* interfaces ────────────────────────────────────────────
+  import http-client;
+  import networking;
+  import kv-store;
+  import cache;
+  import observe;
+  import time;
+  import scheduling;
+  import process;
+  import http-server;
+
+  // ── standard wasi:* interfaces (via wasmtime_wasi::add_to_linker_sync) ─
+  import wasi:io/error@0.2.0;
+  import wasi:io/poll@0.2.0;
+  import wasi:io/streams@0.2.0;
+  import wasi:filesystem/types@0.2.0;
+  import wasi:filesystem/preopens@0.2.0;
+  import wasi:clocks/wall-clock@0.2.0;
+  import wasi:clocks/monotonic-clock@0.2.0;
+  import wasi:random/random@0.2.0;
+  import wasi:random/insecure@0.2.0;
+  import wasi:random/insecure-seed@0.2.0;
+  import wasi:cli/environment@0.2.0;
+  import wasi:cli/exit@0.2.0;
+  import wasi:cli/stdin@0.2.0;
+  import wasi:cli/stdout@0.2.0;
+  import wasi:cli/stderr@0.2.0;
+}

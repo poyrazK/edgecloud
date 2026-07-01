@@ -18,6 +18,12 @@ pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<Runtim
     let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
     linker.allow_shadowing(true);
 
+    // Wire wasi:filesystem, wasi:io, wasi:clocks, wasi:random into the linker
+    // before the custom edge:* interfaces so that allow_shadowing(true) lets
+    // edge:* re-export any overlapping names cleanly.
+    #[cfg(feature = "filesystem")]
+    wasmtime_wasi::add_to_linker_sync(&mut linker)?;
+
     EdgeRuntime::add_to_linker(&mut linker, |state: &mut RuntimeState| state)?;
 
     Ok(linker)
