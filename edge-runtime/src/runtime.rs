@@ -636,8 +636,23 @@ fn make_scheduler_for_tenant(tenant_id: &str) -> scheduling::Scheduler {
 /// the ctx falls through without the preopen so the guest still runs
 /// (no filesystem access) rather than refusing to start.
 fn build_wasi_ctx_for_tenant(env: &Arc<HashMap<String, String>>, tenant_id: &str) -> WasiCtx {
-    let env_strings: Vec<(String, String)> =
-        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // Apply the env blocklist BEFORE handing the env to `WasiCtx`. The
+    // host exposes the env to the guest via two paths:
+    //
+    //   * `edge:cloud/process::get-env`/`get-all-env` — tenant-filtered
+    //     by the worker before it reaches here (sanity layer).
+    //   * `wasi:cli/environment::get-environment()` — the canonical
+    //     WASI Preview 2 path that any guest can call directly.
+    //
+    // Without filtering here, an operator who sets e.g. `AWS_ACCESS_KEY_ID`
+    // in the per-app env leaks the credential to the guest through the
+    // wasi:cli path. The blocklist (`AWS_*`, `*SECRET*`, `*API_KEY*`, …)
+    // lives in `interfaces/process.rs::filter_env_vars` and is reused
+    // here — single source of truth.
+    let env_strings: Vec<(String, String)> = process::filter_env_vars(
+        env.iter().map(|(k, v)| (k.clone(), v.clone())),
+    )
+    .collect();
     let mut builder = WasiCtxBuilder::new();
     builder.envs(&env_strings);
 
