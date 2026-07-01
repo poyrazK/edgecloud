@@ -105,6 +105,7 @@ fn test_config(
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        worker_sync_threshold_secs: 60,
     }
 }
 
@@ -288,6 +289,7 @@ async fn test_app_lifecycle() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
 
     let msg = TaskMessage::TaskUpdate {
@@ -380,6 +382,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        worker_sync_threshold_secs: 60,
     };
 
     let engine = edge_runtime::create_engine().context("create engine")?;
@@ -471,6 +474,7 @@ async fn test_stop_all_apps() {
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
+            routes: None,
         };
         let msg = TaskMessage::TaskUpdate {
             timestamp: "2026-06-15T00:00:00Z".to_string(),
@@ -548,6 +552,7 @@ async fn build_supervisor(
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        worker_sync_threshold_secs: 60,
     };
 
     let engine = edge_runtime::create_engine()?;
@@ -616,6 +621,7 @@ async fn test_artifact_hash_match_starts_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -667,6 +673,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let bad_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -698,6 +705,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let good_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:01Z".to_string(),
@@ -759,6 +767,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -825,6 +834,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -875,6 +885,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -1136,6 +1147,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-18T00:00:00Z".to_string(),

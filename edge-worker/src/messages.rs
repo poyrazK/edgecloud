@@ -59,6 +59,7 @@ pub enum TaskMessage {
 /// DeploymentRoute: a single destination in a weighted traffic split.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeploymentRoute {
+    #[allow(dead_code)]
     pub deployment_id: String,
     /// SHA-256 of this deployment's wasm artifact. Each route carries its
     /// own hash — the top-level `AppSpec::deployment_hash` only describes
@@ -66,6 +67,7 @@ pub struct DeploymentRoute {
     /// download the primary's binary for every canary route (and verify it
     /// against the wrong hash, failing for any deployment whose artifact
     /// differs from the primary's).
+    #[allow(dead_code)]
     pub deployment_hash: String,
     /// Reserved for canary weight propagation; the worker currently uses 100%
     /// for every route and applies the weight at the ingress layer. Held on the
@@ -80,7 +82,6 @@ pub struct DeploymentRoute {
 pub struct AppSpec {
     pub deployment_id: String,
     pub deployment_hash: String,
-    /// Optional traffic split. When present, the worker runs ALL deployments
     /// listed (not just the primary one) concurrently. None = legacy mode
     /// (single deployment_id only).
     #[serde(default, skip_serializing_if = "Option::is_none")]

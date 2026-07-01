@@ -37,6 +37,7 @@ pub struct Config {
     /// the periodic CP-side reconcile (5min default) usually catches
     /// up first on a healthy cluster; short enough that an isolated
     /// worker doesn't sit stale for the full NATS retention window.
+    #[allow(dead_code)]
     pub worker_sync_threshold_secs: u64,
     pub port_cooldown_secs: u64,
     pub starting_port: u16,

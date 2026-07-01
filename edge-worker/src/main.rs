@@ -138,16 +138,6 @@ async fn main() -> anyhow::Result<()> {
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // Shared HTTP client for all supervisor-initiated requests to the
-    // control plane (currently: /sync fallback). Constructed once so its
-    // connection pool — and any open TLS sessions to the CP — survive
-    // across heartbeat ticks. A per-call Client (the previous
-    // behaviour) forced a fresh TLS handshake every fallback during
-    // sustained NATS outage.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
     // Create the supervisor
     let supervisor = Arc::new(Supervisor {
         config: config.clone(),
@@ -156,36 +146,19 @@ async fn main() -> anyhow::Result<()> {
         port_pool,
         nats: nats.clone(),
         log_forwarder: log_forwarder.clone(),
-        jwt_signer: jwt_signer.clone(),
-        http,
     });
 
     let heartbeat_supervisor = supervisor.clone();
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
-    // Watchdog threshold for the HTTP /sync fallback (issue #53).
-    // The periodic CP-side publish at RECONCILE_INTERVAL (5min default)
-    // is the durable safety net; this threshold is what the worker uses
-    // to decide "NATS has gone silent, fall back to HTTP". Default 60s
-    // gives the periodic CP loop time to fire on a healthy cluster while
-    // bounding the worst-case worker staleness on a CP-isolated network
-    // partition.
-    let sync_threshold = Duration::from_secs(config.worker_sync_threshold_secs);
 
     // Start the heartbeat task — exits cleanly when it receives the shutdown signal.
-    // Clone the sender so the original stays available for signal handlers.
     let shutdown_tx_for_heartbeat = shutdown_tx.clone();
-    // Subscribe ONCE, outside the loop. broadcast::Receiver::recv() only sees
-    // messages sent after the subscription was created; re-subscribing inside
-    // the loop loses any signal sent between the previous recv() returning
-    // and the next subscribe() call. (This was the bug fix for finding #12.)
     let mut shutdown_rx_for_heartbeat = shutdown_tx_for_heartbeat.subscribe();
     tokio::spawn(async move {
         let mut ticker = interval(heartbeat_interval);
-        // Skip the first tick which fires immediately on creation.
         ticker.tick().await;
         loop {
             tokio::select! {
-                // `biased` ensures shutdown always wins when both are ready.
                 biased;
                 _ = shutdown_rx_for_heartbeat.recv() => {
                     tracing::info!("heartbeat task received shutdown signal, stopping");
@@ -203,47 +176,6 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             tracing::error!(err = %e, "failed to publish heartbeat");
-                        }
-                    }
-
-                    // HTTP /sync fallback watchdog (issue #53). If we
-                    // haven't received any TaskMessage (NAT or HTTP) in
-                    // `sync_threshold`, pull the full desired state from
-                    // the control plane directly. Idempotent — same
-                    // diff logic as a NATS-delivered full_sync. Catches
-                    // the offline-forever case where the CP's NATS
-                    // stream retention expires (24h default) before
-                    // reconnect.
-                    let last_seen = {
-                        let st = heartbeat_supervisor.state.read().await;
-                        st.last_task_received_at
-                            .lock()
-                            .ok()
-                            .and_then(|g| *g)
-                    };
-                    let silent_for = last_seen
-                        .map(|t| t.elapsed())
-                        .unwrap_or(Duration::MAX);
-                    if silent_for >= sync_threshold {
-                        tracing::warn!(
-                            silent_for = ?silent_for,
-                            threshold = ?sync_threshold,
-                            "NATS silent too long; pulling /sync fallback"
-                        );
-                        match heartbeat_supervisor.fetch_sync().await {
-                            Ok(Some(msg)) => {
-                                if let Err(e) =
-                                    heartbeat_supervisor.handle_task_message(msg).await
-                                {
-                                    tracing::error!(err = %e, "failed to apply /sync payload");
-                                }
-                            }
-                            Ok(None) => {
-                                // fetch_sync already logged the reason.
-                            }
-                            Err(e) => {
-                                tracing::error!(err = %e, "/sync fetch failed unexpectedly");
-                            }
                         }
                     }
                 }

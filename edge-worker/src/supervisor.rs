@@ -46,11 +46,14 @@ impl Supervisor {
     /// in the desired set never causes us to stop another tenant's app
     /// that happens to share the same name.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
-        let TaskMessage::TaskUpdate {
-            tenant_id,
-            apps: desired_apps,
-            ..
-        } = msg;
+        let (tenant_id, desired_apps) = match msg {
+            TaskMessage::TaskUpdate {
+                tenant_id, apps, ..
+            } => (tenant_id, apps),
+            TaskMessage::FullSync {
+                tenant_id, apps, ..
+            } => (tenant_id, apps),
+        };
 
         // Snapshot this tenant's running apps: (deployment_id, status).
         // Filtered to `tenant_id` so other tenants' apps don't appear.
@@ -830,6 +833,7 @@ impl Supervisor {
                     exit_code,
                     request_count: snap.request_count,
                     outbound_bytes: snap.outbound_bytes,
+                    observer_metrics: Vec::new(),
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                 },

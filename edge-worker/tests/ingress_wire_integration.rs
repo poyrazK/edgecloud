@@ -138,11 +138,8 @@ async fn build_supervisor(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
-        jwt_signer.clone(),
+        jwt_signer,
     );
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
     Ok(Arc::new(Supervisor {
         config,
         state,
@@ -150,8 +147,6 @@ async fn build_supervisor(
         port_pool,
         nats,
         log_forwarder,
-        jwt_signer,
-        http,
     }))
 }
 
