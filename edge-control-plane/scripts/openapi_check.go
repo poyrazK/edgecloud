@@ -95,15 +95,19 @@ func run() error {
 //   - /openapi.yaml, /docs, /docs/ (spec/doc serving infrastructure)
 //   - /api/... redirect routes (deprecated old paths that redirect to /api/v1/)
 //     These are not part of the OpenAPI contract because they are not real endpoints.
+//   - /api/v1/internal/... routes (service-to-service, not part of the public API)
 func isInfrastructure(route string) bool {
 	if route == "GET /openapi.yaml" || route == "GET /docs" || route == "GET /docs/" {
 		return true
 	}
-	// Anything under /api/ that is NOT /api/v1/ is a deprecated redirect.
 	// Extract the path portion (after "METHOD ").
 	methodAndPath := route
 	if idx := strings.Index(route, " "); idx != -1 {
 		methodAndPath = route[idx+1:]
+	}
+	// Internal service-to-service routes are not part of the public API contract.
+	if strings.HasPrefix(methodAndPath, "/api/v1/internal/") {
+		return true
 	}
 	// Redirect routes: /api/... but not /api/v1/...
 	hasPrefix := strings.HasPrefix(methodAndPath, "/api/")
@@ -111,9 +115,10 @@ func isInfrastructure(route string) bool {
 	return hasPrefix && notVersioned
 }
 
-// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) from the given files.
+// parseRoutes extracts all mux.HandleFunc("METHOD /path", ...) and
+// mux.Handle("METHOD /path", ...) calls from the given files.
 func parseRoutes(filenames ...string) ([]route, error) {
-	pattern := regexp.MustCompile(`\.HandleFunc\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
+	pattern := regexp.MustCompile(`\.Handle(?:Func)?\s*\(\s*"([A-Z]+)\s+([^"]+)"`)
 
 	var routes []route
 	seen := make(map[string]bool)
