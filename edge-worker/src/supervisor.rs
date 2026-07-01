@@ -282,6 +282,7 @@ impl Supervisor {
                     app_ctx: app_ctx.clone(),
                     meter: meter.clone(),
                     env: env.clone(),
+                    max_request_body_bytes: self.config.handler_max_request_body_bytes,
                 };
 
                 let dispatch = HandlerDispatch::new(
@@ -445,19 +446,66 @@ impl Supervisor {
             t.abort();
         }
 
-        // Propagate any panic from the app task.
+        // Propagate any panic from the app task. Two failure modes to
+        // distinguish:
+        //
+        //   * `JoinError::Cancelled` — `handle.abort()` was called on a
+        //     task that had already returned cleanly. This is the
+        //     common case for the Handler model: the broadcast shutdown
+        //     signal reaches the dispatch task; it returns `Ok(())`
+        //     within microseconds; the supervisor's `handle.abort()`
+        //     then turns that finished task into a Cancelled JoinError.
+        //     Re-panicking here would crash the supervisor task on
+        //     every redeploy (re-deploy Handler app → shutdown →
+        //     abort → JoinError::Cancelled → panic_any), and break the
+        //     NATS consume loop.
+        //   * Real panic payload — the guest trapped with a non-zero
+        //     exit, or the host task failed. We re-raise via
+        //     `panic::resume_unwind` so the supervisor task surfaces a
+        //     real Rust panic (which is observable by crash-reporting
+        //     infrastructure), rather than swallowing it.
         if let Some(handle) = handle {
-            handle.abort();
-            // try_unwrap extracts the JoinHandle from the Arc; if there are other
-            // Arcs (shouldn't happen here), fall back to not awaiting.
-            match std::sync::Arc::try_unwrap(handle) {
+            // try_unwrap extracts the JoinHandle from the Arc; if there
+            // are other Arcs (shouldn't happen here), we skip the await
+            // and let the inner task finish on its own. Dropping the
+            // Arc without awaiting is fine because the task that holds
+            // the JoinHandle has already been requested to shutdown
+            // via the broadcast/oneshot signal above.
+            let join_result = match std::sync::Arc::try_unwrap(handle) {
                 Ok(join_handle) => {
-                    if let Err(panic_info) = join_handle.await {
-                        std::panic::panic_any(panic_info);
+                    // Skip the abort if the task already finished
+                    // (e.g. the broadcast signal already reached it).
+                    // `JoinHandle::is_finished()` is `Send + Sync` and
+                    // non-blocking.
+                    if !join_handle.is_finished() {
+                        join_handle.abort();
                     }
+                    join_handle.await
                 }
                 Err(_) => {
-                    tracing::warn!("could not unwrap JoinHandle — multiple refs");
+                    tracing::debug!("could not unwrap JoinHandle — multiple refs; skipping await");
+                    return Ok(());
+                }
+            };
+            match join_result {
+                Ok(()) => {
+                    // Clean return — expected path. Nothing to do.
+                }
+                Err(join_err) if join_err.is_cancelled() => {
+                    // Aborted task that hadn't yet signaled completion.
+                    // This is the normal Handler-shutdown path; not an
+                    // error.
+                    tracing::debug!("app task cancelled cleanly");
+                }
+                Err(join_err) => {
+                    // Real panic. `try_into_panic()` returns the
+                    // original Box<dyn Any + Send> payload; we resume
+                    // the unwind so the supervisor task crashes with
+                    // the original panic message rather than wrapping
+                    // it in a generic JoinError.
+                    if let Ok(panic_payload) = join_err.try_into_panic() {
+                        std::panic::resume_unwind(panic_payload);
+                    }
                 }
             }
         }
