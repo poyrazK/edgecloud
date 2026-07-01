@@ -545,73 +545,78 @@ func TestClassifyFromPatterns(t *testing.T) {
 	}
 }
 
-// TestPartitionManualReview pins the gap #4 fix: when --analyze-json
-// fails, the fallback heuristic must still split detected patterns into
-// Transformed vs ManualReview by diffing each POSIX snippet against the
-// transformed WASI source. Without this, every pattern was silently
-// classified as AutoTransformable and PatternsManualReview was always
-// empty in fallback scenarios.
-func TestPartitionManualReview(t *testing.T) {
-	bind := domain.PatternInfo{Pattern: "bind(fd, addr, len)", Snippet: "bind(fd, addr, len)", WasiEquivalent: "wasi_socket_tcp_start_bind"}
-	// fork uses the analyzer's PascalCase Debug form
-	// (PatternKind::Posix(PosixPattern::Fork) → "Fork"), not the
-	// POSIX call signature — the analyzer-detected set uses Debug
-	// strings while the heuristic uses call signatures.
-	fork := domain.PatternInfo{Pattern: "Fork", Snippet: "fork()", WasiEquivalent: "no WASI equivalent"}
-	unknown := domain.PatternInfo{Pattern: "weird_pattern_no_posix_token()", Snippet: "weird_pattern_no_posix_token()", WasiEquivalent: "n/a"}
-
+// TestDetectManualReviewPatternsC pins gap #4 for the C fallback:
+// when --analyze-json fails, the heuristic must surface
+// NotTransformable POSIX calls the transformer left verbatim (fork,
+// poll, select, exec*, etc.) into PatternsManualReview. Without this,
+// every pattern was silently classified as AutoTransformable and
+// PatternsManualReview was always empty in fallback scenarios.
+func TestDetectManualReviewPatternsC(t *testing.T) {
 	tests := []struct {
-		name            string
-		detected        []domain.PatternInfo
-		wasiSource      string
-		wantTransformed []string
-		wantManual      []string
+		name       string
+		wasiSource string
+		want       []string // expected Pattern names in order
 	}{
-		{
-			name:            "bind preserved in wasi source → manual review",
-			detected:        []domain.PatternInfo{bind},
-			wasiSource:      "int main(){ bind(fd, addr, 8); return 0; }",
-			wantTransformed: nil,
-			wantManual:      []string{"bind(fd, addr, len)"},
-		},
-		{
-			name:            "bind rewritten to wasi → transformed",
-			detected:        []domain.PatternInfo{bind},
-			wasiSource:      "wasi_socket_tcp_start_bind(fd, addr, 8);",
-			wantTransformed: []string{"bind(fd, addr, len)"},
-			wantManual:      nil,
-		},
-		{
-			name:            "fork preserved → manual review",
-			detected:        []domain.PatternInfo{fork},
-			wasiSource:      "int main(){ if(fork()) return 1; return 0; }",
-			wantTransformed: nil,
-			wantManual:      []string{"Fork"},
-		},
-		{
-			name:            "unknown pattern defaults to transformed",
-			detected:        []domain.PatternInfo{unknown},
-			wasiSource:      "anything goes",
-			wantTransformed: []string{"weird_pattern_no_posix_token()"},
-			wantManual:      nil,
-		},
+		{"fork preserved", "int main(){ if(fork()) return 1; }", []string{"Fork"}},
+		{"vfork preserved", "vfork();", []string{"Fork"}},
+		{"poll preserved", "poll(fds, 1, -1);", []string{"Poll"}},
+		{"select preserved", "select(nfds, &readfds, NULL, NULL, NULL);", []string{"Select"}},
+		{"exec variants dedup to single Exec entry", "execve(...); execl(...); execvp(...); exec(...);", []string{"Exec"}},
+		{"socketpair preserved", "socketpair(AF_UNIX, SOCK_STREAM, 0, sv);", []string{"SocketPair"}},
+		{"shutdown preserved", "shutdown(fd, SHUT_RDWR);", []string{"Shutdown"}},
+		{"accept preserved", "accept(fd, NULL, NULL);", []string{"Accept"}},
+		{"accept4 preserved", "accept4(fd, NULL, NULL, 0);", []string{"Accept"}},
+		{"gethostbyname family dedups to single GetHostByName", "gethostbyname(\"h\"); getaddrinfo(...); gethostbyaddr(...);", []string{"GetHostByName"}},
+		{"O_NONBLOCK in source", "fd = socket(AF_INET, SOCK_STREAM | O_NONBLOCK, 0);", []string{"NonBlocking"}},
+		{"SOCK_RAW in source", "fd = socket(AF_INET, SOCK_RAW, 0);", []string{"SockRaw"}},
+		{"empty source", "", nil},
+		{"only wasi_* (auto-transformable, no manual review)", "wasi_socket_tcp_create(AF_INET, SOCK_STREAM); wasi_socket_tcp_start_bind(...);", nil},
+		{"mixed auto + manual", "wasi_socket_tcp_create(...); if(fork()) return 1;", []string{"Fork"}},
+		{"all four basic manual review patterns", "fork(); poll(...); select(...); accept(...);", []string{"Fork", "Poll", "Select", "Accept"}},
+		{"identifier-suffix does not match (xbind does not match bind)", "xbind(fd, addr, 8);", nil},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			transformed, manualReview := partitionManualReview(tt.detected, tt.wasiSource)
-			if !patternNamesEqual(transformed, tt.wantTransformed) {
-				t.Errorf("transformed = %v, want %v", patternNames(transformed), tt.wantTransformed)
+			got := detectManualReviewPatternsC(tt.wasiSource)
+			if !patternNamesEqual(got, tt.want) {
+				t.Errorf("detectManualReviewPatternsC() = %v, want %v", patternNames(got), tt.want)
 			}
-			if !patternNamesEqual(manualReview, tt.wantManual) {
-				t.Errorf("manualReview = %v, want %v", patternNames(manualReview), tt.wantManual)
-			}
-			// All entries routed to manualReview must carry
-			// NotTransformable so downstream classifyFromPatterns
-			// and FileReport.ManualReview consumers see the right value.
-			for _, p := range manualReview {
+			for _, p := range got {
 				if p.Transformability != domain.TransformabilityNotTransformable {
-					t.Errorf("manual-review entry must be NotTransformable, got: %q (pattern=%s)", p.Transformability, p.Pattern)
+					t.Errorf("entry must be NotTransformable, got: %q (pattern=%s)", p.Transformability, p.Pattern)
+				}
+			}
+		})
+	}
+}
+
+// TestDetectManualReviewPatternsRust pins gap #4 for the Rust fallback.
+func TestDetectManualReviewPatternsRust(t *testing.T) {
+	tests := []struct {
+		name       string
+		wasiSource string
+		want       []string
+	}{
+		{".accept( on TcpListener", "let s = listener.accept();", []string{"TcpAccept"}},
+		{"UdpSocket::connect literal", "let s = UdpSocket::connect(\"127.0.0.1:8080\");", []string{"UdpConnect"}},
+		{"std::process::exit literal", "std::process::exit(1);", []string{"ProcessExit"}},
+		{"empty source", "", nil},
+		{"only auto-transformable (TcpStream::connect rewritten)", "let s = wasi_socket_tcp_start_connect(...);", nil},
+		{"all three manual review patterns", "let s = listener.accept(); let _ = UdpSocket::connect(\"...\"); std::process::exit(0);", []string{"TcpAccept", "UdpConnect", "ProcessExit"}},
+		{"identifier-suffix does not match (myaccept does not match .accept)", "myaccept();", nil},
+		{"TcpAccept is not false-positive on bare accept()", "accept(sock, NULL, NULL);", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := detectManualReviewPatternsRust(tt.wasiSource)
+			if !patternNamesEqual(got, tt.want) {
+				t.Errorf("detectManualReviewPatternsRust() = %v, want %v", patternNames(got), tt.want)
+			}
+			for _, p := range got {
+				if p.Transformability != domain.TransformabilityNotTransformable {
+					t.Errorf("entry must be NotTransformable, got: %q (pattern=%s)", p.Transformability, p.Pattern)
 				}
 			}
 		})
@@ -815,7 +820,7 @@ func TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview(t *testing.T) {
 	shimPath := filepath.Join(shimDir, "edge-migrate-shim")
 	shim := "#!/bin/sh\n" +
 		"case \" $* \" in\n" +
-		"  *' --analyze-json '*|*' --analyze-json\\t'*)\n" +
+		"  *' --analyze-json '*)\n" +
 		"    echo 'shim: forcing --analyze-json failure' >&2\n" +
 		"    exit 1 ;;\n" +
 		"  *)\n" +
