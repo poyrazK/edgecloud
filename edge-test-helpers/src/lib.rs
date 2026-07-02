@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
 use testcontainers_modules::nats::Nats;
@@ -73,6 +74,9 @@ pub fn should_skip_integration_tests() -> bool {
 pub async fn start_nats() -> (ContainerAsync<Nats>, String) {
     let container: ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
         .with_startup_timeout(Duration::from_secs(30))
+        .with_ready_conditions(vec![WaitFor::Duration {
+            length: Duration::from_secs(5),
+        }])
         .start()
         .await
         .expect("start NATS container");
@@ -81,18 +85,7 @@ pub async fn start_nats() -> (ContainerAsync<Nats>, String) {
         .get_host_port_ipv4(4222)
         .await
         .expect("get NATS port");
-    let addr = format!("{}:{}", host, port);
-
-    // Poll until port is open
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    (container, addr)
+    (container, format!("{}:{}", host, port))
 }
 
 /// RAII guard bundling a freshly-built `Supervisor` with the NATS
