@@ -480,8 +480,8 @@ fn synthetic_response(
     status: hyper::StatusCode,
     diagnostic: &str,
 ) -> HyperResponse<HyperOutgoingBody> {
-    use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use http_body_util::{BodyExt, Full};
+    use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use std::convert::Infallible;
 
     let bounded = truncate_diagnostic(diagnostic);
