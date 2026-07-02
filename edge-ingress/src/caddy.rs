@@ -762,10 +762,6 @@ mod tests {
     // because wiremock + tokio can flap on the runner.
     // -----------------------------------------------------------------
 
-    fn should_skip_integration_tests() -> bool {
-        std::env::var("CI").is_ok() || std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-    }
-
     /// 502 twice, then 200 — `load_config` must retry and succeed.
     /// Pins the retry budget (`MAX_LOAD_ATTEMPTS = 3`) and the
     /// exponential backoff shape (the 200 is the third response,
@@ -774,8 +770,8 @@ mod tests {
     /// an Err to the upstream and the FQDN table would not reload.
     #[tokio::test]
     async fn load_config_retries_on_502() {
-        if should_skip_integration_tests() {
-            eprintln!("skipping load_config_retries_on_502 under CI/SKIP_INTEGRATION_TESTS");
+        if std::env::var("SKIP_INTEGRATION_TESTS").is_ok() {
+            eprintln!("skipping load_config_retries_on_502 under SKIP_INTEGRATION_TESTS");
             return;
         }
         use wiremock::matchers::{method, path};
@@ -807,8 +803,8 @@ mod tests {
     /// Pins the retryable-status gate at the variant level.
     #[tokio::test]
     async fn load_config_does_not_retry_on_400() {
-        if should_skip_integration_tests() {
-            eprintln!("skipping load_config_does_not_retry_on_400 under CI/SKIP_INTEGRATION_TESTS");
+        if std::env::var("SKIP_INTEGRATION_TESTS").is_ok() {
+            eprintln!("skipping load_config_does_not_retry_on_400 under SKIP_INTEGRATION_TESTS");
             return;
         }
         use wiremock::matchers::{method, path};
@@ -840,9 +836,9 @@ mod tests {
     /// must update this assertion.
     #[tokio::test]
     async fn load_config_gives_up_after_three_503s() {
-        if should_skip_integration_tests() {
+        if std::env::var("SKIP_INTEGRATION_TESTS").is_ok() {
             eprintln!(
-                "skipping load_config_gives_up_after_three_503s under CI/SKIP_INTEGRATION_TESTS"
+                "skipping load_config_gives_up_after_three_503s under SKIP_INTEGRATION_TESTS"
             );
             return;
         }
