@@ -73,6 +73,7 @@ fn test_config(
     nats_url: String,
     control_plane_url: String,
 ) -> Config {
+    let pid_offset = (std::process::id() % 1000) as u16;
     Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
@@ -82,7 +83,7 @@ fn test_config(
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -142,6 +143,7 @@ impl TestHarness {
     async fn new_inner() -> anyhow::Result<Self> {
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
+        let pid_offset = (std::process::id() % 1000) as u16;
 
         // Delegate supervisor wiring to the shared helper. The per-test
         // tempdir is threaded through Config.cache_dir so cache-poisoning
@@ -158,7 +160,7 @@ impl TestHarness {
             worker_sync_threshold_secs: 60,
             health_check_timeout_secs: 60,
             port_cooldown_secs: 60,
-            starting_port: 18_000,
+            starting_port: 18_000 + pid_offset,
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
@@ -337,6 +339,7 @@ async fn test_heartbeat_published() {
 }
 
 async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     // Start a NATS container directly (no `SupervisorGuard` here because
     // this test doesn't bind the container to the supervisor struct; it
     // forgets it explicitly so it stays alive for the test's duration,
@@ -354,7 +357,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -790,6 +793,7 @@ async fn test_queue_group_pinning() {
 }
 
 async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     // Single NATS container, shared by both workers and the publisher.
     let (nats_container, nats_url) = start_nats().await;
 
@@ -810,7 +814,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -835,7 +839,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_200 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -1618,6 +1622,7 @@ async fn build_supervisor_only_with_cp(
     tenant_id: &str,
     control_plane_url: &str,
 ) -> anyhow::Result<Arc<Supervisor>> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     let config = Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
@@ -1629,7 +1634,7 @@ async fn build_supervisor_only_with_cp(
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 19_500,
+        starting_port: 19_500 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,

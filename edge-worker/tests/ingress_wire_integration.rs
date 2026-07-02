@@ -45,6 +45,7 @@ fn wire_test_config(
     region: &str,
     worker_addr: &str,
 ) -> edge_worker::config::Config {
+    let pid_offset = (std::process::id() % 1000) as u16;
     edge_worker::config::Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
@@ -56,7 +57,7 @@ fn wire_test_config(
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 19_000,
+        starting_port: 19_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
