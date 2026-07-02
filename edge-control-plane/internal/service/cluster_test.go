@@ -27,7 +27,7 @@ func (m *mockClusterWorkerRepo) GetLatestStatuses(ctx context.Context, ids []str
 func TestClusterService_List_EmptyWorkers(t *testing.T) {
 	svc := NewClusterService(&mockClusterWorkerRepo{
 		listFn: func(ctx context.Context) ([]domain.Worker, error) { return nil, nil },
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -49,7 +49,7 @@ func TestClusterService_List_WorkerWithNoStatus(t *testing.T) {
 		getLatestStatusesFn: func(ctx context.Context, ids []string) (map[string]domain.WorkerStatus, error) {
 			return map[string]domain.WorkerStatus{}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -84,7 +84,7 @@ func TestClusterService_List_SingleWorkerRunningApps(t *testing.T) {
 				"w_1": {Apps: appsJSON},
 			}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -116,7 +116,7 @@ func TestClusterService_List_MultipleRegions(t *testing.T) {
 				"w_sfo": {Apps: appsJSON},
 			}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -144,7 +144,7 @@ func TestClusterService_List_InvalidStatusJSON(t *testing.T) {
 				"w_1": {Apps: json.RawMessage(`{bad}`)},
 			}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -163,7 +163,7 @@ func TestClusterService_List_NilIP(t *testing.T) {
 		getLatestStatusesFn: func(ctx context.Context, ids []string) (map[string]domain.WorkerStatus, error) {
 			return map[string]domain.WorkerStatus{}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -192,7 +192,7 @@ func TestClusterService_List_IntegerDivisionRounding(t *testing.T) {
 				"w_1": {Apps: appsJSON}, // 5 apps
 			}, nil
 		},
-	})
+	}, nil)
 	view, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List: %v", err)

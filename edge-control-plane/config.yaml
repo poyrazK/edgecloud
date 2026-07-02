@@ -32,6 +32,17 @@ migration:
   edge_migrate_path: "edge-migrate"
   wasi_sdk_path: "/usr/local/wasi-sdk/bin"
 
+# Cluster autoscaler (issue #85). Disabled by default.
+autoscale:
+  enabled: false
+  min_workers: 2
+  max_workers: 50
+  target_headroom_pct: 20
+  scale_up_cooldown_s: 60
+  scale_down_cooldown_s: 300
+  decision_interval_s: 30
+  provider_kind: "noop"
+
 # region is this control plane's own region. Used as the default for
 # deployments that don't specify `?regions=`. Defaults to "global" if
 # unset (which works with the wildcard NATS subject edgecloud.tasks.>).

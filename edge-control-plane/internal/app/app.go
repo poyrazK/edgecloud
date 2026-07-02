@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/autoscale"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -41,6 +42,7 @@ type App struct {
 	WorkerSvc    *service.WorkerService
 	ReconcileSvc *service.ReconcileService
 	LogGC        *service.LogGCService
+	AutoscaleSvc *autoscale.Service
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -65,6 +67,7 @@ func New(
 	trafficSplitRepo := repository.NewTrafficSplitRepository(db)
 	logEntryRepo := repository.NewLogEntryRepository(db)
 	domainRepo := repository.NewDomainRepository(db)
+	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
@@ -83,7 +86,7 @@ func New(
 		workerRepo, quotaRepo, activeDeploymentRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 	)
-	clusterSvc := service.NewClusterService(workerRepo)
+	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
 	migrationSvc := service.NewMigrationService(
 		deploymentRepo, artifactStore,
 		cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath,
@@ -98,6 +101,29 @@ func New(
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
+
+	var autoscaleSvc *autoscale.Service
+	if cfg.Autoscale.Enabled {
+		cloud, err := autoscale.NewCloudProvider(cfg.Autoscale.ProviderKind, nil)
+		if err != nil {
+			log.Fatalf("autoscale: invalid provider_kind %q: %v", cfg.Autoscale.ProviderKind, err)
+		}
+		autoscaleSvc = autoscale.NewService(autoscale.Deps{
+			Cfg: autoscale.Config{
+				Enabled:            cfg.Autoscale.Enabled,
+				MinWorkers:         cfg.Autoscale.MinWorkers,
+				MaxWorkers:         cfg.Autoscale.MaxWorkers,
+				TargetHeadroomPct:  cfg.Autoscale.TargetHeadroomPct,
+				ScaleUpCooldownS:   cfg.Autoscale.ScaleUpCooldownS,
+				ScaleDownCooldownS: cfg.Autoscale.ScaleDownCooldownS,
+				DecisionIntervalS:  cfg.Autoscale.DecisionIntervalS,
+			},
+			NC:         publisher.Conn(),
+			DeployRepo: activeDeploymentRepo,
+			EventRepo:  autoscaleEventRepo,
+			Cloud:      cloud,
+		})
+	}
 
 	// ── Handlers ──────────────────────────────────────────────────
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
@@ -277,6 +303,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
+	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)
 
 	apiWithAuth := authMiddleware.Authenticate(api)
 	apiWithOwner := authMiddleware.Authenticate(
@@ -292,10 +319,9 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 
 	// Service-to-service read endpoint that the edge-ingress polls to
 	// apply Caddy weights for canary/blue-green traffic splits.
-	mux.Handle(
-		"GET /api/v1/internal/traffic/{tenantID}/{appName}",
-		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)),
-	)
+	mux.HandleFunc("GET /api/v1/internal/traffic/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
+	})
 
 	// Internal endpoints (worker-facing, JWT auth).
 	internalMux := http.NewServeMux()
@@ -343,6 +369,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		WorkerSvc:    workerSvc,
 		ReconcileSvc: reconcileSvc,
 		LogGC:        service.NewLogGCService(logEntryRepo),
+		AutoscaleSvc: autoscaleSvc,
 	}
 }
 
@@ -364,6 +391,16 @@ func (a *App) RunBackground(ctx context.Context) {
 	// Periodic full-state reconcile (issue #53). Tunable via RECONCILE_INTERVAL.
 	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
 	go a.ReconcileSvc.Run(ctx, reconcileInterval)
+
+	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
+	// is false — Subscribe returns nil immediately.
+	if a.AutoscaleSvc != nil {
+		go func() {
+			if err := a.AutoscaleSvc.Subscribe(ctx); err != nil {
+				log.Printf("autoscale subscription error: %v", err)
+			}
+		}()
+	}
 }
 
 // stableWindowFromEnv reads STABLE_WINDOW_SECONDS from the environment,

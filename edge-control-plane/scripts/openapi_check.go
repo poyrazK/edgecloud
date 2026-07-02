@@ -31,7 +31,7 @@ func main() {
 
 func run() error {
 	// Parse routes from both main.go and internal/app/app.go
-	routes, err := parseRoutes("cmd/api/main.go", "internal/app/app.go")
+	routes, err := parseRoutes("internal/app/app.go")
 	if err != nil {
 		return fmt.Errorf("parse routes: %w", err)
 	}
@@ -95,19 +95,15 @@ func run() error {
 //   - /openapi.yaml, /docs, /docs/ (spec/doc serving infrastructure)
 //   - /api/... redirect routes (deprecated old paths that redirect to /api/v1/)
 //     These are not part of the OpenAPI contract because they are not real endpoints.
-//   - /api/v1/internal/... routes (service-to-service, not part of the public API)
 func isInfrastructure(route string) bool {
 	if route == "GET /openapi.yaml" || route == "GET /docs" || route == "GET /docs/" {
 		return true
 	}
+	// Anything under /api/ that is NOT /api/v1/ is a deprecated redirect.
 	// Extract the path portion (after "METHOD ").
 	methodAndPath := route
 	if idx := strings.Index(route, " "); idx != -1 {
 		methodAndPath = route[idx+1:]
-	}
-	// Internal service-to-service routes are not part of the public API contract.
-	if strings.HasPrefix(methodAndPath, "/api/v1/internal/") {
-		return true
 	}
 	// Redirect routes: /api/... but not /api/v1/...
 	hasPrefix := strings.HasPrefix(methodAndPath, "/api/")

@@ -26,6 +26,17 @@ components:
       type: http
       scheme: bearer
       description: Worker JWT (HMAC-SHA256). Issued to workers by the control plane.
+    InternalTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: |
+        Shared-secret header for trusted service-to-service callers
+        (peer control planes pulling artifacts, the edge-ingress
+        fetching traffic splits). Token value must match the
+        receiving control plane's `internal_token` config. Reject
+        requests to `http://` peer URLs — TLS is required to protect
+        the token in transit.
 
   schemas:
     # -------------------------------------------------------------------------
@@ -770,21 +781,25 @@ components:
       type: object
       description: Per-region snapshot of cluster state.
       properties:
+        generated_at:
+          type: string
+          format: date-time
+          description: Server-side timestamp when this view was assembled.
         regions:
-          type: array
-          items:
+          type: object
+          additionalProperties:
             $ref: '#/components/schemas/RegionView'
 
     RegionView:
       type: object
       properties:
-        name:
-          type: string
-          example: us-east1
         workers:
           type: array
           items:
             $ref: '#/components/schemas/WorkerStatus'
+        apps_per_worker_avg:
+          type: integer
+          description: Mean number of apps hosted per worker in this region.
 
     WorkerStatus:
       type: object
@@ -792,10 +807,25 @@ components:
         worker_id:
           type: string
           example: w_us-east1_01
-        apps:
-          type: array
-          items:
-            $ref: '#/components/schemas/AppStatus'
+        region:
+          type: string
+          example: us-east1
+        ip:
+          type: string
+          description: Worker public IP. Omitted when not reported.
+          example: 203.0.113.42
+        last_seen:
+          type: string
+          format: date-time
+          description: Last heartbeat timestamp.
+        app_count:
+          type: integer
+          description: Number of apps the worker reported on its latest heartbeat.
+          example: 12
+        memory_mb:
+          type: integer
+          description: Worker-allocated memory budget.
+          example: 4096
 
     AppStatus:
       type: object
@@ -807,6 +837,49 @@ components:
           type: integer
           format: int64
           description: Total requests handled by this app on this worker.
+
+    AutoscaleEvent:
+      type: object
+      description: One row in the autoscale_events table.
+      properties:
+        id:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        region:
+          type: string
+        action:
+          type: string
+          enum: [scale_up, scale_down, noop]
+        from_count:
+          type: integer
+        to_count:
+          type: integer
+        reason:
+          type: string
+        provider_kind:
+          type: string
+        succeeded:
+          type: boolean
+        error_message:
+          type: string
+          nullable: true
+
+    AutoscaleEventList:
+      type: object
+      description: Envelope returned by GET /api/v1/admin/cluster/events.
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AutoscaleEvent'
+        limit:
+          type: integer
+        region:
+          type: string
+          nullable: true
           example: 9821
 
     # -------------------------------------------------------------------------
@@ -2127,6 +2200,61 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/admin/cluster/events:
+    get:
+      operationId: listAutoscaleEvents
+      summary: List recent cluster autoscaler events (admin only)
+      description: Returns the most-recent autoscale_events rows, newest first.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - in: query
+          name: region
+          required: false
+          schema:
+            type: string
+          description: Restrict to a single region. Omit for all regions.
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 50
+          description: Maximum rows to return. Clamped to [1, 500].
+      responses:
+        '200':
+          description: Event list, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutoscaleEventList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/internal/traffic/{tenantID}/{appName}:
+    get:
+      summary: Internal traffic split lookup
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: appName
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Traffic split data
+
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)
   # -------------------------------------------------------------------------
@@ -2264,10 +2392,28 @@ paths:
     get:
       operationId: downloadArtifact
       summary: Download the Wasm artifact for a deployment
-      description: Used by workers to download artifact content after a task update.
-        Requires a valid worker JWT.
+      description: |
+        Used by workers to download artifact content after a task update,
+        AND by peer control planes to pull artifacts through this CP for
+        a remote region's worker. Auth is dual-lane:
+
+          - **Worker JWT** (existing): a valid 24h HMAC JWT in
+            `Authorization: Bearer <token>`. Used by every edge-worker
+            today.
+          - **Internal token** (new, issue #127 step 3): the
+            `X-Internal-Token: <value>` header matching the receiving
+            CP's `internal_token` config. Used by a peer CP whose local
+            cache is cold when a worker in its region calls. The peer
+            CP must use `https://` to protect the token in transit.
+
+        A request presenting `Authorization` is dispatched to the worker
+        lane (and rejected if the JWT is invalid); a request without
+        `Authorization` is dispatched to the internal-token lane. The
+        internal-token lane is fail-closed when `internal_token` is
+        unset, so a misconfigured CP cannot accidentally widen access.
       security:
         - WorkerJWTAuth: []
+        - InternalTokenAuth: []
       parameters:
         - name: deploymentID
           in: path

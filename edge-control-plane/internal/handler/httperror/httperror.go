@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 )
 
 // ErrorCode is a machine-readable SCREAMING_SNAKE_CASE identifier.
@@ -47,9 +45,14 @@ func write(w http.ResponseWriter, code ErrorCode, message string, httpStatus int
 	}
 }
 
+// requestIDKey is the context key for the request ID. It must match the
+// key used by middleware/tracing.go. Using a plain string is sufficient
+// since context keys are compared by value, not identity.
+const requestIDKey = "request_id"
+
 // requestIDFromContext extracts the request ID from context, or returns "".
 func requestIDFromContext(ctx context.Context) string {
-	if id, ok := ctx.Value(domain.RequestIDKey).(string); ok {
+	if id, ok := ctx.Value(requestIDKey).(string); ok {
 		return id
 	}
 	return ""

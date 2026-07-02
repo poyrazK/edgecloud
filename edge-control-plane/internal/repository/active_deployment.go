@@ -324,3 +324,15 @@ func (r *ActiveDeploymentRepository) AppendRegionsFailed(ctx context.Context, te
 	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr, ts, attemptID)
 	return err
 }
+
+// Count returns the fleet-wide count of active_deployments rows.
+// The autoscaler (issue #85) uses this to compute its target
+// headroom — every region sizes its own fleet against the same
+// DesiredApps value because the deployment table is global
+// (region lives on workers, not on deployments). Multi-region
+// partitioning is a separate concern.
+func (r *ActiveDeploymentRepository) Count(ctx context.Context) (int, error) {
+	var count int
+	err := r.db.GetContext(ctx, &count, `SELECT COUNT(*) FROM active_deployments`)
+	return count, err
+}

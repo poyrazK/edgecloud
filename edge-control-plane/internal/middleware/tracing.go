@@ -4,13 +4,12 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/google/uuid"
 )
 
 // RequestIDKey is the context key for the request ID.
 // Matches the key expected by handler/httperror/requestIDFromContext.
-var RequestIDKey = domain.RequestIDKey
+const RequestIDKey contextKey = "request_id"
 
 // RequestID middleware generates a UUID request ID for every request and
 // writes it to the X-Request-ID response header. If the client sends an

@@ -66,6 +66,25 @@ type HeartbeatMessage struct {
 	WorkerID  string                      `json:"worker_id"`
 	Region    string                      `json:"region"`
 	Apps      map[string]domain.AppStatus `json:"apps"`
+	// ClusterHeadroom carries capacity info for the autoscaler (issue #85).
+	// Optional on the wire so pre-#85 workers (no field) still serialize
+	// cleanly through this struct, and a new worker talking to an old
+	// control plane has the field silently dropped by the consumer's
+	// partial unmarshal — both directions safe.
+	//
+	// The autoscaler reads `AppSlots` from this block; CPUPct / MemPct are
+	// observability-only for now (no sysinfo on the worker yet).
+	ClusterHeadroom *ClusterHeadroom `json:"cluster_headroom,omitempty"`
+}
+
+// ClusterHeadroom mirrors the Rust `ClusterHeadroom` struct in
+// edge-worker/src/messages.rs. AppSlots is the only field the autoscaler
+// acts on; the rest are pass-through for future PRs that add
+// system-introspection.
+type ClusterHeadroom struct {
+	CPUPct   *float64 `json:"cpu_pct,omitempty"`
+	MemPct   *float64 `json:"mem_pct,omitempty"`
+	AppSlots uint32   `json:"app_slots"`
 }
 
 // StreamConfig describes a JetStream stream to be created/verified.

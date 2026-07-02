@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
 // ClusterView is the operator-facing snapshot of every region + worker
@@ -33,9 +34,20 @@ type WorkerView struct {
 	MemoryMB int       `json:"memory_mb"`
 }
 
+// AutoscaleEventList is the envelope returned by
+// GET /api/v1/admin/cluster/events. The `region` field echoes back
+// the filter (or `nil` when listing all regions) so a CLI paginating
+// across calls can verify its filter without re-parsing query state.
+type AutoscaleEventList struct {
+	Items  []domain.AutoscaleEvent `json:"items"`
+	Limit  int                     `json:"limit"`
+	Region *string                 `json:"region"`
+}
+
 // ClusterServiceInterface allows handler tests to substitute a mock.
 type ClusterServiceInterface interface {
 	List(ctx context.Context) (*ClusterView, error)
+	RecentEvents(ctx context.Context, region string, limit int) (*AutoscaleEventList, error)
 }
 
 // ClusterWorkerRepoInterface is the subset of *repository.WorkerRepository used by ClusterService.
@@ -47,13 +59,24 @@ type ClusterWorkerRepoInterface interface {
 // ClusterService builds the cluster view from the worker + worker_status
 // repositories. Both queries are best-effort: a worker with no status
 // row simply gets AppCount=0 (heartbeat hasn't arrived yet).
+//
+// `autoscaleEvents` (issue #85) powers RecentEvents. The two endpoints
+// serve different operator questions ("what does the fleet look like
+// RIGHT NOW?" vs. "why did the fleet size change?") so they intentionally
+// share no state.
 type ClusterService struct {
-	workerRepo ClusterWorkerRepoInterface
+	workerRepo      ClusterWorkerRepoInterface
+	autoscaleEvents *repository.AutoscaleRepository
 }
 
-// NewClusterService constructs a ClusterService.
-func NewClusterService(workerRepo ClusterWorkerRepoInterface) *ClusterService {
-	return &ClusterService{workerRepo: workerRepo}
+// NewClusterService constructs a ClusterService. `workerRepo` is the
+// worker + worker_status accessor; `autoscaleEvents` is the autoscaler
+// event log (issue #85).
+func NewClusterService(
+	workerRepo ClusterWorkerRepoInterface,
+	autoscaleEvents *repository.AutoscaleRepository,
+) *ClusterService {
+	return &ClusterService{workerRepo: workerRepo, autoscaleEvents: autoscaleEvents}
 }
 
 // regionAccum collects per-region aggregates during the worker loop so we
@@ -135,4 +158,41 @@ func (s *ClusterService) List(ctx context.Context) (*ClusterView, error) {
 		}
 	}
 	return view, nil
+}
+
+// RecentEvents returns the most-recent `autoscale_events` rows,
+// newest first. Powers GET /api/v1/admin/cluster/events (issue #85).
+//
+// `region` is optional: empty string matches all regions; a non-empty
+// value scopes the result to one region. `limit` is clamped to [1, 500]
+// before the DB query so a typo'd query string can't materialize the
+// whole table.
+//
+// `RecentEvents` was deliberately not folded into `List` — the two
+// endpoints serve different operator questions ("what does the fleet
+// look like RIGHT NOW?" vs. "why did the fleet size change?"). Keeping
+// them separate also means a hot `cluster status` loop (e.g., a
+// dashboard polling every 5s) doesn't drag the autoscale_events
+// table along with it.
+func (s *ClusterService) RecentEvents(ctx context.Context, region string, limit int) (*AutoscaleEventList, error) {
+	const maxLimit = 500
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	items, err := s.autoscaleEvents.ListRecent(ctx, region, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listing autoscale events: %w", err)
+	}
+	out := &AutoscaleEventList{
+		Items: items,
+		Limit: limit,
+	}
+	if region != "" {
+		r := region
+		out.Region = &r
+	}
+	return out, nil
 }

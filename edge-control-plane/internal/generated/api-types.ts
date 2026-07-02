@@ -607,6 +607,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/cluster/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent cluster autoscaler events (admin only)
+         * @description Returns the most-recent autoscale_events rows, newest first.
+         */
+        get: operations["listAutoscaleEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/traffic/{tenantID}/{appName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Internal traffic split lookup */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                    appName: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Traffic split data */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/domains": {
         parameters: {
             query?: never;
@@ -1241,17 +1298,45 @@ export interface components {
         };
         /** @description Per-region snapshot of cluster state. */
         ClusterView: {
-            regions?: components["schemas"]["RegionView"][];
+            /**
+             * Format: date-time
+             * @description Server-side timestamp when this view was assembled.
+             */
+            generated_at?: string;
+            regions?: {
+                [key: string]: components["schemas"]["RegionView"];
+            };
         };
         RegionView: {
-            /** @example us-east1 */
-            name?: string;
             workers?: components["schemas"]["WorkerStatus"][];
+            /** @description Mean number of apps hosted per worker in this region. */
+            apps_per_worker_avg?: number;
         };
         WorkerStatus: {
             /** @example w_us-east1_01 */
             worker_id?: string;
-            apps?: components["schemas"]["AppStatus"][];
+            /** @example us-east1 */
+            region?: string;
+            /**
+             * @description Worker public IP. Omitted when not reported.
+             * @example 203.0.113.42
+             */
+            ip?: string;
+            /**
+             * Format: date-time
+             * @description Last heartbeat timestamp.
+             */
+            last_seen?: string;
+            /**
+             * @description Number of apps the worker reported on its latest heartbeat.
+             * @example 12
+             */
+            app_count?: number;
+            /**
+             * @description Worker-allocated memory budget.
+             * @example 4096
+             */
+            memory_mb?: number;
         };
         AppStatus: {
             /** @example web-app */
@@ -1259,9 +1344,31 @@ export interface components {
             /**
              * Format: int64
              * @description Total requests handled by this app on this worker.
-             * @example 9821
              */
             request_count?: number;
+        };
+        /** @description One row in the autoscale_events table. */
+        AutoscaleEvent: {
+            /** Format: int64 */
+            id?: number;
+            /** Format: date-time */
+            created_at?: string;
+            region?: string;
+            /** @enum {string} */
+            action?: "scale_up" | "scale_down" | "noop";
+            from_count?: number;
+            to_count?: number;
+            reason?: string;
+            provider_kind?: string;
+            succeeded?: boolean;
+            error_message?: string | null;
+        };
+        /** @description Envelope returned by GET /api/v1/admin/cluster/events. */
+        AutoscaleEventList: {
+            items?: components["schemas"]["AutoscaleEvent"][];
+            limit?: number;
+            /** @example 9821 */
+            region?: string | null;
         };
         /**
          * @description A tenant-owned FQDN bound to a specific app. The status field is
@@ -2529,6 +2636,34 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterView"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listAutoscaleEvents: {
+        parameters: {
+            query?: {
+                /** @description Restrict to a single region. Omit for all regions. */
+                region?: string;
+                /** @description Maximum rows to return. Clamped to [1, 500]. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Event list, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoscaleEventList"];
                 };
             };
             401: components["responses"]["Unauthorized"];

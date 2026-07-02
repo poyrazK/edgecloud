@@ -204,6 +204,14 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
 		// from the same worker may carry different tenants (the
 		// worker hosts multiple tenants in multi-tenant mode).
 		TenantID string `json:"tenant_id"`
+		// ClusterHeadroom carries capacity info from issue #85.
+		// Preserved as json.RawMessage so the autoscaler can decode
+		// it on its own (autoscaler is wired in PR #3); we just
+		// persist the apps blob today. A pre-#85 worker simply
+		// doesn't have the field, so this stays nil — backward-compat
+		// is automatic because Go's json.Unmarshal ignores unknown
+		// fields by default.
+		ClusterHeadroom json.RawMessage `json:"cluster_headroom"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
 		return

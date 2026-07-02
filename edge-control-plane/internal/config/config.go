@@ -17,6 +17,11 @@ type Config struct {
 	JWT       JWTConfig       `yaml:"jwt"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Migration MigrationConfig `yaml:"migration"`
+	// Autoscale configures the cluster autoscaler (issue #85).
+	// Disabled by default — operators flip `enabled: true` once the
+	// fleet has multiple workers and the cloud-provider integration
+	// (NoopCloudProvider today; Hetzner in a follow-up) is ready.
+	Autoscale AutoscaleConfig `yaml:"autoscale"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
 	// multi-region — preserves today's "publish one TaskMessage to a
@@ -110,6 +115,20 @@ type RateLimitConfig struct {
 	IPRate int `yaml:"ip_rate"`
 	// IPBurst is the maximum burst of requests per client IP.
 	IPBurst int `yaml:"ip_burst"`
+}
+
+// AutoscaleConfig configures the cluster autoscaler (issue #85).
+// Disabled by default — operators flip enabled: true once the
+// fleet has multiple workers and a cloud-provider is wired in.
+type AutoscaleConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	MinWorkers         int    `yaml:"min_workers"`
+	MaxWorkers         int    `yaml:"max_workers"`
+	TargetHeadroomPct  int    `yaml:"target_headroom_pct"`
+	ScaleUpCooldownS   int    `yaml:"scale_up_cooldown_s"`
+	ScaleDownCooldownS int    `yaml:"scale_down_cooldown_s"`
+	DecisionIntervalS  int    `yaml:"decision_interval_s"`
+	ProviderKind       string `yaml:"provider_kind"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -250,6 +269,60 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("RATE_LIMIT_IP_BURST must be a valid integer: %w", err)
 		}
 		cfg.RateLimit.IPBurst = burst
+	}
+
+	// Override with autoscale config env vars (issue #85)
+	if v := os.Getenv("AUTOSCALE_ENABLED"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_ENABLED must be a valid boolean: %w", err)
+		}
+		cfg.Autoscale.Enabled = enabled
+	}
+	if v := os.Getenv("AUTOSCALE_MIN_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_MIN_WORKERS must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.MinWorkers = n
+	}
+	if v := os.Getenv("AUTOSCALE_MAX_WORKERS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_MAX_WORKERS must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.MaxWorkers = n
+	}
+	if v := os.Getenv("AUTOSCALE_TARGET_HEADROOM_PCT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_TARGET_HEADROOM_PCT must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.TargetHeadroomPct = n
+	}
+	if v := os.Getenv("AUTOSCALE_SCALE_UP_COOLDOWN_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_SCALE_UP_COOLDOWN_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.ScaleUpCooldownS = n
+	}
+	if v := os.Getenv("AUTOSCALE_SCALE_DOWN_COOLDOWN_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_SCALE_DOWN_COOLDOWN_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.ScaleDownCooldownS = n
+	}
+	if v := os.Getenv("AUTOSCALE_DECISION_INTERVAL_S"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("AUTOSCALE_DECISION_INTERVAL_S must be a valid integer: %w", err)
+		}
+		cfg.Autoscale.DecisionIntervalS = n
+	}
+	if v := os.Getenv("AUTOSCALE_PROVIDER_KIND"); v != "" {
+		cfg.Autoscale.ProviderKind = v
 	}
 
 	// Override with migration config env vars

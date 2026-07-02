@@ -229,3 +229,59 @@ func TestMockPublisher_DoesNotMutateCallerStruct(t *testing.T) {
 		t.Errorf("mock mutated caller struct: type=%q, want task_update", msg.Type)
 	}
 }
+
+// TestHeartbeatMessage_ClusterHeadroomRoundTrip pins the wire shape used
+// by the autoscaler (issue #85). AppSlots must serialize, must round-trip,
+// and CPUPct/MemPct must be omitted when nil.
+func TestHeartbeatMessage_ClusterHeadroomRoundTrip(t *testing.T) {
+	msg := &HeartbeatMessage{
+		Type:      "heartbeat",
+		Timestamp: time.Now(),
+		WorkerID:  "w_fra_test",
+		Region:    "fra",
+		Apps:      map[string]domain.AppStatus{},
+		ClusterHeadroom: &ClusterHeadroom{
+			AppSlots: 42,
+		},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"cluster_headroom":{"app_slots":42}`) {
+		t.Errorf("cluster_headroom.app_slots must appear on the wire; got: %s", data)
+	}
+	if strings.Contains(string(data), "cpu_pct") || strings.Contains(string(data), "mem_pct") {
+		t.Errorf("nil CPUPct/MemPct must be omitted; got: %s", data)
+	}
+	var decoded struct {
+		ClusterHeadroom ClusterHeadroom `json:"cluster_headroom"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.ClusterHeadroom.AppSlots != 42 {
+		t.Errorf("AppSlots = %d, want 42", decoded.ClusterHeadroom.AppSlots)
+	}
+}
+
+// TestHeartbeatMessage_NoClusterHeadroom pins the pre-#85 wire shape.
+// A heartbeat without the field must still serialize cleanly. This is
+// the regression that would break pre-#85 workers if `omitempty` were
+// forgotten on the new field.
+func TestHeartbeatMessage_NoClusterHeadroom(t *testing.T) {
+	msg := &HeartbeatMessage{
+		Type:      "heartbeat",
+		Timestamp: time.Now(),
+		WorkerID:  "w_legacy",
+		Region:    "fra",
+		Apps:      map[string]domain.AppStatus{},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "cluster_headroom") {
+		t.Errorf("nil ClusterHeadroom must be omitted; got: %s", data)
+	}
+}
