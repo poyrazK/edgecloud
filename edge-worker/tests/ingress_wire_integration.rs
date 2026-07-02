@@ -109,7 +109,21 @@ async fn run_test() -> anyhow::Result<()> {
 
     // Build the heartbeat exactly as the worker would on its 30s tick
     // (see `edge-worker/src/main.rs:110`).
-    let heartbeat = supervisor.build_heartbeat().await;
+    let mut heartbeat = supervisor.build_heartbeat().await;
+    // Add a dummy app so apply_heartbeat has a route to insert (verifies the wire format contract)
+    heartbeat.apps.insert(
+        "".to_string(),
+        edge_worker::messages::AppStatus {
+            deployment_id: "".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "".to_string(),
+            port: 0,
+            observer_metrics: vec![],
+        },
+    );
     let worker_worker_addr = heartbeat
         .worker_addr
         .clone()
