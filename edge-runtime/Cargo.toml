@@ -83,9 +83,24 @@ process = []
 # (which still has the v0.1 API). These lints allow the v0.1 → v0.2
 # transition; tracked in #211.
 [package.metadata.cargo-semver-checks.lints]
-struct_missing = "allow"
-trait_missing = "allow"
-struct_pub_field_missing = "allow"
+# v0.1 → v0.2: the runtime's public API surface changes wholesale (the
+# custom HTTP/networking/streaming stack is replaced with wasi:http +
+# wasi:sockets bindings). Every "removal" / "rename" / "field added"
+# lint below fires because of that transition, not regressions. None
+# of this is meant to round-trip through a v0.1 → v0.1 patch bump;
+# this is the v0.2 cut. Re-evaluate after the wasmtime bump in #211.
+auto_trait_impl_removed = "allow"
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_missing = "allow"
 enum_variant_missing = "allow"
+feature_missing = "allow"
 function_missing = "allow"
+inherent_method_missing = "allow"
 method_missing = "allow"
+module_missing = "allow"
+pub_module_level_const_missing = "allow"
+struct_missing = "allow"
+struct_pub_field_missing = "allow"
+trait_missing = "allow"
+variant_missing = "allow"
