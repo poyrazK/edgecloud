@@ -361,4 +361,5 @@ jobs:
       - name: Run integration tests
         run: |
           cargo nextest run --workspace \
+            -j 2 \
             -E 'binary(integration_tests) | binary(ingress_wire_integration) | binary(integration)'

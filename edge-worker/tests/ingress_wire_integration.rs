@@ -115,6 +115,12 @@ async fn run_test() -> anyhow::Result<()> {
         .clone()
         .expect("worker_addr must be set on worker-built heartbeat");
 
+    // Subscribe from a separate async-nats client (simulating the ingress
+    // process) and pull the raw bytes.
+    let client = async_nats::connect(&nats_url).await?;
+    let subject = format!("edgecloud.heartbeats.{}", region);
+    let mut sub = client.subscribe(subject).await?;
+
     // Publish via the worker's own NatsClient — same code path the
     // heartbeat loop in `main.rs` uses — so we're testing the production
     // publisher, not a parallel hand-rolled one.
@@ -124,11 +130,6 @@ async fn run_test() -> anyhow::Result<()> {
         .await
         .context("publish heartbeat via NatsClient")?;
 
-    // Subscribe from a separate async-nats client (simulating the ingress
-    // process) and pull the raw bytes.
-    let client = async_nats::connect(&nats_url).await?;
-    let subject = format!("edgecloud.heartbeats.{}", region);
-    let mut sub = client.subscribe(subject).await?;
     let msg = timeout(Duration::from_secs(5), sub.next())
         .await
         .context("subscription timed out — heartbeat was not published")?
