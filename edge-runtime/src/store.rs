@@ -1,54 +1,49 @@
 //! wasmtime Store creation.
 
 use crate::limits::new_memory_limits;
-use std::ptr::NonNull;
 use wasmtime::{Engine, ResourceLimiter, Store, StoreLimits};
 
-/// Create a wasmtime Store.
+/// Types that embed a [`StoreLimits`] for wasmtime resource accounting.
 ///
-/// Memory limits are enforced via wasmtime's `ResourceLimiter` mechanism.
-pub fn create_store<T>(engine: &Engine, max_memory_mb: u64, data: T) -> Store<T> {
-    let mut store = Store::new(engine, data);
-    if max_memory_mb == 0 {
-        return store;
+/// Implement this on the Store data type `T` so that [`create_store`] can
+/// wire resource limits via a properly lifetime-bounded closure — no
+/// `'static` extension, no heap allocation beyond the [`Store`] itself,
+/// no unsafe code.
+pub trait HasStoreLimits {
+    /// Called by [`create_store`] before the wasmtime [`Store`] is
+    /// constructed. Implementations store `limits` in a field.
+    fn set_store_limits(&mut self, limits: StoreLimits);
+
+    /// Returns a mutable reference to the embedded [`ResourceLimiter`].
+    /// Called by wasmtime's limiter callback on every resource check.
+    /// The lifetime is tied to `&mut self`, so no `'static` extension
+    /// is needed.
+    ///
+    /// # Panics
+    /// May panic if called before [`set_store_limits`].
+    fn store_limits_mut(&mut self) -> &mut dyn ResourceLimiter;
+}
+
+/// Create a wasmtime [`Store`] with optional memory limits.
+///
+/// When `max_memory_mb` is `0` no limiter is installed and the guest can
+/// grow memory without bound. For any non-zero value the limits are
+/// embedded in `data` via [`HasStoreLimits`] and exposed to wasmtime's
+/// resource-limiter callback with a properly lifetime-bounded closure.
+pub fn create_store<T: HasStoreLimits>(
+    engine: &Engine,
+    max_memory_mb: u64,
+    mut data: T,
+) -> Store<T> {
+    if max_memory_mb > 0 {
+        data.set_store_limits(new_memory_limits(max_memory_mb));
     }
-
-    let limits = new_memory_limits(max_memory_mb);
-    let mut limiter = StaticLimiter::new(limits);
-    store.limiter(move |_data| limiter.limiter());
-
+    let mut store = Store::new(engine, data);
+    if max_memory_mb > 0 {
+        store.limiter(|data| data.store_limits_mut());
+    }
     store
 }
-
-/// Holds a `StoreLimits` with a `'static` lifetime by leaking it,
-/// then hands out `&'static mut dyn ResourceLimiter` to wasmtime.
-struct StaticLimiter {
-    ptr: NonNull<StoreLimits>,
-}
-
-impl StaticLimiter {
-    fn new(limits: StoreLimits) -> Self {
-        let leaked = Box::leak(Box::new(limits));
-        Self {
-            ptr: NonNull::from(leaked),
-        }
-    }
-
-    fn limiter(&mut self) -> &'static mut dyn ResourceLimiter {
-        // SAFETY: `ptr` points to a uniquely-owned, never-freed `Box::leak`
-        // allocation. `&mut self` guarantees this method cannot be called
-        // concurrently or re-entrantly, so at most one `&'static mut` reference
-        // to the underlying `StoreLimits` exists at a time — no aliasing.
-        unsafe { self.ptr.as_mut() as &'static mut dyn ResourceLimiter }
-    }
-}
-
-// SAFETY: StaticLimiter is captured by move into an FnMut closure owned by a
-// single wasmtime Store. `Store` is not Send; the limiter is only ever accessed
-// from the thread that drives the store. NonNull<StoreLimits> is not auto-Send/
-// Sync (raw pointer), so we assert it manually.
-unsafe impl Send for StaticLimiter {}
-unsafe impl Sync for StaticLimiter {}
 
 #[cfg(test)]
 mod tests {

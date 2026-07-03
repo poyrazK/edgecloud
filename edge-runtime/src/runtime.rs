@@ -46,6 +46,7 @@ use crate::edge_runtime_long::edge::cloud::{
     time::Host as LongTimeHost,
 };
 use crate::egress::EgressPolicy;
+use crate::store::HasStoreLimits;
 use crate::interfaces::{cache, kv_store, observe, process, scheduling, time};
 use crate::metering::RequestMeter;
 use parking_lot::RwLock;
@@ -54,6 +55,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
+use wasmtime::{ResourceLimiter, StoreLimits};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
@@ -109,6 +111,12 @@ pub struct RuntimeState {
     /// `process.exit`. Allows `execute_app` to distinguish a clean guest
     /// exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
+
+    /// Memory limits embedded here so `create_store` can wire wasmtime's
+    /// resource-limiter callback with a proper lifetime-bounded closure
+    /// rather than a `Box::leak`-based `'static` reference. Set by
+    /// `create_store` before the `Store` is constructed; `None` until then.
+    store_limits: Option<StoreLimits>,
 }
 
 impl RuntimeState {
@@ -140,6 +148,7 @@ impl RuntimeState {
             tenant_id: String::new(),
             egress: Arc::new(EgressPolicy::allow_all()),
             exit_code,
+            store_limits: None,
         }
     }
 
@@ -198,6 +207,7 @@ impl RuntimeState {
             tenant_id,
             egress,
             exit_code,
+            store_limits: None,
         }
     }
 
@@ -250,6 +260,7 @@ impl Clone for RuntimeState {
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
             exit_code: Arc::new(AtomicU32::new(0)),
+            store_limits: None, // set fresh by create_store for each new Store
         }
     }
 }
@@ -323,6 +334,18 @@ impl WasiHttpView for RuntimeState {
     // EgressPolicy methods that we don't need for v0.2 — every header a
     // tenant wants blocked is already enforced by the URL-level
     // `EgressPolicy::check` above.
+}
+
+impl HasStoreLimits for RuntimeState {
+    fn set_store_limits(&mut self, limits: StoreLimits) {
+        self.store_limits = Some(limits);
+    }
+
+    fn store_limits_mut(&mut self) -> &mut dyn ResourceLimiter {
+        self.store_limits
+            .as_mut()
+            .expect("store_limits not set — create_store must call set_store_limits first")
+    }
 }
 
 #[cfg(test)]
