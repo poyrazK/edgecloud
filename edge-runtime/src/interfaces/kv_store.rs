@@ -665,4 +665,131 @@ mod tests {
         // Safe IDs return Ok (either Ok(None) when env var absent, or Ok(Some)).
         assert!(KvStore::from_env_for_tenant("t_abc123").is_ok());
     }
+
+    // ── Persistence error paths ────────────────────────────────────────
+
+    #[test]
+    fn persistence_load_corrupted_json() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("store.json"), "{invalid json}").unwrap();
+        assert!(
+            KvStore::with_persistence(dir.path()).is_err(),
+            "corrupted JSON should return Err"
+        );
+    }
+
+    #[test]
+    fn persistence_load_corrupted_base64() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let data = r#"{"version":1,"keys":[{"key":"k","value":"not-base64!!","expires_at":null}]}"#;
+        std::fs::write(dir.path().join("store.json"), data).unwrap();
+        let err = KvStore::with_persistence(dir.path()).err().unwrap();
+        assert!(matches!(err, KvStoreError::Corrupted(e) if e.contains("base64")));
+    }
+
+    #[test]
+    fn persistence_load_non_existent_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = KvStore::with_persistence(&dir.path().join("nonexistent"))
+            .expect("should return Ok with empty store");
+        assert!(store.list_keys("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn persistence_flush_if_persistent_no_runtime() {
+        // When no tokio runtime is active, flush_if_persistent should
+        // silently skip instead of panicking. Verify the file is NOT written.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = KvStore::with_persistence(dir.path()).expect("persistent store");
+        store.set("k".into(), b"v".to_vec(), None).unwrap();
+
+        let store_file = dir.path().join("store.json");
+        assert!(
+            !store_file.exists(),
+            "flush should skip without a tokio runtime"
+        );
+    }
+
+    #[test]
+    fn persistence_flush_if_persistent_no_store() {
+        // KvStore::new() has no persistence — flush_if_persistent should no-op.
+        let store = KvStore::new();
+        store.set("k".into(), b"v".to_vec(), None).unwrap();
+        assert_eq!(store.get("k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn persistence_from_env_sets_store_path() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let result = tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_KV_STORE_PATH", Some(dir.path()), || {
+                let store = KvStore::from_env()
+                    .expect("from_env ok")
+                    .expect("should be Some with env var set");
+                store.set("k".into(), b"persistent".to_vec(), None).unwrap();
+                // File should now exist on disk.
+                assert!(dir.path().join("store.json").exists());
+                // Reload and verify.
+                let reloaded = KvStore::with_persistence(dir.path()).expect("reload");
+                assert_eq!(reloaded.get("k").unwrap(), Some(b"persistent".to_vec()));
+            });
+        })
+        .await;
+
+        result.expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_ttl_expiry_on_reload() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let past = 100_000_000u64; // Year ~1973 — definitely expired.
+
+        // Write a store file directly with an expired entry.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let expired_entry = serde_json::json!({
+            "version": 1,
+            "keys": [{
+                "key": "expired-key",
+                "value": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"dead"),
+                "expires_at": past
+            }]
+        });
+        std::fs::write(dir.path().join("store.json"), expired_entry.to_string()).unwrap();
+
+        tokio::task::spawn_blocking({
+            let d = dir.path().to_owned();
+            move || {
+                let store = KvStore::with_persistence(&d).expect("load with expired entry");
+                assert!(
+                    !store.exists("expired-key"),
+                    "expired entry must not survive reload"
+                );
+                assert!(store.list_keys("").unwrap().is_empty());
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_clear_flushes_empty() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        tokio::task::spawn_blocking({
+            let d = dir.path().to_owned();
+            move || {
+                let store = KvStore::with_persistence(&d).expect("persistent store");
+                store.set("k".into(), b"v".to_vec(), None).unwrap();
+                store.clear();
+                // Reload from disk — should be empty.
+                let reloaded = KvStore::with_persistence(&d).expect("reload after clear");
+                assert!(reloaded.list_keys("").unwrap().is_empty());
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
 }

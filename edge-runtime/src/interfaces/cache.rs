@@ -660,4 +660,123 @@ mod tests {
         assert_eq!(cache.get("b").unwrap(), Some(b"2".to_vec()));
         assert_eq!(cache.get("c").unwrap(), Some(b"3".to_vec()));
     }
+
+    // ── Persistence error paths ────────────────────────────────────────
+
+    #[test]
+    fn persistence_load_corrupted_json() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(CACHE_FILENAME), "{invalid json}").unwrap();
+        assert!(
+            Cache::with_persistence(dir.path(), 100).is_err(),
+            "corrupted JSON should return Err"
+        );
+    }
+
+    #[test]
+    fn persistence_load_corrupted_base64() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let data =
+            r#"{"version":1,"entries":[{"key":"k","value":"not-base64!!","expires_at":null}]}"#;
+        std::fs::write(dir.path().join(CACHE_FILENAME), data).unwrap();
+        let err = Cache::with_persistence(dir.path(), 100).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("base64"), "expected base64 error, got {msg}");
+    }
+
+    #[test]
+    fn persistence_load_non_existent_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cache = Cache::with_persistence(&dir.path().join("nonexistent"), 100)
+            .expect("should return Ok with empty cache");
+        assert_eq!(cache.size().unwrap(), 0);
+    }
+
+    #[test]
+    fn persistence_flush_if_persistent_no_runtime() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cache = Cache::with_persistence(dir.path(), 100).expect("persistent cache");
+        cache.set("k".into(), b"v".to_vec(), None).unwrap();
+
+        let cache_file = dir.path().join(CACHE_FILENAME);
+        assert!(
+            !cache_file.exists(),
+            "flush should skip without a tokio runtime"
+        );
+    }
+
+    #[test]
+    fn persistence_flush_if_persistent_no_store() {
+        let cache = Cache::new(100);
+        cache.set("k".into(), b"v".to_vec(), None).unwrap();
+        assert_eq!(cache.get("k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn persistence_from_env_sets_cache_path() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_CACHE_PATH", Some(dir.path()), || {
+                let cache = Cache::from_env(100)
+                    .expect("from_env ok")
+                    .expect("should be Some with env var set");
+                cache.set("k".into(), b"persistent".to_vec(), None).unwrap();
+                assert!(dir.path().join(CACHE_FILENAME).exists());
+            });
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_ttl_expiry_on_reload() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let past = 100_000_000u64;
+
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let expired_entry = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "key": "expired-key",
+                "value": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"dead"),
+                "expires_at": past
+            }]
+        });
+        std::fs::write(dir.path().join(CACHE_FILENAME), expired_entry.to_string()).unwrap();
+
+        tokio::task::spawn_blocking({
+            let d = dir.path().to_owned();
+            move || {
+                let cache = Cache::with_persistence(&d, 100).expect("load with expired entry");
+                assert!(
+                    !cache.exists("expired-key"),
+                    "expired entry must not survive reload"
+                );
+                assert_eq!(cache.size().unwrap(), 0);
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_clear_flushes_empty() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        tokio::task::spawn_blocking({
+            let d = dir.path().to_owned();
+            move || {
+                let cache = Cache::with_persistence(&d, 100).expect("persistent cache");
+                cache.set("k".into(), b"v".to_vec(), None).unwrap();
+                cache.clear().unwrap();
+                let reloaded = Cache::with_persistence(&d, 100).expect("reload after clear");
+                assert_eq!(reloaded.size().unwrap(), 0);
+            }
+        })
+        .await
+        .expect("spawn_blocking panicked");
+    }
 }

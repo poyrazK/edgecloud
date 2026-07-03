@@ -60,6 +60,7 @@ wat = "1"
 wit-parser = "0.217"
 semver = "1"
 tempfile = "3"
+temp-env = "0.3"
 
 [features]
 # Default features gate only modules that still exist in
