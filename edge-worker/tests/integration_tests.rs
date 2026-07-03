@@ -99,8 +99,6 @@ fn test_config(
     }
 }
 
-/// Timeout for subscribing to heartbeats.
-const HEARTBEAT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to wait for the full test harness to start (container + NATS connection).
 const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -191,19 +189,6 @@ impl TestHarness {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
-async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<HeartbeatMessage> {
-    let client = async_nats::connect(nats_url).await?;
-    let subject = format!("edgecloud.heartbeats.{}", region);
-    let mut sub = client.subscribe(subject).await?;
-    let msg = timeout(HEARTBEAT_SUBSCRIBE_TIMEOUT, sub.next())
-        .await
-        .context("heartbeat subscription timed out")?
-        .context("no heartbeat message received")?;
-    let heartbeat =
-        serde_json::from_slice::<HeartbeatMessage>(&msg.payload).context("parse heartbeat")?;
-    Ok(heartbeat)
-}
 
 /// Helper: wait for an app to appear in state with Running status.
 ///
