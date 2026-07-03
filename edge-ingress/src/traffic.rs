@@ -192,6 +192,96 @@ mod tests {
         let cache = TrafficSplitCache::default();
         assert!(cache.known_apps().is_empty());
     }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_weights() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "splits": [
+                    {"deployment_id": "d1", "weight": 80},
+                    {"deployment_id": "d2", "weight": 20}
+                ]}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "app1", None).await;
+
+        match outcome {
+            FetchOutcome::Ok(weights) => {
+                assert_eq!(weights.get("d1"), Some(&80));
+                assert_eq!(weights.get("d2"), Some(&20));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_none_on_404() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/traffic/t1/no-such-app",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "no-such-app", None).await;
+
+        match outcome {
+            FetchOutcome::Transient(reason) => {
+                assert!(
+                    reason.contains("404"),
+                    "expected 404 in transient reason, got {reason}"
+                );
+            }
+            other => panic!("expected Transient(404), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_unauthorized_on_401() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "app1", None).await;
+
+        assert!(matches!(outcome, FetchOutcome::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_sends_internal_token_header() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .and(wiremock::matchers::header("X-Internal-Token", "s3cret"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "splits": [] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome =
+            fetch_app_split(&http, &mock_server.uri(), "t1", "app1", Some("s3cret")).await;
+
+        assert!(matches!(outcome, FetchOutcome::Ok(_)));
+    }
 }
 
 /// Outcome of a single traffic-split fetch. The spawn_fetcher loop uses

@@ -217,75 +217,67 @@ mod tests {
     use edge_worker::messages::AppStatus;
     use std::collections::HashMap;
 
-    /// A heartbeat with `worker_addr: None` must NOT mutate the routing
-    /// table, and `apply_heartbeat` must return `false` so the caller skips
-    /// the Caddy-reload notify. This is the "no addr → skip" contract
-    /// pinned at `heartbeats.rs:84` — without this test, a future refactor
-    /// (e.g. switching to `unwrap_or("0.0.0.0")` to "make tests pass") would
-    /// silently route traffic to the wrong upstream. The defensive check
-    /// exists precisely to make that failure loud at runtime, not at
-    /// traffic-time.
-    #[tokio::test]
-    async fn handle_one_skips_when_worker_addr_is_none() {
-        let table = Arc::new(RoutingTable::new());
-        let mut apps = HashMap::new();
-        apps.insert(
-            "api".to_string(),
-            AppStatus {
-                deployment_id: "d_test".to_string(),
-                status: "running".to_string(),
-                exit_code: None,
-                request_count: 0,
-                outbound_bytes: 0,
-                tenant_id: "t_a".to_string(),
-                port: 8081,
-                observer_metrics: vec![],
-            },
-        );
-        let hb = HeartbeatMessage {
+    /// Helper to build a minimal AppStatus with the given tenant, status,
+    /// and port. All other fields get sensible defaults.
+    fn app_status(tenant_id: &str, status: &str, port: u16) -> AppStatus {
+        AppStatus {
+            deployment_id: "d_test".to_string(),
+            status: status.to_string(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: tenant_id.to_string(),
+            port,
+            observer_metrics: vec![],
+        }
+    }
+
+    /// Helper to build a HeartbeatMessage with a worker_addr and apps.
+    fn hb_with_addr(worker_addr: &str, apps: HashMap<String, AppStatus>) -> HeartbeatMessage {
+        HeartbeatMessage {
+            msg_type: "heartbeat".to_string(),
+            timestamp: "2026-06-19T00:00:00Z".to_string(),
+            worker_id: "w_fra_abc".to_string(),
+            region: "fra".to_string(),
+            worker_addr: Some(worker_addr.to_string()),
+            apps,
+        }
+    }
+
+    fn hb_no_addr(apps: HashMap<String, AppStatus>) -> HeartbeatMessage {
+        HeartbeatMessage {
             msg_type: "heartbeat".to_string(),
             timestamp: "2026-06-19T00:00:00Z".to_string(),
             worker_id: "w_fra_abc".to_string(),
             region: "fra".to_string(),
             worker_addr: None,
             apps,
-        };
-
-        let changed = apply_heartbeat(&table, &hb).await;
-        assert!(
-            !changed,
-            "apply_heartbeat must return false when worker_addr is None"
-        );
-        assert_eq!(
-            table.len().await,
-            0,
-            "no route should be inserted when worker_addr is None"
-        );
+        }
     }
 
-    /// Same expectation for an empty-string `worker_addr`. A misconfigured
-    /// worker that boots with `EDGE_WORKER_ADDR=""` (or an old worker
-    /// pre-dating #70 that somehow makes it past serde) must also be
-    /// rejected — otherwise we'd render `dial: ":8081"` to Caddy, which
-    /// fails opaquely at connection time instead of at the heartbeat
-    /// boundary where we have logs and metrics.
+    // ── Existing tests ────────────────────────────────────────────────
+
+    /// A heartbeat with `worker_addr: None` must NOT mutate the routing
+    /// table, and `apply_heartbeat` must return `false` so the caller skips
+    /// the Caddy-reload notify.
+    #[tokio::test]
+    async fn handle_one_skips_when_worker_addr_is_none() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
+        let hb = hb_no_addr(apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(!changed);
+        assert_eq!(table.len().await, 0);
+    }
+
+    /// Same expectation for an empty-string `worker_addr`.
     #[tokio::test]
     async fn handle_one_skips_when_worker_addr_is_empty_string() {
         let table = Arc::new(RoutingTable::new());
         let mut apps = HashMap::new();
-        apps.insert(
-            "api".to_string(),
-            AppStatus {
-                deployment_id: "d_test".to_string(),
-                status: "running".to_string(),
-                exit_code: None,
-                request_count: 0,
-                outbound_bytes: 0,
-                tenant_id: "t_a".to_string(),
-                port: 8081,
-                observer_metrics: vec![],
-            },
-        );
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         let hb = HeartbeatMessage {
             msg_type: "heartbeat".to_string(),
             timestamp: "2026-06-19T00:00:00Z".to_string(),
@@ -296,53 +288,21 @@ mod tests {
         };
 
         let changed = apply_heartbeat(&table, &hb).await;
-        assert!(
-            !changed,
-            "apply_heartbeat must return false when worker_addr is empty"
-        );
-        assert_eq!(
-            table.len().await,
-            0,
-            "no route should be inserted when worker_addr is empty"
-        );
+        assert!(!changed);
+        assert_eq!(table.len().await, 0);
     }
 
-    /// Happy-path companion: with a valid `worker_addr`, `apply_heartbeat`
-    /// inserts one route per app and returns `true`. Without this we only
-    /// test the negative path and could regress the positive one unnoticed
-    /// (e.g. a refactor that swaps the empty-check for a hard return before
-    /// any upsert).
+    /// Happy-path: with a valid `worker_addr`, `apply_heartbeat` inserts
+    /// one route per app and returns `true`.
     #[tokio::test]
     async fn handle_one_inserts_route_when_worker_addr_present() {
         let table = Arc::new(RoutingTable::new());
         let mut apps = HashMap::new();
-        apps.insert(
-            "api".to_string(),
-            AppStatus {
-                deployment_id: "d_test".to_string(),
-                status: "running".to_string(),
-                exit_code: None,
-                request_count: 0,
-                outbound_bytes: 0,
-                tenant_id: "t_a".to_string(),
-                port: 8081,
-                observer_metrics: vec![],
-            },
-        );
-        let hb = HeartbeatMessage {
-            msg_type: "heartbeat".to_string(),
-            timestamp: "2026-06-19T00:00:00Z".to_string(),
-            worker_id: "w_fra_abc".to_string(),
-            region: "fra".to_string(),
-            worker_addr: Some("203.0.113.10".to_string()),
-            apps,
-        };
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
+        let hb = hb_with_addr("203.0.113.10", apps);
 
         let changed = apply_heartbeat(&table, &hb).await;
-        assert!(
-            changed,
-            "handle_one must return true when at least one route is upserted"
-        );
+        assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].worker_addr, "203.0.113.10");
@@ -351,5 +311,80 @@ mod tests {
         assert_eq!(snap[0].app_name, "api");
         assert_eq!(snap[0].deployment_id, None);
         assert_eq!(snap[0].weight, 100);
+    }
+
+    // ── New apply_heartbeat tests ─────────────────────────────────────
+
+    /// Key with `:` separator sets the deployment_id (canary support).
+    #[tokio::test]
+    async fn apply_heartbeat_with_canary_key() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api:v2".to_string(), app_status("t_a", "running", 8081));
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].app_name, "api");
+        assert_eq!(snap[0].deployment_id, Some("v2".to_string()));
+    }
+
+    /// Non-"running" status removes the entry.
+    #[tokio::test]
+    async fn apply_heartbeat_with_non_running_status() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "crashed", 8081));
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        // The "crashed" app causes an upsert with that status, which
+        // the routing table interprets as "remove".
+        assert_eq!(table.len().await, 0);
+    }
+
+    /// Multiple apps in a single heartbeat — both upserted.
+    #[tokio::test]
+    async fn apply_heartbeat_with_multiple_apps() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
+        apps.insert("worker".to_string(), app_status("t_a", "running", 8082));
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 2);
+    }
+
+    /// Empty apps map — returns false, no mutation.
+    #[tokio::test]
+    async fn apply_heartbeat_with_empty_apps() {
+        let table = Arc::new(RoutingTable::new());
+        let hb = hb_with_addr("203.0.113.10", HashMap::new());
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(!changed);
+        assert_eq!(table.len().await, 0);
+    }
+
+    /// Mixed statuses: one running, one crashed. Only running survives.
+    #[tokio::test]
+    async fn apply_heartbeat_with_mixed_statuses() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
+        apps.insert("cron".to_string(), app_status("t_a", "crashed", 8082));
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].app_name, "api");
     }
 }
