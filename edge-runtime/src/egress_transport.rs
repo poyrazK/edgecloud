@@ -299,7 +299,7 @@ pub(crate) async fn send_request_handler(
         .build()
         .expect("comes from valid request");
 
-    // 7. Send the request.
+// 7. Send the request.
     let response = timeout(first_byte_timeout, sender.send_request(request))
         .await
         .map_err(|_| ErrorCode::ConnectionReadTimeout)?
