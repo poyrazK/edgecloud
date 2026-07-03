@@ -307,6 +307,38 @@ pub struct AppWorkerStatus {
     pub exit_code: Option<i32>,
 }
 
+/// An app as returned by `GET /api/v1/apps` and
+/// `GET /api/v1/apps/{appName}`. Mirrors the Go control-plane
+/// `domain.App` struct field-for-field. The Go struct has no JSON
+/// tags so serde must match the literal PascalCase field names.
+///
+/// Note: `rename_all = "PascalCase"` would map `id` → `Id` and
+/// `tenant_id` → `TenantId`, but the Go struct emits `ID` and
+/// `TenantID` — hence the individual renames.
+#[derive(Debug, Deserialize)]
+pub struct App {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "TenantID")]
+    pub tenant_id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Description", default)]
+    pub description: Option<String>,
+    #[serde(rename = "CreatedAt")]
+    pub created_at: String,
+}
+
+/// Wrapper for the paginated list response:
+/// `{"apps": [...], "limit": 50, "offset": 0}`
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AppListResponse {
+    apps: Vec<App>,
+    limit: u32,
+    offset: u32,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -701,6 +733,18 @@ impl ApiClient {
         self.get_json_anyhow("list deployments", |base| {
             format!("{base}/api/v1/list/{app_name}")
         })
+    }
+
+    /// GET `/api/v1/apps` — list all apps for the authenticated tenant.
+    pub fn list_apps(&self) -> Result<Vec<App>> {
+        let resp: AppListResponse =
+            self.get_json_anyhow("list apps", |base| format!("{base}/api/v1/apps"))?;
+        Ok(resp.apps)
+    }
+
+    /// GET `/api/v1/apps/{appName}` — get a single app by name.
+    pub fn get_app(&self, app_name: &str) -> Result<App> {
+        self.get_json_anyhow("get app", |base| format!("{base}/api/v1/apps/{app_name}"))
     }
 
     // ---- Custom-domain (issue #83) ----

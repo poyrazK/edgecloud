@@ -156,6 +156,15 @@ enum Command {
         weight: Option<u8>,
     },
 
+    /// List all apps, or show details for one.
+    ///
+    /// `edge apps` lists all apps for the tenant.
+    /// `edge apps get <name>` shows details for a specific app.
+    Apps {
+        #[command(subcommand)]
+        action: Option<AppsCommand>,
+    },
+
     /// Roll back to the previous deployment.
     ///
     /// Swaps the active deployment back to the deployment that was
@@ -264,6 +273,19 @@ enum StatusAction {
     Deployment,
 }
 
+/// `edge apps` — list apps or show details for one.
+///
+/// Bare `edge apps` lists all apps for the tenant.
+/// `edge apps get <name>` shows details for a specific app.
+#[derive(Subcommand)]
+enum AppsCommand {
+    /// Show details for a specific app.
+    Get {
+        /// App name to fetch.
+        name: String,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -286,6 +308,10 @@ fn main() -> Result<()> {
             deployment_id,
             weight,
         } => commands::activate::run(&cli.path, &deployment_id, weight),
+        Command::Apps { action } => match action {
+            None => commands::apps::list(&cli.path),
+            Some(AppsCommand::Get { name }) => commands::apps::get(&cli.path, &name),
+        },
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev => commands::dev::run(&cli.path),
