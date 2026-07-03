@@ -808,6 +808,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             control_plane_url,
@@ -834,6 +836,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let dir = TempDir::new().expect("tempdir");
         let spool = Arc::new(Spool::open(dir.path()).await.expect("open spool"));
@@ -1230,6 +1234,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             "http://127.0.0.1:0", // no POSTs attempted
@@ -1282,6 +1288,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let _f = LogForwarder::new(
             "http://127.0.0.1:0",
@@ -1341,6 +1349,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             "http://127.0.0.1:0",
@@ -1469,6 +1479,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             &server.uri(),
@@ -1554,6 +1566,7 @@ mod tests {
                 "w_test",
                 "test-region",
                 "t_test",
+                None, // H8: tests use no audience by default
             );
             let f = LogForwarder::new(
                 &server.uri(),
@@ -1616,6 +1629,7 @@ mod tests {
                 "w_test",
                 "test-region",
                 "t_test",
+                None, // H8: tests use no audience by default
             );
             let f = LogForwarder::new(
                 &server.uri(),
@@ -1692,6 +1706,7 @@ mod tests {
                 "w_test",
                 "test-region",
                 "t_test",
+                None, // H8: tests use no audience by default
             );
             let f = LogForwarder::new(
                 &server.uri(),
@@ -1995,6 +2010,7 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            None, // H8: tests use no audience by default
             || -> anyhow::Result<JwtBundle> { Err(anyhow::anyhow!("bootstrap 401 (test)")) },
         );
         let f = LogForwarder::new(
@@ -2094,6 +2110,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             &format!("http://{addr}"),
@@ -2171,6 +2189,8 @@ mod tests {
             "w_test",
             "test-region",
             "t_test",
+            // H8: tests use no audience by default.
+            None,
         );
         let f = LogForwarder::new(
             &format!("http://{addr}"),

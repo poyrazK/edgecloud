@@ -71,6 +71,7 @@ pub fn test_config(
         // /api/internal/*). Any non-empty placeholder works.
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
+        worker_jwt_audience: String::new(), // H8: tests use no audience by default
         worker_tenant_id: "t_test".to_string(),
         // Phase 4 bootstrap: tests don't configure the bootstrap path
         // by default — they use the legacy static-secret signer
@@ -172,6 +173,12 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
             worker_id.clone(),
             region.clone(),
             tenant_id.clone(),
+            // H8: tests use no audience by default so the existing
+            // signer unit tests (which predated the audience feature)
+            // keep producing aud-less tokens. The audience is
+            // exercised end-to-end via the dedicated Go-side
+            // TestVerifyWorkerJWT_WrongAudience / CorrectAudience.
+            None,
             move || {
                 // The signer holds this closure via Arc<dyn Fn>;
                 // cloning the captured Arcs into the request keeps
@@ -239,6 +246,9 @@ pub(crate) fn build_signer_for_config(config: &Config) -> Arc<WorkerJwtSigner> {
             config.worker_id.clone(),
             config.region.clone(),
             config.tenant_id_for_signer(),
+            // H8: same comment as the callback path above — tests
+            // use no audience by default.
+            None,
         )
     }
 }

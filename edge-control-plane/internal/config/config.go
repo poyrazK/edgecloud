@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -95,23 +96,35 @@ type JWTConfig struct {
 	Secret string `yaml:"secret"`
 	TTL    int    `yaml:"ttl_hours"`
 	Issuer string `yaml:"issuer"`
-	// BootstrapPSK is the pre-shared key workers use to enroll via
-	// `POST /api/internal/auth/token` (Phase 4). Must match
-	// `WORKER_BOOTSTRAP_PSK` on the worker side.
+	// Audience is the `aud` claim expected on worker JWTs (PR #200
+	// review finding H8 — defense-in-depth gate). Empty disables the
+	// check (matches the existing Issuer behavior). The minter
+	// (`internal/service/jwtmint.go`) defaults an empty value to
+	// "edge-internal"; deployments that want a different audience
+	// should set `JWT_AUDIENCE`.
+	Audience string `yaml:"audience"`
+	// BootstrapPSKs is the per-tenant pre-shared key map (PR #200
+	// review finding H1) workers use to enroll via
+	// `POST /api/internal/auth/token`. Keyed by tenant ID
+	// (`^t_[a-z0-9_]+$`); the value is the per-tenant PSK. A worker
+	// bootstrapping for tenant T must use the PSK configured under
+	// `BootstrapPSKs[T]`. A compromised PSK for tenant A therefore
+	// cannot mint a JWT for tenant B — the keyed lookup returns
+	// nil for tenant B, the middleware returns 401.
 	//
-	// Empty disables the bootstrap endpoint entirely (the route
+	// Empty map disables the bootstrap endpoint entirely (the route
 	// returns 503). Operators wanting strict enrollment-only auth
-	// can run with `BootstrapPSK` set and `Secret` set to a strong
+	// can run with `BootstrapPSKs` set and `Secret` set to a strong
 	// random value used only for token verification — the two
 	// paths are independent at the server level.
 	//
-	// Validated like Secret: non-empty + ≥32 bytes when set. We
-	// skip the "known placeholder" check (the one on Secret)
-	// because operators typically source PSKs from a secrets
-	// manager rather than a config file — a placeholder check
-	// would generate false positives on short randomly-generated
-	// keys that happen to collide with a known-bad value.
-	BootstrapPSK string `yaml:"bootstrap_psk"`
+	// Validated like the legacy single PSK: each non-empty value
+	// must be ≥32 bytes. We skip the "known placeholder" check on
+	// each value because operators typically source PSKs from a
+	// secrets manager rather than a config file — a placeholder
+	// check would generate false positives on short randomly-
+	// generated keys that happen to collide with a known-bad value.
+	BootstrapPSKs map[string]string `yaml:"bootstrap_psks"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -217,8 +230,20 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
 	}
-	if v := os.Getenv("BOOTSTRAP_PSK"); v != "" {
-		cfg.JWT.BootstrapPSK = v
+	if v := os.Getenv("JWT_AUDIENCE"); v != "" {
+		cfg.JWT.Audience = v
+	}
+	// BOOTSTRAP_PSKS is a JSON-encoded map of `tenant_id` → PSK, e.g.
+	//   BOOTSTRAP_PSKS='{"t_tenant1":"<32+ byte hex>","t_tenant2":"<...>"}'
+	// Single-PSK deployments can keep using a JSON object with one
+	// entry. Empty string (unset) leaves the map nil — the bootstrap
+	// endpoint then returns 503 per the existing behavior.
+	if v := os.Getenv("BOOTSTRAP_PSKS"); v != "" {
+		var psks map[string]string
+		if err := json.Unmarshal([]byte(v), &psks); err != nil {
+			return nil, fmt.Errorf("BOOTSTRAP_PSKS must be a JSON object of tenant_id -> psk: %w", err)
+		}
+		cfg.JWT.BootstrapPSKs = psks
 	}
 	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
 		cfg.Region = v
@@ -273,13 +298,14 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// Bootstrap PSK is optional; when set, it must be ≥32 bytes (same
-	// floor as the JWT secret — short keys make HMAC-SHA256 brute-force
-	// feasible). Empty PSK leaves the bootstrap endpoint disabled; the
-	// route still exists but returns 503 from the middleware, so
-	// operators can roll out the worker side before the server side
-	// without a config mismatch producing confusing 401s.
-	if err := validateBootstrapPSK(cfg.JWT.BootstrapPSK); err != nil {
+	// Bootstrap PSKs (per-tenant) are optional; when set, each entry must
+	// be ≥32 bytes (same floor as the JWT secret — short keys make
+	// HMAC-SHA256 brute-force feasible). An empty map leaves the
+	// bootstrap endpoint disabled; the route still exists but returns
+	// 503 from the middleware, so operators can roll out the worker
+	// side before the server side without a config mismatch producing
+	// confusing 401s.
+	if err := validateBootstrapPSKs(cfg.JWT.BootstrapPSKs); err != nil {
 		return nil, err
 	}
 
@@ -386,20 +412,32 @@ func validateStorageConfig(s *StorageConfig) error {
 	return nil
 }
 
-// validateBootstrapPSK enforces two rules (in priority order):
-//  1. when set, the PSK must be at least 32 bytes,
-//  2. (no placeholder check — see JWTConfig.BootstrapPSK doc for the
-//     rationale).
+// validateBootstrapPSKs enforces the per-tenant PSK map rules. The
+// map itself is optional (an empty/nil map disables the bootstrap
+// endpoint with 503). When non-empty, every value must be ≥32 bytes
+// (same floor as the JWT secret — short keys make HMAC-SHA256 brute-
+// force feasible). Tenant ID keys are not validated here; the
+// middleware's character-set validator handles them at request time.
 //
-// Empty is allowed: the bootstrap endpoint is opt-in. An empty PSK
-// causes the route to return 503 instead of 401 so the failure mode
-// is distinguishable from a wrong-PSK submission.
-func validateBootstrapPSK(s string) error {
-	if s == "" {
+// No placeholder check is applied to the values — operators typically
+// source PSKs from a secrets manager rather than a config file, and a
+// placeholder check would generate false positives on short
+// randomly-generated keys that happen to collide with a known-bad
+// value.
+func validateBootstrapPSKs(psks map[string]string) error {
+	if len(psks) == 0 {
 		return nil
 	}
-	if len(s) < 32 {
-		return fmt.Errorf("jwt.bootstrap_psk must be at least 32 bytes when set (got %d)", len(s))
+	for tenant, psk := range psks {
+		if psk == "" {
+			return fmt.Errorf("jwt.bootstrap_psks[%q] is empty; each entry must be ≥32 bytes when set", tenant)
+		}
+		if len(psk) < 32 {
+			return fmt.Errorf(
+				"jwt.bootstrap_psks[%q] must be at least 32 bytes (got %d)",
+				tenant, len(psk),
+			)
+		}
 	}
 	return nil
 }

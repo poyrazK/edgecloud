@@ -327,16 +327,39 @@ mod tests {
 
     #[test]
     fn sign_with_psk_matches_known_vector() {
-        // Vector computed with python:
-        //   import hmac, hashlib
-        //   hmac.new(b"0123456789abcdef0123456789abcdef",
-        //            b"w_fra_abc123:fra:t_tenant1", hashlib.sha256).hexdigest()
-        // The exact value isn't important — what matters is determinism
-        // and stability against an accidental algorithm change. If this
-        // test breaks, check whether the input format or the algorithm
-        // drifted. The payload was extended to include `tenant_id` in
-        // finding A1.
+        // PR #200 review finding C4: the previous version of this test
+        // only asserted `sig.len() == 64` and self-equality — anyone
+        // who changed the canonical separator, swapped the byte order
+        // of `(worker_id, region, tenant_id)`, or replaced `Sha256`
+        // with `Sha512` would still see this test pass. The whole
+        // point of this test is the Rust↔Go HMAC conformance
+        // invariant; without an actual digest pin, the invariant has
+        // no safety net.
+        //
+        // Vector: HMAC-SHA256(
+        //   key   = b"0123456789abcdef0123456789abcdef",
+        //   msg   = b"w_fra_abc123:fra:t_tenant1",
+        // ).hexdigest()
+        //
+        // Compute via:
+        //   python3 -c "import hmac, hashlib; print(hmac.new( \
+        //     b'0123456789abcdef0123456789abcdef', \
+        //     b'w_fra_abc123:fra:t_tenant1', hashlib.sha256).hexdigest())"
+        //
+        // The Go-side mirror lives at
+        // edge-control-plane/internal/handler/bootstrap_test.go and
+        // pins the same digest. Both tests fail together if the wire
+        // format drifts across the language boundary.
+        const EXPECTED_HEX: &str =
+            "3561792155cbfd37ce3cfeb01f31585d6014194e8f1e9ccbbd7f8eb7aa6c2a0c";
         let sig = sign_with_psk(TEST_PSK, "w_fra_abc123", "fra", "t_tenant1");
+        assert_eq!(
+            sig, EXPECTED_HEX,
+            "HMAC-SHA256 digest must match the pinned cross-language vector"
+        );
+        // Defensive sanity: also keep the length and hex-shape checks
+        // so a future regression that breaks the format flags at the
+        // assertion site rather than at the diff below.
         assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
         assert!(
             sig.chars()
