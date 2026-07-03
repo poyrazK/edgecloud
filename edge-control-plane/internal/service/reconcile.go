@@ -11,13 +11,17 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 )
 
-// ErrTenantNotFound is returned by BuildFullSync when the caller
+// ErrTenantNotFoundInReconcile is returned by BuildFullSync when the caller
 // (e.g. the /sync HTTP fallback handler) asks for a tenantID that has
 // no row in the tenants table. A worker that references a deleted
 // tenant is the only realistic production trigger — the handler maps
 // it to 500 so operators see the inconsistent state in their error
 // dashboards instead of silently receiving an empty payload.
-var ErrTenantNotFound = errors.New("tenant not found")
+//
+// This sentinel was previously named ErrTenantNotFound; it was renamed
+// in billing v0 so that the canonical "tenant row missing" sentinel
+// could live in tenant.go as a 404-mapped error without ambiguity.
+var ErrTenantNotFoundInReconcile = errors.New("tenant not found")
 
 // reconcileTenants is the subset of *repository.TenantRepository the
 // ReconcileService needs. List fans out across all tenants for the
@@ -330,7 +334,7 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 
 	// Resolve tenant allowlist up front. A missing tenant row is an
 	// inconsistent-state error (worker registered but tenant deleted):
-	// return ErrTenantNotFound so the HTTP handler can surface a 500
+	// return ErrTenantNotFoundInReconcile so the HTTP handler can surface a 500
 	// with a useful log line, instead of silently returning a payload
 	// stripped of egress rules.
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
@@ -338,7 +342,7 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 		return nil, err
 	}
 	if tenant == nil {
-		return nil, ErrTenantNotFound
+		return nil, ErrTenantNotFoundInReconcile
 	}
 	allowlist := tenant.AllowlistedDestinations
 
