@@ -331,6 +331,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
+	api.HandleFunc("DELETE /api/v1/apps/{appName}", appHandler.Delete)
 	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
