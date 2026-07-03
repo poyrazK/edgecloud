@@ -17,3 +17,9 @@ type App struct {
 type CreateAppRequest struct {
 	Description string `json:"description"` // optional
 }
+
+// UpdateAppRequest is sent when updating an existing app.
+// nil pointer fields mean "don't change"; non-nil means "set to this value".
+type UpdateAppRequest struct {
+	Description *string `json:"description"` // nil = no change, "" = clear
+}

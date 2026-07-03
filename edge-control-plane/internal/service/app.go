@@ -23,6 +23,7 @@ type appRepoInterface interface {
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
+	Update(ctx context.Context, app *domain.App) error
 	// GetForUpdate locks the (tenant, app) row with `SELECT … FOR UPDATE`.
 	// Added for the v2 quota-race fix in AddDomain (issue #83 second-pass
 	// review); the lock is held for the caller's tx lifetime.
@@ -171,6 +172,29 @@ func (s *AppService) GetForUpdate(ctx context.Context, tenantID, appName string)
 // List returns apps for a tenant with pagination.
 func (s *AppService) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
 	return s.appRepo.List(ctx, tenantID, limit, offset)
+}
+
+// Update updates mutable fields of an existing app.
+// Returns ErrAppNotFound if the app does not exist.
+// Currently only description is mutable; add fields to the
+// UpdateAppRequest and this method as needed.
+func (s *AppService) Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error) {
+	app, err := s.appRepo.Get(ctx, tenantID, appName)
+	if err != nil {
+		return nil, fmt.Errorf("getting app: %w", err)
+	}
+	if app == nil {
+		return nil, ErrAppNotFound
+	}
+
+	if req.Description != nil {
+		app.Description = req.Description
+	}
+
+	if err := s.appRepo.Update(ctx, app); err != nil {
+		return nil, fmt.Errorf("updating app: %w", err)
+	}
+	return app, nil
 }
 
 // Delete deletes an app and all its associated data atomically.

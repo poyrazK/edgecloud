@@ -20,6 +20,8 @@ type mockAppSvc struct {
 	listErr   error
 	getApp    *domain.App
 	getErr    error
+	updateApp *domain.App
+	updateErr error
 	deleteErr error
 }
 
@@ -35,6 +37,9 @@ func (m *mockAppSvc) Get(ctx context.Context, tenantID, appName string) (*domain
 	}
 	return m.getApp, nil
 }
+func (m *mockAppSvc) Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error) {
+	return m.updateApp, m.updateErr
+}
 func (m *mockAppSvc) Delete(ctx context.Context, tenantID, appName string) error {
 	return m.deleteErr
 }
@@ -45,6 +50,7 @@ func newAppMux(svc *mockAppSvc) *http.ServeMux {
 	mux.HandleFunc("POST /api/apps/{appName}", h.Create)
 	mux.HandleFunc("GET /api/apps", h.List)
 	mux.HandleFunc("GET /api/apps/{appName}", h.Get)
+	mux.HandleFunc("PUT /api/apps/{appName}", h.Update)
 	mux.HandleFunc("DELETE /api/apps/{appName}", h.Delete)
 	return mux
 }
@@ -158,6 +164,84 @@ func TestAppHandler_Get_NotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestAppHandler_Update_Success(t *testing.T) {
+	desc := "updated description"
+	svc := &mockAppSvc{
+		updateApp: &domain.App{ID: "a_1", TenantID: "t_test", Name: "hello", Description: &desc},
+	}
+	mux := newAppMux(svc)
+
+	body := `{"description":"updated description"}`
+	req := httptest.NewRequest(http.MethodPut, "/api/apps/hello", strings.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var app domain.App
+	if err := json.Unmarshal(rr.Body.Bytes(), &app); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if app.Description == nil || *app.Description != "updated description" {
+		t.Errorf("Description = %v, want 'updated description'", app.Description)
+	}
+}
+
+func TestAppHandler_Update_ClearsDescription(t *testing.T) {
+	empty := ""
+	svc := &mockAppSvc{
+		updateApp: &domain.App{ID: "a_1", TenantID: "t_test", Name: "hello", Description: &empty},
+	}
+	mux := newAppMux(svc)
+
+	body := `{"description":""}`
+	req := httptest.NewRequest(http.MethodPut, "/api/apps/hello", strings.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var app domain.App
+	if err := json.Unmarshal(rr.Body.Bytes(), &app); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if app.Description == nil || *app.Description != "" {
+		t.Errorf("Description = %v, want empty string", app.Description)
+	}
+}
+
+func TestAppHandler_Update_NotFound(t *testing.T) {
+	svc := &mockAppSvc{updateErr: service.ErrAppNotFound}
+	mux := newAppMux(svc)
+
+	body := `{"description":"doesnt matter"}`
+	req := httptest.NewRequest(http.MethodPut, "/api/apps/hello", strings.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestAppHandler_Update_InvalidBody(t *testing.T) {
+	mux := newAppMux(&mockAppSvc{})
+
+	req := httptest.NewRequest(http.MethodPut, "/api/apps/hello", strings.NewReader(`not json`))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
 	}
 }
 
