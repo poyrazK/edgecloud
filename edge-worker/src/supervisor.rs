@@ -621,6 +621,7 @@ impl Supervisor {
                         Ok(Ok(true)) => {
                             // Component wants to keep running (blocking call returned normally).
                             // Loop back and re-execute — this supports long-running HTTP servers.
+                            sleep(Duration::from_millis(10)).await;
                             continue;
                         }
                         Ok(Ok(false)) => {
