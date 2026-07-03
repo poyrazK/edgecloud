@@ -105,6 +105,11 @@ enum Command {
         #[arg(long, value_name = "REGIONS", value_delimiter = ',')]
         regions: Vec<String>,
 
+        /// Path to the wasm artifact. Overrides the default
+        /// `target/wasm32-wasip2/release/{app}.wasm`.
+        #[arg(long, value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+
         /// Opt in to auto-rollback (issue #74). When set, the server
         /// records `auto_rollback_enabled = true` on this deployment
         /// (and on the active slot at activate time). With this flag:
@@ -297,7 +302,15 @@ fn main() -> Result<()> {
             id,
             regions,
             auto_rollback,
-        } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
+            file,
+        } => commands::deploy::run(
+            &cli.path,
+            &app,
+            id.as_deref(),
+            &regions,
+            auto_rollback,
+            file.as_deref(),
+        ),
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
             StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
             StatusAction::Deployment => commands::status::run(&cli.path),
