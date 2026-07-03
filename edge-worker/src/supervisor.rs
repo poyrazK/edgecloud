@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Context;
 use edge_runtime::linker::create_component_linker_long_running;
 use edge_runtime::{create_component_linker_handler, EgressPolicy, RequestMeter};
 use futures::StreamExt;
@@ -191,7 +190,10 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(e).context(format!("failed to compile component for {}", app_name));
+                return Err(anyhow::anyhow!(
+                    "failed to compile component for {}: {}",
+                    app_name, e
+                ));
             }
         };
 
@@ -220,10 +222,10 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(e).context(format!(
+                return Err(anyhow::anyhow!(
                     "failed to pre-instantiate {} (execution_model={:?}); \
-                     wasi: imports are wired in Phase C",
-                    app_name, execution_model
+                     wasi: imports are wired in Phase C: {}",
+                    app_name, execution_model, e
                 ));
             }
         };

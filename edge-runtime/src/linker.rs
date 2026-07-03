@@ -41,7 +41,7 @@
 
 use crate::RuntimeState;
 use anyhow::Result;
-use wasmtime::component::Linker as ComponentLinker;
+use wasmtime::component::{HasSelf, Linker as ComponentLinker};
 use wasmtime::Engine;
 
 /// Build the linker shared by both `edge-runtime` and
@@ -59,13 +59,13 @@ pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<Runtim
 
     // Step 1: wasi:cli/command (io, clocks, filesystem, random, sockets, cli).
     // Requires `RuntimeState: WasiView` — implemented in runtime.rs.
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
     // Step 2: wasi:http/{outgoing-handler, types}. Components can make
     // outbound HTTP calls. Egress enforcement is wired via
     // RuntimeState's WasiHttpView::send_request override.
     // Requires `RuntimeState: WasiHttpView` — implemented in runtime.rs.
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
     // Step 3: edge:cloud/* — registers each Host impl individually.
     // RuntimeState implements all six below in runtime.rs.
@@ -121,7 +121,13 @@ fn edge_cloud_add_to_linker_get_host(linker: &mut ComponentLinker<RuntimeState>)
 
     macro_rules! register_host {
         ($mod:ident) => {{
-            long_cloud::$mod::add_to_linker(linker, host_getter)?;
+            // In wasmtime 36 the bindgen-generated add_to_linker wants
+            // `for<'a> Fn(&'a mut T) -> <T as HasData>::Data<'a>`. The
+            // turbofish `HasSelf<RuntimeState>` tells the macro the
+            // store type explicitly — `HasSelf<T>`'s blanket `Data<'a> =
+            // &'a mut T` then resolves the (otherwise ambiguous) two-
+            // world Host impls.
+            long_cloud::$mod::add_to_linker::<_, HasSelf<RuntimeState>>(linker, host_getter)?;
         }};
     }
 

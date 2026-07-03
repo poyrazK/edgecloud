@@ -26,17 +26,6 @@ ignore = [
     "RUSTSEC-2026-0096",
     "RUSTSEC-2026-0149",
     "RUSTSEC-2026-0182",
-    # v0.2 PR #196 merge blockers — wasmtime pinned at 25.0.3 because
-    # the PR's WIT vendor (wit-component 0.252.0) requires wasmtime 25+
-    # and the toolchain swap (wasm32-unknown-unknown + wasm-tools component
-    # new) was validated against that line. Patched wasmtime lines are
-    # 24.0.11 / 36.0.12 / 45.0.3 / 46.0.1; none are drop-in compatible
-    # with v0.2's WIT vendor. Tracked in #211.
-    "RUSTSEC-2026-0049", # rustls-webpki: CRLs not authoritative
-    "RUSTSEC-2026-0098", # rustls-webpki: name constraints URI
-    "RUSTSEC-2026-0099", # rustls-webpki: name constraints wildcard
-    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parse
-    "RUSTSEC-2026-0188", # wasmtime-wasi: FilePerms bypass via hardlink/rename
 ]
 
 [licenses]

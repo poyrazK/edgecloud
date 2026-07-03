@@ -49,10 +49,10 @@ use hyper::Response as HyperResponse;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use wasmtime::component::InstancePre;
-use wasmtime_wasi_http::bindings::http::types::Scheme;
-use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
-use wasmtime_wasi_http::WasiHttpView;
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::WasiHttpView;
 
 use edge_runtime::interfaces::observe::{AppLogContext, LogSink};
 use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
@@ -62,9 +62,9 @@ use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
 // is NOT re-exported at the crate root (verified in 25.0.3's `lib.rs`).
 // The Response Sender/Receiver aliases factor a 6-line type that
 // clippy::type_complexity rightly complains about.
-type HandlerProxyPre = wasmtime_wasi_http::bindings::ProxyPre<RuntimeState>;
+type HandlerProxyPre = wasmtime_wasi_http::p2::bindings::ProxyPre<RuntimeState>;
 type HandlerResponseResult =
-    Result<HyperResponse<HyperOutgoingBody>, wasmtime_wasi_http::bindings::http::types::ErrorCode>;
+    Result<HyperResponse<HyperOutgoingBody>, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>;
 type HandlerResponseSender = tokio::sync::oneshot::Sender<HandlerResponseResult>;
 type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseResult>;
 
@@ -126,8 +126,11 @@ impl HandlerDispatch {
         epoch_tick_ms: u64,
         config: HandlerConfig,
     ) -> anyhow::Result<Self> {
+        // wasmtime 45 `Error` no longer implements `std::error::Error`, so
+        // `anyhow::Context::context` can't apply directly. Map to
+        // `anyhow::Error` first, preserving the source chain.
         let proxy_pre = HandlerProxyPre::new(instance_pre)
-            .context("ProxyPre::new (component does not export wasi:http/incoming-handler)")?;
+            .map_err(|e| anyhow::anyhow!("ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"))?;
         // Defend against divide-by-zero: a misconfigured 0 tick would
         // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);
@@ -387,14 +390,21 @@ impl HandlerDispatch {
         // declaration that maps `error-code` → `HttpError`.
         let (sender, receiver): (HandlerResponseSender, HandlerResponseReceiver) =
             tokio::sync::oneshot::channel();
+        // wasmtime 45 moved `new_incoming_request` / `new_response_outparam`
+        // off the `WasiHttpView` trait onto `WasiHttpCtxView`, so we go
+        // through `data_mut().http()` to get the view. The errors are
+        // `wasmtime::Error`, which no longer implements `std::error::Error`
+        // in wasmtime 45, so map to `anyhow::Error` directly.
         let req_handle = store
             .data_mut()
+            .http()
             .new_incoming_request(Scheme::Http, req)
-            .context("new_incoming_request")?;
+            .map_err(|e| anyhow::anyhow!("new_incoming_request: {e}"))?;
         let out = store
             .data_mut()
+            .http()
             .new_response_outparam(sender)
-            .context("new_response_outparam")?;
+            .map_err(|e| anyhow::anyhow!("new_response_outparam: {e}"))?;
 
         // Account the request before dispatching the guest. We
         // snapshot-and-subtract in the heartbeat loop, not here, so
@@ -411,11 +421,14 @@ impl HandlerDispatch {
             let proxy = proxy_pre
                 .instantiate_async(&mut store)
                 .await
-                .context("proxy_pre.instantiate_async")?;
+                .map_err(|e| anyhow::anyhow!("proxy_pre.instantiate_async: {e}"))?;
+            // call_handle returns `wasmtime::Result<()>`. wasmtime 45 Error
+            // does not implement `std::error::Error`, so map to anyhow.
             proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, req_handle, out)
                 .await
+                .map_err(|e| anyhow::anyhow!("proxy.wasi_http_incoming_handler.call_handle: {e}"))
         }
         .await;
 

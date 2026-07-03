@@ -32,14 +32,11 @@ pub fn create_engine() -> Result<wasmtime::Engine> {
     // Enable epoch interruption for CPU time limits
     config.epoch_interruption(true);
 
-    // Required for `wasmtime_wasi::add_to_linker_async` /
-    // `wasmtime_wasi_http::add_only_http_to_linker_async` — both use
-    // `func_wrap_async` internally (Phase C: wasi: wiring). Without
-    // this, linker construction panics with "cannot use
-    // `func_wrap_async` without enabling async support in the config".
-    // The performance cost is ~5% on synchronous workloads and is
-    // mandatory for any async-aware wasi:* surface.
-    config.async_support(true);
+    // Async support is now unconditional in wasmtime 36+ (the
+    // `async_support(true)` call was deprecated and removed in 45).
+    // The `async` + `component-model` features on the `wasmtime`
+    // dependency enable everything `wasmtime_wasi::p2::add_to_linker_async`
+    // and `wasmtime_wasi_http::p2::add_only_http_to_linker_async` need.
 
     let engine = Engine::new(&config)?;
     Ok(engine)

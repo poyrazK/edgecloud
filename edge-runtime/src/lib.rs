@@ -64,8 +64,6 @@ pub mod edge_runtime_long {
     wasmtime::component::bindgen!({
         world: "edge-runtime",
         path: "src/wit",
-        tracing: false,
-        verbose_tracing: false,
     });
 }
 
@@ -73,8 +71,6 @@ pub mod edge_runtime_handler {
     wasmtime::component::bindgen!({
         world: "edge-runtime-handler",
         path: "src/wit",
-        tracing: false,
-        verbose_tracing: false,
         // See the module-level comment in `edge_runtime_long` for the
         // rationale on `with:`. The only `with:` mapping we use is for
         // the `wasi:http/incoming-handler` export, so the bindgen-
@@ -82,7 +78,7 @@ pub mod edge_runtime_handler {
         // `Guest` that `wasmtime_wasi_http::ProxyPre::call_handle` is
         // statically dispatched against.
         with: {
-            "wasi:http/incoming-handler": wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler,
+            "wasi:http/incoming-handler": wasmtime_wasi_http::p2::bindings::exports::wasi::http::incoming_handler,
         },
     });
 }
