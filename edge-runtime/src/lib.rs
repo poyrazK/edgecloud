@@ -6,6 +6,7 @@
 // apply (no per-function tracing block here), so the silence is intentional.
 
 pub mod egress;
+pub(crate) mod egress_transport;
 pub mod engine;
 pub mod limits;
 pub mod linker;

@@ -58,9 +58,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, W
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
-use wasmtime_wasi_http::p2::{
-    default_send_request, HttpError, HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
-};
+use wasmtime_wasi_http::p2::{HttpError, HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 use wasmtime_wasi_http::WasiHttpCtx;
 
 /// Process-wide per-tenant store registries. Each tenant gets its own
@@ -337,9 +335,18 @@ impl WasiHttpHooks for EgressHttpHooks {
             let diagnostics = format!("egress denied: {reason}");
             return Err(HttpError::from(ErrorCode::InternalError(Some(diagnostics))));
         }
-        // Egress allowlist passed — defer to the canonical hyper-based
-        // send_request implementation that wasmtime-wasi-http ships.
-        Ok(default_send_request(request, config))
+        // Egress allowlist passed — defer to our custom DNS-rebinding-
+        // aware send_request handler in `egress_transport`. It
+        // pre-resolves via `tokio::net::lookup_host`, validates each
+        // candidate IP against `egress.check_resolved_ip`, then connects
+        // to the validated IP literal — so the kernel cannot re-resolve
+        // and serve a poisoned record on the second query.
+        Ok(crate::egress_transport::spawn_send_request_handler(
+            request,
+            config,
+            self.egress.clone(),
+            self.tenant_id.clone(),
+        ))
     }
     // `is_forbidden_header` falls back to the `WasiHttpHooks` default
     // which strips the canonical hop-by-hop / connection-state header
@@ -351,6 +358,14 @@ impl WasiHttpHooks for EgressHttpHooks {
     // URL-level `EgressPolicy::check` above.
 }
 
+/// ## Known gap (v0.3 follow-up — issue #216 candidate)
+///
+/// `wasi:sockets/ip-name-lookup` and `wasi:sockets/tcp` are a separate
+/// egress surface that bypasses this hook entirely. A guest can call
+/// `wasi:sockets/ip-name-lookup::resolve("127.0.0.1")` then
+/// `wasi:sockets/tcp::connect` to that IP literal without ever touching
+/// `wasi:http/outgoing-handler`. Tracked as a v0.3 follow-up.
+///
 /// `WasiHttpView` — required by `wasmtime_wasi_http::p2::add_only_http_to_linker_async`.
 /// wasmtime 45 collapsed the trait from `{ctx, table}` into a single
 /// `http()` method returning a `WasiHttpCtxView` bundle (mirrors the

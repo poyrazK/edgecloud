@@ -53,6 +53,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Time
 clock = { version = "0.4", optional = true }
 
+# Outbound TLS for the egress transport (`egress_transport` module).
+# `egress-tls` is the only feature flag; when off, only plaintext HTTP
+# is supported and outbound HTTPS requests return `TlsProtocolError`.
+# Versions mirror `wasmtime-wasi-http 45.0.3`'s deps so the runtime and
+# the outbound TLS stack share the same `rustls` ABI.
+rustls        = { version = "0.23", optional = true }
+tokio-rustls   = { version = "0.26", optional = true }
+webpki-roots  = { version = "0.26", optional = true }
+# Used by egress_transport for body wrapping (matches wasmtime-wasi-http
+# 45.0.3's dependency).
+http-body-util = { version = "0.1", optional = true }
+
 [dev-dependencies]
 wasmtime-environ = "=45.0.3"
 wiremock = "0.6"
@@ -67,13 +79,16 @@ tempfile = "3"
 # `networking`, and `dns`; their deps (`reqwest`, `futures`, `bytes`,
 # `httparse`, `rustls`, `rustls-pemfile`, `tokio-rustls`, `flate2`,
 # `trust-dns-resolver`) are no longer listed.
-default = ["kv-store", "cache", "observe", "time", "scheduling", "process"]
+default = ["kv-store", "cache", "observe", "time", "scheduling", "process", "egress-tls"]
 kv-store = []
 cache = ["dep:lru"]
 observe = ["dep:metrics"]
 time = ["dep:clock"]
 scheduling = ["dep:tokio"]
 process = []
+# Outbound TLS stack for the egress transport. Required for production
+# builds; gateable for wasm targets and minimal test builds.
+egress-tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:http-body-util"]
 
 # v0.2 PR #196 ships a backwards-incompatible rewrite of the runtime
 # public API: the v0.1 custom HTTP server + networking + DNS layer is
@@ -115,6 +130,10 @@ function_parameter_count_changed = "allow"
 method_parameter_count_changed = "allow"
 method_requires_different_generic_type_params = "allow"
 trait_method_added = "allow"
+# rustls/tokio-rustls/webpki-roots are now direct deps of edge-runtime
+# (added for the egress-tls feature in PR #206/#207). These are
+# surface additions for `cargo-semver-checks`.
+public_dependency_added = "allow"
 
 # `cargo-udeps` (run on nightly) flags `metrics`, `clock`, and
 # `tracing-subscriber` as unused because their usage is gated by the
