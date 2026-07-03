@@ -359,8 +359,6 @@ jobs:
         uses: taiki-e/install-action@cargo-nextest
 
       - name: Run integration tests
-        env:
-          NEXTEST_TEST_TIMEOUT: 30s
         run: |
           cargo nextest run --workspace \
             -E 'binary(integration_tests) | binary(ingress_wire_integration) | binary(integration)'
