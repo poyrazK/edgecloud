@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Tenants
 CREATE TABLE tenants (
     id          TEXT PRIMARY KEY,  -- "t_<uuid>"

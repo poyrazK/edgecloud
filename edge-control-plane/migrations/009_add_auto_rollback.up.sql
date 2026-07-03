@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add the auto-rollback feature for issue #74. Three columns, no
 -- data backfill: existing rows just see sensible defaults and the
 -- control plane behaves identically until a tenant opts in.

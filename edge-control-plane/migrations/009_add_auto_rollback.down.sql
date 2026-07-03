@@ -1,3 +1,4 @@
+-- +migrate Down
 -- Reverse migration 009: drop auto-rollback columns.
 -- DESTRUCTIVE: any tenant opt-in flags and observed-running timestamps
 -- are lost. Only run this as part of a planned rollback.

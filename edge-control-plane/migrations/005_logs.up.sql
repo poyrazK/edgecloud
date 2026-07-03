@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Tenant log store. Populated by workers via POST /api/internal/logs (issue #76).
 CREATE TABLE logs (
     id            BIGSERIAL PRIMARY KEY,

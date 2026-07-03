@@ -1,3 +1,4 @@
+-- +migrate Up
 -- 014_audit_logs.up.sql
 -- Append-only event table for tracking state-changing API operations.
 -- Every CUD handler writes one row so operators and compliance tooling

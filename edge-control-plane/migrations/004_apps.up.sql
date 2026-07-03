@@ -1,3 +1,4 @@
+-- +migrate Up
 CREATE TABLE apps (
     id          TEXT PRIMARY KEY,
     tenant_id   TEXT NOT NULL REFERENCES tenants(id),

@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue (review follow-up): AuthenticateRawKey looks up rows by SHA-256 of
 -- the raw key, but CreateAPIKey stores the argon2id PHC string in key_hash.
 -- The two strings never match, so every newly-created API key was rejected

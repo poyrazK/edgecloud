@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add hash_algorithm column to api_keys so the auth path can dispatch to
 -- the algorithm-specific verifier. Previously every row stored its hash
 -- format implicitly in key_hash and the service code had to guess; this

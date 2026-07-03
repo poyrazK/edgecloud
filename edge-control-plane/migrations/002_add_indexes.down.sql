@@ -1,3 +1,4 @@
+-- +migrate Down
 -- Rollback indexes
 
 DROP INDEX IF EXISTS idx_deployments_tenant_app;

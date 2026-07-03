@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Migration 006 added lookup_hash as a nullable column and backfilled
 -- only sha256 rows (argon2id rows cannot be backfilled — the raw key is
 -- unrecoverable from an argon2id hash, so the only path forward is for

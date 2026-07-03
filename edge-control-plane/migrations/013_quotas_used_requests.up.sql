@@ -1,3 +1,4 @@
+-- +migrate Up
 -- 013_quotas_used_requests.up.sql
 -- Adds per-tenant request-count metering to the quotas table.
 -- `used_request_count` reuses the existing `quota_period_start` (added by 009)

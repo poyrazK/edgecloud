@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add performance indexes for common query patterns
 
 -- deployments: frequently queried by tenant + app name

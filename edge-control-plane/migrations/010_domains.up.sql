@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Custom-domain bindings for issue #83. One row per tenant-owned FQDN
 -- bound to one of the tenant's apps. Tenant-facing CRUD lives at
 -- /api/v1/apps/{appName}/domains*; the internal ingress poller reads

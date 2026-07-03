@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add the `regions` column to `deployments` for issue #82 (multi-region
 -- deploys, v1). The column stores the list of regions a deployment is
 -- replicated to; the activate path loops over this list and publishes one

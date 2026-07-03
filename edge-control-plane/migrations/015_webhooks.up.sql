@@ -1,3 +1,4 @@
+-- +migrate Up
 -- 015_webhooks.up.sql
 -- Tenant-managed webhook subscriptions for deployment lifecycle events.
 -- Tenants register URLs that receive POST JSON payloads on deploy,

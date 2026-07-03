@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue #127: per-region publish state for cross-region artifact
 -- replication. Records which regions an active_deployments row has
 -- already been successfully published to, so retries are idempotent

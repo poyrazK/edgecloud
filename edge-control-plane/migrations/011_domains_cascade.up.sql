@@ -1,3 +1,4 @@
+-- +migrate Up
 -- PR #133 review finding #4: add FOREIGN KEY … ON DELETE CASCADE from
 -- domains(tenant_id, app_name) to apps(tenant_id, name). The apps
 -- table already carries UNIQUE (tenant_id, name) at 004_apps.up.sql:7,

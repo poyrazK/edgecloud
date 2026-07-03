@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Audit table for the cluster autoscaler (issue #85). Every scale
 -- decision (scale_up, scale_down, noop) the autoscaler makes is
 -- persisted here so operators can:
