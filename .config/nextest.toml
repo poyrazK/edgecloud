@@ -1,2 +1,3 @@
+# Trigger run to wait for natural completion
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 2 }
