@@ -294,17 +294,31 @@ func (s *WorkerService) ingestMetrics(appsRaw json.RawMessage) {
 	}
 }
 
-// checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
-// tenant's running total in the DB (cross-worker, cross-interval), then logs a
-// violation when the cumulative total exceeds the per-month max_outbound_mb cap.
-// Phase 1: log-only. Phase 2 (tracked in issue #120 follow-up): evict apps.
-func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.RawMessage) {
+// applyTenantDelta sums per-tenant usage deltas from a heartbeat payload,
+// writes the cumulative total to the DB, and logs a quota breach when the
+// monthly cap is exceeded. Used by checkOutboundQuota and checkRequestCount
+// — both pass different selector functions for the field/cap/used labels
+// but share this body. Phase 1 is log-only.
+//
+// Sentinel: cap <= 0 means "unlimited" (the enterprise tier stores -1 for
+// all max_* columns) or "unset / admin-cleared" — either way we skip the
+// breach check rather than false-trip a tenant whose cap hasn't been
+// initialized.
+func (s *WorkerService) applyTenantDelta(
+	ctx context.Context,
+	appsRaw json.RawMessage,
+	field func(*domain.AppStatus) uint64,
+	capField func(*domain.Quota) int64,
+	usedField func(*domain.Quota) int64,
+	capLabel string,
+	add func(context.Context, string, uint64) (*domain.Quota, error),
+) {
 	if len(appsRaw) == 0 {
 		return
 	}
 	var apps map[string]domain.AppStatus
 	if err := json.Unmarshal(appsRaw, &apps); err != nil {
-		log.Printf("heartbeat: could not decode apps for quota check: %v", err)
+		log.Printf("heartbeat: could not decode apps for %s quota check: %v", capLabel, err)
 		return
 	}
 
@@ -314,38 +328,51 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 	byTenant := make(map[string]uint64)
 	for _, app := range apps {
 		if app.TenantID != "" {
-			byTenant[app.TenantID] += app.OutboundBytes
+			byTenant[app.TenantID] += field(&app)
 		}
 	}
 
-	for tenantID, deltaBytes := range byTenant {
-		if deltaBytes == 0 {
+	for tenantID, delta := range byTenant {
+		if delta == 0 {
 			// Old worker or genuinely idle — skip; don't write a no-op UPDATE.
 			continue
 		}
-		// Persist the delta and get back the updated cumulative total in one
-		// round-trip. This aggregates across all workers and all intervals.
-		quota, err := s.quotaRepo.AddOutboundBytes(ctx, tenantID, deltaBytes)
+		quota, err := add(ctx, tenantID, delta)
 		if err != nil {
-			log.Printf("heartbeat: failed to record outbound bytes for tenant %s: %v", tenantID, err)
+			log.Printf("heartbeat: failed to record %s for tenant %s: %v", capLabel, tenantID, err)
 			continue
 		}
 		if quota == nil {
 			// No quota row — tenant is unlimited; nothing to enforce.
 			continue
 		}
-		if quota.MaxOutboundMB <= 0 {
+		cap := capField(quota)
+		if cap <= 0 {
 			// Unlimited or unconfigured — nothing to enforce.
 			continue
 		}
-		limitBytes := int64(quota.MaxOutboundMB) * 1024 * 1024
-		if quota.UsedOutboundBytes > limitBytes {
+		used := usedField(quota)
+		if used > cap {
 			log.Printf(
-				"quota: tenant %s used %d outbound bytes, exceeds monthly limit %d (%d MB) — enforcement pending",
-				tenantID, quota.UsedOutboundBytes, limitBytes, quota.MaxOutboundMB,
+				"quota: tenant %s used %d %s, exceeds monthly limit %d — enforcement pending",
+				tenantID, used, capLabel, cap,
 			)
 		}
 	}
+}
+
+// checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
+// tenant's running total in the DB (cross-worker, cross-interval), then logs a
+// violation when the cumulative total exceeds the per-month max_outbound_mb cap.
+// Phase 1: log-only. Phase 2 (tracked in issue #120 follow-up): evict apps.
+func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.RawMessage) {
+	s.applyTenantDelta(ctx, appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.OutboundBytes },
+		func(q *domain.Quota) int64 { return int64(q.MaxOutboundMB) * 1024 * 1024 },
+		func(q *domain.Quota) int64 { return q.UsedOutboundBytes },
+		"outbound bytes",
+		s.quotaRepo.AddOutboundBytes,
+	)
 }
 
 // checkRequestCount accumulates request_count from this heartbeat into the
@@ -353,51 +380,14 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 // a violation when the cumulative total exceeds the per-month
 // max_requests_per_month cap. Mirrors checkOutboundQuota but reads
 // app.RequestCount instead of app.OutboundBytes. Phase 1: log-only.
-//
-// Sentinel: MaxRequestsPerMonth < 0 means "unlimited" (the enterprise tier
-// stores -1 for all max_* columns). MaxRequestsPerMonth == 0 means "unset /
-// admin-cleared" — same handling as outbound: skip the breach check rather
-// than false-trip a tenant whose cap hasn't been initialized.
 func (s *WorkerService) checkRequestCount(ctx context.Context, appsRaw json.RawMessage) {
-	if len(appsRaw) == 0 {
-		return
-	}
-	var apps map[string]domain.AppStatus
-	if err := json.Unmarshal(appsRaw, &apps); err != nil {
-		log.Printf("heartbeat: could not decode apps for request-count check: %v", err)
-		return
-	}
-
-	byTenant := make(map[string]uint64)
-	for _, app := range apps {
-		if app.TenantID != "" {
-			byTenant[app.TenantID] += app.RequestCount
-		}
-	}
-
-	for tenantID, deltaReq := range byTenant {
-		if deltaReq == 0 {
-			continue
-		}
-		quota, err := s.quotaRepo.AddRequestCount(ctx, tenantID, deltaReq)
-		if err != nil {
-			log.Printf("heartbeat: failed to record request count for tenant %s: %v", tenantID, err)
-			continue
-		}
-		if quota == nil {
-			continue
-		}
-		if quota.MaxRequestsPerMonth <= 0 {
-			// Unlimited (sentinel -1) or unconfigured (0) — nothing to enforce.
-			continue
-		}
-		if quota.UsedRequestCount > int64(quota.MaxRequestsPerMonth) {
-			log.Printf(
-				"quota: tenant %s used %d requests, exceeds monthly limit %d — enforcement pending",
-				tenantID, quota.UsedRequestCount, quota.MaxRequestsPerMonth,
-			)
-		}
-	}
+	s.applyTenantDelta(ctx, appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		s.quotaRepo.AddRequestCount,
+	)
 }
 
 // GetAppTarget returns the running target for a single
