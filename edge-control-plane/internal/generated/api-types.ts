@@ -1175,10 +1175,42 @@ export interface components {
              */
             max_memory_mb?: number;
             /**
-             * @description Outbound egress cap in MB per month.
+             * @description Outbound egress cap in MB per month. -1 = unlimited (enterprise).
              * @example 1000
              */
             max_outbound_mb?: number;
+            /**
+             * @description Request-count cap per calendar month (UTC). -1 = unlimited (enterprise).
+             *     Default value depends on the tenant's plan:
+             *     free=100000, pro=5000000, business=50000000, enterprise=unlimited.
+             * @example 5000000
+             */
+            max_requests_per_month?: number;
+            /**
+             * Format: int64
+             * @description Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+             * @example 0
+             */
+            used_outbound_bytes?: number;
+            /**
+             * Format: int64
+             * @description Cumulative request count in the current UTC month. Resets on month rollover.
+             * @example 0
+             */
+            used_request_count?: number;
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
+             * @example 2026-07-01T00:00:00Z
+             */
+            quota_period_start?: string;
+            /**
+             * @description Highest usage percentage across the two monthly caps
+             *     (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
+             *     expressed as a 0-100 value. null when both caps are unlimited.
+             * @example 42.5
+             */
+            usage_pct?: number | null;
         };
         MigrationReport: {
             /**
