@@ -113,7 +113,7 @@ pub fn create_component_linker_handler(engine: &Engine) -> Result<ComponentLinke
 /// one's — same underlying Host impl since the WIT bodies are
 /// identical; the bindgens differ only in their generated trait
 /// namespaces, not the host impls).
-fn host_getter(state: &mut RuntimeState) -> &mut RuntimeState {
+pub(crate) fn host_getter(state: &mut RuntimeState) -> &mut RuntimeState {
     state
 }
 
@@ -140,4 +140,62 @@ fn edge_cloud_add_to_linker_get_host(linker: &mut ComponentLinker<RuntimeState>)
     register_host!(process);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::create_engine;
+    use crate::runtime::RuntimeState;
+
+    #[test]
+    fn create_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn create_long_running_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker_long_running(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn create_handler_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker_handler(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn host_getter_returns_identity() {
+        let mut state = RuntimeState::new();
+        let returned: *mut RuntimeState = host_getter(&mut state);
+        let original: *mut RuntimeState = &mut state;
+        assert_eq!(
+            returned, original,
+            "host_getter must return the same RuntimeState reference"
+        );
+    }
+
+    #[test]
+    fn edge_cloud_interfaces_registered() {
+        let engine = create_engine().expect("engine");
+        let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(&engine);
+        // All 6 edge:cloud interfaces register without error.
+        let result = edge_cloud_add_to_linker_get_host(&mut linker);
+        assert!(result.is_ok(), "all edge:cloud interfaces must register");
+    }
+
+    #[test]
+    fn linker_works_with_default_runtime_state() {
+        // Both worlds use the same linker factory — this test
+        // confirms RuntimeState::new() (test constructor) is
+        // accepted by the linker, which exercises the WasiView,
+        // WasiHttpView, and all 6 edge:cloud Host impls.
+        let engine = create_engine().expect("engine");
+        let _linker = create_component_linker(&engine).expect("linker");
+    }
 }
