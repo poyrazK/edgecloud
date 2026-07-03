@@ -418,8 +418,9 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		middleware.RoleIngest,
 	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 	workerJWTConfig := middleware.WorkerJWTConfig{
-		Secret: cfg.JWT.Secret,
-		Issuer: cfg.JWT.Issuer,
+		Secret:   cfg.JWT.Secret,
+		Issuer:   cfg.JWT.Issuer,
+		Audience: cfg.JWT.Audience,
 	}
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT (existing behavior) OR
@@ -474,9 +475,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	workerJWTMinter := service.NewWorkerJWTMinter(cfg.JWT)
 	bootstrapHandler := handler.NewBootstrapHandler(workerJWTMinter)
 	if bootstrapHandler != nil {
-		bootstrapCfg := middleware.BootstrapAuthConfig{
-			PSK: []byte(cfg.JWT.BootstrapPSK),
+		// PR #200 review finding H1: per-tenant PSK binding. The
+		// map is keyed by tenant ID; the middleware looks up the
+		// PSK for the tenant claiming the body and rejects with 401
+		// if no entry exists for that tenant.
+		psks := make(map[string][]byte, len(cfg.JWT.BootstrapPSKs))
+		for tenant, psk := range cfg.JWT.BootstrapPSKs {
+			psks[tenant] = []byte(psk)
 		}
+		bootstrapCfg := middleware.BootstrapAuthConfig{PSKs: psks}
 		mux.Handle("POST /api/internal/auth/token",
 			middleware.PSKAuth(bootstrapCfg)(http.HandlerFunc(bootstrapHandler.MintToken)))
 	}

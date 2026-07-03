@@ -705,6 +705,7 @@ mod tests {
             "w_test",
             "test",
             "t_test",
+            None, // H8: tests use no audience by default
         );
         let downloader = Downloader::new(server.uri(), cache_dir, signer);
 
@@ -742,6 +743,7 @@ mod tests {
             "w_test",
             "test",
             "t_test",
+            None, // H8: tests use no audience by default
         )
     }
 }

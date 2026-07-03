@@ -37,7 +37,7 @@ func newTestBootstrap(t *testing.T) (*BootstrapHandler, *middleware.BootstrapAut
 		t.Fatal("NewBootstrapHandler returned nil")
 	}
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	return h, &middleware.BootstrapAuthConfig{PSK: psk}
+	return h, &middleware.BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 }
 
 // Stand up a PSKAuth-wrapped handler for end-to-end tests.
@@ -69,7 +69,7 @@ func mintReq(t *testing.T, workerID, region, tenantID, pskStr string) *http.Requ
 
 func TestBootstrapHandler_HappyPath(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	req := mintReq(t, "w_fra_abc", "fra", "t_tenant1", psk)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -115,7 +115,7 @@ func TestBootstrapHandler_HappyPath(t *testing.T) {
 
 func TestBootstrapHandler_BodyMismatchWorkerID(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	// Headers signed for w_a, body claims w_b.
 	req := mintReq(t, "w_a", "fra", "t_tenant1", psk)
 	body, _ := json.Marshal(map[string]string{
@@ -133,7 +133,7 @@ func TestBootstrapHandler_BodyMismatchWorkerID(t *testing.T) {
 
 func TestBootstrapHandler_BodyMismatchRegion(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	req := mintReq(t, "w_fra_abc", "fra", "t_tenant1", psk)
 	body, _ := json.Marshal(map[string]string{
 		"worker_id": "w_fra_abc",
@@ -155,7 +155,7 @@ func TestBootstrapHandler_BodyMismatchRegion(t *testing.T) {
 // the signature over the body's tenant_id — mismatch → 401.
 func TestBootstrapHandler_BodyMismatchTenantID(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	req := mintReq(t, "w_fra_abc", "fra", "t_alice", psk)
 	body, _ := json.Marshal(map[string]string{
 		"worker_id": "w_fra_abc",
@@ -173,7 +173,7 @@ func TestBootstrapHandler_BodyMismatchTenantID(t *testing.T) {
 
 func TestBootstrapHandler_EmptyTenantID(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	req := mintReq(t, "w_fra_abc", "fra", "", psk)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -184,7 +184,7 @@ func TestBootstrapHandler_EmptyTenantID(t *testing.T) {
 
 func TestBootstrapHandler_InvalidJSON(t *testing.T) {
 	h, pskCfg := newTestHandler(t)
-	psk := string(pskCfg.PSK)
+	psk := string(pskCfg.PSKs["t_tenant1"])
 	req := mintReq(t, "w_fra_abc", "fra", "t_tenant1", psk)
 	req.Body = nopCloser{bytes.NewReader([]byte("not-json-{"))}
 	rr := httptest.NewRecorder()

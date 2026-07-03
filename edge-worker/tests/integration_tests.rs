@@ -102,6 +102,7 @@ fn test_config(
         worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
+        worker_jwt_audience: String::new(), // H8: integration tests use no audience
         worker_tenant_id: "t_test".to_string(),
         worker_bootstrap_psk: None,
         jwt_cache_path: PathBuf::from("/tmp/edge-worker-test-jwt-cache.json"),
@@ -372,6 +373,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         consumer_name: "test-heartbeat-consumer".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_issuer: "edgecloud".to_string(),
+        worker_jwt_audience: String::new(), // H8: integration tests use no audience
         worker_tenant_id: "t_test".to_string(),
         worker_bootstrap_psk: None,
         jwt_cache_path: PathBuf::from("/tmp/edge-worker-test-jwt-cache.json"),
@@ -389,6 +391,9 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         config.worker_id.clone(),
         config.region.clone(),
         config.worker_tenant_id.clone(),
+        // H8: integration tests use no audience by default so
+        // they don't need the worker_jwt_audience plumbing.
+        None,
     );
 
     let downloader = Arc::new(Downloader::new(
@@ -552,6 +557,7 @@ async fn build_supervisor(
         // on /api/internal/*). Any non-empty placeholder works.
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
+        worker_jwt_audience: String::new(), // H8: integration tests use no audience
         worker_tenant_id: "t_test".to_string(),
         worker_bootstrap_psk: None,
         jwt_cache_path: PathBuf::from("/tmp/edge-worker-test-jwt-cache.json"),
@@ -568,6 +574,9 @@ async fn build_supervisor(
         config.worker_id.clone(),
         config.region.clone(),
         config.worker_tenant_id.clone(),
+        // H8: integration tests use no audience by default so
+        // they don't need the worker_jwt_audience plumbing.
+        None,
     );
     let downloader = Arc::new(Downloader::new(
         config.control_plane_url.clone(),

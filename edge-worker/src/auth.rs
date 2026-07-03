@@ -39,7 +39,27 @@ use crate::bootstrap::{self, JwtBundle};
 /// How long before the cached token's `exp` we re-sign. 5 minutes is well
 /// above typical NTP drift and gives a comfortable margin if a request
 /// stalls at the control plane right as the old token crosses `exp`.
-const REFRESH_LEAD: Duration = Duration::from_secs(5 * 60);
+///
+/// PR #200 review finding H3: the const is replaced by a function that
+/// returns the same 5-minute value plus a deterministic-per-boot jitter
+/// of `[0, 60]s`. All workers in a region share one PSK and roughly the
+/// same `REFRESH_LEAD` window, so when the operator rotates the PSK
+/// every worker whose cached JWT is within ~5 min of expiry would
+/// re-bootstrap at the same instant — a thundering herd against the
+/// control plane's `/api/internal/auth/token` endpoint. The jitter
+/// spreads the re-bootstrap wave over a 1-minute window.
+fn refresh_lead_with_jitter() -> Duration {
+    // Deterministic-per-boot jitter without adding a `rand` dep.
+    // `subsec_nanos()` is unique-enough for this purpose — workers
+    // that boot within the same nanosecond form a negligible fraction
+    // of the fleet. If a stronger guarantee is needed later, swap
+    // this for `rand::thread_rng().gen_range(0..=60)`.
+    let jitter_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 % 61)
+        .unwrap_or(0);
+    Duration::from_secs(5 * 60 + jitter_secs)
+}
 
 /// Default token TTL. Matches the Go control plane's `JWTConfig.TTL` default
 /// (24h) and the whitepaper's §9.3 internal endpoint spec.
@@ -47,15 +67,26 @@ const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Worker JWT claims — wire-compatible with `middleware.WorkerClaims` (Go).
 ///
-/// `iss`/`exp`/`iat`/`jti` are standard JWT claims. `worker_id`, `tenant_id`,
-/// `region`, and `apps` are worker-specific. The Go control plane reads
-/// worker_id, tenant_id, and apps; `region` and `jti` are informational and
-/// ignored — but `jti` (random per-token) gives us replay protection and
-/// guarantees each `sign()` produces a unique token even within the same
-/// second.
+/// `iss`/`aud`/`exp`/`iat`/`jti` are standard JWT claims. `worker_id`,
+/// `tenant_id`, `region`, and `apps` are worker-specific. The Go
+/// control plane reads worker_id, tenant_id, and apps; `region` and
+/// `jti` are informational and ignored — but `jti` (random per-token)
+/// gives us replay protection and guarantees each `sign()` produces a
+/// unique token even within the same second.
+///
+/// `aud` (PR #200 review finding H8) is the defense-in-depth gate
+/// that distinguishes worker-issued JWTs from any other token type
+/// minted with the same secret in the future. An empty `aud` is
+/// allowed (mirrors the Go side, where an empty
+/// `WorkerJWTConfig.Audience` disables the check) for backward
+/// compatibility with code paths that predate this field; production
+/// workers should set the audience via `WORKER_JWT_AUDIENCE`
+/// (default: `"edge-internal"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerClaims {
     pub iss: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
     pub exp: usize,
     pub iat: usize,
     pub jti: String,
@@ -90,6 +121,12 @@ pub enum TokenSource {
 pub struct WorkerJwtSigner {
     source: TokenSource,
     issuer: String,
+    /// Optional `aud` claim (PR #200 review finding H8). `None`
+    /// disables the claim (backward-compatible with code paths that
+    /// predate the audience gate). Production workers should set
+    /// this to `Some("edge-internal".to_string())` via
+    /// `Config::worker_jwt_audience`.
+    audience: Option<String>,
     worker_id: String,
     region: String,
     tenant_id: String,
@@ -122,6 +159,7 @@ impl WorkerJwtSigner {
         worker_id: impl Into<String>,
         region: impl Into<String>,
         tenant_id: impl Into<String>,
+        audience: Option<String>,
     ) -> Arc<Self> {
         Self::from_source(
             TokenSource::Static(secret.into()),
@@ -129,6 +167,7 @@ impl WorkerJwtSigner {
             worker_id.into(),
             region.into(),
             tenant_id.into(),
+            audience,
         )
     }
 
@@ -144,6 +183,7 @@ impl WorkerJwtSigner {
         worker_id: impl Into<String>,
         region: impl Into<String>,
         tenant_id: impl Into<String>,
+        audience: Option<String>,
         fetch: F,
     ) -> Arc<Self>
     where
@@ -155,6 +195,7 @@ impl WorkerJwtSigner {
             worker_id.into(),
             region.into(),
             tenant_id.into(),
+            audience,
         )
     }
 
@@ -164,10 +205,12 @@ impl WorkerJwtSigner {
         worker_id: String,
         region: String,
         tenant_id: String,
+        audience: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             source,
             issuer,
+            audience,
             worker_id,
             region,
             tenant_id,
@@ -232,7 +275,7 @@ impl WorkerJwtSigner {
         // before expiry). Returns while holding the lock; the guard is
         // dropped on return and the token is cloned out.
         if let Some(ct) = cache.as_ref() {
-            if ct.expires_at.saturating_duration_since(now) > REFRESH_LEAD {
+            if ct.expires_at.saturating_duration_since(now) > refresh_lead_with_jitter() {
                 return Ok(ct.token.clone());
             }
         }
@@ -294,6 +337,7 @@ impl WorkerJwtSigner {
 
         let claims = WorkerClaims {
             iss: self.issuer.clone(),
+            aud: self.audience.clone(),
             exp: now_unix + self.ttl.as_secs() as usize,
             iat: now_unix,
             jti: Uuid::new_v4().to_string(),
@@ -382,6 +426,7 @@ mod tests {
             "w_fra_abc123",
             "fra",
             "t_tenant1",
+            None,
         )
     }
 
@@ -482,6 +527,7 @@ mod tests {
             "w_fra_abc123",
             "fra",
             "t_tenant1",
+            None,
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(JwtBundle {
@@ -528,6 +574,7 @@ mod tests {
             "w_fra_abc123",
             "fra",
             "t_tenant1",
+            None,
             || Err(anyhow::anyhow!("synthetic bootstrap failure")),
         );
         let err = s.sign().expect_err("must error on callback failure");
@@ -575,7 +622,7 @@ mod tests {
     fn new_with_callback_errors_when_server_returns_past_expiry() {
         let counter = Arc::new(AtomicU32::new(0));
         let s =
-            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", {
+            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", None, {
                 let counter = counter.clone();
                 move || {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -603,7 +650,7 @@ mod tests {
     fn new_with_callback_does_not_cache_when_server_returns_past_expiry() {
         let counter = Arc::new(AtomicU32::new(0));
         let s =
-            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", {
+            WorkerJwtSigner::new_with_callback("edgecloud", "w_fra_abc123", "fra", "t_tenant1", None, {
                 let counter = counter.clone();
                 move || {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -732,5 +779,24 @@ mod tests {
             "post-expiry concurrent calls must trigger exactly one extra callback; got {}",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    /// PR #200 review finding H3: the refresh lead must include a
+    /// jitter so a fleet of workers sharing one PSK doesn't all
+    /// re-bootstrap at the same instant when the operator rotates
+    /// the PSK. The function must always return a value within
+    /// `[300s, 360s]`.
+    #[test]
+    fn refresh_lead_jitter_is_within_window() {
+        let min = std::time::Duration::from_secs(5 * 60);
+        let max = std::time::Duration::from_secs(5 * 60 + 60);
+        for _ in 0..1000 {
+            let got = refresh_lead_with_jitter();
+            assert!(
+                got >= min && got <= max,
+                "refresh lead must be in [300s, 360s]; got {:?}",
+                got
+            );
+        }
     }
 }

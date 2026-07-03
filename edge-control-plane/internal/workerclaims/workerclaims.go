@@ -18,10 +18,46 @@ import "github.com/golang-jwt/jwt/v5"
 // and `jti` are informational and ignored by `VerifyWorkerJWT`.
 // `jti` (random per-token) gives replay protection and guarantees
 // each Mint produces a unique token even within the same second.
+//
+// `role` distinguishes the bearer: per-worker tokens carry
+// `RoleWorker` (or empty, for backward compatibility with tokens
+// minted before this field existed); the long-lived ingress
+// service token carries `RoleIngest` so the control plane can
+// gate cross-tenant reads (ListDomains, TlsAllowed,
+// UpdateDomainStatus) to the poller only — a per-worker JWT
+// would otherwise see every tenant's domain mapping. The
+// `omitempty` keeps the JSON shape backward-compatible with
+// pre-Role tokens.
+//
+// PR #200 review finding H2: this struct is the single source of
+// truth. The verifier (`internal/middleware`) and the minter
+// (`internal/service`) both reference it; `middleware.WorkerClaims`
+// is a type alias to it so existing call sites
+// (`claims := middleware.WorkerClaims{...}`) keep compiling without
+// edits. Adding a new claim here automatically threads through both
+// minter and verifier, eliminating the silent-drift risk of two
+// separately-defined structs.
 type WorkerClaims struct {
 	jwt.RegisteredClaims
 	WorkerID string   `json:"worker_id"`
 	TenantID string   `json:"tenant_id"`
 	Region   string   `json:"region"`
 	Apps     []string `json:"apps"`
+	Role     string   `json:"role,omitempty"`
 }
+
+// Role constants for the Role claim. Lives on WorkerClaims so the
+// minter, verifier, and ingress token issuer all reference the same
+// canonical strings.
+const (
+	// RoleWorker is the default for any worker-issued JWT. May run
+	// per-worker endpoints (e.g. /api/internal/download/*,
+	// /api/internal/workers/*) but NOT the cross-tenant domain
+	// endpoints.
+	RoleWorker = "worker"
+	// RoleIngest is for the long-lived ingress service token
+	// (cmd/api/mint.go). Allows access to the cross-tenant domain
+	// endpoints used by the FQDN poller and the v2 Caddy event
+	// hook (issue #83).
+	RoleIngest = "ingest"
+)

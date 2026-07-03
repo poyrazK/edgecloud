@@ -8,44 +8,37 @@ import (
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/workerclaims"
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// WorkerClaims are the JWT claims issued to workers.
-type WorkerClaims struct {
-	jwt.RegisteredClaims
-	WorkerID string   `json:"worker_id"`
-	TenantID string   `json:"tenant_id"`
-	Region   string   `json:"region"`
-	Apps     []string `json:"apps"`
-	// Role distinguishes the bearer: per-worker tokens carry
-	// RoleWorker (or empty, for backward compatibility with tokens
-	// minted before this field existed); the long-lived ingress
-	// service token carries RoleIngest so the control plane can
-	// gate cross-tenant reads (ListDomains, TlsAllowed,
-	// UpdateDomainStatus) to the poller only — a per-worker JWT
-	// would otherwise see every tenant's domain mapping.
-	Role string `json:"role,omitempty"`
-}
+// WorkerClaims is a type alias for `workerclaims.WorkerClaims` so all
+// existing call sites (`claims := middleware.WorkerClaims{...}`)
+// keep compiling unchanged. PR #200 review finding H2: this alias
+// makes the verifier and the minter reference the same underlying
+// struct, so adding a new claim in `workerclaims` automatically
+// threads through both halves — eliminating the silent-drift risk of
+// two separately-defined structs.
+type WorkerClaims = workerclaims.WorkerClaims
 
-// Role constants for the Role claim.
+// Role constants are re-exported from the workerclaims package so
+// existing references (`middleware.RoleIngest`) keep working.
 const (
-	// RoleWorker is the default for any worker-issued JWT. May run
-	// per-worker endpoints (e.g. /api/internal/download/*,
-	// /api/internal/workers/*) but NOT the cross-tenant domain
-	// endpoints.
-	RoleWorker = "worker"
-	// RoleIngest is for the long-lived ingress service token
-	// (cmd/api/mint.go). Allows access to the cross-tenant domain
-	// endpoints used by the FQDN poller and the v2 Caddy event
-	// hook (issue #83).
-	RoleIngest = "ingest"
+	RoleWorker = workerclaims.RoleWorker
+	RoleIngest = workerclaims.RoleIngest
 )
 
-// WorkerJWTConfig holds the HMAC secret and expected issuer.
+// WorkerJWTConfig holds the HMAC secret, expected issuer, and
+// expected audience. PR #200 review finding H8: the `aud` claim is
+// a defense-in-depth check that distinguishes worker-issued JWTs
+// from any other JWT type minted with the same secret in the
+// future (e.g. an admin or tenant-facing token). An empty
+// `Audience` disables the check, mirroring the existing `Issuer`
+// behavior — production callers must set both.
 type WorkerJWTConfig struct {
-	Secret string
-	Issuer string
+	Secret   string
+	Issuer   string
+	Audience string
 }
 
 const (
@@ -74,6 +67,18 @@ func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, er
 	// explicit call makes the intent visible and removes a layer of
 	// conditional indirection that the library handles internally.
 	opts = append(opts, jwt.WithIssuer(cfg.Issuer))
+	// PR #200 review finding H8: gate on the `aud` claim so worker
+	// JWTs are distinguishable from any other token type minted with
+	// the same secret in the future. The library's `WithAudience`
+	// does NOT short-circuit on an empty string (unlike `WithIssuer`,
+	// which treats empty as "no issuer check"); it actively requires
+	// the claim to be present. Skip the option entirely when
+	// `cfg.Audience == ""` so existing call sites (which predated
+	// the field) keep working unchanged. Production callers must set
+	// `WorkerJWTConfig.Audience = "edge-internal"`.
+	if cfg.Audience != "" {
+		opts = append(opts, jwt.WithAudience(cfg.Audience))
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])

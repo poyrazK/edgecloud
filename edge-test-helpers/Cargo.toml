@@ -21,3 +21,4 @@ tokio = { version = "1.45", features = ["full"] }
 # Smoke tests verify should_skip_integration_tests and test_config without
 # standing up Docker. nats_container and build_supervisor are exercised by
 # every consumer's integration suite (no separate smoke needed).
+

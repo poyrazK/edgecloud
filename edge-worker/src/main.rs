@@ -25,6 +25,18 @@ use edge_spool::Spool;
 use edge_worker::tracing_layer::WorkerLogLayer;
 
 use crate::auth::WorkerJwtSigner;
+
+/// Convert a worker-jwt-audience config string into an `Option<String>`
+/// for the signer constructor. Empty string means "no audience" — the
+/// signer then omits the `aud` claim from minted JWTs, matching the
+/// pre-H8 behavior. PR #200 review finding H8.
+fn audience_opt(audience: &str) -> Option<String> {
+    if audience.is_empty() {
+        None
+    } else {
+        Some(audience.to_string())
+    }
+}
 use crate::bootstrap::JwtBundle;
 use crate::config::Config;
 use crate::downloader::Downloader;
@@ -98,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 config.worker_id.clone(),
                 config.region.clone(),
                 config.worker_tenant_id.clone(),
+                audience_opt(&config.worker_jwt_audience),
                 make_bootstrap_callback(
                     http_client.clone(),
                     bootstrap_control_plane_url.clone(),
@@ -122,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
                     config.worker_id.clone(),
                     config.region.clone(),
                     config.worker_tenant_id.clone(),
+                    audience_opt(&config.worker_jwt_audience),
                     make_bootstrap_callback(
                         http_client.clone(),
                         bootstrap_control_plane_url.clone(),
@@ -145,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     config.worker_id.clone(),
                     config.region.clone(),
                     config.worker_tenant_id.clone(),
+                    audience_opt(&config.worker_jwt_audience),
                 )
             } else {
                 tracing::warn!(
@@ -163,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                     config.worker_id.clone(),
                     config.region.clone(),
                     config.worker_tenant_id.clone(),
+                    audience_opt(&config.worker_jwt_audience),
                     || {
                         Err(anyhow::anyhow!(
                             "no JWT source configured: set WORKER_BOOTSTRAP_PSK \
@@ -458,13 +474,25 @@ fn make_bootstrap_callback(
                 ));
             }
         };
-        // We're in a sync closure (the signer calls `sign()` outside
-        // an await point), but the bootstrap is async. Bridge via
-        // tokio's block_on — only the signer's slow path takes this
-        // hit, and only on cache miss (every REFRESH_LEAD, ~24h).
-        // The `client` is shared with the LogForwarder (finding B2):
-        // both reuse the same connection pool, no per-call TLS init.
-        let bundle = tokio::runtime::Handle::current().block_on(bootstrap::fetch_token(
+        // Sync→async bridge for the bootstrap POST. The signer calls
+        // `sign()` from inside tokio tasks (`Downloader::get_artifact`,
+        // `LogForwarder::flush_now`), so we're on a tokio runtime
+        // worker thread. Calling `Handle::current().block_on(...)`
+        // from inside a multi-thread runtime worker panics with
+        // "Cannot drop a runtime in a context where blocking is not
+        // allowed" — the same anti-pattern that d2399f4 retired for
+        // the reqwest sync/async bridge.
+        //
+        // The safe pattern (also used in `edge-test-helpers`):
+        //   1. `Handle::try_current()` — succeeds if we're on a
+        //      runtime worker thread; use `handle.block_on(...)`.
+        //   2. Otherwise — no runtime; build a fresh single-thread
+        //      runtime and call its `block_on(...)`.
+        //
+        // `block_on_in_runtime` is the shared helper at the bottom of
+        // this file; it's used for both `fetch_token` and `save_to_disk`
+        // below.
+        let bundle = block_on_in_runtime(bootstrap::fetch_token(
             &control_plane_url,
             &client,
             &psk,
@@ -475,8 +503,8 @@ fn make_bootstrap_callback(
         // Best-effort cache write. A failure here is logged but not
         // fatal — the in-memory bundle is still valid for the rest
         // of this boot.
-        if let Err(e) = tokio::runtime::Handle::current()
-            .block_on(bootstrap::save_to_disk(&cache_path, &bundle))
+        if let Err(e) =
+            block_on_in_runtime(bootstrap::save_to_disk(&cache_path, &bundle))
         {
             tracing::warn!(
                 err = %e,
@@ -486,6 +514,28 @@ fn make_bootstrap_callback(
             );
         }
         Ok(bundle)
+    }
+}
+
+/// Run an async future on the current tokio runtime if one exists,
+/// otherwise build a fresh single-thread runtime. Safe to call from
+/// inside a tokio worker thread (the original `Handle::current()` +
+/// `block_on` would panic).
+///
+/// Used by `make_bootstrap_callback` for both the bootstrap POST and
+/// the JWT cache write. Mirrors the pattern in
+/// `edge-test-helpers/src/supervisor.rs::build_signer_for_config`
+/// (review finding C2).
+fn block_on_in_runtime<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(future),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime for bootstrap callback");
+            rt.block_on(future)
+        }
     }
 }
 

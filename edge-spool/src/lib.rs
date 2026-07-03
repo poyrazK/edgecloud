@@ -95,12 +95,38 @@ impl Spool {
     /// `replay_spool`) decides what to do with any pending entries —
     /// that keeps the boundary clear between "spool is open" and
     /// "buffer contains the replayed contents".
+    ///
+    /// **Crash recovery (review C3 + H6).** Before returning, `open`
+    /// scans `dir` for orphans left by a previous crash:
+    ///   - `spool.draining` is renamed back to `spool.jsonl` so the
+    ///     pending batches are visible to the next `drain` instead of
+    ///     being silently lost. This is the case where `drain` had
+    ///     renamed `spool.jsonl` to `spool.draining` but died before
+    ///     the parse/unlink completed — without recovery, every
+    ///     pending batch would be invisible.
+    ///   - `*.tmp` siblings are removed. These are by definition
+    ///     orphans from a crashed `rotate_when_over`; the rotate
+    ///     either completed (the canonical file is already up to date)
+    ///     or didn't (the data on disk is still the pre-rotate
+    ///     contents and a subsequent rotate will redo the work).
+    ///     Leaving them in place leaks disk on every crash loop.
+    ///
+    /// Cleanup order: `*.tmp` first (idempotent), then `spool.draining`
+    /// rename (preserves the data).
     pub async fn open(dir: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(dir)
             .await
             .with_context(|| format!("create spool dir {}", dir.display()))?;
 
         let path = dir.join("spool.jsonl");
+
+        // Orphan recovery. Failures here are warnings, not errors — a
+        // best-effort cleanup is strictly better than panicking, and
+        // a missing rename doesn't lose data (the file is still on
+        // disk; the next `drain` will pick it up if the rename
+        // happens to land before that, or the operator can manually
+        // clean up).
+        recover_spool_orphans(dir, &path).await;
 
         Ok(Self {
             inner: Arc::new(SpoolInner {
@@ -428,56 +454,87 @@ impl Spool {
         // `[0..head_end]` (line-aligned); appending head-then-tail
         // reconstructs the original line on the next drain.
         // Prepending would break byte order — must be append.
+        //
+        // H4 fix: if the suffix-append fails (disk full, I/O error),
+        // rename `draining` back to `active` so the next drain retries
+        // the full file idempotently. Without this, the next drain's
+        // rename of `spool.jsonl → spool.draining` would atomically
+        // overwrite the orphaned `draining` (which still holds the
+        // full original) with the partial active file — losing the
+        // middle bytes that the failed append was supposed to preserve.
         if !dropped_head_suffix.is_empty() || !dropped_tail_prefix.is_empty() {
-            let mut append = tokio::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(&self.inner.path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "open active spool for dropped-suffix append: {}",
-                        self.inner.path.display()
-                    )
-                })?;
-            if !dropped_head_suffix.is_empty() {
-                tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_head_suffix)
+            let append_result: Result<()> = async {
+                let mut append = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(&self.inner.path)
                     .await
                     .with_context(|| {
                         format!(
-                            "append head suffix to active spool: {}",
+                            "open active spool for dropped-suffix append: {}",
                             self.inner.path.display()
                         )
                     })?;
-            }
-            if !dropped_tail_prefix.is_empty() {
-                tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_tail_prefix)
+                if !dropped_head_suffix.is_empty() {
+                    tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_head_suffix)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "append head suffix to active spool: {}",
+                                self.inner.path.display()
+                            )
+                        })?;
+                }
+                if !dropped_tail_prefix.is_empty() {
+                    tokio::io::AsyncWriteExt::write_all(&mut append, &dropped_tail_prefix)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "append tail prefix to active spool: {}",
+                                self.inner.path.display()
+                            )
+                        })?;
+                }
+                tokio::io::AsyncWriteExt::flush(&mut append)
                     .await
                     .with_context(|| {
                         format!(
-                            "append tail prefix to active spool: {}",
+                            "flush active spool after dropped-suffix append: {}",
                             self.inner.path.display()
                         )
                     })?;
+                Ok(())
             }
-            tokio::io::AsyncWriteExt::flush(&mut append)
-                .await
-                .with_context(|| {
-                    format!(
-                        "flush active spool after dropped-suffix append: {}",
-                        self.inner.path.display()
-                    )
-                })?;
+            .await;
+            if let Err(err) = append_result {
+                // H4 recovery: rename draining back to active. The
+                // full original is now on disk again; the next drain
+                // retries idempotently. Best-effort: log if the
+                // recovery rename fails but still propagate the
+                // original append error.
+                if let Err(rename_err) =
+                    tokio::fs::rename(&draining, &self.inner.path).await
+                {
+                    tracing::error!(
+                        draining = %draining.display(),
+                        active = %self.inner.path.display(),
+                        append_err = %err,
+                        rename_err = %rename_err,
+                        "spool: failed to recover from dropped-suffix append error"
+                    );
+                }
+                return Err(err);
+            }
         }
 
-        // Best-effort unlink. If this fails (e.g. transient I/O), the
-        // file is still consumed and the next drain sees a missing
-        // draining file; the data is in the parsed Vec. A leftover
-        // file would be re-drained on the next call and re-parsed —
-        // duplicates at the application level, not a data loss.
-        let _ = tokio::fs::remove_file(&draining).await;
-
+        // H5 fix: moved unlink to AFTER the parse loop so the draining
+        // file remains on disk if parse fails. Per-line errors are
+        // logged + skipped (one bad line doesn't drop the whole
+        // spool — review finding H5). The unlink only runs if we
+        // successfully parse the rest; otherwise the data is still
+        // on disk and the next drain can retry idempotently.
         if raw.is_empty() {
+            let _ = tokio::fs::remove_file(&draining).await;
             return Ok(Vec::new());
         }
 
@@ -487,14 +544,37 @@ impl Spool {
                 // Trailing newline; ignore.
                 continue;
             }
-            // A corrupt line is a real bug (we wrote every line with
-            // `\n` appended and no partial writes), so surface it
-            // rather than silently dropping. The caller can decide to
-            // log + continue or fail the drain.
-            let value: serde_json::Value =
-                serde_json::from_slice(line).with_context(|| format!("parse spool line {i}"))?;
-            out.push(value);
+            // H5 fix: tolerate a single unparseable line. The writer
+            // (`append`) only ever appends `\n`-terminated JSONL, so a
+            // corrupt line in practice means either a forward-
+            // incompatible schema change between worker versions or
+            // a partial disk write. In both cases, dropping the whole
+            // batch set (the pre-fix behavior) is the wrong move —
+            // we'd lose every accumulated batch since the previous
+            // successful drain. Log + skip the bad line and keep
+            // parsing the rest; the unlink at the bottom of the
+            // function removes the consumed data once we're done.
+            match serde_json::from_slice::<serde_json::Value>(line) {
+                Ok(value) => out.push(value),
+                Err(err) => {
+                    tracing::warn!(
+                        line_index = i,
+                        line_len = line.len(),
+                        err = %err,
+                        "spool: skipping unparseable line in drain"
+                    );
+                }
+            }
         }
+
+        // Now that the parse loop is complete (with any unparseable
+        // lines logged and skipped), unlink the draining file. If
+        // this fails (e.g. transient I/O), the data is already in
+        // `out`; a leftover file would be re-drained on the next
+        // call and re-parsed — duplicates at the application level,
+        // not data loss.
+        let _ = tokio::fs::remove_file(&draining).await;
+
         Ok(out)
     }
 
@@ -660,6 +740,81 @@ impl Spool {
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.inner.path
+    }
+}
+
+/// Best-effort orphan cleanup called from `Spool::open`.
+///
+/// Scans `dir` for files left over by a previous worker crash:
+///
+/// - **`spool.draining`** — rename back to `spool.jsonl` (the active
+///   path). This is the durability-critical case: `drain` had already
+///   moved the file off the active path, and a crash before the
+///   parse/unlink step would otherwise lose every pending batch. The
+///   atomic rename restores the data so the next `drain` picks it up.
+///
+/// - **`spool.jsonl.tmp`** (and any `spool.jsonl.tmp.*` siblings from
+///   future tmp-name patterns) — remove. These are by definition
+///   orphans from a crashed `rotate_when_over`; the rotate either
+///   completed (the canonical file is up to date) or didn't (a
+///   subsequent rotate will redo the work). Leaving them in place
+///   leaks disk on every crash loop.
+///
+/// The order is `*.tmp` first, then `spool.draining` rename. Failures
+/// are logged but never propagated — a best-effort cleanup is strictly
+/// better than panicking; a missed rename doesn't lose data (the file
+/// is still on disk).
+async fn recover_spool_orphans(dir: &Path, active_path: &Path) {
+    // Glob-match via read_dir: any sibling whose name starts with the
+    // canonical tmp prefix is an orphan. Future tmp-name patterns are
+    // caught without code changes.
+    let tmp_prefix = "spool.jsonl.tmp";
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                err = %err,
+                "spool: read_dir failed during orphan recovery; skipping"
+            );
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "spool.draining" {
+            // Atomic rename back to the active path.
+            let draining = entry.path();
+            match tokio::fs::rename(&draining, active_path).await {
+                Ok(()) => tracing::warn!(
+                    draining = %draining.display(),
+                    active = %active_path.display(),
+                    "spool: recovered orphaned draining file from previous crash"
+                ),
+                Err(err) => tracing::warn!(
+                    draining = %draining.display(),
+                    err = %err,
+                    "spool: failed to recover orphaned draining file"
+                ),
+            }
+        } else if name_str.starts_with(tmp_prefix) {
+            // Best-effort remove. The tmp file is by definition an
+            // orphan — losing it on a transient error is no worse than
+            // the original crash.
+            let tmp = entry.path();
+            match tokio::fs::remove_file(&tmp).await {
+                Ok(()) => tracing::warn!(
+                    tmp = %tmp.display(),
+                    "spool: removed stale tmp file from previous crash"
+                ),
+                Err(err) => tracing::warn!(
+                    tmp = %tmp.display(),
+                    err = %err,
+                    "spool: failed to remove stale tmp file"
+                ),
+            }
+        }
     }
 }
 
@@ -1043,6 +1198,155 @@ mod tests {
         let drained2 = spool.drain(None).await.expect("drain 2");
         assert_eq!(drained2.len(), 1);
         assert_eq!(drained2[0], json!({"second": true}));
+    }
+
+    // ----------------------------------------------------------------
+    // Crash-recovery tests (review findings C3, H5, H6).
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_recovers_orphaned_draining_file() {
+        // Simulates a worker crash mid-drain: the rename to
+        // `spool.draining` happened but the parse/unlink did not.
+        // Without recovery, every pending batch would be invisible
+        // to the next `open`/`drain` — the spool's central durability
+        // promise is broken.
+        let dir = TempDir::new().expect("tempdir");
+        let draining = dir.path().join("spool.draining");
+        let line1 = json!({"recovered": 1});
+        let line2 = json!({"recovered": 2});
+        let line3 = json!({"recovered": 3});
+        let payload = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&line1).unwrap(),
+            serde_json::to_string(&line2).unwrap(),
+            serde_json::to_string(&line3).unwrap()
+        );
+        tokio::fs::write(&draining, payload.as_bytes())
+            .await
+            .expect("seed draining file");
+
+        // Open: must atomically rename `spool.draining` → `spool.jsonl`.
+        let spool = Spool::open(dir.path()).await.expect("open");
+
+        // After open, the draining file is gone and the active file
+        // holds the recovered data.
+        assert!(!draining.exists(), "draining file must be renamed away");
+        assert!(
+            dir.path().join("spool.jsonl").exists(),
+            "active file must exist after recovery"
+        );
+
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(
+            drained.len(),
+            3,
+            "all three recovered batches must round-trip"
+        );
+        assert_eq!(drained[0], line1);
+        assert_eq!(drained[1], line2);
+        assert_eq!(drained[2], line3);
+    }
+
+    #[tokio::test]
+    async fn open_cleans_stale_tmp_files() {
+        // Simulates one or more worker crashes during
+        // `rotate_when_over` (which uses `spool.jsonl.tmp` as the
+        // staging file). Without cleanup, these leak disk on every
+        // crash loop.
+        let dir = TempDir::new().expect("tempdir");
+        let tmp1 = dir.path().join("spool.jsonl.tmp");
+        let tmp2 = dir.path().join("spool.jsonl.tmp.abc123");
+        tokio::fs::write(&tmp1, b"junk from first crash")
+            .await
+            .expect("seed tmp1");
+        tokio::fs::write(&tmp2, b"junk from second crash")
+            .await
+            .expect("seed tmp2");
+
+        let _spool = Spool::open(dir.path()).await.expect("open");
+
+        assert!(!tmp1.exists(), "tmp1 must be removed");
+        assert!(!tmp2.exists(), "tmp2 (with extra suffix) must also be removed");
+        // No active file yet — open on a fresh dir is a no-op for data.
+        assert!(!dir.path().join("spool.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn open_handles_draining_and_tmp_together() {
+        // Both kinds of orphans present simultaneously — the cleanup
+        // must handle them in a single open call.
+        let dir = TempDir::new().expect("tempdir");
+        let draining = dir.path().join("spool.draining");
+        let tmp = dir.path().join("spool.jsonl.tmp");
+        let seed = json!({"recovered": true});
+        let payload = format!("{}\n", serde_json::to_string(&seed).unwrap());
+        tokio::fs::write(&draining, payload.as_bytes())
+            .await
+            .expect("seed draining");
+        tokio::fs::write(&tmp, b"orphan tmp").await.expect("seed tmp");
+
+        let spool = Spool::open(dir.path()).await.expect("open");
+
+        assert!(!draining.exists(), "draining renamed");
+        assert!(!tmp.exists(), "tmp removed");
+
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(drained, vec![seed]);
+    }
+
+    #[tokio::test]
+    async fn drain_skips_unparseable_line_keeps_others() {
+        // Review H5: a single corrupt line must not drop the entire
+        // spool. The pre-fix `?`-propagate would abandon every batch
+        // since the last successful drain.
+        let (_dir, spool) = fresh_spool().await;
+
+        let good_a = json!({"ok": "a"});
+        let good_b = json!({"ok": "b"});
+        let good_c = json!({"ok": "c"});
+        spool.append(&good_a).await.expect("append a");
+        spool.append(&good_b).await.expect("append b");
+        spool.append(&good_c).await.expect("append c");
+
+        // Inject a corrupt line directly into the spool file.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(spool.path())
+            .expect("open spool for inject");
+        f.write_all(b"{not valid json\n")
+            .expect("inject corrupt line");
+        drop(f);
+
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(
+            drained.len(),
+            3,
+            "the three good lines must round-trip; the corrupt line is skipped"
+        );
+        assert_eq!(drained[0], good_a);
+        assert_eq!(drained[1], good_b);
+        assert_eq!(drained[2], good_c);
+    }
+
+    #[tokio::test]
+    async fn drain_unlinks_after_parse() {
+        // The unlink must run AFTER parse, not before. If parse fails
+        // (tested above), the file should still be on disk so the
+        // operator can recover. After a successful parse, the file is
+        // gone.
+        let dir = TempDir::new().expect("tempdir");
+        let spool = Spool::open(dir.path()).await.expect("open");
+        spool.append(&json!({"k": 1})).await.expect("append");
+
+        let drained = spool.drain(None).await.expect("drain");
+        assert_eq!(drained.len(), 1);
+
+        // After a successful drain, both the active and draining
+        // files are gone.
+        assert!(!dir.path().join("spool.jsonl").exists());
+        assert!(!dir.path().join("spool.draining").exists());
     }
 
     /// Finding C1 — `rotate_when_over` must complete in bounded time

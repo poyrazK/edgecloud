@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,5 +326,60 @@ func TestWorkerAuth_HeaderWinsWhenBothPresent(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d (header should win when both present)", rec.Code, http.StatusOK)
+	}
+}
+
+// PR #200 review finding H8: when `WorkerJWTConfig.Audience` is set,
+// tokens with a different `aud` claim must be rejected. This is the
+// defense-in-depth gate that distinguishes worker-issued JWTs from
+// any other token type minted with the same secret in the future.
+func TestVerifyWorkerJWT_WrongAudience(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud", Audience: "edge-internal"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			Audience:  jwt.ClaimStrings{"some-other-service"},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Fatal("expected error for wrong audience, got nil")
+	}
+	if !strings.Contains(err.Error(), "aud") {
+		t.Errorf("error should mention aud; got: %v", err)
+	}
+}
+
+// PR #200 review finding H8: when `WorkerJWTConfig.Audience` is set,
+// tokens with the matching `aud` claim must be accepted. Pairs with
+// TestVerifyWorkerJWT_WrongAudience.
+func TestVerifyWorkerJWT_CorrectAudience(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret", Issuer: "edgecloud", Audience: "edge-internal"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			Audience:  jwt.ClaimStrings{"edge-internal"},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret"))
+
+	got, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Fatalf("expected valid token, got %v", err)
+	}
+	if got.WorkerID != "w_fra_abc123" {
+		t.Errorf("WorkerID = %q, want %q", got.WorkerID, "w_fra_abc123")
 	}
 }
