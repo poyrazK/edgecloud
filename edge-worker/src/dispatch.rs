@@ -63,8 +63,10 @@ use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
 // The Response Sender/Receiver aliases factor a 6-line type that
 // clippy::type_complexity rightly complains about.
 type HandlerProxyPre = wasmtime_wasi_http::p2::bindings::ProxyPre<RuntimeState>;
-type HandlerResponseResult =
-    Result<HyperResponse<HyperOutgoingBody>, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode>;
+type HandlerResponseResult = Result<
+    HyperResponse<HyperOutgoingBody>,
+    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+>;
 type HandlerResponseSender = tokio::sync::oneshot::Sender<HandlerResponseResult>;
 type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseResult>;
 
@@ -126,8 +128,11 @@ impl HandlerDispatch {
         epoch_tick_ms: u64,
         config: HandlerConfig,
     ) -> anyhow::Result<Self> {
-        let proxy_pre = HandlerProxyPre::new(instance_pre)
-            .map_err(|e| anyhow::anyhow!("ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"))?;
+        let proxy_pre = HandlerProxyPre::new(instance_pre).map_err(|e| {
+            anyhow::anyhow!(
+                "ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"
+            )
+        })?;
         // Defend against divide-by-zero: a misconfigured 0 tick would
         // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);

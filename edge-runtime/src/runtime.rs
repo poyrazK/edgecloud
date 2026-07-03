@@ -54,7 +54,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView, WasiCtxView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
@@ -279,7 +279,7 @@ impl Clone for RuntimeState {
 impl WasiView for RuntimeState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
-            ctx:  &mut self.wasi_ctx,
+            ctx: &mut self.wasi_ctx,
             table: &mut self.resource_table,
         }
     }
@@ -446,10 +446,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("http://127.0.0.1/");
-        let result = state
-            .http()
-            .hooks
-            .send_request(req, TEST_REQUEST_CONFIG);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for denied host, got Ok");
         let msg = format!("{:?}", result.unwrap_err()).to_lowercase();
         assert!(
@@ -470,10 +467,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let result = state
-            .http()
-            .hooks
-            .send_request(req, TEST_REQUEST_CONFIG);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok from send_request for allowlisted host, got: {:?}",
@@ -487,10 +481,7 @@ mod send_request_tests {
         // must be denied.
         let mut state = state_with_egress(Arc::new(EgressPolicy::new(vec![])));
         let req = make_request("https://example.com/");
-        let result = state
-            .http()
-            .hooks
-            .send_request(req, TEST_REQUEST_CONFIG);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for empty allowlist, got Ok");
     }
 
@@ -500,10 +491,7 @@ mod send_request_tests {
         // pass, only hard-denied IPs would still error.
         let mut state = state_with_egress(Arc::new(EgressPolicy::allow_all()));
         let req = make_request("http://127.0.0.1/");
-        let result = state
-            .http()
-            .hooks
-            .send_request(req, TEST_REQUEST_CONFIG);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         // Loopback still hard-denied even under allow_all() — this
         // confirms the hard-deny layer precedes the allowlist.
         assert!(
@@ -520,10 +508,7 @@ mod send_request_tests {
                 vec!["*.stripe.com".to_string()],
             )));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let result = state
-            .http()
-            .hooks
-            .send_request(req, TEST_REQUEST_CONFIG);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok for wildcard-matched host, got: {:?}",

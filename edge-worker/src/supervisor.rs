@@ -220,12 +220,11 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(anyhow::Error::from(e)
-                    .context(format!(
-                        "failed to pre-instantiate {} (execution_model={:?}); \
+                return Err(anyhow::Error::from(e).context(format!(
+                    "failed to pre-instantiate {} (execution_model={:?}); \
                          wasi: imports are wired in Phase C",
-                        app_name, execution_model
-                    )));
+                    app_name, execution_model
+                )));
             }
         };
 

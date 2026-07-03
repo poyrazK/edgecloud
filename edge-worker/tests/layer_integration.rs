@@ -148,8 +148,7 @@ impl LayerHarness {
             create_component_linker_handler(&engine).context("create_component_linker_handler")?;
 
         let bytes = std::fs::read(&path).context("read handler.wasm")?;
-        let component =
-            Component::from_binary(&engine, &bytes).map_err(anyhow::Error::from)?;
+        let component = Component::from_binary(&engine, &bytes).map_err(anyhow::Error::from)?;
 
         // Pre-compile the component into an InstancePre. The per-request
         // path rebuilds its own store+state; this pre-compilation step

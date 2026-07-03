@@ -104,6 +104,17 @@ struct_missing = "allow"
 struct_pub_field_missing = "allow"
 trait_missing = "allow"
 variant_missing = "allow"
+# Re-evaluated after the wasmtime 25.0.3 -> 45.0.3 bump (PR #211). The
+# bindgen-generated `add_to_linker` macro output changed shape in 36+:
+# it now takes 3 params (`<T, D>(linker, options, host_getter)` where
+# `D: HostWithStore`) instead of 2, and `GuestIndices::new` takes a
+# `D` generic. wasmtime-wasi 36+ also added `Host::exit_with_code`
+# to the wasi:cli/exit Host trait. None of this is a runtime API we
+# own; it's all bindgen expansion noise from the wasmtime bump.
+function_parameter_count_changed = "allow"
+method_parameter_count_changed = "allow"
+method_requires_different_generic_type_params = "allow"
+trait_method_added = "allow"
 
 # `cargo-udeps` (run on nightly) flags `metrics`, `clock`, and
 # `tracing-subscriber` as unused because their usage is gated by the
