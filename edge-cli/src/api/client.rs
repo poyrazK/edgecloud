@@ -806,6 +806,26 @@ impl ApiClient {
         self.get_json_anyhow("get app", |base| format!("{base}/api/v1/apps/{app_name}"))
     }
 
+    /// POST `/api/v1/apps/{appName}` — create a new app.
+    pub fn create_app(&self, app_name: &str, description: Option<&str>) -> Result<App> {
+        let url = format!("{}/api/v1/apps/{}", self.base_url, app_name);
+        let payload = serde_json::json!({ "description": description });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&payload)
+            .send()?;
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("create app failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let body: App = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
+        Ok(body)
+    }
+
     /// GET `/api/v1/quotas` — get tenant quota and usage.
     pub fn get_quota(&self) -> Result<QuotaResponse> {
         self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))

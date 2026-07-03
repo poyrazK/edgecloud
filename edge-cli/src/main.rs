@@ -167,9 +167,10 @@ enum Command {
         weight: Option<u8>,
     },
 
-    /// List all apps, or show details for one.
+    /// List all apps, create an app, or show details for one.
     ///
     /// `edge apps` lists all apps for the tenant.
+    /// `edge apps create <name>` creates a new app.
     /// `edge apps get <name>` shows details for a specific app.
     Apps {
         #[command(subcommand)]
@@ -303,6 +304,7 @@ enum StatusAction {
 /// `edge apps` — list apps or show details for one.
 ///
 /// Bare `edge apps` lists all apps for the tenant.
+/// `edge apps create <name>` creates a new app.
 /// `edge apps get <name>` shows details for a specific app.
 #[derive(Subcommand)]
 enum AppsCommand {
@@ -310,6 +312,14 @@ enum AppsCommand {
     Get {
         /// App name to fetch.
         name: String,
+    },
+    /// Create a new app.
+    Create {
+        /// Name of the app to create.
+        name: String,
+        /// Optional description for the app.
+        #[arg(long)]
+        description: Option<String>,
     },
 }
 
@@ -347,6 +357,9 @@ fn main() -> Result<()> {
         Command::Apps { action } => match action {
             None => commands::apps::list(&cli.path),
             Some(AppsCommand::Get { name }) => commands::apps::get(&cli.path, &name),
+            Some(AppsCommand::Create { name, description }) => {
+                commands::apps::create(&cli.path, &name, description.as_deref())
+            }
         },
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
