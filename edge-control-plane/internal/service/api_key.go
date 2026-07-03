@@ -29,6 +29,7 @@ type APIKeyRepo interface {
 	GetByLookupHash(ctx context.Context, lookupHash string) (*domain.APIKey, error)
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	Delete(ctx context.Context, id string) error
+	Update(ctx context.Context, k *domain.APIKey) error
 	UpdateLastUsed(ctx context.Context, id string) error
 	UpdateHashIfAlgorithm(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error)
 }
@@ -113,6 +114,37 @@ func mintAPIKey(tenantID, name, role string) (string, *domain.APIKey, error) {
 	return rawKey, apiKey, nil
 }
 
+// ErrAPIKeyNotFound is returned by UpdateAPIKey when the key does not exist
+// or does not belong to the requesting tenant.
+var ErrAPIKeyNotFound = fmt.Errorf("api key not found")
+
+// UpdateAPIKey updates mutable fields (name, role) of an existing API key.
+// Returns ErrAPIKeyNotFound if the key is missing or belongs to a different tenant.
+func (s *APIKeyService) UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
+	key, err := s.apiKeyRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("getting api key: %w", err)
+	}
+	if key == nil || key.TenantID != tenantID {
+		return nil, ErrAPIKeyNotFound
+	}
+
+	if req.Name != nil {
+		key.Name = *req.Name
+	}
+	if req.Role != nil {
+		if !domain.IsValidRole(*req.Role) {
+			return nil, fmt.Errorf("invalid role: %s", *req.Role)
+		}
+		key.Role = *req.Role
+	}
+
+	if err := s.apiKeyRepo.Update(ctx, key); err != nil {
+		return nil, fmt.Errorf("updating api key: %w", err)
+	}
+	return key, nil
+}
+
 func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
 	return s.apiKeyRepo.ListByTenant(ctx, tenantID)
 }
@@ -124,6 +156,7 @@ type APIKeyServiceInterface interface {
 	ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	GetByID(ctx context.Context, id string) (*domain.APIKey, error)
 	DeleteAPIKey(ctx context.Context, id string) error
+	UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error)
 }
 
 // GetByID returns a single API key by its prefixed ID (e.g. "k_<uuid>").

@@ -76,6 +76,9 @@ func (m *mockAPIKeySvc) ListAPIKeys(ctx context.Context, tenantID string) ([]dom
 func (m *mockAPIKeySvc) DeleteAPIKey(ctx context.Context, id string) error {
 	panic("not used by Whoami")
 }
+func (m *mockAPIKeySvc) UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
+	panic("not used by Whoami")
+}
 
 // contextWithAuth simulates what AuthMiddleware injects after a successful
 // Bearer token validation.

@@ -200,6 +200,18 @@ components:
           format: date-time
           example: "2026-01-02T03:04:05Z"
 
+    UpdateAPIKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: New name. Omit to leave unchanged.
+          example: renamed-key
+        role:
+          type: string
+          description: "New role. Omit to leave unchanged. Valid roles: 'developer', 'owner', 'viewer'."
+          example: viewer
+
     # -------------------------------------------------------------------------
     # Apps
     # -------------------------------------------------------------------------
@@ -2007,6 +2019,38 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   /api/v1/keys/{keyID}:
+    put:
+      operationId: updateAPIKey
+      summary: Update an API key's name or role
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The API key ID to update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAPIKeyRequest'
+      responses:
+        '200':
+          description: API key updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIKeyInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
     delete:
       operationId: deleteAPIKey
       summary: Revoke an API key

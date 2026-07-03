@@ -35,6 +35,7 @@ func (s *stubAPIKeyRepo) ListByTenant(ctx context.Context, tenantID string) ([]d
 	return nil, nil
 }
 func (s *stubAPIKeyRepo) Delete(ctx context.Context, id string) error { return nil }
+func (s *stubAPIKeyRepo) Update(ctx context.Context, k *domain.APIKey) error { return nil }
 func (s *stubAPIKeyRepo) UpdateLastUsed(ctx context.Context, id string) error {
 	return nil
 }

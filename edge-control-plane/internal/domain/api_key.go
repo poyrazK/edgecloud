@@ -48,3 +48,10 @@ const (
 func IsValidRole(r string) bool {
 	return r == RoleOwner || r == RoleDeveloper || r == RoleViewer
 }
+
+// UpdateAPIKeyRequest is sent when updating an existing API key.
+// nil pointer fields mean "don't change"; non-nil means "set to this value".
+type UpdateAPIKeyRequest struct {
+	Name *string `json:"name"` // nil = no change
+	Role *string `json:"role"` // nil = no change
+}

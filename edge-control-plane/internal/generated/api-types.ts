@@ -490,7 +490,8 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /** Update an API key's name or role */
+        put: operations["updateAPIKey"];
         post?: never;
         /** Revoke an API key */
         delete: operations["deleteAPIKey"];
@@ -908,6 +909,18 @@ export interface components {
              * @example 2026-01-02T03:04:05Z
              */
             created_at?: string;
+        };
+        UpdateAPIKeyRequest: {
+            /**
+             * @description New name. Omit to leave unchanged.
+             * @example renamed-key
+             */
+            name?: string;
+            /**
+             * @description New role. Omit to leave unchanged. Valid roles: 'developer', 'owner', 'viewer'.
+             * @example viewer
+             */
+            role?: string;
         };
         CreateAppRequest: {
             /**
@@ -2443,6 +2456,37 @@ export interface operations {
                     "application/json": components["schemas"]["Quota"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateAPIKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The API key ID to update. */
+                keyID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAPIKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description API key updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyInfo"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
