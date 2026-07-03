@@ -28,6 +28,10 @@ type PlanSpec struct {
 
 // planTiers is the single source of truth for plan→quota mapping.
 // Values mirror whitepaper §11 (whitepaper.md:720-735) verbatim.
+//
+// The same plan→cap values are duplicated in
+// migrations/013_quotas_used_requests.up.sql for the backfill UPDATE.
+// Keep both in sync when adding tiers or adjusting caps.
 var planTiers = map[string]PlanSpec{
 	"free": {
 		Name: "free", DisplayName: "Free", PricePerMonthCents: 0,
