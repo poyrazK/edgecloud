@@ -90,6 +90,13 @@ pub struct Config {
     /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
     /// Defaults to `edgecloud`.
     pub worker_jwt_issuer: String,
+    /// Expected `aud` claim (PR #200 review finding H8). Defaults to
+    /// `edge-internal` to match the Go side's default; the worker
+    /// pins the value as `Some(audience)` so the resulting JWT
+    /// carries the audience gate. An empty string disables the
+    /// audience claim for backward compatibility with code paths
+    /// that predate the feature.
+    pub worker_jwt_audience: String,
     /// The tenant this worker is authorized for. Loaded once at startup;
     /// a worker is per-tenant in this design (whitepaper §9.3 calls for
     /// tenant-agnostic workers — file a follow-up to revisit).
@@ -236,6 +243,8 @@ impl Config {
             worker_jwt_secret: std::env::var("WORKER_JWT_SECRET").unwrap_or_default(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
+            worker_jwt_audience: std::env::var("WORKER_JWT_AUDIENCE")
+                .unwrap_or_else(|_| "edge-internal".into()),
             worker_tenant_id: std::env::var("WORKER_TENANT_ID")
                 .context("WORKER_TENANT_ID not set")?,
             worker_bootstrap_psk: parse_env_string_with_psk_check("WORKER_BOOTSTRAP_PSK"),

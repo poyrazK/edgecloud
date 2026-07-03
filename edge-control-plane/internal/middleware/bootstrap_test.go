@@ -88,6 +88,33 @@ func TestVerifyPSKSignature_TenantIDMismatch(t *testing.T) {
 	}
 }
 
+// PR #200 review finding C4: pin the same cross-language HMAC-SHA256
+// digest that the Rust `sign_with_psk_matches_known_vector` test
+// pins. Both tests fail together if the canonical payload format,
+// separator, byte order, or hash algorithm drifts between the two
+// languages — production only learns about it at first request,
+// which is too late.
+//
+// Compute via:
+//   python3 -c "import hmac, hashlib; print(hmac.new( \
+//     b'0123456789abcdef0123456789abcdef', \
+//     b'w_fra_abc123:fra:t_tenant1', hashlib.sha256).hexdigest())"
+//
+// Note: this uses "w_fra_abc123" (with the trailing 3) to match the
+// Rust side exactly. The earlier `TestVerifyPSKSignature_*` tests
+// use "w_fra_abc" without the trailing 3 — both digests are
+// stable; the cross-language invariant test only needs to match the
+// Rust pin.
+func TestSignTest_MatchesPinnedRustVector(t *testing.T) {
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	const expectedHex = "3561792155cbfd37ce3cfeb01f31585d6014194e8f1e9ccbbd7f8eb7aa6c2a0c"
+	got := signTest(psk, "w_fra_abc123", "fra", "t_tenant1")
+	if got != expectedHex {
+		t.Fatalf("Go HMAC-SHA256 digest drifted from Rust pin.\n  want: %s\n  got:  %s\nCheck the canonical payload format (%q) and the hash algorithm.",
+			expectedHex, got, "w_fra_abc123:fra:t_tenant1")
+	}
+}
+
 func TestVerifyPSKSignature_EmptySignature(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
 	if err := VerifyPSKSignature(psk, "w_fra_abc", "fra", "t_tenant1", ""); err == nil {
@@ -112,7 +139,7 @@ func TestVerifyPSKSignature_NonHex(t *testing.T) {
 }
 
 func TestPSKAuth_MissingHeaders(t *testing.T) {
-	cfg := BootstrapAuthConfig{PSK: []byte("0123456789abcdef0123456789abcdef")}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": []byte("0123456789abcdef0123456789abcdef")}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -133,7 +160,7 @@ func TestPSKAuth_MissingBody(t *testing.T) {
 	// the middleware now reads the body for tenant_id (finding A1)
 	// and must reject with 400.
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -154,7 +181,7 @@ func TestPSKAuth_MissingBody(t *testing.T) {
 
 func TestPSKAuth_InvalidJSONBody(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -175,7 +202,7 @@ func TestPSKAuth_InvalidJSONBody(t *testing.T) {
 
 func TestPSKAuth_EmptyTenantID(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -193,7 +220,7 @@ func TestPSKAuth_EmptyTenantID(t *testing.T) {
 
 func TestPSKAuth_Valid(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	var gotID, gotRegion, gotTenant string
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotID = GetBootstrapWorkerID(r.Context())
@@ -220,7 +247,7 @@ func TestPSKAuth_Valid(t *testing.T) {
 
 func TestPSKAuth_WrongSignature(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -246,7 +273,7 @@ func TestPSKAuth_WrongSignature(t *testing.T) {
 // signature was captured for tenant A must be rejected.
 func TestPSKAuth_BodyTenantIDMismatch(t *testing.T) {
 	psk := []byte("0123456789abcdef0123456789abcdef")
-	cfg := BootstrapAuthConfig{PSK: psk}
+	cfg := BootstrapAuthConfig{PSKs: map[string][]byte{"t_tenant1": psk}}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -277,7 +304,7 @@ func TestPSKAuth_EmptyPSKReturnsServiceUnavailable(t *testing.T) {
 	// exists but every request returns 503 (operators see the
 	// difference between "wrong-PSK" 401 and "server-side
 	// disabled" 503).
-	cfg := BootstrapAuthConfig{PSK: nil}
+	cfg := BootstrapAuthConfig{PSKs: nil}
 	called := false
 	h := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -343,3 +370,103 @@ func TestValidateIdentity_RejectsBadTenantID(t *testing.T) {
 type nopReadCloser struct{ *bytes.Reader }
 
 func (nopReadCloser) Close() error { return nil }
+
+// PR #200 review finding H1: per-tenant PSK binding. A request
+// whose body's tenant_id has no entry in the per-tenant PSK map
+// must be rejected with the same generic 401 used for a signature
+// mismatch — never a different status that would let an attacker
+// enumerate which tenants have PSKs configured.
+func TestPSKAuth_UnknownTenantRejected(t *testing.T) {
+	cfg := BootstrapAuthConfig{
+		PSKs: map[string][]byte{
+			"t_known1": []byte("known-psk-32-bytes-long-aaaaaaaaaaaa"),
+		},
+	}
+	// Build a request for tenant "t_unknown" using a signature
+	// computed with the *known* PSK. The middleware must reject
+	// this on the tenant-lookup step, before signature verification.
+	sig := signTest([]byte("known-psk-32-bytes-long-aaaaaaaaaaaa"),
+		"w_fra_abc", "fra", "t_unknown")
+	req := httptest.NewRequest("POST", "/api/internal/auth/token",
+		bytes.NewReader([]byte(`{"worker_id":"w_fra_abc","region":"fra","tenant_id":"t_unknown"}`)))
+	req.Header.Set("X-Worker-Id", "w_fra_abc")
+	req.Header.Set("X-Worker-Region", "fra")
+	req.Header.Set("X-Bootstrap-Signature", sig)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	middleware := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler must NOT be invoked for unknown tenant")
+	}))
+	middleware.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (unknown tenant must be 401, not 503/200)",
+			rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// PR #200 review finding H1: the known-tenant path must still work
+// after the per-tenant refactor. Pairs with TestPSKAuth_UnknownTenantRejected.
+func TestPSKAuth_KnownTenantAccepted(t *testing.T) {
+	cfg := BootstrapAuthConfig{
+		PSKs: map[string][]byte{
+			"t_known1": []byte("known-psk-32-bytes-long-aaaaaaaaaaaa"),
+			"t_known2": []byte("other-psk-32-bytes-long-bbbbbbbbbbb"),
+		},
+	}
+	sig := signTest([]byte("known-psk-32-bytes-long-aaaaaaaaaaaa"),
+		"w_fra_abc", "fra", "t_known1")
+	req := httptest.NewRequest("POST", "/api/internal/auth/token",
+		bytes.NewReader([]byte(`{"worker_id":"w_fra_abc","region":"fra","tenant_id":"t_known1"}`)))
+	req.Header.Set("X-Worker-Id", "w_fra_abc")
+	req.Header.Set("X-Worker-Region", "fra")
+	req.Header.Set("X-Bootstrap-Signature", sig)
+	req.Header.Set("Content-Type", "application/json")
+
+	called := false
+	rec := httptest.NewRecorder()
+	middleware := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+	middleware.ServeHTTP(rec, req)
+
+	if !called {
+		t.Errorf("handler must be invoked for known tenant; status = %d", rec.Code)
+	}
+}
+
+// PR #200 review finding H1: a captured signature for tenant A
+// cannot be replayed against tenant B even when both tenants have
+// PSKs configured — the per-tenant lookup selects tenant B's PSK
+// which produces a different HMAC than the captured signature.
+// (Defense in depth on top of the existing A1 tenant-binding check.)
+func TestPSKAuth_CrossTenantReplayBlocked(t *testing.T) {
+	cfg := BootstrapAuthConfig{
+		PSKs: map[string][]byte{
+			"t_alice": []byte("alice-psk-32-bytes-long-aaaaaaaaaaa"),
+			"t_victim": []byte("victim-psk-32-bytes-long-bbbbbbbbbb"),
+		},
+	}
+	// Capture a signature for t_alice using alice's PSK.
+	capturedSig := signTest([]byte("alice-psk-32-bytes-long-aaaaaaaaaaa"),
+		"w_fra_abc", "fra", "t_alice")
+	// Replay against t_victim with the SAME signature.
+	req := httptest.NewRequest("POST", "/api/internal/auth/token",
+		bytes.NewReader([]byte(`{"worker_id":"w_fra_abc","region":"fra","tenant_id":"t_victim"}`)))
+	req.Header.Set("X-Worker-Id", "w_fra_abc")
+	req.Header.Set("X-Worker-Region", "fra")
+	req.Header.Set("X-Bootstrap-Signature", capturedSig)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	middleware := PSKAuth(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler must NOT be invoked for cross-tenant replay")
+	}))
+	middleware.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (cross-tenant replay must 401)",
+			rec.Code, http.StatusUnauthorized)
+	}
+}

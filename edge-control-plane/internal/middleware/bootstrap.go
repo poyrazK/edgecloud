@@ -14,16 +14,37 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 )
 
-// BootstrapAuthConfig holds the pre-shared key the worker uses to
-// prove its identity during enrollment. Separate from WorkerJWTConfig
+// BootstrapAuthConfig holds the pre-shared keys workers use to prove
+// their identity during enrollment. Separate from WorkerJWTConfig
 // because the bootstrap path is the chicken-and-egg predecessor of
 // the JWT path — same server, different proof mechanism.
+//
+// PR #200 review finding H1: per-tenant PSK binding. The PSKs map is
+// keyed by `tenant_id`; a worker bootstrapping for tenant T must use
+// the PSK configured under `PSKs[T]`. A compromised PSK for tenant A
+// therefore cannot mint a JWT for tenant B (the HMAC verification
+// fails because the keyed lookup returns no entry for tenant B).
+//
+// Empty map disables the endpoint entirely (every request is rejected
+// with 503 — the route exists but cannot succeed until configured).
 type BootstrapAuthConfig struct {
-	// PSK is the pre-shared key the worker HMAC-signs with. Must match
-	// WORKER_BOOTSTRAP_PSK on the worker side. Empty PSK disables
-	// the endpoint entirely (every request is rejected with 503 —
-	// the route exists but cannot succeed until configured).
-	PSK []byte
+	// PSKs is the per-tenant pre-shared key map. Tenant IDs follow
+	// the same `^t_[a-z0-9_]+$` regex the worker sends in the body's
+	// `tenant_id` field. The HMAC computation uses the value
+	// `PSKs[tenantID]` as the key.
+	PSKs map[string][]byte
+}
+
+// PSKFor returns the per-tenant PSK for the given tenant ID, or nil
+// if no PSK is configured for that tenant. Callers should treat nil as
+// "tenant unknown" and reject the request with the same generic 401
+// used for signature mismatches (don't reveal whether the tenant was
+// unknown vs. whether the signature was wrong — avoids an oracle).
+func (c BootstrapAuthConfig) PSKFor(tenantID string) []byte {
+	if c.PSKs == nil {
+		return nil
+	}
+	return c.PSKs[tenantID]
 }
 
 const (
@@ -153,12 +174,12 @@ func VerifyPSKSignature(psk []byte, workerID, region, tenantID, signatureHex str
 func PSKAuth(cfg BootstrapAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if len(cfg.PSK) == 0 {
+			if len(cfg.PSKs) == 0 {
 				// 503 (not 401) because the server itself is
 				// misconfigured — not the client's fault. Operators
 				// see this in their own logs and know to set
-				// BOOTSTRAP_PSK.
-				httperror.WriteCtx(w, r, http.StatusServiceUnavailable, "bootstrap disabled: BOOTSTRAP_PSK not configured")
+				// BOOTSTRAP_PSKS.
+				httperror.WriteCtx(w, r, http.StatusServiceUnavailable, "bootstrap disabled: BOOTSTRAP_PSKS not configured")
 				return
 			}
 			workerID := strings.TrimSpace(r.Header.Get("X-Worker-Id"))
@@ -194,7 +215,18 @@ func PSKAuth(cfg BootstrapAuthConfig) func(http.Handler) http.Handler {
 				httperror.BadRequestCtx(w, r, err.Error())
 				return
 			}
-			if err := VerifyPSKSignature(cfg.PSK, workerID, region, body.TenantID, signature); err != nil {
+			// H1: per-tenant PSK binding. Look up the PSK for this
+			// tenant before signature verification. An empty result
+			// means "this tenant has no PSK configured"; we return
+			// the same generic 401 as a signature mismatch so an
+			// attacker can't enumerate which tenants have PSKs
+			// configured.
+			psk := cfg.PSKFor(body.TenantID)
+			if psk == nil {
+				httperror.UnauthorizedCtx(w, r, "invalid signature")
+				return
+			}
+			if err := VerifyPSKSignature(psk, workerID, region, body.TenantID, signature); err != nil {
 				httperror.UnauthorizedCtx(w, r, "invalid signature")
 				return
 			}

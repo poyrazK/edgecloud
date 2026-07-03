@@ -18,20 +18,22 @@ import (
 // through `Mint` rather than constructing the JWT inline.
 //
 // The minter is constructed once at startup from the JWT config
-// (secret + issuer + TTL) and shared by every handler. There's no
-// mutable state to speak of, so concurrent Mint calls are safe and
-// cheap.
+// (secret + issuer + audience + TTL) and shared by every handler.
+// There's no mutable state to speak of, so concurrent Mint calls
+// are safe and cheap.
 type WorkerJWTMinter struct {
-	secret []byte
-	issuer string
-	ttl    time.Duration
+	secret   []byte
+	issuer   string
+	audience string
+	ttl      time.Duration
 }
 
 // NewWorkerJWTMinter constructs a minter from the configured JWT
-// settings. Pulls the secret / issuer / TTL out of `config.JWTConfig`
-// (the same fields that drive `middleware.WorkerAuth`) so a token
-// minted here is identical to one the operator could mint by hand
-// with `JWT_SECRET`. The TTL is converted from hours to a Duration.
+// settings. Pulls the secret / issuer / audience / TTL out of
+// `config.JWTConfig` (the same fields that drive
+// `middleware.WorkerAuth`) so a token minted here is identical to
+// one the operator could mint by hand with `JWT_SECRET`. The TTL
+// is converted from hours to a Duration.
 func NewWorkerJWTMinter(cfg config.JWTConfig) *WorkerJWTMinter {
 	ttl := time.Duration(cfg.TTL) * time.Hour
 	if ttl <= 0 {
@@ -41,10 +43,19 @@ func NewWorkerJWTMinter(cfg config.JWTConfig) *WorkerJWTMinter {
 		// (which would 401 immediately on every WorkerAuth call).
 		ttl = 24 * time.Hour
 	}
+	audience := cfg.Audience
+	if audience == "" {
+		// PR #200 review H8: default the audience to "edge-internal" so
+		// deployments that haven't set JWT_AUDIENCE still get the
+		// defense-in-depth gate. Matches the default the worker-side
+		// signer uses (edge-worker/src/config.rs).
+		audience = "edge-internal"
+	}
 	return &WorkerJWTMinter{
-		secret: []byte(cfg.Secret),
-		issuer: cfg.Issuer,
-		ttl:    ttl,
+		secret:   []byte(cfg.Secret),
+		issuer:   cfg.Issuer,
+		audience: audience,
+		ttl:      ttl,
 	}
 }
 
@@ -69,6 +80,7 @@ func (m *WorkerJWTMinter) Mint(workerID, tenantID, region string) (string, time.
 	claims := &workerclaims.WorkerClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    m.issuer,
+			Audience:  jwt.ClaimStrings{m.audience},
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(exp),
 			ID:        newJTI(),
