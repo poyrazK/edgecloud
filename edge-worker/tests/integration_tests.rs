@@ -372,6 +372,14 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
+    // Connect and subscribe first
+    let client = async_nats::connect(&nats_url).await?;
+    let subject = format!("edgecloud.heartbeats.{}", "test-region");
+    let mut sub = client.subscribe(subject).await?;
+
+    // Give NATS server a moment to register the subscription
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
     // Build and publish a heartbeat manually
     let heartbeat = supervisor.build_heartbeat().await;
     supervisor
@@ -380,14 +388,14 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         .await
         .context("publish heartbeat")?;
 
-    // Subscribe and receive it
-    let received = timeout(
-        Duration::from_secs(5),
-        subscribe_heartbeats(&nats_url, "test-region"),
-    )
-    .await
-    .context("heartbeat subscription timed out")?
-    .context("subscribe_heartbeats")?;
+    // Receive it
+    let msg = timeout(Duration::from_secs(5), sub.next())
+        .await
+        .context("heartbeat subscription timed out")?
+        .context("no heartbeat message received")?;
+
+    let received: HeartbeatMessage =
+        serde_json::from_slice(&msg.payload).context("parse heartbeat")?;
 
     assert_eq!(received.worker_id, "test-worker");
     assert_eq!(received.region, "test-region");

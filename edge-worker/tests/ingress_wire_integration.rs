@@ -136,6 +136,9 @@ async fn run_test() -> anyhow::Result<()> {
     let subject = format!("edgecloud.heartbeats.{}", region);
     let mut sub = client.subscribe(subject).await?;
 
+    // Give NATS server a moment to register the subscription before we publish
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
     // Publish via the worker's own NatsClient — same code path the
     // heartbeat loop in `main.rs` uses — so we're testing the production
     // publisher, not a parallel hand-rolled one.
