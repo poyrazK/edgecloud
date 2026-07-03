@@ -188,22 +188,25 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Plan changes go through a dedicated service path because they may
-	// also rewrite the quota row. Done before UpdateTenant so the
-	// response reflects the new plan + (optionally) new quota defaults.
+	// also rewrite the quota row. The plan-change branch re-fetches after
+	// the service commits so the response's embedded Quota reflects the
+	// new tier (the original captured `tenant` would otherwise show the
+	// OLD quota caps alongside the new plan).
+	planChanged := false
 	if req.Plan != "" && req.Plan != tenant.Plan {
 		if err := h.tenantSvc.UpdateTenantPlan(r.Context(), tenantID, req.Plan, !req.PreserveQuotaLimits); err != nil {
-			if errors.Is(err, domain.ErrUnknownPlan) {
+			switch {
+			case errors.Is(err, domain.ErrUnknownPlan):
 				httperror.BadRequestCtx(w, r, "plan: must be one of free, pro, business, enterprise")
-				return
+			case errors.Is(err, service.ErrTenantNotFound), errors.Is(err, service.ErrQuotaNotFound):
+				httperror.NotFoundCtx(w, r, "tenant not found")
+			default:
+				log.Printf("UpdateTenantPlan(%s, %s): %v", tenantID, req.Plan, err)
+				httperror.InternalErrorCtx(w, r)
 			}
-			log.Printf("UpdateTenantPlan(%s, %s): %v", tenantID, req.Plan, err)
-			httperror.InternalErrorCtx(w, r)
 			return
 		}
-		// Reflect the new plan in the response. Skip the per-field name
-		// update below so UpdateTenant doesn't overwrite the plan we
-		// just wrote via UpdateTenantPlan.
-		tenant.Plan = req.Plan
+		planChanged = true
 	} else if req.Plan != "" {
 		// Same plan re-stated — no quota reapply, but validate anyway so
 		// an unknown plan string still gets a 400.
@@ -212,6 +215,20 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tenant.Plan = req.Plan
+	}
+
+	if planChanged {
+		// UpdateTenantPlan already wrote both rows in its own transaction.
+		// Re-fetch the canonical post-state so the response payload is
+		// consistent (new plan + new quota). Do NOT call UpdateTenant
+		// below — it would write a second time with stale fields.
+		fresh, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
+		if err != nil || fresh == nil {
+			log.Printf("Update: post-plan-change re-fetch failed for %s: %v", tenantID, err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		tenant = fresh
 	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {

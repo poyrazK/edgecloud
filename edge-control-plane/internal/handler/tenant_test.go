@@ -12,23 +12,27 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // mockTenantSvc implements service.TenantServiceInterface for testing.
 type mockTenantSvc struct {
-	bootstrapErr     error
-	bootstrapTenant  *domain.Tenant
-	bootstrapRawKey  string
-	createTenantResp *domain.Tenant
-	createTenantErr  error
-	getTenantResp    *domain.TenantWithQuota
-	getTenantErr     error
-	listTenantsResp  []domain.Tenant
-	listTenantsErr   error
-	updateTenantErr  error
-	deleteTenantErr  error
-	getQuotaResp     *domain.Quota
-	getQuotaErr      error
+	bootstrapErr        error
+	bootstrapTenant     *domain.Tenant
+	bootstrapRawKey     string
+	createTenantResp    *domain.Tenant
+	createTenantErr     error
+	getTenantResp       *domain.TenantWithQuota
+	getTenantRespAfter  *domain.TenantWithQuota // returned on the second-and-later GetTenant calls (plan-change re-fetch)
+	getTenantCalls      int
+	getTenantErr        error
+	listTenantsResp     []domain.Tenant
+	listTenantsErr      error
+	updateTenantErr     error
+	updateTenantPlanErr error // distinct from updateTenantErr so we can assert sentinel mapping on the plan-change branch
+	deleteTenantErr     error
+	getQuotaResp        *domain.Quota
+	getQuotaErr         error
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
@@ -46,8 +50,12 @@ func (m *mockTenantSvc) CreateTenant(ctx context.Context, name, plan string) (*d
 }
 
 func (m *mockTenantSvc) GetTenant(ctx context.Context, id string) (*domain.TenantWithQuota, error) {
+	m.getTenantCalls++
 	if m.getTenantErr != nil {
 		return nil, m.getTenantErr
+	}
+	if m.getTenantCalls >= 2 && m.getTenantRespAfter != nil {
+		return m.getTenantRespAfter, nil
 	}
 	return m.getTenantResp, nil
 }
@@ -64,7 +72,7 @@ func (m *mockTenantSvc) UpdateTenant(ctx context.Context, t *domain.Tenant) erro
 }
 
 func (m *mockTenantSvc) UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error {
-	return m.updateTenantErr
+	return m.updateTenantPlanErr
 }
 
 func (m *mockTenantSvc) DeleteTenant(ctx context.Context, id string) error {
@@ -584,8 +592,8 @@ func TestUpdate_PlanChange_AutoAppliesDefaults(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
 	}
-	if svc.updateTenantErr != nil {
-		t.Errorf("UpdateTenantPlan should have been called; got updateTenantErr=%v", svc.updateTenantErr)
+	if svc.updateTenantPlanErr != nil {
+		t.Errorf("UpdateTenantPlan should have been called; got updateTenantPlanErr=%v", svc.updateTenantPlanErr)
 	}
 }
 
@@ -615,7 +623,7 @@ func TestUpdate_PlanChange_RejectsUnknownPlan(t *testing.T) {
 		getTenantResp: &domain.TenantWithQuota{
 			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
 		},
-		updateTenantErr: fmt.Errorf("%w: %q", domain.ErrUnknownPlan, "platinum"),
+		updateTenantPlanErr: fmt.Errorf("%w: %q", domain.ErrUnknownPlan, "platinum"),
 	}
 	h := handler.NewTenantHandler(svc)
 
@@ -628,5 +636,91 @@ func TestUpdate_PlanChange_RejectsUnknownPlan(t *testing.T) {
 
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for unknown plan on update, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_TenantNotFound_404(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		},
+		updateTenantPlanErr: service.ErrTenantNotFound,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for tenant-not-found on plan change, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_QuotaNotFound_404(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		},
+		updateTenantPlanErr: service.ErrQuotaNotFound,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for quota-not-found on plan change, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_ResponseShowsNewQuota(t *testing.T) {
+	// First GetTenant (pre-plan-change) returns free-tier caps.
+	// Second GetTenant (post-plan-change re-fetch) returns the pro-tier
+	// caps. The handler must encode the post-fetch row so the response
+	// shows plan="pro" alongside max_requests_per_month=5_000_000.
+	free := &domain.TenantWithQuota{
+		Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 100_000, MaxOutboundMB: 1000},
+	}
+	pro := &domain.TenantWithQuota{
+		Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "pro"},
+		Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 5_000_000, MaxOutboundMB: 10_000},
+	}
+	svc := &mockTenantSvc{
+		getTenantResp:      free,
+		getTenantRespAfter: pro,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Plan                string `json:"plan"`
+		MaxRequestsPerMonth int    `json:"max_requests_per_month"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Plan != "pro" {
+		t.Errorf("Plan = %q, want pro", resp.Plan)
+	}
+	if resp.MaxRequestsPerMonth != 5_000_000 {
+		t.Errorf("MaxRequestsPerMonth = %d, want 5_000_000 (post-update re-fetch should override pre-update value)", resp.MaxRequestsPerMonth)
 	}
 }
