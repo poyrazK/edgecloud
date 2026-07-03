@@ -99,7 +99,6 @@ fn test_config(
     }
 }
 
-
 /// Maximum time to wait for the full test harness to start (container + NATS connection).
 const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -188,7 +187,6 @@ impl TestHarness {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
 
 /// Helper: wait for an app to appear in state with Running status.
 ///
