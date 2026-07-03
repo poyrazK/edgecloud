@@ -211,6 +211,17 @@ components:
           description: Optional human-readable description.
           example: Main web app
 
+    UpdateAppRequest:
+      type: object
+      properties:
+        description:
+          type: string
+          nullable: true
+          description: |
+            New description. Send `null` or omit to leave unchanged.
+            Send `""` to clear the description.
+          example: Updated description
+
     App:
       type: object
       properties:
@@ -1271,6 +1282,42 @@ paths:
       responses:
         '200':
           description: App details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    put:
+      operationId: updateApp
+      summary: Update mutable fields of an app
+      description: |
+        Updates the mutable fields (currently only `description`) of
+        an existing app. Nullable fields: omit the field or send `null`
+        to leave it unchanged; send `""` to clear it.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAppRequest'
+      responses:
+        '200':
+          description: App updated.
           content:
             application/json:
               schema:
