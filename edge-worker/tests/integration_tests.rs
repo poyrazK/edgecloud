@@ -42,6 +42,12 @@ use edge_test_helpers::{
     should_skip_integration_tests, start_nats, SupervisorGuard,
 };
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,edge_worker=debug,edge_runtime=debug")
+        .try_init();
+}
+
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
     include_bytes!("fixtures/test-handle.wasm")
@@ -236,6 +242,7 @@ async fn test_app_lifecycle() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -454,6 +461,7 @@ async fn test_artifact_hash_match_starts_app() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -497,6 +505,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -591,6 +600,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
