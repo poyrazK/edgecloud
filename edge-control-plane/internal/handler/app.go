@@ -68,6 +68,7 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(app); err != nil {
 		log.Printf("Create app: failed to encode response: %v", err)
 	}
+	auditRecord(r, "create", "app", appName, "app "+appName+" created", "success")
 }
 
 // List handles GET /api/apps — list all apps for the tenant with pagination.
@@ -158,6 +159,7 @@ func (h *AppHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(app); err != nil {
 		log.Printf("Update app: failed to encode response: %v", err)
 	}
+	auditRecord(r, "update", "app", appName, "app "+appName+" updated", "success")
 }
 
 // Delete handles DELETE /api/apps/{appName} — delete an app and all its data.
@@ -182,4 +184,5 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "delete", "app", appName, "app "+appName+" deleted", "success")
 }

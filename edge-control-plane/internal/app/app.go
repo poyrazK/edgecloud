@@ -142,6 +142,10 @@ func New(
 	}
 
 	// ── Handlers ──────────────────────────────────────────────────
+	auditRepo := repository.NewAuditRepository(db)
+	auditor := service.NewAuditor(auditRepo)
+	handler.DefaultAuditor = auditor
+
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)

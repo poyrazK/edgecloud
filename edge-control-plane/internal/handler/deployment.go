@@ -174,6 +174,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Deploy: failed to encode response: %v", err)
 	}
+	auditRecord(r, "deploy", "deployment", deployment.ID, "deployment "+deployment.ID+" created for app "+appName, "success")
 }
 
 // parseRegions turns the `?regions=` query value into a deduped slice.
@@ -375,6 +376,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
 			log.Printf("Activate: failed to encode response: %v", err)
 		}
+		auditRecord(r, "activate", "deployment", deploymentID, "deployment "+deploymentID+" activated for app "+appName, "success")
 		return
 	}
 
@@ -460,6 +462,7 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID}); err != nil {
 		log.Printf("Rollback: failed to encode response: %v", err)
 	}
+	auditRecord(r, "rollback", "deployment", newID, "app "+appName+" rolled back to deployment "+newID, "success")
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {

@@ -52,6 +52,7 @@ func (h *TrafficHandler) SetTraffic(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(map[string]string{"status": "traffic_set"}); err != nil {
 		log.Printf("SetTraffic: failed to encode response: %v", err)
 	}
+	auditRecord(r, "update", "traffic", appName, "traffic splits updated for app "+appName, "success")
 }
 
 // GetTraffic handles GET /api/v1/apps/{appName}/traffic.

@@ -53,6 +53,7 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "update", "env", appName+"/"+req.Key, "env var "+req.Key+" set for app "+appName, "success")
 }
 
 func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -87,4 +88,5 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "delete", "env", appName+"/"+key, "env var "+key+" deleted from app "+appName, "success")
 }
