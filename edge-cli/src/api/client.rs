@@ -339,6 +339,24 @@ struct AppListResponse {
     offset: u32,
 }
 
+/// Quota and usage returned by `GET /api/v1/quotas`.
+/// Mirrors the Go control-plane `quotaResponse` struct.
+#[derive(Debug, Deserialize)]
+pub struct QuotaResponse {
+    pub tenant_id: String,
+    pub max_deployments: i32,
+    pub max_apps: i32,
+    pub max_workers: i32,
+    pub max_memory_mb: i32,
+    pub max_outbound_mb: i32,
+    pub max_requests_per_month: i32,
+    pub used_outbound_bytes: i64,
+    pub used_request_count: i64,
+    pub quota_period_start: String,
+    #[serde(default)]
+    pub usage_pct: Option<f64>,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -607,6 +625,24 @@ impl ApiClient {
         Ok(())
     }
 
+    /// DELETE `/api/v1/apps/{appName}/env/{key}` — delete an environment variable.
+    pub fn delete_env(&self, app_name: &str, key: &str) -> Result<()> {
+        let url = format!("{}/api/v1/apps/{}/env/{}", self.base_url, app_name, key);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("delete env failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        Ok(())
+    }
+
     /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
     pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
         let url = if let Some(w) = weight {
@@ -745,6 +781,11 @@ impl ApiClient {
     /// GET `/api/v1/apps/{appName}` — get a single app by name.
     pub fn get_app(&self, app_name: &str) -> Result<App> {
         self.get_json_anyhow("get app", |base| format!("{base}/api/v1/apps/{app_name}"))
+    }
+
+    /// GET `/api/v1/quotas` — get tenant quota and usage.
+    pub fn get_quota(&self) -> Result<QuotaResponse> {
+        self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))
     }
 
     // ---- Custom-domain (issue #83) ----

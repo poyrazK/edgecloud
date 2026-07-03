@@ -5,5 +5,6 @@ pub mod domains;
 
 pub use client::{
     APIKeySummary, ApiClient, ApiError, App, AppWorkerStatus, LogEntry, LogListResponse,
+    QuotaResponse,
 };
 pub use domains::Domain;

@@ -13,6 +13,7 @@ pub mod init;
 pub mod logs;
 pub mod migrate;
 pub mod open;
+pub mod quota;
 pub mod rollback;
 pub(crate) mod state_io;
 pub mod status;

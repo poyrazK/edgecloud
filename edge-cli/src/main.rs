@@ -145,6 +145,12 @@ enum Command {
     /// List environment variables.
     EnvList,
 
+    /// Delete an environment variable.
+    EnvDelete {
+        /// Environment variable key to delete.
+        key: String,
+    },
+
     /// Activate a specific deployment.
     Activate {
         /// Deployment ID to activate.
@@ -199,6 +205,9 @@ enum Command {
 
     /// List all deployments for the app.
     Deployments,
+
+    /// Show tenant quota and usage.
+    Quota,
 
     /// Read recent log entries for the app (issue #77).
     ///
@@ -304,6 +313,7 @@ fn main() -> Result<()> {
         },
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
+        Command::EnvDelete { key } => commands::env::delete_var(&cli.path, &key),
         Command::Activate {
             deployment_id,
             weight,
@@ -317,6 +327,7 @@ fn main() -> Result<()> {
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Quota => commands::quota::run(&cli.path),
         Command::Logs {
             app,
             since,
