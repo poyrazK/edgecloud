@@ -357,6 +357,14 @@ pub struct QuotaResponse {
     pub usage_pct: Option<f64>,
 }
 
+/// Egress allowlist returned by `GET /api/v1/egress` and sent by
+/// `PUT /api/v1/egress`. Mirrors the Go control-plane
+/// `egressResponse` struct.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EgressAllowlist {
+    pub allowlist: Vec<String>,
+}
+
 impl ApiClient {
     /// Create a new API client. Loads the API key from
     /// `EDGE_API_KEY` env var or `~/.config/edgecloud/config.toml`.
@@ -786,6 +794,33 @@ impl ApiClient {
     /// GET `/api/v1/quotas` — get tenant quota and usage.
     pub fn get_quota(&self) -> Result<QuotaResponse> {
         self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))
+    }
+
+    /// GET `/api/v1/egress` — get the current egress allowlist.
+    pub fn get_egress(&self) -> Result<EgressAllowlist> {
+        self.get_json_anyhow("get egress", |base| format!("{base}/api/v1/egress"))
+    }
+
+    /// PUT `/api/v1/egress` — replace the egress allowlist.
+    pub fn set_egress(&self, hosts: &[String]) -> Result<EgressAllowlist> {
+        let url = format!("{}/api/v1/egress", self.base_url);
+        let payload = EgressAllowlist {
+            allowlist: hosts.to_vec(),
+        };
+        let resp = self
+            .http
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .json(&payload)
+            .send()?;
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("set egress failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        // Server returns the stored allowlist; re-fetch to surface it.
+        self.get_egress()
     }
 
     // ---- Custom-domain (issue #83) ----

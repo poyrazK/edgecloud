@@ -8,6 +8,7 @@ pub mod deploy;
 pub mod deployments;
 pub mod dev;
 pub mod domains;
+pub mod egress;
 pub mod env;
 pub mod init;
 pub mod logs;

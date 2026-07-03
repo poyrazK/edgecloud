@@ -264,6 +264,12 @@ enum Command {
     /// Manage custom FQDNs bound to a deployment (issue #83).
     #[command(subcommand)]
     Domains(DomainsCommand),
+
+    /// Manage the outbound host allowlist (egress rules).
+    Egress {
+        #[command(subcommand)]
+        action: commands::egress::EgressAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -370,6 +376,13 @@ fn main() -> Result<()> {
             let action: commands::domains::DomainsAction = cmd.into();
             action.run(&cli.path)
         }
+        Command::Egress { action } => match action {
+            commands::egress::EgressAction::Show => commands::egress::show(&cli.path),
+            commands::egress::EgressAction::Set { hosts } => {
+                commands::egress::set(&cli.path, &hosts)
+            }
+            commands::egress::EgressAction::Clear => commands::egress::clear(&cli.path),
+        },
     }
 }
 
