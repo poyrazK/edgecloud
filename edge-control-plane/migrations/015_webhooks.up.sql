@@ -2,8 +2,6 @@
 -- Tenant-managed webhook subscriptions for deployment lifecycle events.
 -- Tenants register URLs that receive POST JSON payloads on deploy,
 -- activate, rollback, and auto-rollback events.
-BEGIN;
-
 CREATE TABLE webhooks (
     id          VARCHAR(64)  PRIMARY KEY,
     tenant_id   VARCHAR(64)  NOT NULL,
@@ -34,5 +32,3 @@ CREATE TABLE webhook_deliveries (
 );
 
 CREATE INDEX idx_webhook_deliveries_webhook ON webhook_deliveries (webhook_id, created_at DESC);
-
-COMMIT;

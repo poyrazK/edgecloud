@@ -6,8 +6,6 @@
 -- The table is INSERT-only (no UPDATE, no DELETE). A daily/weekly
 -- retention job (separate PR) can drop partitions or delete rows older
 -- than the retention window, modelled after log_gc.go.
-BEGIN;
-
 CREATE TABLE audit_logs (
     id          BIGSERIAL    PRIMARY KEY,
     tenant_id   VARCHAR(64)  NOT NULL DEFAULT '',
@@ -30,5 +28,3 @@ CREATE INDEX idx_audit_logs_tenant_created
 -- Secondary: forensics on a specific resource.
 CREATE INDEX idx_audit_logs_resource
     ON audit_logs (resource, resource_id, created_at DESC);
-
-COMMIT;
