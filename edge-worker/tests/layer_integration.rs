@@ -1308,6 +1308,77 @@ async fn l30_process_get_cwd() {
     );
 }
 
+// ── Outbound Metering (L45) ────────────────────────────────────────────
+
+/// L45: outbound byte metering is restored. Fire a GET that returns a
+/// known-size response body and assert that
+/// `meter.snapshot().outbound_bytes` reflects it (fixes issue #210).
+#[tokio::test(flavor = "multi_thread")]
+async fn l45_outbound_metering_counts_response_bytes() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let meter = Arc::new(RequestMeter::new(
+        "test-tenant".to_string(),
+        "l45-deployment".to_string(),
+    ));
+    let meter_for_config = meter.clone();
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l45".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l45-deployment".to_string(),
+        },
+        meter: meter_for_config,
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // The handler fixture's "/" path returns JSON ~50-100 bytes.
+    let resp = client.get(&url).send().await.expect("GET /");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first_body = resp.text().await.expect("body");
+    let first_len = first_body.len() as u64;
+
+    // After the first request, outbound bytes should at minimum
+    // cover the response body.
+    let snap = meter.snapshot();
+    assert!(
+        snap.outbound_bytes >= first_len,
+        "outbound_bytes ({}) should be >= response body size ({})",
+        snap.outbound_bytes,
+        first_len
+    );
+
+    // Fire 99 more and verify accumulation.
+    for _ in 0..99 {
+        let resp = client.get(&url).send().await.expect("GET /");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.text().await.expect("body");
+    }
+
+    let snap = meter.snapshot();
+    assert!(
+        snap.outbound_bytes >= 100 * first_len,
+        "after 100 requests, outbound_bytes ({}) should be >= {}",
+        snap.outbound_bytes,
+        100 * first_len
+    );
+}
+
 // ── L31-L50: System-level behavioral tests ─────────────────────────────
 //
 // These tests exercise concurrency, multi-tenancy, TTL expiry, resource

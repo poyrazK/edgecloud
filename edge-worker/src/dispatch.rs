@@ -43,6 +43,8 @@ use std::task::{Context as TaskCtx, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -52,6 +54,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::WasiHttpView;
@@ -72,24 +75,19 @@ type HandlerResponseResult = Result<
 type HandlerResponseSender = tokio::sync::oneshot::Sender<HandlerResponseResult>;
 type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseResult>;
 
-/// Wraps a [`Body`] and counts every data frame's byte length via
-/// [`RequestMeter::record_outbound_bytes`] so the deployment's heartbeat
-/// reflects actual bytes served (fixes issue #210 — outbound byte metering
-/// was lost when PR #196 deleted `http_server.rs`).
+/// Wraps [`HyperOutgoingBody`] and counts every data frame's byte length
+/// via [`RequestMeter::record_outbound_bytes`] (issue #210 — outbound
+/// byte metering was lost when PR #196 deleted `http_server.rs`).
 ///
-/// Zero-copy: `CountingBody` never buffers; it only observes frame sizes
-/// as hyper polls them from the inner body.
-struct CountingBody<B> {
-    inner: B,
+/// Call `.boxed_unsync()` to convert back to [`HyperOutgoingBody`].
+struct CountingBody {
+    inner: HyperOutgoingBody,
     meter: Arc<RequestMeter>,
 }
 
-impl<B: Body + Unpin> Body for CountingBody<B>
-where
-    B::Data: AsRef<[u8]>,
-{
-    type Data = B::Data;
-    type Error = B::Error;
+impl Body for CountingBody {
+    type Data = Bytes;
+    type Error = ErrorCode;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -97,8 +95,8 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(buf) = frame.data_ref() {
-                    self.meter.record_outbound_bytes(buf.as_ref().len() as u64);
+                if let Some(data) = frame.data_ref() {
+                    self.meter.record_outbound_bytes(data.len() as u64);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -348,7 +346,8 @@ impl HandlerDispatch {
     ///     invoked so the count is exact even if the guest traps.
     ///
     /// Errors are mapped to:
-    ///   * `Ok(Ok(resp))` → forward the guest response.
+    ///   * `Ok(Ok(resp))` → forward the guest response, wrapping the
+    ///     body in CountingBody to meter outbound bytes (issue #210).
     ///   * `Ok(Err(http_error))` → wrap as a 500 response with the
     ///     diagnostic in the body (so a client gets a real HTTP
     ///     response, not a connection drop).
@@ -394,7 +393,11 @@ impl HandlerDispatch {
                                 cap = self.config.max_request_body_bytes,
                                 "request body exceeds per-app cap; rejecting 413",
                             );
-                            return Ok(synthetic_413(len, self.config.max_request_body_bytes, &self.config.meter));
+                            return Ok(synthetic_413(
+                                len,
+                                self.config.max_request_body_bytes,
+                                &self.config.meter,
+                            ));
                         }
                     }
                 }
@@ -474,12 +477,18 @@ impl HandlerDispatch {
 
         let meter = &self.config.meter;
         match receiver.await {
-            Ok(Ok(resp)) => Ok(resp.map(|body| {
-                HyperOutgoingBody::new(CountingBody {
+            Ok(Ok(resp)) => {
+                // Wrap the response body in CountingBody so every data
+                // frame's byte length is metered via record_outbound_bytes
+                // (fixes issue #210 — outbound byte metering was lost
+                // when PR #196 deleted http_server.rs).
+                let (parts, body) = resp.into_parts();
+                let counting = CountingBody {
                     inner: body,
                     meter: meter.clone(),
-                })
-            })),
+                };
+                Ok(HyperResponse::from_parts(parts, counting.boxed_unsync()))
+            }
             Ok(Err(error_code)) => {
                 // Guest exited cleanly via `response-outparam::set`
                 // with an error (e.g. EgressPolicy denial surface
@@ -566,6 +575,9 @@ fn truncate_diagnostic(diagnostic: &str) -> &str {
 /// the connection mid-message if the service returns `Err`, so every
 /// error path MUST return `Ok(synthetic_response(...))` rather than
 /// propagating `Err`.
+///
+/// The synthetic body length is recorded via `meter.record_outbound_bytes`
+/// so billing reflects bytes served even on error responses (issue #210).
 fn synthetic_response(
     status: hyper::StatusCode,
     diagnostic: &str,
@@ -579,6 +591,8 @@ fn synthetic_response(
     let body = bounded.as_bytes().to_vec();
     let len = body.len();
 
+    meter.record_outbound_bytes(len as u64);
+
     let body_wrapped =
         Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
 
@@ -586,10 +600,7 @@ fn synthetic_response(
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, len)
-        .body(HyperOutgoingBody::new(CountingBody {
-            inner: body_wrapped,
-            meter: meter.clone(),
-        }))
+        .body(HyperOutgoingBody::new(body_wrapped))
         .expect("synthetic response: builder with explicit content-length never fails")
 }
 
@@ -600,7 +611,11 @@ fn synthetic_500(diagnostic: &str, meter: &Arc<RequestMeter>) -> HyperResponse<H
 
 /// Build a synthetic 413 Payload Too Large with a diagnostic that
 /// describes the over-cap request. See `synthetic_response`.
-fn synthetic_413(content_length: u64, cap: u64, meter: &Arc<RequestMeter>) -> HyperResponse<HyperOutgoingBody> {
+fn synthetic_413(
+    content_length: u64,
+    cap: u64,
+    meter: &Arc<RequestMeter>,
+) -> HyperResponse<HyperOutgoingBody> {
     let diagnostic =
         format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
     synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic, meter)
@@ -671,8 +686,8 @@ mod synthetic_response_tests {
 
     #[test]
     fn synthetic_500_truncates_very_long_diagnostics() {
-        let long = "x".repeat(10_000);
         let m = test_meter();
+        let long = "x".repeat(10_000);
         let resp = synthetic_500(&long, &m);
         let cl: usize = resp
             .headers()
