@@ -159,7 +159,7 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)

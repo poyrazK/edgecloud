@@ -71,6 +71,7 @@ type InternalHandler struct {
 	// payload the periodic loop would publish. Tests inject a stub.
 	// nil-safe: when nil, the Sync endpoint returns 501.
 	syncBuilder syncPayloadBuilder
+	cpRegion    string
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -129,6 +130,7 @@ func NewInternalHandler(
 	logEntryRepo logEntryRepo,
 	reconcileSvc syncRequester,
 	syncBuilder syncPayloadBuilder,
+	cpRegion string,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
@@ -137,6 +139,7 @@ func NewInternalHandler(
 		logEntryRepo:  logEntryRepo,
 		reconcileSvc:  reconcileSvc,
 		syncBuilder:   syncBuilder,
+		cpRegion:      cpRegion,
 	}
 }
 
@@ -203,6 +206,16 @@ func (h *InternalHandler) RegisterWorker(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+
+	// Return the CP's own region so the worker can validate it matches
+	// its local REGION at startup (issue #254). A mismatch would cause
+	// the worker to subscribe to the wrong NATS subject, silently never
+	// receiving any task messages.
+	resp := map[string]string{
+		"cp_region": h.cpRegion,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 
 	// Fire-and-forget full_sync so the worker comes up populated
 	// immediately instead of waiting up to RECONCILE_INTERVAL (issue #53).

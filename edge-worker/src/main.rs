@@ -105,6 +105,57 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
+    // Validate region consistency with the control plane (issue #254).
+    // If the CP uses "global" and the worker uses "fra", the worker will
+    // subscribe to the wrong NATS subject and silently never receive
+    // task messages. Registering with the CP early surfaces the mismatch
+    // immediately with a clear error message.
+    {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let payload = serde_json::json!({
+            "worker_id": config.worker_id,
+            "region": config.region,
+        });
+        let resp = http
+            .post(format!("{}/api/internal/workers", config.control_plane_url))
+            .header("Authorization", format!("Bearer {}", jwt_signer.sign()))
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "worker registration failed (status {}): {}. \
+                 Ensure CONTROL_PLANE_REGION matches worker REGION.",
+                status,
+                body
+            );
+        }
+
+        let cp: serde_json::Value = resp.json().await?;
+        let cp_region = cp["cp_region"].as_str().unwrap_or("");
+        if !cp_region.is_empty() && cp_region != config.region {
+            anyhow::bail!(
+                "region mismatch: worker REGION={} but control plane has cp_region={}. \
+                 The worker will not receive task messages unless the regions match. \
+                 To fix: set CONTROL_PLANE_REGION={} on the control plane, \
+                 or set REGION={} on the worker.",
+                config.region,
+                cp_region,
+                config.region,
+                cp_region
+            );
+        }
+    }
+    tracing::info!(
+        worker_region = %config.region,
+        "region validated with control plane"
+    );
+
     // Create cache directory
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     tracing::info!(dir = %config.cache_dir.display(), "cache directory ready");
