@@ -26,6 +26,7 @@ type workerRepoInterface interface {
 	Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error)
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	Delete(ctx context.Context, id string) error
+	DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error)
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error)
 	GetByID(ctx context.Context, id string) (*domain.Worker, error)
 	UpdateLastSeen(ctx context.Context, id string) error
@@ -357,6 +358,62 @@ func (s *WorkerService) applyTenantDelta(
 				"quota: tenant %s used %d %s, exceeds monthly limit %d — enforcement pending",
 				tenantID, used, capLabel, cap,
 			)
+		}
+	}
+}
+
+// workerRepoForGC is the subset of *repository.WorkerRepository needed
+// by WorkerGCService. Defined locally so tests can mock it without a DB.
+type workerRepoForGC interface {
+	DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error)
+}
+
+// WorkerGCService periodically prunes stale worker records. Matches the
+// LogGCService pattern: fires immediately on start, then ticks at interval.
+type WorkerGCService struct {
+	repo workerRepoForGC
+}
+
+func NewWorkerGCService(repo workerRepoForGC) *WorkerGCService {
+	return &WorkerGCService{repo: repo}
+}
+
+// Run blocks until ctx is cancelled. The first sweep fires immediately.
+// Workers whose last_seen is older than `maxAge` are deleted.
+// If interval or maxAge is non-positive the service refuses to run.
+func (s *WorkerGCService) Run(ctx context.Context, interval, maxAge time.Duration) {
+	if interval <= 0 || maxAge <= 0 {
+		log.Printf("worker_gc: invalid interval=%s maxAge=%s; refusing to run", interval, maxAge)
+		return
+	}
+
+	runOnce := func() {
+		if ctx.Err() != nil {
+			return
+		}
+		deleted, err := s.repo.DeleteOlderThan(ctx, maxAge)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("worker_gc: delete failed (maxAge=%s): %v", maxAge, err)
+			return
+		}
+		if deleted > 0 {
+			log.Printf("worker_gc: deleted %d stale worker records older than %s", deleted, maxAge)
+		}
+	}
+
+	runOnce()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
 		}
 	}
 }
