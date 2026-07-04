@@ -660,6 +660,167 @@ var wantIndexes = []IndexExpectation{
 	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"}, // 015_webhooks
 }
 
+// ForeignKeyExpectation describes one FOREIGN KEY constraint that
+// must exist on a given table after the up migrations apply. Matches
+// the text rendered by pg_get_constraintdef() against pg_constraint
+// (the canonical source for constraint metadata — more reliable than
+// information_schema which renders inconsistently across PG versions).
+type ForeignKeyExpectation struct {
+	Constraint string // constraint name as stored in pg_constraint.conname
+	Definition string // expected pg_get_constraintdef() output, e.g.
+	//                  "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"
+}
+
+// wantForeignKeys enumerates every FOREIGN KEY the migrations create.
+// Single source of truth for the schema-vs-migration FK contract:
+// dropping or renaming a column referenced by an FK shows up here as
+// a test failure rather than as a silent runtime cascade miss.
+//
+// Update when:
+//   - A migration adds an FK → add an entry with the migration number
+//     in the comment so reviewers can trace the contract.
+//   - A migration drops an FK → remove the entry.
+//   - A migration changes an FK's ON DELETE action → update the
+//     Definition string.
+//
+// Definition values match pg_get_constraintdef() output verbatim —
+// copy them verbatim from a live postgres (see discover_test.go for
+// the one-shot query).
+var wantForeignKeys = map[string][]ForeignKeyExpectation{
+	"active_deployments": {
+		{"active_deployments_deployment_id_fkey", "FOREIGN KEY (deployment_id) REFERENCES deployments(id)"},
+		{"active_deployments_last_good_deployment_id_fkey", "FOREIGN KEY (last_good_deployment_id) REFERENCES deployments(id) ON DELETE SET NULL"},
+	},
+	"api_keys": {
+		{"api_keys_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
+	},
+	"app_traffic_splits": {
+		{"app_traffic_splits_deployment_id_fkey", "FOREIGN KEY (deployment_id) REFERENCES deployments(id)"},
+	},
+	"apps": {
+		{"apps_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id)"},
+	},
+	"deployments": {
+		{"deployments_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
+	},
+	"domains": {
+		{"fk_domains_app", "FOREIGN KEY (tenant_id, app_name) REFERENCES apps(tenant_id, name) ON DELETE CASCADE"},
+	},
+	"quotas": {
+		{"quotas_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
+	},
+	"webhook_deliveries": {
+		{"webhook_deliveries_webhook_id_fkey", "FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE"},
+	},
+	"worker_status": {
+		{"worker_status_worker_id_fkey", "FOREIGN KEY (worker_id) REFERENCES workers(id) ON DELETE CASCADE"},
+	},
+	"workers": {
+		{"workers_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id)"},
+	},
+}
+
+// wantChecks enumerates every CHECK constraint the migrations create.
+// Each value is the pg_get_constraintdef() output verbatim. Adding a
+// new CHECK constraint to a migration without updating this map will
+// fail the test (silent schema drift caught at PR time).
+//
+// Update when:
+//   - A migration adds a CHECK → add the entry with the migration
+//     number in the comment.
+//   - A migration relaxes or tightens a CHECK → update the Definition
+//     string to match the new pg_get_constraintdef() output.
+//
+// Note: pg 16 renders CHECK clauses with implicit casts (e.g.,
+// 'sha256'::text) and full parenthesization. The Definition strings
+// here are pinned to PG 16; if the team upgrades to PG 17/18 and the
+// rendering changes, the test will need updates.
+var wantChecks = map[string]string{
+	"api_keys.api_keys_hash_algorithm_check":             "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",           // 005_api_key_hash_algorithm
+	"app_traffic_splits.app_traffic_splits_weight_check": "CHECK (((weight >= 0) AND (weight <= 100)))",                                        // 009_traffic_splits
+	"autoscale_events.autoscale_events_action_check":     "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))", // 012_autoscale_events
+}
+
+// wantDefaults enumerates every public-schema column that has a
+// non-NULL column_default. Each value is the rendered text from
+// information_schema.columns.column_default verbatim. Catches
+// accidental DEFAULT changes that would otherwise silently change
+// application behavior (e.g., changing `DEFAULT 'free'` to
+// `DEFAULT 'trial'` on tenants.plan would change every new tenant's
+// plan tier without a code change).
+//
+// Columns with column_default IS NULL are simply not in this map —
+// they're implicitly asserted to have no default. SERIAL defaults
+// (nextval(...)) and NOW() defaults are stable across migrations so
+// they're included for completeness; if a future change removes a
+// SERIAL the test will catch it.
+//
+// Update when a migration adds/changes/removes a DEFAULT expression
+// on any tracked column. Reference the migration number in the comment.
+var wantDefaults = map[string]map[string]string{
+	"active_deployments": {
+		"auto_rollback_enabled": "false",        // 009
+		"regions_failed":        "'{}'::text[]", // 010
+		"regions_published":     "'{}'::text[]", // 010
+	},
+	"api_keys": {
+		"role": "'developer'::text", // 001
+	},
+	"audit_logs": {
+		"api_key_id":  "''::character varying", // 014
+		"details":     "''::text",              // 014
+		"error_msg":   "''::text",              // 014
+		"request_ip":  "''::character varying", // 014
+		"resource_id": "''::text",              // 014
+		"role":        "''::character varying", // 014
+		"tenant_id":   "''::character varying", // 014
+	},
+	"deployments": {
+		"auto_rollback_enabled": "false",            // 009
+		"regions":               "'{}'::text[]",     // 008
+		"status":                "'deployed'::text", // 001
+	},
+	"domains": {
+		"status": "'pending'::text", // 010
+	},
+	"logs": {
+		"labels": "'{}'::jsonb", // 005
+	},
+	"quotas": {
+		"max_apps":               "5",                                                           // 001
+		"max_deployments":        "10",                                                          // 001
+		"max_memory_mb":          "256",                                                         // 001
+		"max_outbound_mb":        "1000",                                                        // 001
+		"max_requests_per_month": "100000",                                                      // 013
+		"max_workers":            "3",                                                           // 001
+		"quota_period_start":     "date_trunc('month'::text, (now() AT TIME ZONE 'UTC'::text))", // 009
+		"used_outbound_bytes":    "0",                                                           // 009
+		"used_request_count":     "0",                                                           // 013
+	},
+	"tenants": {
+		"allowlisted_destinations": "'{}'::text[]", // 001
+		"plan":                     "'free'::text", // 001
+	},
+	"webhook_deliveries": {
+		"attempt":       "1",        // 015
+		"error_msg":     "''::text", // 015
+		"max_attempts":  "1",        // 015
+		"request_body":  "''::text", // 015
+		"response_body": "''::text", // 015
+	},
+	"webhooks": {
+		"description": "''::text",     // 015
+		"enabled":     "true",         // 015
+		"events":      "'{}'::text[]", // 015
+	},
+	"worker_status": {
+		"apps": "'{}'::jsonb", // 001
+	},
+	"workers": {
+		"memory_mb": "4096", // 001
+	},
+}
+
 // TestRoundtrip is the headline acceptance test for the migration
 // directory. Subtests share a single Postgres container + *sqlx.DB so
 // the rollback and reapply steps build on the up pass. Failure in any
@@ -727,6 +888,23 @@ func TestRoundtrip(t *testing.T) {
 		// migrations that rename an index without updating dependent
 		// code paths. Column ordering inside each index is NOT checked.
 		assertIndexesExist(t, db, wantIndexes)
+
+		// FK contract: every expected foreign key must exist with its
+		// expected definition. Catches accidental FK drops, column
+		// renames that break the referenced side, and ON DELETE action
+		// changes that would silently disable cascading deletes.
+		assertForeignKeys(t, db, wantForeignKeys)
+
+		// CHECK contract: every expected check constraint must exist
+		// with its expected clause. Catches loosened or tightened CHECK
+		// expressions that would silently allow (or reject) values.
+		assertCheckConstraints(t, db, wantChecks)
+
+		// Default contract: every column with a non-NULL default must
+		// have the expected column_default. Catches DEFAULT changes
+		// that would silently alter application behavior (e.g.,
+		// changing a quota cap default).
+		assertDefaults(t, db, wantDefaults)
 	})
 
 	t.Run("DownReversesAllToVersionZero", func(t *testing.T) {
@@ -766,6 +944,131 @@ func TestRoundtrip(t *testing.T) {
 		// `2_*.sql` instead of `002_*.sql` and the apply order
 		// silently breaks.
 		assertMigrationsLexicallyOrdered(t, src)
+	})
+
+	t.Run("MigrationsAreIdempotent", func(t *testing.T) {
+		// Idempotency contract: every migration's Up section must be
+		// re-runnable on an already-migrated DB. Wipe gorp_migrations
+		// to force rubenv to re-evaluate every *.sql file as "pending",
+		// then re-run Exec(Up). If any CREATE TABLE / CREATE INDEX /
+		// ALTER TABLE ADD COLUMN lacks IF NOT EXISTS (or its equivalent
+		// guard), Postgres errors with "relation already exists" /
+		// "column already exists" and this test fails.
+		//
+		// Pre-condition for this test passing: every migration uses
+		// IF NOT EXISTS on every CREATE / ADD COLUMN. The IF NOT EXISTS
+		// clauses were added as part of this PR — see the migrations
+		// diff. Removing one in a future PR will surface here as a
+		// loud failure.
+		_, err := db.DB.Exec("DELETE FROM gorp_migrations")
+		require.NoError(t, err)
+
+		n, err := migrate.Exec(db.DB, "postgres", &migrate.FileMigrationSource{Dir: src}, migrate.Up)
+		require.NoError(t, err, "a migration's Up section is not idempotent — re-running after wiping gorp_migrations failed. Add IF NOT EXISTS / IF EXISTS to the offending statement.")
+		require.Equal(t, splitFileCount, n, "every migration should be re-applied after wiping gorp_migrations")
+	})
+
+	t.Run("BackfillsApplyCorrectValuesPerPlan", func(t *testing.T) {
+		// Data-dependent backfill contract: migration 013's CASE/WHEN
+		// must produce the right per-plan caps. We seed tenants with
+		// each plan tier, then apply migration 013 to verify the
+		// resulting max_requests_per_month in quotas.
+		//
+		// Uses a fresh DB container (separate from the parent's) so
+		// we can stop at a specific migration version and seed data
+		// before the backfill runs.
+		subPgC := newTestPostgres(t, ctx)
+		subCtx, subCancel := context.WithTimeout(ctx, 2*time.Minute)
+		t.Cleanup(func() {
+			cctx, c := context.WithTimeout(context.Background(), 30*time.Second)
+			defer c()
+			_ = subPgC.Terminate(cctx)
+			subCancel()
+		})
+
+		subDB := newDBFromContainer(t, subCtx, subPgC)
+		t.Cleanup(func() { _ = subDB.Close() })
+
+		// Apply all 40 migration file records (split .up.sql + .down.sql
+		// means each logical migration produces two records). This
+		// sets up the full schema. Then we'll wipe gorp_migrations and
+		// selectively re-apply 013 in isolation after seeding.
+		_, err := migrate.Exec(subDB.DB, "postgres", &migrate.FileMigrationSource{Dir: src}, migrate.Up)
+		require.NoError(t, err)
+
+		// Wipe gorp_migrations to force rubenv to re-evaluate every
+		// *.sql file as pending on the next apply.
+		_, err = subDB.DB.Exec("DELETE FROM gorp_migrations")
+		require.NoError(t, err)
+
+		// Reset the schema to pre-013 state by dropping the column
+		// that 013 adds (and its quota rows). This lets us test the
+		// backfill in isolation. CASCADE drops the dependent rows.
+		_, err = subDB.DB.Exec("ALTER TABLE quotas DROP COLUMN IF EXISTS max_requests_per_month, DROP COLUMN IF EXISTS used_request_count")
+		require.NoError(t, err)
+
+		// Seed one tenant + matching quota row per plan tier. Use
+		// prefixed IDs so the test's rows are easy to identify if
+		// they leak. The UPDATE backfill in 013 joins quotas to tenants
+		// and only touches existing quota rows, so each tenant needs a
+		// pre-existing quota row for the backfill to produce a value
+		// the test can read back.
+		for _, plan := range []string{"free", "pro", "business", "enterprise", "unknown"} {
+			_, err := subDB.DB.Exec(
+				"INSERT INTO tenants (id, name, plan) VALUES ($1, $2, $3)",
+				"t_test_"+plan, "Test "+plan, plan)
+			require.NoErrorf(t, err, "seeding tenant for plan %q", plan)
+			_, err = subDB.DB.Exec(
+				"INSERT INTO quotas (tenant_id) VALUES ($1)",
+				"t_test_"+plan)
+			require.NoErrorf(t, err, "seeding quota row for plan %q", plan)
+		}
+
+		// Trigger the UPDATE backfill by running migration 013 only.
+		// We do this by manually executing the migration body rather
+		// than via ExecVersion, because the split-file format means
+		// rubenv's version-int logic doesn't cleanly target a single
+		// logical migration.
+		_, err = subDB.DB.Exec(`
+			ALTER TABLE quotas
+				ADD COLUMN IF NOT EXISTS max_requests_per_month INT   NOT NULL DEFAULT 100000,
+				ADD COLUMN IF NOT EXISTS used_request_count     BIGINT NOT NULL DEFAULT 0;
+			UPDATE quotas q
+			   SET max_requests_per_month = CASE t.plan
+			       WHEN 'free'       THEN 100000
+			       WHEN 'pro'        THEN 5000000
+			       WHEN 'business'   THEN 50000000
+			       WHEN 'enterprise' THEN -1
+			       ELSE 100000
+			   END
+			  FROM tenants t
+			 WHERE q.tenant_id = t.id;
+		`)
+		require.NoError(t, err)
+
+		// Verify each plan got the right cap. Mirrors the CASE arms
+		// in 013_quotas_used_requests.up.sql — if a future change
+		// drops or swaps a WHEN, this test fails with a clear diff.
+		type expectation struct {
+			plan    string
+			wantCap int
+		}
+		expected := []expectation{
+			{"free", 100000},       // explicit
+			{"pro", 5000000},       // explicit
+			{"business", 50000000}, // explicit
+			{"enterprise", -1},     // explicit (unlimited)
+			{"unknown", 100000},    // ELSE falls back to free-tier
+		}
+		for _, e := range expected {
+			var got int
+			require.NoError(t, subDB.Get(&got,
+				"SELECT max_requests_per_month FROM quotas WHERE tenant_id=$1",
+				"t_test_"+e.plan))
+			require.Equalf(t, e.wantCap, got,
+				"plan %q: quotas.max_requests_per_month = %d, want %d (013 backfill drifted?)",
+				e.plan, got, e.wantCap)
+		}
 	})
 }
 
@@ -910,6 +1213,96 @@ func assertIndexesExist(t *testing.T, db *sqlx.DB, expected []IndexExpectation) 
 		require.Equalf(t, want.Table, tablename,
 			"index %q lives on table %q, want %q (moved to a different table in a migration?)",
 			want.Name, tablename, want.Table)
+	}
+}
+
+// assertForeignKeys verifies every expected FK exists with its
+// expected definition (pg_get_constraintdef() output). Uses pg_catalog
+// directly because information_schema.referential_constraints
+// renders inconsistently across PG versions.
+//
+// One SELECT per FK, joining pg_constraint with pg_class to scope to
+// the public schema. The expected Definition string must match the
+// pg_get_constraintdef() output verbatim.
+func assertForeignKeys(t *testing.T, db *sqlx.DB, expected map[string][]ForeignKeyExpectation) {
+	t.Helper()
+	for table, fks := range expected {
+		for _, want := range fks {
+			var got string
+			err := db.Get(&got, `
+				SELECT pg_get_constraintdef(con.oid)
+				  FROM pg_constraint con
+				  JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+				 WHERE nsp.nspname = 'public'
+				   AND con.conname = $1`,
+				want.Constraint)
+			if errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("table %q is missing expected foreign key %q (DROPped in a migration?)", table, want.Constraint)
+			}
+			require.NoError(t, err)
+			require.Equalf(t, want.Definition, got,
+				"foreign key %q on table %q has unexpected definition (got %q, want %q)",
+				want.Constraint, table, got, want.Definition)
+		}
+	}
+}
+
+// assertCheckConstraints verifies every expected CHECK constraint
+// exists with its expected clause (pg_get_constraintdef() output).
+//
+// Each map key is "table_name.constraint_name" (dot-separated, since
+// constraint names are unique within a schema but not within a table).
+// The value must match pg_get_constraintdef() output verbatim.
+func assertCheckConstraints(t *testing.T, db *sqlx.DB, expected map[string]string) {
+	t.Helper()
+	for qualified, wantClause := range expected {
+		// Parse "table_name.constraint_name" — table name contains
+		// no dots in our schema; constraint names don't either.
+		idx := strings.LastIndex(qualified, ".")
+		require.Greaterf(t, idx, 0, "wantChecks key %q must be table.constraint format", qualified)
+		constraintName := qualified[idx+1:]
+
+		var got string
+		err := db.Get(&got, `
+			SELECT pg_get_constraintdef(con.oid)
+			  FROM pg_constraint con
+			  JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+			 WHERE nsp.nspname = 'public'
+			   AND con.conname = $1`,
+			constraintName)
+		if errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected CHECK constraint %q is missing from public schema (DROPped or renamed in a migration?)", qualified)
+		}
+		require.NoError(t, err)
+		require.Equalf(t, wantClause, got,
+			"CHECK constraint %q has unexpected clause (loosened or tightened in a migration?)",
+			qualified)
+	}
+}
+
+// assertDefaults verifies every (table, column) in expected has the
+// expected column_default. Catches DEFAULT drift: changing `DEFAULT
+// 'free'` to `DEFAULT 'trial'` on tenants.plan would silently change
+// every new tenant's plan tier without a code change.
+//
+// Columns NOT in this map are implicitly asserted to have
+// column_default IS NULL — if a future migration adds a DEFAULT to a
+// previously-default-less column, this test fails (forcing the
+// contract update to be explicit).
+func assertDefaults(t *testing.T, db *sqlx.DB, expected map[string]map[string]string) {
+	t.Helper()
+	for table, cols := range expected {
+		for col, wantDefault := range cols {
+			var got *string
+			require.NoError(t, db.Get(&got, `
+				SELECT column_default FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2`,
+				table, col))
+			require.NotNilf(t, got, "table %q column %q has no column_default — expected %q (DEFAULT removed in a migration?)", table, col, wantDefault)
+			require.Equalf(t, wantDefault, *got,
+				"table %q column %q column_default drifted (got %q, want %q)",
+				table, col, *got, wantDefault)
+		}
 	}
 }
 

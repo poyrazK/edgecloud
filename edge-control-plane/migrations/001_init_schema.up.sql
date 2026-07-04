@@ -1,6 +1,6 @@
 -- +migrate Up
 -- Tenants
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
     id          TEXT PRIMARY KEY,  -- "t_<uuid>"
     name        TEXT NOT NULL,
     plan        TEXT NOT NULL DEFAULT 'free',
@@ -9,7 +9,7 @@ CREATE TABLE tenants (
 );
 
 -- Quotas (per tenant)
-CREATE TABLE quotas (
+CREATE TABLE IF NOT EXISTS quotas (
     tenant_id   TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
     max_deployments  INT NOT NULL DEFAULT 10,
     max_apps        INT NOT NULL DEFAULT 5,
@@ -19,7 +19,7 @@ CREATE TABLE quotas (
 );
 
 -- API Keys
-CREATE TABLE api_keys (
+CREATE TABLE IF NOT EXISTS api_keys (
     id          TEXT PRIMARY KEY,  -- "k_<uuid>"
     tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
@@ -31,7 +31,7 @@ CREATE TABLE api_keys (
 );
 
 -- Deployments
-CREATE TABLE deployments (
+CREATE TABLE IF NOT EXISTS deployments (
     id          TEXT PRIMARY KEY,  -- "d_<uuid>"
     tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     app_name    TEXT NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE deployments (
 );
 
 -- Active Deployment Mapping
-CREATE TABLE active_deployments (
+CREATE TABLE IF NOT EXISTS active_deployments (
     tenant_id   TEXT NOT NULL,
     app_name    TEXT NOT NULL,
     deployment_id TEXT NOT NULL REFERENCES deployments(id),
@@ -49,7 +49,7 @@ CREATE TABLE active_deployments (
 );
 
 -- App Environment Variables
-CREATE TABLE app_env (
+CREATE TABLE IF NOT EXISTS app_env (
     tenant_id   TEXT NOT NULL,
     app_name    TEXT NOT NULL,
     env_key     TEXT NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE app_env (
 );
 
 -- Workers (registered supervisors)
-CREATE TABLE workers (
+CREATE TABLE IF NOT EXISTS workers (
     id          TEXT PRIMARY KEY,  -- "w_<region>_<uuid>"
     region      TEXT NOT NULL,
     ip          TEXT,
@@ -68,7 +68,7 @@ CREATE TABLE workers (
 );
 
 -- Worker Status Reports
-CREATE TABLE worker_status (
+CREATE TABLE IF NOT EXISTS worker_status (
     worker_id   TEXT PRIMARY KEY REFERENCES workers(id) ON DELETE CASCADE,
     apps        JSONB NOT NULL DEFAULT '{}',  -- { app_name: { status, exit_code, deployment_id } }
     last_report TIMESTAMPTZ NOT NULL DEFAULT NOW()

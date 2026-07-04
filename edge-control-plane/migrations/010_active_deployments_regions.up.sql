@@ -23,7 +23,7 @@
 -- single transient NATS hiccup cannot permanently wedge a region.
 
 ALTER TABLE active_deployments
-    ADD COLUMN regions_published        TEXT[]      NOT NULL DEFAULT '{}',
-    ADD COLUMN regions_failed           TEXT[]      NOT NULL DEFAULT '{}',
-    ADD COLUMN last_publish_at          TIMESTAMPTZ,
-    ADD COLUMN last_publish_attempt_id  UUID;
+    ADD COLUMN IF NOT EXISTS regions_published        TEXT[]      NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS regions_failed           TEXT[]      NOT NULL DEFAULT '{}',
+    ADD COLUMN IF NOT EXISTS last_publish_at          TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS last_publish_attempt_id  UUID;

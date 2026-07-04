@@ -1,5 +1,5 @@
 -- +migrate Up
-CREATE TABLE apps (
+CREATE TABLE IF NOT EXISTS apps (
     id          TEXT PRIMARY KEY,
     tenant_id   TEXT NOT NULL REFERENCES tenants(id),
     name        TEXT NOT NULL,
@@ -7,4 +7,4 @@ CREATE TABLE apps (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (tenant_id, name)
 );
-CREATE INDEX idx_apps_tenant_id ON apps(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_apps_tenant_id ON apps(tenant_id);

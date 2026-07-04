@@ -12,5 +12,5 @@
 -- is the right thing to clear, and the existing ErrNoLastGood path
 -- already turns NULL into a clean 409.
 ALTER TABLE active_deployments
-    ADD COLUMN last_good_deployment_id TEXT
+    ADD COLUMN IF NOT EXISTS last_good_deployment_id TEXT
         REFERENCES deployments(id) ON DELETE SET NULL;

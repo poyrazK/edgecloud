@@ -15,4 +15,4 @@
 -- cross-region deploys require either a shared artifact store or per-region
 -- control-plane federation; that work is tracked separately.
 
-ALTER TABLE deployments ADD COLUMN regions TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS regions TEXT[] NOT NULL DEFAULT '{}';

@@ -9,8 +9,8 @@
 -- Plan→cap values mirror internal/domain/plans.go:31-55. Keep both files in
 -- sync when adding new tiers or adjusting caps.
 ALTER TABLE quotas
-    ADD COLUMN max_requests_per_month INT   NOT NULL DEFAULT 100000,
-    ADD COLUMN used_request_count     BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS max_requests_per_month INT   NOT NULL DEFAULT 100000,
+    ADD COLUMN IF NOT EXISTS used_request_count     BIGINT NOT NULL DEFAULT 0;
 
 -- Backfill existing rows from tenants.plan so paid-tier tenants don't
 -- silently drop to free-tier caps after this migration. Unrecognized

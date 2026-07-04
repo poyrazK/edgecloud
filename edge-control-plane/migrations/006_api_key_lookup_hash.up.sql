@@ -13,11 +13,11 @@
 -- raw key is unrecoverable from an argon2id hash. Operators must re-issue
 -- those keys. Partial UNIQUE index tolerates NULLs.
 
-ALTER TABLE api_keys ADD COLUMN lookup_hash TEXT;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS lookup_hash TEXT;
 
 UPDATE api_keys
    SET lookup_hash = key_hash
  WHERE hash_algorithm = 'sha256';
 
-CREATE UNIQUE INDEX idx_api_keys_lookup_hash
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_lookup_hash
     ON api_keys(lookup_hash) WHERE lookup_hash IS NOT NULL;

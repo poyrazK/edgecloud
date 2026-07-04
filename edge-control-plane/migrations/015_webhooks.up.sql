@@ -3,7 +3,7 @@
 -- Tenant-managed webhook subscriptions for deployment lifecycle events.
 -- Tenants register URLs that receive POST JSON payloads on deploy,
 -- activate, rollback, and auto-rollback events.
-CREATE TABLE webhooks (
+CREATE TABLE IF NOT EXISTS webhooks (
     id          VARCHAR(64)  PRIMARY KEY,
     tenant_id   VARCHAR(64)  NOT NULL,
     url         TEXT         NOT NULL,
@@ -14,10 +14,10 @@ CREATE TABLE webhooks (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_webhooks_tenant ON webhooks (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks (tenant_id);
 
 -- Append-only delivery log for debugging and observability.
-CREATE TABLE webhook_deliveries (
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id            BIGSERIAL    PRIMARY KEY,
     webhook_id    VARCHAR(64)  NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
     event_type    VARCHAR(32)  NOT NULL,
@@ -32,4 +32,4 @@ CREATE TABLE webhook_deliveries (
     completed_at  TIMESTAMPTZ
 );
 
-CREATE INDEX idx_webhook_deliveries_webhook ON webhook_deliveries (webhook_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook ON webhook_deliveries (webhook_id, created_at DESC);

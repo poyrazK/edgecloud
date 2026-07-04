@@ -31,8 +31,8 @@
 --    publish a TaskMessage because workers are still serving the
 --    same deployment_id; only the safety-net pointer changes.
 
-ALTER TABLE deployments ADD COLUMN auto_rollback_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS auto_rollback_enabled BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE active_deployments ADD COLUMN auto_rollback_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE active_deployments ADD COLUMN IF NOT EXISTS auto_rollback_enabled BOOLEAN NOT NULL DEFAULT false;
 
-ALTER TABLE active_deployments ADD COLUMN stable_since TIMESTAMPTZ NULL;
+ALTER TABLE active_deployments ADD COLUMN IF NOT EXISTS stable_since TIMESTAMPTZ NULL;

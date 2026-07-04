@@ -7,7 +7,7 @@
 -- The table is INSERT-only (no UPDATE, no DELETE). A daily/weekly
 -- retention job (separate PR) can drop partitions or delete rows older
 -- than the retention window, modelled after log_gc.go.
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
     id          BIGSERIAL    PRIMARY KEY,
     tenant_id   VARCHAR(64)  NOT NULL DEFAULT '',
     api_key_id  VARCHAR(64)  NOT NULL DEFAULT '',
@@ -23,9 +23,9 @@ CREATE TABLE audit_logs (
 );
 
 -- Primary read path: recent events for a tenant (admin audit trail).
-CREATE INDEX idx_audit_logs_tenant_created
+CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created
     ON audit_logs (tenant_id, created_at DESC);
 
 -- Secondary: forensics on a specific resource.
-CREATE INDEX idx_audit_logs_resource
+CREATE INDEX IF NOT EXISTS idx_audit_logs_resource
     ON audit_logs (resource, resource_id, created_at DESC);
