@@ -72,6 +72,10 @@ func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker
 	return m.getByIDFunc(ctx, id)
 }
 
+func (m *mockWorkerRepo) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	return 0, nil
+}
+
 // mockQuotaRepo implements quotaRepoInterface for testing.
 type mockQuotaRepo struct {
 	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)

@@ -43,6 +43,7 @@ type App struct {
 	WorkerSvc    *service.WorkerService
 	ReconcileSvc *service.ReconcileService
 	LogGC        *service.LogGCService
+	WorkerGC     *service.WorkerGCService
 	AutoscaleSvc *autoscale.Service
 }
 
@@ -431,6 +432,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		WorkerSvc:    workerSvc,
 		ReconcileSvc: reconcileSvc,
 		LogGC:        service.NewLogGCService(logEntryRepo),
+		WorkerGC:     service.NewWorkerGCService(workerRepo),
 		AutoscaleSvc: autoscaleSvc,
 	}
 }
@@ -453,6 +455,11 @@ func (a *App) RunBackground(ctx context.Context) {
 	// Periodic full-state reconcile (issue #53). Tunable via RECONCILE_INTERVAL.
 	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
 	go a.ReconcileSvc.Run(ctx, reconcileInterval)
+
+	// Stale worker GC. Tunable via env (WORKER_GC_INTERVAL, WORKER_MAX_AGE).
+	workerGCInterval := parseDurationEnv("WORKER_GC_INTERVAL", 5*time.Minute)
+	workerMaxAge := parseDurationEnv("WORKER_MAX_AGE", 15*time.Minute)
+	go a.WorkerGC.Run(ctx, workerGCInterval, workerMaxAge)
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately.

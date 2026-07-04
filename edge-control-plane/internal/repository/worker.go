@@ -194,6 +194,18 @@ func (r *WorkerRepository) Delete(ctx context.Context, id string) error {
 	return err
 }
 
+// DeleteOlderThan removes worker records whose last_seen is older than
+// the given duration. Returns the number of deleted rows.
+func (r *WorkerRepository) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM workers WHERE last_seen < NOW() - make_interval(secs => $1)`,
+		age.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (r *WorkerRepository) UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error {
 	query := `INSERT INTO worker_status (worker_id, apps, last_report) VALUES ($1, $2, $3) ON CONFLICT (worker_id) DO UPDATE SET apps = $2, last_report = $3`
 	_, err := r.db.ExecContext(ctx, query, ws.WorkerID, ws.Apps, ws.LastReport)
