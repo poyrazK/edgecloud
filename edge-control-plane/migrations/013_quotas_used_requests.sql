@@ -1,3 +1,4 @@
+-- +migrate Up notransaction
 -- 013_quotas_used_requests.up.sql
 -- Adds per-tenant request-count metering to the quotas table.
 -- `used_request_count` reuses the existing `quota_period_start` (added by 009)
@@ -29,3 +30,8 @@ UPDATE quotas q
  WHERE q.tenant_id = t.id;
 
 COMMIT;
+
+-- +migrate Down notransaction
+-- 013_quotas_used_requests.down.sql
+ALTER TABLE quotas DROP COLUMN used_request_count;
+ALTER TABLE quotas DROP COLUMN max_requests_per_month;

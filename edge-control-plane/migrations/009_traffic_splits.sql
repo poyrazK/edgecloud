@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add `app_traffic_splits` table for issue #84 (canary/blue-green deploys).
 -- Stores one row per (app, deployment, weight). Sum of weights per app = 100.
 -- The primary deployment (weight=100) is also recorded here when using
@@ -18,3 +19,7 @@ CREATE TABLE app_traffic_splits (
 -- Index for fetching all splits for a given app (used by GET /traffic and
 -- by the ingress on startup and after each Caddy reload).
 CREATE INDEX idx_ats_tenant_app ON app_traffic_splits(tenant_id, app_name);
+
+-- +migrate Down
+DROP INDEX IF EXISTS idx_ats_tenant_app;
+DROP TABLE IF EXISTS app_traffic_splits;

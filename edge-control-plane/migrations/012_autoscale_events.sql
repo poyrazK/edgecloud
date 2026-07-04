@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Audit table for the cluster autoscaler (issue #85). Every scale
 -- decision (scale_up, scale_down, noop) the autoscaler makes is
 -- persisted here so operators can:
@@ -48,3 +49,11 @@ CREATE TABLE autoscale_events (
 
 CREATE INDEX idx_autoscale_events_region_time
     ON autoscale_events (region, created_at DESC);
+
+-- +migrate Down
+-- Reverse of 012_autoscale_events.up.sql. Drops the index first
+-- (Postgres drops the index automatically when the table is dropped,
+-- but being explicit matches the up migration's ordering).
+
+DROP INDEX IF EXISTS idx_autoscale_events_region_time;
+DROP TABLE IF EXISTS autoscale_events;

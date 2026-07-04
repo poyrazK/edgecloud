@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add last_good_deployment_id column to active_deployments for issue #74
 -- (CLI rollback UX). On a successful Activate, the previous deployment_id is
 -- copied into this column; RollbackDeployment then swaps them back atomically.
@@ -13,3 +14,8 @@
 ALTER TABLE active_deployments
     ADD COLUMN last_good_deployment_id TEXT
         REFERENCES deployments(id) ON DELETE SET NULL;
+
+-- +migrate Down
+-- Reverse 005_add_last_good.up.sql.
+ALTER TABLE active_deployments
+    DROP COLUMN last_good_deployment_id;

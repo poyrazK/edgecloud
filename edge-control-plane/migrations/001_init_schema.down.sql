@@ -1,8 +1,0 @@
-DROP TABLE IF EXISTS worker_status;
-DROP TABLE IF EXISTS workers;
-DROP TABLE IF EXISTS app_env;
-DROP TABLE IF EXISTS active_deployments;
-DROP TABLE IF EXISTS deployments;
-DROP TABLE IF EXISTS api_keys;
-DROP TABLE IF EXISTS quotas;
-DROP TABLE IF EXISTS tenants;

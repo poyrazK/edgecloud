@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Custom-domain bindings for issue #83. One row per tenant-owned FQDN
 -- bound to one of the tenant's apps. Tenant-facing CRUD lives at
 -- /api/v1/apps/{appName}/domains*; the internal ingress poller reads
@@ -46,3 +47,6 @@ CREATE INDEX idx_domains_tenant_app ON domains(tenant_id, app_name);
 -- Hot path: TlsAllowed handler is per-FQDN (Caddy's on_demand.ask
 -- callback runs once per hostname during ACME issuance).
 CREATE INDEX idx_domains_fqdn ON domains(fqdn);
+
+-- +migrate Down
+DROP TABLE IF EXISTS domains;

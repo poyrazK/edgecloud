@@ -1,3 +1,4 @@
+-- +migrate Up notransaction
 -- Issue (review follow-up): AuthenticateRawKey looks up rows by SHA-256 of
 -- the raw key, but CreateAPIKey stores the argon2id PHC string in key_hash.
 -- The two strings never match, so every newly-created API key was rejected
@@ -31,3 +32,7 @@ CREATE UNIQUE INDEX idx_api_keys_lookup_hash
     ON api_keys(lookup_hash) WHERE lookup_hash IS NOT NULL;
 
 COMMIT;
+
+-- +migrate Down notransaction
+DROP INDEX IF EXISTS idx_api_keys_lookup_hash;
+ALTER TABLE api_keys DROP COLUMN IF EXISTS lookup_hash;

@@ -1,3 +1,4 @@
+-- +migrate Up
 CREATE TABLE apps (
     id          TEXT PRIMARY KEY,
     tenant_id   TEXT NOT NULL REFERENCES tenants(id),
@@ -7,3 +8,6 @@ CREATE TABLE apps (
     UNIQUE (tenant_id, name)
 );
 CREATE INDEX idx_apps_tenant_id ON apps(tenant_id);
+
+-- +migrate Down
+DROP TABLE apps CASCADE;

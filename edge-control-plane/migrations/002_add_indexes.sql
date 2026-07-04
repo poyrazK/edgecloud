@@ -1,3 +1,4 @@
+-- +migrate Up notransaction
 -- Add performance indexes for common query patterns
 
 -- deployments: frequently queried by tenant + app name
@@ -15,3 +16,13 @@ CREATE INDEX CONCURRENTLY idx_active_deployments_tenant ON active_deployments(te
 
 -- app_env: frequently queried by tenant + app
 CREATE INDEX CONCURRENTLY idx_app_env_tenant_app ON app_env(tenant_id, app_name);
+
+-- +migrate Down notransaction
+-- Rollback indexes
+
+DROP INDEX IF EXISTS idx_deployments_tenant_app;
+DROP INDEX IF EXISTS idx_deployments_tenant;
+DROP INDEX IF EXISTS idx_workers_region;
+DROP INDEX IF EXISTS idx_api_keys_tenant;
+DROP INDEX IF EXISTS idx_active_deployments_tenant;
+DROP INDEX IF EXISTS idx_app_env_tenant_app;

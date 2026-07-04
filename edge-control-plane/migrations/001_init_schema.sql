@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Tenants
 CREATE TABLE tenants (
     id          TEXT PRIMARY KEY,  -- "t_<uuid>"
@@ -72,3 +73,13 @@ CREATE TABLE worker_status (
     apps        JSONB NOT NULL DEFAULT '{}',  -- { app_name: { status, exit_code, deployment_id } }
     last_report TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- +migrate Down
+DROP TABLE IF EXISTS worker_status;
+DROP TABLE IF EXISTS workers;
+DROP TABLE IF EXISTS app_env;
+DROP TABLE IF EXISTS active_deployments;
+DROP TABLE IF EXISTS deployments;
+DROP TABLE IF EXISTS api_keys;
+DROP TABLE IF EXISTS quotas;
+DROP TABLE IF EXISTS tenants;

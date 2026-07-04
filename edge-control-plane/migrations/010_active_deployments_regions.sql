@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue #127: per-region publish state for cross-region artifact
 -- replication. Records which regions an active_deployments row has
 -- already been successfully published to, so retries are idempotent
@@ -26,3 +27,14 @@ ALTER TABLE active_deployments
     ADD COLUMN regions_failed           TEXT[]      NOT NULL DEFAULT '{}',
     ADD COLUMN last_publish_at          TIMESTAMPTZ,
     ADD COLUMN last_publish_attempt_id  UUID;
+
+-- +migrate Down
+-- Reverse migration 010: drop the per-region publish state columns
+-- from `active_deployments`. DESTRUCTIVE: any in-flight publish
+-- history is lost. Only run this as part of a planned rollback.
+
+ALTER TABLE active_deployments
+    DROP COLUMN regions_published,
+    DROP COLUMN regions_failed,
+    DROP COLUMN last_publish_at,
+    DROP COLUMN last_publish_attempt_id;

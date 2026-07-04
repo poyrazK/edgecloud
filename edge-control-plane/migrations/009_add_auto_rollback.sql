@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add the auto-rollback feature for issue #74. Three columns, no
 -- data backfill: existing rows just see sensible defaults and the
 -- control plane behaves identically until a tenant opts in.
@@ -35,3 +36,14 @@ ALTER TABLE deployments ADD COLUMN auto_rollback_enabled BOOLEAN NOT NULL DEFAUL
 ALTER TABLE active_deployments ADD COLUMN auto_rollback_enabled BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE active_deployments ADD COLUMN stable_since TIMESTAMPTZ NULL;
+
+-- +migrate Down
+-- Reverse migration 009: drop auto-rollback columns.
+-- DESTRUCTIVE: any tenant opt-in flags and observed-running timestamps
+-- are lost. Only run this as part of a planned rollback.
+
+ALTER TABLE active_deployments DROP COLUMN IF EXISTS stable_since;
+
+ALTER TABLE active_deployments DROP COLUMN IF EXISTS auto_rollback_enabled;
+
+ALTER TABLE deployments DROP COLUMN IF EXISTS auto_rollback_enabled;

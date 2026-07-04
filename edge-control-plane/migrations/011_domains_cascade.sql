@@ -1,3 +1,4 @@
+-- +migrate Up
 -- PR #133 review finding #4: add FOREIGN KEY … ON DELETE CASCADE from
 -- domains(tenant_id, app_name) to apps(tenant_id, name). The apps
 -- table already carries UNIQUE (tenant_id, name) at 004_apps.up.sql:7,
@@ -24,3 +25,9 @@ ALTER TABLE domains
     FOREIGN KEY (tenant_id, app_name)
     REFERENCES apps(tenant_id, name)
     ON DELETE CASCADE;
+
+-- +migrate Down
+-- Reverse of 011_domains_cascade.up.sql. Drops the cascading FK
+-- constraint; the orphan-on-delete behaviour returns.
+
+ALTER TABLE domains DROP CONSTRAINT fk_domains_app;

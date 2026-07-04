@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add the `regions` column to `deployments` for issue #82 (multi-region
 -- deploys, v1). The column stores the list of regions a deployment is
 -- replicated to; the activate path loops over this list and publishes one
@@ -15,3 +16,10 @@
 -- control-plane federation; that work is tracked separately.
 
 ALTER TABLE deployments ADD COLUMN regions TEXT[] NOT NULL DEFAULT '{}';
+
+-- +migrate Down
+-- Reverse migration 008: drop the `regions` column from `deployments`.
+-- DESTRUCTIVE: any per-region target information on existing rows is lost.
+-- Only run this as part of a planned rollback.
+
+ALTER TABLE deployments DROP COLUMN regions;
