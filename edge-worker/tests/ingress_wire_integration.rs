@@ -67,6 +67,7 @@ fn wire_test_config(
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
     }
 }
 

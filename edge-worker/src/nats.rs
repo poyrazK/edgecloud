@@ -69,13 +69,17 @@ pub trait NatsClient: Send + Sync + 'static {
 /// Production NATS client wrapping async-nats with JetStream support.
 pub struct NatsClientImpl {
     client: async_nats::Client,
+    task_stream_replicas: usize,
 }
 
 impl NatsClientImpl {
     /// Connect to a NATS server.
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+    pub async fn connect(url: &str, task_stream_replicas: usize) -> anyhow::Result<Self> {
         let client = async_nats::connect(url).await?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            task_stream_replicas,
+        })
     }
 
     /// Idempotently create the tasks stream if it does not exist.
@@ -84,14 +88,14 @@ impl NatsClientImpl {
     /// per-region consumers with different filter subjects), 24h max
     /// age, replication factor 3. Safe to call from both the worker and
     /// the control plane.
-    pub async fn ensure_task_stream(&self) -> anyhow::Result<()> {
+    pub async fn ensure_task_stream(&self, replicas: usize) -> anyhow::Result<()> {
         let js = jetstream::new(self.client.clone());
         js.get_or_create_stream(StreamConfig {
             name: TASK_STREAM.to_string(),
             subjects: vec![TASK_SUBJECT_WILDCARD.to_string()],
             retention: RetentionPolicy::Interest,
             max_age: Duration::from_secs(24 * 60 * 60),
-            num_replicas: 3,
+            num_replicas: replicas,
             ..Default::default()
         })
         .await
@@ -111,7 +115,7 @@ impl NatsClient for NatsClientImpl {
     ) -> anyhow::Result<TaskMessageStream> {
         // Idempotent — works whether or not the control plane already
         // created the stream.
-        self.ensure_task_stream().await?;
+        self.ensure_task_stream(self.task_stream_replicas).await?;
         let js = jetstream::new(self.client.clone());
         let stream = js
             .get_stream(TASK_STREAM)

@@ -175,7 +175,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
         config.port_cooldown_secs,
     )));
     let nats =
-        Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn NatsClientTrait>;
+        Arc::new(NatsClientImpl::connect(&config.nats_url, 1).await?) as Arc<dyn NatsClientTrait>;
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),

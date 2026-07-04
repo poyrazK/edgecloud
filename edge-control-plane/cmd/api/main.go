@@ -55,7 +55,7 @@ func main() {
 		Subjects:  []string{"edgecloud.tasks.>"},
 		Retention: natsio.InterestPolicy,
 		MaxAge:    24 * time.Hour,
-		Replicas:  3,
+		Replicas:  cfg.NATS.Replicas,
 	}); err != nil {
 		log.Fatalf("Failed to ensure NATS stream: %v", err)
 	}

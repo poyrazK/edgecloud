@@ -95,6 +95,7 @@ fn test_config(
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
+        task_stream_replicas: 1,
     }
 }
 
@@ -169,6 +170,7 @@ impl TestHarness {
             worker_tenant_id: "t_test".to_string(),
             handler_request_budget_ms: 1000,
             handler_max_request_body_bytes: 10 * 1024 * 1024,
+            task_stream_replicas: 1,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -366,6 +368,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
+        task_stream_replicas: 1,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -821,6 +824,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -846,6 +850,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1640,10 +1645,10 @@ async fn build_supervisor_only_with_cp(
         worker_tenant_id: tenant_id.to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
     };
 
     let guard = build_supervisor_with(config).await;
-    // Discard the guard's container handle — `supervisor` is a clone
     // of the Arc inside the guard; the guard holds the container
     // alive for as long as it's in scope. Once this function returns
     // the caller owns the supervisor but NOT the guard; that means

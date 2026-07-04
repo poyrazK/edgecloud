@@ -59,7 +59,8 @@ type DatabaseConfig struct {
 }
 
 type NATSConfig struct {
-	URL string `yaml:"url"`
+	URL      string `yaml:"url"`
+	Replicas int    `yaml:"replicas"`
 }
 
 type AppConfig struct {
@@ -249,6 +250,13 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("EDGE_SECRETS_MASTER_KEY"); v != "" {
 		cfg.SecretsMasterKey = v
 	}
+	if v := os.Getenv("TASK_STREAM_REPLICAS"); v != "" {
+		r, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("TASK_STREAM_REPLICAS must be a valid integer: %w", err)
+		}
+		cfg.NATS.Replicas = r
+	}
 
 	// Override rate-limit config with env vars
 	if v := os.Getenv("RATE_LIMIT_TENANT_RATE"); v != "" {
@@ -362,6 +370,9 @@ func Load(path string) (*Config, error) {
 	// `CONTROL_PLANE_REGION` env var. See issue #82.
 	if cfg.Region == "" {
 		cfg.Region = "global"
+	}
+	if cfg.NATS.Replicas <= 0 {
+		cfg.NATS.Replicas = 3
 	}
 
 	// Defaults for rate-limit config. Zero means "use default";

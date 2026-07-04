@@ -181,8 +181,9 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Connect to NATS
-    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url).await?)
-        as Arc<dyn crate::nats::NatsClient>;
+    let nats =
+        Arc::new(NatsClientImpl::connect(&config.nats_url, config.task_stream_replicas).await?)
+            as Arc<dyn crate::nats::NatsClient>;
     tracing::info!(url = %config.nats_url, "connected to NATS");
 
     // Create the shutdown broadcast channel for the heartbeat task.
