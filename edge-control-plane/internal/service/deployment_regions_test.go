@@ -146,7 +146,7 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 
 	// 4. tenantRepo.GetByID — return a tenant with an allowlist so the
 	// TaskMessage carries it.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow(tenantID, "Test Tenant", "free", `{"api.example.com"}`, time.Now()))
@@ -234,7 +234,7 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
@@ -287,7 +287,7 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start FROM quotas WHERE tenant_id =`)).
@@ -337,7 +337,7 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start FROM quotas WHERE tenant_id =`)).
@@ -414,7 +414,7 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
@@ -465,7 +465,7 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))

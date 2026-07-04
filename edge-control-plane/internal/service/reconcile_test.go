@@ -36,6 +36,16 @@ type fakeTenantRepo struct {
 	getByIDCalls []string // every ID looked up, in order — useful for asserting "was GetByID called?"
 }
 
+func (f *fakeTenantRepo) ListActive(_ context.Context) ([]domain.Tenant, error) {
+	var active []domain.Tenant
+	for _, t := range f.tenants {
+		if !t.IsDisabled() {
+			active = append(active, t)
+		}
+	}
+	return active, nil
+}
+
 func (f *fakeTenantRepo) List(_ context.Context) ([]domain.Tenant, error) {
 	return f.tenants, nil
 }

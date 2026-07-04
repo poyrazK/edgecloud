@@ -105,11 +105,25 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 // can assert the wire shape; default funcs return zero values
 // (nil/empty) so tests that only exercise one method don't need to
 // stub the others.
+type mockTenantRepo struct {
+    tenantRepoInterface
+}
+
+func (m *mockTenantRepo) SetDisabledAt(_ context.Context, _ string, _ time.Time) error {
+    return nil
+}
+
+func (m *mockTenantRepo) ClearDisabledAt(_ context.Context, _ string) error {
+    return nil
+}
+
+
 type mockActiveRepo struct {
 	getFunc               func(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
 	setStableSinceFunc    func(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error
 	clearStableSinceFunc  func(ctx context.Context, tenantID, appName string) error
 	promoteToLastGoodFunc func(ctx context.Context, tenantID, appName, deploymentID string) error
+	listByTenantFunc      func(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
 }
 
 func (m *mockActiveRepo) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
@@ -136,6 +150,12 @@ func (m *mockActiveRepo) PromoteToLastGood(ctx context.Context, tenantID, appNam
 	}
 	return m.promoteToLastGoodFunc(ctx, tenantID, appName, deploymentID)
 }
+func (m *mockActiveRepo) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
+	if m.listByTenantFunc == nil {
+		return nil, nil
+	}
+	return m.listByTenantFunc(ctx, tenantID)
+}
 
 // workerSvcForTest builds a WorkerService with mock dependencies.
 // activeRepo is the new parameter the stability-window evaluator
@@ -143,7 +163,13 @@ func (m *mockActiveRepo) PromoteToLastGood(ctx context.Context, tenantID, appNam
 // called from handleHeartbeat when a tenant_id is present, which
 // the pre-existing tests don't send.
 func workerSvcForTest(wr *mockWorkerRepo, qr *mockQuotaRepo) *WorkerService {
-	return &WorkerService{workerRepo: wr, quotaRepo: qr, nc: nil, activeRepo: nil}
+	return &WorkerService{
+		workerRepo: wr,
+		quotaRepo:  qr,
+		tenantRepo: &mockTenantRepo{},
+		nc:         nil,
+		activeRepo: nil,
+	}
 }
 
 // workerSvcForStabilityTest builds a WorkerService with a 1-second
@@ -154,6 +180,7 @@ func workerSvcForStabilityTest(ar *mockActiveRepo) *WorkerService {
 	return &WorkerService{
 		workerRepo:   &mockWorkerRepo{},
 		quotaRepo:    &mockQuotaRepo{},
+		tenantRepo:   &mockTenantRepo{},
 		activeRepo:   ar,
 		nc:           nil,
 		stableWindow: 1 * time.Second,

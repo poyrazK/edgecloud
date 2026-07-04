@@ -11,7 +11,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
-	nats "github.com/nats-io/nats.go"
+	natsio "github.com/nats-io/nats.go"
 )
 
 // Sentinel errors for WorkerService Register.
@@ -20,6 +20,14 @@ var (
 	ErrRegionMismatch  = errors.New("region mismatch between worker_id and request region")
 	ErrQuotaExceeded   = errors.New("max workers reached for tenant")
 )
+
+// tenantRepoInterface defines the repository methods used by WorkerService
+// for tenant-level operations (issue #155).
+type tenantRepoInterface interface {
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	SetDisabledAt(ctx context.Context, tenantID string, at time.Time) error
+	ClearDisabledAt(ctx context.Context, tenantID string) error
+}
 
 // workerRepoInterface defines the repository methods used by WorkerService.
 type workerRepoInterface interface {
@@ -51,6 +59,7 @@ type activeRepoInterface interface {
 	SetStableSince(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error
 	ClearStableSince(ctx context.Context, tenantID, appName string) error
 	PromoteToLastGood(ctx context.Context, tenantID, appName, deploymentID string) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
 }
 
 // defaultStableWindowSeconds is the default for `STABLE_WINDOW_SECONDS`
@@ -66,7 +75,8 @@ type WorkerService struct {
 	workerRepo   workerRepoInterface
 	quotaRepo    quotaRepoInterface
 	activeRepo   activeRepoInterface
-	nc           *nats.Conn
+	tenantRepo   tenantRepoInterface
+	nc           *natsio.Conn
 	stableWindow time.Duration
 	metricsAgg   *MetricsAggregator
 }
@@ -79,7 +89,15 @@ type WorkerService struct {
 // the default (30s, configurable via STABLE_WINDOW_SECONDS env). The
 // CLI accepts any non-negative integer; sub-second precision is not
 // supported.
-func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *repository.QuotaRepository, activeRepo *repository.ActiveDeploymentRepository, nc *nats.Conn, stableWindow time.Duration, metricsAgg *MetricsAggregator) *WorkerService {
+func NewWorkerService(
+	workerRepo *repository.WorkerRepository,
+	quotaRepo *repository.QuotaRepository,
+	activeRepo *repository.ActiveDeploymentRepository,
+	tenantRepo *repository.TenantRepository,
+	nc *natsio.Conn,
+	stableWindow time.Duration,
+	metricsAgg *MetricsAggregator,
+) *WorkerService {
 	if stableWindow <= 0 {
 		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
 	}
@@ -87,6 +105,7 @@ func NewWorkerService(workerRepo *repository.WorkerRepository, quotaRepo *reposi
 		workerRepo:   workerRepo,
 		quotaRepo:    quotaRepo,
 		activeRepo:   activeRepo,
+		tenantRepo:   tenantRepo,
 		nc:           nc,
 		stableWindow: stableWindow,
 		metricsAgg:   metricsAgg,
@@ -169,7 +188,7 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 		// No NATS connection — skip subscription (e.g., in tests)
 		return nil
 	}
-	ch := make(chan *nats.Msg, 100)
+	ch := make(chan *natsio.Msg, 100)
 	sub, err := s.nc.ChanSubscribe("edgecloud.heartbeats.>", ch)
 	if err != nil {
 		return fmt.Errorf("subscribing to heartbeats: %w", err)
@@ -192,7 +211,7 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 	return nil
 }
 
-func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *nats.Msg) {
+func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	var hb struct {
 		Type       string          `json:"type"`
 		Timestamp  time.Time       `json:"timestamp"`
@@ -354,10 +373,78 @@ func (s *WorkerService) applyTenantDelta(
 		used := usedField(quota)
 		if used > cap {
 			log.Printf(
-				"quota: tenant %s used %d %s, exceeds monthly limit %d — enforcement pending",
+				"quota: tenant %s used %d %s, exceeds monthly limit %d — disabling tenant",
 				tenantID, used, capLabel, cap,
 			)
+			// Disable the tenant so the reconcile loop stops publishing
+			// task updates and new deployments are rejected (issue #155).
+			if err := s.tenantRepo.SetDisabledAt(ctx, tenantID, time.Now()); err != nil {
+				log.Printf("quota: failed to disable tenant %s: %v", tenantID, err)
+				continue
+			}
+			// Publish empty task_update so workers in every region
+			// stop the tenant's apps immediately instead of waiting
+			// for the next reconcile cycle (5 min).
+			s.notifyDisableTenant(ctx, tenantID)
 		}
+	}
+}
+
+// notifyDisableTenant publishes a task_update with an empty apps map to
+// every region where the tenant has active deployments. This tells workers
+// to stop the tenant's apps immediately (issue #155).
+func (s *WorkerService) notifyDisableTenant(ctx context.Context, tenantID string) {
+	if s.nc == nil {
+		return
+	}
+	ads, err := s.activeRepo.ListByTenant(ctx, tenantID)
+	if err != nil {
+		log.Printf("quota: failed to list active deployments for tenant %s: %v", tenantID, err)
+		return
+	}
+	if len(ads) == 0 {
+		return
+	}
+	// Collect unique regions from all active deployments using the
+	// RegionsPublished field (the set of regions that have been
+	// notified for this tenant's deployments).
+	regionSet := make(map[string]struct{})
+	for _, ad := range ads {
+		for _, r := range ad.RegionsPublished {
+			regionSet[r] = struct{}{}
+		}
+	}
+	if len(regionSet) == 0 {
+		regionSet["global"] = struct{}{}
+	}
+	js, err := s.nc.JetStream()
+	if err != nil {
+		log.Printf("quota: JetStream context for tenant %s disable notification: %v", tenantID, err)
+		return
+	}
+	for region := range regionSet {
+		msg := struct {
+			Type      string                 `json:"type"`
+			Timestamp time.Time              `json:"timestamp"`
+			TenantID  string                 `json:"tenant_id"`
+			Apps      map[string]interface{} `json:"apps"`
+		}{
+			Type:      "task_update",
+			Timestamp: time.Now(),
+			TenantID:  tenantID,
+			Apps:      map[string]interface{}{},
+		}
+		data, err := json.Marshal(msg)
+		if err != nil {
+			log.Printf("quota: marshal disable notification for tenant %s: %v", tenantID, err)
+			continue
+		}
+		subject := fmt.Sprintf("edgecloud.tasks.%s", region)
+		if _, err := js.Publish(subject, data); err != nil {
+			log.Printf("quota: publish disable notification for tenant %s region %s: %v", tenantID, region, err)
+			continue
+		}
+		log.Printf("quota: published empty task_update for disabled tenant %s region %s", tenantID, region)
 	}
 }
 

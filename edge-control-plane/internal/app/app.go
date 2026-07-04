@@ -83,7 +83,7 @@ func New(
 	envSvc := service.NewEnvService(appEnvRepo)
 	metricsAgg := service.NewMetricsAggregator()
 	workerSvc := service.NewWorkerService(
-		workerRepo, quotaRepo, activeDeploymentRepo,
+		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 	)
 	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)

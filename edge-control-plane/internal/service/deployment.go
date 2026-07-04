@@ -592,6 +592,9 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if tenant == nil {
 		return fmt.Errorf("tenant not found")
 	}
+	if tenant.IsDisabled() {
+		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
+	}
 
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {

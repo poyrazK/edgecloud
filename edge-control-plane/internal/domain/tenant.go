@@ -25,6 +25,18 @@ type Tenant struct {
 	// same reason on the encoding side.
 	AllowlistedDestinations pq.StringArray `db:"allowlisted_destinations" json:"allowlisted_destinations"`
 	CreatedAt               time.Time      `db:"created_at"               json:"created_at"`
+	// DisabledAt is set when the tenant exceeds their outbound bandwidth
+	// quota (issue #155). When non-nil, the control plane skips publishing
+	// task updates for this tenant and rejects new deployments/activations.
+	// Cleared when the billing period resets or an operator manually
+	// re-enables the tenant.
+	DisabledAt *time.Time `db:"disabled_at" json:"disabled_at,omitempty"`
+}
+
+// IsDisabled returns true if the tenant is currently disabled (disabled_at
+// is set in the past).
+func (t *Tenant) IsDisabled() bool {
+	return t.DisabledAt != nil && !t.DisabledAt.IsZero()
 }
 
 // Quota defines resource limits for a tenant.

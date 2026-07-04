@@ -32,7 +32,7 @@ var ErrTenantNotFoundInReconcile = errors.New("tenant not found")
 // actually detect "not found" because tenant is a slice that can be
 // empty for unrelated reasons (e.g. a fresh DB, or pagination later).
 type reconcileTenants interface {
-	List(ctx context.Context) ([]domain.Tenant, error)
+	ListActive(ctx context.Context) ([]domain.Tenant, error)
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
@@ -161,7 +161,7 @@ func (s *ReconcileService) Run(ctx context.Context, interval time.Duration) {
 // logged-and-continued so a single bad tenant doesn't take the whole
 // sweep down.
 func (s *ReconcileService) RunOnce(ctx context.Context) error {
-	tenants, err := s.tenantRepo.List(ctx)
+	tenants, err := s.tenantRepo.ListActive(ctx)
 	if err != nil {
 		return err
 	}
