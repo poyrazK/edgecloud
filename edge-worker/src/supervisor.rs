@@ -12,7 +12,7 @@ use wasmtime::component::InstancePre;
 
 use crate::config::Config;
 use crate::detect::{detect_execution_model, ExecutionModel};
-use crate::dispatch::{HandlerConfig, HandlerDispatch};
+use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, TaskMessage};
@@ -316,12 +316,15 @@ impl Supervisor {
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
                 };
 
+                let tls_config =
+                    try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
                 let dispatch = HandlerDispatch::new(
                     instance_pre.clone(),
                     raw_port,
                     self.config.handler_request_budget_ms,
                     self.config.epoch_tick_ms,
                     handler_config,
+                    tls_config,
                 )?;
 
                 let dispatch = Arc::new(dispatch);

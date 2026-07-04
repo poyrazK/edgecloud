@@ -96,6 +96,8 @@ fn test_config(
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     }
 }
 
@@ -171,6 +173,8 @@ impl TestHarness {
             handler_request_budget_ms: 1000,
             handler_max_request_body_bytes: 10 * 1024 * 1024,
             task_stream_replicas: 1,
+            tls_cert_path: None,
+            tls_key_path: None,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -369,6 +373,8 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -825,6 +831,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -851,6 +859,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1646,6 +1656,8 @@ async fn build_supervisor_only_with_cp(
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
 
     let guard = build_supervisor_with(config).await;

@@ -49,11 +49,18 @@ http-body-util = "0.1"
 # hyper client internals.
 hyper = { version = "1", features = ["server", "client", "http1"] }
 
+# TLS support for HandlerDispatch FaaS endpoint (issue #209).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
+
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
+# Generate self-signed TLS certs for the try_load_tls_config test (issue #209).
+rcgen = { version = "0.13", features = ["pem"] }
 # Shared test harness: NATS container startup, skip predicate, and
 # Supervisor wiring (formerly duplicated across integration_tests.rs,
 # ingress_wire_integration.rs, and edge-ingress/tests/integration.rs).

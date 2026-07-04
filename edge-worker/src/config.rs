@@ -114,6 +114,15 @@ pub struct Config {
     /// RECOMMENDED in production — a misbehaving tenant can exhaust
     /// worker memory with one POST).
     pub handler_max_request_body_bytes: u64,
+    /// Optional path to a PEM-encoded TLS certificate for the FaaS
+    /// HandlerDispatch endpoint (issue #209). When set alongside
+    /// `tls_key_path`, the dispatch accepts TLS connections in
+    /// addition to plaintext. Both must be set for TLS to activate.
+    pub tls_cert_path: Option<String>,
+    /// Optional path to a PEM-encoded TLS private key for the FaaS
+    /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
+    /// and `tls_key_path` must be set for TLS to activate.
+    pub tls_key_path: Option<String>,
 }
 
 impl Config {
@@ -212,6 +221,8 @@ impl Config {
                 "HANDLER_MAX_REQUEST_BODY_BYTES",
                 10 * 1024 * 1024,
             )?,
+            tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
+            tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
         })
     }
 

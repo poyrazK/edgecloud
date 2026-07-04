@@ -50,6 +50,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request as HyperRequest;
 use hyper::Response as HyperResponse;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use wasmtime::component::InstancePre;
@@ -61,6 +62,8 @@ use wasmtime_wasi_http::p2::WasiHttpView;
 
 use edge_runtime::interfaces::observe::{AppLogContext, LogSink};
 use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
+use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
 
 // Convenience aliases: the bindgen-generated `ProxyPre` lives one level
 // deeper than the example docs suggest — `wasmtime_wasi_http::ProxyPre`
@@ -113,6 +116,52 @@ impl Body for CountingBody {
     }
 }
 
+/// Stream type that can be either plain TCP or TLS-wrapped (issue #209).
+enum MaybeTls {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTls {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCtx<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTls {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskCtx<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTls::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(s) => Pin::new(s).poll_flush(cx),
+            MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTls::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Per-app HTTP dispatcher for a FaaS component.
 ///
 /// Owns a `ProxyPre<RuntimeState>` (pre-instantiated component) and a
@@ -136,6 +185,8 @@ pub struct HandlerDispatch {
     /// Per-app context shared across all requests (tenant_id, egress,
     /// meter, log_sink, app_ctx). Cheap to clone (`Arc`-heavy).
     config: Arc<HandlerConfig>,
+    /// Optional TLS server config for encrypted connections (issue #209).
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Per-app context handed to every FaaS request.
@@ -170,6 +221,7 @@ impl HandlerDispatch {
         request_budget_ms: u64,
         epoch_tick_ms: u64,
         config: HandlerConfig,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> anyhow::Result<Self> {
         let proxy_pre = HandlerProxyPre::new(instance_pre).map_err(|e| {
             anyhow::anyhow!(
@@ -186,6 +238,7 @@ impl HandlerDispatch {
             request_budget_ticks: ticks.max(1),
             tick_ms,
             config: Arc::new(config),
+            tls_config,
         })
     }
 
@@ -275,10 +328,32 @@ impl HandlerDispatch {
                         }
                     };
                     let server = self.clone();
+                    let tls_config = self.tls_config.clone();
                     let tenant_id_for_log = server.config.tenant_id.clone();
                     let app_name_for_log = server.config.app_ctx.app_name.clone();
                     tokio::spawn(async move {
-                        match server.serve_connection(client).await {
+                        // Perform TLS handshake if configured, otherwise
+                        // use the plain TCP stream (issue #209).
+                        let stream = if let Some(tls) = tls_config {
+                            match tokio_rustls::TlsAcceptor::from(tls)
+                                .accept(client)
+                                .await
+                            {
+                                Ok(tls_stream) => MaybeTls::Tls(Box::new(tls_stream)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tenant_id = %tenant_id_for_log,
+                                        client = %addr,
+                                        err = %e,
+                                        "TLS handshake failed"
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            MaybeTls::Plain(client)
+                        };
+                        match server.serve_connection_generic(TokioIo::new(stream)).await {
                             Ok(()) => {
                                 tracing::debug!(
                                     client = %addr,
@@ -301,19 +376,20 @@ impl HandlerDispatch {
         }
     }
 
-    /// Serve one accepted TCP connection. Iterates HTTP/1.1 request/
-    /// response cycles until the client closes or a handler errors.
+    /// Serve one accepted TCP connection (plain or TLS). Iterates
+    /// HTTP/1.1 request/response cycles until the client closes or
+    /// a handler errors.
     ///
     /// We use the raw `hyper::server::conn::http1` API because
     /// `wasmtime-wasi-http` 25's examples pair with `hyper` directly.
-    /// axum 0.7 would add an extra layer of `axum::body::Body` ↔
-    /// `hyper::body::Incoming` conversion with no win for a FaaS
-    /// dispatch path that already round-trips through `hyper::Body`.
-    async fn serve_connection(
+    async fn serve_connection_generic<IO>(
         self: Arc<Self>,
-        client: tokio::net::TcpStream,
-    ) -> anyhow::Result<()> {
-        let io = TokioIo::new(client);
+        client: TokioIo<IO>,
+    ) -> anyhow::Result<()>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = client;
         let server = self.clone();
         let svc = service_fn(move |req: HyperRequest<Incoming>| {
             let server = server.clone();
@@ -553,6 +629,48 @@ impl HandlerDispatch {
     }
 }
 
+/// Load TLS certificate and key from files specified by paths (issue #209).
+/// Returns `None` if either path is unset, the files can't be read, or
+/// the PEM data is invalid. Logs warnings for each failure mode so
+/// operators can diagnose without enabling debug logging.
+pub fn try_load_tls_config(
+    cert_path: &Option<String>,
+    key_path: &Option<String>,
+) -> Option<Arc<rustls::ServerConfig>> {
+    let cert_path = cert_path.as_ref()?;
+    let key_path = key_path.as_ref()?;
+
+    let cert = std::fs::read(cert_path)
+        .map_err(|e| tracing::warn!(path = %cert_path, err = %e, "failed to read TLS certificate"))
+        .ok()?;
+    let key = std::fs::read(key_path)
+        .map_err(|e| tracing::warn!(path = %key_path, err = %e, "failed to read TLS private key"))
+        .ok()?;
+
+    if cert.is_empty() || key.is_empty() {
+        tracing::warn!("TLS certificate or key file is empty");
+        return None;
+    }
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert))
+        .filter_map(Result::ok)
+        .collect();
+    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key))
+        .ok()
+        .flatten()?;
+
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()?;
+
+    // Advertise HTTP/2 via ALPN so clients can negotiate it over TLS.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    tracing::info!(cert_path = %cert_path, "TLS configured");
+    Some(Arc::new(cfg))
+}
+
 /// Shared body of every synthetic error response. Truncates the
 /// diagnostic to a UTF-8-safe boundary at 1024 bytes (so a 100 MB
 /// error string doesn't blow up the dispatch). Inputs under 1024
@@ -619,6 +737,69 @@ fn synthetic_413(
     let diagnostic =
         format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
     synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic, meter)
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn try_load_tls_config_returns_none_when_no_env() {
+        assert!(try_load_tls_config(&None, &None).is_none());
+        assert!(try_load_tls_config(&Some("cert.pem".into()), &None).is_none());
+        assert!(try_load_tls_config(&None, &Some("key.pem".into())).is_none());
+    }
+
+    #[test]
+    fn try_load_tls_config_returns_none_on_bad_path() {
+        assert!(try_load_tls_config(
+            &Some("/nonexistent/cert.pem".into()),
+            &Some("/nonexistent/key.pem".into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn try_load_tls_config_parses_self_signed_cert_and_key() {
+        // rustls 0.23 requires a CryptoProvider to be installed before
+        // constructing ServerConfig. Install the ring-based default.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("generate self-signed cert");
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+
+        let mut cert_file = NamedTempFile::new().expect("cert tempfile");
+        write!(cert_file, "{}", cert_pem).expect("write cert");
+        let mut key_file = NamedTempFile::new().expect("key tempfile");
+        write!(key_file, "{}", key_pem).expect("write key");
+
+        let result = try_load_tls_config(
+            &Some(cert_file.path().to_str().unwrap().into()),
+            &Some(key_file.path().to_str().unwrap().into()),
+        );
+        assert!(result.is_some(), "should load valid cert+key");
+
+        let cfg = result.unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn try_load_tls_config_returns_none_on_empty_file() {
+        let cert_file = NamedTempFile::new().expect("cert tempfile");
+        let key_file = NamedTempFile::new().expect("key tempfile");
+        assert!(try_load_tls_config(
+            &Some(cert_file.path().to_str().unwrap().into()),
+            &Some(key_file.path().to_str().unwrap().into()),
+        )
+        .is_none());
+    }
 }
 
 #[cfg(test)]

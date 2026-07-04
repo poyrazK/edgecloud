@@ -179,7 +179,7 @@ impl LayerHarness {
         };
 
         let dispatch = Arc::new(
-            HandlerDispatch::new(instance_pre, port, 1_000, 1, config)
+            HandlerDispatch::new(instance_pre, port, 1_000, 1, config, None)
                 .context("HandlerDispatch::new")?,
         );
 
@@ -456,6 +456,7 @@ async fn l7_per_request_timeout_returns_500() {
             /* request_budget_ms */ 100,
             1,
             config,
+            None,
         )
         .expect("HandlerDispatch::new"),
     );
@@ -521,7 +522,8 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
     let port = ephemeral_port().expect("bind ephemeral port");
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(instance_pre, port, 5_000, 10, config).expect("HandlerDispatch::new"),
+        HandlerDispatch::new(instance_pre, port, 5_000, 10, config, None)
+            .expect("HandlerDispatch::new"),
     );
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);

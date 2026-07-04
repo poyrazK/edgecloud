@@ -68,6 +68,8 @@ fn wire_test_config(
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     }
 }
 
