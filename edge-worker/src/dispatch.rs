@@ -48,6 +48,7 @@ use hyper::Request as HyperRequest;
 use hyper::Response as HyperResponse;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio_rustls::TlsAcceptor;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -117,6 +118,9 @@ pub struct HandlerConfig {
     /// the guest is invoked. `0` disables the cap (NOT RECOMMENDED —
     /// see `Config::handler_max_request_body_bytes`).
     pub max_request_body_bytes: u64,
+    /// Optional TLS server configuration. When set, the handler
+    /// dispatch serves HTTPS using the provided cert/key.
+    pub tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl HandlerDispatch {
@@ -270,16 +274,24 @@ impl HandlerDispatch {
         self: Arc<Self>,
         client: tokio::net::TcpStream,
     ) -> anyhow::Result<()> {
-        let io = TokioIo::new(client);
+        // If TLS is configured, perform the handshake before dispatching.
+        if let Some(tls_config) = &self.config.tls_config {
+            let acceptor = TlsAcceptor::from(tls_config.clone());
+            let tls_stream = acceptor.accept(client).await?;
+            let io = TokioIo::new(tls_stream);
+            return self.serve_http_on(io).await;
+        }
+        self.serve_http_on(TokioIo::new(client)).await
+    }
+
+    async fn serve_http_on(
+        self: &Arc<Self>,
+        io: TokioIo<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>,
+    ) -> anyhow::Result<()> {
         let server = self.clone();
         let svc = service_fn(move |req: HyperRequest<Incoming>| {
             let server = server.clone();
-            async move {
-                // `handle_request` returns `anyhow::Result<HyperResponse>`
-                // which is `Send + Sync + 'static` — the bounds
-                // `hyper::service::Service` requires on `Output::Error`.
-                server.handle_request(req).await
-            }
+            async move { server.handle_request(req).await }
         });
         http1::Builder::new()
             .keep_alive(true)
@@ -548,6 +560,39 @@ fn synthetic_413(content_length: u64, cap: u64) -> HyperResponse<HyperOutgoingBo
     let diagnostic =
         format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
     synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic)
+}
+
+/// TLS configuration loader. Mirrors the v0.1 `try_load_tls_config` from
+/// `edge-runtime/src/interfaces/http_server.rs` (removed in PR #196).
+/// Reads cert and key PEM files from env vars, builds a `rustls::ServerConfig`
+/// with ALPN protocols `h2` and `http/1.1`.
+///
+/// Returns `None` when either env var is unset — the caller treats None
+/// as "serve plaintext".
+pub fn try_load_tls_config() -> Option<Arc<rustls::ServerConfig>> {
+    use std::fs;
+    let cert_path = std::env::var("EDGE_TLS_CERT_PATH").ok()?;
+    let key_path = std::env::var("EDGE_TLS_KEY_PATH").ok()?;
+
+    let certs = {
+        let cert_pem = fs::read(&cert_path).ok()?;
+        let mut reader = std::io::BufReader::new(&cert_pem[..]);
+        rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+    };
+    let key = {
+        let key_pem = fs::read(&key_path).ok()?;
+        let mut reader = std::io::BufReader::new(&key_pem[..]);
+        rustls_pemfile::private_key(&mut reader).ok()??
+    };
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()?;
+
+    Some(Arc::new(config))
 }
 
 #[cfg(test)]

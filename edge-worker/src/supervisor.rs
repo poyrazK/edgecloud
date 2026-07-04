@@ -305,6 +305,7 @@ impl Supervisor {
                 // used instead.
                 let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
+                let tls_config = crate::dispatch::try_load_tls_config();
                 let handler_config = HandlerConfig {
                     tenant_id: tenant_id.to_string(),
                     egress: egress_for_handler.clone(),
@@ -314,6 +315,7 @@ impl Supervisor {
                     meter: meter.clone(),
                     env: env.clone(),
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                    tls_config,
                 };
 
                 let dispatch = HandlerDispatch::new(

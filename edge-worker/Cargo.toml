@@ -48,6 +48,9 @@ http-body-util = "0.1"
 # `client` because wasmtime-wasi-http's default_send_request depends on the
 # hyper client internals.
 hyper = { version = "1", features = ["server", "client", "http1"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
