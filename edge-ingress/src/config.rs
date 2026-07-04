@@ -28,7 +28,14 @@ pub struct Config {
     pub nats_url: String,
     pub caddy_admin_url: String,
     pub region: String,
+    /// Path to the TLS certificate PEM file. Passed to Caddy's
+    /// `load_files` config. When Caddy runs in Docker, this must be
+    /// a container-accessible path (e.g. `/etc/caddy/tls/cert.pem`
+    /// matching a `-v` mount), not a host path like `/Users/...`.
+    /// Set via `TLS_CERT_FILE` (required).
     pub cert_file: String,
+    /// Path to the TLS key PEM file. Same Docker constraint as
+    /// `cert_file`. Set via `TLS_KEY_FILE` (required).
     pub key_file: String,
     pub listen_http: String,
     pub listen_https: String,
@@ -59,8 +66,12 @@ impl Config {
     ///
     /// Required env vars:
     /// - `INGRESS_REGION` (e.g. `fra`)
-    /// - `TLS_CERT_FILE` (path to the `*.edgecloud.dev` wildcard cert PEM)
-    /// - `TLS_KEY_FILE` (path to the matching key PEM)
+    /// - `TLS_CERT_FILE` — path to the `*.edgecloud.dev` wildcard cert PEM.
+    ///   When Caddy runs in Docker, this must be a path accessible from
+    ///   inside the container (e.g. `/etc/caddy/tls/cert.pem` when using
+    ///   `-v` mount), NOT a host-only path like `/Users/user/...`.
+    /// - `TLS_KEY_FILE` — path to the matching key PEM. Same Docker
+    ///   path constraint as `TLS_CERT_FILE`.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
