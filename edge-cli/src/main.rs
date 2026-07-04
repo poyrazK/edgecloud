@@ -105,6 +105,11 @@ enum Command {
         #[arg(long, value_name = "REGIONS", value_delimiter = ',')]
         regions: Vec<String>,
 
+        /// Path to the wasm artifact. Overrides the default
+        /// `target/wasm32-wasip2/release/{app}.wasm`.
+        #[arg(long, value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+
         /// Opt in to auto-rollback (issue #74). When set, the server
         /// records `auto_rollback_enabled = true` on this deployment
         /// (and on the active slot at activate time). With this flag:
@@ -145,6 +150,12 @@ enum Command {
     /// List environment variables.
     EnvList,
 
+    /// Delete an environment variable.
+    EnvDelete {
+        /// Environment variable key to delete.
+        key: String,
+    },
+
     /// Activate a specific deployment.
     Activate {
         /// Deployment ID to activate.
@@ -154,6 +165,16 @@ enum Command {
         /// this deployment and the currently active one.
         #[arg(long)]
         weight: Option<u8>,
+    },
+
+    /// List all apps, create an app, or show details for one.
+    ///
+    /// `edge apps` lists all apps for the tenant.
+    /// `edge apps create <name>` creates a new app.
+    /// `edge apps get <name>` shows details for a specific app.
+    Apps {
+        #[command(subcommand)]
+        action: Option<AppsCommand>,
     },
 
     /// Roll back to the previous deployment.
@@ -191,6 +212,16 @@ enum Command {
     /// List all deployments for the app.
     Deployments,
 
+    /// Show tenant quota and usage.
+    Quota,
+
+    /// Show the ingress target (worker address and port) for a running app.
+    Ingress {
+        /// App name. Defaults to the app in `.edge/state.json`.
+        #[arg(default_value = "")]
+        app: String,
+    },
+
     /// Read recent log entries for the app (issue #77).
     ///
     /// Calls `GET /api/v1/apps/{appName}/logs` and prints the most
@@ -225,6 +256,12 @@ enum Command {
         /// to [1, 1000]; default 100.
         #[arg(long, default_value_t = 100)]
         limit: u32,
+
+        /// Offset for pagination. Use to page through older entries.
+        /// Pagination is offset-based; the server returns a
+        /// `next_offset` hint when more results exist.
+        #[arg(long, value_name = "N")]
+        offset: Option<u32>,
     },
 
     /// Manage authentication (signup, login, whoami, logout).
@@ -241,6 +278,12 @@ enum Command {
     /// Manage custom FQDNs bound to a deployment (issue #83).
     #[command(subcommand)]
     Domains(DomainsCommand),
+
+    /// Manage the outbound host allowlist (egress rules).
+    Egress {
+        #[command(subcommand)]
+        action: commands::egress::EgressAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -264,6 +307,28 @@ enum StatusAction {
     Deployment,
 }
 
+/// `edge apps` — list apps or show details for one.
+///
+/// Bare `edge apps` lists all apps for the tenant.
+/// `edge apps create <name>` creates a new app.
+/// `edge apps get <name>` shows details for a specific app.
+#[derive(Subcommand)]
+enum AppsCommand {
+    /// Show details for a specific app.
+    Get {
+        /// App name to fetch.
+        name: String,
+    },
+    /// Create a new app.
+    Create {
+        /// Name of the app to create.
+        name: String,
+        /// Optional description for the app.
+        #[arg(long)]
+        description: Option<String>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -275,31 +340,58 @@ fn main() -> Result<()> {
             id,
             regions,
             auto_rollback,
-        } => commands::deploy::run(&cli.path, &app, id.as_deref(), &regions, auto_rollback),
+            file,
+        } => commands::deploy::run(
+            &cli.path,
+            &app,
+            id.as_deref(),
+            &regions,
+            auto_rollback,
+            file.as_deref(),
+        ),
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
             StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
             StatusAction::Deployment => commands::status::run(&cli.path),
         },
         Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
         Command::EnvList => commands::env::list_vars(&cli.path),
+        Command::EnvDelete { key } => commands::env::delete_var(&cli.path, &key),
         Command::Activate {
             deployment_id,
             weight,
         } => commands::activate::run(&cli.path, &deployment_id, weight),
+        Command::Apps { action } => match action {
+            None => commands::apps::list(&cli.path),
+            Some(AppsCommand::Get { name }) => commands::apps::get(&cli.path, &name),
+            Some(AppsCommand::Create { name, description }) => {
+                commands::apps::create(&cli.path, &name, description.as_deref())
+            }
+        },
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev => commands::dev::run(&cli.path),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Quota => commands::quota::run(&cli.path),
+        Command::Ingress { app } => commands::ingress::run(&cli.path, &app),
         Command::Logs {
             app,
             since,
             level,
             follow,
             limit,
+            offset,
         } => {
             let since_dur = parse_since(&since)?;
-            commands::logs::run(&cli.path, &app, since_dur, level.as_deref(), follow, limit)
+            commands::logs::run(
+                &cli.path,
+                &app,
+                since_dur,
+                level.as_deref(),
+                follow,
+                limit,
+                offset,
+            )
         }
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
@@ -320,6 +412,13 @@ fn main() -> Result<()> {
             let action: commands::domains::DomainsAction = cmd.into();
             action.run(&cli.path)
         }
+        Command::Egress { action } => match action {
+            commands::egress::EgressAction::Show => commands::egress::show(&cli.path),
+            commands::egress::EgressAction::Set { hosts } => {
+                commands::egress::set(&cli.path, &hosts)
+            }
+            commands::egress::EgressAction::Clear => commands::egress::clear(&cli.path),
+        },
     }
 }
 

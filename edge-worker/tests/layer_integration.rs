@@ -148,15 +148,14 @@ impl LayerHarness {
             create_component_linker_handler(&engine).context("create_component_linker_handler")?;
 
         let bytes = std::fs::read(&path).context("read handler.wasm")?;
-        let component =
-            Component::from_binary(&engine, &bytes).context("Component::from_binary")?;
+        let component = Component::from_binary(&engine, &bytes).map_err(anyhow::Error::from)?;
 
         // Pre-compile the component into an InstancePre. The per-request
         // path rebuilds its own store+state; this pre-compilation step
         // is what makes HandlerDispatch::serve fast on the hot path.
         let instance_pre: InstancePre<RuntimeState> = linker
             .instantiate_pre(&component)
-            .context("linker.instantiate_pre")?;
+            .map_err(anyhow::Error::from)?;
 
         // Port allocation: prefer 8192+ (ephemeral range, less likely
         // to clash with a developer's local services).

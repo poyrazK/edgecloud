@@ -4,7 +4,7 @@
 //! worlds share the same `edge:cloud@0.2.0` import surface and the
 //! same `include wasi:cli/command@0.2.1` surface. The only difference
 //! between the two worlds is the `wasi:http/incoming-handler` *export*
-//! on the handler world, which `wasmtime_wasi_http::ProxyPre` routes
+//! on the handler world, which `wasmtime_wasi_http::p2::bindings::ProxyPre` routes
 //! against at *instantiation* time, not at linker-construction time.
 //! So one factory, parameterized on `engine`, is correct.
 //!
@@ -12,12 +12,12 @@
 //!
 //! See the module-level comment in `lib.rs`. In short: we do NOT let
 //! bindgen auto-register the wasi:* Host impls (which would require
-//! `RuntimeState` to implement 100+ `wasmtime_wasi::bindings::...::Host`
+//! `RuntimeState` to implement 100+ `wasmtime_wasi::p2::bindings::...::Host`
 //! methods directly — `wit-bindgen 0.51` doesn't auto-wrap in
 //! `WasiImpl`). Instead, the linker is built up in three explicit
 //! passes:
 //!
-//! 1. **`wasmtime_wasi::add_to_linker_async`** — registers every
+//! 1. **`wasmtime_wasi::p2::add_to_linker_async`** — registers every
 //!    `wasi:cli/command` import (`wasi:io/*`, `wasi:clocks/*`,
 //!    `wasi:filesystem/*`, `wasi:random/*`, `wasi:sockets/*`,
 //!    `wasi:cli/*`) via the canonical `WasiImpl<&mut T>` wrapper.
@@ -41,7 +41,7 @@
 
 use crate::RuntimeState;
 use anyhow::Result;
-use wasmtime::component::Linker as ComponentLinker;
+use wasmtime::component::{HasSelf, Linker as ComponentLinker};
 use wasmtime::Engine;
 
 /// Build the linker shared by both `edge-runtime` and
@@ -52,20 +52,21 @@ use wasmtime::Engine;
 /// Long-running components implement `_start` and self-host any TCP
 /// servers they need via `wasi:sockets` (registered via step 1).
 /// Handler components additionally export `wasi:http/incoming-handler`,
-/// which `wasmtime_wasi_http::ProxyPre` dispatches against at request
+/// which `wasmtime_wasi_http::p2::bindings::ProxyPre` dispatches against at request
 /// time — see `edge-worker/src/dispatch.rs`.
 pub fn create_component_linker(engine: &Engine) -> Result<ComponentLinker<RuntimeState>> {
     let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(engine);
 
     // Step 1: wasi:cli/command (io, clocks, filesystem, random, sockets, cli).
     // Requires `RuntimeState: WasiView` — implemented in runtime.rs.
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
     // Step 2: wasi:http/{outgoing-handler, types}. Components can make
     // outbound HTTP calls. Egress enforcement is wired via
-    // RuntimeState's WasiHttpView::send_request override.
+    // RuntimeState's `EgressHttpHooks` (stored as `http_hooks`), reached
+    // through `WasiHttpView::http()` -> `WasiHttpCtxView::hooks`.
     // Requires `RuntimeState: WasiHttpView` — implemented in runtime.rs.
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
     // Step 3: edge:cloud/* — registers each Host impl individually.
     // RuntimeState implements all six below in runtime.rs.
@@ -112,7 +113,7 @@ pub fn create_component_linker_handler(engine: &Engine) -> Result<ComponentLinke
 /// one's — same underlying Host impl since the WIT bodies are
 /// identical; the bindgens differ only in their generated trait
 /// namespaces, not the host impls).
-fn host_getter(state: &mut RuntimeState) -> &mut RuntimeState {
+pub(crate) fn host_getter(state: &mut RuntimeState) -> &mut RuntimeState {
     state
 }
 
@@ -121,7 +122,13 @@ fn edge_cloud_add_to_linker_get_host(linker: &mut ComponentLinker<RuntimeState>)
 
     macro_rules! register_host {
         ($mod:ident) => {{
-            long_cloud::$mod::add_to_linker(linker, host_getter)?;
+            // In wasmtime 36 the bindgen-generated add_to_linker wants
+            // `for<'a> Fn(&'a mut T) -> <T as HasData>::Data<'a>`. The
+            // turbofish `HasSelf<RuntimeState>` tells the macro the
+            // store type explicitly — `HasSelf<T>`'s blanket `Data<'a> =
+            // &'a mut T` then resolves the (otherwise ambiguous) two-
+            // world Host impls.
+            long_cloud::$mod::add_to_linker::<_, HasSelf<RuntimeState>>(linker, host_getter)?;
         }};
     }
 
@@ -133,4 +140,62 @@ fn edge_cloud_add_to_linker_get_host(linker: &mut ComponentLinker<RuntimeState>)
     register_host!(process);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::create_engine;
+    use crate::runtime::RuntimeState;
+
+    #[test]
+    fn create_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn create_long_running_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker_long_running(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn create_handler_linker_succeeds() {
+        let engine = create_engine().expect("engine");
+        let linker = create_component_linker_handler(&engine).expect("linker");
+        drop(linker);
+    }
+
+    #[test]
+    fn host_getter_returns_identity() {
+        let mut state = RuntimeState::new();
+        let returned: *mut RuntimeState = host_getter(&mut state);
+        let original: *mut RuntimeState = &mut state;
+        assert_eq!(
+            returned, original,
+            "host_getter must return the same RuntimeState reference"
+        );
+    }
+
+    #[test]
+    fn edge_cloud_interfaces_registered() {
+        let engine = create_engine().expect("engine");
+        let mut linker: ComponentLinker<RuntimeState> = ComponentLinker::new(&engine);
+        // All 6 edge:cloud interfaces register without error.
+        let result = edge_cloud_add_to_linker_get_host(&mut linker);
+        assert!(result.is_ok(), "all edge:cloud interfaces must register");
+    }
+
+    #[test]
+    fn linker_works_with_default_runtime_state() {
+        // Both worlds use the same linker factory — this test
+        // confirms RuntimeState::new() (test constructor) is
+        // accepted by the linker, which exercises the WasiView,
+        // WasiHttpView, and all 6 edge:cloud Host impls.
+        let engine = create_engine().expect("engine");
+        let _linker = create_component_linker(&engine).expect("linker");
+    }
 }

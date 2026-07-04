@@ -19,6 +19,7 @@ type AppServiceInterface interface {
 	Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error)
 	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
+	Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error)
 	Delete(ctx context.Context, tenantID, appName string) error
 }
 
@@ -67,6 +68,7 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(app); err != nil {
 		log.Printf("Create app: failed to encode response: %v", err)
 	}
+	auditRecord(r, "create", "app", appName, "app "+appName+" created", "success")
 }
 
 // List handles GET /api/apps — list all apps for the tenant with pagination.
@@ -126,6 +128,40 @@ func (h *AppHandler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Update handles PUT /api/v1/apps/{appName} — update mutable fields of an app.
+func (h *AppHandler) Update(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+
+	if appName == "" {
+		httperror.BadRequestCtx(w, r, "app name required")
+		return
+	}
+
+	var req domain.UpdateAppRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+
+	app, err := h.appSvc.Update(r.Context(), tenantID, appName, &req)
+	if err != nil {
+		if errors.Is(err, service.ErrAppNotFound) {
+			httperror.NotFoundCtx(w, r, "app not found")
+			return
+		}
+		log.Printf("internal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(app); err != nil {
+		log.Printf("Update app: failed to encode response: %v", err)
+	}
+	auditRecord(r, "update", "app", appName, "app "+appName+" updated", "success")
+}
+
 // Delete handles DELETE /api/apps/{appName} — delete an app and all its data.
 func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
@@ -148,4 +184,5 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "delete", "app", appName, "app "+appName+" deleted", "success")
 }

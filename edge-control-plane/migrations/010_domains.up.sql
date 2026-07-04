@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Custom-domain bindings for issue #83. One row per tenant-owned FQDN
 -- bound to one of the tenant's apps. Tenant-facing CRUD lives at
 -- /api/v1/apps/{appName}/domains*; the internal ingress poller reads
@@ -28,7 +29,7 @@
 -- 7. verified_at — wall-clock when status last transitioned to
 --    `active`. Nullable; reserved for v2.
 
-CREATE TABLE domains (
+CREATE TABLE IF NOT EXISTS domains (
     id          TEXT PRIMARY KEY,
     tenant_id   TEXT NOT NULL,
     app_name    TEXT NOT NULL,
@@ -41,8 +42,8 @@ CREATE TABLE domains (
 
 -- Hot path: ingress poller reads by (tenant_id, app_name) when
 -- composing per-tenant route subsets (heartbeats.rs diff).
-CREATE INDEX idx_domains_tenant_app ON domains(tenant_id, app_name);
+CREATE INDEX IF NOT EXISTS idx_domains_tenant_app ON domains(tenant_id, app_name);
 
 -- Hot path: TlsAllowed handler is per-FQDN (Caddy's on_demand.ask
 -- callback runs once per hostname during ACME issuance).
-CREATE INDEX idx_domains_fqdn ON domains(fqdn);
+CREATE INDEX IF NOT EXISTS idx_domains_fqdn ON domains(fqdn);

@@ -72,9 +72,29 @@ pub struct Config {
     /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
     /// Defaults to `edgecloud`.
     pub worker_jwt_issuer: String,
-    /// The tenant this worker is authorized for. Loaded once at startup;
-    /// a worker is per-tenant in this design (whitepaper §9.3 calls for
-    /// tenant-agnostic workers — file a follow-up to revisit).
+    /// The tenant this worker is authorized for. Loaded once at startup
+    /// and embedded in the worker's JWT `tenant_id` claim. All outbound
+    /// calls to `/api/internal/*` (downloads, logs, sync, registration)
+    /// are scoped to this tenant — the control plane only returns
+    /// artifacts and data belonging to this tenant ID.
+    ///
+    /// The worker is **architecturally multi-tenant**: it can host apps
+    /// from different tenants simultaneously via per-tenant NATS task
+    /// messages. However, because the JWT is signed once at boot, every
+    /// HTTP call still carries the same `tenant_id` claim. In practice
+    /// this means:
+    ///
+    /// - A worker whose `WORKER_TENANT_ID=t_a` cannot download artifacts
+    ///   or forward logs for apps that belong to `t_b` (even if the NATS
+    ///   task message says `tenant_id=t_b`).
+    ///
+    /// - The `/sync` fallback endpoint returns this tenant's apps, not
+    ///   the per-NATS-message tenant.
+    ///
+    /// A future change should make the JWT per-request (or per-tenant)
+    /// so the worker can fully serve multiple tenants. Until then, this
+    /// env var is **required** and must match the tenant whose apps this
+    /// worker hosts for outbound HTTP calls.
     pub worker_tenant_id: String,
     /// Per-request CPU budget for FaaS (Handler) components, in ms.
     /// Default 1000ms (1s). The store's epoch deadline is set to
@@ -103,7 +123,9 @@ impl Config {
     ///   this worker for the public ingress. Required: silent defaults have
     ///   produced every past "URL works for me but not for users" incident.
     /// - `WORKER_JWT_SECRET` (HMAC secret shared with the control plane)
-    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`)
+    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`) — the tenant ID whose apps
+    ///   this worker hosts. Required: scopes all `/api/internal/*` calls
+    ///   (downloads, logs, sync) to this tenant. See struct field docs.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -172,8 +194,11 @@ impl Config {
             worker_jwt_secret: std::env::var("WORKER_JWT_SECRET").unwrap_or_default(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
-            worker_tenant_id: std::env::var("WORKER_TENANT_ID")
-                .context("WORKER_TENANT_ID not set")?,
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID").context(
+                "WORKER_TENANT_ID not set — a tenant ID is required (e.g. t_abc123). \
+                     This is the ID of the tenant whose apps this worker hosts. \
+                     All outbound calls to /api/internal/* are scoped to this tenant.",
+            )?,
             handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
             handler_max_request_body_bytes: parse_env_u64(
                 "HANDLER_MAX_REQUEST_BODY_BYTES",

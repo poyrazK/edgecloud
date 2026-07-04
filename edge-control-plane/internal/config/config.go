@@ -41,6 +41,12 @@ type Config struct {
 	// to Caddy. Operators must set EDGE_INTERNAL_TOKEN on both the
 	// control plane and the ingress to the same value.
 	InternalToken string `yaml:"internal_token"`
+	// SecretsMasterKey is a hex-encoded 32-byte AES-256-GCM key used
+	// to encrypt app env values at rest. Generate with:
+	//   openssl rand -hex 32
+	// When empty, env values are stored in plaintext (development mode).
+	// In production, set EDGE_SECRETS_MASTER_KEY in the environment.
+	SecretsMasterKey string `yaml:"secrets_master_key"`
 }
 
 type DatabaseConfig struct {
@@ -239,6 +245,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("EDGE_INTERNAL_TOKEN"); v != "" {
 		cfg.InternalToken = v
+	}
+	if v := os.Getenv("EDGE_SECRETS_MASTER_KEY"); v != "" {
+		cfg.SecretsMasterKey = v
 	}
 
 	// Override rate-limit config with env vars

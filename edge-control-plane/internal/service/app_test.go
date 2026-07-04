@@ -20,6 +20,7 @@ type mockAppRepo struct {
 	countByTenantFunc         func(ctx context.Context, tenantID string) (int, error)
 	atomicDeleteFunc          func(ctx context.Context, tenantID, appName string) (bool, error)
 	insertIfNotExistsFunc     func(ctx context.Context, app *domain.App) (bool, error)
+	updateFunc                func(ctx context.Context, app *domain.App) error
 	getForUpdateFunc          func(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	deleteIfNoDeploymentsFunc func(ctx context.Context, tenantID, appName string) (bool, error)
 }
@@ -80,6 +81,13 @@ func (m *mockAppRepo) DeleteIfNoDeployments(ctx context.Context, tenantID, appNa
 	return false, nil
 }
 
+func (m *mockAppRepo) Update(ctx context.Context, app *domain.App) error {
+	if m.updateFunc != nil {
+		return m.updateFunc(ctx, app)
+	}
+	return nil
+}
+
 // mockQuotaRepoForApps implements quotaRepoInterface for testing.
 type mockQuotaRepoForApps struct {
 	getByTenantIDFunc func(ctx context.Context, tenantID string) (*domain.Quota, error)
@@ -93,6 +101,10 @@ func (m *mockQuotaRepoForApps) GetByTenantID(ctx context.Context, tenantID strin
 }
 
 func (m *mockQuotaRepoForApps) AddOutboundBytes(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+	return &domain.Quota{}, nil
+}
+
+func (m *mockQuotaRepoForApps) AddRequestCount(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
 	return &domain.Quota{}, nil
 }
 
@@ -491,5 +503,74 @@ func TestAppService_DeleteIfNoDeployments_RepoErrorSurfaces(t *testing.T) {
 	}
 	if deleted {
 		t.Error("expected deleted=false alongside error")
+	}
+}
+
+func TestAppService_Update_Success(t *testing.T) {
+	desc := "original desc"
+	app := &domain.App{ID: "a_1", TenantID: "t_test", Name: "myapp", Description: &desc}
+
+	repo := &mockAppRepo{
+		getFunc: func(_ context.Context, tenantID, appName string) (*domain.App, error) {
+			return app, nil
+		},
+		updateFunc: func(_ context.Context, a *domain.App) error {
+			return nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	newDesc := "updated description"
+	updated, err := svc.Update(context.Background(), "t_test", "myapp", &domain.UpdateAppRequest{
+		Description: &newDesc,
+	})
+	if err != nil {
+		t.Fatalf("Update() error = %v, want nil", err)
+	}
+	if updated.Description == nil || *updated.Description != "updated description" {
+		t.Errorf("Description = %v, want 'updated description'", updated.Description)
+	}
+}
+
+func TestAppService_Update_ClearsDescription(t *testing.T) {
+	desc := "original desc"
+	app := &domain.App{ID: "a_1", TenantID: "t_test", Name: "myapp", Description: &desc}
+
+	repo := &mockAppRepo{
+		getFunc: func(_ context.Context, tenantID, appName string) (*domain.App, error) {
+			return app, nil
+		},
+		updateFunc: func(_ context.Context, a *domain.App) error {
+			return nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	empty := ""
+	updated, err := svc.Update(context.Background(), "t_test", "myapp", &domain.UpdateAppRequest{
+		Description: &empty,
+	})
+	if err != nil {
+		t.Fatalf("Update() error = %v, want nil", err)
+	}
+	if updated.Description != nil && *updated.Description != "" {
+		t.Errorf("Description = %v, want empty string", *updated.Description)
+	}
+}
+
+func TestAppService_Update_NotFound(t *testing.T) {
+	repo := &mockAppRepo{
+		getFunc: func(_ context.Context, tenantID, appName string) (*domain.App, error) {
+			return nil, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	newDesc := "doesn't matter"
+	_, err := svc.Update(context.Background(), "t_test", "nonexistent", &domain.UpdateAppRequest{
+		Description: &newDesc,
+	})
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Errorf("Update() error = %v, want ErrAppNotFound", err)
 	}
 }

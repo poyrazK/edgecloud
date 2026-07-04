@@ -204,6 +204,8 @@ type DeploymentService struct {
 	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
+	envSvc         *EnvService // injected for decryption at publish
+	webhookSvc     *WebhookService // injected for webhook events
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
 	// target any region — both in `Deploy` (when the HTTP request
@@ -250,6 +252,15 @@ func NewDeploymentService(
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
 func (s *DeploymentService) SetAppService(appSvc *AppService) {
 	s.appSvc = appSvc
+}
+
+// SetEnvService injects the EnvService used for decrypting env vars at publish.
+func (s *DeploymentService) SetEnvService(envSvc *EnvService) {
+	s.envSvc = envSvc
+}
+
+func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
+	s.webhookSvc = webhookSvc
 }
 
 // Deploy creates a new deployment and stores the artifact.
@@ -437,6 +448,13 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, err
 	}
 
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), deployment.TenantID, deployment.AppName, "deploy", map[string]string{
+			"deployment_id": deployment.ID,
+			"hash":          deployment.Hash,
+		})
+	}
+
 	return deployment, nil
 }
 
@@ -550,13 +568,21 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	}
 
 	// Publish task update
-	envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
-	if err != nil {
-		return fmt.Errorf("listing env vars: %w", err)
-	}
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
+	var envMap map[string]string
+	if s.envSvc != nil {
+		envMap, err = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("preparing env vars for publish: %w", err)
+		}
+	} else {
+		envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing env vars: %w", err)
+		}
+		envMap = make(map[string]string, len(envs))
+		for _, e := range envs {
+			envMap[e.EnvKey] = e.EnvValue
+		}
 	}
 
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
@@ -603,7 +629,15 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	return s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions)
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
+		return err
+	}
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
+			"deployment_id": deploymentID,
+		})
+	}
+	return nil
 }
 
 // publishSwap fans a TaskMessage out to every region in `regions`,
@@ -857,9 +891,19 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		return "", err
 	}
 
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
+	envMap := make(map[string]string, len(envs))
+	if s.envSvc != nil {
+		for _, e := range envs {
+			v, err := s.envSvc.Decrypt(e.EnvValue)
+			if err != nil {
+				return "", fmt.Errorf("rollback: decrypting env %s: %w", e.EnvKey, err)
+			}
+			envMap[e.EnvKey] = v
+		}
+	} else {
+		for _, e := range envs {
+			envMap[e.EnvKey] = e.EnvValue
+		}
 	}
 
 	msg := &nats.TaskMessage{
@@ -878,6 +922,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	}
 	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
 		return "", err
+	}
+
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "rollback", map[string]string{
+			"deployment_id": rolledBackID,
+		})
 	}
 
 	return rolledBackID, nil
@@ -928,7 +978,17 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 		}
 		envMap := make(map[string]string, len(envs))
 		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
+			v := e.EnvValue
+			if s.envSvc != nil {
+				var decErr error
+				v, decErr = s.envSvc.Decrypt(e.EnvValue)
+				if decErr != nil {
+					log.Printf("republish: decrypting env %s/%s: %v", ad.AppName, e.EnvKey, decErr)
+					failedApps = append(failedApps, ad.AppName)
+					break
+				}
+			}
+			envMap[e.EnvKey] = v
 		}
 
 		msg := &nats.TaskMessage{

@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Audit table for the cluster autoscaler (issue #85). Every scale
 -- decision (scale_up, scale_down, noop) the autoscaler makes is
 -- persisted here so operators can:
@@ -33,7 +34,7 @@
 --    populated when false.
 -- 10. error_message — only set when succeeded = false.
 
-CREATE TABLE autoscale_events (
+CREATE TABLE IF NOT EXISTS autoscale_events (
     id              BIGSERIAL PRIMARY KEY,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     region          TEXT        NOT NULL,
@@ -46,5 +47,5 @@ CREATE TABLE autoscale_events (
     error_message   TEXT
 );
 
-CREATE INDEX idx_autoscale_events_region_time
+CREATE INDEX IF NOT EXISTS idx_autoscale_events_region_time
     ON autoscale_events (region, created_at DESC);

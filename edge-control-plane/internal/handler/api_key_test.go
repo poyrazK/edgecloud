@@ -13,6 +13,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // mockAPIKeyCreateSvc is a minimal mock for service.APIKeyServiceInterface —
@@ -46,6 +47,9 @@ func (m *mockAPIKeyCreateSvc) GetByID(_ context.Context, _ string) (*domain.APIK
 	panic("not used by Create")
 }
 func (m *mockAPIKeyCreateSvc) DeleteAPIKey(_ context.Context, _ string) error {
+	panic("not used by Create")
+}
+func (m *mockAPIKeyCreateSvc) UpdateAPIKey(_ context.Context, _, _ string, _ *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
 	panic("not used by Create")
 }
 
@@ -166,5 +170,83 @@ func TestCreateAPIKey_ServiceError(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "db down") {
 		t.Errorf("response should not leak raw error, got: %s", rr.Body.String())
+	}
+}
+
+// mockAPIKeyUpdateSvc implements APIKeyServiceInterface for Update tests.
+type mockAPIKeyUpdateSvc struct {
+	updateKey *domain.APIKey
+	updateErr error
+}
+
+func (m *mockAPIKeyUpdateSvc) CreateAPIKey(_ context.Context, _, _, _ string) (*domain.APIKey, string, error) {
+	panic("not used by Update")
+}
+func (m *mockAPIKeyUpdateSvc) ListAPIKeys(_ context.Context, _ string) ([]domain.APIKey, error) {
+	panic("not used by Update")
+}
+func (m *mockAPIKeyUpdateSvc) GetByID(_ context.Context, _ string) (*domain.APIKey, error) {
+	panic("not used by Update")
+}
+func (m *mockAPIKeyUpdateSvc) DeleteAPIKey(_ context.Context, _ string) error {
+	panic("not used by Update")
+}
+func (m *mockAPIKeyUpdateSvc) UpdateAPIKey(_ context.Context, _, _ string, _ *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
+	return m.updateKey, m.updateErr
+}
+
+func TestUpdateAPIKey_Success(t *testing.T) {
+	name := "renamed-key"
+	svc := &mockAPIKeyUpdateSvc{
+		updateKey: &domain.APIKey{ID: "k_1", TenantID: "t_abc", Name: name, Role: domain.RoleDeveloper},
+	}
+	h := handler.NewAPIKeyHandler(svc)
+
+	body, _ := json.Marshal(map[string]string{"name": name})
+	req := httptest.NewRequest("PUT", "/api/keys/k_1", bytes.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_abc"))
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var key domain.APIKey
+	if err := json.NewDecoder(rr.Body).Decode(&key); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if key.Name != name {
+		t.Errorf("Name = %q, want %q", key.Name, name)
+	}
+}
+
+func TestUpdateAPIKey_NotFound(t *testing.T) {
+	svc := &mockAPIKeyUpdateSvc{updateErr: service.ErrAPIKeyNotFound}
+	h := handler.NewAPIKeyHandler(svc)
+
+	body, _ := json.Marshal(map[string]string{"name": "new-name"})
+	req := httptest.NewRequest("PUT", "/api/keys/k_missing", bytes.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_abc"))
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestUpdateAPIKey_InvalidBody(t *testing.T) {
+	h := handler.NewAPIKeyHandler(&mockAPIKeyUpdateSvc{})
+
+	req := httptest.NewRequest("PUT", "/api/keys/k_1", strings.NewReader(`not json`))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_abc"))
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
 	}
 }

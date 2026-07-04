@@ -34,6 +34,12 @@ type TrafficEnvRepoInterface interface {
 	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
 }
 
+// TrafficEnvDecrypter is the subset of SecretEncryptor used by TrafficService.
+// Injected via SetEnvDecrypter. When nil, env values pass through as plaintext.
+type TrafficEnvDecrypter interface {
+	Decrypt(value string) (string, error)
+}
+
 // TrafficTenantRepoInterface is the tenant-repo subset needed by TrafficService.
 type TrafficTenantRepoInterface interface {
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
@@ -64,6 +70,9 @@ type TrafficService struct {
 	// (which gets it from config) so a control plane that runs without an
 	// explicit region still publishes to a subject every worker subscribes to.
 	defaultRegion string
+	// envDecrypter decrypts env values before publishing to workers.
+	// When nil, values pass through as plaintext (dev mode / backward compat).
+	envDecrypter TrafficEnvDecrypter
 }
 
 // NewTrafficService creates a TrafficService.
@@ -89,6 +98,11 @@ func NewTrafficService(
 		publisher:      publisher,
 		defaultRegion:  defaultRegion,
 	}
+}
+
+// SetEnvDecrypter injects the decrypter used for decrypting env values at publish.
+func (s *TrafficService) SetEnvDecrypter(dec TrafficEnvDecrypter) {
+	s.envDecrypter = dec
 }
 
 // ValidateSum checks that the sum of weights equals 100.
@@ -194,10 +208,7 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 	if err != nil {
 		return fmt.Errorf("listing env vars: %w", err)
 	}
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
-	}
+	envMap := buildEnvMap(envs, s.envDecrypter)
 
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil || tenant == nil {
@@ -270,10 +281,7 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	if err != nil {
 		return fmt.Errorf("listing env vars: %w", err)
 	}
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
-	}
+	envMap := buildEnvMap(envs, s.envDecrypter)
 
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil || tenant == nil {
@@ -355,4 +363,23 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 		return fmt.Errorf("publishing traffic split failed for region(s): %s", strings.Join(failedRegions, ","))
 	}
 	return nil
+}
+
+// buildEnvMap converts a slice of AppEnv rows into a map, decrypting values
+// when a decrypter is provided. Used by both publishClearTaskUpdate and
+// publishTaskUpdate.
+func buildEnvMap(envs []domain.AppEnv, dec TrafficEnvDecrypter) map[string]string {
+	m := make(map[string]string, len(envs))
+	for _, e := range envs {
+		v := e.EnvValue
+		if dec != nil {
+			if d, err := dec.Decrypt(e.EnvValue); err == nil {
+				v = d
+			}
+			// Decrypt error: fall through with plaintext so decrypter
+			// misconfiguration doesn't break publishes.
+		}
+		m[e.EnvKey] = v
+	}
+	return m
 }

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -74,6 +75,7 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Create API key: failed to encode response: %v", err)
 	}
+	auditRecord(r, "create", "api_key", apiKey.ID, "api key "+apiKey.Name+" created", "success")
 }
 
 func (h *APIKeyHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -115,4 +117,34 @@ func (h *APIKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "delete", "api_key", keyID, "api key "+keyID+" deleted", "success")
+}
+
+// Update handles PUT /api/v1/keys/{keyID} — update mutable fields of an API key.
+func (h *APIKeyHandler) Update(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	keyID := r.PathValue("keyID")
+
+	var req domain.UpdateAPIKeyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+
+	key, err := h.apiKeySvc.UpdateAPIKey(r.Context(), keyID, tenantID, &req)
+	if err != nil {
+		if errors.Is(err, service.ErrAPIKeyNotFound) {
+			httperror.NotFoundCtx(w, r, "api key not found")
+			return
+		}
+		log.Printf("internal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(key); err != nil {
+		log.Printf("Update API key: failed to encode response: %v", err)
+	}
+	auditRecord(r, "update", "api_key", keyID, "api key "+keyID+" updated", "success")
 }

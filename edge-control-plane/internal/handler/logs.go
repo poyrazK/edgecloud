@@ -37,10 +37,15 @@ func NewLogHandler(logSvc *service.LogService) *LogHandler {
 // response tells them the effective lower bound as RFC3339 so a
 // follow-on --follow can pin `since = <this> + 1ms` without parsing
 // the input again.
+//
+// "next_offset" is present only when there are more results beyond this
+// page. The caller can pass `?offset=<next_offset>` to fetch the next
+// batch. Omitted when the response is the final page (len(items) < limit).
 type LogListResponse struct {
-	Items []domain.LogEntry `json:"items"`
-	Limit int               `json:"limit"`
-	Since string            `json:"since"` // RFC3339; "" if unbounded
+	Items      []domain.LogEntry `json:"items"`
+	Limit      int               `json:"limit"`
+	Since      string            `json:"since"`       // RFC3339; "" if unbounded
+	NextOffset *int              `json:"next_offset"` // omitted when no more pages
 }
 
 // List handles GET /api/v1/apps/{appName}/logs.
@@ -82,11 +87,17 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 		httperror.BadRequestCtx(w, r, "invalid limit: "+err.Error())
 		return
 	}
+	offset, err := parseOffsetParam(q.Get("offset"))
+	if err != nil {
+		httperror.BadRequestCtx(w, r, "invalid offset: "+err.Error())
+		return
+	}
 
-	entries, effectiveLimit, err := h.logSvc.ListByTenantApp(r.Context(), tenantID, appName, service.LogQuery{
+	result, err := h.logSvc.ListByTenantApp(r.Context(), tenantID, appName, service.LogQuery{
 		Since:  since,
 		MinLvl: minLvl,
 		Limit:  limit,
+		Offset: offset,
 	})
 	if err != nil {
 		// service.ErrInvalidLevel is gated above; any error reaching
@@ -97,9 +108,10 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := LogListResponse{
-		Items: entries,
-		Limit: effectiveLimit,
-		Since: effectiveSinceRFC3339(since),
+		Items:      result.Entries,
+		Limit:      result.Limit,
+		Since:      effectiveSinceRFC3339(since),
+		NextOffset: result.NextOffset,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	// json.NewEncoder never returns a meaningful error here — the
@@ -153,6 +165,23 @@ func parseSinceParam(raw string) (time.Duration, error) {
 // the upper bound — the handler only validates that the string parses
 // as a non-negative integer (the service treats ≤0 as "use default").
 func parseLimitParam(raw string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New("expected integer")
+	}
+	if n < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return n, nil
+}
+
+// parseOffsetParam returns the user-supplied offset, or 0 when absent.
+// Accepts non-negative integers only; negative values are rejected with
+// a 400 (the service doesn't silently clamp).
+func parseOffsetParam(raw string) (int, error) {
 	if raw == "" {
 		return 0, nil
 	}

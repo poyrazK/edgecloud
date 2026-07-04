@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -54,6 +55,14 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	if plan == "" {
 		plan = "free"
 	}
+	// Self-service bootstrap only accepts the free tier — paid plans must
+	// go through the Stripe checkout endpoint (follow-up ticket). Reject
+	// pro/business/enterprise here so a tenant can't claim paid quotas
+	// without payment.
+	if plan != "free" {
+		httperror.BadRequestCtx(w, r, "plan: only 'free' is accepted at bootstrap; paid tiers require the checkout endpoint (coming soon)")
+		return
+	}
 
 	tenant, rawKey, err := h.tenantSvc.BootstrapTenant(r.Context(), req.Name, plan, req.KeyName)
 	if err != nil {
@@ -69,6 +78,10 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		APIKey:   rawKey,
 	}); err != nil {
 		log.Printf("Bootstrap tenant: failed to encode response: %v", err)
+	}
+	auditRecord(r, "bootstrap", "tenant", tenant.ID, "tenant "+tenant.ID+" created via self-signup", "success")
+	if DefaultTenantCreationLimiter != nil {
+		DefaultTenantCreationLimiter.Record(service.StripPort(r.RemoteAddr))
 	}
 }
 
@@ -86,6 +99,10 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if plan == "" {
 		plan = "free"
 	}
+	if !domain.IsValidPlan(plan) {
+		httperror.BadRequestCtx(w, r, "plan: must be one of free, pro, business, enterprise")
+		return
+	}
 
 	tenant, err := h.tenantSvc.CreateTenant(r.Context(), req.Name, plan)
 	if err != nil {
@@ -99,6 +116,7 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(tenant); err != nil {
 		log.Printf("Create tenant: failed to encode response: %v", err)
 	}
+	auditRecord(r, "create", "tenant", tenant.ID, "tenant "+tenant.Name+" created by admin", "success")
 }
 
 func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +157,13 @@ type UpdateTenantRequest struct {
 	// the JSON request body. The conversion to pq.StringArray happens
 	// at the assignment below so the domain stays consistent.
 	AllowlistedDestinations []string `json:"allowlisted_destinations"`
+	// PreserveQuotaLimits controls plan-change behavior. Default false:
+	// changing `plan` re-applies the new tier's quota defaults
+	// (max_deployments, max_apps, max_workers, max_memory_mb,
+	// max_outbound_mb, max_requests_per_month). Set true to flip just the
+	// plan label while leaving the per-tenant ceilings as the admin
+	// hand-tuned them.
+	PreserveQuotaLimits bool `json:"preserve_quota_limits"`
 }
 
 func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
@@ -159,15 +184,56 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if req.Name != "" {
 		tenant.Name = req.Name
 	}
-	if req.Plan != "" {
-		tenant.Plan = req.Plan
-	}
 	if len(req.AllowlistedDestinations) > 0 {
 		// Convert []string -> domain.StringArrayFrom so the field type
 		// matches the domain. The repo wraps the value in pq.Array()
 		// on the way to Postgres; the conversion here just gets the Go
 		// type right so the assignment compiles.
 		tenant.AllowlistedDestinations = domain.StringArrayFrom(req.AllowlistedDestinations)
+	}
+
+	// Plan changes go through a dedicated service path because they may
+	// also rewrite the quota row. The plan-change branch re-fetches after
+	// the service commits so the response's embedded Quota reflects the
+	// new tier (the original captured `tenant` would otherwise show the
+	// OLD quota caps alongside the new plan).
+	planChanged := false
+	if req.Plan != "" && req.Plan != tenant.Plan {
+		if err := h.tenantSvc.UpdateTenantPlan(r.Context(), tenantID, req.Plan, !req.PreserveQuotaLimits); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrUnknownPlan):
+				httperror.BadRequestCtx(w, r, "plan: must be one of free, pro, business, enterprise")
+			case errors.Is(err, service.ErrTenantNotFound), errors.Is(err, service.ErrQuotaNotFound):
+				httperror.NotFoundCtx(w, r, "tenant not found")
+			default:
+				log.Printf("UpdateTenantPlan(%s, %s): %v", tenantID, req.Plan, err)
+				httperror.InternalErrorCtx(w, r)
+			}
+			return
+		}
+		planChanged = true
+	} else if req.Plan != "" {
+		// Same plan re-stated — no quota reapply, but validate anyway so
+		// an unknown plan string still gets a 400.
+		if !domain.IsValidPlan(req.Plan) {
+			httperror.BadRequestCtx(w, r, "plan: must be one of free, pro, business, enterprise")
+			return
+		}
+		tenant.Plan = req.Plan
+	}
+
+	if planChanged {
+		// UpdateTenantPlan already wrote both rows in its own transaction.
+		// Re-fetch the canonical post-state so the response payload is
+		// consistent (new plan + new quota). Do NOT call UpdateTenant
+		// below — it would write a second time with stale fields.
+		fresh, err := h.tenantSvc.GetTenant(r.Context(), tenantID)
+		if err != nil || fresh == nil {
+			log.Printf("Update: post-plan-change re-fetch failed for %s: %v", tenantID, err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		tenant = fresh
 	}
 
 	if err := h.tenantSvc.UpdateTenant(r.Context(), &tenant.Tenant); err != nil {
@@ -179,6 +245,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(tenant); err != nil {
 		log.Printf("Update tenant: failed to encode response: %v", err)
 	}
+	auditRecord(r, "update", "tenant", tenantID, "tenant "+tenantID+" updated", "success")
 }
 
 func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -187,5 +254,6 @@ func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
+	auditRecord(r, "delete", "tenant", tenantID, "tenant "+tenantID+" deleted", "success")
 	w.WriteHeader(http.StatusNoContent)
 }

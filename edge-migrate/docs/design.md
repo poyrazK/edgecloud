@@ -2,7 +2,7 @@
 
 > **Status:** Draft v0.3
 > **Date:** 2026-06-19
-> **Owner:** edgeCloud team
+> **Owner:** Hüseyin Poyraz Küçükarslan
 >
 > **v0.3 changes:** Added Rust support end-to-end. `Language` is now a first-class parameter on the CLI (`--language rust`) and on the HTTP API (`language: rust`); the bin dispatches to `RustAnalyzer` + `RustTransformer` and the Go control plane compiles with `rustc --target wasm32-wasip2`. New §4.4 lists the Rust pattern mapping table. The server now requires `rustc` with the `wasm32-wasip2` target installed (alongside the existing `clang` requirement), controlled via `RUSTC_PATH` env var. `pattern` on `PatternMatch` is now a `PatternKind` sum type (`Posix(...)` | `Rust(...)`); the JSON wire format remains a flat string for backward compatibility.
 >

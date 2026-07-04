@@ -656,4 +656,63 @@ mod tests {
     fn max_err_body_is_4_kib() {
         assert_eq!(MAX_ERR_BODY, 4 * 1024);
     }
+
+    // ── Pure function tests ────────────────────────────────────────────
+
+    /// The production `parse_language` returns `Result<Language, anyhow::Error>`.
+    /// We test the success/failure cases directly via `super::parse_language`.
+    #[test]
+    fn parse_language_recognizes_c() {
+        assert!(super::parse_language("c").is_ok());
+    }
+
+    #[test]
+    fn parse_language_recognizes_rust() {
+        assert!(super::parse_language("rust").is_ok());
+    }
+
+    #[test]
+    fn parse_language_unknown_returns_err() {
+        let err = super::parse_language("fortran").unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("fortran"));
+        assert!(msg.contains("c' or 'rust"));
+    }
+
+    #[test]
+    fn language_label_returns_c() {
+        assert_eq!(super::language_label(edge_migrate_lib::Language::C), "c");
+    }
+
+    #[test]
+    fn language_label_returns_rust() {
+        assert_eq!(
+            super::language_label(edge_migrate_lib::Language::Rust),
+            "rust"
+        );
+    }
+
+    #[test]
+    fn derive_app_name_strips_extension() {
+        assert_eq!(
+            super::derive_app_name("my-app.c", edge_migrate_lib::Language::C),
+            "my-app"
+        );
+    }
+
+    #[test]
+    fn derive_app_name_uses_file_stem() {
+        assert_eq!(
+            super::derive_app_name("src/main.rs", edge_migrate_lib::Language::Rust),
+            "main"
+        );
+    }
+
+    #[test]
+    fn derive_app_name_falls_back_to_app() {
+        assert_eq!(
+            super::derive_app_name("", edge_migrate_lib::Language::C),
+            "app"
+        );
+    }
 }

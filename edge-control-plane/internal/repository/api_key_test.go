@@ -196,3 +196,39 @@ func TestAPIKeyRepository_GetByLookupHash_PropagatesDBError(t *testing.T) {
 		t.Errorf("error = %v, want %q", err, "connection refused")
 	}
 }
+
+func TestAPIKeyRepository_Update_Success(t *testing.T) {
+	repo, mock, cleanup := newMockRepo(t)
+	defer cleanup()
+
+	key := &domain.APIKey{ID: "k_1", Name: "renamed", Role: domain.RoleViewer}
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`)).
+		WithArgs(key.ID, key.Name, key.Role).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Update(context.Background(), key); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+func TestAPIKeyRepository_Update_NameOnly(t *testing.T) {
+	repo, mock, cleanup := newMockRepo(t)
+	defer cleanup()
+
+	key := &domain.APIKey{ID: "k_1", Name: "renamed", Role: domain.RoleDeveloper}
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`)).
+		WithArgs(key.ID, key.Name, key.Role).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Update(context.Background(), key); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}

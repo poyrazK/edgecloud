@@ -191,6 +191,7 @@ type LogListFilter struct {
 	Since  time.Duration
 	Levels []string
 	Limit  int
+	Offset int
 }
 
 // ListByTenantApp returns the most recent log entries for (tenantID, appName),
@@ -236,6 +237,12 @@ WHERE tenant_id = $1 AND app_name = $2`)
 	sb.WriteString(" ORDER BY ts DESC LIMIT ")
 	sb.WriteString(nextPlaceholder())
 	args = append(args, filter.Limit)
+
+	if filter.Offset > 0 {
+		sb.WriteString(" OFFSET ")
+		sb.WriteString(nextPlaceholder())
+		args = append(args, filter.Offset)
+	}
 
 	out := make([]domain.LogEntry, 0, filter.Limit)
 	if err := r.db.SelectContext(ctx, &out, sb.String(), args...); err != nil {

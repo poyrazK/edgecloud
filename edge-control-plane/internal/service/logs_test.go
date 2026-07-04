@@ -77,8 +77,7 @@ func TestLogService_LevelsAtOrAbove(t *testing.T) {
 // TestLogService_ClampsLimit pins the limit policy: ≤0 → default,
 // >MaxLogLimit → max, in-between → unchanged. The service's clamp is
 // the only defense against a hostile caller asking for the whole logs
-// table. The effective-limit second return value MUST match what the
-// repo got (handler echoes it back without re-clamping).
+// table.
 func TestLogService_ClampsLimit(t *testing.T) {
 	cases := []struct {
 		name string
@@ -95,7 +94,7 @@ func TestLogService_ClampsLimit(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			repo := &stubLister{}
 			svc := NewLogService(repo)
-			_, got, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+			result, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 				Limit: c.in,
 			})
 			if err != nil {
@@ -104,18 +103,14 @@ func TestLogService_ClampsLimit(t *testing.T) {
 			if repo.lastFilter.Limit != c.want {
 				t.Errorf("repo limit = %d, want %d", repo.lastFilter.Limit, c.want)
 			}
-			if got != c.want {
-				t.Errorf("effective limit = %d, want %d", got, c.want)
+			if result.Limit != c.want {
+				t.Errorf("effective limit = %d, want %d", result.Limit, c.want)
 			}
 		})
 	}
 }
 
-// TestService_ResolveLimit pins the exported helper's contract directly
-// (the handler calls it... no, the handler echoes the value from
-// ListByTenantApp; ResolveLimit is the function the service itself
-// delegates to). Pinning it separately means a refactor that swaps the
-// implementation can keep the contract.
+// TestService_ResolveLimit pins the exported helper's contract directly.
 func TestService_ResolveLimit(t *testing.T) {
 	cases := []struct {
 		in   int
@@ -135,15 +130,11 @@ func TestService_ResolveLimit(t *testing.T) {
 	}
 }
 
-// TestLogService_AppliesDefaultSince pins the since-default policy:
-// zero or negative Since → DefaultLogSince. A negative value comes
-// from a future-dated RFC3339 (handler clamps to 0 before calling) or
-// a clock-skewed client; either way the service should not propagate
-// a negative into the SQL.
+// TestLogService_AppliesDefaultSince pins the since-default policy.
 func TestLogService_AppliesDefaultSince(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Since: 0,
 		Limit: 10,
 	})
@@ -155,13 +146,11 @@ func TestLogService_AppliesDefaultSince(t *testing.T) {
 	}
 }
 
-// TestLogService_RejectsUnknownLevel pins the error path: an unknown
-// level must surface as ErrInvalidLevel (not a generic error) so the
-// handler can map it to 400.
+// TestLogService_RejectsUnknownLevel pins the error path.
 func TestLogService_RejectsUnknownLevel(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		MinLvl: "critical",
 		Limit:  10,
 	})
@@ -170,13 +159,11 @@ func TestLogService_RejectsUnknownLevel(t *testing.T) {
 	}
 }
 
-// TestLogService_TranslatesLevelToLevelSet pins the query translation:
-// a non-empty MinLvl produces a Levels slice with every level at or
-// above it. The repo uses this slice for the level = ANY(...) filter.
+// TestLogService_TranslatesLevelToLevelSet pins the query translation.
 func TestLogService_TranslatesLevelToLevelSet(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		MinLvl: "warn",
 		Limit:  10,
 	})
@@ -189,14 +176,11 @@ func TestLogService_TranslatesLevelToLevelSet(t *testing.T) {
 	}
 }
 
-// TestLogService_NoLevelFilterOmitsLevels pins the empty-MinLvl case:
-// when no level is requested, the repo must see a nil Levels slice
-// (not the full canonical set, which would still match everything
-// but cost a recheck).
+// TestLogService_NoLevelFilterOmitsLevels pins the empty-MinLvl case.
 func TestLogService_NoLevelFilterOmitsLevels(t *testing.T) {
 	repo := &stubLister{}
 	svc := NewLogService(repo)
-	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Limit: 10,
 	})
 	if err != nil {
@@ -207,18 +191,74 @@ func TestLogService_NoLevelFilterOmitsLevels(t *testing.T) {
 	}
 }
 
-// TestLogService_PropagatesRepoError pins the error pass-through:
-// any non-ErrInvalidLevel error from the repo must reach the handler
-// unchanged (the handler maps it to 500).
+// TestLogService_PropagatesRepoError pins the error pass-through.
 func TestLogService_PropagatesRepoError(t *testing.T) {
 	wantErr := errors.New("db unreachable")
 	repo := &stubLister{err: wantErr}
 	svc := NewLogService(repo)
-	_, _, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
 		Limit: 10,
 	})
 	if !errors.Is(err, wantErr) {
 		t.Errorf("err = %v, want %v", err, wantErr)
+	}
+}
+
+// TestLogService_NextOffsetWhenFullPage returns a NextOffset when the
+// result has exactly limit entries (more rows may exist).
+func TestLogService_NextOffsetWhenFullPage(t *testing.T) {
+	repo := &stubLister{
+		entries: make([]domain.LogEntry, MaxLogLimit),
+	}
+	svc := NewLogService(repo)
+	result, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+		Limit:  MaxLogLimit,
+		Offset: 500,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if result.NextOffset == nil {
+		t.Fatal("expected NextOffset to be set when result is full")
+	}
+	want := 500 + MaxLogLimit
+	if *result.NextOffset != want {
+		t.Errorf("NextOffset = %d, want %d", *result.NextOffset, want)
+	}
+}
+
+// TestLogService_NoNextOffsetWhenPartialPage omits NextOffset when the
+// result has fewer than limit entries (last page).
+func TestLogService_NoNextOffsetWhenPartialPage(t *testing.T) {
+	repo := &stubLister{
+		entries: make([]domain.LogEntry, 3),
+	}
+	svc := NewLogService(repo)
+	result, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+		Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if result.NextOffset != nil {
+		t.Errorf("NextOffset = %d, want nil (partial page)", *result.NextOffset)
+	}
+}
+
+// TestLogService_OffsetPropagatesToRepo pins that offset reaches the
+// repository filter unchanged.
+func TestLogService_OffsetPropagatesToRepo(t *testing.T) {
+	repo := &stubLister{}
+	svc := NewLogService(repo)
+	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+		Limit:  50,
+		Offset: 150,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if repo.lastFilter.Offset != 150 {
+		t.Errorf("repo offset = %d, want 150", repo.lastFilter.Offset)
 	}
 }
 

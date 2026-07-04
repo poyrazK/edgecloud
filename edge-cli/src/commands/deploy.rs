@@ -29,11 +29,12 @@ pub fn run(
     id: Option<&str>,
     regions: &[String],
     auto_rollback: bool,
+    file: Option<&Path>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions, auto_rollback)
+    run_upload(path, app, regions, auto_rollback, file)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -47,18 +48,27 @@ pub fn run(
 /// worker-driven auto-rollback trigger and the heartbeat-driven
 /// stability-window promotion.
 #[cfg(feature = "network")]
-fn run_upload(path: &Path, app: &str, regions: &[String], auto_rollback: bool) -> Result<()> {
+fn run_upload(
+    path: &Path,
+    app: &str,
+    regions: &[String],
+    auto_rollback: bool,
+    file: Option<&Path>,
+) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
         app.to_string()
     } else {
         edge_toml.project.name.clone()
     };
-    let artifact = path
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("release")
-        .join(format!("{}.wasm", app_name));
+    let artifact = match file {
+        Some(f) => f.to_path_buf(),
+        None => path
+            .join("target")
+            .join("wasm32-wasip2")
+            .join("release")
+            .join(format!("{}.wasm", app_name)),
+    };
 
     let wasm_bytes = std::fs::read(&artifact).map_err(|e| {
         output::error(&format!("failed to read {}: {}", artifact.display(), e));
@@ -159,6 +169,7 @@ pub fn run(
     _id: Option<&str>,
     _regions: &[String],
     _auto_rollback: bool,
+    _file: Option<&Path>,
 ) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }

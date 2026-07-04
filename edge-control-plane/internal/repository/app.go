@@ -129,6 +129,13 @@ func (r *AppRepository) DeleteIfNoDeployments(ctx context.Context, tenantID, app
 	return deleted, err
 }
 
+// Update updates mutable fields of an existing app.
+func (r *AppRepository) Update(ctx context.Context, app *domain.App) error {
+	query := `UPDATE apps SET description = $1 WHERE id = $2 AND tenant_id = $3`
+	_, err := r.db.ExecContext(ctx, query, app.Description, app.ID, app.TenantID)
+	return err
+}
+
 // CountByTenant returns the number of apps for a tenant.
 func (r *AppRepository) CountByTenant(ctx context.Context, tenantID string) (int, error) {
 	var count int

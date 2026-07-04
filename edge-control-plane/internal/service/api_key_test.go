@@ -19,6 +19,7 @@ type mockAPIKeyRepo struct {
 	getByLookupHashFn       func(ctx context.Context, lookupHash string) (*domain.APIKey, error)
 	listByTenantFn          func(ctx context.Context, tenantID string) ([]domain.APIKey, error)
 	deleteFn                func(ctx context.Context, id string) error
+	updateFn                func(ctx context.Context, k *domain.APIKey) error
 	updateLastUsedFn        func(ctx context.Context, id string) error
 	updateHashIfAlgorithmFn func(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error)
 }
@@ -58,6 +59,12 @@ func (m *mockAPIKeyRepo) UpdateLastUsed(ctx context.Context, id string) error {
 		return nil
 	}
 	return m.updateLastUsedFn(ctx, id)
+}
+func (m *mockAPIKeyRepo) Update(ctx context.Context, k *domain.APIKey) error {
+	if m.updateFn == nil {
+		return nil
+	}
+	return m.updateFn(ctx, k)
 }
 func (m *mockAPIKeyRepo) UpdateHashIfAlgorithm(ctx context.Context, id, currentAlgo, newHash, newAlgo string) (int64, error) {
 	if m.updateHashIfAlgorithmFn == nil {
@@ -461,5 +468,111 @@ func TestAPIKeyService_AuthenticateRawKey_ExpiredLegacyKeySkipsRehash(t *testing
 	}
 	if rehashCalls != 0 {
 		t.Errorf("rehash called %d times for expired legacy key; want 0 (expiry must gate before rehash)", rehashCalls)
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKey_Success(t *testing.T) {
+	key := &domain.APIKey{ID: "k_1", TenantID: "t_test", Name: "original", Role: domain.RoleDeveloper}
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return key, nil
+		},
+		updateFn: func(_ context.Context, k *domain.APIKey) error {
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	newName := "renamed"
+	updated, err := svc.UpdateAPIKey(context.Background(), "k_1", "t_test", &domain.UpdateAPIKeyRequest{
+		Name: &newName,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAPIKey() error = %v, want nil", err)
+	}
+	if updated.Name != newName {
+		t.Errorf("Name = %q, want %q", updated.Name, newName)
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKey_RoleChange(t *testing.T) {
+	key := &domain.APIKey{ID: "k_1", TenantID: "t_test", Name: "original", Role: domain.RoleDeveloper}
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return key, nil
+		},
+		updateFn: func(_ context.Context, k *domain.APIKey) error {
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	newRole := "viewer"
+	updated, err := svc.UpdateAPIKey(context.Background(), "k_1", "t_test", &domain.UpdateAPIKeyRequest{
+		Role: &newRole,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAPIKey() error = %v, want nil", err)
+	}
+	if updated.Role != newRole {
+		t.Errorf("Role = %q, want %q", updated.Role, newRole)
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKey_NotFound(t *testing.T) {
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return nil, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	newName := "doesnt-matter"
+	_, err := svc.UpdateAPIKey(context.Background(), "k_missing", "t_test", &domain.UpdateAPIKeyRequest{
+		Name: &newName,
+	})
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Errorf("error = %v, want ErrAPIKeyNotFound", err)
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKey_WrongTenant(t *testing.T) {
+	key := &domain.APIKey{ID: "k_1", TenantID: "t_other", Name: "original", Role: domain.RoleDeveloper}
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return key, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	newName := "hacker"
+	_, err := svc.UpdateAPIKey(context.Background(), "k_1", "t_test", &domain.UpdateAPIKeyRequest{
+		Name: &newName,
+	})
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Errorf("error = %v, want ErrAPIKeyNotFound for wrong tenant", err)
+	}
+}
+
+func TestAPIKeyService_UpdateAPIKey_InvalidRole(t *testing.T) {
+	key := &domain.APIKey{ID: "k_1", TenantID: "t_test", Name: "original", Role: domain.RoleDeveloper}
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return key, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	badRole := "superadmin"
+	_, err := svc.UpdateAPIKey(context.Background(), "k_1", "t_test", &domain.UpdateAPIKeyRequest{
+		Role: &badRole,
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid role, got nil")
 	}
 }

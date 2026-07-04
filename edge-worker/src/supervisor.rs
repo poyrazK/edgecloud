@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Context;
 use edge_runtime::linker::create_component_linker_long_running;
 use edge_runtime::{create_component_linker_handler, EgressPolicy, RequestMeter};
 use futures::StreamExt;
@@ -16,7 +15,7 @@ use crate::detect::{detect_execution_model, ExecutionModel};
 use crate::dispatch::{HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
-use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
+use crate::messages::{AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, TaskMessage};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -191,7 +190,8 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(e).context(format!("failed to compile component for {}", app_name));
+                return Err(anyhow::Error::from(e)
+                    .context(format!("failed to compile component for {}", app_name)));
             }
         };
 
@@ -220,11 +220,11 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
-                return Err(e).context(format!(
+                return Err(anyhow::Error::from(e).context(format!(
                     "failed to pre-instantiate {} (execution_model={:?}); \
-                     wasi: imports are wired in Phase C",
+                         wasi: imports are wired in Phase C",
                     app_name, execution_model
-                ));
+                )));
             }
         };
 
@@ -875,6 +875,14 @@ impl Supervisor {
                 },
             );
         }
+
+        // Populate cluster headroom for the autoscaler (issue #85).
+        let free_slots = self.port_pool.lock().await.free_slots();
+        msg.cluster_headroom = Some(ClusterHeadroom {
+            cpu_pct: None,
+            mem_pct: None,
+            app_slots: free_slots,
+        });
 
         msg
     }

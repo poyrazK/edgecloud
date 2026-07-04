@@ -117,12 +117,14 @@ fn wasi_http_view_clone_preserves_state() {
     // Both states expose `WasiHttpView` — same trait, same impl, same
     // zero-sized inner. The clone must remain valid for `new_incoming_request`
     // / `new_response_outparam` to be callable on it.
-    use wasmtime_wasi_http::WasiHttpView;
+    use wasmtime_wasi_http::p2::WasiHttpView;
     let mut s = s;
     let mut clone = clone;
-    // Lint the trait method accessor (returns &mut WasiHttpCtx).
-    let _s_ctx: &mut wasmtime_wasi_http::WasiHttpCtx = s.ctx();
-    let _c_ctx: &mut wasmtime_wasi_http::WasiHttpCtx = clone.ctx();
+    // Lint the trait method accessor. wasmtime 45 collapsed
+    // `WasiHttpView::ctx` into a single `http()` method that returns a
+    // `WasiHttpCtxView` bundle; the `WasiHttpCtx` is now at `view.ctx`.
+    let _s_ctx: &mut wasmtime_wasi_http::WasiHttpCtx = s.http().ctx;
+    let _c_ctx: &mut wasmtime_wasi_http::WasiHttpCtx = clone.http().ctx;
 }
 
 // ── Linker mismatch tests ───────────────────────────────────────────────

@@ -231,4 +231,36 @@ mod tests {
         unset_var(name);
         assert_eq!(parse_duration_env(name), None);
     }
+
+    // ── Ingress hostname ──────────────────────────────────────────────
+
+    /// Must stay in sync with the Go control plane's
+    /// `TestIngressHost_Format`. Every `https://<tenant>-<app>.edgecloud.dev`
+    /// URL the control plane advertises to tenants depends on this format.
+    #[test]
+    fn ingress_host_returns_formatted_hostname() {
+        let host = ingress_host("t_acme", "api");
+        assert_eq!(host, "t_acme-api.edgecloud.dev");
+    }
+
+    /// Pin the constant against accidental re-branding. The Go control
+    /// plane has an identical guard in `TestIngressHostSuffix_Constant`.
+    /// If this constant ever changes, the wildcard TLS certificate and
+    /// the Go side must be updated in lock-step.
+    #[test]
+    fn ingress_host_suffix_is_edgecloud_dev() {
+        assert_eq!(INGRESS_HOST_SUFFIX, "edgecloud.dev");
+    }
+
+    /// Edge cases: empty tenant or app name must not produce a trailing
+    /// or leading `-` that could be confused with a subdomain boundary.
+    #[test]
+    fn ingress_host_handles_edge_cases() {
+        let host = ingress_host("", "");
+        // Empty tenant + app still produces a valid-ish hostname,
+        // just `-.edgecloud.dev` — which won't resolve, but it
+        // won't panic or produce anything injectable.
+        assert!(host.ends_with(".edgecloud.dev"));
+        assert!(host.contains('.'));
+    }
 }

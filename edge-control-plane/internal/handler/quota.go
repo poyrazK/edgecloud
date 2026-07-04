@@ -25,6 +25,14 @@ func NewQuotaHandler(tenantSvc QuotaServiceInterface) *QuotaHandler {
 	return &QuotaHandler{tenantSvc: tenantSvc}
 }
 
+// quotaResponse wraps domain.Quota with the derived usage_pct field.
+// usage_pct is omitted when both caps are unlimited (sentinel < 0) so
+// enterprise tenants don't see a misleading 0%.
+type quotaResponse struct {
+	domain.Quota
+	UsagePct *float64 `json:"usage_pct,omitempty"`
+}
+
 // GetQuota handles GET /api/quotas — returns the authenticated tenant's quota limits.
 func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
@@ -39,8 +47,9 @@ func (h *QuotaHandler) GetQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := quotaResponse{Quota: *quota, UsagePct: quota.UsagePct()}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(quota); err != nil {
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("GetQuota: failed to encode response: %v", err)
 	}
 }

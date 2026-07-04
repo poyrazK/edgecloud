@@ -324,6 +324,43 @@ func TestAppRepository_InsertIfNotExists_Conflict(t *testing.T) {
 	}
 }
 
+func TestAppRepository_Update_Success(t *testing.T) {
+	repo, mock, cleanup := newAppMockRepo(t)
+	defer cleanup()
+
+	desc := "updated description"
+	app := &domain.App{ID: "a_1", TenantID: "t_1", Name: "hello", Description: &desc}
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE apps SET description = $1 WHERE id = $2 AND tenant_id = $3`)).
+		WithArgs(app.Description, app.ID, app.TenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Update(context.Background(), app); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+func TestAppRepository_Update_ClearsDescription(t *testing.T) {
+	repo, mock, cleanup := newAppMockRepo(t)
+	defer cleanup()
+
+	app := &domain.App{ID: "a_1", TenantID: "t_1", Name: "hello", Description: nil}
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE apps SET description = $1 WHERE id = $2 AND tenant_id = $3`)).
+		WithArgs(nil, app.ID, app.TenantID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Update(context.Background(), app); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
 func TestAppRepository_Get_DBError(t *testing.T) {
 	repo, mock, cleanup := newAppMockRepo(t)
 	defer cleanup()

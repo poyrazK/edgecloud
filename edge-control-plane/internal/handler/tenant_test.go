@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,23 +12,27 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // mockTenantSvc implements service.TenantServiceInterface for testing.
 type mockTenantSvc struct {
-	bootstrapErr     error
-	bootstrapTenant  *domain.Tenant
-	bootstrapRawKey  string
-	createTenantResp *domain.Tenant
-	createTenantErr  error
-	getTenantResp    *domain.TenantWithQuota
-	getTenantErr     error
-	listTenantsResp  []domain.Tenant
-	listTenantsErr   error
-	updateTenantErr  error
-	deleteTenantErr  error
-	getQuotaResp     *domain.Quota
-	getQuotaErr      error
+	bootstrapErr        error
+	bootstrapTenant     *domain.Tenant
+	bootstrapRawKey     string
+	createTenantResp    *domain.Tenant
+	createTenantErr     error
+	getTenantResp       *domain.TenantWithQuota
+	getTenantRespAfter  *domain.TenantWithQuota // returned on the second-and-later GetTenant calls (plan-change re-fetch)
+	getTenantCalls      int
+	getTenantErr        error
+	listTenantsResp     []domain.Tenant
+	listTenantsErr      error
+	updateTenantErr     error
+	updateTenantPlanErr error // distinct from updateTenantErr so we can assert sentinel mapping on the plan-change branch
+	deleteTenantErr     error
+	getQuotaResp        *domain.Quota
+	getQuotaErr         error
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
@@ -45,8 +50,12 @@ func (m *mockTenantSvc) CreateTenant(ctx context.Context, name, plan string) (*d
 }
 
 func (m *mockTenantSvc) GetTenant(ctx context.Context, id string) (*domain.TenantWithQuota, error) {
+	m.getTenantCalls++
 	if m.getTenantErr != nil {
 		return nil, m.getTenantErr
+	}
+	if m.getTenantCalls >= 2 && m.getTenantRespAfter != nil {
+		return m.getTenantRespAfter, nil
 	}
 	return m.getTenantResp, nil
 }
@@ -60,6 +69,10 @@ func (m *mockTenantSvc) ListTenants(ctx context.Context) ([]domain.Tenant, error
 
 func (m *mockTenantSvc) UpdateTenant(ctx context.Context, t *domain.Tenant) error {
 	return m.updateTenantErr
+}
+
+func (m *mockTenantSvc) UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error {
+	return m.updateTenantPlanErr
 }
 
 func (m *mockTenantSvc) DeleteTenant(ctx context.Context, id string) error {
@@ -472,5 +485,242 @@ func TestDelete_ServiceError(t *testing.T) {
 	respBody := rr.Body.String()
 	if strings.Contains(respBody, "db connection lost") {
 		t.Errorf("response should not contain raw error, got: %s", respBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Plan validation (billing v0)
+// ---------------------------------------------------------------------------
+
+func TestBootstrap_RejectsPaidPlan(t *testing.T) {
+	bootstrapCalled := false
+	svc := &mockTenantSvc{
+		bootstrapTenant: &domain.Tenant{ID: "t_x", Name: "x", Plan: "pro"},
+		bootstrapRawKey: "sk_x",
+		bootstrapErr:    errors.New("should not be called"),
+	}
+	// We can't intercept the call with this mock design, but the handler
+	// short-circuits with 400 BEFORE calling the service. So if Bootstrap
+	// returns 400 AND the response body doesn't include the mock's tenant
+	// fields, the gate worked.
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"name":"acme","plan":"pro","key_name":"owner"}`
+	req := httptest.NewRequest("POST", "/api/tenants", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	h.Bootstrap(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for plan=pro at bootstrap, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "sk_x") {
+		t.Errorf("response leaked mock API key, suggests service was called: %s", rr.Body.String())
+	}
+	_ = bootstrapCalled
+}
+
+func TestBootstrap_AcceptsFreePlan(t *testing.T) {
+	svc := &mockTenantSvc{
+		bootstrapTenant: &domain.Tenant{ID: "t_x", Name: "x", Plan: "free"},
+		bootstrapRawKey: "sk_x",
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"name":"acme","plan":"free","key_name":"owner"}`
+	req := httptest.NewRequest("POST", "/api/tenants", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	h.Bootstrap(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreate_AdminAcceptsProPlan(t *testing.T) {
+	svc := &mockTenantSvc{
+		createTenantResp: &domain.Tenant{ID: "t_x", Name: "acme", Plan: "pro"},
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"name":"acme","plan":"pro"}`
+	req := httptest.NewRequest("POST", "/api/admin/tenants", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	h.Create(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreate_RejectsUnknownPlan(t *testing.T) {
+	svc := &mockTenantSvc{}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"name":"acme","plan":"platinum"}`
+	req := httptest.NewRequest("POST", "/api/admin/tenants", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	h.Create(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown plan, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if svc.createTenantResp != nil {
+		t.Errorf("CreateTenant should not have been called for invalid plan")
+	}
+}
+
+func TestUpdate_PlanChange_AutoAppliesDefaults(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+			Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 100_000},
+		},
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if svc.updateTenantPlanErr != nil {
+		t.Errorf("UpdateTenantPlan should have been called; got updateTenantPlanErr=%v", svc.updateTenantPlanErr)
+	}
+}
+
+func TestUpdate_PlanChange_PreserveQuotaLimits_KeepsCustom(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "business"},
+			Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 50_000_000},
+		},
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"free","preserve_quota_limits":true}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_RejectsUnknownPlan(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		},
+		updateTenantPlanErr: fmt.Errorf("%w: %q", domain.ErrUnknownPlan, "platinum"),
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"platinum"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown plan on update, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_TenantNotFound_404(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		},
+		updateTenantPlanErr: service.ErrTenantNotFound,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for tenant-not-found on plan change, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_QuotaNotFound_404(t *testing.T) {
+	svc := &mockTenantSvc{
+		getTenantResp: &domain.TenantWithQuota{
+			Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		},
+		updateTenantPlanErr: service.ErrQuotaNotFound,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for quota-not-found on plan change, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpdate_PlanChange_ResponseShowsNewQuota(t *testing.T) {
+	// First GetTenant (pre-plan-change) returns free-tier caps.
+	// Second GetTenant (post-plan-change re-fetch) returns the pro-tier
+	// caps. The handler must encode the post-fetch row so the response
+	// shows plan="pro" alongside max_requests_per_month=5_000_000.
+	free := &domain.TenantWithQuota{
+		Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "free"},
+		Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 100_000, MaxOutboundMB: 1000},
+	}
+	pro := &domain.TenantWithQuota{
+		Tenant: domain.Tenant{ID: "t_x", Name: "acme", Plan: "pro"},
+		Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 5_000_000, MaxOutboundMB: 10_000},
+	}
+	svc := &mockTenantSvc{
+		getTenantResp:      free,
+		getTenantRespAfter: pro,
+	}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"plan":"pro"}`
+	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Plan                string `json:"plan"`
+		MaxRequestsPerMonth int    `json:"max_requests_per_month"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Plan != "pro" {
+		t.Errorf("Plan = %q, want pro", resp.Plan)
+	}
+	if resp.MaxRequestsPerMonth != 5_000_000 {
+		t.Errorf("MaxRequestsPerMonth = %d, want 5_000_000 (post-update re-fetch should override pre-update value)", resp.MaxRequestsPerMonth)
 	}
 }

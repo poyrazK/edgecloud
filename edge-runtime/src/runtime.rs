@@ -56,13 +56,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
 use wasmtime::{ResourceLimiter, StoreLimits};
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-use wasmtime_wasi_http::body::HyperOutgoingBody;
-use wasmtime_wasi_http::types::{
-    default_send_request, HostFutureIncomingResponse, OutgoingRequestConfig,
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
+use wasmtime_wasi_http::p2::{
+    default_send_request, HttpError, HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
 };
-use wasmtime_wasi_http::{HttpError, HttpResult, WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 /// Process-wide per-tenant store registries. Each tenant gets its own
 /// `Arc<KvStore>` / `Arc<Cache>` / `Scheduler`, cached here so state is
@@ -107,6 +108,15 @@ pub struct RuntimeState {
     /// `wasi:http/outgoing-handler` host impl (deferred to the linker task).
     pub egress: Arc<EgressPolicy>,
 
+    /// wasmtime 45 moved `send_request` off the `WasiHttpView` trait and
+    /// onto a new `WasiHttpHooks` trait, referenced by
+    /// `WasiHttpCtxView::hooks`. We store the concrete `EgressHttpHooks`
+    /// struct here; `WasiHttpView::http()` coerces `&mut self.http_hooks`
+    /// to `&mut dyn WasiHttpHooks` for the linker. Concrete storage
+    /// avoids the per-request `Box::new` + `String::clone` that a boxed
+    /// trait object would force.
+    pub(crate) http_hooks: EgressHttpHooks,
+
     /// Shared exit-code flag set by `Process::exit` when the guest calls
     /// `process.exit`. Allows `execute_app` to distinguish a clean guest
     /// exit from a wasm trap.
@@ -147,6 +157,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: String::new(),
             egress: Arc::new(EgressPolicy::allow_all()),
+            http_hooks: EgressHttpHooks::new(Arc::new(EgressPolicy::allow_all()), String::new()),
             exit_code,
             store_limits: None,
         }
@@ -204,8 +215,12 @@ impl RuntimeState {
             wasi_http_ctx: WasiHttpCtx::new(),
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: env,
-            tenant_id,
-            egress,
+            tenant_id: tenant_id.clone(),
+            egress: egress.clone(),
+            // The hooks box shares the same Arc-shared EgressPolicy and
+            // tenant id as the top-level fields, so a future mid-flight
+            // policy swap (returning a new Arc) only updates one place.
+            http_hooks: EgressHttpHooks::new(egress, tenant_id),
             exit_code,
             store_limits: None,
         }
@@ -259,6 +274,7 @@ impl Clone for RuntimeState {
             wasi_env_for_clone: self.wasi_env_for_clone.clone(),
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
+            http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
             store_limits: None, // set fresh by create_store for each new Store
         }
@@ -272,35 +288,45 @@ impl Clone for RuntimeState {
 /// wasmtime 25 split this into two separate methods (no `WasiCtxView`
 /// tuple type).
 impl WasiView for RuntimeState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resource_table,
+        }
     }
 }
 
-/// `WasiHttpView` — required by `wasmtime_wasi_http::add_only_http_to_linker_async`.
-/// The default `send_request` is overridden to enforce the tenant's
-/// `EgressPolicy` (Phase C-3). Per-request outbound requests go through
-/// this path: `guest.wasi:http/outgoing-handler::handle(req, out)` →
-/// `WasiHttpImpl<&mut T>::send_request` → `T::send_request` →
-/// `EgressPolicy::check(url)` → either denied (returns `Err`) or
-/// forwarded to the canonical `default_send_request` impl.
+/// Per-tenant `WasiHttpHooks` impl. wasmtime 45 split the outgoing-HTTP
+/// customization off the `WasiHttpView` trait into a separate
+/// `WasiHttpHooks` trait, referenced from `WasiHttpCtxView::hooks`.
+/// `send_request` is the only hook we override — it enforces the tenant's
+/// `EgressPolicy` before opening any TCP connection.
+///
+/// Per-request outbound requests go through this path:
+/// `guest.wasi:http/outgoing-handler::handle(req, out)` →
+/// `WasiHttpImpl<&mut T>::send_request` → `T::http().hooks.send_request`
+/// (where `T::http()` returns the `WasiHttpCtxView` and `hooks` is our
+/// `&mut EgressHttpHooks`) → `EgressPolicy::check(url)` → either
+/// denied (returns `Err`) or forwarded to the canonical
+/// `default_send_request` impl.
 ///
 /// The check runs PRE-DNS, so a denied host NEVER leaves the worker.
-/// The DNS-rebinding guard (`EgressPolicy::check_resolved_ip`) is best-
-/// effort in v0.2 — `wasmtime-wasi-http` 25.0.3 doesn't expose the
-/// hyper `connect_hook` we'd need to actually inspect the resolved IP
-/// before connect. v0.3 will land this via a hyper upgrade. See the
-/// `egress` field and the plan §C-3 "DNS-rebinding guard" decision.
-impl WasiHttpView for RuntimeState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.wasi_http_ctx
+/// The DNS-rebinding guard (`EgressPolicy::check_resolved_ip`) is
+/// best-effort in v0.2 — wasmtime-wasi-http 45 has no `connect_hook`
+/// for IP-level enforcement. See the `egress` field and plan §C-3
+/// "DNS-rebinding guard" decision.
+pub(crate) struct EgressHttpHooks {
+    pub(crate) egress: Arc<EgressPolicy>,
+    pub(crate) tenant_id: String,
+}
+
+impl EgressHttpHooks {
+    pub(crate) fn new(egress: Arc<EgressPolicy>, tenant_id: String) -> Self {
+        Self { egress, tenant_id }
     }
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
-    }
+}
+
+impl WasiHttpHooks for EgressHttpHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
@@ -326,14 +352,33 @@ impl WasiHttpView for RuntimeState {
         // send_request implementation that wasmtime-wasi-http ships.
         Ok(default_send_request(request, config))
     }
-    // `is_forbidden_header` falls back to the WasiHttpView default which
-    // strips the canonical hop-by-hop / connection-state header set
-    // (Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization,
-    // TE, Trailers, Transfer-Encoding, Upgrade, Host, Http2-Settings).
-    // Adding egress-specific stripping here would require new
-    // EgressPolicy methods that we don't need for v0.2 — every header a
-    // tenant wants blocked is already enforced by the URL-level
-    // `EgressPolicy::check` above.
+    // `is_forbidden_header` falls back to the `WasiHttpHooks` default
+    // which strips the canonical hop-by-hop / connection-state header
+    // set (Connection, Keep-Alive, Proxy-Authenticate,
+    // Proxy-Authorization, TE, Trailers, Transfer-Encoding, Upgrade,
+    // Host, Http2-Settings). Adding egress-specific stripping here
+    // would require new `EgressPolicy` methods we don't need for v0.2 —
+    // every header a tenant wants blocked is already enforced by the
+    // URL-level `EgressPolicy::check` above.
+}
+
+/// `WasiHttpView` — required by `wasmtime_wasi_http::p2::add_only_http_to_linker_async`.
+/// wasmtime 45 collapsed the trait from `{ctx, table}` into a single
+/// `http()` method returning a `WasiHttpCtxView` bundle (mirrors the
+/// `WasiView` change in wasmtime 36). The `hooks` field is the
+/// `EgressHttpHooks` box stored on `RuntimeState`.
+impl WasiHttpView for RuntimeState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        // `&mut self.http_hooks` (a `&mut EgressHttpHooks`) coerces to
+        // `&mut dyn WasiHttpHooks` at the struct-literal site via the
+        // `WasiHttpHooks for EgressHttpHooks` impl above. No Box, no
+        // heap indirection.
+        WasiHttpCtxView {
+            ctx: &mut self.wasi_http_ctx,
+            table: &mut self.resource_table,
+            hooks: &mut self.http_hooks,
+        }
+    }
 }
 
 impl HasStoreLimits for RuntimeState {
@@ -368,7 +413,18 @@ mod send_request_tests {
     use hyper::Request;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use wasmtime_wasi_http::WasiHttpView;
+
+    /// Default request config used by every `send_request` test below.
+    /// Hoisted out of the test bodies so a future field addition to
+    /// `OutgoingRequestConfig` only updates one site (and so the
+    /// tests don't drift to inconsistent defaults).
+    const TEST_REQUEST_CONFIG: wasmtime_wasi_http::p2::types::OutgoingRequestConfig =
+        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: std::time::Duration::from_secs(60),
+            first_byte_timeout: std::time::Duration::from_secs(60),
+            between_bytes_timeout: std::time::Duration::from_secs(60),
+        };
 
     /// A no-op `LogSink` for tests that only exercise `send_request`.
     struct NoopSink;
@@ -395,11 +451,11 @@ mod send_request_tests {
     /// Build a minimal `hyper::Request<HyperOutgoingBody>` with the
     /// supplied URL. The body is empty — we never get past the URL
     /// check so no real network IO happens.
-    fn make_request(uri: &str) -> Request<wasmtime_wasi_http::body::HyperOutgoingBody> {
+    fn make_request(uri: &str) -> Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody> {
         Request::builder()
             .uri(uri)
             .method("GET")
-            .body(wasmtime_wasi_http::body::HyperOutgoingBody::default())
+            .body(wasmtime_wasi_http::p2::body::HyperOutgoingBody::default())
             .expect("test request build")
     }
 
@@ -413,13 +469,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("http://127.0.0.1/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for denied host, got Ok");
         let msg = format!("{:?}", result.unwrap_err()).to_lowercase();
         assert!(
@@ -440,13 +490,7 @@ mod send_request_tests {
             "api.stripe.com".to_string()
         ])));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok from send_request for allowlisted host, got: {:?}",
@@ -460,13 +504,7 @@ mod send_request_tests {
         // must be denied.
         let mut state = state_with_egress(Arc::new(EgressPolicy::new(vec![])));
         let req = make_request("https://example.com/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(result.is_err(), "expected Err for empty allowlist, got Ok");
     }
 
@@ -476,13 +514,7 @@ mod send_request_tests {
         // pass, only hard-denied IPs would still error.
         let mut state = state_with_egress(Arc::new(EgressPolicy::allow_all()));
         let req = make_request("http://127.0.0.1/");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         // Loopback still hard-denied even under allow_all() — this
         // confirms the hard-deny layer precedes the allowlist.
         assert!(
@@ -499,13 +531,7 @@ mod send_request_tests {
                 vec!["*.stripe.com".to_string()],
             )));
         let req = make_request("https://api.stripe.com/v1/charges");
-        let config = wasmtime_wasi_http::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_secs(60),
-            first_byte_timeout: std::time::Duration::from_secs(60),
-            between_bytes_timeout: std::time::Duration::from_secs(60),
-        };
-        let result = state.send_request(req, config);
+        let result = state.http().hooks.send_request(req, TEST_REQUEST_CONFIG);
         assert!(
             result.is_ok(),
             "expected Ok for wildcard-matched host, got: {:?}",
@@ -929,3 +955,178 @@ impl_scheduling!(SchedulingHost);
 
 impl_process!(LongProcessHost);
 impl_process!(ProcessHost);
+
+#[cfg(test)]
+mod with_env_and_meter_tests {
+    use super::*;
+    use crate::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+
+    struct NoopSink;
+    impl LogSink for NoopSink {
+        fn push(&self, _r: LogRecord, _c: AppLogContext) {}
+    }
+
+    fn state_with_env(env: HashMap<String, String>, tenant_id: &str) -> RuntimeState {
+        RuntimeState::with_env_and_meter(
+            env,
+            None,
+            tenant_id.to_string(),
+            Arc::new(EgressPolicy::allow_all()),
+            Arc::new(NoopSink) as Arc<dyn LogSink>,
+            AppLogContext {
+                app_name: "test".to_string(),
+                tenant_id: tenant_id.to_string(),
+                deployment_id: "test".to_string(),
+            },
+        )
+    }
+
+    // ── exit_requested ─────────────────────────────────────────────────
+
+    #[test]
+    fn exit_requested_returns_none_on_zero() {
+        let state = RuntimeState::new();
+        assert_eq!(state.exit_requested(), None);
+    }
+
+    #[test]
+    fn exit_requested_returns_code_after_exit() {
+        let state = RuntimeState::new();
+        state.process.exit(42);
+        assert_eq!(state.exit_requested(), Some(42));
+    }
+
+    // ── Env passthrough ────────────────────────────────────────────────
+    //
+    // `with_env_and_meter` stores the raw env in `Process` as-is. The
+    // worker is responsible for pre-filtering before calling this
+    // constructor. The defense-in-depth env blocklist is applied inside
+    // `build_wasi_ctx_for_tenant` to the wasi:cli path (which we cannot
+    // easily inspect from tests), not to the process::get-all-env path.
+
+    #[test]
+    fn env_passed_through_to_process() {
+        let mut env = HashMap::new();
+        env.insert("SAFE_VAR".into(), "safe".into());
+        env.insert("AWS_SECRET_KEY".into(), "leaked".into());
+        env.insert("DB_API_KEY".into(), "secret123".into());
+
+        let state = state_with_env(env.clone(), &format!("env-pass-{}", uuid::Uuid::new_v4()));
+        let all_env: HashMap<String, String> = state.process.get_all_env().into_iter().collect();
+
+        // All vars are passed through — runtime does NOT filter the Process.
+        assert_eq!(all_env.get("SAFE_VAR"), Some(&"safe".into()));
+        assert_eq!(all_env.get("AWS_SECRET_KEY"), Some(&"leaked".into()));
+        assert_eq!(all_env.get("DB_API_KEY"), Some(&"secret123".into()));
+    }
+
+    // ── Persistence env var wiring ────────────────────────────────────
+
+    #[tokio::test]
+    async fn persistence_env_vars_create_persistent_stores() {
+        let kv_dir = tempfile::TempDir::new().expect("kv temp dir");
+        let cache_dir = tempfile::TempDir::new().expect("cache temp dir");
+        let sched_dir = tempfile::TempDir::new().expect("sched temp dir");
+        let tenant_id = format!("persist-{}", uuid::Uuid::new_v4());
+
+        let kv_str = kv_dir.path().to_string_lossy().to_string();
+        let cache_str = cache_dir.path().to_string_lossy().to_string();
+        let sched_str = sched_dir.path().to_string_lossy().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_KV_STORE_PATH", Some(&kv_str), || {
+                temp_env::with_var("EDGE_CACHE_PATH", Some(&cache_str), || {
+                    temp_env::with_var("EDGE_SCHEDULING_PATH", Some(&sched_str), || {
+                        let state = state_with_env(HashMap::new(), &tenant_id);
+
+                        state.kv_store.set("k".into(), b"v".to_vec(), None).unwrap();
+                        assert_eq!(state.kv_store.get("k").unwrap(), Some(b"v".to_vec()));
+
+                        state.cache.set("ck".into(), b"cv".to_vec(), None).unwrap();
+                        assert_eq!(state.cache.get("ck").unwrap(), Some(b"cv".to_vec()));
+
+                        let sched_id = state
+                            .scheduling
+                            .schedule_once(60_000, b"sp".to_vec())
+                            .unwrap();
+                        state.scheduling.cancel(&sched_id).unwrap();
+                    });
+                });
+            });
+        })
+        .await;
+
+        result.expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_env_var_fallback_on_bad_path() {
+        let bad_dir = tempfile::TempDir::new().expect("temp dir");
+        let tenant_id = format!("fallback-{}", uuid::Uuid::new_v4());
+
+        // Make the directory read-only so with_persistence fails.
+        let mut perms = std::fs::metadata(bad_dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(bad_dir.path(), perms).expect("set read-only");
+
+        let bad_str = bad_dir.path().to_string_lossy().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_KV_STORE_PATH", Some(&bad_str), || {
+                // Should not panic — fallback to ephemeral store.
+                let state = state_with_env(HashMap::new(), &tenant_id);
+                state.kv_store.set("k".into(), b"v".to_vec(), None).unwrap();
+                assert_eq!(state.kv_store.get("k").unwrap(), Some(b"v".to_vec()));
+            });
+        })
+        .await;
+
+        result.expect("spawn_blocking panicked");
+    }
+
+    // ── Registry caching ───────────────────────────────────────────────
+
+    #[test]
+    fn same_tenant_reuses_registry_stores() {
+        let tenant_id = format!("reuse-{}", uuid::Uuid::new_v4());
+        let state1 = state_with_env(HashMap::new(), &tenant_id);
+        let state2 = state_with_env(HashMap::new(), &tenant_id);
+
+        // Both calls must return the same Arc allocations.
+        assert!(
+            Arc::ptr_eq(&state1.kv_store, &state2.kv_store),
+            "same tenant must reuse kv_store Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&state1.cache, &state2.cache),
+            "same tenant must reuse cache Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
+            "same tenant must reuse scheduling Arc"
+        );
+    }
+
+    #[test]
+    fn different_tenants_have_different_stores() {
+        let tenant_a = format!("diff-a-{}", uuid::Uuid::new_v4());
+        let tenant_b = format!("diff-b-{}", uuid::Uuid::new_v4());
+        let state1 = state_with_env(HashMap::new(), &tenant_a);
+        let state2 = state_with_env(HashMap::new(), &tenant_b);
+
+        assert!(
+            !Arc::ptr_eq(&state1.kv_store, &state2.kv_store),
+            "different tenants must have different kv_store Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state1.cache, &state2.cache),
+            "different tenants must have different cache Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
+            "different tenants must have different scheduling Arcs"
+        );
+    }
+}

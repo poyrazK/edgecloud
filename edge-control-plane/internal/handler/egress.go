@@ -117,4 +117,5 @@ func (h *EgressHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, egressResponse(req))
+	auditRecord(r, "update", "egress", tenantID, "egress allowlist updated for tenant "+tenantID, "success")
 }

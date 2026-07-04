@@ -101,6 +101,24 @@ func New(
 	reconcileSvc := service.NewReconcileService(
 		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
+
+	// Wire secrets encryption (if configured).
+	secretsEnc, encErr := service.NewSecretEncryptor(cfg.SecretsMasterKey)
+	if encErr != nil {
+		log.Fatalf("failed to create secrets encryptor: %v", encErr)
+	}
+	if secretsEnc != nil {
+		envSvc.SetSecretEncryptor(secretsEnc)
+		deploymentSvc.SetEnvService(envSvc)
+		trafficSvc.SetEnvDecrypter(secretsEnc)
+		reconcileSvc.SetEnvDecrypter(secretsEnc)
+	}
+
+	webhookRepo := repository.NewWebhookRepository(db)
+	webhookSvc := service.NewWebhookService(webhookRepo)
+	deploymentSvc.SetWebhookService(webhookSvc)
+	webhookHandler := handler.NewWebhookHandler(webhookSvc)
+
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
@@ -129,6 +147,10 @@ func New(
 	}
 
 	// ── Handlers ──────────────────────────────────────────────────
+	auditRepo := repository.NewAuditRepository(db)
+	auditor := service.NewAuditor(auditRepo)
+	handler.DefaultAuditor = auditor
+
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
@@ -137,7 +159,7 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -156,8 +178,10 @@ func New(
 	// Tenant rate limiter: applied after auth on all /api/v1/* routes.
 	// Zero-value configs use defaults set in config.Load().
 	tenantLimiter := middleware.NewRateLimiter(cfg.RateLimit.TenantRate, cfg.RateLimit.TenantBurst)
-	// IP rate limiter: applied on unauthenticated public endpoints.
-	ipLimiter := middleware.NewRateLimiter(cfg.RateLimit.IPRate, cfg.RateLimit.IPBurst)
+	// Bootstrap rate limiter: tight limit for self-signup abuse prevention.
+	bootstrapLimiter := middleware.NewRateLimiter(2, 5)
+	// Tenant creation limiter: per-IP cap (10 per hour) to prevent DB fill.
+	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -214,8 +238,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	})
 
 	// Public endpoints (no auth required) — IP rate limited
-	mux.Handle("POST /api/v1/tenants", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(tenantHandler.Bootstrap)))
-	mux.Handle("POST /api/v1/keys", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(apiKeyHandler.Create)))
+	mux.Handle("POST /api/v1/tenants",
+		handler.DefaultTenantCreationLimiter.Middleware(
+			bootstrapLimiter.Middleware(middleware.ClientIP)(
+				http.HandlerFunc(tenantHandler.Bootstrap)),
+		))
 
 	// Deprecated: redirect old /api/... paths to /api/v1/... for clients still
 	// on the old contract. Workers use /api/internal/... (unversioned).
@@ -231,10 +258,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("POST /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("GET /api/keys", redirectTo("/api/v1/keys"))
+	mux.HandleFunc("POST /api/keys", redirectTo("/api/v1/keys"))
 	mux.HandleFunc("DELETE /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
+	mux.HandleFunc("PUT /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
 	mux.HandleFunc("GET /api/apps", redirectTo("/api/v1/apps"))
 	mux.HandleFunc("GET /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("POST /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
+	mux.HandleFunc("PUT /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("DELETE /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/apps/{appName}/active", redirectTo("/api/v1/apps/"+"{appName}/active"))
 	mux.HandleFunc("GET /api/apps/{appName}/ingress", redirectTo("/api/v1/apps/"+"{appName}/ingress"))
@@ -284,11 +314,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
+	api.HandleFunc("PUT /api/v1/apps/{appName}", appHandler.Update)
 	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
 	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
+	api.HandleFunc("PUT /api/v1/keys/{keyID}", apiKeyHandler.Update)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
@@ -299,6 +331,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains", domainHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Get)
 	api.HandleFunc("DELETE /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
+
+	// Webhook CRUD routes
+	api.HandleFunc("POST /api/v1/webhooks", webhookHandler.Create)
+	api.HandleFunc("GET /api/v1/webhooks", webhookHandler.List)
+	api.HandleFunc("PUT /api/v1/webhooks/{webhookID}", webhookHandler.Update)
+	api.HandleFunc("DELETE /api/v1/webhooks/{webhookID}", webhookHandler.Delete)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()

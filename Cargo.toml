@@ -14,8 +14,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["edgeCloud team"]
-license = "MIT OR Apache-2.0"
+authors = ["Hüseyin Poyraz Küçükarslan"]
+license = "Proprietary"
 
 [workspace.dependencies]
 tree-sitter = "0.25"

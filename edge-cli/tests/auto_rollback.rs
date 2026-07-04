@@ -1,4 +1,4 @@
-//! Integration tests for `edge deploy --auto-rollback`.
+//! Integration tests for `edge deploy --auto-rollback` and `edge deploy --file`.
 //!
 //! Mirrors the wiremock pattern from `tests/rollback.rs` and
 //! `tests/deploy.rs`. The CLI test exists to pin the contract that
@@ -81,6 +81,54 @@ async fn deploy_auto_rollback_flag_forwards_to_query_param() {
     cmd.current_dir(project.path());
     cmd.arg("deploy");
     cmd.arg("--auto-rollback");
+
+    cmd.assert().success();
+}
+
+/// `edge deploy --file <path>` MUST read the artifact from the
+/// given path instead of the default target directory.
+#[tokio::test]
+async fn deploy_with_file_flag_uploads_custom_artifact() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    // Write edge.toml but do NOT seed the default target dir.
+    std::fs::write(
+        project.path().join("edge.toml"),
+        r#"[project]
+name = "myapp"
+version = "0.1.0"
+target = "wasm32-wasip2"
+
+[deployment]
+"#,
+    )
+    .unwrap();
+    // Write the artifact to a custom path.
+    let custom_wasm = project.path().join("custom.wasm");
+    std::fs::write(&custom_wasm, VALID_WASM_HEADER).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/deploy/myapp"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "d_custom",
+            "url": "https://myapp.example.test",
+            "regions": ["global"],
+            "auto_rollback_enabled": false,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("deploy");
+    cmd.arg("--file");
+    cmd.arg(custom_wasm.to_string_lossy().as_ref());
 
     cmd.assert().success();
 }

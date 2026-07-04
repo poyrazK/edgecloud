@@ -77,7 +77,7 @@ mod tests {
     /// Skipped on Windows: wasmtime trap delivery triggers
     /// STATUS_STACK_BUFFER_OVERRUN in the Windows test runner.
     ///
-    /// `config.async_support(true)` is enabled in `create_engine()` (Phase C)
+    /// `async (now unconditional in wasmtime 36+)` is enabled in `create_engine()` (Phase C)
     /// — required for `wasi:cli/command` wiring — so instantiation and the
     /// function call must use the `_async` variants. wasmtime enforces this
     /// at runtime: `must use async instantiation when async support is enabled`.

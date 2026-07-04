@@ -528,8 +528,8 @@ func TestBuildFullSync_NoActiveDeployments_ReturnsEmptyMap(t *testing.T) {
 // proceeded with allowlist=nil when the tenant row was missing —
 // which would have stripped egress rules for an inconsistent
 // (worker registered, tenant deleted) state. Now: GetByID returns
-// (nil, nil), BuildFullSync returns ErrTenantNotFound so the HTTP
-// handler can map it to a logged error instead of a stripped
+// (nil, nil), BuildFullSync returns ErrTenantNotFoundInReconcile so
+// the HTTP handler can map it to a logged error instead of a stripped
 // payload. We assert errors.Is (not ==) because the service wraps
 // no context, but a future revision might.
 func TestBuildFullSync_TenantNotFound_ReturnsError(t *testing.T) {
@@ -542,8 +542,8 @@ func TestBuildFullSync_TenantNotFound_ReturnsError(t *testing.T) {
 	}
 
 	apps, err := svc.BuildFullSync(context.Background(), "t_a", "global")
-	if !errors.Is(err, ErrTenantNotFound) {
-		t.Errorf("err=%v, want ErrTenantNotFound", err)
+	if !errors.Is(err, ErrTenantNotFoundInReconcile) {
+		t.Errorf("err=%v, want ErrTenantNotFoundInReconcile", err)
 	}
 	if apps != nil {
 		t.Errorf("apps=%v, want nil on tenant-not-found", apps)

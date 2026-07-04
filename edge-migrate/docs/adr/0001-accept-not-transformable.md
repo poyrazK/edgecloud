@@ -2,7 +2,7 @@
 
 * **Status:** Accepted
 * **Date:** 2026-07-01
-* **Authors:** edgeCloud team
+* **Authors:** Hüseyin Poyraz Küçükarslan
 * **Supersedes:** —
 * **Superseded by:** —
 

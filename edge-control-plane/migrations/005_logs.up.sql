@@ -1,5 +1,6 @@
+-- +migrate Up
 -- Tenant log store. Populated by workers via POST /api/internal/logs (issue #76).
-CREATE TABLE logs (
+CREATE TABLE IF NOT EXISTS logs (
     id            BIGSERIAL PRIMARY KEY,
     tenant_id     VARCHAR NOT NULL,
     deployment_id VARCHAR NOT NULL,
@@ -13,7 +14,7 @@ CREATE TABLE logs (
 );
 
 -- Primary read path: "give me the latest logs for app X under tenant T".
-CREATE INDEX idx_logs_tenant_app_ts ON logs (tenant_id, app_name, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_tenant_app_ts ON logs (tenant_id, app_name, ts DESC);
 
 -- GC sweep path: DELETE FROM logs WHERE ts < $1.
-CREATE INDEX idx_logs_ts ON logs (ts);
+CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs (ts);

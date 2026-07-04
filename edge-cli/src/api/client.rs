@@ -277,6 +277,8 @@ pub struct LogListResponse {
     pub limit: u32,
     #[serde(default)]
     pub since: String,
+    #[serde(default)]
+    pub next_offset: Option<u32>,
 }
 
 /// Worker-reported status of one app, returned by
@@ -305,6 +307,79 @@ pub struct AppWorkerStatus {
     /// Process exit code from the worker's last observation.
     /// `None` when not provided (e.g. running, hung, or unknown).
     pub exit_code: Option<i32>,
+}
+
+/// An app as returned by `GET /api/v1/apps` and
+/// `GET /api/v1/apps/{appName}`. Mirrors the Go control-plane
+/// `domain.App` struct field-for-field. The Go struct has no JSON
+/// tags so serde must match the literal PascalCase field names.
+///
+/// Note: `rename_all = "PascalCase"` would map `id` → `Id` and
+/// `tenant_id` → `TenantId`, but the Go struct emits `ID` and
+/// `TenantID` — hence the individual renames.
+#[derive(Debug, Deserialize)]
+pub struct App {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "TenantID")]
+    pub tenant_id: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Description", default)]
+    pub description: Option<String>,
+    #[serde(rename = "CreatedAt")]
+    pub created_at: String,
+}
+
+/// Wrapper for the paginated list response:
+/// `{"apps": [...], "limit": 50, "offset": 0}`
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AppListResponse {
+    apps: Vec<App>,
+    limit: u32,
+    offset: u32,
+}
+
+/// Quota and usage returned by `GET /api/v1/quotas`.
+/// Mirrors the Go control-plane `quotaResponse` struct.
+#[derive(Debug, Deserialize)]
+pub struct QuotaResponse {
+    pub tenant_id: String,
+    pub max_deployments: i32,
+    pub max_apps: i32,
+    pub max_workers: i32,
+    pub max_memory_mb: i32,
+    pub max_outbound_mb: i32,
+    pub max_requests_per_month: i32,
+    pub used_outbound_bytes: i64,
+    pub used_request_count: i64,
+    pub quota_period_start: String,
+    #[serde(default)]
+    pub usage_pct: Option<f64>,
+}
+
+/// Egress allowlist returned by `GET /api/v1/egress` and sent by
+/// `PUT /api/v1/egress`. Mirrors the Go control-plane
+/// `egressResponse` struct.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EgressAllowlist {
+    pub allowlist: Vec<String>,
+}
+
+/// Ingress target for a running app, returned by
+/// `GET /api/v1/apps/{appName}/ingress`. The `ready` field indicates
+/// whether the app is currently running on a worker. When `false`,
+/// only `app_name` is populated (plus `reason` in the raw response).
+#[derive(Debug, Deserialize)]
+pub struct IngressResponse {
+    pub ready: bool,
+    pub app_name: String,
+    pub tenant_id: Option<String>,
+    pub worker_id: Option<String>,
+    pub region: Option<String>,
+    pub worker_addr: Option<String>,
+    pub port: Option<i32>,
 }
 
 impl ApiClient {
@@ -575,6 +650,24 @@ impl ApiClient {
         Ok(())
     }
 
+    /// DELETE `/api/v1/apps/{appName}/env/{key}` — delete an environment variable.
+    pub fn delete_env(&self, app_name: &str, key: &str) -> Result<()> {
+        let url = format!("{}/api/v1/apps/{}/env/{}", self.base_url, app_name, key);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("delete env failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        Ok(())
+    }
+
     /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
     pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
         let url = if let Some(w) = weight {
@@ -700,6 +793,78 @@ impl ApiClient {
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
         self.get_json_anyhow("list deployments", |base| {
             format!("{base}/api/v1/list/{app_name}")
+        })
+    }
+
+    /// GET `/api/v1/apps` — list all apps for the authenticated tenant.
+    pub fn list_apps(&self) -> Result<Vec<App>> {
+        let resp: AppListResponse =
+            self.get_json_anyhow("list apps", |base| format!("{base}/api/v1/apps"))?;
+        Ok(resp.apps)
+    }
+
+    /// GET `/api/v1/apps/{appName}` — get a single app by name.
+    pub fn get_app(&self, app_name: &str) -> Result<App> {
+        self.get_json_anyhow("get app", |base| format!("{base}/api/v1/apps/{app_name}"))
+    }
+
+    /// POST `/api/v1/apps/{appName}` — create a new app.
+    pub fn create_app(&self, app_name: &str, description: Option<&str>) -> Result<App> {
+        let url = format!("{}/api/v1/apps/{}", self.base_url, app_name);
+        let payload = serde_json::json!({ "description": description });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&payload)
+            .send()?;
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("create app failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        let body: App = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
+        Ok(body)
+    }
+
+    /// GET `/api/v1/quotas` — get tenant quota and usage.
+    pub fn get_quota(&self) -> Result<QuotaResponse> {
+        self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))
+    }
+
+    /// GET `/api/v1/egress` — get the current egress allowlist.
+    pub fn get_egress(&self) -> Result<EgressAllowlist> {
+        self.get_json_anyhow("get egress", |base| format!("{base}/api/v1/egress"))
+    }
+
+    /// PUT `/api/v1/egress` — replace the egress allowlist.
+    pub fn set_egress(&self, hosts: &[String]) -> Result<EgressAllowlist> {
+        let url = format!("{}/api/v1/egress", self.base_url);
+        let payload = EgressAllowlist {
+            allowlist: hosts.to_vec(),
+        };
+        let resp = self
+            .http
+            .put(&url)
+            .header("Authorization", self.auth_header())
+            .json(&payload)
+            .send()?;
+        let _ = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("set egress failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        // Server returns the stored allowlist; re-fetch to surface it.
+        self.get_egress()
+    }
+
+    /// GET `/api/v1/apps/{appName}/ingress` — get the ingress target
+    /// (worker address and port) for a running app.
+    pub fn get_ingress(&self, app_name: &str) -> Result<IngressResponse> {
+        self.get_json_anyhow("get ingress", |base| {
+            format!("{base}/api/v1/apps/{app_name}/ingress")
         })
     }
 
@@ -885,6 +1050,7 @@ impl<'a> Logs<'a> {
         since_rfc3339: Option<&str>,
         level: Option<&str>,
         limit: Option<u32>,
+        offset: Option<u32>,
     ) -> Result<LogListResponse> {
         // Build the URL with optional query params locally, then
         // hand the formatted string to `get_json_anyhow` for the
@@ -913,6 +1079,13 @@ impl<'a> Logs<'a> {
                 parsed
                     .query_pairs_mut()
                     .append_pair("limit", &n.to_string());
+            }
+        }
+        if let Some(n) = offset {
+            if n > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("offset", &n.to_string());
             }
         }
         let url = parsed.to_string();

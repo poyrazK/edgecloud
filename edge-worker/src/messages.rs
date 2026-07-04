@@ -96,6 +96,22 @@ pub struct AppSpec {
     pub max_memory_mb: u64,
 }
 
+/// ClusterHeadroom carries capacity info for the autoscaler (issue #85).
+///
+/// Mirrors the Go `ClusterHeadroom` struct in
+/// `edge-control-plane/internal/nats/publisher.go`. `AppSlots` is the
+/// only field the autoscaler acts on — the number of free port slots
+/// this worker can allocate (i.e., not in cooldown). `cpu_pct` and
+/// `mem_pct` are observability-only for now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterHeadroom {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_pct: Option<f64>,
+    pub app_slots: u32,
+}
+
 /// HeartbeatMessage: published to `edgecloud.heartbeats.<region>` every 30s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatMessage {
@@ -111,6 +127,11 @@ pub struct HeartbeatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_addr: Option<String>,
     pub apps: HashMap<String, AppStatus>,
+    /// Capacity headroom for the cluster autoscaler. `None` on pre-#85
+    /// workers so old control planes and the autoscaler handle legacy
+    /// workers via their fallback (50 assumed slots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_headroom: Option<ClusterHeadroom>,
 }
 
 /// AppStatus: status of a single app within a heartbeat.
@@ -176,6 +197,7 @@ impl HeartbeatMessage {
             region,
             worker_addr: Some(worker_addr),
             apps: HashMap::new(),
+            cluster_headroom: None,
         }
     }
 }
@@ -232,6 +254,7 @@ mod tests {
             region: "fra".to_string(),
             worker_addr: None,
             apps: HashMap::new(),
+            cluster_headroom: None,
         };
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(

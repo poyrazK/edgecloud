@@ -603,4 +603,77 @@ mod tests {
             s.cancel(&id).unwrap();
         }
     }
+
+    // ── Persistence error paths ────────────────────────────────────────
+
+    #[test]
+    fn persistence_load_corrupted_json() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // with_persistence expects a directory — it joins SCHEDULE_FILENAME.
+        std::fs::write(dir.path().join(SCHEDULE_FILENAME), "{invalid json}").unwrap();
+        assert!(
+            Scheduler::with_persistence(dir.path()).is_err(),
+            "corrupted JSON should return Err"
+        );
+    }
+
+    #[test]
+    fn persistence_load_corrupted_base64() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let data = r#"{"version":1,"tasks":[{"id":"t1","payload":"not-base64!!","interval_ms":null,"expires_at":9999999999}]}"#;
+        std::fs::write(dir.path().join(SCHEDULE_FILENAME), data).unwrap();
+        let err = Scheduler::with_persistence(dir.path()).err().unwrap();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("base64"), "expected base64 error, got {msg}");
+    }
+
+    #[test]
+    fn persistence_load_non_existent_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // Point at an empty dir — no schedule.json exists, should return empty.
+        let s =
+            Scheduler::with_persistence(dir.path()).expect("should return Ok with empty scheduler");
+        assert!(s.cancel("nonexistent").is_err());
+    }
+
+    #[test]
+    fn persistence_flush_if_persistent_no_store() {
+        let s = Scheduler::new();
+        let id = s.schedule_once(60_000, b"payload".to_vec()).unwrap();
+        s.cancel(&id).unwrap();
+    }
+
+    #[test]
+    fn persistence_ttl_expiry_drops_oneshot_on_reload() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let past = 100_000_000u64; // definitely expired
+
+        // Write a schedule file directly with an expired one-shot task.
+        let expired_entry = serde_json::json!({
+            "version": 1,
+            "tasks": [{
+                "id": "expired-task",
+                "payload": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"dead"),
+                "interval_ms": null,
+                "expires_at": past
+            }]
+        });
+        std::fs::write(
+            dir.path().join(SCHEDULE_FILENAME),
+            expired_entry.to_string(),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let s = Scheduler::with_persistence(dir.path()).expect("load with expired task");
+        // The expired one-shot was dropped on load — cancel should fail.
+        assert!(
+            s.cancel("expired-task").is_err(),
+            "expired task must not survive reload"
+        );
+    }
 }

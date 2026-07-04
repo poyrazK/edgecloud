@@ -1,3 +1,4 @@
+-- +migrate Down
 -- Reverse 005_api_key_hash_algorithm: drop the constraint, allow NULLs,
 -- then drop the column. Drop order matters: NOT NULL must be relaxed
 -- before DROP COLUMN so existing rows don't fail validation.

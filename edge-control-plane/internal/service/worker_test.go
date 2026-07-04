@@ -1,9 +1,13 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +76,7 @@ func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker
 type mockQuotaRepo struct {
 	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)
 	addOutboundBytesFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addRequestCountFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -84,6 +89,13 @@ func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*do
 func (m *mockQuotaRepo) AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	if m.addOutboundBytesFunc != nil {
 		return m.addOutboundBytesFunc(ctx, tenantID, delta)
+	}
+	return &domain.Quota{}, nil
+}
+
+func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	if m.addRequestCountFunc != nil {
+		return m.addRequestCountFunc(ctx, tenantID, delta)
 	}
 	return &domain.Quota{}, nil
 }
@@ -828,3 +840,140 @@ func TestWorkerService_GetAppStatus_PropagatesRepoError(t *testing.T) {
 		t.Errorf("err = %v, want %v", err, wantErr)
 	}
 }
+
+// captureLogger redirects log output to a buffer for the duration of the
+// returned restore function. Used to assert log lines from applyTenantDelta
+// without leaking the global logger.
+func captureLogger(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	return buf, func() {
+		log.SetOutput(prev)
+		log.SetFlags(prevFlags)
+	}
+}
+
+func TestApplyTenantDelta_Requests_ExceedsCap_Logs(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, delta uint64) (*domain.Quota, error) {
+			return &domain.Quota{
+				MaxRequestsPerMonth: 100,
+				UsedRequestCount:    101, // breach
+			}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 1, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	out := buf.String()
+	if !strings.Contains(out, "used 101 requests") {
+		t.Errorf("log output missing breach line; got %q", out)
+	}
+	if !strings.Contains(out, "exceeds monthly limit 100") {
+		t.Errorf("log output missing limit; got %q", out)
+	}
+}
+
+func TestApplyTenantDelta_OutboundBytes_Unlimited_NoLog(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addOutboundBytesFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			// MaxOutboundMB = -1 (unlimited sentinel)
+			return &domain.Quota{MaxOutboundMB: -1, UsedOutboundBytes: 9999}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", OutboundBytes: 1, RequestCount: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.OutboundBytes },
+		func(q *domain.Quota) int64 { return int64(q.MaxOutboundMB) * 1024 * 1024 },
+		func(q *domain.Quota) int64 { return q.UsedOutboundBytes },
+		"outbound bytes",
+		svc.quotaRepo.AddOutboundBytes,
+	)
+
+	if buf.Len() != 0 {
+		t.Errorf("unlimited tenant produced log output: %q", buf.String())
+	}
+}
+
+func TestApplyTenantDelta_SkipsZeroDelta(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 0, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if called {
+		t.Errorf("AddRequestCount called despite zero delta (should be skipped)")
+	}
+}
+
+func TestApplyTenantDelta_RepositoryError_LogsAndContinues(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			return nil, errors.New("db down")
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 5, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	// Should not panic; should log the error.
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if !strings.Contains(buf.String(), "failed to record requests for tenant t_a") {
+		t.Errorf("expected error log; got %q", buf.String())
+	}
+}
+
+// Unused import suppression: strconv is used in tests for tenant ID assertions
+// but a few of the helper-only tests above don't reference it. Keep the
+// import explicit so adding new tests is friction-free.
+var _ = strconv.Itoa
