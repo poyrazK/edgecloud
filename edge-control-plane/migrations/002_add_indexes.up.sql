@@ -1,4 +1,4 @@
--- +migrate Up
+-- +migrate Up notransaction
 -- Add performance indexes for common query patterns
 
 -- deployments: frequently queried by tenant + app name

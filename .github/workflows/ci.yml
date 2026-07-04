@@ -290,6 +290,69 @@ jobs:
           path: cover.out
 
   # ============================================================
+  # GO-TEST-INTEGRATION — migrations roundtrip (postgres)
+  # ============================================================
+  # Exercises every *.sql file in edge-control-plane/migrations/
+  # against a real Postgres via testcontainers. Catches malformed
+  # rubenv/sql-migrate markers, CREATE INDEX CONCURRENTLY in a
+  # default-wrapped transaction (migrate.go:540-548), and *.up.sql
+  # / ↓down.sql asymmetries. Build-tag-gated so the fast `go-test`
+  # job stays pure-sqlmock.
+  #
+  # Uses services: postgres (pre-cached image, ~6s cold start)
+  # instead of docker:dind — no privileged container, no dind
+  # daemon-shared-state flake.
+  go-test-integration:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge-control-plane
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: edgecloud_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d edgecloud_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: "5432"
+      DATABASE_USER: test
+      DATABASE_PASSWORD: test
+      DATABASE_NAME: edgecloud_test
+      DATABASE_SSLMODE: disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod/
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
+      - name: Run migration roundtrip test
+        run: go test -tags=integration -v -count=1 ./migrations/... 2>&1 | tee test-logs.txt
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-integration-logs
+          path: edge-control-plane/test-logs.txt
+
+  # ============================================================
   # TYPOS — spell check source files
   # ============================================================
   typos:

@@ -8,6 +8,7 @@
 -- NOT NULL so future code paths cannot insert a row with an empty or NULL
 -- lookup_hash and silently bypass authentication.
 
+-- +migrate StatementBegin
 DO $$
 DECLARE null_count INT;
 BEGIN
@@ -16,5 +17,6 @@ BEGIN
         RAISE EXCEPTION 'cannot set lookup_hash NOT NULL: % rows have NULL lookup_hash (re-issue those keys first; raw keys are unrecoverable from argon2id hashes)', null_count;
     END IF;
 END $$;
+-- +migrate StatementEnd
 
 ALTER TABLE api_keys ALTER COLUMN lookup_hash SET NOT NULL;
