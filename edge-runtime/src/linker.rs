@@ -138,6 +138,7 @@ fn edge_cloud_add_to_linker_get_host(linker: &mut ComponentLinker<RuntimeState>)
     register_host!(time);
     register_host!(scheduling);
     register_host!(process);
+    // register_host!(websocket); // TODO: wire websocket Host trait on RuntimeState
 
     Ok(())
 }
