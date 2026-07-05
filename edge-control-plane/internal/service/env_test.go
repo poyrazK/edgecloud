@@ -9,10 +9,11 @@ import (
 )
 
 type mockEnvRepo struct {
-	setFn       func(ctx context.Context, env *domain.AppEnv) error
-	listFn      func(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
-	listByAppsFn func(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error)
-	deleteFn    func(ctx context.Context, tenantID, appName, key string) error
+	setFn         func(ctx context.Context, env *domain.AppEnv) error
+	listFn        func(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+	listByAppsFn  func(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error)
+	listAllAppsFn func(ctx context.Context) ([]string, []string, error)
+	deleteFn      func(ctx context.Context, tenantID, appName, key string) error
 }
 
 func (m *mockEnvRepo) Set(ctx context.Context, env *domain.AppEnv) error {
@@ -26,6 +27,12 @@ func (m *mockEnvRepo) ListByApps(ctx context.Context, tenantID string, appNames 
 		return m.listByAppsFn(ctx, tenantID, appNames)
 	}
 	return nil, nil
+}
+func (m *mockEnvRepo) ListAllApps(ctx context.Context) ([]string, []string, error) {
+	if m.listAllAppsFn != nil {
+		return m.listAllAppsFn(ctx)
+	}
+	return nil, nil, nil
 }
 func (m *mockEnvRepo) Delete(ctx context.Context, tenantID, appName, key string) error {
 	return m.deleteFn(ctx, tenantID, appName, key)

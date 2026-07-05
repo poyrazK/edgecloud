@@ -104,8 +104,15 @@ func New(
 		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
 
-	// Wire secrets encryption (if configured).
-	secretsEnc, encErr := service.NewSecretEncryptor(cfg.SecretsMasterKey)
+	// Wire secrets encryption (if configured). Supports both legacy
+	// (secrets_master_key) and keyring (secrets.active_key_id + keys) config.
+	var secretsEnc *service.SecretEncryptor
+	var encErr error
+	if cfg.Secrets.ActiveKeyID != "" {
+		secretsEnc, encErr = service.NewSecretEncryptorFromConfig(cfg.Secrets.ActiveKeyID, cfg.Secrets.Keys)
+	} else if cfg.SecretsMasterKey != "" {
+		secretsEnc, encErr = service.NewSecretEncryptorFromLegacy(cfg.SecretsMasterKey)
+	}
 	if encErr != nil {
 		log.Fatalf("failed to create secrets encryptor: %v", encErr)
 	}
@@ -310,9 +317,6 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("DELETE /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
-	mux.HandleFunc("GET /api/internal/download/{deploymentID}", redirectTo("/api/internal/download/"+"{deploymentID}"))
-	mux.HandleFunc("POST /api/internal/workers", redirectTo("/api/internal/workers"))
-	mux.HandleFunc("GET /api/internal/workers", redirectTo("/api/internal/workers"))
 
 	// Protected API routes
 	api := http.NewServeMux()
@@ -384,6 +388,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// apply Caddy weights for canary/blue-green traffic splits.
 	mux.HandleFunc("GET /api/v1/internal/traffic/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
+	})
+
+	// Secrets admin endpoints (X-Internal-Token auth).
+	secretsHandler := handler.NewSecretsAdminHandler(secretsEnc, envSvc)
+	mux.HandleFunc("GET /api/v1/admin/secrets/keys", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(secretsHandler.ListKeys)).ServeHTTP(w, r)
+	})
+	mux.HandleFunc("POST /api/v1/admin/secrets/re-encrypt", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(secretsHandler.ReEncrypt)).ServeHTTP(w, r)
 	})
 
 	// Internal endpoints (worker-facing, JWT auth).

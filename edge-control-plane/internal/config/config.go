@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -46,7 +47,15 @@ type Config struct {
 	//   openssl rand -hex 32
 	// When empty, env values are stored in plaintext (development mode).
 	// In production, set EDGE_SECRETS_MASTER_KEY in the environment.
+	//
+	// DEPRECATED: use Secrets instead. When both are set, Load returns
+	// an error. When SecretsMasterKey is set and Secrets is not, the
+	// key is auto-assigned key ID "legacy".
 	SecretsMasterKey string `yaml:"secrets_master_key"`
+	// Secrets configures envelope encryption with key rotation support.
+	// ActiveKeyID selects which key encrypts new values; all keys in the
+	// map are used for decryption. When set, SecretsMasterKey must be empty.
+	Secrets SecretsConfig `yaml:"secrets"`
 }
 
 type DatabaseConfig struct {
@@ -105,9 +114,23 @@ type StorageConfig struct {
 }
 
 type JWTConfig struct {
+	// Secret is a single JWT signing secret.
+	// DEPRECATED: use Keys + ActiveKID instead.
 	Secret string `yaml:"secret"`
-	TTL    int    `yaml:"ttl_hours"`
-	Issuer string `yaml:"issuer"`
+	// ActiveKID selects which key in Keys is used for signing new tokens.
+	// When only Secret is set, ActiveKID defaults to "default".
+	ActiveKID string            `yaml:"active_kid"`
+	Keys      map[string]string `yaml:"keys"`
+	TTL       int               `yaml:"ttl_hours"`
+	Issuer    string            `yaml:"issuer"`
+}
+
+// SecretsConfig configures envelope encryption with a keyring.
+// ActiveKeyID selects which key encrypts new values; all keys in
+// the map are available for decryption.
+type SecretsConfig struct {
+	ActiveKeyID string            `yaml:"active_key_id"`
+	Keys        map[string]string `yaml:"keys"`
 }
 
 // RateLimitConfig controls per-tenant and per-IP rate limiting.
@@ -249,6 +272,36 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("EDGE_SECRETS_MASTER_KEY"); v != "" {
 		cfg.SecretsMasterKey = v
+	}
+	if v := os.Getenv("EDGE_SECRETS_ACTIVE_KEY_ID"); v != "" {
+		cfg.Secrets.ActiveKeyID = v
+	}
+	// EDGE_SECRETS_KEY_<ID> env vars override entries in cfg.Secrets.Keys.
+	for _, e := range os.Environ() {
+		if before, after, ok := strings.Cut(e, "="); ok && strings.HasPrefix(before, "EDGE_SECRETS_KEY_") {
+			keyID := before[len("EDGE_SECRETS_KEY_"):]
+			if keyID != "" {
+				if cfg.Secrets.Keys == nil {
+					cfg.Secrets.Keys = make(map[string]string)
+				}
+				cfg.Secrets.Keys[keyID] = after
+			}
+		}
+	}
+	if v := os.Getenv("JWT_ACTIVE_KID"); v != "" {
+		cfg.JWT.ActiveKID = v
+	}
+	// JWT_KEY_<KID> env vars override entries in cfg.JWT.Keys.
+	for _, e := range os.Environ() {
+		if before, after, ok := strings.Cut(e, "="); ok && strings.HasPrefix(before, "JWT_KEY_") {
+			kid := before[len("JWT_KEY_"):]
+			if kid != "" {
+				if cfg.JWT.Keys == nil {
+					cfg.JWT.Keys = make(map[string]string)
+				}
+				cfg.JWT.Keys[kid] = after
+			}
+		}
 	}
 	if v := os.Getenv("TASK_STREAM_REPLICAS"); v != "" {
 		r, err := strconv.Atoi(v)
@@ -394,7 +447,12 @@ func Load(path string) (*Config, error) {
 	// default `change-me-in-production` placeholder and forget to override
 	// it; failing startup is louder and safer than silently running with a
 	// publicly-known secret. (Audit finding #2 — also referenced by tests.)
-	if err := validateJWTSecret(cfg.JWT.Secret); err != nil {
+	if err := validateJWTSecret(cfg.JWT.Secret, cfg.JWT.ActiveKID, cfg.JWT.Keys); err != nil {
+		return nil, err
+	}
+
+	// Validate secrets config: must not mix old and new formats.
+	if err := validateSecretsConfig(cfg.SecretsMasterKey, cfg.Secrets); err != nil {
 		return nil, err
 	}
 
@@ -426,22 +484,61 @@ var insecureJWTSecretValues = map[string]struct{}{
 	"insecure":                {},
 }
 
-// validateJWTSecret enforces three rules in priority order:
-//  1. secret must be set (non-empty),
-//  2. secret must not match a known placeholder,
-//  3. secret must be at least 32 bytes long.
+// validateJWTSecret enforces the JWT secret configuration.
+// Supports two modes:
+//  1. Legacy: single Secret field (must be ≥32 bytes, not a placeholder)
+//  2. Keyring: ActiveKID + Keys map (ActiveKID must be in Keys, each key ≥32 bytes)
 //
-// Empty and placeholder checks are separate because the operator action
-// they imply is different (set the var vs. choose a unique value).
-func validateJWTSecret(s string) error {
-	if s == "" {
+// When both are zero/unset, the function returns an error (no JWT auth configured).
+func validateJWTSecret(secret string, activeKID string, keys map[string]string) error {
+	// Keyring mode.
+	if len(keys) > 0 {
+		if activeKID == "" {
+			return fmt.Errorf("jwt.active_kid is required when jwt.keys is set")
+		}
+		if _, ok := keys[activeKID]; !ok {
+			return fmt.Errorf("jwt.active_kid %q not found in jwt.keys", activeKID)
+		}
+		for kid, val := range keys {
+			if _, ok := insecureJWTSecretValues[val]; ok {
+				return fmt.Errorf("jwt.keys[%q] %q is a known placeholder; use a unique value", kid, val)
+			}
+			if len(val) < 32 {
+				return fmt.Errorf("jwt.keys[%q] must be at least 32 bytes (got %d)", kid, len(val))
+			}
+		}
+		return nil
+	}
+
+	// Legacy mode: single secret. Must be set, ≥32 bytes, not a placeholder.
+	if secret == "" {
 		return fmt.Errorf("jwt.secret is not set; set JWT_SECRET or jwt.secret to a unique value")
 	}
-	if _, ok := insecureJWTSecretValues[s]; ok {
-		return fmt.Errorf("jwt.secret %q is a known placeholder; set JWT_SECRET or jwt.secret to a unique value", s)
+	if _, ok := insecureJWTSecretValues[secret]; ok {
+		return fmt.Errorf("jwt.secret %q is a known placeholder; set JWT_SECRET or jwt.secret to a unique value", secret)
 	}
-	if len(s) < 32 {
-		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(s))
+	if len(secret) < 32 {
+		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(secret))
+	}
+	return nil
+}
+
+// validateSecretsConfig enforces that the old and new secrets config
+// formats are not mixed.
+func validateSecretsConfig(masterKey string, secrets SecretsConfig) error {
+	if masterKey != "" && secrets.ActiveKeyID != "" {
+		return fmt.Errorf("cannot set both secrets_master_key and secrets.active_key_id; use secrets.keys exclusively")
+	}
+	if masterKey != "" && len(secrets.Keys) > 0 {
+		return fmt.Errorf("cannot set both secrets_master_key and secrets.keys; use secrets.keys exclusively")
+	}
+	if secrets.ActiveKeyID != "" && len(secrets.Keys) == 0 {
+		return fmt.Errorf("secrets.active_key_id is set but secrets.keys is empty")
+	}
+	if secrets.ActiveKeyID != "" {
+		if _, ok := secrets.Keys[secrets.ActiveKeyID]; !ok {
+			return fmt.Errorf("secrets.active_key_id %q not found in secrets.keys", secrets.ActiveKeyID)
+		}
 	}
 	return nil
 }
