@@ -162,10 +162,21 @@ impl Supervisor {
             self.stop_app(tenant_id, app_name).await?;
         }
 
-        // Acquire a port.
+        // Acquire an HTTP port.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
             pool.acquire().expect("port pool exhausted")
+        };
+
+        // Acquire a WebSocket port if the spec requests one via the
+        // EDGE_WS_PORT env var. The guest is expected to listen on this
+        // port via wasi:sockets for WebSocket upgrade traffic (issue #312).
+        let wants_ws = spec.env.contains_key("EDGE_WS_PORT");
+        let ws_port = if wants_ws {
+            let mut pool = self.port_pool.lock().await;
+            Some(pool.acquire().expect("port pool exhausted"))
+        } else {
+            None
         };
 
         // Download artifact (blocking on first request).
@@ -181,6 +192,9 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
+                if let Some(ws) = ws_port {
+                    pool.release(ws);
+                }
                 return Err(e);
             }
         };
@@ -258,6 +272,11 @@ impl Supervisor {
         // consumes.
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
+        // Replace the EDGE_WS_PORT sentinel ("0") with the actual allocated port
+        // so the guest sees the real port number in its environment.
+        if let Some(ws) = ws_port {
+            env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
+        }
 
         // EgressPolicy from the spec.allowlist. None / empty → allow-all.
         // Spec carries Vec<String>:
