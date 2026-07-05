@@ -53,14 +53,19 @@ samples/hello/
 ├── Cargo.toml         # crate-type = ["cdylib"], isolated [workspace]
 ├── edge.toml          # [project] name = "hello", [deployment] api = ...
 ├── README.md          # this file
-├── src/
-│   └── lib.rs         # wasi:http/incoming-handler implementation
-└── wit/
-    ├── edge-cloud.wit   # vendored from edge-worker/tests/fixtures/wit/
-    └── deps/            # wasi:http, wasi:io, wasi:cli, ... @0.2.1
+└── src/
+    └── lib.rs         # wasi:http/incoming-handler implementation
 ```
 
-The `wit/` tree is vendored rather than relative-pathing into
-`edge-worker/tests/fixtures/wit/` so the sample is self-contained —
-moving or deleting the host repo's fixture path doesn't break the
-sample.
+The WIT tree used by `wit-bindgen` lives in
+[`edge-worker/tests/fixtures/wit/`](../../edge-worker/tests/fixtures/wit/)
+and is referenced via the `path: "../../edge-worker/tests/fixtures/wit"`
+field in `src/lib.rs`. The runtime's own WIT at
+[`edge-runtime/src/wit/`](../../edge-runtime/src/wit/) is the source of
+truth for wasmtime's resolver but isn't directly usable by
+`wit-bindgen` — its `include wasi:cli/command@0.2.1;` syntax is
+wasmtime-only and its dep `.wit` files don't carry top-level
+`package` declarations. The fixture tree was explicitly adapted for
+`wit-bindgen` (with package decls and a `wasi:http/outgoing-handler`
+import on the handler world), so the sample points at it instead of
+duplicating 33 files.

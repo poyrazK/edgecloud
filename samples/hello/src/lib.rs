@@ -34,7 +34,15 @@
 
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
-    path: "wit",
+    // Point at the host repo's existing wit-bindgen-compatible WIT tree
+    // (edge-worker/tests/fixtures/wit/) instead of vendoring. The runtime's
+    // own edge-runtime/src/wit/ is the source of truth for wasmtime's
+    // resolver but is NOT directly usable by wit-bindgen: its `include
+    // wasi:cli/command@0.2.1;` syntax is wasmtime-only, and its dep .wit
+    // files don't carry top-level `package` declarations. The fixture tree
+    // was explicitly adapted for wit-bindgen (with package decls and a
+    // `wasi:http/outgoing-handler` import on the handler world).
+    path: "../../edge-worker/tests/fixtures/wit",
     generate_all,
 });
 
