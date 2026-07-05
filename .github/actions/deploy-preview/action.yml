@@ -49,10 +49,22 @@ runs:
     - name: Deploy preview
       id: deploy
       shell: bash
-      env:
-        EDGE_API_KEY: ${{ inputs.api-key }}
-        EDGE_API_URL: ${{ inputs.api-url }}
+      # Inline the input expansion in the run: block rather than
+      # declaring `env:` at the step level. Secrets passed via
+      # `with: api-key: ${{ secrets.X }}` to a composite action
+      # sometimes don't propagate through the step's `env:` block
+      # to the bash subshell — the value reaches `inputs.api-key`
+      # but doesn't make it into the bash environment. Inline
+      # `${{ inputs.api-key }}` is expanded by the runner at
+      # template time before bash starts, so the shell sees the
+      # literal value. This was the root cause of CI run
+      # 28747490693 reporting "no EDGE_API_KEY configured" even
+      # with EDGECLOUD_API_KEY configured as a repo secret.
       run: |
+        EDGE_API_KEY="${{ inputs.api-key }}"
+        EDGE_API_URL="${{ inputs.api-url }}"
+        export EDGE_API_KEY EDGE_API_URL
+
         # Skip silently when no API key is configured (typical for
         # fork PRs where secrets aren't shared). The downstream
         # "Comment PR" step gates on `preview-url != ''` so this is a
