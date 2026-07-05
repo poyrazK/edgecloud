@@ -150,8 +150,8 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
 /// can be activated under `myapp`).
 #[cfg(feature = "network")]
 pub fn run_promote(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
-    let edge_toml = EdgeToml::from_path(path)
-        .with_context(|| "edge deploy --promote requires edge.toml")?;
+    let edge_toml =
+        EdgeToml::from_path(path).with_context(|| "edge deploy --promote requires edge.toml")?;
     let app_name = if !app.is_empty() {
         app.to_string()
     } else {
