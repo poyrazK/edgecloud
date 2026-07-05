@@ -449,7 +449,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ReconcileSvc:    reconcileSvc,
 		LogGC:           service.NewLogGCService(logEntryRepo),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
-		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo),
+		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
 		AutoscaleSvc:    autoscaleSvc,
 	}
 }
