@@ -650,6 +650,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/cluster/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List recent cluster autoscaler events (admin only)
+         * @description Returns the most-recent autoscale_events rows, newest first.
+         */
+        get: operations["listAutoscaleEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/secrets/keys": {
         parameters: {
             query?: never;
@@ -657,6 +677,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /** List key IDs in the secrets keyring */
         get: operations["listSecretsKeys"];
         put?: never;
         post?: never;
@@ -673,29 +694,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        post: operations["reEncryptSecrets"];
-        put?: never;
         get?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/admin/cluster/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List recent cluster autoscaler events (admin only)
-         * @description Returns the most-recent autoscale_events rows, newest first.
-         */
-        get: operations["listAutoscaleEvents"];
         put?: never;
-        post?: never;
+        /** Re-encrypt all env values with the active key */
+        post: operations["reEncryptSecrets"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3052,15 +3054,12 @@ export interface operations {
                     };
                 };
             };
+            /** @description Missing or invalid internal token */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": {
-                        error?: string;
-                    };
-                };
+                content?: never;
             };
         };
     };
@@ -3085,25 +3084,19 @@ export interface operations {
                     };
                 };
             };
+            /** @description Encryption not configured */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": {
-                        error?: string;
-                    };
-                };
+                content?: never;
             };
+            /** @description Re-encryption failed */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": {
-                        error?: string;
-                    };
-                };
+                content?: never;
             };
         };
     };
