@@ -13,6 +13,7 @@ pub mod linker;
 pub mod memory;
 pub mod metering;
 pub mod runtime;
+pub mod socket_egress;
 pub mod store;
 
 pub mod interfaces;

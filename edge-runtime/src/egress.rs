@@ -12,7 +12,7 @@
 //!    host (exact or `*.suffix` wildcard). The sentinel value `"*"` allows
 //!    all non-hard-denied hosts and is used only in tests.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use url::{Host, Url};
 
 /// Per-tenant egress policy derived from `AppSpec.allowlist`.
@@ -59,6 +59,53 @@ impl EgressPolicy {
         } else {
             Ok(())
         }
+    }
+
+    /// Check whether an outbound socket-level connection to `addr` is permitted.
+    ///
+    /// Composes two layers:
+    ///
+    /// 1. **Hard-deny** (loopback, link-local, private, metadata endpoints,
+    ///    multicast, broadcast, IPv4-mapped-IPv6, IPv6 ULA, IPv6 link-local):
+    ///    always blocked, regardless of allowlist or mode.
+    /// 2. **Allowlist**: empty list ⇒ default-deny. The `"*"` sentinel permits
+    ///    every non-hard-denied IP. A non-empty allowlist permits every
+    ///    non-hard-denied IP — hostname-pinned enforcement happens at the
+    ///    HTTP layer in `EgressHttpHooks::send_request`.
+    ///
+    /// **Asymmetry vs. HTTP.** Because `wasi:sockets/tcp::start-connect`
+    /// only receives a `SocketAddr` (an IP literal), the closure cannot
+    /// match the tenant's hostname allowlist (e.g. `api.stripe.com`)
+    /// against an IP. The contract is therefore: a tenant who has
+    /// configured a non-empty allowlist is opting into raw-socket egress
+    /// to any non-hard-denied IP. A tenant who wants raw sockets fully
+    /// disabled should either leave the allowlist empty (default-deny)
+    /// or set the runtime's `EDGE_EGRESS_SOCKET_MODE` to `block-all`.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
+    pub fn check_address(&self, addr: SocketAddr) -> Result<(), String> {
+        // Layer 1: hard-deny. Reuses `check_resolved_ip` which already
+        // delegates to `is_blocked_ip` (covers all hard-deny ranges).
+        self.check_resolved_ip(addr.ip())?;
+
+        // Layer 2: allowlist.
+        if self.allowlist.is_empty() {
+            return Err(format!(
+                "egress denied: no allowlist configured, outbound traffic is disabled (ip: {})",
+                addr.ip()
+            ));
+        }
+
+        // Sentinel: the `"*"` entry bypasses allowlist matching (hard-deny
+        // still applies above). Reserved for `EgressPolicy::allow_all()`
+        // and operator opt-in.
+        if self.allowlist.iter().any(|e| e == "*") {
+            return Ok(());
+        }
+
+        // Non-empty allowlist + non-hard-denied IP: permit. See the
+        // asymmetry note in the doc comment.
+        Ok(())
     }
 
     /// Check whether an outbound request to `url` is permitted.
@@ -481,5 +528,165 @@ mod tests {
             .check_resolved_ip("93.184.216.34".parse().unwrap())
             .is_ok());
         assert!(policy.check_resolved_ip("8.8.8.8".parse().unwrap()).is_ok());
+    }
+
+    // ── check_address: socket-level (TCP/UDP) egress ───────────────────
+    //
+    // `check_address` is the new primitive that backs the
+    // `wasi:sockets/tcp-connect` / `wasi:sockets/udp-send` policy hook
+    // (issue #309). It composes:
+    //   1. hard-deny (`check_resolved_ip` → `is_blocked_ip`)
+    //   2. allowlist — empty ⇒ deny; `"*"` ⇒ permit; non-empty ⇒ permit
+    //      non-hard-denied IPs (the documented asymmetry; hostname-pinned
+    //      enforcement stays at the HTTP layer).
+
+    #[test]
+    fn address_loopback_ipv4_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_address("127.0.0.1:80".parse().unwrap())
+            .is_err());
+        // Any port — hard-deny is port-independent.
+        assert!(policy
+            .check_address("127.0.0.1:65535".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_loopback_ipv6_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy.check_address("[::1]:80".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn address_link_local_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        // AWS / Azure / GCP metadata endpoint.
+        assert!(policy
+            .check_address("169.254.169.254:80".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_address("169.254.0.1:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_private_ranges_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_address("10.0.0.1:80".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_address("192.168.1.1:80".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_address("172.16.0.1:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_ipv6_ula_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        // AWS IMDSv2 IPv6 endpoint.
+        assert!(policy
+            .check_address("[fd00:ec2::254]:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_broadcast_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_address("255.255.255.255:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_multicast_denied_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_address("224.0.0.1:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_public_allowed_under_allow_all() {
+        let policy = EgressPolicy::allow_all();
+        assert!(policy.check_address("8.8.8.8:80".parse().unwrap()).is_ok());
+        assert!(policy
+            .check_address("93.184.216.34:443".parse().unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn address_empty_allowlist_denies_public_ip() {
+        // Empty allowlist = default-deny (matches HTTP behavior).
+        let policy = EgressPolicy::new(vec![]);
+        assert!(policy.check_address("8.8.8.8:80".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn address_empty_allowlist_denies_loopback() {
+        let policy = EgressPolicy::new(vec![]);
+        // Hard-deny must apply even before the allowlist layer; the
+        // deny message can come from either layer — we just check Err.
+        assert!(policy
+            .check_address("127.0.0.1:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_nonempty_allowlist_permits_public_ip() {
+        // The documented asymmetry: a tenant with a hostname-only
+        // allowlist is *opting into* raw-socket egress to any
+        // non-hard-denied IP. Hostname-pinned enforcement lives at
+        // the HTTP layer (`EgressHttpHooks::send_request`).
+        let policy = EgressPolicy::new(vec!["api.stripe.com".to_string()]);
+        assert!(policy.check_address("8.8.8.8:80".parse().unwrap()).is_ok());
+        assert!(policy
+            .check_address("93.184.216.34:443".parse().unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn address_nonempty_allowlist_still_blocks_loopback() {
+        // Hard-deny ALWAYS overrides the allowlist — same posture as HTTP.
+        let policy = EgressPolicy::new(vec!["api.stripe.com".to_string()]);
+        assert!(policy
+            .check_address("127.0.0.1:80".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_address("169.254.169.254:80".parse().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn address_port_is_ignored() {
+        // Hard-deny is port-independent: any port on 127.0.0.1 is denied.
+        let policy = EgressPolicy::allow_all();
+        assert!(policy
+            .check_address("127.0.0.1:1".parse().unwrap())
+            .is_err());
+        assert!(policy
+            .check_address("127.0.0.1:65535".parse().unwrap())
+            .is_err());
+        // Allow of public IPs is also port-independent.
+        let policy2 = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        assert!(policy2.check_address("8.8.8.8:1".parse().unwrap()).is_ok());
+        assert!(policy2
+            .check_address("8.8.8.8:65535".parse().unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn address_star_sentinel_in_nonempty_allowlist_permits_public() {
+        // Mixing `"*"` with real entries: hard-deny still applies, but
+        // any non-blocked IP is permitted (matches `check` behavior).
+        let policy = EgressPolicy::new(vec!["api.stripe.com".to_string(), "*".to_string()]);
+        assert!(policy.check_address("8.8.8.8:80".parse().unwrap()).is_ok());
+        // Hard-deny still beats the sentinel.
+        assert!(policy
+            .check_address("127.0.0.1:80".parse().unwrap())
+            .is_err());
     }
 }

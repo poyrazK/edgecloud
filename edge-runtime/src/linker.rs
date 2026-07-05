@@ -8,27 +8,37 @@
 //! against at *instantiation* time, not at linker-construction time.
 //! So one factory, parameterized on `engine`, is correct.
 //!
-//! ## Wiring strategy (Phase C)
+//! ## Wiring strategy (wasmtime 45.0.3)
 //!
-//! See the module-level comment in `lib.rs`. In short: we do NOT let
-//! bindgen auto-register the wasi:* Host impls (which would require
-//! `RuntimeState` to implement 100+ `wasmtime_wasi::p2::bindings::...::Host`
-//! methods directly — `wit-bindgen 0.51` doesn't auto-wrap in
-//! `WasiImpl`). Instead, the linker is built up in three explicit
-//! passes:
+//! In wasmtime 45.0.3, `wasmtime_wasi::p2::add_to_linker_async` and
+//! `wasmtime_wasi_http::p2::add_only_http_to_linker_async` register
+//! their Host impls against stores that implement `WasiView` and
+//! `WasiHttpView` respectively. `RuntimeState` implements both (see
+//! `runtime.rs`). `T::sockets()` is reachable through the blanket
+//! `impl<T: WasiView> WasiSocketsView for T` from
+//! `wasmtime-wasi-45.0.3/src/view.rs:87-95` — we do **not** shadow it
+//! with a manual `WasiSocketsView for RuntimeState`.
+//!
+//! The linker is built up in three explicit passes:
 //!
 //! 1. **`wasmtime_wasi::p2::add_to_linker_async`** — registers every
 //!    `wasi:cli/command` import (`wasi:io/*`, `wasi:clocks/*`,
 //!    `wasi:filesystem/*`, `wasi:random/*`, `wasi:sockets/*`,
-//!    `wasi:cli/*`) via the canonical `WasiImpl<&mut T>` wrapper.
-//!    Requires `T: WasiView` (`RuntimeState` has this; see
-//!    `runtime.rs`).
-//! 2. **`wasmtime_wasi_http::add_only_http_to_linker_async`** — adds
-//!    `wasi:http/{outgoing-handler,types}` via `WasiHttpImpl<&mut T>`.
-//!    `add_only_http` (NOT `add_to_linker_async`) because the latter
-//!    double-registers `wasi:io`, `wasi:clocks`, `wasi:random` with
-//!    step 1. Requires `T: WasiHttpView` (`RuntimeState` implements
-//!    this in `runtime.rs`).
+//!    `wasi:cli/*`) against `T: WasiView`. Sockets policy is
+//!    **injected upstream of this call** via
+//!    `WasiCtxBuilder::socket_addr_check(...)` inside
+//!    `build_wasi_ctx_for_tenant` (`runtime.rs`). wasmtime 45.0.3's
+//!    `WasiSocketsCtx` fields are `pub(crate)`, so a manual trait impl
+//!    overriding `WasiSocketsView::sockets()` is not possible —
+//!    `socket_egress::make_socket_addr_check` is the closure consumed
+//!    by the builder (see `socket_egress.rs`).
+//! 2. **`wasmtime_wasi_http::p2::add_only_http_to_linker_async`** — adds
+//!    `wasi:http/{outgoing-handler,types}` via `WasiHttpImpl<&mut T>`
+//!    against `T: WasiHttpView`. `add_only_http` (NOT
+//!    `add_to_linker_async`) because the latter double-registers
+//!    `wasi:io`, `wasi:clocks`, `wasi:random` with step 1. HTTP egress
+//!    is gated by `EgressHttpHooks::send_request` on
+//!    `RuntimeState::http_hooks` (see `runtime.rs`).
 //! 3. **bindgen-generated per-interface `add_to_linker_get_host` for
 //!    each `edge:cloud/*` Host impl** — `RuntimeState` directly
 //!    implements these (in `runtime.rs`). We invoke each individually

@@ -42,6 +42,9 @@
 //! - L27: process get-all-env — `l27_process_get_all_env` (this file)
 //! - L28: process get-args — `l29_process_get_args` (this file)
 //! - L29: process get-cwd — `l30_process_get_cwd` (this file)
+//! - L31: wasi:sockets BlockAll default — `l31_socket_egress_block_all_denies_under_default` (this file)
+//! - L32: wasi:sockets AllowList + hard-deny target — `l32_socket_egress_allowlist_blocks_hard_deny_ip` (this file)
+//! - L33: wasi:sockets AllowList + public IP — `l33_socket_egress_allowlist_permits_public_ip` (this file)
 //!
 //! ## Skip policy
 //!
@@ -1837,4 +1840,179 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         event_count >= 3,
         "SSE response should contain at least 3 data: lines, got {event_count}\nbody:\n{body}"
     );
+}
+// ── L31–L33: wasi:sockets egress (issue #309) ──────────────────────────
+//
+// These tests prove the runtime's `WasiCtxBuilder::socket_addr_check`
+// closure (see `edge-runtime/src/socket_egress.rs`) is wired into the
+// linker. Each test instantiates the handler fixture, calls a new
+// `/sockets/tcp/connect?ip=...&port=...` endpoint, and asserts the
+// response body matches the expected policy decision.
+//
+//   * `l31_block_all_denies_under_default` — default mode (env unset ⇒
+//     `BlockAll`). Any `start-connect` returns a deny from the closure.
+//   * `l32_allowlist_blocks_hard_deny_ip` — `EDGE_EGRESS_SOCKET_MODE=
+//     allowlist` + `EgressPolicy::new(vec!["api.example.com"])`. Target
+//     `127.0.0.1` is in the hard-deny list ⇒ closure returns `false`
+//     even though the allowlist is non-empty (hard-deny wins).
+//   * `l33_allowlist_permits_public_ip` — same policy but target a
+//     public IP. Closure returns `true`; the response body prefix is
+//     `"allow"`. (The actual TCP connect may fail at the kernel level;
+//     we only assert the policy decision here.)
+//
+// `EDGE_EGRESS_SOCKET_MODE` mutations are serialized via a static
+// `Mutex` because all env-aware tests want the same value
+// (`allowlist`) — without the lock, two tests mutating the same
+// env var concurrently could race on std::env::set_var (UB on
+// 1.86+). The default-mode test (#l31) doesn't touch env and runs
+// concurrently with the suite.
+static SOCKET_EGRESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII helper that holds `SOCKET_EGRESS_ENV_LOCK` for the lifetime of
+/// the returned guard and sets `EDGE_EGRESS_SOCKET_MODE=value`. The
+/// Drop impl restores the previous value. We use this rather than
+/// free-standing `std::env::set_var`/`remove_var` because std::env::set_var
+/// is `unsafe` on Rust 1.86+ (libc `getenv` race soundness); a single
+/// lock serializes every mutation and we never call `set_var` outside
+/// the lock.
+struct ScopedSocketEgressMode {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl ScopedSocketEgressMode {
+    fn new(value: &str) -> Self {
+        let guard = SOCKET_EGRESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("EDGE_EGRESS_SOCKET_MODE");
+        // SAFETY: serialized by the held mutex guard — no other thread
+        // reads/writes the env var while the guard is held.
+        unsafe { std::env::set_var("EDGE_EGRESS_SOCKET_MODE", value) };
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+}
+
+impl Drop for ScopedSocketEgressMode {
+    fn drop(&mut self) {
+        // SAFETY: same as above — the mutex guard is still held until
+        // the struct's lifetime ends. Restore the previous value (or
+        // remove the var if it was unset) so other tests see a
+        // consistent value.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("EDGE_EGRESS_SOCKET_MODE", v),
+                None => std::env::remove_var("EDGE_EGRESS_SOCKET_MODE"),
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l31_socket_egress_block_all_denies_under_default() {
+    // Default mode (env unset) is BlockAll — every `start-connect` is
+    // denied by the closure before any real TCP IO.
+    //
+    // We still acquire `SOCKET_EGRESS_ENV_LOCK` and explicitly clear
+    // `EDGE_EGRESS_SOCKET_MODE` (via a `ScopedSocketEgressMode`
+    // observing the previous value) so concurrent runs of l32/l33
+    // can't leak the var into this test.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let _mode = ScopedSocketEgressMode::new("block-all");
+
+    let cfg = test_config("l31");
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // 8.8.8.8:53 is a public, non-hard-denied IP. Under BlockAll the
+    // closure returns `false` regardless; wasmtime maps the closure's
+    // `false` to `ErrorCode::AccessDenied`. The fixture surfaces that
+    // as body prefix `deny:access-denied`.
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=8.8.8.8&port=53"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.starts_with("deny:"),
+        "BlockAll must deny wasi:sockets connect (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l32_socket_egress_allowlist_blocks_hard_deny_ip() {
+    // mode=allowlist + `EgressPolicy::new(vec!["api.example.com"])`.
+    // Target `127.0.0.1:80` is in the hard-deny range (loopback) so
+    // the closure returns `false` — hard-deny wins over the non-empty
+    // allowlist, same posture as the HTTP egress layer.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let _mode = ScopedSocketEgressMode::new("allowlist");
+    let mut cfg = test_config("l32");
+    cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=127.0.0.1&port=80"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    // The fixture surfaces the `ErrorCode` variant that wasmtime
+    // returns when the closure denies; the EgressPolicy's textual
+    // reason ("hostname resolved to blocked IP") is logged but not
+    // propagated to the guest. Body prefix `deny:` is the assertion
+    // of the policy decision.
+    assert!(
+        body.starts_with("deny:"),
+        "loopback must be hard-denied (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l33_socket_egress_allowlist_permits_public_ip() {
+    // mode=allowlist + non-empty allowlist + public IP target.
+    // Closure returns `true` (per the documented asymmetry — see
+    // `EgressPolicy::check_address` in `egress.rs`); the fixture's
+    // path returns `"allow"`. We don't assert on whether the
+    // underlying TCP succeeded (no listener at 8.8.8.8:53 in CI);
+    // only on the policy decision.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let _mode = ScopedSocketEgressMode::new("allowlist");
+    let mut cfg = test_config("l33");
+    cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=8.8.8.8&port=53"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.starts_with("allow"),
+        "non-hard-denied IP under non-empty allowlist + AllowList must permit (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
 }
