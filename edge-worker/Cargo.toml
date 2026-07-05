@@ -47,7 +47,7 @@ http-body-util = "0.1"
 # types come from hyper directly, so we need a direct dep. Pulled with
 # `client` because wasmtime-wasi-http's default_send_request depends on the
 # hyper client internals.
-hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 
 # TLS support for HandlerDispatch FaaS endpoint (issue #209).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

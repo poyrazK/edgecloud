@@ -46,10 +46,13 @@ use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::rt::Executor;
 use hyper::server::conn::http1;
+use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::Request as HyperRequest;
 use hyper::Response as HyperResponse;
+use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -340,12 +343,20 @@ impl HandlerDispatch {
                     tokio::spawn(async move {
                         // Perform TLS handshake if configured, otherwise
                         // use the plain TCP stream (issue #209).
-                        let stream = if let Some(tls) = tls_config {
+                        let (stream, negotiated_h2) = if let Some(tls) = tls_config {
                             match tokio_rustls::TlsAcceptor::from(tls)
                                 .accept(client)
                                 .await
                             {
-                                Ok(tls_stream) => MaybeTls::Tls(Box::new(tls_stream)),
+                                Ok(tls_stream) => {
+                                    let h2 = tls_stream
+                                        .get_ref()
+                                        .1
+                                        .alpn_protocol()
+                                        .map(|p| p == b"h2")
+                                        .unwrap_or(false);
+                                    (MaybeTls::Tls(Box::new(tls_stream)), h2)
+                                }
                                 Err(e) => {
                                     tracing::warn!(
                                         tenant_id = %tenant_id_for_log,
@@ -357,9 +368,15 @@ impl HandlerDispatch {
                                 }
                             }
                         } else {
-                            MaybeTls::Plain(client)
+                            (MaybeTls::Plain(client), false)
                         };
-                        match server.serve_connection_generic(TokioIo::new(stream)).await {
+                        let io = TokioIo::new(stream);
+                        let result = if negotiated_h2 {
+                            server.serve_connection_h2(io).await
+                        } else {
+                            server.serve_connection_generic(io).await
+                        };
+                        match result {
                             Ok(()) => {
                                 tracing::debug!(
                                     client = %addr,
@@ -414,8 +431,38 @@ impl HandlerDispatch {
         Ok(())
     }
 
+    /// Serve one accepted connection using HTTP/2 (ALPN-negotiated `h2`).
+    async fn serve_connection_h2<IO>(self: Arc<Self>, client: TokioIo<IO>) -> anyhow::Result<()>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = client;
+        let server = self.clone();
+        let svc = service_fn(move |req: HyperRequest<Incoming>| {
+            let server = server.clone();
+            async move { server.handle_request(req).await }
+        });
+        http2::Builder::new(crate::dispatch::TokioExecutor)
+            .serve_connection(io, svc)
+            .await
+            .context("http2::Builder::serve_connection")?;
+        Ok(())
+    }
+}
+
+/// Tokio-based executor for hyper HTTP/2 connections.
+#[derive(Clone, Copy, Debug)]
+struct TokioExecutor;
+impl<F: Future + Send + 'static> Executor<F> for TokioExecutor {
+    fn execute(&self, f: F) {
+        tokio::spawn(async move {
+            f.await;
+        });
+    }
+}
+
+impl HandlerDispatch {
     /// Dispatch a single HTTP request through `ProxyPre`.
-    ///
     /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
     /// `lib.rs`. Key differences from that example:
     ///
