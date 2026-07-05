@@ -327,6 +327,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
 	api.HandleFunc("POST /api/v1/apps/{appName}/rollback", deploymentHandler.Rollback)
+	api.HandleFunc("POST /api/v1/apps/{appName}/promote/{deploymentID}", deploymentHandler.Promote)
 	api.HandleFunc("GET /api/v1/apps/{appName}/active", deploymentHandler.GetActive)
 	api.HandleFunc("GET /api/v1/apps/{appName}/status", workerStatusHandler.Get)
 	api.HandleFunc("GET /api/v1/auth/whoami", authHandler.Whoami)

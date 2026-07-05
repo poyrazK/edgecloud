@@ -144,6 +144,27 @@ fn run_activate(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Promote a preview deployment to production.
+/// Activates the deployment under the real app name (the CP's PromoteDeployment
+/// relaxes the app_name check so a deployment stored under `myapp--preview-xxx`
+/// can be activated under `myapp`).
+#[cfg(feature = "network")]
+pub fn run_promote(path: &Path, app: &str, deployment_id: &str) -> Result<()> {
+    let edge_toml = EdgeToml::from_path(path)
+        .with_context(|| "edge deploy --promote requires edge.toml")?;
+    let app_name = if !app.is_empty() {
+        app.to_string()
+    } else {
+        edge_toml.project.name.clone()
+    };
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
+    client.promote(&app_name, deployment_id)?;
+    output::success("Promoted successfully");
+    println!("  ID: {deployment_id}");
+    println!("  App: {app_name}");
+    Ok(())
+}
+
 /// Decide whether to print `  URL: <live_url>` for the just-activated
 /// app. Returns Some(url) only when state.json exists, belongs to the
 /// same app we activated, and has a non-empty `live_url`; otherwise

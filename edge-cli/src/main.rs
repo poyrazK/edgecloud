@@ -9,6 +9,16 @@ mod state;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::time::SystemTime;
+
+/// Generate a short unique suffix for preview deployments.
+fn short_hash() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", nanos >> 8)
+}
 
 #[derive(Parser)]
 #[command(name = "edge", version = "0.1.0", about = "edgeCloud developer CLI")]
@@ -125,6 +135,19 @@ enum Command {
         /// property, not a session toggle).
         #[arg(long)]
         auto_rollback: bool,
+
+        /// Deploy as a preview with a unique staging URL.
+        /// The app is deployed under a suffixed name (e.g. `myapp--preview-abc123`)
+        /// so it gets its own `https://{tenant}-{app}--preview-{hash}.edgecloud.dev` URL.
+        /// Use `edge deploy --promote <id>` to promote a preview to production.
+        #[arg(long)]
+        preview: bool,
+
+        /// Promote a preview deployment to production.
+        /// Takes a deployment ID that was deployed as a preview and activates it
+        /// under the app's real name. The preview URL stops working after promotion.
+        #[arg(long, value_name = "deployment_id")]
+        promote: Option<String>,
     },
 
     /// Inspect runtime and deployment status.
@@ -341,14 +364,26 @@ fn main() -> Result<()> {
             regions,
             auto_rollback,
             file,
-        } => commands::deploy::run(
-            &cli.path,
-            &app,
-            id.as_deref(),
-            &regions,
-            auto_rollback,
-            file.as_deref(),
-        ),
+            preview,
+            promote,
+        } => {
+            if let Some(dep_id) = promote {
+                return commands::deploy::run_promote(&cli.path, &app, &dep_id);
+            }
+            let preview_app = if preview {
+                Some(format!("{}--preview-{}", &app, &short_hash()))
+            } else {
+                None
+            };
+            commands::deploy::run(
+                &cli.path,
+                preview_app.as_deref().unwrap_or(&app),
+                id.as_deref(),
+                &regions,
+                auto_rollback,
+                file.as_deref(),
+            )
+        }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
             StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
             StatusAction::Deployment => commands::status::run(&cli.path),

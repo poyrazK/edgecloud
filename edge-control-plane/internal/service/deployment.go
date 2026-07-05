@@ -110,6 +110,9 @@ var (
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
+	// ErrDeploymentNotFound is returned by PromoteDeployment when the
+	// deployment doesn't exist or belongs to a different tenant.
+	ErrDeploymentNotFound = fmt.Errorf("deployment not found")
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
 	// deployment). Distinct from ErrAppNotFound (which is for the app
@@ -517,6 +520,29 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("deployment not found")
 	}
 
+	return s.activateDeployment(ctx, tenantID, appName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+}
+
+// PromoteDeployment activates a deployment under a different app name than
+// the one it was originally deployed under. This enables the preview →
+// production promotion workflow: a user deploys as `myapp--pr-42` (gets a
+// unique preview URL), then promotes the same artifact to `myapp`.
+func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error {
+	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
+	if err != nil || deployment == nil {
+		return ErrDeploymentNotFound
+	}
+	if deployment.TenantID != tenantID {
+		return ErrDeploymentNotFound
+	}
+	return s.activateDeployment(ctx, tenantID, targetAppName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+}
+
+// activateDeployment is the shared inner logic for ActivateDeployment
+// and PromoteDeployment. It sets the active deployment row and publishes
+// a task update, without checking the deployment's original app name.
+func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
+
 	// Atomically move the current active id into last_good_deployment_id
 	// and write the new id. Two readers can race on a non-tx read+write;
 	// use a tx with FOR UPDATE so concurrent activate/rollback serialize.
@@ -569,15 +595,17 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 
 	// Publish task update
 	var envMap map[string]string
+	var pubErr error
 	if s.envSvc != nil {
-		envMap, err = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
-		if err != nil {
-			return fmt.Errorf("preparing env vars for publish: %w", err)
+		envMap, pubErr = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
+		if pubErr != nil {
+			return fmt.Errorf("preparing env vars for publish: %w", pubErr)
 		}
 	} else {
-		envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
-		if err != nil {
-			return fmt.Errorf("listing env vars: %w", err)
+		var envs []domain.AppEnv
+		envs, pubErr = s.appEnvRepo.List(ctx, tenantID, appName)
+		if pubErr != nil {
+			return fmt.Errorf("listing env vars: %w", pubErr)
 		}
 		envMap = make(map[string]string, len(envs))
 		for _, e := range envs {
@@ -585,9 +613,9 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		}
 	}
 
-	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting tenant: %w", err)
+	tenant, pubErr := s.tenantRepo.GetByID(ctx, tenantID)
+	if pubErr != nil {
+		return fmt.Errorf("getting tenant: %w", pubErr)
 	}
 	if tenant == nil {
 		return fmt.Errorf("tenant not found")
@@ -596,9 +624,9 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
 	}
 
-	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting quota: %w", err)
+	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if pubErr != nil {
+		return fmt.Errorf("getting quota: %w", pubErr)
 	}
 	maxMemoryMB := 256
 	if quota != nil && quota.MaxMemoryMB > 0 {
