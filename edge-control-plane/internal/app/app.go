@@ -168,7 +168,7 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -426,6 +426,29 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ActiveKID: cfg.JWT.ActiveKID,
 		Keys:      cfg.JWT.Keys,
 	}
+
+	// Bootstrap endpoint (issue #104): no auth middleware — uses HMAC
+	// signature verification directly in the handler. Rate-limited to
+	// 5 req/min per IP.
+	if cfg.BootstrapSecret != "" {
+		mux.Handle("POST /api/internal/bootstrap",
+			bootstrapLimiter.Middleware(middleware.ClientIP)(
+				http.HandlerFunc(internalHandler.Bootstrap),
+			),
+		)
+
+		// Worker-secret: protected by BootstrapAuth (separate key from WorkerAuth).
+		bootstrapJWTConfig := middleware.BootstrapJWTConfig{
+			BootstrapSecret: cfg.BootstrapSecret,
+			Issuer:          "edgecloud-bootstrap",
+		}
+		mux.Handle("GET /api/internal/worker-secret",
+			middleware.BootstrapAuth(bootstrapJWTConfig)(
+				http.HandlerFunc(internalHandler.WorkerSecret),
+			),
+		)
+	}
+
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT OR an X-Internal-Token header.
 	downloadMux := http.NewServeMux()

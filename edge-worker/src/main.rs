@@ -1,6 +1,7 @@
 //! edge-worker — Worker Supervisor entry point.
 
 mod auth;
+mod bootstrap;
 mod config;
 mod detect;
 mod dispatch;
@@ -41,11 +42,59 @@ async fn main() -> anyhow::Result<()> {
     // and every tracing call that follows.
     let config = Config::from_env()?;
 
+    // Resolve the JWT secret: direct env var, or bootstrap handshake.
+    let jwt_secret = if !config.worker_jwt_secret.is_empty() {
+        config.worker_jwt_secret.clone()
+    } else if !config.worker_bootstrap_secret.is_empty() {
+        // Bootstrap handshake (issue #104): exchange the bootstrap
+        // secret for the real JWT secret via the control plane.
+        tracing::info!(
+            "WORKER_JWT_SECRET is empty but WORKER_BOOTSTRAP_SECRET is set; \
+             starting bootstrap handshake with control plane"
+        );
+
+        let bootstrap_client = crate::bootstrap::BootstrapClient::new(
+            config.control_plane_url.clone(),
+            config.worker_bootstrap_secret.as_bytes().to_vec(),
+            config.worker_id.clone(),
+            config.region.clone(),
+            config.worker_tenant_id.clone(),
+        );
+
+        match bootstrap_client.run().await {
+            Ok(secret) => {
+                tracing::info!("bootstrap handshake succeeded; worker can now authenticate");
+                secret
+            }
+            Err(e) => {
+                tracing::error!(
+                    err = %e,
+                    "bootstrap handshake failed — worker cannot authenticate with \
+                     control plane. Log forwarding, artifact downloads, and worker \
+                     registration will all fail with 401. Set WORKER_JWT_SECRET directly \
+                     to bypass the bootstrap. Exiting."
+                );
+                anyhow::bail!("bootstrap handshake failed: {e}");
+            }
+        }
+    } else {
+        tracing::warn!(
+            "Neither WORKER_JWT_SECRET nor WORKER_BOOTSTRAP_SECRET is set; \
+             /api/internal/* calls will return 401 until the secret is provisioned. \
+             NATS heartbeats and the deployment supervisor keep running — only the \
+             log forwarder and downloader are affected. See follow-up issue D for \
+             the bootstrap handshake."
+        );
+        String::new()
+    };
+
+    let jwt_secret_empty = jwt_secret.is_empty();
+
     // Initialize JWT signer — signs outbound calls to the control plane's
     // /api/internal/* endpoints. Worker is per-tenant in this design; the
     // JWT carries the worker's tenant_id claim.
     let jwt_signer = WorkerJwtSigner::new(
-        config.worker_jwt_secret.clone(),
+        jwt_secret,
         config.worker_jwt_kid.clone(),
         config.worker_jwt_issuer.clone(),
         config.worker_id.clone(),
@@ -70,18 +119,14 @@ async fn main() -> anyhow::Result<()> {
         spool,
     );
 
-    // Without a JWT secret the worker can still run — NATS heartbeats and
-    // the deployment supervisor don't need it — but every outbound call
-    // to /api/internal/* will 401 until the secret is provisioned. Warn
-    // loudly so an operator notices instead of discovering it from a
-    // silent drop in log forwarding. A real fix needs a JWT bootstrap
-    // handshake (see follow-up issue D).
-    if config.worker_jwt_secret.is_empty() {
+    // Log if the JWT secret was not available (bootstrap or direct).
+    // This also maintains backward compat with the old "optional secret" behavior.
+    if jwt_secret_empty {
         tracing::warn!(
-            "WORKER_JWT_SECRET is not set; /api/internal/* calls will return 401 \
-             until the secret is provisioned. NATS heartbeats and the deployment \
+            "No JWT secret is available; /api/internal/* calls will return 401 \
+             until a secret is provisioned. NATS heartbeats and the deployment \
              supervisor keep running — only the log forwarder and downloader are \
-             affected. See follow-up issue D for the bootstrap handshake."
+             affected."
         );
     }
 

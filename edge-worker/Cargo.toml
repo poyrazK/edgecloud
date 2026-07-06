@@ -30,6 +30,8 @@ wasmtime = { version = "=45.0.3", features = ["component-model", "async", "anyho
 # `src/dispatch.rs`. Pairs with `wasmtime-wasi-http` in edge-runtime.
 wasmtime-wasi-http = "=45.0.3"
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
 
