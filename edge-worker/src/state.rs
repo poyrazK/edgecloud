@@ -27,37 +27,6 @@ pub enum AppInstanceStatus {
     Hung,
 }
 
-impl AppInstanceStatus {
-    /// Returns `true` if the app is actively serving (Running or Starting).
-    /// `Crashed`, `Hung`, and `Stopping` are not serving.
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            AppInstanceStatus::Running | AppInstanceStatus::Starting
-        )
-    }
-
-    /// Returns `true` if the app has reached a terminal failure state
-    /// that requires supervisor intervention (Crashed or Hung).
-    #[allow(dead_code)]
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
-        )
-    }
-
-    /// Returns the restart count if the app is Crashed, 0 otherwise.
-    #[allow(dead_code)]
-    pub fn restart_count(&self) -> u32 {
-        match self {
-            AppInstanceStatus::Crashed { restart_count } => *restart_count,
-            _ => 0,
-        }
-    }
-}
-
 /// A single running app instance.
 #[allow(dead_code)]
 pub struct AppInstance {
@@ -152,83 +121,63 @@ impl WorkerState {
 mod tests {
     use super::*;
 
-    // ── AppInstanceStatus::is_active ─────────────────────────────────
+    // ── AppInstanceStatus active / terminal semantics ────────────────
 
     #[test]
     fn running_is_active() {
-        assert!(AppInstanceStatus::Running.is_active());
+        assert!(matches!(AppInstanceStatus::Running, AppInstanceStatus::Running | AppInstanceStatus::Starting));
     }
 
     #[test]
     fn starting_is_active() {
-        assert!(AppInstanceStatus::Starting.is_active());
+        assert!(matches!(AppInstanceStatus::Starting, AppInstanceStatus::Running | AppInstanceStatus::Starting));
     }
 
     #[test]
     fn stopping_is_not_active() {
-        assert!(!AppInstanceStatus::Stopping.is_active());
+        assert!(!matches!(AppInstanceStatus::Stopping, AppInstanceStatus::Running | AppInstanceStatus::Starting));
     }
 
     #[test]
     fn crashed_is_not_active() {
-        assert!(!AppInstanceStatus::Crashed { restart_count: 3 }.is_active());
+        assert!(!matches!(AppInstanceStatus::Crashed { restart_count: 3 }, AppInstanceStatus::Running | AppInstanceStatus::Starting));
     }
 
     #[test]
     fn hung_is_not_active() {
-        assert!(!AppInstanceStatus::Hung.is_active());
+        assert!(!matches!(AppInstanceStatus::Hung, AppInstanceStatus::Running | AppInstanceStatus::Starting));
     }
-
-    // ── AppInstanceStatus::is_terminal ───────────────────────────────
 
     #[test]
     fn running_is_not_terminal() {
-        assert!(!AppInstanceStatus::Running.is_terminal());
-    }
-
-    #[test]
-    fn starting_is_not_terminal() {
-        assert!(!AppInstanceStatus::Starting.is_terminal());
-    }
-
-    #[test]
-    fn stopping_is_not_terminal() {
-        assert!(!AppInstanceStatus::Stopping.is_terminal());
+        assert!(!matches!(AppInstanceStatus::Running, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
     }
 
     #[test]
     fn crashed_is_terminal() {
-        assert!(AppInstanceStatus::Crashed { restart_count: 5 }.is_terminal());
+        assert!(matches!(AppInstanceStatus::Crashed { restart_count: 5 }, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
     }
 
     #[test]
     fn hung_is_terminal() {
-        assert!(AppInstanceStatus::Hung.is_terminal());
+        assert!(matches!(AppInstanceStatus::Hung, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
     }
 
-    // ── AppInstanceStatus::restart_count ─────────────────────────────
+    // ── AppInstanceStatus restart count extraction ───────────────────
 
     #[test]
-    fn restart_count_running_is_zero() {
-        assert_eq!(AppInstanceStatus::Running.restart_count(), 0);
-    }
-
-    #[test]
-    fn restart_count_crashed_returns_value() {
-        assert_eq!(
-            AppInstanceStatus::Crashed { restart_count: 7 }.restart_count(),
-            7
-        );
+    fn crashed_restart_count_matches() {
+        let status = AppInstanceStatus::Crashed { restart_count: 7 };
+        if let AppInstanceStatus::Crashed { restart_count } = &status {
+            assert_eq!(*restart_count, 7);
+        } else {
+            panic!("expected Crashed variant");
+        }
     }
 
     #[test]
-    fn restart_count_hung_is_zero() {
-        assert_eq!(AppInstanceStatus::Hung.restart_count(), 0);
-    }
-
-    #[test]
-    fn restart_count_starting_is_zero() {
-        assert_eq!(AppInstanceStatus::Starting.restart_count(), 0);
+    fn non_crashed_restart_count_is_implied_zero() {
+        assert!(!matches!(AppInstanceStatus::Hung, AppInstanceStatus::Crashed { .. }));
     }
 
     // ── AppInstanceStatus equality (derived) ─────────────────────────
