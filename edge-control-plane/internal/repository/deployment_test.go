@@ -40,7 +40,7 @@ func TestDeploymentRepository_Create(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
-		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(d.Regions), d.CreatedAt, d.AutoRollbackEnabled).
+		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(d.Regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Create(context.Background(), d); err != nil {
@@ -67,7 +67,7 @@ func TestDeploymentRepository_Create_NilRegionsUsesEmptyArray(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
-		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(pq.StringArray{}), d.CreatedAt, d.AutoRollbackEnabled).
+		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(pq.StringArray{}), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Create(context.Background(), d); err != nil {

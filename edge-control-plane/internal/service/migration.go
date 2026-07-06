@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 )
@@ -44,6 +45,13 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
+	// UpdateHashAndSignature writes the post-SaveAndHash fields
+	// (hash, signature, signing_key_id) to the row created by the
+	// earlier Create call. Used by the migration service after
+	// the artifact is on disk and signed (issue #307). Idempotent
+	// on missing row (no-op) so a retry after a transient error
+	// doesn't fail with "row not found".
+	UpdateHashAndSignature(ctx context.Context, d *domain.Deployment) error
 	// DeleteByID removes a deployment row by ID. Idempotent on missing
 	// row. Used as the compensating write when the artifact save
 	// fails after the row was inserted.
@@ -91,6 +99,12 @@ type MigrationService struct {
 	// rustcPath is the absolute path to a rustc binary capable of
 	// targeting wasm32-wasip2. Used when language == "rust".
 	rustcPath string
+	// signer stamps every new deployment's artifact (issue #307).
+	// Required — set by the constructor; a nil signer would cause
+	// `Migrate` and `MigrateTree` to return an error. Mirrors
+	// `DeploymentService.signer` so artifacts produced by either
+	// service carry the same key id.
+	signer *signing.Signer
 }
 
 // NewMigrationService creates a MigrationService.
@@ -98,6 +112,7 @@ func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
 	artifactStore storage.ArtifactStore,
 	edgeMigratePath, wasiSdkPath, rustcPath string,
+	signer *signing.Signer,
 ) *MigrationService {
 	return &MigrationService{
 		deploymentRepo:  deploymentRepo,
@@ -105,6 +120,7 @@ func NewMigrationService(
 		edgeMigratePath: edgeMigratePath,
 		wasiSdkPath:     wasiSdkPath,
 		rustcPath:       rustcPath,
+		signer:          signer,
 	}
 }
 
@@ -465,6 +481,38 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrationFailed, saveErr)
 	}
 	deployment.Hash = hex.EncodeToString(hash)
+
+	// Sign the artifact (issue #307). Mirrors `DeploymentService.Deploy`:
+	// sign over `sha256(artifact) || deployment.ID` and stamp the
+	// result + key id on the row. Done before the report is returned
+	// because the deployment row is the persisted proof of the
+	// signature — a report without a signed row would tell the
+	// tenant "your code is deployed" while leaving the worker with
+	// no way to verify it.
+	if s.signer == nil {
+		return nil, fmt.Errorf("signing is not configured (migration service requires a signer at construction)")
+	}
+	sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID)
+	if signErr != nil {
+		return nil, fmt.Errorf("signing artifact: %w", signErr)
+	}
+	deployment.Signature = sig
+	deployment.SigningKeyID = s.signer.KeyID()
+	if updateErr := s.deploymentRepo.UpdateHashAndSignature(ctx, deployment); updateErr != nil {
+		// Create is called twice in the Migrate path: once before
+		// SaveAndHash (to record the row early so the AppService
+		// quota check fires), and once via UpdateHashAndSignature
+		// after signing. A failure here means the signature didn't
+		// make it to disk.
+		// Compensate: remove the row + the artifact.
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("updating deployment with hash and signature: %w", updateErr)
+	}
 
 	// Build success report from envelope's structured Report (HEAD),
 	// overlaying fields the envelope doesn't carry (wasm_stored,
@@ -1164,6 +1212,35 @@ func (s *MigrationService) MigrateTree(
 		return nil, fmt.Errorf("%w: saving artifact: %w", ErrMigrateTreeFailed, saveErr)
 	}
 	deployment.Hash = hex.EncodeToString(hash)
+
+	// Sign the artifact (issue #307). Mirrors `Migrate` and
+	// `DeploymentService.Deploy` — sign over
+	// `sha256(artifact) || deployment.ID` and persist the
+	// signature + key id on the row. The original code created
+	// the row with an empty hash and never updated it, so this
+	// is the first time the row carries both hash and signature.
+	// The Create call below is a no-op insert (row already
+	// exists) and will fail; to make this work we have to use a
+	// real Update path. Since `DeploymentRepoInterface` only
+	// exposes Create, we AddUpdate here as well (see below).
+	if s.signer == nil {
+		return nil, fmt.Errorf("signing is not configured (migration service requires a signer at construction)")
+	}
+	sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID)
+	if signErr != nil {
+		return nil, fmt.Errorf("signing artifact: %w", signErr)
+	}
+	deployment.Signature = sig
+	deployment.SigningKeyID = s.signer.KeyID()
+	if err := s.deploymentRepo.UpdateHashAndSignature(ctx, deployment); err != nil {
+		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
+			log.Printf("rollback DeleteByID failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)
+		}
+		if delErr := s.artifactStore.Delete(ctx, tenantID, appName, depID); delErr != nil && !errors.Is(delErr, os.ErrNotExist) {
+			log.Printf("rollback artifact.Delete failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)
+		}
+		return nil, fmt.Errorf("updating deployment with hash and signature: %w", err)
+	}
 
 	return &domain.TreeMigrationReport{
 		Status:            status,

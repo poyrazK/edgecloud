@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 40 // 20 .up.sql + 20 .down.sql on current main
+const splitFileCount = 44 // 22 .up.sql + 22 .down.sql on current main (17 pairs after 017)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -151,6 +151,8 @@ var wantColumns = map[string][]string{
 		"created_at",
 		"regions",               // 008_deployments_regions
 		"auto_rollback_enabled", // 009_add_auto_rollback
+		"signature",             // 017_add_signature
+		"signing_key_id",        // 017_add_signature
 	},
 	"active_deployments": {
 		"tenant_id",

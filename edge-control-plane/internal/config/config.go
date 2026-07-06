@@ -19,6 +19,12 @@ type Config struct {
 	JWT       JWTConfig       `yaml:"jwt"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Migration MigrationConfig `yaml:"migration"`
+	// Signing configures the Ed25519 artifact-signing key (issue #307).
+	// The CP signs every new deployment's artifact at upload time;
+	// workers verify the signature before instantiation. The private
+	// key never leaves the CP. The public key is propagated to workers
+	// out-of-band (today: EDGE_SIGNING_PUBKEY env var on each worker).
+	Signing SigningConfig `yaml:"signing"`
 	// Autoscale configures the cluster autoscaler (issue #85).
 	// Disabled by default — operators flip `enabled: true` once the
 	// fleet has multiple workers and the cloud-provider integration
@@ -452,6 +458,15 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("RUSTC_PATH"); v != "" {
 		cfg.Migration.RustcPath = v
 	}
+	if v := os.Getenv("EDGE_SIGNING_KEY_PATH"); v != "" {
+		cfg.Signing.KeyPath = v
+	}
+	if v := os.Getenv("EDGE_SIGNING_KEY"); v != "" {
+		cfg.Signing.Key = v
+	}
+	if v := os.Getenv("EDGE_SIGNING_KEY_ID"); v != "" {
+		cfg.Signing.KeyID = v
+	}
 
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
@@ -520,7 +535,29 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Validate the signing key (issue #307). At least one of KeyPath /
+	// Key must be set; a CP without a signing key cannot issue
+	// signatures on new artifacts, and Deploy should fail rather than
+	// silently produce unsigned rows.
+	if err := validateSigningConfig(&cfg.Signing); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateSigningConfig enforces that an Ed25519 signing key is
+// configured. The format / content of the key itself is validated
+// at load time by `signing.LoadFromFile` / `signing.LoadFromEnv` —
+// this validator only checks "is the operator pointing at SOMETHING".
+// A missing KeyID is allowed (with a warning logged by the caller)
+// so dev environments can boot without ceremony, but a missing key
+// entirely is a hard failure.
+func validateSigningConfig(s *SigningConfig) error {
+	if s.KeyPath == "" && s.Key == "" {
+		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH) or signing.key (EDGE_SIGNING_KEY) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
+	}
+	return nil
 }
 
 // insecureJWTSecretValues is the set of well-known placeholder JWT secrets
@@ -745,4 +782,29 @@ type MigrationConfig struct {
 	// language == "rust" to compile the transformed source into a
 	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
 	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
+}
+
+// SigningConfig configures the Ed25519 signing key used to sign
+// deployment artifacts (issue #307). The CP signs every new
+// deployment's artifact at upload time; workers verify the
+// signature before instantiation. The private key never leaves the
+// CP. The public key is propagated to workers out-of-band (today:
+// the EDGE_SIGNING_PUBKEY env var on each worker). At least one of
+// KeyPath / Key must be set or the CP fails to start.
+type SigningConfig struct {
+	// KeyPath is the path to a file containing the Ed25519 private
+	// key. Two formats are accepted (selected by file size): 32 raw
+	// bytes (seed form, expanded via ed25519.NewKeyFromSeed) or 64
+	// raw bytes (the full private key per RFC 8032 §5.1.2). Hex
+	// variants (64 or 128 hex chars) of either are also accepted.
+	KeyPath string `yaml:"key_path"`
+	// Key is the inline Ed25519 private key, used when KeyPath is
+	// unset (typical in container deployments where the key is
+	// injected via a sealed secret). Same format rules as KeyPath.
+	Key string `yaml:"key"`
+	// KeyID is a logical identifier (operator-chosen, e.g. "k1")
+	// stamped onto each `deployments` row at sign time. Required
+	// for clean rotation semantics; missing is allowed but emits a
+	// startup warning so operators see the footgun in their logs.
+	KeyID string `yaml:"key_id"`
 }

@@ -13,6 +13,20 @@ type Deployment struct {
 	AppName  string `db:"app_name"`
 	Status   string `db:"status"`
 	Hash     string `db:"hash"` // SHA-256 of Wasm payload
+	// Signature is the base64url(no-pad) Ed25519 signature over
+	// `sha256(artifact_bytes) || deployment_id` (issue #307). Empty
+	// for rows created before the signing code shipped; the worker
+	// treats empty as "unsigned legacy artifact" and the rollout
+	// flag EDGE_REQUIRE_SIGNATURE gates whether such rows are
+	// accepted. Stamped at Deploy / Migrate / MigrateTree time by
+	// `signing.Signer.Sign`.
+	Signature string `db:"signature"`
+	// SigningKeyID is the logical key id used to sign this row
+	// (env EDGE_SIGNING_KEY_ID on the CP). Future rotation work
+	// will check `signing_key_id = <current key id>` to refuse
+	// artifacts signed with a retired key without a DB lookup per
+	// request. Empty for legacy rows.
+	SigningKeyID string `db:"signing_key_id"`
 	// Regions is the list of regions this deployment is replicated to.
 	// The activate path loops over this list and publishes one
 	// `TaskMessage` per region to `edgecloud.tasks.<region>`. An empty

@@ -38,20 +38,30 @@ type TaskMessage struct {
 
 // AppConfig describes an app's deployment configuration.
 type AppConfig struct {
-	DeploymentID   string            `json:"deployment_id"`
-	DeploymentHash string            `json:"deployment_hash"`
-	Routes         []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
-	Env            map[string]string `json:"env"`
-	Allowlist      []string          `json:"allowlist"`
-	MaxMemoryMB    int               `json:"max_memory_mb"`
+	DeploymentID   string `json:"deployment_id"`
+	DeploymentHash string `json:"deployment_hash"`
+	// DeploymentSignature is the base64url(no-pad) Ed25519 signature
+	// over `sha256(artifact_bytes) || deployment_id` (issue #307).
+	// Workers verify the signature against the configured public key
+	// before instantiation. Empty for pre-#307 deployments (legacy
+	// mode); the worker's `EDGE_REQUIRE_SIGNATURE` flag gates
+	// whether empty signatures are accepted. Each DeploymentRoute
+	// carries its own signature so canary splits can verify
+	// independently.
+	DeploymentSignature string            `json:"deployment_signature,omitempty"`
+	Routes              []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
+	Env                 map[string]string `json:"env"`
+	Allowlist           []string          `json:"allowlist"`
+	MaxMemoryMB         int               `json:"max_memory_mb"`
 }
 
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
 // Workers use this to run multiple deployments of the same app concurrently.
 type DeploymentRoute struct {
-	DeploymentID   string `json:"deployment_id"`
-	DeploymentHash string `json:"deployment_hash"`
-	Weight         int    `json:"weight"`
+	DeploymentID        string `json:"deployment_id"`
+	DeploymentHash      string `json:"deployment_hash"`
+	DeploymentSignature string `json:"deployment_signature,omitempty"`
+	Weight              int    `json:"weight"`
 }
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.
@@ -130,18 +140,19 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 // `omitempty` JSON tag on AppConfig.Routes means nil and missing
 // produce identical wire output.
 func BuildAppConfig(
-	deploymentID, deploymentHash string,
+	deploymentID, deploymentHash, deploymentSignature string,
 	env map[string]string,
 	allowlist []string,
 	maxMemoryMB int,
 	routes ...DeploymentRoute,
 ) AppConfig {
 	cfg := AppConfig{
-		DeploymentID:   deploymentID,
-		DeploymentHash: deploymentHash,
-		Env:            env,
-		Allowlist:      allowlist,
-		MaxMemoryMB:    maxMemoryMB,
+		DeploymentID:        deploymentID,
+		DeploymentHash:      deploymentHash,
+		DeploymentSignature: deploymentSignature,
+		Env:                 env,
+		Allowlist:           allowlist,
+		MaxMemoryMB:         maxMemoryMB,
 	}
 	if len(routes) > 0 {
 		cfg.Routes = routes

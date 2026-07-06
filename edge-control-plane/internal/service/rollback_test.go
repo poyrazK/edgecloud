@@ -17,6 +17,9 @@ type mockRollbackDeploymentRepo struct {
 func (m *mockRollbackDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
 	return nil
 }
+func (m *mockRollbackDeploymentRepo) UpdateHashAndSignature(ctx context.Context, d *domain.Deployment) error {
+	return nil
+}
 func (m *mockRollbackDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
 	return m.deleteByIDFn(ctx, id)
 }

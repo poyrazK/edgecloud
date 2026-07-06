@@ -13,6 +13,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
 )
@@ -69,6 +70,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
@@ -112,6 +114,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -127,6 +130,29 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 	if dep.Hash == "" {
 		t.Error("deployment.Hash = \"\", want populated (SaveAndHash should set it)")
+	}
+
+	// Issue #307: the happy path must stamp a base64url Ed25519
+	// signature onto the deployment row plus the signing key id.
+	// Without these, a worker running with EDGE_REQUIRE_SIGNATURE=true
+	// would reject the artifact at instantiation time — a silent
+	// regression from the previous behavior.
+	signer := signing.TestKey(t)
+	if dep.Signature == "" {
+		t.Error("deployment.Signature = \"\", want populated (Signer.Sign should set it)")
+	}
+	if dep.SigningKeyID != signer.KeyID() {
+		t.Errorf("deployment.SigningKeyID = %q, want %q", dep.SigningKeyID, signer.KeyID())
+	}
+	// And the signature must verify against the same keypair —
+	// round-trip check that catches any future drift in the signed
+	// message layout (the canonical closure of issue #307).
+	ok, vErr := signer.Verify(dep.Hash, dep.ID, dep.Signature)
+	if vErr != nil {
+		t.Fatalf("Verify: %v", vErr)
+	}
+	if !ok {
+		t.Error("signature produced by Deploy did not verify against the test key")
 	}
 }
 
@@ -164,6 +190,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		// defaultRegion unset — defensive "global" default in the
 		// constructor doesn't matter for this test (validation
 		// fires before the default-region fallback is consulted).
+		signer: signing.TestKey(t),
 	}
 
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
@@ -194,6 +221,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
@@ -225,6 +253,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	// Build 17 valid regions (a..q) — the cap is 16.
@@ -278,6 +307,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	regions := make([]string, 0, 16)
@@ -339,6 +369,7 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(badDir),
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -410,6 +441,7 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(badDir),
 		appSvc:         appSvc,
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
