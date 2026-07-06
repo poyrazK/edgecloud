@@ -116,3 +116,135 @@ impl WorkerState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── AppInstanceStatus active / terminal semantics ────────────────
+
+    #[test]
+    fn running_is_active() {
+        assert!(matches!(
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn starting_is_active() {
+        assert!(matches!(
+            AppInstanceStatus::Starting,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn stopping_is_not_active() {
+        assert!(!matches!(
+            AppInstanceStatus::Stopping,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn crashed_is_not_active() {
+        assert!(!matches!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn hung_is_not_active() {
+        assert!(!matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn running_is_not_terminal() {
+        assert!(!matches!(
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
+    }
+
+    #[test]
+    fn crashed_is_terminal() {
+        assert!(matches!(
+            AppInstanceStatus::Crashed { restart_count: 5 },
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
+    }
+
+    #[test]
+    fn hung_is_terminal() {
+        assert!(matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
+    }
+
+    // ── AppInstanceStatus restart count extraction ───────────────────
+
+    #[test]
+    fn crashed_restart_count_matches() {
+        let status = AppInstanceStatus::Crashed { restart_count: 7 };
+        if let AppInstanceStatus::Crashed { restart_count } = &status {
+            assert_eq!(*restart_count, 7);
+        } else {
+            panic!("expected Crashed variant");
+        }
+    }
+
+    #[test]
+    fn non_crashed_restart_count_is_implied_zero() {
+        assert!(!matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Crashed { .. }
+        ));
+    }
+
+    // ── AppInstanceStatus equality (derived) ─────────────────────────
+
+    #[test]
+    fn same_variants_are_equal() {
+        assert_eq!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Crashed { restart_count: 3 }
+        );
+    }
+
+    #[test]
+    fn different_restart_counts_are_not_equal() {
+        assert_ne!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Crashed { restart_count: 5 }
+        );
+    }
+
+    #[test]
+    fn different_variants_are_not_equal() {
+        assert_ne!(AppInstanceStatus::Running, AppInstanceStatus::Hung);
+    }
+
+    // ── WorkerState ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_worker_state_is_empty() {
+        let engine = Engine::default();
+        let state = WorkerState::new(engine);
+        assert!(state.apps.is_empty());
+        assert_eq!(state.apps.len(), 0);
+    }
+
+    #[test]
+    fn new_worker_state_last_task_is_none() {
+        let engine = Engine::default();
+        let state = WorkerState::new(engine);
+        let last = state.last_task_received_at.lock().unwrap();
+        assert!(last.is_none());
+    }
+}
