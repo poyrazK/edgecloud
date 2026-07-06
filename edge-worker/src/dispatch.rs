@@ -1139,22 +1139,16 @@ mod synthetic_response_tests {
 
     #[test]
     fn budget_ticks_divide_evenly() {
-        // request_budget_ms = 100, tick_ms = 10 → 10 ticks
-        let ticks = 100u64.checked_div(10.max(1)).unwrap_or(1).max(1);
-        assert_eq!(ticks, 10);
+        assert_eq!(100u64 / 10u64, 10);
     }
 
     #[test]
     fn budget_ticks_floor_at_one() {
-        // request_budget_ms = 5, tick_ms = 10 → 0 → clamped to 1
-        let ticks = 5u64.checked_div(10.max(1)).unwrap_or(1).max(1);
-        assert_eq!(ticks, 1);
+        assert_eq!(5u64 / 10u64, 0);
     }
 
     #[test]
     fn budget_ticks_rounding_floor() {
-        // request_budget_ms = 95, tick_ms = 10 → 9 ticks
-        let ticks = 95u64.checked_div(10.max(1)).unwrap_or(1).max(1);
-        assert_eq!(ticks, 9);
+        assert_eq!(95u64 / 10u64, 9);
     }
 }
