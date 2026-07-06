@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+use edge_runtime::socket_egress::SocketEgressPolicy;
 use edge_runtime::{
     create_component_linker_handler, create_engine, EgressPolicy, RequestMeter, RuntimeState,
 };
@@ -180,6 +181,7 @@ impl LayerHarness {
             env: HashMap::new(),
             max_request_body_bytes: 10 * 1024 * 1024,
             metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         };
 
         let dispatch = Arc::new(
@@ -333,6 +335,7 @@ async fn l6_request_body_over_cap_returns_413() {
         env: HashMap::new(),
         max_request_body_bytes: 100,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -381,6 +384,7 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None, // 10 MB — generous
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -454,6 +458,7 @@ async fn l7_per_request_timeout_returns_500() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
 
     let dispatch = Arc::new(
@@ -643,6 +648,7 @@ async fn l11_guest_calls_process_get_env() {
         env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -688,6 +694,7 @@ async fn l12_guest_calls_time_now() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -737,6 +744,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -810,6 +818,7 @@ async fn l14_guest_calls_cache_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -880,6 +889,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -937,6 +947,7 @@ async fn l16_guest_schedules_task() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -984,6 +995,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     }
 }
 
@@ -1272,6 +1284,7 @@ async fn l27_process_get_all_env() {
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
     let cl = make_client();
@@ -1355,6 +1368,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -1814,6 +1828,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -1923,9 +1938,8 @@ async fn l31_socket_egress_block_all_denies_under_default() {
     if should_skip_layer_tests() {
         return;
     }
-    let _mode = ScopedSocketEgressMode::new("block-all");
-
-    let cfg = test_config("l31");
+    let mut cfg = test_config("l31");
+    cfg.socket_mode = SocketEgressPolicy::BlockAll;
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
@@ -1957,8 +1971,8 @@ async fn l32_socket_egress_allowlist_blocks_hard_deny_ip() {
     if should_skip_layer_tests() {
         return;
     }
-    let _mode = ScopedSocketEgressMode::new("allowlist");
     let mut cfg = test_config("l32");
+    cfg.socket_mode = SocketEgressPolicy::AllowList;
     cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
 
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
@@ -1995,8 +2009,8 @@ async fn l33_socket_egress_allowlist_permits_public_ip() {
     if should_skip_layer_tests() {
         return;
     }
-    let _mode = ScopedSocketEgressMode::new("allowlist");
     let mut cfg = test_config("l33");
+    cfg.socket_mode = SocketEgressPolicy::AllowList;
     cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
 
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;

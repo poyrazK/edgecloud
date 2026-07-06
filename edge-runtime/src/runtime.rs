@@ -117,6 +117,14 @@ pub struct RuntimeState {
     /// is reflected in both at once.
     pub egress: Arc<EgressPolicy>,
 
+    /// Per-deployment socket-egress mode (issue #309). `Copy`, so each
+    /// `RuntimeState::clone` copies it cheaply without consulting the
+    /// env var. The runtime does **not** read `EDGE_EGRESS_SOCKET_MODE`
+    /// itself; the bootstrap site is `edge-worker/src/config.rs::Config::from_env`,
+    /// which sets it once at worker startup and threads it through
+    /// `HandlerConfig` → `RuntimeState::with_env_and_meter`.
+    pub socket_mode: SocketEgressPolicy,
+
     /// wasmtime 45 moved `send_request` off the `WasiHttpView` trait and
     /// onto a new `WasiHttpHooks` trait, referenced by
     /// `WasiHttpCtxView::hooks`. We store the concrete `EgressHttpHooks`
@@ -163,6 +171,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: String::new(),
             egress: egress.clone(),
+            socket_mode: SocketEgressPolicy::BlockAll,
             http_hooks: EgressHttpHooks::new(egress, String::new()),
             exit_code,
             store_limits: None,
@@ -175,8 +184,10 @@ impl RuntimeState {
     /// `egress` is enforced on `wasi:http/outgoing-handler` via the
     /// `EgressHttpHooks` stored in `http_hooks` and on
     /// `wasi:sockets/{tcp,udp}` connect-side via the closure installed
-    /// in `build_wasi_ctx_for_tenant` (read from `EDGE_EGRESS_SOCKET_MODE`,
-    /// defaulting to `BlockAll`).
+    /// in `build_wasi_ctx_for_tenant`. `socket_mode` is threaded in as a
+    /// parameter (no env reads on the per-request hot path); the
+    /// bootstrap site that reads `EDGE_EGRESS_SOCKET_MODE` is
+    /// `edge-worker/src/config.rs::Config::from_env`.
     ///
     /// `log_sink` and `app_ctx` are wired into the per-tenant `Observer`
     /// so guest `emit_log` calls reach the worker's `LogForwarder`. The
@@ -195,17 +206,13 @@ impl RuntimeState {
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
+        socket_mode: SocketEgressPolicy,
     ) -> Self {
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
         let kv_store = get_or_create_kv_store(&tenant_id);
         let cache_store = get_or_create_cache(&tenant_id);
         let scheduling = get_or_create_scheduler(&tenant_id);
-
-        // Resolve once per call — `SocketEgressPolicy::from_env` memoizes
-        // into a process-static `OnceLock`, so the env read is cheap on
-        // the per-request supervisor hot path.
-        let socket_mode = SocketEgressPolicy::from_env();
 
         let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode);
 
@@ -233,6 +240,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: tenant_id.clone(),
             egress: egress.clone(),
+            socket_mode,
             // The hooks box shares the same Arc-shared EgressPolicy and
             // tenant id as the top-level fields, so a future mid-flight
             // policy swap (returning a new Arc) only updates one place.
@@ -286,7 +294,7 @@ impl Clone for RuntimeState {
                 &self.wasi_env_for_clone,
                 &self.tenant_id,
                 &self.egress,
-                SocketEgressPolicy::from_env(),
+                self.socket_mode,
             ),
             // WasiHttpCtx is zero-sized in wasmtime 25 (`PhantomData`)
             // so this is a no-op clone. The per-Store resources still
@@ -297,6 +305,7 @@ impl Clone for RuntimeState {
             wasi_env_for_clone: self.wasi_env_for_clone.clone(),
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
+            socket_mode: self.socket_mode,
             http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
             store_limits: None, // set fresh by create_store for each new Store
@@ -497,6 +506,7 @@ mod send_request_tests {
                 deployment_id: "phase-c8-test".to_string(),
             },
             None,
+            crate::socket_egress::SocketEgressPolicy::default(),
         )
     }
 
@@ -1057,6 +1067,7 @@ mod with_env_and_meter_tests {
                 deployment_id: "test".to_string(),
             },
             None,
+            crate::socket_egress::SocketEgressPolicy::default(),
         )
     }
 

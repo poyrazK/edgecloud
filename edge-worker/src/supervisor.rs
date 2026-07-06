@@ -427,6 +427,7 @@ impl Supervisor {
                     env: env.clone(),
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
                     metrics_acc: metrics_acc.clone(),
+                    socket_mode: self.config.socket_mode,
                 };
 
                 let tls_config =
@@ -902,7 +903,10 @@ impl Supervisor {
         };
 
         // Create a fresh RuntimeState with per-app env vars, metering, log
-        // sink, app context, and tenant_id for tenant isolation.
+        // sink, app context, and tenant_id for tenant isolation. The
+        // socket-mode placeholder `Default` (= BlockAll) matches the
+        // effective behavior today; commit 5 (A.6) threads the
+        // worker-configured mode through here from `self.config.socket_mode`.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
@@ -911,6 +915,7 @@ impl Supervisor {
             log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
             app_ctx,
             metrics_acc,
+            edge_runtime::socket_egress::SocketEgressPolicy::default(),
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
