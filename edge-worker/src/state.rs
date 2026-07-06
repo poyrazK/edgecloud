@@ -125,42 +125,66 @@ mod tests {
 
     #[test]
     fn running_is_active() {
-        assert!(matches!(AppInstanceStatus::Running, AppInstanceStatus::Running | AppInstanceStatus::Starting));
+        assert!(matches!(
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
     }
 
     #[test]
     fn starting_is_active() {
-        assert!(matches!(AppInstanceStatus::Starting, AppInstanceStatus::Running | AppInstanceStatus::Starting));
+        assert!(matches!(
+            AppInstanceStatus::Starting,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
     }
 
     #[test]
     fn stopping_is_not_active() {
-        assert!(!matches!(AppInstanceStatus::Stopping, AppInstanceStatus::Running | AppInstanceStatus::Starting));
+        assert!(!matches!(
+            AppInstanceStatus::Stopping,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
     }
 
     #[test]
     fn crashed_is_not_active() {
-        assert!(!matches!(AppInstanceStatus::Crashed { restart_count: 3 }, AppInstanceStatus::Running | AppInstanceStatus::Starting));
+        assert!(!matches!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
     }
 
     #[test]
     fn hung_is_not_active() {
-        assert!(!matches!(AppInstanceStatus::Hung, AppInstanceStatus::Running | AppInstanceStatus::Starting));
+        assert!(!matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
     }
 
     #[test]
     fn running_is_not_terminal() {
-        assert!(!matches!(AppInstanceStatus::Running, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
+        assert!(!matches!(
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
     }
 
     #[test]
     fn crashed_is_terminal() {
-        assert!(matches!(AppInstanceStatus::Crashed { restart_count: 5 }, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
+        assert!(matches!(
+            AppInstanceStatus::Crashed { restart_count: 5 },
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
     }
 
     #[test]
     fn hung_is_terminal() {
-        assert!(matches!(AppInstanceStatus::Hung, AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung));
+        assert!(matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        ));
     }
 
     // ── AppInstanceStatus restart count extraction ───────────────────
@@ -177,7 +201,10 @@ mod tests {
 
     #[test]
     fn non_crashed_restart_count_is_implied_zero() {
-        assert!(!matches!(AppInstanceStatus::Hung, AppInstanceStatus::Crashed { .. }));
+        assert!(!matches!(
+            AppInstanceStatus::Hung,
+            AppInstanceStatus::Crashed { .. }
+        ));
     }
 
     // ── AppInstanceStatus equality (derived) ─────────────────────────
