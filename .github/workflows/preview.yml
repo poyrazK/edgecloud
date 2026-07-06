@@ -60,15 +60,19 @@ jobs:
       # `$CARGO_HOME/bin/edge`. Each GitHub Actions step is a fresh
       # shell, so PATH from this step doesn't carry to the next.
       # `dtolnay/rust-toolchain` only adds `$CARGO_HOME/bin` to PATH
-      # for steps that follow it directly; with the composite
-      # `cargo install` step in between, the next step's PATH no
-      # longer includes the install dir. Prepend it explicitly so
-      # the deploy step can find `edge` — CI run 28774697516 failed
-      # with `edge: command not found (rc=127)` without this.
+      # for steps immediately following it; the cargo install in
+      # between resets the env. CI run 28774697516 + 28774979460
+      # both failed with `edge: command not found (rc=127)` even
+      # with `PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}` set
+      # in the step's env — `${{ env.PATH }}` rendered as empty
+      # string, so the resulting PATH was just
+      # `/home/runner/.cargo/bin:` (trailing colon, no system PATH).
+      # Bypass the issue entirely by using the absolute path to
+      # `edge`.
       - name: Deploy preview
         id: deploy
         env:
-          PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}
+          EDGE_BIN: /home/runner/.cargo/bin/edge
           EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
           EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
         run: |
@@ -90,7 +94,7 @@ jobs:
           # Capture merged stdout+stderr to a buffer so the URL
           # parse below can run against the full output regardless
           # of where the CLI wrote it.
-          output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" edge deploy --preview 2>&1) || {
+          output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" "$EDGE_BIN" deploy --preview 2>&1) || {
             rc=$?
             echo "::error::edge deploy --preview failed (rc=$rc)"
             printf '%s\n' "$output"
