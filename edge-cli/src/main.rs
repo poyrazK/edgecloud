@@ -13,12 +13,19 @@ use std::time::SystemTime;
 
 /// Source language for the `edge build` and `edge init` commands
 /// (issue #317 — Multi-language runtime support). Each variant maps
-/// to a dedicated build pipeline; the lowercase clap render (`rust`,
+/// to a dedicated build pipeline; the lowercase clap value (`rust`,
 /// `js`) is what the user types on the command line and what gets
 /// written into `[project] language = "..."` in `edge.toml`.
+///
+/// Single source of truth: the `#[value(name = "...")]` attribute is
+/// the canonical wire form. `Display::fmt` and `as_str()` both
+/// delegate to it, so adding a new variant is a one-line change at
+/// this enum (no edits to `init.rs`, `build.rs`, or `deploy.rs`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum LangArg {
+    #[value(name = "rust")]
     Rust,
+    #[value(name = "js")]
     Js,
 }
 
@@ -34,6 +41,8 @@ impl LangArg {
     /// and friends can match on a `&str` rather than re-implementing
     /// the per-variant rendering.
     pub fn as_str(&self) -> &'static str {
+        // Sourced from the `#[value(name = "...")]` attribute above so
+        // adding a variant here can't drift from the clap wire form.
         match self {
             LangArg::Rust => "rust",
             LangArg::Js => "js",
@@ -129,10 +138,12 @@ enum Command {
 
     /// Compile the project to WebAssembly.
     Build {
-        /// Source language to build. Must match the project's
-        /// `[project] language` in `edge.toml` (the build does NOT
-        /// cross-check — mismatches surface as a missing artifact
-        /// at deploy time).
+        /// Source language to build. When omitted, defaults to `rust`.
+        /// If the project's `[project] language` in `edge.toml` is set
+        /// (e.g. `js`) and `--lang` is also passed, the two must agree —
+        /// mismatches are rejected with a clear error pointing at the
+        /// conflicting values so the user fixes the toml instead of
+        /// silently building the wrong artifact.
         #[arg(long, value_enum, default_value_t = LangArg::Rust)]
         lang: LangArg,
     },
@@ -145,6 +156,16 @@ enum Command {
         /// App name. Upload mode: overrides edge.toml. Activate mode (with --id): primary source; falls back to .edge/state.json.
         #[arg(default_value = "")]
         app: String,
+
+        /// Source language for the artifact path lookup. By default
+        /// we read `[project] language` from `edge.toml`. Pass this
+        /// flag to override (e.g. when you built with
+        /// `edge build --lang=js` but your toml still says `rust`).
+        /// `--lang` and the toml must agree; mismatches are rejected
+        /// with a clear error so a stale rust deploy path can never
+        /// be served for a Javy artifact.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
 
         /// Activate a previously-stored deployment by ID (e.g. from `edge migrate`).
         #[arg(long, value_name = "deployment_id")]
@@ -266,7 +287,13 @@ enum Command {
     },
 
     /// Local development server with hot-reload.
-    Dev,
+    Dev {
+        /// Source language to build. Must match `[project] language`
+        /// in `edge.toml` (the dev server does not cross-check — pass
+        /// the same value you used for `edge build`).
+        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
+        lang: LangArg,
+    },
 
     /// Open the deployed URL in a browser.
     Open {
@@ -409,6 +436,7 @@ fn main() -> Result<()> {
             file,
             preview,
             promote,
+            lang,
         } => {
             if let Some(dep_id) = promote {
                 return commands::deploy::run_promote(&cli.path, &app, &dep_id);
@@ -425,6 +453,7 @@ fn main() -> Result<()> {
                 &regions,
                 auto_rollback,
                 file.as_deref(),
+                lang,
             )
         }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
@@ -447,7 +476,7 @@ fn main() -> Result<()> {
         },
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
-        Command::Dev => commands::dev::run(&cli.path),
+        Command::Dev { lang } => commands::dev::run(&cli.path, lang),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
         Command::Quota => commands::quota::run(&cli.path),

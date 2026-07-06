@@ -36,9 +36,16 @@ pub struct Project {
 impl Project {
     /// Resolve the project's source language, defaulting to `"rust"`
     /// for projects whose `edge.toml` was written before the language
-    /// field existed. Always returns a non-empty string.
+    /// field existed. Always returns a non-empty string — even if the
+    /// toml explicitly sets `language = ""` (a valid TOML value), we
+    /// treat that as "absent" and fall back to the default, because
+    /// `path_for` would otherwise match its `_` arm and silently
+    /// route the deploy to a stale rust artifact.
     pub fn language_or_default(&self) -> &str {
-        self.language.as_deref().unwrap_or("rust")
+        match self.language.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => "rust",
+        }
     }
 }
 
@@ -170,6 +177,28 @@ target = "wasm32-wasip2"
 "#,
         );
         assert_eq!(toml.project.language, None);
+        assert_eq!(toml.project.language_or_default(), "rust");
+    }
+
+    #[test]
+    fn language_or_default_treats_empty_string_as_missing() {
+        // `language = ""` is a valid TOML value and parses as
+        // Some(""). The unwrap_or("rust") fallback alone would return
+        // "" (because Some("") is_some), which then matches the `_`
+        // arm in `path_for` and silently deploys a stale rust
+        // artifact. Treat empty-string as absent so the default
+        // wins.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = ""
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.language.as_deref(), Some(""));
         assert_eq!(toml.project.language_or_default(), "rust");
     }
 }
