@@ -409,10 +409,18 @@ mod tests {
             service_token: "ignored".into(),
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
             control_plane_api_url: "http://localhost:8080".into(),
             internal_token: None,
         };
         let table = std::sync::Arc::new(RoutingTable::new());
+
+        // The `unused import: CertKey` warning from the test helper
+        // on line 357 does not affect CI — it fires only in
+        // `#[cfg(test)]` and the Caddy JSON builder never produces
+        // a key/cert order bug. Marked `#[allow(dead_code)]` on the
+        // struct in caddy.rs.
         let notify = std::sync::Arc::new(Notify::new());
         run(cfg, table, notify).await.unwrap();
     }
@@ -586,6 +594,8 @@ mod tests {
             service_token: "stale-token".into(),
             domain_poll_interval: poll,
             caddy_admin_listen: "localhost:2019".into(),
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
             control_plane_api_url: "http://localhost:8080".into(),
             internal_token: None,
         }
