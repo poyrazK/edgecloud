@@ -72,7 +72,12 @@ jobs:
       - name: Deploy preview
         id: deploy
         env:
-          EDGE_BIN: /home/runner/.cargo/bin/edge
+          # cargo install defaults the binary name to the crate
+          # name (with `-` replaced by `-`); the edge-cli crate
+          # produces `edge-cli`, not `edge`. CI run 28775240288
+          # hit "No such file or directory" with EDGE_BIN=.../edge
+          # — the file is actually .../edge-cli.
+          EDGE_BIN: /home/runner/.cargo/bin/edge-cli
           EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
           EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
         run: |
