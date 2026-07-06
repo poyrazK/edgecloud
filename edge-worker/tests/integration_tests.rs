@@ -99,8 +99,8 @@ fn test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     }
-    socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
 }
 
 /// Timeout for subscribing to heartbeats.
