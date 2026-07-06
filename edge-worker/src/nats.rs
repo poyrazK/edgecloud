@@ -330,12 +330,15 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         pub fn ack_count(&self) -> u32 {
             self.ack_calls.load(Ordering::Relaxed)
         }
+        #[allow(dead_code)]
         pub fn nack_count(&self) -> u32 {
             self.nack_calls.load(Ordering::Relaxed)
         }
+        #[allow(dead_code)]
         pub fn term_count(&self) -> u32 {
             self.term_calls.load(Ordering::Relaxed)
         }
