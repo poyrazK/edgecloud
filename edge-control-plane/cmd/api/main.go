@@ -71,7 +71,7 @@ func main() {
 	// ── Ingress Service Token ─────────────────────────────────────
 	region := os.Getenv("APP_REGION")
 	if region != "" {
-		tok, err := mintIngressToken(application.WorkerJWTConfig, region)
+		tok, err := mintIngressToken(application.JWTSecret, application.JWTIssuer, region)
 		if err != nil {
 			log.Fatalf("failed to mint ingress token: %v", err)
 		}

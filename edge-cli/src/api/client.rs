@@ -696,27 +696,6 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Promote a preview deployment to production.
-    /// POST /api/v1/apps/{app_name}/promote/{deployment_id}
-    pub fn promote(&self, app_name: &str, deployment_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/api/v1/apps/{}/promote/{}",
-            self.base_url, app_name, deployment_id
-        );
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("promote failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
-        Ok(())
-    }
-
     /// Set traffic splits for an app.
     /// `splits` is a slice of (deployment_id, weight) pairs; weights must sum to 100.
     pub fn set_traffic(&self, app_name: &str, splits: &[(String, u8)]) -> Result<()> {

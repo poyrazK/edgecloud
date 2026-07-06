@@ -109,10 +109,14 @@ var (
 	// check is enough to reject obviously-non-wasm inputs before
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
+<<<<<<< HEAD
 	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
+=======
+	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
 	// ErrDeploymentNotFound is returned by PromoteDeployment when the
 	// deployment doesn't exist or belongs to a different tenant.
 	ErrDeploymentNotFound = fmt.Errorf("deployment not found")
+>>>>>>> ac9d1d0 (feat: deploy preview environments with --preview and --promote)
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
 	// deployment). Distinct from ErrAppNotFound (which is for the app

@@ -195,6 +195,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
         log_forwarder,
         jwt_signer,
         http,
+        engine_pool: Arc::new(edge_worker::supervisor::StandbyPool::new(5)?),
     }))
 }
 

@@ -704,7 +704,6 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
-            None,
             "edgecloud",
             "w_test",
             "test",

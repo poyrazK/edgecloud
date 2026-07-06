@@ -172,48 +172,8 @@ func (s *APIKeyService) GetByID(ctx context.Context, id string) (*domain.APIKey,
 	return s.apiKeyRepo.GetByID(ctx, id)
 }
 
-// DeleteAPIKey deletes an API key, verifying it belongs to the requesting tenant.
-func (s *APIKeyService) DeleteAPIKey(ctx context.Context, tenantID, id string) error {
-	key, err := s.apiKeyRepo.GetByID(ctx, id)
-	if err != nil {
-		return fmt.Errorf("getting api key: %w", err)
-	}
-	if key == nil || key.TenantID != tenantID {
-		return ErrAPIKeyNotFound
-	}
+func (s *APIKeyService) DeleteAPIKey(ctx context.Context, id string) error {
 	return s.apiKeyRepo.Delete(ctx, id)
-}
-
-// RotateAPIKey expires the old key and creates a new one with the same name and role.
-// The old key is immediately invalidated by setting its ExpiresAt in the past.
-// Returns the new API key and raw key.
-func (s *APIKeyService) RotateAPIKey(ctx context.Context, tenantID, id string) (*domain.APIKey, string, error) {
-	oldKey, err := s.apiKeyRepo.GetByID(ctx, id)
-	if err != nil {
-		return nil, "", fmt.Errorf("getting api key: %w", err)
-	}
-	if oldKey == nil || oldKey.TenantID != tenantID {
-		return nil, "", ErrAPIKeyNotFound
-	}
-
-	// Create new key with same name and role.
-	rawKey, newKey, err := mintAPIKey(tenantID, oldKey.Name, oldKey.Role)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Expire the old key immediately.
-	now := time.Now()
-	oldKey.ExpiresAt = &now
-	if err := s.apiKeyRepo.Update(ctx, oldKey); err != nil {
-		return nil, "", fmt.Errorf("expiring old api key: %w", err)
-	}
-
-	if err := s.apiKeyRepo.Create(ctx, newKey); err != nil {
-		return nil, "", fmt.Errorf("creating new api key: %w", err)
-	}
-
-	return newKey, rawKey, nil
 }
 
 // AuthenticateRawKey looks up a key by its stable SHA-256 lookup hash and

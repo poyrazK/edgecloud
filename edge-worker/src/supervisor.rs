@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use edge_runtime::linker::create_component_linker_long_running;
-use edge_runtime::{create_component_linker_handler, EgressPolicy, RequestMeter};
+use edge_runtime::{EgressPolicy, RequestMeter};
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
 use crate::config::Config;
-use crate::detect::{detect_execution_model, ExecutionModel};
+use crate::detect::{detect_execution_model_from_bytes, ExecutionModel};
 use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -21,6 +21,41 @@ use crate::messages::{
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
+
+/// A pool of pre-warmed wasmtime::Engine instances.
+pub struct StandbyPool {
+    pool: Mutex<tokio::sync::mpsc::Receiver<wasmtime::Engine>>,
+    sender: tokio::sync::mpsc::Sender<wasmtime::Engine>,
+}
+
+impl StandbyPool {
+    pub fn new(size: usize) -> anyhow::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel(size.max(1));
+        for _ in 0..size {
+            let engine = edge_runtime::create_engine()?;
+            tx.try_send(engine).map_err(|_| anyhow::anyhow!("failed to pre-warm pool"))?;
+        }
+        Ok(Self {
+            pool: Mutex::new(rx),
+            sender: tx,
+        })
+    }
+
+    pub async fn acquire(&self) -> wasmtime::Engine {
+        let mut rx = self.pool.lock().await;
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(engine)) => engine,
+            _ => {
+                tracing::warn!("StandbyPool exhausted; creating transient engine");
+                edge_runtime::create_engine().expect("fallback engine must build")
+            }
+        }
+    }
+
+    pub fn release(&self, engine: wasmtime::Engine) {
+        let _ = self.sender.try_send(engine);
+    }
+}
 
 /// The main supervisor — manages all running apps for this worker node.
 #[allow(dead_code)]
@@ -34,15 +69,15 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
+    /// HTTP client for sync fallback.
+    pub http: reqwest::Client,
+    /// Standby engine pool for lazy starting apps.
+    pub engine_pool: Arc<StandbyPool>,
     /// JWT signer used by `fetch_sync` (the HTTP /sync fallback) and by
     /// downloader/internal HTTP calls. Mirrors the main-branch shape so
     /// `edge-test-helpers::build_supervisor_inner` can construct a
     /// Supervisor for tests without separate plumbing.
     pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
-    /// Shared HTTP client. Constructed once at startup so its TLS
-    /// connection pool survives across every /sync fallback tick —
-    /// same rationale as `Downloader::client`.
-    pub http: reqwest::Client,
 }
 
 impl Supervisor {
@@ -199,112 +234,14 @@ impl Supervisor {
             }
         };
 
-        let engine = &self.state.read().await.engine;
-
-        // Try AOT compilation cache first.
-        let cwasm_path = self.downloader.cwasm_path(&spec.deployment_id);
-        let component = if cwasm_path.exists() {
-            match tokio::fs::read(&cwasm_path).await {
-                Ok(cwasm_bytes) => {
-                    // Safety: Loading pre-compiled code from a local trusted file cache is safe.
-                    // We catch any deserialization failures and fall back to from_binary.
-                    match unsafe {
-                        wasmtime::component::Component::deserialize(engine, &cwasm_bytes)
-                    } {
-                        Ok(c) => {
-                            tracing::info!(
-                                tenant_id,
-                                app_name,
-                                deployment_id = %spec.deployment_id,
-                                "AOT pre-compilation cache hit: successfully deserialized component"
-                            );
-                            Some(c)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                tenant_id,
-                                app_name,
-                                deployment_id = %spec.deployment_id,
-                                err = %e,
-                                "failed to deserialize component; falling back to JIT compilation"
-                            );
-                            let _ = tokio::fs::remove_file(&cwasm_path).await;
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        tenant_id,
-                        app_name,
-                        deployment_id = %spec.deployment_id,
-                        err = %e,
-                        "failed to read AOT cache file; falling back to JIT compilation"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let component = match component {
-            Some(c) => c,
-            None => {
-                // Compile the component using the shared engine.
-                match wasmtime::component::Component::from_binary(engine, &artifact) {
-                    Ok(c) => {
-                        // Serialize and write to cache in a background task so we don't block
-                        // the initial start/restart path.
-                        let cwasm_path_clone = cwasm_path.clone();
-                        let serialized_result = c.serialize();
-                        tokio::spawn(async move {
-                            match serialized_result {
-                                Ok(serialized_bytes) => {
-                                    if let Err(e) =
-                                        tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await
-                                    {
-                                        tracing::warn!(
-                                            path = %cwasm_path_clone.display(),
-                                            err = %e,
-                                            "failed to write serialized component to AOT cache"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            path = %cwasm_path_clone.display(),
-                                            "successfully wrote serialized component to AOT cache"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(err = %e, "failed to serialize compiled component");
-                                }
-                            }
-                        });
-                        c
-                    }
-                    Err(e) => {
-                        let mut pool = self.port_pool.lock().await;
-                        pool.release(raw_port);
-                        if let Some(ws) = ws_port {
-                            pool.release(ws);
-                        }
-                        return Err(anyhow::Error::from(e)
-                            .context(format!("failed to compile component for {}", app_name)));
-                    }
-                }
-            }
-        };
-
         // Decide which WIT world this component targets. Detection is
         // structural — we look for a `wasi:http/incoming-handler` export
         // and pick `Handler` if found, otherwise `LongRunning`. The
         // linker factory must match: only the Handler linker has the
-        // `wasi:http/incoming-handler` export wired in via ProxyPre
-        // (Phase C wires that path; for now both linkers add only the
-        // edge:cloud/* imports — instantiation will fail for components
-        // that import wasi:*, which is expected pre-Phase-C).
-        let execution_model = detect_execution_model(&component);
+        // `wasi:http/incoming-handler` export wired in via ProxyPre.
+        // We do this via fast-path byte detection to avoid compiling FaaS
+        // handlers until their first request arrives.
+        let execution_model = crate::detect::detect_execution_model_from_bytes(&artifact);
         tracing::info!(
             tenant_id,
             app_name,
@@ -312,21 +249,125 @@ impl Supervisor {
             "execution model detected"
         );
 
-        let linker = match execution_model {
-            ExecutionModel::Handler => create_component_linker_handler(engine)?,
-            ExecutionModel::LongRunning => create_component_linker_long_running(engine)?,
-        };
-        let instance_pre = match linker.instantiate_pre(&component) {
-            Ok(ip) => ip,
-            Err(e) => {
-                let mut pool = self.port_pool.lock().await;
-                pool.release(raw_port);
-                return Err(anyhow::Error::from(e).context(format!(
-                    "failed to pre-instantiate {} (execution_model={:?}); \
-                         wasi: imports are wired in Phase C",
-                    app_name, execution_model
-                )));
+        let engine = self.state.read().await.engine.clone();
+
+        let instance_pre = if execution_model == ExecutionModel::LongRunning {
+            // For LongRunning apps, we compile and instantiate eagerly.
+            // Try AOT compilation cache first.
+            let cwasm_path = self.downloader.cwasm_path(&spec.deployment_id);
+            let component = if cwasm_path.exists() {
+                match tokio::fs::read(&cwasm_path).await {
+                    Ok(cwasm_bytes) => {
+                        // Safety: Loading pre-compiled code from a local trusted file cache is safe.
+                        match unsafe {
+                            wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
+                        } {
+                            Ok(c) => {
+                                tracing::info!(
+                                    tenant_id,
+                                    app_name,
+                                    deployment_id = %spec.deployment_id,
+                                    "AOT pre-compilation cache hit: successfully deserialized component"
+                                );
+                                Some(c)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    tenant_id,
+                                    app_name,
+                                    deployment_id = %spec.deployment_id,
+                                    err = %e,
+                                    "failed to deserialize component; falling back to JIT compilation"
+                                );
+                                let _ = tokio::fs::remove_file(&cwasm_path).await;
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tenant_id,
+                            app_name,
+                            deployment_id = %spec.deployment_id,
+                            err = %e,
+                            "failed to read AOT cache file; falling back to JIT compilation"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let component = match component {
+                Some(c) => c,
+                None => {
+                    // Compile the component using the shared engine.
+                    let engine_for_spawn = engine.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        wasmtime::component::Component::from_binary(&engine_for_spawn, &artifact)
+                    }).await.unwrap() {
+                        Ok(c) => {
+                            // Serialize and write to cache in a background task
+                            let cwasm_path_clone = cwasm_path.clone();
+                            let serialized_result = c.serialize();
+                            tokio::spawn(async move {
+                                match serialized_result {
+                                    Ok(serialized_bytes) => {
+                                        if let Err(e) =
+                                            tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await
+                                        {
+                                            tracing::warn!(
+                                                path = %cwasm_path_clone.display(),
+                                                err = %e,
+                                                "failed to write serialized component to AOT cache"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                path = %cwasm_path_clone.display(),
+                                                "successfully wrote serialized component to AOT cache"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(err = %e, "failed to serialize compiled component");
+                                    }
+                                }
+                            });
+                            c
+                        }
+                        Err(e) => {
+                            let mut pool = self.port_pool.lock().await;
+                            pool.release(raw_port);
+                            if let Some(ws) = ws_port {
+                                pool.release(ws);
+                            }
+                            return Err(anyhow::Error::from(e)
+                                .context(format!("failed to compile component for {}", app_name)));
+                        }
+                    }
+                }
+            };
+
+            let linker = create_component_linker_long_running(&engine)?;
+            match linker.instantiate_pre(&component) {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    let mut pool = self.port_pool.lock().await;
+                    pool.release(raw_port);
+                    if let Some(ws) = ws_port {
+                        pool.release(ws);
+                    }
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "failed to pre-instantiate {} (execution_model={:?}); \
+                             wasi: imports are wired in Phase C",
+                        app_name, execution_model
+                    )));
+                }
             }
+        } else {
+            // Handler (FaaS) apps defer instantiation until the first request.
+            None
         };
 
         // Spawn the per-app epoch ticker. The engine clock is global, but
@@ -427,17 +468,20 @@ impl Supervisor {
                     env: env.clone(),
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
                     metrics_acc: metrics_acc.clone(),
+                    last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
                 };
 
                 let tls_config =
                     try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
                 let dispatch = HandlerDispatch::new(
-                    instance_pre.clone(),
                     raw_port,
                     self.config.handler_request_budget_ms,
                     self.config.epoch_tick_ms,
                     handler_config,
                     tls_config,
+                    self.downloader.clone(),
+                    spec.deployment_id.clone(),
+                    self.engine_pool.clone(),
                 )?;
 
                 let dispatch = Arc::new(dispatch);
@@ -467,7 +511,7 @@ impl Supervisor {
                 });
                 (None, Some(broadcast_tx), handle, Some(dispatch))
             } else {
-                let instance_pre_clone = instance_pre.clone();
+                let instance_pre_clone = instance_pre.clone().unwrap();
                 let meter_clone = meter.clone();
                 let state_clone = self.state.clone();
                 // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
@@ -527,7 +571,7 @@ impl Supervisor {
             meter,
             shutdown_tx,
             shutdown_tx_broadcast,
-            instance_pre,
+            instance_pre: instance_pre.unwrap(),
             handle: Some(std::sync::Arc::new(handle)),
             ticker: Some(ticker),
             execution_model,
@@ -543,6 +587,39 @@ impl Supervisor {
 
         tracing::info!(tenant_id = %tenant_id_for_instance, app_name, port = raw_port, "app started");
         Ok(())
+    }
+
+    /// Periodically scans all active apps and evicts in-memory Wasm components for idle Handler (FaaS) apps.
+    pub async fn evict_idle_apps(&self, idle_timeout: Duration) {
+        let apps = {
+            let state = self.state.read().await;
+            state.apps.clone()
+        };
+
+        for ((tenant_id, app_name), app_mutex) in apps {
+            let app = app_mutex.lock().await;
+            if app.execution_model == ExecutionModel::Handler {
+                if let Some(ref dispatch) = app.dispatch {
+                    let last_req_opt = {
+                        let lock = dispatch.config.last_request_at.lock().await;
+                        *lock
+                    };
+                    if let Some(last_req) = last_req_opt {
+                        if last_req.elapsed() > idle_timeout {
+                            // Try evicting the component
+                            if let Some(engine) = dispatch.evict().await {
+                                tracing::info!(
+                                    tenant_id = %tenant_id,
+                                    app_name = %app_name,
+                                    "Idle timeout reached: evicting component from memory (scale-to-zero)"
+                                );
+                                self.engine_pool.release(engine);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Stop an app gracefully.

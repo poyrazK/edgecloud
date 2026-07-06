@@ -25,8 +25,8 @@ func (h *SecretsAdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	ids := h.encryptor.KeyIDs()
 	activeID := h.encryptor.ActiveKeyID()
 	resp := map[string]interface{}{
-		"key_ids":            ids,
-		"active_key":         activeID,
+		"key_ids":     ids,
+		"active_key":  activeID,
 		"encryption_enabled": h.encryptor != nil,
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -55,7 +55,5 @@ func (h *SecretsAdminHandler) ReEncrypt(w http.ResponseWriter, r *http.Request) 
 		"status":       "ok",
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("secrets ReEncrypt encode: %v", err)
-	}
+	json.NewEncoder(w).Encode(resp)
 }

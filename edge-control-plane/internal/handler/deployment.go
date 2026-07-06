@@ -54,6 +54,11 @@ type deploymentPromoter interface {
 	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
 }
 
+// deploymentPromoter is the narrow contract the Promote handler needs.
+type deploymentPromoter interface {
+	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
+}
+
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,

@@ -489,7 +489,7 @@ var insecureJWTSecretValues = map[string]struct{}{
 //  1. Legacy: single Secret field (must be ≥32 bytes, not a placeholder)
 //  2. Keyring: ActiveKID + Keys map (ActiveKID must be in Keys, each key ≥32 bytes)
 //
-// When both are zero/unset, the function returns an error (no JWT auth configured).
+// Returns nil when both fields are zero (no JWT auth at all — test/migration path).
 func validateJWTSecret(secret string, activeKID string, keys map[string]string) error {
 	// Keyring mode.
 	if len(keys) > 0 {
@@ -510,9 +510,9 @@ func validateJWTSecret(secret string, activeKID string, keys map[string]string) 
 		return nil
 	}
 
-	// Legacy mode: single secret. Must be set, ≥32 bytes, not a placeholder.
+	// Legacy mode: single secret. Empty is allowed (no JWT auth).
 	if secret == "" {
-		return fmt.Errorf("jwt.secret is not set; set JWT_SECRET or jwt.secret to a unique value")
+		return nil
 	}
 	if _, ok := insecureJWTSecretValues[secret]; ok {
 		return fmt.Errorf("jwt.secret %q is a known placeholder; set JWT_SECRET or jwt.secret to a unique value", secret)

@@ -105,9 +105,9 @@ func (r *APIKeyRepository) UpdateHashIfAlgorithm(
 	return res.RowsAffected()
 }
 
-// Update updates an existing API key's mutable fields (name, role, expires_at).
+// Update updates an existing API key's mutable fields (name, role).
 func (r *APIKeyRepository) Update(ctx context.Context, k *domain.APIKey) error {
-	query := `UPDATE api_keys SET name = $2, role = $3, expires_at = $4 WHERE id = $1`
-	_, err := r.db.ExecContext(ctx, query, k.ID, k.Name, k.Role, k.ExpiresAt)
+	query := `UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`
+	_, err := r.db.ExecContext(ctx, query, k.ID, k.Name, k.Role)
 	return err
 }

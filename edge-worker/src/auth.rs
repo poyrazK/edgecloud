@@ -155,8 +155,12 @@ impl WorkerJwtSigner {
             header.kid = Some(kid.clone());
         }
 
-        encode(&header, &claims, &EncodingKey::from_secret(&self.secret))
-            .expect("HS256 signing should not fail")
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_secret(&self.secret),
+        )
+        .expect("HS256 signing should not fail")
     }
 }
 
@@ -212,7 +216,7 @@ mod tests {
     fn signer() -> Arc<WorkerJwtSigner> {
         WorkerJwtSigner::new(
             "test-secret",
-            Some("test-kid".to_string()),
+            Some("test-kid"),
             "edgecloud",
             "w_fra_abc123",
             "fra",

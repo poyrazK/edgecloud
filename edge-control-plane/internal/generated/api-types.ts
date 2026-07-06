@@ -235,29 +235,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/apps/{appName}/promote/{deploymentID}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Promote a preview deployment to production
-         * @description Activates a deployment under a different app name than it was
-         *     originally deployed under. Used to promote a preview deployment
-         *     (deployed under a suffixed name like `myapp--preview-abc123`) to
-         *     the real app name. The deployment must belong to the same tenant.
-         */
-        post: operations["promoteDeployment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/apps/{appName}/rollback": {
         parameters: {
             query?: never;
@@ -523,23 +500,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/keys/{keyID}/rotate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Rotate an API key (generate new key, expire old one) */
-        post: operations["rotateAPIKey"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/egress": {
         parameters: {
             query?: never;
@@ -704,40 +664,6 @@ export interface paths {
         get: operations["listAutoscaleEvents"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/admin/secrets/keys": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List key IDs in the secrets keyring */
-        get: operations["listSecretsKeys"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/admin/secrets/re-encrypt": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Re-encrypt all env values with the active key */
-        post: operations["reEncryptSecrets"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2166,37 +2092,6 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
-    promoteDeployment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Target app name for promotion. */
-                appName: string;
-                /** @description The deployment ID to promote (from a preview deploy). */
-                deploymentID: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deployment promoted. */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        /** @example promoted */
-                        status?: string;
-                    };
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalError"];
-        };
-    };
     rollbackDeployment: {
         parameters: {
             query?: never;
@@ -2724,32 +2619,6 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
-    rotateAPIKey: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description The API key ID to rotate. */
-                keyID: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description New API key created. */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CreateAPIKeyResponse"];
-                };
-            };
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            500: components["responses"]["InternalError"];
-        };
-    };
     getEgressAllowlist: {
         parameters: {
             query?: never;
@@ -3151,12 +3020,15 @@ export interface operations {
                     };
                 };
             };
-            /** @description Missing or invalid internal token */
             401: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        error?: string;
+                    };
+                };
             };
         };
     };
@@ -3181,19 +3053,25 @@ export interface operations {
                     };
                 };
             };
-            /** @description Encryption not configured */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        error?: string;
+                    };
+                };
             };
-            /** @description Re-encryption failed */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": {
+                        error?: string;
+                    };
+                };
             };
         };
     };

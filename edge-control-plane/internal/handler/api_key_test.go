@@ -219,7 +219,7 @@ func TestUpdateAPIKey_Success(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (body: %s)", rr.Code, rr.Body.String())
 	}
-	var key domain.SafeAPIKeyResponse
+	var key domain.APIKey
 	if err := json.NewDecoder(rr.Body).Decode(&key); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

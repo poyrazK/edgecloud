@@ -1580,46 +1580,6 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /api/v1/apps/{appName}/promote/{deploymentID}:
-    post:
-      operationId: promoteDeployment
-      summary: Promote a preview deployment to production
-      description: |
-        Activates a deployment under a different app name than it was
-        originally deployed under. Used to promote a preview deployment
-        (deployed under a suffixed name like `myapp--preview-abc123`) to
-        the real app name. The deployment must belong to the same tenant.
-      parameters:
-        - name: appName
-          in: path
-          required: true
-          schema:
-            type: string
-          description: Target app name for promotion.
-        - name: deploymentID
-          in: path
-          required: true
-          schema:
-            type: string
-          description: The deployment ID to promote (from a preview deploy).
-      responses:
-        '200':
-          description: Deployment promoted.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: promoted
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-
   /api/v1/apps/{appName}/rollback:
     post:
       operationId: rollbackDeployment

@@ -142,33 +142,3 @@ func (h *APIKeyHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	auditRecord(r, "update", "api_key", keyID, "api key "+keyID+" updated", "success")
 }
-
-// Rotate handles POST /api/v1/keys/{keyID}/rotate — invalidates the old key
-// and returns a new one with the same name and role.
-func (h *APIKeyHandler) Rotate(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-	keyID := r.PathValue("keyID")
-
-	newKey, rawKey, err := h.apiKeySvc.RotateAPIKey(r.Context(), tenantID, keyID)
-	if err != nil {
-		if errors.Is(err, service.ErrAPIKeyNotFound) {
-			httperror.NotFoundCtx(w, r, "api key not found")
-			return
-		}
-		log.Printf("internal error: %v", err)
-		httperror.InternalErrorCtx(w, r)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(CreateAPIKeyResponse{
-		ID:    newKey.ID,
-		Name:  newKey.Name,
-		Role:  newKey.Role,
-		Token: rawKey,
-	}); err != nil {
-		log.Printf("Rotate API key: failed to encode response: %v", err)
-	}
-	auditRecord(r, "rotate", "api_key", keyID, "api key "+keyID+" rotated to "+newKey.ID, "success")
-}

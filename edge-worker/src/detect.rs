@@ -202,3 +202,24 @@ mod tests {
         assert!(!is_handler_export("custom:http/incoming-handler@0.2.1"));
     }
 }
+
+/// A fast-path execution model detector that does not require full WebAssembly compilation.
+/// We look for a `wasi:http/incoming-handler` export which indicates a FaaS function.
+pub fn detect_execution_model_from_bytes(bytes: &[u8]) -> ExecutionModel {
+    match wasmparser::Parser::new(0).parse_all(bytes).find_map(|p| match p {
+        Ok(wasmparser::Payload::ExportSection(s)) => Some(s),
+        _ => None,
+    }) {
+        Some(exports) => {
+            for export in exports {
+                if let Ok(e) = export {
+                    if e.name.contains("wasi:http/incoming-handler") {
+                        return ExecutionModel::Handler;
+                    }
+                }
+            }
+            ExecutionModel::LongRunning
+        }
+        None => ExecutionModel::LongRunning,
+    }
+}
