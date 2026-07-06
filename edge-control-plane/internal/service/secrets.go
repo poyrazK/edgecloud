@@ -179,11 +179,11 @@ func (sec *SecretEncryptor) Decrypt(value string) (string, error) {
 func (sec *SecretEncryptor) decryptWithKey(key []byte, nonceHex, ctHex string) (string, error) {
 	nonce, err := hex.DecodeString(nonceHex)
 	if err != nil || len(nonce) == 0 {
-		return "", fmt.Errorf("invalid nonce hex: %w", err)
+		return "", fmt.Errorf("invalid nonce")
 	}
 	ct, err := hex.DecodeString(ctHex)
 	if err != nil {
-		return "", fmt.Errorf("invalid ciphertext hex: %w", err)
+		return "", fmt.Errorf("invalid ciphertext")
 	}
 
 	block, err := aes.NewCipher(key)
@@ -193,10 +193,6 @@ func (sec *SecretEncryptor) decryptWithKey(key []byte, nonceHex, ctHex string) (
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return "", fmt.Errorf("gcm: %w", err)
-	}
-	// GCM panics on incorrect nonce length. Guard it.
-	if len(nonce) != gcm.NonceSize() {
-		return "", fmt.Errorf("invalid nonce length: got %d, want %d", len(nonce), gcm.NonceSize())
 	}
 	plaintext, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {

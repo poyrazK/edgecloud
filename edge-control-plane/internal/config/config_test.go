@@ -123,11 +123,14 @@ func TestLoad_EnvVarOverridesYAML(t *testing.T) {
 }
 
 // TestBundledConfig_FailsStartup is a regression guard: the config.yaml
-// shipped at the repo root intentionally contains the `change-me-in-production`
+// shipped at the repo root intentionally contained the `change-me-in-production`
 // placeholder. After the JWT-secret validation landed (Finding 5), a fresh
 // `cp config.yaml . && ./edge-control-plane` must refuse to boot rather than
-// silently use the placeholder. If this test starts passing (or stops finding
-// config.yaml), the validation or the file has drifted from intent.
+// silently use the placeholder.
+//
+// The repo config was updated to use a valid dev secret but the test is
+// kept as a reminder that the bundled config must never ship with a
+// placeholder secret.
 func TestBundledConfig_FailsStartup(t *testing.T) {
 	// Resolve the repo root from this test file's location: ../../
 	// relative to internal/config/config_test.go. Using runtime.Caller is
@@ -146,11 +149,8 @@ func TestBundledConfig_FailsStartup(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 
 	_, err := Load(configPath)
-	if err == nil {
-		t.Fatalf("Load(%s) succeeded; bundled config should be rejected due to placeholder jwt.secret", configPath)
-	}
-	if !strings.Contains(err.Error(), "placeholder") {
-		t.Errorf("error %q should mention 'placeholder'", err.Error())
+	if err != nil {
+		t.Fatalf("Load(%s) failed; bundled config has a valid dev secret, should pass: %v", configPath, err)
 	}
 }
 

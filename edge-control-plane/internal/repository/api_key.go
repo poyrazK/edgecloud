@@ -39,7 +39,7 @@ func (r *APIKeyRepository) Create(ctx context.Context, k *domain.APIKey) error {
 		// so duplicates could pile up unnoticed.
 		return fmt.Errorf("api_key %s: LookupHash must be set (SHA-256 hex of raw key)", k.ID)
 	}
-	query := `INSERT INTO api_keys (id, tenant_id, name, key_hash, lookup_hash, role, created_at, expires_at, hash_algorithm) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+	query := `INSERT INTO api_keys (id, tenant_id, name, key_hash, lookup_hash, role, created_at, expires_at, hash_algorithm) VALUES ($1, $2, $3, $4, $5, $6, $7, $9)`
 	_, err := r.db.ExecContext(ctx, query, k.ID, k.TenantID, k.Name, k.KeyHash, k.LookupHash, k.Role, k.CreatedAt, k.ExpiresAt, k.HashAlgorithm)
 	return err
 }
@@ -107,7 +107,7 @@ func (r *APIKeyRepository) UpdateHashIfAlgorithm(
 
 // Update updates an existing API key's mutable fields (name, role, expires_at).
 func (r *APIKeyRepository) Update(ctx context.Context, k *domain.APIKey) error {
-	query := `UPDATE api_keys SET name = $2, role = $3, expires_at = $4 WHERE id = $1`
-	_, err := r.db.ExecContext(ctx, query, k.ID, k.Name, k.Role, k.ExpiresAt)
+	query := `UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`
+	_, err := r.db.ExecContext(ctx, query, k.ID, k.Name, k.Role)
 	return err
 }

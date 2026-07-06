@@ -9,16 +9,6 @@ mod state;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::time::SystemTime;
-
-/// Generate a short unique suffix for preview deployments.
-fn short_hash() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}", nanos >> 8)
-}
 
 #[derive(Parser)]
 #[command(name = "edge", version = "0.1.0", about = "edgeCloud developer CLI")]
@@ -486,4 +476,13 @@ fn parse_since(s: &str) -> Result<std::time::Duration> {
         other => anyhow::bail!("--since unit {other:?} not supported (use s/m/h/d)"),
     };
     Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
+}
+
+fn short_hash() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!("{:06x}", ms % 0xffffff)
 }

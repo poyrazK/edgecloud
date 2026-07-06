@@ -92,27 +92,21 @@ func TestRoundTrip_NewFormat(t *testing.T) {
 }
 
 func TestRoundTrip_LegacyFormat(t *testing.T) {
-	// Simulate an old-format value (no key_id prefix) being upgraded to
-	// a keyring encryptor. We first produce a new-format value, strip the
-	// "legacy:" prefix to simulate what a pre-keyring deployment stored.
+	// Encrypt with legacy constructor, decrypt with keyring constructor.
 	legacySec, _ := NewSecretEncryptorFromLegacy(testMasterKey)
 	keyringSec, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
 
 	plaintext := "STRIPE_KEY=sk_live_abc123"
-	encNew, err := legacySec.Encrypt(plaintext)
+	encOld, err := legacySec.Encrypt(plaintext)
 	if err != nil {
 		t.Fatalf("Legacy Encrypt: %v", err)
 	}
 
-	// Strip "legacy:" prefix to create an old-format value.
-	colonIdx := strings.Index(encNew, ":")
-	if colonIdx < 0 {
-		t.Fatalf("encrypted value has no colon: %q", encNew)
-	}
-	encOld := encNew[colonIdx+1:]
-
+	// Strip the "legacy:" prefix that NewSecretEncryptorFromLegacy now adds
+	// to simulate a true old-format 2-part ciphertext from before the migration.
+	encOld = strings.TrimPrefix(encOld, "legacy:")
 	dec, err := keyringSec.Decrypt(encOld)
 	if err != nil {
 		t.Fatalf("Keyring Decrypt (old format): %v", err)

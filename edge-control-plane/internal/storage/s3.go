@@ -224,7 +224,7 @@ func (s *S3ArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, de
 	if err != nil {
 		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: %w", key, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: status %d", key, resp.StatusCode)
 	}

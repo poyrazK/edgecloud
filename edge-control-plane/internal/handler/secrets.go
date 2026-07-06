@@ -55,7 +55,5 @@ func (h *SecretsAdminHandler) ReEncrypt(w http.ResponseWriter, r *http.Request) 
 		"status":       "ok",
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("secrets ReEncrypt encode: %v", err)
-	}
+	_ = json.NewEncoder(w).Encode(resp)
 }

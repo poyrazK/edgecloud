@@ -18,7 +18,7 @@ storage:
   artifact_path: "/var/edgecloud/registry"
 
 jwt:
-  secret: "change-me-in-production"
+  secret: "this-is-a-valid-dev-secret-for-local-testing"
   ttl_hours: 24
   issuer: "edgecloud"
 

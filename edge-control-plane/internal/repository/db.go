@@ -21,6 +21,7 @@ type DBTX interface {
 	// can do single-row reads from inside a CTE / RETURNING without
 	// having to switch to *sqlx.DB at the call site.
 	QueryRowxContext(ctx context.Context, query string, args ...any) *sqlx.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 // NewDB creates a new database connection.

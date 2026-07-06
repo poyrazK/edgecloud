@@ -186,11 +186,12 @@ impl LayerHarness {
             max_request_body_bytes: 10 * 1024 * 1024,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
         };
 
         let dispatch = Arc::new(
-            HandlerDispatch::new(instance_pre, port, 1_000, 1, config, None)
-                .context("HandlerDispatch::new")?,
+            { let d = HandlerDispatch::new(port, 1_000, 1, config, None, std::sync::Arc::new(edge_worker::downloader::Downloader::new("http://localhost".to_string(), std::path::PathBuf::from("/tmp"), edge_worker::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""))), "test-deploy".to_string(), std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()) ).unwrap(); d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap()).await; d }
+                ,
         );
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -340,6 +341,7 @@ async fn l6_request_body_over_cap_returns_413() {
         max_request_body_bytes: 100,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -389,6 +391,7 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None, // 10 MB — generous
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))), // 10 MB — generous
     })
     .await;
 
@@ -463,18 +466,17 @@ async fn l7_per_request_timeout_returns_500() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     };
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(
-            instance_pre,
-            port,
+        { let d = HandlerDispatch::new(
+                        port,
             /* request_budget_ms */ 100,
             1,
             config,
-            None,
-        )
-        .expect("HandlerDispatch::new"),
+            None, std::sync::Arc::new(edge_worker::downloader::Downloader::new("http://localhost".to_string(), std::path::PathBuf::from("/tmp"), edge_worker::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""))), "test-deploy".to_string(), std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()) ).unwrap(); d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap()).await; d }
+        ,
     );
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -549,8 +551,7 @@ async fn spawn_handler_with_tls_config(
     let port = ephemeral_port().expect("bind ephemeral port");
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(instance_pre, port, 5_000, 10, config, tls_config)
-            .expect("HandlerDispatch::new"),
+        { let d = HandlerDispatch::new(port, 5_000, 10, config, tls_config, std::sync::Arc::new(edge_worker::downloader::Downloader::new("http://localhost".to_string(), std::path::PathBuf::from("/tmp"), edge_worker::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""))), "test-deploy".to_string(), std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()) ).unwrap(); d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap()).await; d }
     );
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
@@ -664,6 +665,7 @@ async fn l11_guest_calls_process_get_env() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -710,6 +712,7 @@ async fn l12_guest_calls_time_now() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -760,6 +763,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -834,6 +838,7 @@ async fn l14_guest_calls_cache_round_trip() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -905,6 +910,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -963,6 +969,7 @@ async fn l16_guest_schedules_task() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -1011,6 +1018,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     }
 }
 
@@ -1300,6 +1308,7 @@ async fn l27_process_get_all_env() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
     let cl = make_client();
@@ -1384,6 +1393,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 
@@ -1844,6 +1854,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
     })
     .await;
 

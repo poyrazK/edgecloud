@@ -66,23 +66,22 @@ func (r *AppEnvRepository) ListByApps(ctx context.Context, tenantID string, appN
 // ListAllApps returns all distinct (tenant_id, app_name) pairs that
 // have at least one env var. Used by the re-encrypt endpoint.
 func (r *AppEnvRepository) ListAllApps(ctx context.Context) ([]string, []string, error) {
-	type pair struct {
-		TenantID string `db:"tenant_id"`
-		AppName  string `db:"app_name"`
-	}
-	var pairs []pair
+	var tenants, apps []string
 	query := `SELECT DISTINCT tenant_id, app_name FROM app_env ORDER BY tenant_id, app_name`
-	err := r.db.SelectContext(ctx, &pairs, query)
+	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, nil, err
 	}
-	tenants := make([]string, len(pairs))
-	apps := make([]string, len(pairs))
-	for i, p := range pairs {
-		tenants[i] = p.TenantID
-		apps[i] = p.AppName
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var t, a string
+		if err := rows.Scan(&t, &a); err != nil {
+			return nil, nil, err
+		}
+		tenants = append(tenants, t)
+		apps = append(apps, a)
 	}
-	return tenants, apps, nil
+	return tenants, apps, rows.Err()
 }
 
 func (r *AppEnvRepository) Delete(ctx context.Context, tenantID, appName, key string) error {

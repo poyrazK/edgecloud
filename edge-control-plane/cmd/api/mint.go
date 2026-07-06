@@ -12,23 +12,21 @@ import (
 
 // mintIngressToken builds a long-lived (1y TTL) HMAC-SHA256 JWT for the
 // ingress binary. The token carries `role: "ingest"` so the
-// `WorkerAuth` middleware can distinguish it from per-worker tokens.
+// `WorkerAuth` middleware can distinguish it from per-worker tokens
+// (which carry `role: "worker"`, or no `role` for backward compat).
 //
-// When the WorkerJWTConfig has an ActiveKID and Keys map, the token's
-// `kid` header is set so key rotation can proceed without invalidating
-// this token mid-lifecycle. The signing key is resolved via
-// cfg.ResolveSigningKey().
-func mintIngressToken(cfg middleware.WorkerJWTConfig, region string) (string, error) {
-	signingKey, err := cfg.ResolveSigningKey()
-	if err != nil {
-		return "", fmt.Errorf("resolving signing key: %w", err)
+// The token is NOT a per-process secret. It's the same on every restart
+// unless the operator rotates `JWT_SECRET`. Operators SHOULD rotate
+// JWT_SECRET periodically; rotating invalidates both the new token
+// written here AND every existing worker JWT, so it requires a
+// coordinated control-plane + worker + ingress redeploy. This is
+// intentional — the ingress and workers are managed together.
+func mintIngressToken(secret, issuer, region string) (string, error) {
+	if secret == "" {
+		return "", fmt.Errorf("JWT secret is empty")
 	}
 	if region == "" {
 		region = "global"
-	}
-	issuer := cfg.Issuer
-	if issuer == "" {
-		issuer = "edgecloud"
 	}
 	now := time.Now()
 	subject := "ingress-" + region
@@ -41,13 +39,13 @@ func mintIngressToken(cfg middleware.WorkerJWTConfig, region string) (string, er
 			NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Minute)),
 		},
 		WorkerID: subject,
-		Role:     middleware.RoleIngest,
+		// TenantID is intentionally empty — the ingress is a global
+		// service, not bound to a single tenant. Internal endpoints
+		// (`ListDomains`, `TlsAllowed`) are tenant-agnostic.
+		Role: middleware.RoleIngest,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	if cfg.ActiveKID != "" {
-		token.Header["kid"] = cfg.ActiveKID
-	}
-	signed, err := token.SignedString(signingKey)
+	signed, err := token.SignedString([]byte(secret))
 	if err != nil {
 		return "", fmt.Errorf("signing ingress token: %w", err)
 	}
