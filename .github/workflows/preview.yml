@@ -56,26 +56,19 @@ jobs:
       - name: Install edge CLI
         run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
-      # Deploy the staged component as a preview. Inlined directly in
-      # the workflow (not via the .github/actions/deploy-preview
-      # composite) so the EDGECLOUD_API_KEY repo secret reaches the
-      # bash step's `env:` block via the workflow-level `secrets.X`
-      # context. Composite action inputs that bind `${{ secrets.X }}`
-      # through `with:` consistently render empty in this repo's CI
-      # (run 28747658310 job 85241230517 showed `$EDGE_API_KEY=""`
-      # even with the secret configured), so the composite is
-      # bypassed for the secret-bearing deploy step. The composite
-      # remains in the repo for external consumers who can use a
-      # different secret-passing pattern (e.g. `secrets: inherit` is
-      # only valid for reusable workflows, not composite actions).
-      #
-      # Fork PRs do not receive the repo secret — the empty
-      # EDGE_API_KEY branch fires (writes empty `preview-url`), and
-      # the `Comment PR` step's `if:` skips on empty string. No
-      # secrets leak, no spurious failure.
+      # The cargo install above puts the `edge` binary at
+      # `$CARGO_HOME/bin/edge`. Each GitHub Actions step is a fresh
+      # shell, so PATH from this step doesn't carry to the next.
+      # `dtolnay/rust-toolchain` only adds `$CARGO_HOME/bin` to PATH
+      # for steps that follow it directly; with the composite
+      # `cargo install` step in between, the next step's PATH no
+      # longer includes the install dir. Prepend it explicitly so
+      # the deploy step can find `edge` — CI run 28774697516 failed
+      # with `edge: command not found (rc=127)` without this.
       - name: Deploy preview
         id: deploy
         env:
+          PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}
           EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
           EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
         run: |
