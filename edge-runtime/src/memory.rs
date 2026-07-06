@@ -71,3 +71,11 @@ pub fn write_bytes<T>(
     memory.write(caller, ptr as usize, bytes)?;
     Ok((ptr as i32, bytes.len() as i32))
 }
+
+#[cfg(test)]
+mod tests {
+    // Memory access functions (read_string, read_bytes, allocate, etc.)
+    // take &Caller which can only be constructed inside a wasm host
+    // function context. Unit tests for these require a full wasm
+    // component — see edge-runtime/tests/ for integration coverage.
+}
