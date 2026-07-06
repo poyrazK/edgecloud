@@ -891,4 +891,19 @@ mod tests {
             "err should mention 503, got: {err}"
         );
     }
+
+    /// Connection refused — must trigger the transport-error retry path.
+    #[tokio::test]
+    async fn load_config_retries_on_connection_refused() {
+        let client = CaddyClient::new("http://127.0.0.1:1", None).unwrap();
+        let cfg = json!({"apps": {}});
+        let err = client
+            .load_config(&cfg)
+            .await
+            .expect_err("connection refused should surface as Err");
+        assert!(
+            err.to_string().contains("transport error"),
+            "err should mention transport error, got: {err}"
+        );
+    }
 }

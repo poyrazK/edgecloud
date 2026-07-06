@@ -280,4 +280,152 @@ mod tests {
         assert!(host.ends_with(".edgecloud.dev"));
         assert!(host.contains('.'));
     }
+
+    // ── Config::from_env() ───────────────────────────────────────────
+
+    /// Helper: set the minimum required env vars for from_env().
+    fn set_required_vars() {
+        set_var("INGRESS_REGION", "fra");
+        set_var("TLS_CERT_FILE", "/tmp/cert.pem");
+        set_var("TLS_KEY_FILE", "/tmp/key.pem");
+    }
+
+    /// Helper: unset all config-related env vars so from_env() sees a clean slate.
+    fn unset_all_config_vars() {
+        for v in &[
+            "INGRESS_REGION",
+            "TLS_CERT_FILE",
+            "TLS_KEY_FILE",
+            "NATS_URL",
+            "CADDY_ADMIN_URL",
+            "INGRESS_LISTEN_HTTP",
+            "INGRESS_LISTEN_HTTPS",
+            "CADDY_ADMIN_TOKEN",
+            "REFRESH_DEBOUNCE_MS",
+            "HTTP_TO_HTTPS",
+            "CONTROL_PLANE_API_URL",
+            "EDGE_INTERNAL_TOKEN",
+            "CONTROL_PLANE_URL",
+            "INGRESS_SERVICE_TOKEN",
+            "DOMAIN_POLL_INTERVAL",
+            "CADDY_ADMIN_LISTEN",
+        ] {
+            unset_var(v);
+        }
+    }
+
+    /// All from_env tests in one serial function to avoid races on global env.
+    #[test]
+    fn from_env_config_assembly() {
+        // 1. Required vars present → success
+        unset_all_config_vars();
+        set_required_vars();
+        let cfg = Config::from_env().expect("required vars should succeed");
+        assert_eq!(cfg.region, "fra");
+        assert_eq!(cfg.cert_file, "/tmp/cert.pem");
+        assert_eq!(cfg.key_file, "/tmp/key.pem");
+
+        // 2. Missing region → error
+        unset_all_config_vars();
+        set_var("TLS_CERT_FILE", "/tmp/cert.pem");
+        set_var("TLS_KEY_FILE", "/tmp/key.pem");
+        assert!(Config::from_env().is_err(), "missing region should fail");
+
+        // 3. Missing cert → error
+        unset_all_config_vars();
+        set_var("INGRESS_REGION", "fra");
+        set_var("TLS_KEY_FILE", "/tmp/key.pem");
+        assert!(Config::from_env().is_err(), "missing cert should fail");
+
+        // 4. Missing key → error
+        unset_all_config_vars();
+        set_var("INGRESS_REGION", "fra");
+        set_var("TLS_CERT_FILE", "/tmp/cert.pem");
+        assert!(Config::from_env().is_err(), "missing key should fail");
+
+        // 5. Defaults for optional fields
+        unset_all_config_vars();
+        set_required_vars();
+        let cfg = Config::from_env().expect("defaults test");
+        assert_eq!(cfg.nats_url, "nats://localhost:4222");
+        assert_eq!(cfg.caddy_admin_url, "http://127.0.0.1:2019");
+        assert_eq!(cfg.listen_http, ":80");
+        assert_eq!(cfg.listen_https, ":443");
+        assert_eq!(cfg.refresh_debounce_ms, 1000);
+        assert!(cfg.http_to_https);
+        assert_eq!(cfg.control_plane_api_url, "http://localhost:8080");
+        assert_eq!(cfg.admin_token, None);
+        assert_eq!(cfg.internal_token, None);
+        assert_eq!(cfg.caddy_admin_listen, "localhost:2019");
+
+        // 6. HTTP_TO_HTTPS=false
+        set_required_vars();
+        set_var("HTTP_TO_HTTPS", "false");
+        let cfg = Config::from_env().expect("http_to_https test");
+        assert!(!cfg.http_to_https);
+
+        // 7. CONTROL_PLANE_URL without token → error
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("CONTROL_PLANE_URL", "http://cp.example.com");
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("CONTROL_PLANE_URL"),
+            "err should mention CONTROL_PLANE_URL: {err}"
+        );
+
+        // 8. Empty EDGE_INTERNAL_TOKEN → None
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("EDGE_INTERNAL_TOKEN", "");
+        let cfg = Config::from_env().expect("empty token test");
+        assert!(cfg.internal_token.is_none());
+
+        // 9. CONTROL_PLANE_URL + token → success
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("CONTROL_PLANE_URL", "http://cp.example.com");
+        set_var("INGRESS_SERVICE_TOKEN", "s3cr3t");
+        let cfg = Config::from_env().expect("token+url test");
+        assert_eq!(cfg.control_plane_url, "http://cp.example.com");
+        assert_eq!(cfg.service_token, "s3cr3t");
+
+        // 10. REFRESH_DEBOUNCE_MS override
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("REFRESH_DEBOUNCE_MS", "500");
+        let cfg = Config::from_env().expect("debounce test");
+        assert_eq!(cfg.refresh_debounce_ms, 500);
+
+        // 11. CADDY_ADMIN_LISTEN override
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("CADDY_ADMIN_LISTEN", "0.0.0.0:2019");
+        let cfg = Config::from_env().expect("admin listen test");
+        assert_eq!(cfg.caddy_admin_listen, "0.0.0.0:2019");
+
+        // 12. DOMAIN_POLL_INTERVAL
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("DOMAIN_POLL_INTERVAL", "10s");
+        let cfg = Config::from_env().expect("poll interval test");
+        assert_eq!(cfg.domain_poll_interval, Duration::from_secs(10));
+
+        // 13. EDGE_INTERNAL_TOKEN with value
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("EDGE_INTERNAL_TOKEN", "my-secret-token");
+        let cfg = Config::from_env().expect("internal token test");
+        assert_eq!(cfg.internal_token, Some("my-secret-token".to_string()));
+
+        // 14. CONTROL_PLANE_API_URL override
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("CONTROL_PLANE_API_URL", "http://cp.internal:8080");
+        let cfg = Config::from_env().expect("api url test");
+        assert_eq!(cfg.control_plane_api_url, "http://cp.internal:8080");
+
+        // Clean up
+        unset_all_config_vars();
+    }
 }
