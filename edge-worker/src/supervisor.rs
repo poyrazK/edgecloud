@@ -33,7 +33,8 @@ impl StandbyPool {
         let (tx, rx) = tokio::sync::mpsc::channel(size.max(1));
         for _ in 0..size {
             let engine = edge_runtime::create_engine()?;
-            tx.try_send(engine).map_err(|_| anyhow::anyhow!("failed to pre-warm pool"))?;
+            tx.try_send(engine)
+                .map_err(|_| anyhow::anyhow!("failed to pre-warm pool"))?;
         }
         Ok(Self {
             pool: Mutex::new(rx),
@@ -301,7 +302,10 @@ impl Supervisor {
                     let engine_for_spawn = engine.clone();
                     match tokio::task::spawn_blocking(move || {
                         wasmtime::component::Component::from_binary(&engine_for_spawn, &artifact)
-                    }).await.unwrap() {
+                    })
+                    .await
+                    .unwrap()
+                    {
                         Ok(c) => {
                             // Serialize and write to cache in a background task
                             let cwasm_path_clone = cwasm_path.clone();
@@ -310,7 +314,8 @@ impl Supervisor {
                                 match serialized_result {
                                     Ok(serialized_bytes) => {
                                         if let Err(e) =
-                                            tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await
+                                            tokio::fs::write(&cwasm_path_clone, &serialized_bytes)
+                                                .await
                                         {
                                             tracing::warn!(
                                                 path = %cwasm_path_clone.display(),
@@ -447,113 +452,114 @@ impl Supervisor {
         //   * `LongRunning` — `oneshot::Sender` consumed by run_app_loop.
         //   * `Handler`     — `broadcast::Sender` consumed by
         //     `HandlerDispatch::serve` via `with_graceful_shutdown`.
-        let (shutdown_tx, shutdown_tx_broadcast, handle, dispatch) =
-            if execution_model == ExecutionModel::Handler {
-                // Drop the unused oneshot receiver; broadcast will be
-                // used instead.
-                let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let (shutdown_tx, shutdown_tx_broadcast, handle, dispatch) = if execution_model
+            == ExecutionModel::Handler
+        {
+            // Drop the unused oneshot receiver; broadcast will be
+            // used instead.
+            let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-                let handler_config = HandlerConfig {
-                    tenant_id: tenant_id.to_string(),
-                    egress: egress_for_handler.clone(),
-                    log_sink: self.log_forwarder.clone()
-                        as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
-                    app_ctx: app_ctx.clone(),
-                    meter: meter.clone(),
-                    env: env.clone(),
-                    max_request_body_bytes: self.config.handler_max_request_body_bytes,
-                    metrics_acc: metrics_acc.clone(),
-                    socket_mode: self.config.socket_mode,
-                    last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
-                };
-
-                let tls_config =
-                    try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
-                let dispatch = HandlerDispatch::new(
-                    raw_port,
-                    self.config.handler_request_budget_ms,
-                    self.config.epoch_tick_ms,
-                    handler_config,
-                    tls_config,
-                    self.downloader.clone(),
-                    spec.deployment_id.clone(),
-                    self.engine_pool.clone(),
-                )?;
-
-                let dispatch = Arc::new(dispatch);
-                let dispatch_for_serve = dispatch.clone();
-                let shutdown_rx_for_dispatch = broadcast_tx.subscribe();
-                let port_for_log = raw_port;
-                let app_name_for_log = app_name_str.clone();
-                let tenant_for_log = tenant_id.clone();
-
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = dispatch_for_serve.serve(shutdown_rx_for_dispatch).await {
-                        tracing::error!(
-                            tenant_id = %tenant_for_log,
-                            app_name = %app_name_for_log,
-                            port = port_for_log,
-                            err = %e,
-                            "HandlerDispatch serve() returned Err"
-                        );
-                    } else {
-                        tracing::info!(
-                            tenant_id = %tenant_for_log,
-                            app_name = %app_name_for_log,
-                            port = port_for_log,
-                            "HandlerDispatch serve() exited"
-                        );
-                    }
-                });
-                (None, Some(broadcast_tx), handle, Some(dispatch))
-            } else {
-                let instance_pre_clone = instance_pre.clone().unwrap();
-                let meter_clone = meter.clone();
-                let state_clone = self.state.clone();
-                // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
-                // falling back to the worker's config default otherwise.
-                let max_memory_mb = if spec.max_memory_mb > 0 {
-                    spec.max_memory_mb
-                } else {
-                    self.config.max_memory_mb
-                };
-                let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
-                let health_check_timeout_secs = self.config.health_check_timeout_secs;
-                let allowlist = spec.allowlist.clone();
-                // downloader_clone is captured into the per-app task so
-                // run_app_loop can post the auto-rollback signal when an
-                // app exhausts its restart cap. Arc<Downloader> is cheap to
-                // clone; the underlying reqwest::Client is internally Arc'd
-                // already, so this is one atomic refcount bump.
-                let downloader_clone = self.downloader.clone();
-                let log_forwarder = self.log_forwarder.clone();
-                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                let metrics_acc_for_loop = metrics_acc.clone();
-
-                let socket_mode_for_loop = self.config.socket_mode;
-                let handle = tokio::spawn(async move {
-                    Self::run_app_loop(
-                        instance_pre_clone,
-                        meter_clone,
-                        env,
-                        state_clone,
-                        app_name_str.clone(),
-                        shutdown_rx,
-                        max_memory_mb,
-                        epoch_deadline_ticks,
-                        health_check_timeout_secs,
-                        tenant_id,
-                        allowlist,
-                        downloader_clone,
-                        log_forwarder,
-                        metrics_acc_for_loop,
-                        socket_mode_for_loop,
-                    )
-                    .await;
-                    tracing::info!(app_name = %app_name_str, "app task exited");
-                });
-                (Some(shutdown_tx), None, handle, None)
+            let handler_config = HandlerConfig {
+                tenant_id: tenant_id.to_string(),
+                egress: egress_for_handler.clone(),
+                log_sink: self.log_forwarder.clone()
+                    as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
+                app_ctx: app_ctx.clone(),
+                meter: meter.clone(),
+                env: env.clone(),
+                max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                metrics_acc: metrics_acc.clone(),
+                socket_mode: self.config.socket_mode,
+                last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
             };
+
+            let tls_config =
+                try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
+            let dispatch = HandlerDispatch::new(
+                raw_port,
+                self.config.handler_request_budget_ms,
+                self.config.epoch_tick_ms,
+                handler_config,
+                tls_config,
+                self.downloader.clone(),
+                spec.deployment_id.clone(),
+                self.engine_pool.clone(),
+            )?;
+
+            let dispatch = Arc::new(dispatch);
+            let dispatch_for_serve = dispatch.clone();
+            let shutdown_rx_for_dispatch = broadcast_tx.subscribe();
+            let port_for_log = raw_port;
+            let app_name_for_log = app_name_str.clone();
+            let tenant_for_log = tenant_id.clone();
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = dispatch_for_serve.serve(shutdown_rx_for_dispatch).await {
+                    tracing::error!(
+                        tenant_id = %tenant_for_log,
+                        app_name = %app_name_for_log,
+                        port = port_for_log,
+                        err = %e,
+                        "HandlerDispatch serve() returned Err"
+                    );
+                } else {
+                    tracing::info!(
+                        tenant_id = %tenant_for_log,
+                        app_name = %app_name_for_log,
+                        port = port_for_log,
+                        "HandlerDispatch serve() exited"
+                    );
+                }
+            });
+            (None, Some(broadcast_tx), handle, Some(dispatch))
+        } else {
+            let instance_pre_clone = instance_pre.clone().unwrap();
+            let meter_clone = meter.clone();
+            let state_clone = self.state.clone();
+            // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
+            // falling back to the worker's config default otherwise.
+            let max_memory_mb = if spec.max_memory_mb > 0 {
+                spec.max_memory_mb
+            } else {
+                self.config.max_memory_mb
+            };
+            let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
+            let health_check_timeout_secs = self.config.health_check_timeout_secs;
+            let allowlist = spec.allowlist.clone();
+            // downloader_clone is captured into the per-app task so
+            // run_app_loop can post the auto-rollback signal when an
+            // app exhausts its restart cap. Arc<Downloader> is cheap to
+            // clone; the underlying reqwest::Client is internally Arc'd
+            // already, so this is one atomic refcount bump.
+            let downloader_clone = self.downloader.clone();
+            let log_forwarder = self.log_forwarder.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let metrics_acc_for_loop = metrics_acc.clone();
+
+            let socket_mode_for_loop = self.config.socket_mode;
+            let handle = tokio::spawn(async move {
+                Self::run_app_loop(
+                    instance_pre_clone,
+                    meter_clone,
+                    env,
+                    state_clone,
+                    app_name_str.clone(),
+                    shutdown_rx,
+                    max_memory_mb,
+                    epoch_deadline_ticks,
+                    health_check_timeout_secs,
+                    tenant_id,
+                    allowlist,
+                    downloader_clone,
+                    log_forwarder,
+                    metrics_acc_for_loop,
+                    socket_mode_for_loop,
+                )
+                .await;
+                tracing::info!(app_name = %app_name_str, "app task exited");
+            });
+            (Some(shutdown_tx), None, handle, None)
+        };
 
         // Register the app instance (Arc<Mutex<>> for interior mutability),
         // keyed by `(tenant_id, app_name)`. Each of the three

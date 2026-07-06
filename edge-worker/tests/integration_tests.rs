@@ -1733,32 +1733,50 @@ async fn test_supervisor_lazy_starting_and_eviction() {
     // Check state. Since it's lazy, there shouldn't be an engine yet.
     let dispatch = {
         let state = harness.supervisor.state.read().await;
-        let inst = state.apps.get(&("t_test".to_string(), "test-app".to_string())).unwrap();
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
         let inst_locked = inst.lock().await;
-        assert_eq!(inst_locked.execution_model, edge_worker::detect::ExecutionModel::Handler);
+        assert_eq!(
+            inst_locked.execution_model,
+            edge_worker::detect::ExecutionModel::Handler
+        );
         inst_locked.dispatch.clone().unwrap()
     };
-    
-    assert!(dispatch.evict().await.is_none(), "Engine should be None because it is lazily started");
+
+    assert!(
+        dispatch.evict().await.is_none(),
+        "Engine should be None because it is lazily started"
+    );
 
     // Simulate request by hitting the port
     let port = {
         let state = harness.supervisor.state.read().await;
-        let inst = state.apps.get(&("t_test".to_string(), "test-app".to_string())).unwrap();
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
         let p = inst.lock().await.port;
         p
     };
 
     let client = reqwest::Client::new();
-    let _ = client.get(format!("http://127.0.0.1:{}", port)).send().await;
-    
+    let _ = client
+        .get(format!("http://127.0.0.1:{}", port))
+        .send()
+        .await;
+
     // Give it a moment to process
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Check state. Engine should exist now.
     let engine = dispatch.evict().await;
-    assert!(engine.is_some(), "Engine should be Some because it was started");
-    
+    assert!(
+        engine.is_some(),
+        "Engine should be Some because it was started"
+    );
+
     // Free it
     if let Some(e) = engine {
         harness.supervisor.engine_pool.release(e);

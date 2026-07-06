@@ -259,7 +259,10 @@ impl HandlerDispatch {
 
     /// Expose for integration tests so they can skip the Downloader.
     #[allow(dead_code)]
-    pub async fn set_proxy_pre(&self, pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>) {
+    pub async fn set_proxy_pre(
+        &self,
+        pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>,
+    ) {
         *self.proxy_pre.write().await = Some(pre);
     }
 
@@ -318,7 +321,7 @@ impl HandlerDispatch {
                 if ticker_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                
+
                 let maybe_engine = {
                     let lock = server_ref.proxy_pre.blocking_read();
                     lock.as_ref().map(|p: &HandlerProxyPre| p.engine().clone())
@@ -554,7 +557,6 @@ impl HandlerDispatch {
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
-        
         {
             let mut lock = self.config.last_request_at.lock().await;
             *lock = Some(std::time::Instant::now());
@@ -571,14 +573,13 @@ impl HandlerDispatch {
                 if write_lock.is_none() {
                     let engine = self.engine_pool.acquire().await;
                     let cwasm_path = self.downloader.cwasm_path(&self.deployment_id);
-                    
+
                     let component = if cwasm_path.exists() {
                         match tokio::fs::read(&cwasm_path).await {
-                            Ok(cwasm_bytes) => {
-                                unsafe {
-                                    wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
-                                }.ok()
+                            Ok(cwasm_bytes) => unsafe {
+                                wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
                             }
+                            .ok(),
                             Err(_) => None,
                         }
                     } else {
@@ -592,8 +593,14 @@ impl HandlerDispatch {
                             let bytes = tokio::fs::read(&wasm_path).await?;
                             let engine_for_spawn = engine.clone();
                             match tokio::task::spawn_blocking(move || {
-                                wasmtime::component::Component::from_binary(&engine_for_spawn, &bytes)
-                            }).await.unwrap() {
+                                wasmtime::component::Component::from_binary(
+                                    &engine_for_spawn,
+                                    &bytes,
+                                )
+                            })
+                            .await
+                            .unwrap()
+                            {
                                 Ok(c) => c,
                                 Err(e) => return Err(anyhow::anyhow!("JIT failed: {e}")),
                             }
