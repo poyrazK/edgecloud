@@ -72,6 +72,7 @@ fn wire_test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: SocketEgressPolicy::default(),
     }
 }

@@ -99,6 +99,7 @@ fn test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     }
 }
@@ -178,6 +179,7 @@ impl TestHarness {
             task_stream_replicas: 1,
             tls_cert_path: None,
             tls_key_path: None,
+            worker_bootstrap_secret: String::new(),
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         };
 
@@ -380,6 +382,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
@@ -840,6 +843,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
@@ -870,6 +874,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
@@ -1669,6 +1674,7 @@ async fn build_supervisor_only_with_cp(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
 

@@ -131,6 +131,15 @@ pub struct Config {
     /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
     /// and `tls_key_path` must be set for TLS to activate.
     pub tls_key_path: Option<String>,
+    /// Optional bootstrap secret for the bootstrap handshake (issue #104).
+    /// When WORKER_JWT_SECRET is empty AND WORKER_BOOTSTRAP_SECRET is set,
+    /// the worker performs the bootstrap handshake on startup:
+    ///   1. POST to /api/internal/bootstrap with HMAC-SHA256 signature
+    ///   2. Receive short-lived (5min) bootstrap JWT
+    ///   3. Exchange bootstrap JWT for the real JWT_SECRET at
+    ///      GET /api/internal/worker-secret
+    pub worker_bootstrap_secret: String,
+
     /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
     /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
     /// (`block-all` (default, closes wasi:sockets connect-side),
@@ -247,6 +256,7 @@ impl Config {
             )?,
             tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
+            worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
         })
     }

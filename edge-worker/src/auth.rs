@@ -57,7 +57,7 @@ pub struct WorkerClaims {
 /// When `kid` is `Some(...)`, the JWT header includes a `kid` field so the
 /// control plane can select the correct verification key during rotation.
 pub struct WorkerJwtSigner {
-    secret: Vec<u8>,
+    secret: Mutex<Vec<u8>>,
     kid: Option<String>,
     issuer: String,
     worker_id: String,
@@ -84,7 +84,7 @@ impl WorkerJwtSigner {
         tenant_id: impl Into<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            secret: secret.into(),
+            secret: Mutex::new(secret.into()),
             kid,
             issuer: issuer.into(),
             worker_id: worker_id.into(),
@@ -133,6 +133,21 @@ impl WorkerJwtSigner {
         *cache = None;
     }
 
+    /// Replace the signing secret and invalidate the token cache.
+    /// Used by the bootstrap handshake (issue #104) to set the real
+    /// JWT_SECRET after bootstrapping, without recreating the signer.
+    /// The next call to `sign()` will re-encode with the new secret.
+    ///
+    /// Currently unused because main.rs resolves the secret before creating
+    /// the signer. Kept for future use cases where the secret needs to be
+    /// rotated at runtime (e.g. key rotation without worker restart).
+    #[allow(dead_code)]
+    pub fn set_secret(&self, new_secret: impl Into<Vec<u8>>) {
+        *self.secret.lock().unwrap_or_else(|e| e.into_inner()) = new_secret.into();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = None;
+    }
+
     fn encode(&self) -> String {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -155,7 +170,8 @@ impl WorkerJwtSigner {
             header.kid = Some(kid.clone());
         }
 
-        encode(&header, &claims, &EncodingKey::from_secret(&self.secret))
+        let secret = self.secret.lock().unwrap_or_else(|e| e.into_inner());
+        encode(&header, &claims, &EncodingKey::from_secret(&secret))
             .expect("HS256 signing should not fail")
     }
 }

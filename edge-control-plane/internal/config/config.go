@@ -33,6 +33,17 @@ type Config struct {
 	// its own region. See `service.ActivateDeployment` for the
 	// fallback path. (Issue #82, v1.)
 	Region string `yaml:"region"`
+	// BootstrapSecret is a shared HMAC secret used by workers to
+	// authenticate at bootstrap when WORKER_JWT_SECRET is not yet
+	// provisioned. The handshake:
+	//   1. Worker POSTs to /api/internal/bootstrap with a payload
+	//      signed by this secret (HMAC-SHA256).
+	//   2. CP returns a short-lived (5min) bootstrap JWT.
+	//   3. Worker exchanges that JWT for the real JWT_SECRET at
+	//      GET /api/internal/worker-secret.
+	// Must be at least 32 bytes, like JWT_SECRET. Set via
+	// BOOTSTRAP_SECRET env var or bootstrap.secret in config.
+	BootstrapSecret string `yaml:"bootstrap_secret"`
 	// InternalToken is a shared secret presented by trusted
 	// service-to-service callers (today: the edge-ingress, which
 	// fetches traffic splits to apply Caddy weights). When set, the
@@ -303,6 +314,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("EDGE_INTERNAL_TOKEN"); v != "" {
 		cfg.InternalToken = v
 	}
+	if v := os.Getenv("BOOTSTRAP_SECRET"); v != "" {
+		cfg.BootstrapSecret = v
+	}
 	if v := os.Getenv("EDGE_SECRETS_MASTER_KEY"); v != "" {
 		cfg.SecretsMasterKey = v
 	}
@@ -484,6 +498,15 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Validate bootstrap secret if configured. Same strength requirements
+	// as JWT_SECRET — must be ≥32 bytes, not a known placeholder.
+	// Optional: when empty, workers must use the direct JWT secret.
+	if cfg.BootstrapSecret != "" {
+		if err := validateBootstrapSecret(cfg.BootstrapSecret); err != nil {
+			return nil, err
+		}
+	}
+
 	// Validate secrets config: must not mix old and new formats.
 	if err := validateSecretsConfig(cfg.SecretsMasterKey, cfg.Secrets); err != nil {
 		return nil, err
@@ -558,6 +581,18 @@ func validateJWTSecret(secret string, activeKID string, keys map[string]string) 
 
 // validateSecretsConfig enforces that the old and new secrets config
 // formats are not mixed.
+// validateBootstrapSecret enforces that the bootstrap secret, when set,
+// meets the same strength requirements as JWT_SECRET.
+func validateBootstrapSecret(secret string) error {
+	if _, ok := insecureJWTSecretValues[secret]; ok {
+		return fmt.Errorf("bootstrap.secret %q is a known placeholder; set BOOTSTRAP_SECRET to a unique value", secret)
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("bootstrap.secret must be at least 32 bytes (got %d)", len(secret))
+	}
+	return nil
+}
+
 func validateSecretsConfig(masterKey string, secrets SecretsConfig) error {
 	if masterKey != "" && secrets.ActiveKeyID != "" {
 		return fmt.Errorf("cannot set both secrets_master_key and secrets.active_key_id; use secrets.keys exclusively")
