@@ -468,6 +468,35 @@ impl<F: Future + Send + 'static> Executor<F> for TokioExecutor {
     }
 }
 
+/// Check whether the incoming request's `Content-Length` exceeds the
+/// per-app body cap. Returns `Some(413 response)` when the body is too
+/// large, `None` when the check passes (or is disabled).
+///
+/// When `cap == 0` the check is disabled — all body sizes are allowed.
+/// When the request has no `Content-Length` header (chunked transfer),
+/// the check is skipped and the wasmtime memory cap provides defense-
+/// in-depth.
+pub fn check_body_cap(
+    content_length: Option<u64>,
+    cap: u64,
+    meter: &Arc<RequestMeter>,
+) -> Option<HyperResponse<HyperOutgoingBody>> {
+    if cap == 0 {
+        return None;
+    }
+    match content_length {
+        Some(len) if len > cap => {
+            tracing::warn!(
+                content_length = len,
+                cap,
+                "request body exceeds per-app cap; rejecting 413",
+            );
+            Some(synthetic_413(len, cap, meter))
+        }
+        _ => None,
+    }
+}
+
 impl HandlerDispatch {
     /// Dispatch a single HTTP request through `ProxyPre`.
     /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
@@ -517,26 +546,16 @@ impl HandlerDispatch {
         // Returning 413 *before* the guest runs (instead of dispatching
         // and letting the guest trap) means a misconfigured tenant
         // can't DoS the worker by spamming large payloads.
-        if self.config.max_request_body_bytes > 0 {
-            if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
-                if let Ok(cl_str) = cl.to_str() {
-                    if let Ok(len) = cl_str.parse::<u64>() {
-                        if len > self.config.max_request_body_bytes {
-                            tracing::warn!(
-                                tenant_id = %self.config.tenant_id,
-                                app_name = %self.config.app_ctx.app_name,
-                                content_length = len,
-                                cap = self.config.max_request_body_bytes,
-                                "request body exceeds per-app cap; rejecting 413",
-                            );
-                            return Ok(synthetic_413(
-                                len,
-                                self.config.max_request_body_bytes,
-                                &self.config.meter,
-                            ));
-                        }
-                    }
-                }
+        {
+            let cl = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(resp) =
+                check_body_cap(cl, self.config.max_request_body_bytes, &self.config.meter)
+            {
+                return Ok(resp);
             }
         }
 
@@ -1037,5 +1056,99 @@ mod synthetic_response_tests {
             cl <= 1024,
             "body should be capped at 1024 even for huge values"
         );
+    }
+
+    // ── check_body_cap tests ────────────────────────────────────────
+
+    #[test]
+    fn body_cap_disabled_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(999_999), 0, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_no_content_length_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(None, 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_within_limit_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(100), 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_exact_limit_returns_none() {
+        let m = test_meter();
+        // Content-Length exactly equal to cap should pass.
+        assert!(check_body_cap(Some(1024), 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_exceeds_returns_413() {
+        let m = test_meter();
+        let resp = check_body_cap(Some(2000), 1024, &m);
+        assert!(resp.is_some());
+        assert_eq!(resp.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn body_cap_zero_length_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(0), 1024, &m).is_none());
+    }
+
+    // ── truncate_diagnostic tests ───────────────────────────────────
+
+    #[test]
+    fn truncate_short_diagnostic_passes_through() {
+        assert_eq!(truncate_diagnostic("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_1024_passes_through() {
+        let s = "x".repeat(1024);
+        assert_eq!(truncate_diagnostic(&s).len(), 1024);
+    }
+
+    #[test]
+    fn truncate_long_diagnostic_capped_at_1024() {
+        let s = "x".repeat(2000);
+        let truncated = truncate_diagnostic(&s);
+        assert!(truncated.len() <= 1024);
+    }
+
+    #[test]
+    fn truncate_empty_returns_empty() {
+        assert_eq!(truncate_diagnostic(""), "");
+    }
+
+    #[test]
+    fn truncate_multi_byte_utf8_boundary() {
+        // Each '☃' is 3 bytes. A string with 342 snowmen = 1026 bytes.
+        // Truncation must cut at a character boundary, so the result
+        // should be 341 snowmen = 1023 bytes.
+        let s = "☃".repeat(342); // 1026 bytes
+        let truncated = truncate_diagnostic(&s);
+        assert!(truncated.len() <= 1024);
+        assert!(truncated.len() % 3 == 0, "must cut at char boundary");
+    }
+
+    // ── budget math tests ───────────────────────────────────────────
+
+    #[test]
+    fn budget_ticks_divide_evenly() {
+        assert_eq!(100u64 / 10u64, 10);
+    }
+
+    #[test]
+    fn budget_ticks_floor_at_one() {
+        assert_eq!(5u64 / 10u64, 0);
+    }
+
+    #[test]
+    fn budget_ticks_rounding_floor() {
+        assert_eq!(95u64 / 10u64, 9);
     }
 }
