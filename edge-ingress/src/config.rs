@@ -293,11 +293,21 @@ mod tests {
     /// Helper: unset all config-related env vars so from_env() sees a clean slate.
     fn unset_all_config_vars() {
         for v in &[
-            "INGRESS_REGION", "TLS_CERT_FILE", "TLS_KEY_FILE",
-            "NATS_URL", "CADDY_ADMIN_URL", "INGRESS_LISTEN_HTTP",
-            "INGRESS_LISTEN_HTTPS", "CADDY_ADMIN_TOKEN", "REFRESH_DEBOUNCE_MS",
-            "HTTP_TO_HTTPS", "CONTROL_PLANE_API_URL", "EDGE_INTERNAL_TOKEN",
-            "CONTROL_PLANE_URL", "INGRESS_SERVICE_TOKEN", "DOMAIN_POLL_INTERVAL",
+            "INGRESS_REGION",
+            "TLS_CERT_FILE",
+            "TLS_KEY_FILE",
+            "NATS_URL",
+            "CADDY_ADMIN_URL",
+            "INGRESS_LISTEN_HTTP",
+            "INGRESS_LISTEN_HTTPS",
+            "CADDY_ADMIN_TOKEN",
+            "REFRESH_DEBOUNCE_MS",
+            "HTTP_TO_HTTPS",
+            "CONTROL_PLANE_API_URL",
+            "EDGE_INTERNAL_TOKEN",
+            "CONTROL_PLANE_URL",
+            "INGRESS_SERVICE_TOKEN",
+            "DOMAIN_POLL_INTERVAL",
             "CADDY_ADMIN_LISTEN",
         ] {
             unset_var(v);

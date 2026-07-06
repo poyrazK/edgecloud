@@ -412,7 +412,9 @@ mod tests {
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 2);
         assert!(snap.iter().any(|e| e.app_name == "api" && e.port == 8081));
-        assert!(snap.iter().any(|e| e.app_name == "api-ws" && e.port == 9091));
+        assert!(snap
+            .iter()
+            .any(|e| e.app_name == "api-ws" && e.port == 9091));
     }
 
     /// WebSocket port with canary key — ws entry gets `{deployment_id}-ws`.
