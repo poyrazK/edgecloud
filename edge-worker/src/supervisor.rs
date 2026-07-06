@@ -491,6 +491,7 @@ impl Supervisor {
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                 let metrics_acc_for_loop = metrics_acc.clone();
 
+                let socket_mode_for_loop = self.config.socket_mode;
                 let handle = tokio::spawn(async move {
                     Self::run_app_loop(
                         instance_pre_clone,
@@ -507,6 +508,7 @@ impl Supervisor {
                         downloader_clone,
                         log_forwarder,
                         metrics_acc_for_loop,
+                        socket_mode_for_loop,
                     )
                     .await;
                     tracing::info!(app_name = %app_name_str, "app task exited");
@@ -696,6 +698,7 @@ impl Supervisor {
         downloader: Arc<Downloader>,
         log_forwarder: Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -738,6 +741,7 @@ impl Supervisor {
                         &app_name,
                         &log_forwarder,
                         metrics_acc.clone(),
+                        socket_mode,
                     ),
                 ) => {
                     match result {
@@ -882,6 +886,7 @@ impl Supervisor {
         app_name: &str,
         log_forwarder: &Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -904,9 +909,10 @@ impl Supervisor {
 
         // Create a fresh RuntimeState with per-app env vars, metering, log
         // sink, app context, and tenant_id for tenant isolation. The
-        // socket-mode placeholder `Default` (= BlockAll) matches the
-        // effective behavior today; commit 5 (A.6) threads the
-        // worker-configured mode through here from `self.config.socket_mode`.
+        // socket_mode is read once at worker startup
+        // (`Config::from_env` → `Config::socket_mode`) and threaded in
+        // here from `start_app` — the runtime does NOT read
+        // `EDGE_EGRESS_SOCKET_MODE` itself.
         let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
             env,
             Some(Arc::clone(meter)),
@@ -915,7 +921,7 @@ impl Supervisor {
             log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
             app_ctx,
             metrics_acc,
-            edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            socket_mode,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed

@@ -75,6 +75,14 @@ impl SocketEgressPolicy {
     /// from the last-seen value (change-detection via a single
     /// `AtomicU8`), so per-request calls (per-RuntimeState, per-Clone)
     /// do not spam the log.
+    ///
+    /// **Process-static by design.** Operators don't reload this knob
+    /// without restarting the worker — the worker reads it once at
+    /// startup via `edge-worker/src/config.rs::Config::from_env` and
+    /// threads the resolved mode through `HandlerConfig::socket_mode`
+    /// into every `RuntimeState::with_env_and_meter` call. This method
+    /// remains as a bootstrap helper for any standalone-runtime user
+    /// who doesn't go through the worker.
     pub fn from_env() -> Self {
         let parsed = match std::env::var("EDGE_EGRESS_SOCKET_MODE") {
             Ok(s) => s.parse::<Self>().unwrap_or_else(|e: String| {
