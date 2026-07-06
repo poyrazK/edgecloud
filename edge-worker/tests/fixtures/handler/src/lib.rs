@@ -354,7 +354,7 @@ impl Guest for Component {
                 let port: u16 = get_query_param(query, "port")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(80);
-                return_text(out, 200, &tcp_connect_string(ip, port));
+                return_text(out, 200, &socket_call_string(ip, port, SocketKind::TcpConnect));
             }
             "/sockets/udp/bind" => {
                 // Exercises `UdpBind` via UDP's `start-bind` (the
@@ -370,7 +370,7 @@ impl Guest for Component {
                 let port: u16 = get_query_param(query, "port")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                return_text(out, 200, &udp_bind_string(ip, port));
+                return_text(out, 200, &socket_call_string(ip, port, SocketKind::UdpBind));
             }
             _ => {
                 return_json(out, 404, br#"{"error":"not found"}"#);
@@ -509,36 +509,47 @@ fn error_code_name(err: SockErrorCode) -> &'static str {
     }
 }
 
-fn tcp_connect_string(ip: &str, port: u16) -> Vec<u8> {
-    let address = match parse_ipv4_from_query(ip) {
-        Some(a) => a,
-        None => return format!("deny:invalid-ip:{ip}").into_bytes(),
-    };
-    let sock = match create_tcp_socket(IpAddressFamily::Ipv4) {
-        Ok(s) => s,
-        Err(e) => return format!("deny:create:{}", error_code_name(e)).into_bytes(),
-    };
-    let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress { address, port });
-    let net = instance_network();
-    match sock.start_connect(&net, addr) {
-        Ok(()) => b"allow".to_vec(),
-        Err(e) => format!("deny:{}", error_code_name(e)).into_bytes(),
-    }
+/// Common scaffolding for the two wasi:sockets fixture paths
+/// (`/sockets/tcp/connect`, `/sockets/udp/bind`). The two operations
+/// diverge only in (a) which socket factory the runtime exposes
+/// (`create_tcp_socket` vs `create_udp_socket`) and (b) which method
+/// the socket then offers (`start_connect` vs `start_bind`). Both
+/// socket types are distinct in the wit-bindgen output, so we
+/// dispatch through `SocketKind` rather than a trait — keeping the
+/// unification narrow and the body of each branch read like a
+/// straight-line procedure.
+enum SocketKind {
+    TcpConnect,
+    UdpBind,
 }
 
-fn udp_bind_string(ip: &str, port: u16) -> Vec<u8> {
+fn socket_call_string(ip: &str, port: u16, kind: SocketKind) -> Vec<u8> {
     let address = match parse_ipv4_from_query(ip) {
         Some(a) => a,
         None => return format!("deny:invalid-ip:{ip}").into_bytes(),
     };
-    let sock = match create_udp_socket(IpAddressFamily::Ipv4) {
-        Ok(s) => s,
-        Err(e) => return format!("deny:create:{}", error_code_name(e)).into_bytes(),
-    };
     let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress { address, port });
     let net = instance_network();
-    match sock.start_bind(&net, addr) {
-        Ok(()) => b"allow".to_vec(),
-        Err(e) => format!("deny:{}", error_code_name(e)).into_bytes(),
+    match kind {
+        SocketKind::TcpConnect => {
+            let sock = match create_tcp_socket(IpAddressFamily::Ipv4) {
+                Ok(s) => s,
+                Err(e) => return format!("deny:create:{}", error_code_name(e)).into_bytes(),
+            };
+            match sock.start_connect(&net, addr) {
+                Ok(()) => b"allow".to_vec(),
+                Err(e) => format!("deny:{}", error_code_name(e)).into_bytes(),
+            }
+        }
+        SocketKind::UdpBind => {
+            let sock = match create_udp_socket(IpAddressFamily::Ipv4) {
+                Ok(s) => s,
+                Err(e) => return format!("deny:create:{}", error_code_name(e)).into_bytes(),
+            };
+            match sock.start_bind(&net, addr) {
+                Ok(()) => b"allow".to_vec(),
+                Err(e) => format!("deny:{}", error_code_name(e)).into_bytes(),
+            }
+        }
     }
 }
