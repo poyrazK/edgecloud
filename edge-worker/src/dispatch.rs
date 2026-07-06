@@ -56,7 +56,6 @@ use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -230,6 +229,7 @@ pub struct HandlerConfig {
 }
 
 impl HandlerDispatch {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: u16,
         request_budget_ms: u64,
@@ -258,6 +258,7 @@ impl HandlerDispatch {
     }
 
     /// Expose for integration tests so they can skip the Downloader.
+    #[allow(dead_code)]
     pub async fn set_proxy_pre(&self, pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>) {
         *self.proxy_pre.write().await = Some(pre);
     }
@@ -513,11 +514,7 @@ pub fn check_body_cap(
 impl HandlerDispatch {
     pub async fn evict(&self) -> Option<wasmtime::Engine> {
         let mut lock = self.proxy_pre.write().await;
-        if let Some(proxy_pre) = lock.take() {
-            Some(proxy_pre.engine().clone())
-        } else {
-            None
-        }
+        lock.take().map(|proxy_pre| proxy_pre.engine().clone())
     }
 
     /// Dispatch a single HTTP request through `ProxyPre`.
@@ -578,12 +575,9 @@ impl HandlerDispatch {
                     let component = if cwasm_path.exists() {
                         match tokio::fs::read(&cwasm_path).await {
                             Ok(cwasm_bytes) => {
-                                match unsafe {
+                                unsafe {
                                     wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
-                                } {
-                                    Ok(c) => Some(c),
-                                    Err(_) => None,
-                                }
+                                }.ok()
                             }
                             Err(_) => None,
                         }

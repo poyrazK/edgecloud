@@ -11,7 +11,7 @@ use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
 use crate::config::Config;
-use crate::detect::{detect_execution_model_from_bytes, ExecutionModel};
+use crate::detect::ExecutionModel;
 use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
