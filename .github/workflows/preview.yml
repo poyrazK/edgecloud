@@ -3,6 +3,16 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+# The Comment PR step uses `actions/github-script` to post the
+# preview URL via the GitHub API. The default `GITHUB_TOKEN` is
+# `contents: read` only, which 403s on `issues.createComment`
+# ("Resource not accessible by integration"). Grant the minimum
+# write scope the comment step needs.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   deploy-preview:
     runs-on: ubuntu-latest
