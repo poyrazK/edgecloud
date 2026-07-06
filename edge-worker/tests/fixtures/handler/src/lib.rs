@@ -472,32 +472,15 @@ fn return_busy_then_ok(out: ResponseOutparam) {
 // `edge-runtime/src/egress.rs` unit tests.
 
 fn parse_ipv4_from_query(ip: &str) -> Option<Ipv4Address> {
-    let parts: Vec<u8> = ip
-        .split('.')
-        .filter_map(|p| p.parse::<u8>().ok())
-        .collect();
-    if parts.len() != 4 {
+    // `std::net::Ipv4Addr::from_str` rejects whitespace, edge cases, and
+    // returns a `[u8; 4]` via `.octets()`. Using stdlib here avoids the
+    // hand-rolled `.split('.').filter_map(parse::<u8>())` which silently
+    // accepts ambiguous inputs that std rejects.
+    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
         return None;
-    }
-    let mut iter = parts.into_iter();
-    Some((
-        iter.next().unwrap(),
-        iter.next().unwrap(),
-        iter.next().unwrap(),
-        iter.next().unwrap(),
-    ))
-}
-
-fn socket_addr_v4_string(addr: IpSocketAddress) -> String {
-    match addr {
-        IpSocketAddress::Ipv4(Ipv4SocketAddress { address, port }) => {
-            let (a, b, c, d) = address;
-            format!("{a}.{b}.{c}.{d}:{port}")
-        }
-        // IPv6 not exercised — keep the catch-all to make a future
-        // extension (and an unexpected variant in debug builds) loud.
-        _ => "non-ipv4".to_string(),
-    }
+    };
+    let [a, b, c, d] = addr.octets();
+    Some((a, b, c, d))
 }
 
 fn error_code_name(err: SockErrorCode) -> &'static str {
@@ -539,10 +522,7 @@ fn tcp_connect_string(ip: &str, port: u16) -> Vec<u8> {
     let net = instance_network();
     match sock.start_connect(&net, addr) {
         Ok(()) => b"allow".to_vec(),
-        Err(e) => {
-            let _ = socket_addr_v4_string(addr); // keep addr live in release build
-            format!("deny:{}", error_code_name(e)).into_bytes()
-        }
+        Err(e) => format!("deny:{}", error_code_name(e)).into_bytes(),
     }
 }
 
