@@ -51,6 +51,7 @@ pub mod observe;
 pub mod process;
 pub mod scheduling;
 pub mod time;
+pub mod websocket;
 
 #[cfg(test)]
 mod tests {
