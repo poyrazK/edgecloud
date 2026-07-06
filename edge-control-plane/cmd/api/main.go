@@ -15,6 +15,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	natsio "github.com/nats-io/nats.go"
 )
@@ -67,6 +68,20 @@ func main() {
 
 	// ── Application Assembly ──────────────────────────────────────
 	application := app.New(cfg, db, publisher, artifactStore, openAPISpec)
+
+	// Issue #332 (Layer 3: Push-to-Edge). When `region_artifact_caches`
+	// is configured + a non-empty `artifact_cache_internal_token` is set,
+	// wire the per-region artifact-cache pusher into the deployment
+	// service. Both are optional — when absent, the cache-push step
+	// in publishSwap is a no-op and the existing pull-from-CP
+	// behavior is unchanged.
+	if len(cfg.Storage.RegionArtifactCaches) > 0 {
+		application.DeploymentSvc.SetRegionArtifactCaches(cfg.Storage.RegionArtifactCaches)
+		application.DeploymentSvc.SetCachePusher(
+			service.NewHTTPArtifactCachePusher(artifactStore, cfg.Storage.ArtifactCacheInternalToken),
+		)
+		log.Printf("region artifact cache: enabled for %d region(s)", len(cfg.Storage.RegionArtifactCaches))
+	}
 
 	// ── Ingress Service Token ─────────────────────────────────────
 	region := os.Getenv("APP_REGION")
