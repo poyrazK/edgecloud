@@ -30,8 +30,26 @@ impl EgressPolicy {
     /// An empty list enforces default-deny.
     /// The `"*"` wildcard sentinel is silently stripped — it is reserved for
     /// the test constructor and must not arrive from external data.
+    ///
+    /// **Defensive telemetry:** when the allowlist contains `"*"`, the
+    /// constructor emits a `tracing::warn!` and strips it. In production,
+    /// the AppSpec wire format is filtered through
+    /// `edge-worker/src/messages.rs::deserialize_allowlist` which already
+    /// maps `["*"]` → `None` *before* this constructor runs (verified at
+    /// `messages.rs:14-25`), so the warn-log is unreachable in production.
+    /// It exists to surface the strip for any other config-driven path
+    /// (e.g. a future admin API or test fixture) that bypasses the
+    /// deserializer. If you intended `"*"`-as-allow-everything, use
+    /// [`EgressPolicy::allow_all`] instead.
     pub fn new(allowlist: Vec<String>) -> Self {
+        let had_wildcard = allowlist.iter().any(|e| e == "*");
         let allowlist = allowlist.into_iter().filter(|e| e != "*").collect();
+        if had_wildcard {
+            tracing::warn!(
+                "EgressPolicy::new stripped '*' from the allowlist. \
+                 Use EgressPolicy::allow_all() if '*'-as-allow-everything was intended."
+            );
+        }
         Self { allowlist }
     }
 
