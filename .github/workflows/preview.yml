@@ -118,7 +118,7 @@ jobs:
           # path becomes `target/wasm32-wasip2/release/--preview-<hash>.wasm`
           # — CI run 28776096730. Passing `hello` makes the preview
           # app `hello--preview-<hash>` and the artifact path correct.
-          output=$(cd samples/hello && EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" "$EDGE_BIN" deploy hello --preview 2>&1) || {
+          output=$(cd samples/hello && EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" "$EDGE_BIN" deploy hello --preview --file ./target/wasm32-wasip2/release/hello.wasm 2>&1) || {
             rc=$?
             echo "::error::edge deploy --preview failed (rc=$rc)"
             printf '%s\n' "$output"
