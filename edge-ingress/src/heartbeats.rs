@@ -262,6 +262,7 @@ mod tests {
             worker_id: "w_fra_abc".to_string(),
             region: "fra".to_string(),
             worker_addr: Some(worker_addr.to_string()),
+            tenant_id: None,
             apps,
             cluster_headroom: None,
         }
@@ -274,6 +275,7 @@ mod tests {
             worker_id: "w_fra_abc".to_string(),
             region: "fra".to_string(),
             worker_addr: None,
+            tenant_id: None,
             apps,
             cluster_headroom: None,
         }
@@ -308,6 +310,7 @@ mod tests {
             worker_id: "w_fra_abc".to_string(),
             region: "fra".to_string(),
             worker_addr: Some(String::new()),
+            tenant_id: None,
             apps,
             cluster_headroom: None,
         };

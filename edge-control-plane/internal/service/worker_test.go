@@ -1007,3 +1007,272 @@ func TestApplyTenantDelta_RepositoryError_LogsAndContinues(t *testing.T) {
 // but a few of the helper-only tests above don't reference it. Keep the
 // import explicit so adding new tests is friction-free.
 var _ = strconv.Itoa
+
+// ── Heartbeat handler tests (issue #297) ─────────────────────────────────
+
+// TestExtractHeartbeatWorkerID_Valid parses a partial JSON to extract worker_id.
+func TestExtractHeartbeatWorkerID_Valid(t *testing.T) {
+	data := []byte(`{"worker_id":"w_fra_abc","type":"heartbeat"}`)
+	got := extractHeartbeatWorkerID(data)
+	if got != "w_fra_abc" {
+		t.Errorf("got %q, want w_fra_abc", got)
+	}
+}
+
+// TestExtractHeartbeatWorkerID_Invalid returns "unknown" on unparseable JSON.
+func TestExtractHeartbeatWorkerID_Invalid(t *testing.T) {
+	got := extractHeartbeatWorkerID([]byte(`broken json`))
+	if got != "unknown" {
+		t.Errorf("got %q, want unknown", got)
+	}
+}
+
+// TestExtractHeartbeatWorkerID_Empty returns "unknown" on empty input.
+func TestExtractHeartbeatWorkerID_Empty(t *testing.T) {
+	got := extractHeartbeatWorkerID([]byte(`{}`))
+	if got != "" {
+		t.Errorf("got %q, want empty string (worker_id absent)", got)
+	}
+}
+
+// TestExtractTenantIDFromApps_ReturnsFirstTenantID picks the tenant_id from
+// the first app it encounters (map iteration order is non-deterministic in Go,
+// so we just assert it returns a non-empty tenant_id).
+func TestExtractTenantIDFromApps_ReturnsFirstTenantID(t *testing.T) {
+	appsRaw := json.RawMessage(`{"app1":{"tenant_id":"t_abc","status":"running"},"app2":{"tenant_id":"t_xyz","status":"starting"}}`)
+	got := extractTenantIDFromApps(appsRaw)
+	if got == "" {
+		t.Errorf("got empty string, expected a non-empty tenant_id")
+	}
+}
+
+// TestExtractTenantIDFromApps_ReturnsEmptyOnNoApps returns "" when apps is empty.
+func TestExtractTenantIDFromApps_ReturnsEmptyOnNoApps(t *testing.T) {
+	appsRaw := json.RawMessage(`{}`)
+	got := extractTenantIDFromApps(appsRaw)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestExtractTenantIDFromApps_SingleApp returns the exact tenant_id when
+// there is only one app (deterministic).
+func TestExtractTenantIDFromApps_SingleApp(t *testing.T) {
+	appsRaw := json.RawMessage(`{"myapp":{"tenant_id":"t_single","status":"running"}}`)
+	got := extractTenantIDFromApps(appsRaw)
+	if got != "t_single" {
+		t.Errorf("got %q, want t_single", got)
+	}
+}
+
+// TestExtractTenantIDFromApps_ReturnsEmptyOnInvalidJSON returns "" on garbage.
+func TestExtractTenantIDFromApps_ReturnsEmptyOnInvalidJSON(t *testing.T) {
+	got := extractTenantIDFromApps(json.RawMessage(`not json`))
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestExtractTenantIDFromApps_ReturnsEmptyWhenNoTenantIDField returns ""
+// when the app statuses don't have a tenant_id field (pre-#297 workers).
+func TestExtractTenantIDFromApps_ReturnsEmptyWhenNoTenantIDField(t *testing.T) {
+	appsRaw := json.RawMessage(`{"app1":{"status":"running","deployment_id":"d_1"}}`)
+	got := extractTenantIDFromApps(appsRaw)
+	if got != "" {
+		t.Errorf("got %q, want empty (no tenant_id field)", got)
+	}
+}
+
+// TestHandleHeartbeat_MalformedJSON_DoesNotPanic sends garbage JSON and
+// verifies the handler doesn't panic and the log mentions the error.
+func TestHandleHeartbeat_MalformedJSON_DoesNotPanic(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{
+		updateLastSeenFunc: func(_ context.Context, _ string) error { return nil },
+		upsertStatusFunc:   func(_ context.Context, _ *domain.WorkerStatus) error { return nil },
+	}, &mockQuotaRepo{})
+
+	msg := &nats.Msg{Data: []byte(`{broken json`)}
+	svc.handleHeartbeat(context.Background(), msg)
+
+	out := buf.String()
+	if !strings.Contains(out, "failed to parse") {
+		t.Errorf("expected log line with 'failed to parse'; got %q", out)
+	}
+}
+
+// TestHandleHeartbeat_ExtractsTenantFromApps verifies the tenant_id fallback:
+// when the top-level tenant_id is absent, the handler extracts it from the
+// first app's status and uses it for auto-register.
+func TestHandleHeartbeat_ExtractsTenantFromApps(t *testing.T) {
+	var upsertedTenant string
+	svc := workerSvcForTest(&mockWorkerRepo{
+		updateLastSeenFunc: func(_ context.Context, _ string) error { return nil },
+		upsertStatusFunc: func(_ context.Context, ws *domain.WorkerStatus) error {
+			return errors.New("worker_status_worker_id_fkey")
+		},
+		upsertFunc: func(_ context.Context, tenantID string, _ *domain.RegisterWorkerRequest) (bool, error) {
+			upsertedTenant = tenantID
+			return true, nil
+		},
+	}, &mockQuotaRepo{})
+
+	heartbeatJSON := `{
+		"type": "heartbeat",
+		"timestamp": "2026-07-04T12:00:00Z",
+		"worker_id": "w_test_fallback",
+		"region": "fra",
+		"worker_addr": "203.0.113.10",
+		"apps": {
+			"myapp": {
+				"tenant_id": "t_from_app",
+				"deployment_id": "d_1",
+				"status": "running",
+				"request_count": 0,
+				"outbound_bytes": 0,
+				"port": 8081
+			}
+		}
+	}`
+	msg := &nats.Msg{Data: []byte(heartbeatJSON)}
+	svc.handleHeartbeat(context.Background(), msg)
+
+	if upsertedTenant != "t_from_app" {
+		t.Errorf("worker upsert called with tenant %q, want t_from_app", upsertedTenant)
+	}
+}
+
+// TestHandleHeartbeat_WithTopLevelTenantID prefers the top-level tenant_id
+// over the one embedded in app statuses.
+func TestHandleHeartbeat_WithTopLevelTenantID(t *testing.T) {
+	var upsertedTenant string
+	svc := workerSvcForTest(&mockWorkerRepo{
+		updateLastSeenFunc: func(_ context.Context, _ string) error { return nil },
+		upsertStatusFunc: func(_ context.Context, ws *domain.WorkerStatus) error {
+			return errors.New("worker_status_worker_id_fkey")
+		},
+		upsertFunc: func(_ context.Context, tenantID string, _ *domain.RegisterWorkerRequest) (bool, error) {
+			upsertedTenant = tenantID
+			return true, nil
+		},
+	}, &mockQuotaRepo{})
+
+	heartbeatJSON := `{
+		"type": "heartbeat",
+		"timestamp": "2026-07-04T12:00:00Z",
+		"worker_id": "w_test_top",
+		"region": "fra",
+		"worker_addr": "203.0.113.10",
+		"tenant_id": "t_top_level",
+		"apps": {
+			"myapp": {
+				"tenant_id": "t_from_app",
+				"deployment_id": "d_1",
+				"status": "running",
+				"request_count": 0,
+				"outbound_bytes": 0,
+				"port": 8081
+			}
+		}
+	}`
+	msg := &nats.Msg{Data: []byte(heartbeatJSON)}
+	svc.handleHeartbeat(context.Background(), msg)
+
+	if upsertedTenant != "t_top_level" {
+		t.Errorf("worker upsert called with tenant %q, want t_top_level (top-level should take priority)", upsertedTenant)
+	}
+}
+
+// TestHandleHeartbeat_SuccessPath logs "heartbeat: processed from" on success.
+func TestHandleHeartbeat_SuccessPath(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{
+		updateLastSeenFunc: func(_ context.Context, _ string) error { return nil },
+		upsertStatusFunc:   func(_ context.Context, _ *domain.WorkerStatus) error { return nil },
+	}, &mockQuotaRepo{})
+
+	heartbeatJSON := `{
+		"type": "heartbeat",
+		"timestamp": "2026-07-04T12:00:00Z",
+		"worker_id": "w_test_success",
+		"region": "fra",
+		"worker_addr": "203.0.113.10",
+		"tenant_id": "t_success",
+		"apps": {
+			"myapp": {
+				"tenant_id": "t_success",
+				"deployment_id": "d_1",
+				"status": "running",
+				"request_count": 0,
+				"outbound_bytes": 0,
+				"port": 8081
+			}
+		}
+	}`
+	msg := &nats.Msg{Data: []byte(heartbeatJSON)}
+	svc.handleHeartbeat(context.Background(), msg)
+
+	out := buf.String()
+	if !strings.Contains(out, "heartbeat: processed from") {
+		t.Errorf("expected success log line; got %q", out)
+	}
+	if !strings.Contains(out, "w_test_success") {
+		t.Errorf("expected worker_id in log; got %q", out)
+	}
+}
+
+// TestHandleHeartbeat_AutoRegister_OnFKError verifies the full auto-register
+// path: UpsertStatus returns FK error → Upsert is called → UpsertStatus
+// retried.
+func TestHandleHeartbeat_AutoRegister_OnFKError(t *testing.T) {
+	var autoRegCalled bool
+	var autoRegTenant string
+
+	svc := workerSvcForTest(&mockWorkerRepo{
+		updateLastSeenFunc: func(_ context.Context, _ string) error { return nil },
+		upsertStatusFunc: func(_ context.Context, ws *domain.WorkerStatus) error {
+			// First call returns FK error; second (retry) succeeds
+			if !autoRegCalled {
+				return errors.New("worker_status_worker_id_fkey")
+			}
+			return nil
+		},
+		upsertFunc: func(_ context.Context, tenantID string, _ *domain.RegisterWorkerRequest) (bool, error) {
+			autoRegCalled = true
+			autoRegTenant = tenantID
+			return true, nil
+		},
+	}, &mockQuotaRepo{})
+
+	heartbeatJSON := `{
+		"type": "heartbeat",
+		"timestamp": "2026-07-04T12:00:00Z",
+		"worker_id": "w_test_autoreg",
+		"region": "fra",
+		"worker_addr": "203.0.113.10",
+		"tenant_id": "t_autoreg",
+		"apps": {
+			"myapp": {
+				"tenant_id": "t_autoreg",
+				"deployment_id": "d_1",
+				"status": "running",
+				"request_count": 0,
+				"outbound_bytes": 0,
+				"port": 8081
+			}
+		}
+	}`
+	msg := &nats.Msg{Data: []byte(heartbeatJSON)}
+	svc.handleHeartbeat(context.Background(), msg)
+
+	if !autoRegCalled {
+		t.Error("auto-register Upsert was not called after FK error")
+	}
+	if autoRegTenant != "t_autoreg" {
+		t.Errorf("auto-register called with tenant %q, want t_autoreg", autoRegTenant)
+	}
+}
