@@ -87,9 +87,8 @@ func TestSecretsAdminHandler_ReEncrypt_NoEncryptor(t *testing.T) {
 }
 
 func TestSecretsAdminHandler_ReEncrypt_WithEncryptionDisabled(t *testing.T) {
-	// nil encryptor but non-nil envSvc (encryption not configured in config).
-	enc, _ := service.NewSecretEncryptor("") // returns nil when key is empty
-	mux := newSecretsMux(enc, nil)
+	// nil encryptor means encryption is not configured.
+	mux := newSecretsMux(nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/secrets/re-encrypt", nil)
 	rr := httptest.NewRecorder()
