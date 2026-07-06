@@ -148,14 +148,27 @@ pub struct RuntimeState {
 
 impl RuntimeState {
     /// Test-only constructor. Ephemeral in-memory stores, no preopens,
-    /// permissive egress, sockets in `BlockAll` mode (the test-seam
-    /// default; tests that exercise the closure directly call
-    /// `socket_egress::make_socket_addr_check` instead).
+    /// permissive egress. `wasi:sockets` policy is the runtime default
+    /// (`BlockAll`); tests that exercise the closure directly call
+    /// `socket_egress::make_socket_addr_check`.
+    ///
+    /// Pre-PR #337 this constructed a `WasiCtx` inline with no
+    /// preopens. PR #337 changed it to call `build_wasi_ctx_for_tenant`,
+    /// which under `EDGE_FS_PATH` would `preopen_dir(base.join(""), "/", ...)`
+    /// — granting the test guest read-write access to the un-tenanted
+    /// `EDGE_FS_PATH` root. Reverted here: tests that need preopens
+    /// should call `with_env_and_meter` with a real tenant id.
     #[cfg(test)]
     pub fn new() -> Self {
         let env = Arc::new(process::filter_env_vars(std::env::vars()).collect::<HashMap<_, _>>());
+        let wasi_ctx = WasiCtxBuilder::new()
+            .envs(
+                &env.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
         let egress = Arc::new(EgressPolicy::allow_all());
-        let wasi_ctx = build_wasi_ctx_for_tenant(&env, "", &egress, SocketEgressPolicy::BlockAll);
         let exit_code = Arc::new(AtomicU32::new(0));
         let process = process::Process::with_env_and_exit_code(env.clone(), exit_code.clone());
         Self {
@@ -171,7 +184,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: String::new(),
             egress: egress.clone(),
-            socket_mode: SocketEgressPolicy::BlockAll,
+            socket_mode: SocketEgressPolicy::default(),
             http_hooks: EgressHttpHooks::new(egress, String::new()),
             exit_code,
             store_limits: None,
