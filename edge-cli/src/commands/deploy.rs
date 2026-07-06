@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use super::build;
 use super::state_io::load_state_optional;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
@@ -61,13 +62,15 @@ fn run_upload(
     } else {
         edge_toml.project.name.clone()
     };
+    // Artifact path is language-aware (issue #317): Rust projects
+    // land at `target/wasm32-wasip2/release/<name>.wasm`, JS at
+    // `target/javy/<name>.wasm`. `build::path_for` is the single
+    // source of truth — `commands::build::run` writes through it,
+    // we read through it, so the two paths can never disagree.
+    // `--file` still overrides when present.
     let artifact = match file {
         Some(f) => f.to_path_buf(),
-        None => path
-            .join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{}.wasm", app_name)),
+        None => build::path_for(path, &app_name, edge_toml.project.language_or_default()),
     };
 
     let wasm_bytes = std::fs::read(&artifact).map_err(|e| {

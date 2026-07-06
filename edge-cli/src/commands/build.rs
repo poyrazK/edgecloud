@@ -1,22 +1,88 @@
 //! `edge build` — compile the project to WebAssembly.
+//!
+//! The dispatch on source language lives in [`run`]. The current
+//! supported languages are `rust` (cargo build --target wasm32-wasip2)
+//! and `js` (javy compile). Each language writes its artifact to a
+//! language-namespaced path under `<project>/target/<lang>/` so multiple
+//! languages can coexist in the same checkout (e.g. a workspace that
+//! runs an integration fixture in JS against a Rust handler).
 
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::EdgeToml;
+use crate::LangArg;
 
 /// Compile the project to WebAssembly.
-pub fn run(path: &Path) -> Result<()> {
+pub fn run(path: &Path, lang: LangArg) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = &edge_toml.project.name;
 
     println!(
-        "Building '{}' (target: {})...",
-        project_name, edge_toml.project.target
+        "Building '{}' (target: {}, language: {})...",
+        project_name, edge_toml.project.target, lang,
     );
 
-    // Run cargo build for the wasm target
+    match lang {
+        LangArg::Rust => build_rust(path, project_name),
+        LangArg::Js => build_js(path, project_name),
+    }
+}
+
+/// Resolve the on-disk artifact path for a project. Single source of
+/// truth used by both `build.rs` (which writes the file) and
+/// `deploy.rs` (which reads it). Exposed `pub(crate)` so the deploy
+/// command can call it without duplicating the path layout.
+///
+/// Layout:
+/// - `rust` → `target/wasm32-wasip2/release/<name>.wasm` (cargo output)
+/// - `js`   → `target/javy/<name>.wasm`                  (javy output)
+/// - any other value defaults to the rust path; callers should
+///   reject unknown values before reaching here.
+pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> PathBuf {
+    match lang {
+        "rust" => project_root
+            .join("target")
+            .join("wasm32-wasip2")
+            .join("release")
+            .join(format!("{}.wasm", name)),
+        "js" => project_root
+            .join("target")
+            .join("javy")
+            .join(format!("{}.wasm", name)),
+        // Unknown language — fall back to the rust path. The caller
+        // (build / deploy) is expected to validate the value before
+        // reaching this helper and surface a friendly error; this
+        // fallback keeps `path_for` total so a bad value can't crash
+        // a read-only command that happens to look at the toml.
+        _ => project_root
+            .join("target")
+            .join("wasm32-wasip2")
+            .join("release")
+            .join(format!("{}.wasm", name)),
+    }
+}
+
+/// Locate the `javy` binary on PATH. Testable seam: pass any
+/// `which_fn` (e.g. `which::which`) and assert the discovered path
+/// or `None`. Mirrors the `Preprocessor::discover_with` pattern at
+/// `edge-migrate/edge-migrate-lib/src/preprocessor.rs:98-114`.
+///
+/// `which_fn` is invoked with the literal string `"javy"`. We do NOT
+/// consult a `$JAVY_PATH` env var (Javy has no standard install
+/// convention analogous to `$WASI_SDK_PATH`); users put javy on PATH.
+pub(crate) fn probe_javy_with<F>(which_fn: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    which_fn("javy")
+}
+
+/// Build via `cargo build --target wasm32-wasip2 --release`. The
+/// pre-language-dispatch original logic; kept verbatim so existing
+/// Rust projects get byte-identical output.
+fn build_rust(path: &Path, project_name: &str) -> Result<()> {
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
         .current_dir(path)
@@ -27,12 +93,7 @@ pub fn run(path: &Path) -> Result<()> {
         anyhow::bail!("cargo build failed");
     }
 
-    let artifact = path
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("release")
-        .join(format!("{}.wasm", project_name));
-
+    let artifact = path_for(path, project_name, "rust");
     if !artifact.exists() {
         anyhow::bail!("artifact not found at {}", artifact.display());
     }
@@ -40,4 +101,114 @@ pub fn run(path: &Path) -> Result<()> {
     println!("✓ Built successfully");
     println!("  Artifact: {}", artifact.display());
     Ok(())
+}
+
+/// Build via `javy compile -o <artifact> <source>`. Requires Javy
+/// v3.x on PATH; surfaces a friendly error with install URL if not.
+/// Captures Javy's stderr and surfaces it on non-zero exit (sharper
+/// than the Rust path's silent cargo-output).
+fn build_js(path: &Path, project_name: &str) -> Result<()> {
+    let javy = probe_javy_with(|name| which::which(name).ok()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`javy` was not found on PATH.\n  \
+             Install from https://github.com/bytecodealliance/javy/releases \
+             (v3.x recommended)\n  \
+             and ensure it is on your PATH before running `edge build --lang=js`."
+        )
+    })?;
+
+    let entry = path.join("index.js");
+    if !entry.is_file() {
+        anyhow::bail!(
+            "`index.js` not found in {} — create it (matching the `edge init --lang=js` \
+             starter) or pass the JS entry point as the positional.",
+            path.display(),
+        );
+    }
+
+    // Create the language-namespaced target dir idempotently.
+    let target_dir = path.join("target").join("javy");
+    std::fs::create_dir_all(&target_dir)?;
+
+    let artifact = target_dir.join(format!("{}.wasm", project_name));
+
+    // Use `Command::output()` (not `spawn/wait`) so Javy's stderr
+    // reaches the terminal on non-zero exit. Javy compile is fast
+    // enough that blocking on it is fine; we don't need streaming.
+    let output = Command::new(&javy)
+        .arg("compile")
+        .arg("-o")
+        .arg(&artifact)
+        .arg(&entry)
+        .current_dir(path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        crate::output::error(&format!("javy compile failed:\n{stderr}"));
+        anyhow::bail!("javy compile failed (see error above)");
+    }
+
+    if !artifact.exists() {
+        anyhow::bail!(
+            "javy exited successfully but artifact is missing at {}",
+            artifact.display(),
+        );
+    }
+
+    println!("✓ Built successfully");
+    println!("  Artifact: {}", artifact.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_javy_with_returns_none_when_javy_missing() {
+        let result = probe_javy_with(|_| None);
+        assert!(result.is_none(), "expected None, got {result:?}");
+    }
+
+    #[test]
+    fn probe_javy_with_returns_some_when_javy_on_path() {
+        let expected = PathBuf::from("/usr/local/bin/javy");
+        let result = probe_javy_with(|name| {
+            assert_eq!(name, "javy", "probe_javy must look up exactly 'javy'");
+            Some(expected.clone())
+        });
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn path_for_returns_rust_target_dir() {
+        let root = Path::new("/proj");
+        let got = path_for(root, "myapp", "rust");
+        assert_eq!(
+            got,
+            PathBuf::from("/proj/target/wasm32-wasip2/release/myapp.wasm")
+        );
+    }
+
+    #[test]
+    fn path_for_returns_javy_target_dir() {
+        let root = Path::new("/proj");
+        let got = path_for(root, "myapp", "js");
+        assert_eq!(got, PathBuf::from("/proj/target/javy/myapp.wasm"));
+    }
+
+    #[test]
+    fn path_for_falls_back_to_rust_for_unknown_language() {
+        // Defensive: an unrecognized lang falls back to the rust path
+        // rather than panicking, so a read-only command (status,
+        // apps get) that incidentally looks at the toml doesn't
+        // crash on a stale language field.
+        let root = Path::new("/proj");
+        let got = path_for(root, "myapp", "ruby");
+        assert_eq!(
+            got,
+            PathBuf::from("/proj/target/wasm32-wasip2/release/myapp.wasm")
+        );
+    }
 }

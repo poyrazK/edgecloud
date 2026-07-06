@@ -8,8 +8,38 @@ mod output;
 mod state;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::time::SystemTime;
+
+/// Source language for the `edge build` and `edge init` commands
+/// (issue #317 — Multi-language runtime support). Each variant maps
+/// to a dedicated build pipeline; the lowercase clap render (`rust`,
+/// `js`) is what the user types on the command line and what gets
+/// written into `[project] language = "..."` in `edge.toml`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LangArg {
+    Rust,
+    Js,
+}
+
+impl std::fmt::Display for LangArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl LangArg {
+    /// Lowercase string form used both as the clap value and as the
+    /// `edge.toml` `language` field. Kept here so `commands::build::path_for`
+    /// and friends can match on a `&str` rather than re-implementing
+    /// the per-variant rendering.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LangArg::Rust => "rust",
+            LangArg::Js => "js",
+        }
+    }
+}
 
 /// Generate a short unique suffix for preview deployments.
 fn short_hash() -> String {
@@ -89,10 +119,23 @@ enum Command {
         /// `~/.config/edgecloud/config.toml`, then the default.
         #[arg(long)]
         api: Option<String>,
+        /// Source language for the starter template. `rust` scaffolds
+        /// `Cargo.toml` + `src/main.rs`; `js` scaffolds `index.js`
+        /// (a wasi:http-only handler, built by Javy). The choice is
+        /// written into `[project] language = "..."` in `edge.toml`.
+        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
+        lang: LangArg,
     },
 
     /// Compile the project to WebAssembly.
-    Build,
+    Build {
+        /// Source language to build. Must match the project's
+        /// `[project] language` in `edge.toml` (the build does NOT
+        /// cross-check — mismatches surface as a missing artifact
+        /// at deploy time).
+        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
+        lang: LangArg,
+    },
 
     /// Upload the artifact to the edgeCloud control plane, or activate a stored one.
     ///
@@ -356,8 +399,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
-        Command::Build => commands::build::run(&cli.path),
+        Command::Init { name, api, lang } => commands::init::run(&name, api.as_deref(), lang),
+        Command::Build { lang } => commands::build::run(&cli.path, lang),
         Command::Deploy {
             app,
             id,
