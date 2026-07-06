@@ -582,7 +582,7 @@ func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		_ = mw.WriteField("app_name", "hello")
 		_ = mw.WriteField("language", "c")
 		_ = mw.WriteField("tree", `{"files":["main.c"]}`)
@@ -879,7 +879,7 @@ func TestMigrate_RejectsOversizedBody(t *testing.T) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		_ = mw.WriteField("filename", "hello.c")
 		_ = mw.WriteField("language", "c")
 		fw, _ := mw.CreateFormFile("file", "hello.c")

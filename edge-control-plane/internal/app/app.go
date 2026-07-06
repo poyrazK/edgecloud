@@ -345,7 +345,6 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
 	api.HandleFunc("PUT /api/v1/keys/{keyID}", apiKeyHandler.Update)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
-	api.HandleFunc("POST /api/v1/keys/{keyID}/rotate", apiKeyHandler.Rotate)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
 	api.HandleFunc("GET /api/v1/apps/{appName}/logs", logHandler.List)

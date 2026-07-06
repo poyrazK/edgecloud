@@ -55,3 +55,26 @@ type UpdateAPIKeyRequest struct {
 	Name *string `json:"name"` // nil = no change
 	Role *string `json:"role"` // nil = no change
 }
+
+// SafeAPIKeyResponse is what we return to the client without exposing the hash.
+type SafeAPIKeyResponse struct {
+	ID        string     `json:"id"`
+	TenantID  string     `json:"tenant_id"`
+	Name      string     `json:"name"`
+	Role      string     `json:"role"`
+	CreatedAt time.Time  `json:"created_at"`
+	LastUsed  *time.Time `json:"last_used"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+func (k *APIKey) ToSafeResponse() SafeAPIKeyResponse {
+	return SafeAPIKeyResponse{
+		ID:        k.ID,
+		TenantID:  k.TenantID,
+		Name:      k.Name,
+		Role:      k.Role,
+		CreatedAt: k.CreatedAt,
+		LastUsed:  k.LastUsed,
+		ExpiresAt: k.ExpiresAt,
+	}
+}

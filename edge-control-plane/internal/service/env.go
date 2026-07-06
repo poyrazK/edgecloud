@@ -110,3 +110,27 @@ func (s *EnvService) DecryptEnvMapBulk(ctx context.Context, tenantID string, app
 	}
 	return out, nil
 }
+
+// ReEncryptAll fetches all environment variables, decrypts them, and
+// re-encrypts them with the active key. Returns the number of values re-encrypted.
+func (s *EnvService) ReEncryptAll(ctx context.Context) (int, error) {
+	tenants, apps, err := s.appEnvRepo.ListAllApps(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	total := 0
+	for i := range tenants {
+		envs, err := s.ListEnv(ctx, tenants[i], apps[i])
+		if err != nil {
+			return total, err
+		}
+		for _, e := range envs {
+			if err := s.SetEnv(ctx, e.TenantID, e.AppName, e.EnvKey, e.EnvValue); err != nil {
+				return total, err
+			}
+			total++
+		}
+	}
+	return total, nil
+}

@@ -72,7 +72,7 @@ func (r *AppEnvRepository) ListAllApps(ctx context.Context) ([]string, []string,
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var t, a string
 		if err := rows.Scan(&t, &a); err != nil {

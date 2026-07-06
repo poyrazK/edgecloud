@@ -163,7 +163,6 @@ type APIKeyServiceInterface interface {
 	GetByID(ctx context.Context, id string) (*domain.APIKey, error)
 	DeleteAPIKey(ctx context.Context, tenantID, id string) error
 	UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error)
-	RotateAPIKey(ctx context.Context, tenantID, id string) (*domain.APIKey, string, error)
 }
 
 // GetByID returns a single API key by its prefixed ID (e.g. "k_<uuid>").
@@ -172,7 +171,14 @@ func (s *APIKeyService) GetByID(ctx context.Context, id string) (*domain.APIKey,
 	return s.apiKeyRepo.GetByID(ctx, id)
 }
 
-func (s *APIKeyService) DeleteAPIKey(ctx context.Context, id string) error {
+func (s *APIKeyService) DeleteAPIKey(ctx context.Context, tenantID, id string) error {
+	key, err := s.apiKeyRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if key == nil || key.TenantID != tenantID {
+		return ErrAPIKeyNotFound
+	}
 	return s.apiKeyRepo.Delete(ctx, id)
 }
 

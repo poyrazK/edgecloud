@@ -67,13 +67,13 @@ func (m *mockAPIKeySvc) GetByID(ctx context.Context, id string) (*domain.APIKey,
 	return m.getByIDResp, nil
 }
 
-func (m *mockAPIKeySvc) CreateAPIKey(ctx context.Context, tenantID, name, role string) (*domain.APIKey, string, error) {
+func (m *mockAPIKeySvc) CreateAPIKey(ctx context.Context, tenantID, name, role string, ttlHours *int) (*domain.APIKey, string, error) {
 	panic("not used by Whoami")
 }
 func (m *mockAPIKeySvc) ListAPIKeys(ctx context.Context, tenantID string) ([]domain.APIKey, error) {
 	panic("not used by Whoami")
 }
-func (m *mockAPIKeySvc) DeleteAPIKey(ctx context.Context, id string) error {
+func (m *mockAPIKeySvc) DeleteAPIKey(ctx context.Context, tenantID, id string) error {
 	panic("not used by Whoami")
 }
 func (m *mockAPIKeySvc) UpdateAPIKey(ctx context.Context, id, tenantID string, req *domain.UpdateAPIKeyRequest) (*domain.APIKey, error) {
