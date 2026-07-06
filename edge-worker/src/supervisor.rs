@@ -84,56 +84,51 @@ impl Supervisor {
             } => (tenant_id, apps),
         };
 
-        // Snapshot this tenant's running apps: (deployment_id, status).
-        // Filtered to `tenant_id` so other tenants' apps don't appear.
-        let current_apps: HashMap<String, (String, AppInstanceStatus)> = {
-            let state = self.state.read().await;
-            let mut map = HashMap::new();
-            for ((t, n), inst) in state.apps.iter() {
-                if t != &tenant_id {
-                    continue;
-                }
-                let inst = inst.lock().await;
-                map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
-            }
-            map
-        };
+        // Snapshot this tenant's running apps.
+        let current_apps = self.snapshot_current_apps(&tenant_id).await;
 
-        // Stop apps no longer in the desired set (within THIS tenant only).
-        for app_name in current_apps.keys() {
-            if !desired_apps.contains_key(app_name) {
-                if let Err(e) = self.stop_app(&tenant_id, app_name).await {
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        app_name,
-                        err = %e,
-                        "failed to stop app"
-                    );
-                }
+        let diff = compute_app_diff(&current_apps, &desired_apps);
+
+        for app_name in &diff.apps_to_stop {
+            if let Err(e) = self.stop_app(&tenant_id, app_name).await {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    app_name,
+                    err = %e,
+                    "failed to stop app"
+                );
             }
         }
 
-        // Start or update apps in the desired set.
-        for (app_name, spec) in &desired_apps {
-            let is_new = !current_apps.contains_key(app_name);
-            let is_changed = current_apps
-                .get(app_name)
-                .map(|(dep_id, _)| dep_id != &spec.deployment_id)
-                .unwrap_or(false);
-
-            if is_new || is_changed {
-                if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        app_name,
-                        err = %e,
-                        "failed to start app"
-                    );
-                }
+        for (app_name, spec) in &diff.apps_to_start {
+            if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    app_name,
+                    err = %e,
+                    "failed to start app"
+                );
             }
         }
 
         Ok(())
+    }
+
+    /// Snapshot this tenant's running apps: app_name → (deployment_id, status).
+    async fn snapshot_current_apps(
+        &self,
+        tenant_id: &str,
+    ) -> HashMap<String, (String, AppInstanceStatus)> {
+        let state = self.state.read().await;
+        let mut map = HashMap::new();
+        for ((t, n), inst) in state.apps.iter() {
+            if t != tenant_id {
+                continue;
+            }
+            let inst = inst.lock().await;
+            map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
+        }
+        map
     }
 
     /// Start a new app or restart a changed one.
@@ -983,19 +978,8 @@ impl Supervisor {
         // (tenant_id, app_name), see edge-ingress::config::ingress_host).
         for ((_tenant_id, app_name), inst) in &state.apps {
             let inst = inst.lock().await;
-            let status = match &inst.status {
-                AppInstanceStatus::Running => "running",
-                AppInstanceStatus::Starting => "starting",
-                AppInstanceStatus::Stopping => "stopping",
-                AppInstanceStatus::Crashed { .. } => "crashed",
-                AppInstanceStatus::Hung => "hung",
-            };
-            let exit_code = match &inst.status {
-                AppInstanceStatus::Running
-                | AppInstanceStatus::Starting
-                | AppInstanceStatus::Stopping => None,
-                AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
-            };
+            let status = app_status_to_string(&inst.status);
+            let exit_code = app_status_exit_code(&inst.status);
             let snap = inst.meter.snapshot();
 
             // Snapshot the app's MetricsAccumulator (guest edge:observe
@@ -1210,6 +1194,314 @@ impl Supervisor {
     async fn try_term(&self, msg: &async_nats::jetstream::Message) {
         if let Err(e) = self.nats.term(msg).await {
             tracing::error!(err = %e, "term() failed — message may be redelivered");
+        }
+    }
+}
+
+/// Result of diffing desired apps against current apps.
+#[derive(Debug)]
+pub struct AppDiff {
+    pub apps_to_stop: Vec<String>,
+    pub apps_to_start: Vec<(String, AppSpec)>,
+}
+
+/// Compute the set of apps to stop vs start based on current and desired sets.
+/// This is a pure function — no I/O, no state mutation.
+///
+/// `current_apps` maps app_name → (deployment_id, status) for a single tenant.
+/// `desired_apps` maps app_name → AppSpec for the same tenant.
+///
+/// Tenant filtering is expected to be done by the caller — this function
+/// operates on already-scoped maps.
+pub fn compute_app_diff(
+    current_apps: &HashMap<String, (String, AppInstanceStatus)>,
+    desired_apps: &HashMap<String, AppSpec>,
+) -> AppDiff {
+    let mut apps_to_stop = Vec::new();
+    let mut apps_to_start = Vec::new();
+
+    // Stop apps no longer in the desired set.
+    for app_name in current_apps.keys() {
+        if !desired_apps.contains_key(app_name) {
+            apps_to_stop.push(app_name.clone());
+        }
+    }
+
+    // Start or update apps in the desired set.
+    for (app_name, spec) in desired_apps {
+        let is_new = !current_apps.contains_key(app_name);
+        let is_changed = current_apps
+            .get(app_name)
+            .map(|(dep_id, _)| dep_id != &spec.deployment_id)
+            .unwrap_or(false);
+
+        if is_new || is_changed {
+            apps_to_start.push((app_name.clone(), spec.clone()));
+        }
+    }
+
+    AppDiff {
+        apps_to_stop,
+        apps_to_start,
+    }
+}
+
+/// Map an AppInstanceStatus to its heartbeat wire string.
+pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
+    match status {
+        AppInstanceStatus::Running => "running",
+        AppInstanceStatus::Starting => "starting",
+        AppInstanceStatus::Stopping => "stopping",
+        AppInstanceStatus::Crashed { .. } => "crashed",
+        AppInstanceStatus::Hung => "hung",
+    }
+}
+
+/// Map an AppInstanceStatus to its heartbeat exit_code.
+pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
+    match status {
+        AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Stopping => {
+            None
+        }
+        AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_spec(deployment_id: &str) -> AppSpec {
+        AppSpec {
+            deployment_id: deployment_id.to_string(),
+            deployment_hash: "abc123".to_string(),
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            max_memory_mb: 256,
+        }
+    }
+
+    fn make_status(deployment_id: &str, status: AppInstanceStatus) -> (String, AppInstanceStatus) {
+        (deployment_id.to_string(), status)
+    }
+
+    fn running(deployment_id: &str) -> (String, AppInstanceStatus) {
+        make_status(deployment_id, AppInstanceStatus::Running)
+    }
+
+    // ── app_status_to_string tests ──────────────────────────────────
+
+    #[test]
+    fn status_to_string_running() {
+        assert_eq!(app_status_to_string(&AppInstanceStatus::Running), "running");
+    }
+
+    #[test]
+    fn status_to_string_starting() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Starting),
+            "starting"
+        );
+    }
+
+    #[test]
+    fn status_to_string_stopping() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Stopping),
+            "stopping"
+        );
+    }
+
+    #[test]
+    fn status_to_string_crashed() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Crashed { restart_count: 5 }),
+            "crashed"
+        );
+    }
+
+    #[test]
+    fn status_to_string_hung() {
+        assert_eq!(app_status_to_string(&AppInstanceStatus::Hung), "hung");
+    }
+
+    // ── app_status_exit_code tests ──────────────────────────────────
+
+    #[test]
+    fn exit_code_running_is_none() {
+        assert_eq!(app_status_exit_code(&AppInstanceStatus::Running), None);
+    }
+
+    #[test]
+    fn exit_code_crashed_is_some() {
+        assert_eq!(
+            app_status_exit_code(&AppInstanceStatus::Crashed { restart_count: 3 }),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn exit_code_hung_is_some() {
+        assert_eq!(app_status_exit_code(&AppInstanceStatus::Hung), Some(1));
+    }
+
+    // ── compute_app_diff tests ──────────────────────────────────────
+
+    #[test]
+    fn diff_new_app_is_started() {
+        let current = HashMap::new();
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].0, "api");
+        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d1");
+    }
+
+    #[test]
+    fn diff_same_app_same_deployment_is_noop() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_changed_deployment_triggers_restart() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d2"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].0, "api");
+        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d2");
+    }
+
+    #[test]
+    fn diff_missing_app_is_stopped() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let desired = HashMap::new();
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], "api");
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_empty_current_starts_all() {
+        let current = HashMap::new();
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+        desired.insert("worker".to_string(), make_spec("d2"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 2);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+    }
+
+    #[test]
+    fn diff_empty_desired_stops_all() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        current.insert("worker".to_string(), running("d2"));
+        let desired = HashMap::new();
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 2);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_mixed_scenario() {
+        let mut current = HashMap::new();
+        current.insert("keep".to_string(), running("d1"));
+        current.insert("stop_me".to_string(), running("d2"));
+        current.insert("update_me".to_string(), running("d3"));
+        let mut desired = HashMap::new();
+        desired.insert("keep".to_string(), make_spec("d1")); // unchanged
+        desired.insert("update_me".to_string(), make_spec("d4")); // changed
+        desired.insert("new_app".to_string(), make_spec("d5")); // new
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop, vec!["stop_me"]);
+        assert_eq!(diff.apps_to_start.len(), 2);
+        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "update_me"));
+        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "new_app"));
+        assert_eq!(
+            diff.apps_to_start
+                .iter()
+                .find(|(n, _)| n == "update_me")
+                .unwrap()
+                .1
+                .deployment_id,
+            "d4"
+        );
+    }
+
+    #[test]
+    fn diff_crashed_app_still_detected_as_running() {
+        let mut current = HashMap::new();
+        current.insert(
+            "api".to_string(),
+            make_status("d1", AppInstanceStatus::Crashed { restart_count: 3 }),
+        );
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d2"));
+
+        // Even though crashed, the app exists — changing deployment_id should trigger start.
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 1);
+    }
+
+    #[test]
+    fn diff_self_corrects_on_same_deployment_after_crash() {
+        let mut current = HashMap::new();
+        current.insert(
+            "api".to_string(),
+            make_status("d1", AppInstanceStatus::Crashed { restart_count: 5 }),
+        );
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        // Same deployment_id, crashed — the diff says no-op because the
+        // supervisor's restart loop handles the crash. The control plane
+        // needs to send a new deployment_id to trigger a restart.
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_non_running_statuses() {
+        for status in &[
+            AppInstanceStatus::Starting,
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Stopping,
+        ] {
+            let mut current = HashMap::new();
+            current.insert("api".to_string(), make_status("d1", status.clone()));
+            let mut desired = HashMap::new();
+            desired.insert("api".to_string(), make_spec("d2"));
+
+            let diff = compute_app_diff(&current, &desired);
+            assert_eq!(
+                diff.apps_to_start.len(),
+                1,
+                "should restart for status {:?}",
+                status
+            );
         }
     }
 }
