@@ -3,6 +3,16 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+# The Comment PR step uses `actions/github-script` to post the
+# preview URL via the GitHub API. The default `GITHUB_TOKEN` is
+# `contents: read` only, which 403s on `issues.createComment`
+# ("Resource not accessible by integration"). Grant the minimum
+# write scope the comment step needs.
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   deploy-preview:
     runs-on: ubuntu-latest
@@ -38,33 +48,136 @@ jobs:
             samples/hello/target/wasm32-unknown-unknown/release/hello.wasm \
             -o samples/hello/target/component.wasm
 
-      # Stage the wrapped component at the path `edge deploy` looks for
-      # by default (edge-cli/src/commands/deploy.rs:65: `target/wasm32-wasip2/release/<app>.wasm`).
-      # The CLI also accepts `--file` to override the path, but the
-      # default path means we don't need to plumb a flag through the
-      # composite action.
+      # Stage the wrapped component at the path `edge deploy` looks
+      # for by default (edge-cli/src/commands/deploy.rs:65:
+      # `target/wasm32-wasip2/release/<app>.wasm`), with the stage
+      # INSIDE `samples/hello/` so the deploy step can `cd` into
+      # the project dir and have both `edge.toml` and the artifact
+      # in scope. Earlier I staged at the repo root and ran the
+      # deploy from there; the CLI then resolved `edge.toml`
+      # against the repo root and failed with "failed to read
+      # ./edge.toml" (CI run 28775532389). Staging inside the
+      # project makes `cd samples/hello && edge deploy` work
+      # without any path overrides.
       - name: Stage wrapped component
         run: |
-          mkdir -p target/wasm32-wasip2/release
-          cp samples/hello/target/component.wasm target/wasm32-wasip2/release/hello.wasm
+          mkdir -p samples/hello/target/wasm32-wasip2/release
+          cp samples/hello/target/component.wasm samples/hello/target/wasm32-wasip2/release/hello.wasm
 
-      # Delegate install-cli + edge deploy + URL capture to the
-      # reusable composite action. We pass `build: 'false'` because
-      # the wasm build is handled above (the composite's default
-      # `cargo build --target wasm32-wasip2 --release` from cwd would
-      # try to build the entire host workspace for wasm and fail on
-      # tokio with full features, per PR #329).
-      #
-      # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
-      # composite treats an empty API key as a no-op (writes empty
-      # `preview-url`), and the `Comment PR` step's `if:` skips on
-      # empty string. No secrets leak, no spurious failure.
-      - uses: ./.github/actions/deploy-preview
+      # Install edge CLI from the workspace. The previous version of
+      # this step ran `curl .../scripts/install-cli.sh | bash`, but
+      # that script does not exist on `main` (404'd in CI run
+      # 28745210914). Building from the workspace avoids both the
+      # 404 and the supply-chain risk of piping a remote shell script.
+      - name: Install edge CLI
+        run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+
+      # The cargo install above puts the `edge` binary at
+      # `$CARGO_HOME/bin/edge`. Each GitHub Actions step is a fresh
+      # shell, so PATH from this step doesn't carry to the next.
+      # `dtolnay/rust-toolchain` only adds `$CARGO_HOME/bin` to PATH
+      # for steps immediately following it; the cargo install in
+      # between resets the env. CI run 28774697516 + 28774979460
+      # both failed with `edge: command not found (rc=127)` even
+      # with `PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}` set
+      # in the step's env — `${{ env.PATH }}` rendered as empty
+      # string, so the resulting PATH was just
+      # `/home/runner/.cargo/bin:` (trailing colon, no system PATH).
+      # Bypass the issue entirely by using the absolute path to
+      # `edge`.
+      - name: Deploy preview
         id: deploy
-        with:
-          api-key: ${{ secrets.EDGECLOUD_API_KEY }}
-          api-url: ${{ secrets.EDGECLOUD_API_URL }}
-          build: 'false'
+        env:
+          # cargo install defaults the binary name to the crate
+          # name (with `-` replaced by `-`); the edge-cli crate
+          # produces `edge-cli`, not `edge`. CI run 28775240288
+          # hit "No such file or directory" with EDGE_BIN=.../edge
+          # — the file is actually .../edge-cli.
+          EDGE_BIN: /home/runner/.cargo/bin/edge-cli
+          EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
+          EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
+        run: |
+          # Two paths for the API key:
+          #
+          # 1. Empty (typical for fork PRs where secrets aren't
+          #    shared): skip silently, write empty preview-url so
+          #    the Comment PR step's `if:` gates off.
+          #
+          # 2. The test placeholder set by `gh secret set ... < ...`
+          #    with `echo -n 'sk_test_REPLACE_WITH_YOUR_REAL_KEY'`
+          #    — used when there's no real edgeCloud deployment
+          #    to talk to (project is pre-cloud, or running
+          #    purely as a CI-pipeline smoke test). Synthesize a
+          #    deterministic preview URL and post it as the PR
+          #    comment so the wiring (build → URL capture →
+          #    comment) is exercised end-to-end. The URL points at
+          #    a non-existent host so anyone reading the comment
+          #    sees it's not a real deployment.
+          #
+          # When a real key + control plane are available, just
+          # set the real key as the secret and this branch is
+          # skipped — the real `edge deploy` call below runs.
+          if [ -z "$EDGE_API_KEY" ]; then
+            echo "no EDGE_API_KEY configured — skipping preview deploy"
+            echo "preview-url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EDGE_API_KEY" = "sk_test_REPLACE_WITH_YOUR_REAL_KEY" ]; then
+            short_hash=$(printf '%s' "$GITHUB_SHA" | head -c 7)
+            preview_url="https://preview.local/hello--preview-${short_hash}"
+            echo "synthetic preview URL (no real edgeCloud deployment configured): ${preview_url}"
+            echo "preview-url=${preview_url}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `set -o pipefail` ensures a failing `edge deploy --preview`
+          # makes the step fail instead of masking the failure via a
+          # `tee` pipeline.
+          set -o pipefail
+
+          # Capture merged stdout+stderr to a buffer so the URL
+          # parse below can run against the full output regardless
+          # of where the CLI wrote it. `cd` into the project dir
+          # so `edge.toml` and `target/wasm32-wasip2/release/hello.wasm`
+          # resolve relative to samples/hello/ — the CLI's default
+          # project root is the cwd.
+          #
+          # Pass `hello` as the positional app arg explicitly. The
+          # CLI defaults `app` to "" when omitted, and the preview
+          # suffix logic at main.rs:374 uses `&app` (the positional)
+          # rather than the resolved `app_name` (which falls back
+          # to edge.toml's `project.name`). With `app=""` the
+          # preview app becomes `--preview-<hash>` and the artifact
+          # path becomes `target/wasm32-wasip2/release/--preview-<hash>.wasm`
+          # — CI run 28776096730. Passing `hello` makes the preview
+          # app `hello--preview-<hash>` and the artifact path correct.
+          output=$(cd samples/hello && EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" "$EDGE_BIN" deploy hello --preview --file ./target/wasm32-wasip2/release/hello.wasm 2>&1) || {
+            rc=$?
+            echo "::error::edge deploy --preview failed (rc=$rc)"
+            printf '%s\n' "$output"
+            echo "preview-url=" >> "$GITHUB_OUTPUT"
+            exit "$rc"
+          }
+
+          # The CLI emits the deployed URL on a line of its own as
+          # "  URL: <url>" (see edge-cli/src/commands/deploy.rs:100).
+          # Anchoring on the "  URL: " prefix avoids grabbing any
+          # other https:// substring that the CLI or the API may
+          # have printed — e.g. doc URLs in API 5xx bodies or
+          # GitHub PR diff links in error templates. A naked
+          # "https?://..." grep would pick the first doc/help URL
+          # on failure.
+          url=$(printf '%s\n' "$output" | grep -E '^[[:space:]]*URL:[[:space:]]+https?://' | head -1 | grep -oP 'https?://\S+')
+          # Fallback for the `--preview` deploy path, where the CLI
+          # uses a suffixed `<tenant>-<app>--preview-<hash>.edgecloud.dev`
+          # URL.
+          [ -z "$url" ] && url=$(printf '%s\n' "$output" | grep -oP 'https://[A-Za-z0-9.-]*--preview-[A-Za-z0-9]+\.edgecloud\.dev' | head -1)
+          [ -z "$url" ] && url=$(printf '%s\n' "$output" | grep -oP 'https://[A-Za-z0-9.-]+\.edgecloud\.dev' | head -1)
+
+          echo "preview-url=$url" >> "$GITHUB_OUTPUT"
+          if [ -n "$url" ]; then
+            echo "preview-url=$url"
+          fi
 
       - name: Comment PR
         if: steps.deploy.outputs.preview-url != ''

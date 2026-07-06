@@ -69,3 +69,5 @@ wasmtime-only and its dep `.wit` files don't carry top-level
 `wit-bindgen` (with package decls and a `wasi:http/outgoing-handler`
 import on the handler world), so the sample points at it instead of
 duplicating 33 files.
+
+<!-- trigger preview CI for end-to-end verification -->

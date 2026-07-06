@@ -1,10 +1,6 @@
 name: 'edgeCloud Deploy Preview'
 description: 'Deploy a preview app to edgeCloud and expose the deployed URL as a step output. Optionally comments the URL on the originating PR.'
 inputs:
-  api-key:
-    description: 'edgeCloud API key. Empty/omitted → no-op (writes empty `preview-url` output). Lets fork PRs use this action without secrets.'
-    required: false
-    default: ''
   api-url:
     description: 'edgeCloud API URL'
     required: false
@@ -17,6 +13,10 @@ inputs:
     description: 'When "true", post a comment with the preview URL on the PR that triggered this run. Only meaningful on `pull_request` events.'
     required: false
     default: 'false'
+secrets:
+  api-key:
+    description: 'edgeCloud API key. Empty/omitted → no-op (writes empty `preview-url` output). Lets fork PRs use this action without secrets. The workflow must pass `secrets: inherit` for this to be populated.'
+    required: false
 outputs:
   preview-url:
     description: 'URL of the deployed preview. Empty when the API key is absent, the deploy fails, or the CLI does not emit a URL.'
@@ -49,10 +49,26 @@ runs:
     - name: Deploy preview
       id: deploy
       shell: bash
-      env:
-        EDGE_API_KEY: ${{ inputs.api-key }}
-        EDGE_API_URL: ${{ inputs.api-url }}
+      # Reference the secret via `${{ secrets.api-key }}` inline rather
+      # than declaring `env:` at the step level. CI runs 28747490693 +
+      # 28747658310 both hit "no EDGE_API_KEY configured" with the env:
+      # binding AND with inline `${{ inputs.api-key }}` expansion —
+      # because `api-key` was declared as an `input`, but composite
+      # actions don't reliably propagate `secrets.X` references into
+      # `inputs.X` when the caller's `with:` does `api-key: ${{ secrets.X }}`
+      # (the value reaches `inputs.api-key` as a string, but in this
+      # particular binding combo the runner substitutes the template
+      # with the empty string).
+      #
+      # Moving `api-key` to a `secrets:` block + having the workflow
+      # pass `secrets: inherit` makes the value available via the
+      # `secrets.X` context, which the runner substitutes inline
+      # before bash starts.
       run: |
+        EDGE_API_KEY="${{ secrets.api-key }}"
+        EDGE_API_URL="${{ inputs.api-url }}"
+        export EDGE_API_KEY EDGE_API_URL
+
         # Skip silently when no API key is configured (typical for
         # fork PRs where secrets aren't shared). The downstream
         # "Comment PR" step gates on `preview-url != ''` so this is a
