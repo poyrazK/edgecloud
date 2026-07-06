@@ -1587,4 +1587,41 @@ mod tests {
             );
         }
     }
+
+    // ── StandbyPool tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_standby_pool_acquire_and_release() {
+        let pool = StandbyPool::new(2).expect("failed to create pool");
+        // Acquire 2 engines (should be fast, no 500ms delay)
+        let start = std::time::Instant::now();
+        let e1 = pool.acquire().await;
+        let _e2 = pool.acquire().await;
+        assert!(start.elapsed().as_millis() < 500, "Should not timeout");
+        
+        // Release 1
+        pool.release(e1);
+        
+        // We should be able to acquire again fast
+        let start2 = std::time::Instant::now();
+        let _e3 = pool.acquire().await;
+        assert!(start2.elapsed().as_millis() < 500, "Should not timeout after release");
+    }
+
+    #[tokio::test]
+    async fn test_standby_pool_exhaustion_fallback() {
+        let pool = StandbyPool::new(1).expect("failed to create pool");
+        
+        // Acquire the only engine in the pool
+        let _e1 = pool.acquire().await;
+        
+        // The pool is now empty. The next acquire should timeout (500ms) and fallback
+        // to a new transient engine without crashing.
+        let start = std::time::Instant::now();
+        let _e2 = pool.acquire().await;
+        let elapsed = start.elapsed();
+        
+        // It should have taken at least 500ms for the timeout
+        assert!(elapsed.as_millis() >= 450, "Should have hit the timeout before fallback");
+    }
 }
