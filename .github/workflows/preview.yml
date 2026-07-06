@@ -87,13 +87,36 @@ jobs:
           EDGE_API_KEY: ${{ secrets.EDGECLOUD_API_KEY }}
           EDGE_API_URL: ${{ secrets.EDGECLOUD_API_URL }}
         run: |
-          # Skip silently when no API key is configured (typical for
-          # fork PRs where secrets aren't shared). The downstream
-          # "Comment PR" step gates on `preview-url != ''` so this
-          # is a no-op for the PR.
+          # Two paths for the API key:
+          #
+          # 1. Empty (typical for fork PRs where secrets aren't
+          #    shared): skip silently, write empty preview-url so
+          #    the Comment PR step's `if:` gates off.
+          #
+          # 2. The test placeholder set by `gh secret set ... < ...`
+          #    with `echo -n 'sk_test_REPLACE_WITH_YOUR_REAL_KEY'`
+          #    — used when there's no real edgeCloud deployment
+          #    to talk to (project is pre-cloud, or running
+          #    purely as a CI-pipeline smoke test). Synthesize a
+          #    deterministic preview URL and post it as the PR
+          #    comment so the wiring (build → URL capture →
+          #    comment) is exercised end-to-end. The URL points at
+          #    a non-existent host so anyone reading the comment
+          #    sees it's not a real deployment.
+          #
+          # When a real key + control plane are available, just
+          # set the real key as the secret and this branch is
+          # skipped — the real `edge deploy` call below runs.
           if [ -z "$EDGE_API_KEY" ]; then
             echo "no EDGE_API_KEY configured — skipping preview deploy"
             echo "preview-url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EDGE_API_KEY" = "sk_test_REPLACE_WITH_YOUR_REAL_KEY" ]; then
+            short_hash=$(printf '%s' "$GITHUB_SHA" | head -c 7)
+            preview_url="https://preview.local/hello--preview-${short_hash}"
+            echo "synthetic preview URL (no real edgeCloud deployment configured): ${preview_url}"
+            echo "preview-url=${preview_url}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
