@@ -45,6 +45,8 @@
 //! - L31: wasi:sockets BlockAll default — `l31_socket_egress_block_all_denies_under_default` (this file)
 //! - L32: wasi:sockets AllowList + hard-deny target — `l32_socket_egress_allowlist_blocks_hard_deny_ip` (this file)
 //! - L33: wasi:sockets AllowList + public IP — `l33_socket_egress_allowlist_permits_public_ip` (this file)
+//! - L34: wasi:http TLS handshake — `l34_handler_dispatch_completes_real_tls_handshake` (this file)
+//! - L35: ALPN h2 routing — `l35_handler_dispatch_h2_alpn_routes_to_h2_dispatcher` (this file)
 //!
 //! ## Skip policy
 //!
@@ -68,8 +70,10 @@ use edge_runtime::socket_egress::SocketEgressPolicy;
 use edge_runtime::{
     create_component_linker_handler, create_engine, EgressPolicy, RequestMeter, RuntimeState,
 };
-use edge_worker::dispatch::{HandlerConfig, HandlerDispatch};
+use edge_worker::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
+use rcgen::generate_simple_self_signed;
 use reqwest::StatusCode;
+use std::io::Write;
 use tokio::sync::broadcast;
 use wasmtime::component::{Component, InstancePre};
 
@@ -521,6 +525,17 @@ async fn l7_per_request_timeout_returns_500() {
 /// arbitrary `HandlerConfig` so tests can vary body caps, timeouts, and
 /// other knobs without repeating the full setup.
 async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Sender<()>) {
+    spawn_handler_with_tls_config(config, None).await
+}
+
+/// Same as `spawn_handler_with_config` but lets the test opt into TLS.
+/// Mirrors the production supervisor's `try_load_tls_config` +
+/// `tls_config` wiring at `edge-worker/src/supervisor.rs:433-441` (issue
+/// #209 + follow-up #272). Used by the L34/L35 e2e TLS tests.
+async fn spawn_handler_with_tls_config(
+    config: HandlerConfig,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> (u16, broadcast::Sender<()>) {
     let path = handler_fixture_path().expect("handler.wasm fixture missing");
     let engine = create_engine().expect("create_engine");
     let linker = create_component_linker_handler(&engine).expect("create_component_linker_handler");
@@ -534,7 +549,7 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
     let port = ephemeral_port().expect("bind ephemeral port");
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(instance_pre, port, 5_000, 10, config, None)
+        HandlerDispatch::new(instance_pre, port, 5_000, 10, config, tls_config)
             .expect("HandlerDispatch::new"),
     );
 
@@ -1991,6 +2006,143 @@ async fn l33_socket_egress_allowlist_permits_public_ip() {
         "non-hard-denied IP under non-empty allowlist + AllowList must \
          either be permitted by the closure or fail at the kernel level \
          (not a policy denial like 'deny:hostname-resolved-to-...'; got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+// ── L34–L35: wasi:http TLS handshake (issue #345) ───────────────────────
+//
+// These tests prove the runtime-side TLS plumbing in
+// `edge-worker/src/dispatch.rs::HandlerDispatch` (issue #209) actually
+// completes a real handshake and dispatches to the right h1/h2 path
+// based on ALPN. The unit tests in `dispatch.rs::tls_tests` only
+// cover `try_load_tls_config` (loading). End-to-end handshake coverage
+// starts here.
+
+/// L34: spin up a `HandlerDispatch` with TLS enabled, point a
+/// `reqwest::Client` at it, and assert the handshake completes and
+/// the fixture's hello JSON returns 200 OK. Uses `rcgen` to mint a
+/// self-signed cert at test time (no fixtures in the repo).
+#[tokio::test(flavor = "multi_thread")]
+async fn l34_handler_dispatch_completes_real_tls_handshake() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    // rustls 0.23 requires a CryptoProvider before constructing any
+    // ServerConfig. Install the ring-based default (matches the unit
+    // tests in `dispatch.rs::tls_tests`).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    // 1. Mint an `localhost`-SAN self-signed cert + key.
+    let cert = generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen self-signed");
+    let cert_der = cert.cert.der().clone();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+
+    let mut cert_file = tempfile::NamedTempFile::new().expect("cert tempfile");
+    cert_file
+        .write_all(cert_pem.as_bytes())
+        .expect("write cert pem");
+    let mut key_file = tempfile::NamedTempFile::new().expect("key tempfile");
+    key_file
+        .write_all(key_pem.as_bytes())
+        .expect("write key pem");
+
+    // 2. Load + wire into a HandlerConfig. Mirrors the production
+    //    supervisor wiring at `supervisor.rs:433-441`.
+    let tls_config = try_load_tls_config(
+        &Some(cert_file.path().to_str().unwrap().into()),
+        &Some(key_file.path().to_str().unwrap().into()),
+    )
+    .expect("try_load_tls_config parsed the synthetic PEMs");
+
+    let cfg = test_config("l34");
+    let (port, shutdown_tx) = spawn_handler_with_tls_config(cfg, Some(tls_config)).await;
+
+    // 3. HTTPS GET via rustls-tls, pinning the self-signed cert.
+    let cl = reqwest::Client::builder()
+        .https_only(true)
+        .add_root_certificate(
+            reqwest::Certificate::from_der(&cert_der).expect("cert as reqwest::Certificate"),
+        )
+        .build()
+        .expect("reqwest::Client");
+    let resp = cl
+        .get(format!("https://localhost:{port}/"))
+        .send()
+        .await
+        .expect("HTTPS GET");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("\"hello\":\"handler\""),
+        "expected the fixture's hello JSON, got: {body:?}"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+/// L35: same setup as L34, but negotiate HTTP/2 via ALPN (the
+/// dispatcher's `try_load_tls_config` advertises `[h2, http/1.1]`),
+/// routing to `serve_connection_h2` at
+/// `edge-worker/src/dispatch.rs:441`. Verifies the h2 dispatcher
+/// branch doesn't panic and serves the same 200.
+///
+/// (Earlier draft used `http2_prior_knowledge()` to skip ALPN, but
+/// that sends a direct h2 client preface while the dispatcher
+/// still inspects ALPN to pick between h1/h2 — the connection was
+/// torn down because the server side expected the h1 path.)
+#[tokio::test(flavor = "multi_thread")]
+async fn l35_handler_dispatch_h2_alpn_routes_to_h2_dispatcher() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert = generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen self-signed");
+    let cert_der = cert.cert.der().clone();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+
+    let mut cert_file = tempfile::NamedTempFile::new().expect("cert tempfile");
+    cert_file
+        .write_all(cert_pem.as_bytes())
+        .expect("write cert pem");
+    let mut key_file = tempfile::NamedTempFile::new().expect("key tempfile");
+    key_file
+        .write_all(key_pem.as_bytes())
+        .expect("write key pem");
+
+    let tls_config = try_load_tls_config(
+        &Some(cert_file.path().to_str().unwrap().into()),
+        &Some(key_file.path().to_str().unwrap().into()),
+    )
+    .expect("try_load_tls_config parsed the synthetic PEMs");
+
+    let cfg = test_config("l35");
+    let (port, shutdown_tx) = spawn_handler_with_tls_config(cfg, Some(tls_config)).await;
+
+    // Default reqwest advertises ALPN `[h2, http/1.1]`; the
+    // dispatcher's rustls config (built by `try_load_tls_config`)
+    // advertises the same. ALPN picks `h2`, the dispatcher detects
+    // it (dispatch.rs:353-365), and the request is dispatched to
+    // `serve_connection_h2`.
+    let cl = reqwest::Client::builder()
+        .https_only(true)
+        .add_root_certificate(
+            reqwest::Certificate::from_der(&cert_der).expect("cert as reqwest::Certificate"),
+        )
+        .build()
+        .expect("reqwest::Client");
+    let resp = cl
+        .get(format!("https://localhost:{port}/"))
+        .send()
+        .await
+        .expect("HTTPS GET via ALPN h2");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("\"hello\":\"handler\""),
+        "expected the fixture's hello JSON via ALPN h2, got: {body:?}"
     );
 
     let _ = shutdown_tx.send(());
