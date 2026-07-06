@@ -357,13 +357,13 @@ func TestVerifyBootstrapJWT_ExpiredToken(t *testing.T) {
 func TestVerifyBootstrapJWT_TamperedToken(t *testing.T) {
 	cfg := testBootstrapCfg()
 	token, _ := IssueBootstrapJWT(cfg, "w1", "t1", "fra")
-	// Tamper the token by changing the payload.
+	// Corrupt the signature part of the token.
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		t.Fatalf("expected 3 parts, got %d", len(parts))
 	}
-	// Replace the payload with base64 of {"sub":"hacker"}.
-	tampered := parts[0] + ".eyJzdWIiOiJoYWNrZXIifQ." + parts[2]
+	// Replace the signature with garbage.
+	tampered := parts[0] + "." + parts[1] + ".invalidsignature"
 	_, err := VerifyBootstrapJWT(tampered, cfg)
 	if err == nil {
 		t.Fatal("expected error for tampered token")
