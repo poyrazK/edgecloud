@@ -1,0 +1,122 @@
+--- a/src/sockets/mod.rs
++++ b/src/sockets/mod.rs
+@@ -160,6 +160,47 @@ impl Default for SocketAddrCheck {
+         Self(Arc::new(|_, _| Box::pin(async { false })))
+     }
+ }
++
++/// A check that will be called for each DNS hostname resolution a
++/// guest requests via `wasi:sockets/ip-name-lookup::resolve-addresses`.
++///
++/// Mirrors [`SocketAddrCheck`] (the connect-side analog), but
++/// applied at the DNS resolution boundary. Returning `true` permits
++/// the resolution and lets the upstream resolver proceed; returning
++/// `false` denies the resolve call with
++/// `ErrorCode::PermanentResolverFailure`.
++///
++/// The closure is fired from
++/// `wasmtime-wasi-45.0.3/src/p2/ip_name_lookup.rs:21-39` (the
++/// upstream `Host for WasiSocketsCtxView::resolve_addresses` impl)
++/// before the kernel resolver runs, so a host that wants to gate
++/// raw-socket egress on observed DNS resolutions can populate a
++/// per-Network cache here and check it in the connect-side
++/// `SocketAddrCheck` closure.
++#[derive(Clone)]
++pub(crate) struct ResolveAddressCheck(
++    Arc<
++        dyn Fn(String, SocketAddrUse) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++            + Send
++            + Sync,
++    >,
++);
++
++impl ResolveAddressCheck {
++    pub(crate) fn new<F>(f: F) -> Self
++    where
++        F: Fn(String, SocketAddrUse) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++            + Send
++            + Sync
++            + 'static,
++    {
++        Self(Arc::new(f))
++    }
++
++    pub(crate) async fn check(
++        &self,
++        host: String,
++        use_: SocketAddrUse,
++    ) -> std::io::Result<()> {
++        if (self.0)(host, use_).await {
++            Ok(())
++        } else {
++            Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "An address was not permitted by the resolve address check.",
++            ))
++        }
++    }
++}
++
++impl Default for ResolveAddressCheck {
++    fn default() -> Self {
++        Self(Arc::new(|_, _| Box::pin(async { true })))
++    }
++}
+
+--- a/src/ctx.rs
++++ b/src/ctx.rs
+@@ pub fn socket_addr_check<F>(&mut self, check: F) -> &mut Self {
+         self
+     }
++
++    /// Install a closure that will be consulted for every
++    /// `wasi:sockets/ip-name-lookup::resolve-addresses` call before
++    /// the upstream resolver runs. Mirrors
++    /// [`WasiCtxBuilder::socket_addr_check`] for the connect-side
++    /// analog. Closing the bypass documented in edge-runtime
++    /// issue #309: a tenant with a hostname allowlist is opted
++    /// into raw-socket egress only for IPs the guest previously
++    /// resolved under allowlisted hostnames.
++    pub fn resolve_address_check<F>(&mut self, f: F) -> &mut Self
++    where
++        F: Fn(String, SocketAddrUse) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++            + Send
++            + Sync
++            + 'static,
++    {
++        self.sockets.resolve_address_check = ResolveAddressCheck::new(f);
++        self
++    }
+
+--- a/src/p2/network.rs
++++ b/src/p2/network.rs
+@@ pub struct Network {
+-    pub(crate) socket_addr_check: SocketAddrCheck,
++    pub(crate) socket_addr_check: SocketAddrCheck,
++    pub(crate) resolve_address_check: ResolveAddressCheck,
+     pub(crate) allow_ip_name_lookup: bool,
+ }
+
+--- a/src/p2/ip_name_lookup.rs
++++ b/src/p2/ip_name_lookup.rs
+@@ impl Host for WasiSocketsCtxView<'_> {
+     fn resolve_addresses(
+         &mut self,
+         network: Resource<Network>,
+         name: String,
+     ) -> Result<Resource<ResolveAddressStream>, SocketError> {
+         let network = self.table.get(&network)?;
++        // Consult the host-side ResolveAddressCheck before resolving.
++        // Closing the bypass documented in edge-runtime issue #309:
++        // a tenant who has a hostname allowlist is opted into
++        // raw-socket egress only for IPs the guest previously resolved
++        // under allowlisted hostnames. The host closure is responsible
++        // for populating a per-Network cache; the connect-side
++        // SocketAddrCheck (wired separately by the host) consults it.
++        if let Err(e) = network.resolve_address_check
++            .check(name.clone(), SocketAddrUse::TcpConnect)
++            .await
++        {
++            return Err(SocketError::from(ErrorCode::PermanentResolverFailure));
++        }
+         let host = parse_host(&name)?;
