@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -111,6 +112,38 @@ type StorageConfig struct {
 	// peer pull-through request).
 	PeerControlPlaneURL           string `yaml:"peer_control_plane_url"`
 	PeerControlPlaneInternalToken string `yaml:"peer_control_plane_internal_token"`
+
+	// RegionArtifactCaches maps a region identifier (matching the
+	// IsValidRegion pattern, `^[a-z0-9][a-z0-9-]{0,63}$`) to the base
+	// URL of the per-region `edge-artifact-cache` binary serving that
+	// region. Issue #332 (Layer 3: Push-to-Edge).
+	//
+	// On deployment activation, the CP PUTs the artifact bytes to each
+	// region's cache BEFORE publishing the TaskMessage to NATS, so the
+	// worker can fetch from a local cache (~1ms RTT) instead of from
+	// the CP (~10ms+ RTT). Region entries with no value (or absent
+	// from the map) skip the push step entirely; the worker continues
+	// to pull from the CP's /api/internal/download/ endpoint as today.
+	//
+	// The URL must include scheme + host + (optional) port + (optional)
+	// path prefix. Per-artifact path-component validation happens
+	// inside the cache binary. The auth token is shared with the cache
+	// via the `INTERNAL_TOKEN` env var on both sides; the CP presents
+	// it as `X-Internal-Token` on every PUT.
+	//
+	// Empty map = no-op (zero behavioral change). Operators opt in by
+	// adding a `region_artifact_caches:` block to config.yaml.
+	RegionArtifactCaches map[string]string `yaml:"region_artifact_caches"`
+
+	// ArtifactCacheInternalToken is the shared secret presented as the
+	// `X-Internal-Token` header on every cache PUT. Operators MUST
+	// set this to the same value as the cache binary's `INTERNAL_TOKEN`
+	// env var. Empty value means "no cache push possible" — the
+	// cache-push step is skipped entirely, which is the safe default
+	// (no auth header sent, no region cache consulted). A regional
+	// cache URL with an empty token is a startup-time validation
+	// error (fail-closed).
+	ArtifactCacheInternalToken string `yaml:"artifact_cache_internal_token"`
 }
 
 type JWTConfig struct {
@@ -603,7 +636,68 @@ func validateStorageConfig(s *StorageConfig) error {
 			return fmt.Errorf("storage.artifact_path is required when artifact_backend is \"remote\" (local cache dir)")
 		}
 	}
+
+	// RegionArtifactCaches (issue #332): every configured region must
+	// have a parseable http(s) URL. An empty URL on a present key
+	// (typo in config) is rejected at startup rather than silently
+	// no-op'ing at activation. An empty `artifact_cache_internal_token`
+	// alongside a non-empty region map is also rejected — a cache URL
+	// without a token would send unauthenticated PUTs and the cache
+	// would 401 every one.
+	for region, rawURL := range s.RegionArtifactCaches {
+		if !isValidRegionIdentifier(region) {
+			return fmt.Errorf(
+				"storage.region_artifact_caches region %q is not a valid region identifier (must match ^[a-z0-9][a-z0-9-]{0,63}$)",
+				region,
+			)
+		}
+		if rawURL == "" {
+			return fmt.Errorf("storage.region_artifact_caches[%q] is empty; remove the key or set a non-empty URL", region)
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return fmt.Errorf("storage.region_artifact_caches[%q]: %w", region, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("storage.region_artifact_caches[%q] must use http or https scheme (got %q)", region, u.Scheme)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("storage.region_artifact_caches[%q] has no host", region)
+		}
+	}
+	if len(s.RegionArtifactCaches) > 0 && s.ArtifactCacheInternalToken == "" {
+		return fmt.Errorf(
+			"storage.artifact_cache_internal_token is required when region_artifact_caches is non-empty (fail-closed: never send unauthenticated cache PUTs)",
+		)
+	}
+
 	return nil
+}
+
+// isValidRegionIdentifier mirrors the IsValidRegion check in the
+// service package (service/deployment.go IsValidRegion), but lives in
+// the config package so config validation doesn't have to import
+// the service package (which would be a cycle). Both must stay in
+// sync; if the service regex changes, update this one too.
+//
+// The match is intentionally identical: ^[a-z0-9][a-z0-9-]{0,63}$
+// — see IsValidRegion doc comment.
+func isValidRegionIdentifier(s string) bool {
+	if len(s) < 1 || len(s) > 64 {
+		return false
+	}
+	if s[0] < 'a' || s[0] > 'z' {
+		if !(s[0] >= '0' && s[0] <= '9') {
+			return false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // MigrationConfig holds paths to migration toolchain binaries.

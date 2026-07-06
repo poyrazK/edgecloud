@@ -44,7 +44,12 @@ type App struct {
 	LogGC        *service.LogGCService
 	WorkerGC     *service.WorkerGCService
 	DeploymentGC *service.DeploymentGCService
-	AutoscaleSvc *autoscale.Service
+	// DeploymentSvc is exposed so main.go can inject the per-region
+	// artifact-cache pusher (issue #332) after construction. Optional
+	// post-New wiring — when not set, the deployment service runs
+	// without cache push (existing behavior).
+	DeploymentSvc *service.DeploymentService
+	AutoscaleSvc  *autoscale.Service
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -450,6 +455,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		LogGC:           service.NewLogGCService(logEntryRepo),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
 		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
+		DeploymentSvc:   deploymentSvc,
 		AutoscaleSvc:    autoscaleSvc,
 	}
 }

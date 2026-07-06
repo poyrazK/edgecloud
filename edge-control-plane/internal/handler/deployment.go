@@ -311,15 +311,25 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 // holds regardless. errors.Is(err, service.ErrPublishFailed) is
 // still matched by the caller before this helper is reached, so
 // callers don't need to repeat the sentinel check.
+//
+// Issue #332: the envelope additionally surfaces the per-region
+// artifact-cache push outcome (`regions_cached`, `regions_cache_failed`)
+// so operators can distinguish "NATS publish failed" from "cache
+// push failed" from the same 502 body. Pre-#332 clients parsing
+// `regions_published` / `regions_failed` see no change.
 func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
 	details := map[string]any{
-		"regions_published": []string{},
-		"regions_failed":    []string{},
+		"regions_published":    []string{},
+		"regions_failed":       []string{},
+		"regions_cached":       []string{},
+		"regions_cache_failed": []string{},
 	}
 	var pubErr *service.PublishError
 	if errors.As(err, &pubErr) {
 		details["regions_published"] = pubErr.Published
 		details["regions_failed"] = pubErr.Failed
+		details["regions_cached"] = pubErr.Cached
+		details["regions_cache_failed"] = pubErr.CacheFailed
 	}
 	httperror.BadGatewayCtx(w, r, staticMessage, details)
 }

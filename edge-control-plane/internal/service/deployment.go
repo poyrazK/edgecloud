@@ -170,18 +170,31 @@ var (
 type PublishError struct {
 	Published []string
 	Failed    []string
-	Err       error
+	// Cached and CacheFailed (issue #332) carry the per-region
+	// outcome of the optional per-region artifact-cache push that
+	// runs before the NATS TaskMessage publish. Always populated
+	// (as empty slices, not nil, when the cache feature is
+	// disabled) so the 502 envelope handler doesn't have to nil-check.
+	Cached      []string
+	CacheFailed []string
+	Err         error
 }
 
 // Error renders the publish error in a stable human-readable form.
 // Includes the per-region breakdown so log lines are diagnostic
-// without needing to inspect the struct fields.
+// without needing to inspect the struct fields. Cache fields are
+// appended when non-empty so the no-cache-configured case is
+// identical to the pre-#332 wire shape.
 func (e *PublishError) Error() string {
 	if e == nil {
 		return "<nil PublishError>"
 	}
-	return fmt.Sprintf("%s (published=%v, failed=%v)",
+	msg := fmt.Sprintf("%s (published=%v, failed=%v)",
 		e.Err.Error(), e.Published, e.Failed)
+	if len(e.Cached) > 0 || len(e.CacheFailed) > 0 {
+		msg += fmt.Sprintf(" (cached=%v, cache_failed=%v)", e.Cached, e.CacheFailed)
+	}
+	return msg
 }
 
 // Unwrap returns the wrapped sentinel so errors.Is(err, ErrPublishFailed)
@@ -209,6 +222,19 @@ type DeploymentService struct {
 	appSvc         *AppService
 	envSvc         *EnvService     // injected for decryption at publish
 	webhookSvc     *WebhookService // injected for webhook events
+	// cachePusher pushes the activation artifact bytes to a per-region
+	// edge-artifact-cache binary before the NATS TaskMessage publish
+	// (issue #332). Optional; when nil, the cache-push step is skipped
+	// and the existing pull-from-CP behavior is unchanged. Set via
+	// SetCachePusher so existing tests/constructors that don't care
+	// about caches don't need to thread an extra argument.
+	cachePusher artifactCachePusher
+	// regionArtifactCaches is the per-region URL map from config. When
+	// a region's URL is unset (or the region is not in the map), the
+	// cache-push step is skipped for that region — the worker continues
+	// to pull from the CP's /api/internal/download/. Set via
+	// SetRegionArtifactCaches.
+	regionArtifactCaches map[string]string
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
 	// target any region — both in `Deploy` (when the HTTP request
@@ -250,6 +276,23 @@ func NewDeploymentService(
 		publisher:      publisher,
 		defaultRegion:  defaultRegion,
 	}
+}
+
+// SetCachePusher injects the per-region artifact-cache pusher. When
+// nil, the cache-push step in publishSwap is a no-op (workers
+// continue to pull from the CP's /api/internal/download/ endpoint).
+// Optional injection so existing tests and wiring code that don't
+// care about caches don't need to thread an extra arg.
+func (s *DeploymentService) SetCachePusher(p artifactCachePusher) {
+	s.cachePusher = p
+}
+
+// SetRegionArtifactCaches injects the per-region URL map. When a
+// region's URL is absent (or empty), the cache-push step for that
+// region is skipped. Combined with SetCachePusher: the pusher must
+// be set AND the region must be in the map for a push to occur.
+func (s *DeploymentService) SetRegionArtifactCaches(m map[string]string) {
+	s.regionArtifactCaches = m
 }
 
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
@@ -763,6 +806,42 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 
 	attemptID := uuid.NewString()
 	now := time.Now()
+
+	// Per-region artifact-cache push (issue #332, Layer 3). Runs
+	// BEFORE the NATS publish so the worker has the artifact in
+	// the local cache by the time it receives the TaskMessage.
+	// Best-effort: a push failure does NOT add the region to
+	// `failed` (the NATS publish still happens; the worker will
+	// pull from the CP). The region is recorded separately in
+	// `cacheFailed` for the 502 envelope, and `cached` records
+	// successes.
+	//
+	// Skip conditions (region in `toPublish` is NOT pushed when):
+	//   - s.cachePusher is nil (cache feature disabled at runtime)
+	//   - s.regionArtifactCaches[region] is unset or empty
+	//
+	// PR 2 will add a `regions_cached` DB column to short-circuit
+	// already-cached regions on retry; for PR 1 the cache push
+	// fires on every attempt (idempotent on the server side).
+	var cached []string
+	var cacheFailed []string
+	if s.cachePusher != nil && len(s.regionArtifactCaches) > 0 {
+		for _, region := range toPublish {
+			cacheURL, ok := s.regionArtifactCaches[region]
+			if !ok || cacheURL == "" {
+				// No cache configured for this region; the worker
+				// will pull from the CP as today.
+				continue
+			}
+			if err := s.cachePusher.Push(ctx, cacheURL, tenantID, appName, deploymentID); err != nil {
+				log.Printf("artifact cache push failed for region %q (deployment %s): %v", region, deploymentID, err)
+				cacheFailed = append(cacheFailed, region)
+				continue
+			}
+			cached = append(cached, region)
+		}
+	}
+
 	var published []string
 	var failed []string
 	for _, region := range toPublish {
@@ -804,11 +883,31 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 		}
 	}
 
+	// A cache push failure is reported alongside the NATS publish
+	// result, not as a fatal activation failure (the NATS publish
+	// still went out, the worker will pull from the CP). The 502
+	// envelope exposes both to the operator.
 	if len(failed) > 0 {
 		return &PublishError{
-			Published: published,
-			Failed:    failed,
-			Err:       ErrPublishFailed,
+			Published:   published,
+			Failed:      failed,
+			Cached:      cached,
+			CacheFailed: cacheFailed,
+			Err:         ErrPublishFailed,
+		}
+	}
+	// All regions published successfully via NATS, but some
+	// cache pushes failed. Surface a *PublishError so the handler
+	// 502 path lights up the cache fields; the wrapped sentinel
+	// is still ErrPublishFailed so the existing `errors.Is` check
+	// in the handler keeps matching.
+	if len(cacheFailed) > 0 {
+		return &PublishError{
+			Published:   published,
+			Failed:      failed,
+			Cached:      cached,
+			CacheFailed: cacheFailed,
+			Err:         ErrPublishFailed,
 		}
 	}
 	return nil
