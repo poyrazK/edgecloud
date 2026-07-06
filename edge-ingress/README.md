@@ -45,8 +45,11 @@ docker run --rm -p 2019:2019 -p 80:80 -p 443:443 \
   caddy:2
 
 # 2. edge-ingress
+#    CADDY_ADMIN_LISTEN keeps Caddy's admin API reachable from the host after
+#    each /load push rewrites the admin block inside the Docker container.
 INGRESS_REGION=fra \
 CADDY_ADMIN_TOKEN=dev-token \
+CADDY_ADMIN_LISTEN=0.0.0.0:2019 \
 TLS_CERT_FILE=/path/to/cert.pem \
 TLS_KEY_FILE=/path/to/key.pem \
 cargo run --manifest-path edge-ingress/Cargo.toml
