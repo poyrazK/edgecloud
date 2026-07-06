@@ -10,8 +10,12 @@
 //!     per-request use. The persistent store handles are `Arc`-cloned;
 //!     the `WasiCtx` is rebuilt from a stored env `HashMap` because
 //!     `wasmtime_wasi::WasiCtx` does not implement `Clone` in 25.x.
-//!   * `egress` is kept as internal state for future `wasi:http` outgoing
-//!     enforcement (deferred to the linker task — not yet wired here).
+//!   * `egress` is enforced on `wasi:http/outgoing-handler` via
+//!     `EgressHttpHooks::send_request` (see the `http_hooks` field),
+//!     and on `wasi:sockets/{tcp,udp}` connect-side via
+//!     `WasiCtxBuilder::socket_addr_check` (see `socket_egress`). Both
+//!     layers share the same `Arc<EgressPolicy>` so a policy swap is
+//!     reflected in both at once.
 //!
 //! v0.2 NOTE on async: wasmtime 25 binds `wit-parser 0.217`, which does
 //! NOT recognize the `async func` syntax. All WIT is plain `func(...)`
@@ -48,6 +52,7 @@ use crate::edge_runtime_long::edge::cloud::{
 use crate::egress::EgressPolicy;
 use crate::interfaces::{cache, kv_store, observe, process, scheduling, time};
 use crate::metering::RequestMeter;
+use crate::socket_egress::{make_socket_addr_check, SocketEgressPolicy};
 use crate::store::HasStoreLimits;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -102,9 +107,23 @@ pub struct RuntimeState {
     /// Tenant that owns this runtime instance.
     pub tenant_id: String,
 
-    /// Per-deployment egress policy. Will be re-applied on the
-    /// `wasi:http/outgoing-handler` host impl (deferred to the linker task).
+    /// Per-deployment egress policy. Enforced on:
+    ///   * `wasi:http/outgoing-handler` via `EgressHttpHooks::send_request`
+    ///     (URL/hostname + hard-deny).
+    ///   * `wasi:sockets/{tcp,udp}` connect-side via the per-tenant
+    ///     `WasiCtx` `socket_addr_check` closure (IP-level + hard-deny).
+    ///
+    /// Both layers share the same `Arc<EgressPolicy>` so a policy swap
+    /// is reflected in both at once.
     pub egress: Arc<EgressPolicy>,
+
+    /// Per-deployment socket-egress mode (issue #309). `Copy`, so each
+    /// `RuntimeState::clone` copies it cheaply without consulting the
+    /// env var. The runtime does **not** read `EDGE_EGRESS_SOCKET_MODE`
+    /// itself; the bootstrap site is `edge-worker/src/config.rs::Config::from_env`,
+    /// which sets it once at worker startup and threads it through
+    /// `HandlerConfig` → `RuntimeState::with_env_and_meter`.
+    pub socket_mode: SocketEgressPolicy,
 
     /// wasmtime 45 moved `send_request` off the `WasiHttpView` trait and
     /// onto a new `WasiHttpHooks` trait, referenced by
@@ -129,7 +148,16 @@ pub struct RuntimeState {
 
 impl RuntimeState {
     /// Test-only constructor. Ephemeral in-memory stores, no preopens,
-    /// permissive egress.
+    /// permissive egress. `wasi:sockets` policy is the runtime default
+    /// (`BlockAll`); tests that exercise the closure directly call
+    /// `socket_egress::make_socket_addr_check`.
+    ///
+    /// Pre-PR #337 this constructed a `WasiCtx` inline with no
+    /// preopens. PR #337 changed it to call `build_wasi_ctx_for_tenant`,
+    /// which under `EDGE_FS_PATH` would `preopen_dir(base.join(""), "/", ...)`
+    /// — granting the test guest read-write access to the un-tenanted
+    /// `EDGE_FS_PATH` root. Reverted here: tests that need preopens
+    /// should call `with_env_and_meter` with a real tenant id.
     #[cfg(test)]
     pub fn new() -> Self {
         let env = Arc::new(process::filter_env_vars(std::env::vars()).collect::<HashMap<_, _>>());
@@ -140,6 +168,7 @@ impl RuntimeState {
                     .collect::<Vec<_>>(),
             )
             .build();
+        let egress = Arc::new(EgressPolicy::allow_all());
         let exit_code = Arc::new(AtomicU32::new(0));
         let process = process::Process::with_env_and_exit_code(env.clone(), exit_code.clone());
         Self {
@@ -154,8 +183,9 @@ impl RuntimeState {
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: env,
             tenant_id: String::new(),
-            egress: Arc::new(EgressPolicy::allow_all()),
-            http_hooks: EgressHttpHooks::new(Arc::new(EgressPolicy::allow_all()), String::new()),
+            egress: egress.clone(),
+            socket_mode: SocketEgressPolicy::default(),
+            http_hooks: EgressHttpHooks::new(egress, String::new()),
             exit_code,
             store_limits: None,
         }
@@ -164,9 +194,13 @@ impl RuntimeState {
     /// Production constructor. Builds per-tenant persistent stores (KV,
     /// cache, scheduler) and a `WasiCtx` for the tenant's preopens.
     ///
-    /// `egress` is stored but not yet enforced on any host call — that
-    /// wiring lands in the linker task when `wasi:http/outgoing-handler`
-    /// is added.
+    /// `egress` is enforced on `wasi:http/outgoing-handler` via the
+    /// `EgressHttpHooks` stored in `http_hooks` and on
+    /// `wasi:sockets/{tcp,udp}` connect-side via the closure installed
+    /// in `build_wasi_ctx_for_tenant`. `socket_mode` is threaded in as a
+    /// parameter (no env reads on the per-request hot path); the
+    /// bootstrap site that reads `EDGE_EGRESS_SOCKET_MODE` is
+    /// `edge-worker/src/config.rs::Config::from_env`.
     ///
     /// `log_sink` and `app_ctx` are wired into the per-tenant `Observer`
     /// so guest `emit_log` calls reach the worker's `LogForwarder`. The
@@ -185,6 +219,7 @@ impl RuntimeState {
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
+        socket_mode: SocketEgressPolicy,
     ) -> Self {
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -192,7 +227,7 @@ impl RuntimeState {
         let cache_store = get_or_create_cache(&tenant_id);
         let scheduling = get_or_create_scheduler(&tenant_id);
 
-        let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id);
+        let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode);
 
         let mut observe_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -218,6 +253,7 @@ impl RuntimeState {
             wasi_env_for_clone: env,
             tenant_id: tenant_id.clone(),
             egress: egress.clone(),
+            socket_mode,
             // The hooks box shares the same Arc-shared EgressPolicy and
             // tenant id as the top-level fields, so a future mid-flight
             // policy swap (returning a new Arc) only updates one place.
@@ -254,10 +290,25 @@ impl Clone for RuntimeState {
     fn clone(&self) -> Self {
         // Persistent stores — Arc-clone (cheap, shared with other tenants).
         // Per-app simple types — must be Clone. Each is Arc-based internally.
+        //
         // wasi: state — `WasiCtx` is rebuilt from the stored env `HashMap`
         // because `wasmtime_wasi::WasiCtx` is not `Clone` in 25.x.
         // `ResourceTable` is fresh so per-`Store` resource handles from
         // one request don't leak to the next.
+        //
+        // Sharing semantics across clones:
+        //   * `egress: Arc<EgressPolicy>` — SHARED via Arc. A `swap()`
+        //     on the original Arc is visible to all clones.
+        //   * `socket_mode: SocketEgressPolicy` — `Copy`, so each clone
+        //     captures its own snapshot. Set once via the worker
+        //     bootstrap (`Config::from_env`); never changes at runtime.
+        //   * `tenant_id: String` — cloned per clone.
+        //   * The `SocketAddrCheck` closure inside the new `WasiCtx`
+        //     is FRESHLY CONSTRUCTED per clone (mirrors the wasmtime
+        //     pattern of rebuilding the whole sockets context per
+        //     Store). It captures the same `Arc<EgressPolicy>` and the
+        //     same `self.socket_mode`, but the closure trait object is
+        //     a new allocation; it is NOT shared across clones.
         Self {
             kv_store: self.kv_store.clone(),
             cache: self.cache.clone(),
@@ -265,7 +316,12 @@ impl Clone for RuntimeState {
             observe: self.observe.clone(),
             time: self.time.clone(),
             process: self.process.clone(),
-            wasi_ctx: build_wasi_ctx_for_tenant(&self.wasi_env_for_clone, &self.tenant_id),
+            wasi_ctx: build_wasi_ctx_for_tenant(
+                &self.wasi_env_for_clone,
+                &self.tenant_id,
+                &self.egress,
+                self.socket_mode,
+            ),
             // WasiHttpCtx is zero-sized in wasmtime 25 (`PhantomData`)
             // so this is a no-op clone. The per-Store resources still
             // live in `resource_table` (fresh below) which is what
@@ -275,6 +331,7 @@ impl Clone for RuntimeState {
             wasi_env_for_clone: self.wasi_env_for_clone.clone(),
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
+            socket_mode: self.socket_mode,
             http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
             store_limits: None, // set fresh by create_store for each new Store
@@ -385,19 +442,17 @@ impl WasiHttpHooks for EgressHttpHooks {
     // URL-level `EgressPolicy::check` above.
 }
 
-/// ## Known gap (v0.3 follow-up — issue #216 candidate)
-///
-/// `wasi:sockets/ip-name-lookup` and `wasi:sockets/tcp` are a separate
-/// egress surface that bypasses this hook entirely. A guest can call
-/// `wasi:sockets/ip-name-lookup::resolve("127.0.0.1")` then
-/// `wasi:sockets/tcp::connect` to that IP literal without ever touching
-/// `wasi:http/outgoing-handler`. Tracked as a v0.3 follow-up.
-///
 /// `WasiHttpView` — required by `wasmtime_wasi_http::p2::add_only_http_to_linker_async`.
 /// wasmtime 45 collapsed the trait from `{ctx, table}` into a single
 /// `http()` method returning a `WasiHttpCtxView` bundle (mirrors the
 /// `WasiView` change in wasmtime 36). The `hooks` field is the
 /// `EgressHttpHooks` box stored on `RuntimeState`.
+///
+/// Sibling egress surface: `wasi:sockets/{tcp,udp}` connect-side is
+/// gated by the `socket_addr_check` closure installed in
+/// `build_wasi_ctx_for_tenant`. See `socket_egress` for the dispatch
+/// table. Binds (`TcpBind`/`UdpBind`) are local-only and unconditionally
+/// permitted; only the connect-side is policy-gated.
 impl WasiHttpView for RuntimeState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         // `&mut self.http_hooks` (a `&mut EgressHttpHooks`) coerces to
@@ -477,6 +532,7 @@ mod send_request_tests {
                 deployment_id: "phase-c8-test".to_string(),
             },
             None,
+            crate::socket_egress::SocketEgressPolicy::default(),
         )
     }
 
@@ -729,7 +785,22 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 /// path is missing or `create_dir_all` fails (read-only mount, EACCES),
 /// the ctx falls through without the preopen so the guest still runs
 /// (no filesystem access) rather than refusing to start.
-fn build_wasi_ctx_for_tenant(env: &Arc<HashMap<String, String>>, tenant_id: &str) -> WasiCtx {
+///
+/// Sockets egress (issue #309): calls `builder.socket_addr_check(...)`
+/// with a closure sourced from `socket_egress::make_socket_addr_check`.
+/// The closure consults the tenant `EgressPolicy` (closed over from
+/// `egress`) and the per-tenant `SocketEgressPolicy` mode (`mode`).
+/// Mode = `BlockAll` keeps the wasmtime 45 default close behavior
+/// (guests cannot use `wasi:sockets` for connect/send); mode =
+/// `AllowList` consults `EgressPolicy::check_address` (hard-deny +
+/// allowlist); mode = `AllowAll` is equivalent to
+/// `WasiCtxBuilder::inherit_network(true)` and is **off by default**.
+fn build_wasi_ctx_for_tenant(
+    env: &Arc<HashMap<String, String>>,
+    tenant_id: &str,
+    egress: &Arc<EgressPolicy>,
+    mode: SocketEgressPolicy,
+) -> WasiCtx {
     // Apply the env blocklist BEFORE handing the env to `WasiCtx`. The
     // host exposes the env to the guest via two paths:
     //
@@ -779,6 +850,17 @@ fn build_wasi_ctx_for_tenant(env: &Arc<HashMap<String, String>>, tenant_id: &str
             }
         }
     }
+
+    // Socket-level egress policy: install the closure before `.build()`.
+    // The closure is the only public injection point in wasmtime-wasi
+    // 45.0.3 — `WasiSocketsCtx`'s fields are `pub(crate)`. See
+    // `socket_egress.rs` for the dispatch table per `SocketEgressPolicy`
+    // × `SocketAddrUse`.
+    builder.socket_addr_check(make_socket_addr_check(
+        egress.clone(),
+        mode,
+        tenant_id.to_string(),
+    ));
 
     builder.build()
 }
@@ -1011,6 +1093,7 @@ mod with_env_and_meter_tests {
                 deployment_id: "test".to_string(),
             },
             None,
+            crate::socket_egress::SocketEgressPolicy::default(),
         )
     }
 

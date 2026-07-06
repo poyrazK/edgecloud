@@ -21,7 +21,7 @@
 
 use edge_runtime::{
     create_component_linker_handler, create_component_linker_long_running, create_engine,
-    EgressPolicy, RuntimeState,
+    socket_egress::SocketEgressPolicy, EgressPolicy, RuntimeState,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,6 +62,7 @@ fn state() -> RuntimeState {
             deployment_id: "smoke".to_string(),
         },
         None,
+        SocketEgressPolicy::default(),
     )
 }
 

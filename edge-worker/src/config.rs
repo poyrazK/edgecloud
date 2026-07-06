@@ -1,6 +1,7 @@
 //! Worker configuration loaded from environment variables.
 
 use anyhow::Context;
+use edge_runtime::socket_egress::SocketEgressPolicy;
 use std::path::PathBuf;
 
 // `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
@@ -130,6 +131,19 @@ pub struct Config {
     /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
     /// and `tls_key_path` must be set for TLS to activate.
     pub tls_key_path: Option<String>,
+    /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
+    /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
+    /// (`block-all` (default, closes wasi:sockets connect-side),
+    /// `allowlist` (consult `EgressPolicy::check_address`),
+    /// `allow-all` (operator opt-in)).
+    ///
+    /// Posted into every `HandlerConfig` constructed by the supervisor,
+    /// which threads it into `RuntimeState::with_env_and_meter` as a
+    /// parameter — the per-request code path does **not** read the
+    /// env var again (avoiding the per-request syscall the v0.2 review
+    /// flagged as a perf regression). Mirrors the
+    /// `handler_max_request_body_bytes` pattern above.
+    pub socket_mode: SocketEgressPolicy,
 }
 
 impl Config {
@@ -164,6 +178,8 @@ impl Config {
     /// - `TASK_STREAM_REPLICAS` (default: `3`) — JetStream replica count
     ///   for the `edgecloud-tasks` stream. Set to `1` for non-clustered
     ///   NATS (local dev).
+    /// - `EDGE_EGRESS_SOCKET_MODE` (default: `block-all`) — see
+    ///   `Config::socket_mode`.
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -231,6 +247,7 @@ impl Config {
             )?,
             tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
+            socket_mode: SocketEgressPolicy::from_env(),
         })
     }
 

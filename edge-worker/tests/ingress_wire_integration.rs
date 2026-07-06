@@ -36,6 +36,7 @@ use edge_worker::supervisor::Supervisor;
 
 use edge_ingress::heartbeats::apply_heartbeat;
 use edge_ingress::routing::RoutingTable;
+use edge_runtime::socket_egress::SocketEgressPolicy;
 
 /// Construct a `Config` matching the worker's runtime expectations, for
 /// the heartbeat wire test (which never starts apps; the only fields it
@@ -71,6 +72,7 @@ fn wire_test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        socket_mode: SocketEgressPolicy::default(),
     }
 }
 

@@ -10,7 +10,10 @@
 //! Run with: `cargo test --manifest-path edge-runtime/Cargo.toml --test handler_fixture_load`
 //! Skip if fixture is missing.
 
-use edge_runtime::{create_component_linker_handler, create_engine, EgressPolicy, RuntimeState};
+use edge_runtime::{
+    create_component_linker_handler, create_engine, socket_egress::SocketEgressPolicy,
+    EgressPolicy, RuntimeState,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +59,7 @@ fn runtime_state() -> RuntimeState {
             deployment_id: "smoke".to_string(),
         },
         None,
+        SocketEgressPolicy::default(),
     )
 }
 

@@ -42,6 +42,9 @@
 //! - L27: process get-all-env — `l27_process_get_all_env` (this file)
 //! - L28: process get-args — `l29_process_get_args` (this file)
 //! - L29: process get-cwd — `l30_process_get_cwd` (this file)
+//! - L31: wasi:sockets BlockAll default — `l31_socket_egress_block_all_denies_under_default` (this file)
+//! - L32: wasi:sockets AllowList + hard-deny target — `l32_socket_egress_allowlist_blocks_hard_deny_ip` (this file)
+//! - L33: wasi:sockets AllowList + public IP — `l33_socket_egress_allowlist_permits_public_ip` (this file)
 //!
 //! ## Skip policy
 //!
@@ -61,6 +64,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+use edge_runtime::socket_egress::SocketEgressPolicy;
 use edge_runtime::{
     create_component_linker_handler, create_engine, EgressPolicy, RequestMeter, RuntimeState,
 };
@@ -177,6 +181,7 @@ impl LayerHarness {
             env: HashMap::new(),
             max_request_body_bytes: 10 * 1024 * 1024,
             metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         };
 
         let dispatch = Arc::new(
@@ -330,6 +335,7 @@ async fn l6_request_body_over_cap_returns_413() {
         env: HashMap::new(),
         max_request_body_bytes: 100,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -378,6 +384,7 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None, // 10 MB — generous
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -451,6 +458,7 @@ async fn l7_per_request_timeout_returns_500() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     };
 
     let dispatch = Arc::new(
@@ -640,6 +648,7 @@ async fn l11_guest_calls_process_get_env() {
         env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -685,6 +694,7 @@ async fn l12_guest_calls_time_now() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -734,6 +744,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -807,6 +818,7 @@ async fn l14_guest_calls_cache_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -877,6 +889,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -934,6 +947,7 @@ async fn l16_guest_schedules_task() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -981,6 +995,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     }
 }
 
@@ -1269,6 +1284,7 @@ async fn l27_process_get_all_env() {
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
     let cl = make_client();
@@ -1352,6 +1368,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -1811,6 +1828,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
     })
     .await;
 
@@ -1837,4 +1855,143 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         event_count >= 3,
         "SSE response should contain at least 3 data: lines, got {event_count}\nbody:\n{body}"
     );
+}
+// ── L31–L33: wasi:sockets egress (issue #309) ──────────────────────────
+//
+// These tests prove the runtime's `WasiCtxBuilder::socket_addr_check`
+// closure (see `edge-runtime/src/socket_egress.rs`) is wired into the
+// linker. Each test instantiates the handler fixture, calls a new
+// `/sockets/tcp/connect?ip=...&port=...` endpoint, and asserts the
+// response body matches the expected policy decision.
+//
+//   * `l31_block_all_denies_under_default` — default mode (env unset ⇒
+//     `BlockAll`). Any `start-connect` returns a deny from the closure.
+//   * `l32_allowlist_blocks_hard_deny_ip` — `EDGE_EGRESS_SOCKET_MODE=
+//     allowlist` + `EgressPolicy::new(vec!["api.example.com"])`. Target
+//     `127.0.0.1` is in the hard-deny list ⇒ closure returns `false`
+//     even though the allowlist is non-empty (hard-deny wins).
+//   * `l33_allowlist_permits_public_ip` — same policy but target a
+//     public IP. Closure returns `true`; the response body prefix is
+//     `"allow"`. (The actual TCP connect may fail at the kernel level;
+//     we only assert the policy decision here.)
+//
+#[tokio::test(flavor = "multi_thread")]
+async fn l31_socket_egress_block_all_denies_under_default() {
+    // `SocketEgressPolicy::BlockAll` is the runtime default — closure
+    // denies every `start-connect`. Pass the mode explicitly through
+    // `HandlerConfig`; no env mutation required (and no UB on
+    // Rust 1.86+).
+    //
+    // (No `SOCKET_EGRESS_ENV_LOCK` / `ScopedSocketEgressMode` helper
+    // — see `l33` for the replace-test-this PR.)
+
+    // can't leak the var into this test.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let mut cfg = test_config("l31");
+    cfg.socket_mode = SocketEgressPolicy::BlockAll;
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    // 8.8.8.8:53 is a public, non-hard-denied IP. Under BlockAll the
+    // closure returns `false` regardless; wasmtime maps the closure's
+    // `false` to `ErrorCode::AccessDenied`. The fixture surfaces that
+    // as body prefix `deny:access-denied`.
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=8.8.8.8&port=53"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.starts_with("deny:"),
+        "BlockAll must deny wasi:sockets connect (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l32_socket_egress_allowlist_blocks_hard_deny_ip() {
+    // mode=allowlist + `EgressPolicy::new(vec!["api.example.com"])`.
+    // Target `127.0.0.1:80` is in the hard-deny range (loopback) so
+    // the closure returns `false` — hard-deny wins over the non-empty
+    // allowlist, same posture as the HTTP egress layer.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let mut cfg = test_config("l32");
+    cfg.socket_mode = SocketEgressPolicy::AllowList;
+    cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=127.0.0.1&port=80"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    // The fixture surfaces the `ErrorCode` variant that wasmtime
+    // returns when the closure denies; the EgressPolicy's textual
+    // reason ("hostname resolved to blocked IP") is logged but not
+    // propagated to the guest. Body prefix `deny:` is the assertion
+    // of the policy decision.
+    assert!(
+        body.starts_with("deny:"),
+        "loopback must be hard-denied (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l33_socket_egress_allowlist_permits_public_ip() {
+    // mode=allowlist + non-empty allowlist + public IP target.
+    // Closure returns `true` (per the documented asymmetry — see
+    // `EgressPolicy::check_address` in `egress.rs`); the fixture's
+    // path returns `"allow"`. We don't assert on whether the
+    // underlying TCP succeeded (no listener at 8.8.8.8:53 in CI);
+    // only on the policy decision.
+    if should_skip_layer_tests() {
+        return;
+    }
+    let mut cfg = test_config("l33");
+    cfg.socket_mode = SocketEgressPolicy::AllowList;
+    cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/tcp/connect?ip=8.8.8.8&port=53"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.text().await.unwrap();
+    // This test asserts the *closure decision*: under non-empty
+    // allowlist + AllowList, a non-hard-denied IP must be permitted by
+    // the policy. The actual TCP connect to 8.8.8.8:53 may then
+    // fail at the kernel level in a sandboxed CI (seccomp, missing
+    // outbound, etc.) — surface as a `deny:connection-*` or
+    // `deny:address-*`, never a closure-policy deny. Accept either
+    // the policy-permit or any kernel-level denial here.
+    let closure_permitted = body.starts_with("allow");
+    let kernel_level_deny = body.starts_with("deny:connection-")
+        || body.starts_with("deny:address-")
+        || body.starts_with("deny:invalid-state")
+        || body.starts_with("deny:timeout");
+    assert!(
+        closure_permitted || kernel_level_deny,
+        "non-hard-denied IP under non-empty allowlist + AllowList must \
+         either be permitted by the closure or fail at the kernel level \
+         (not a policy denial like 'deny:hostname-resolved-to-...'; got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
 }

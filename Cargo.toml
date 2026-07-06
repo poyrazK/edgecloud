@@ -11,6 +11,16 @@ members = [
     "edge-spool",
 ]
 
+# Excluded from the workspace:
+#   - edge-worker/tests/fixtures/handler: built separately by the
+#     Phase E fixture-build script (see tests/fixtures/README.md).
+#     The crate's `wasm32-unknown-unknown` target and `wit-bindgen`
+#     0.45 (older pin) are intentionally not normalized against
+#     the workspace's resolver-2 defaults.
+exclude = [
+    "edge-worker/tests/fixtures/handler",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

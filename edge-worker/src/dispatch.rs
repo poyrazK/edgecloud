@@ -64,6 +64,7 @@ use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 use wasmtime_wasi_http::p2::WasiHttpView;
 
 use edge_runtime::interfaces::observe::{AppLogContext, LogSink};
+use edge_runtime::socket_egress::SocketEgressPolicy;
 use edge_runtime::{EgressPolicy, RequestMeter, RuntimeState};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
@@ -220,6 +221,12 @@ pub struct HandlerConfig {
     /// on the wire. `None` before the app is running (the accumulator
     /// is created in `start_app`).
     pub metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
+    /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
+    /// Threaded into `RuntimeState::with_env_and_meter` on every FaaS
+    /// dispatch — the runtime does NOT read `EDGE_EGRESS_SOCKET_MODE`
+    /// itself; the worker's `Config::from_env` reads it once at
+    /// startup and the supervisor copies it into `HandlerConfig`.
+    pub socket_mode: SocketEgressPolicy,
 }
 
 impl HandlerDispatch {
@@ -546,6 +553,7 @@ impl HandlerDispatch {
             self.config.log_sink.clone(),
             self.config.app_ctx.clone(),
             self.config.metrics_acc.clone(),
+            self.config.socket_mode,
         );
 
         // Clone the shared exit-code flag BEFORE moving `request_state`
