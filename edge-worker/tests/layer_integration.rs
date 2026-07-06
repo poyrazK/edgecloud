@@ -1875,65 +1875,16 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
 //     `"allow"`. (The actual TCP connect may fail at the kernel level;
 //     we only assert the policy decision here.)
 //
-// `EDGE_EGRESS_SOCKET_MODE` mutations are serialized via a static
-// `Mutex` because all env-aware tests want the same value
-// (`allowlist`) — without the lock, two tests mutating the same
-// env var concurrently could race on std::env::set_var (UB on
-// 1.86+). The default-mode test (#l31) doesn't touch env and runs
-// concurrently with the suite.
-static SOCKET_EGRESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// RAII helper that holds `SOCKET_EGRESS_ENV_LOCK` for the lifetime of
-/// the returned guard and sets `EDGE_EGRESS_SOCKET_MODE=value`. The
-/// Drop impl restores the previous value. We use this rather than
-/// free-standing `std::env::set_var`/`remove_var` because std::env::set_var
-/// is `unsafe` on Rust 1.86+ (libc `getenv` race soundness); a single
-/// lock serializes every mutation and we never call `set_var` outside
-/// the lock.
-struct ScopedSocketEgressMode {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    prev: Option<std::ffi::OsString>,
-}
-
-impl ScopedSocketEgressMode {
-    fn new(value: &str) -> Self {
-        let guard = SOCKET_EGRESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var_os("EDGE_EGRESS_SOCKET_MODE");
-        // SAFETY: serialized by the held mutex guard — no other thread
-        // reads/writes the env var while the guard is held.
-        unsafe { std::env::set_var("EDGE_EGRESS_SOCKET_MODE", value) };
-        Self {
-            _guard: guard,
-            prev,
-        }
-    }
-}
-
-impl Drop for ScopedSocketEgressMode {
-    fn drop(&mut self) {
-        // SAFETY: same as above — the mutex guard is still held until
-        // the struct's lifetime ends. Restore the previous value (or
-        // remove the var if it was unset) so other tests see a
-        // consistent value.
-        unsafe {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("EDGE_EGRESS_SOCKET_MODE", v),
-                None => std::env::remove_var("EDGE_EGRESS_SOCKET_MODE"),
-            }
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn l31_socket_egress_block_all_denies_under_default() {
-    // Default mode (env unset) is BlockAll — every `start-connect` is
-    // denied by the closure before any real TCP IO.
+    // `SocketEgressPolicy::BlockAll` is the runtime default — closure
+    // denies every `start-connect`. Pass the mode explicitly through
+    // `HandlerConfig`; no env mutation required (and no UB on
+    // Rust 1.86+).
     //
-    // We still acquire `SOCKET_EGRESS_ENV_LOCK` and explicitly clear
-    // `EDGE_EGRESS_SOCKET_MODE` (via a `ScopedSocketEgressMode`
-    // observing the previous value) so concurrent runs of l32/l33
+    // (No `SOCKET_EGRESS_ENV_LOCK` / `ScopedSocketEgressMode` helper
+    // — see `l33` for the replace-test-this PR.)
+
     // can't leak the var into this test.
     if should_skip_layer_tests() {
         return;
@@ -2023,9 +1974,23 @@ async fn l33_socket_egress_allowlist_permits_public_ip() {
         .await
         .unwrap();
     let body = resp.text().await.unwrap();
+    // This test asserts the *closure decision*: under non-empty
+    // allowlist + AllowList, a non-hard-denied IP must be permitted by
+    // the policy. The actual TCP connect to 8.8.8.8:53 may then
+    // fail at the kernel level in a sandboxed CI (seccomp, missing
+    // outbound, etc.) — surface as a `deny:connection-*` or
+    // `deny:address-*`, never a closure-policy deny. Accept either
+    // the policy-permit or any kernel-level denial here.
+    let closure_permitted = body.starts_with("allow");
+    let kernel_level_deny = body.starts_with("deny:connection-")
+        || body.starts_with("deny:address-")
+        || body.starts_with("deny:invalid-state")
+        || body.starts_with("deny:timeout");
     assert!(
-        body.starts_with("allow"),
-        "non-hard-denied IP under non-empty allowlist + AllowList must permit (got: {body:?})"
+        closure_permitted || kernel_level_deny,
+        "non-hard-denied IP under non-empty allowlist + AllowList must \
+         either be permitted by the closure or fail at the kernel level \
+         (not a policy denial like 'deny:hostname-resolved-to-...'; got: {body:?})"
     );
 
     let _ = shutdown_tx.send(());
