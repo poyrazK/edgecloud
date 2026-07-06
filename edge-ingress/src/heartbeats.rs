@@ -397,6 +397,47 @@ mod tests {
         assert_eq!(table.len().await, 0);
     }
 
+    /// WebSocket port creates a second route entry with `-ws` suffix.
+    #[tokio::test]
+    async fn apply_heartbeat_with_ws_port_creates_second_route() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        let mut status = app_status("t_a", "running", 8081);
+        status.ws_port = Some(9091);
+        apps.insert("api".to_string(), status);
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().any(|e| e.app_name == "api" && e.port == 8081));
+        assert!(snap.iter().any(|e| e.app_name == "api-ws" && e.port == 9091));
+    }
+
+    /// WebSocket port with canary key — ws entry gets `{deployment_id}-ws`.
+    #[tokio::test]
+    async fn apply_heartbeat_with_ws_port_and_canary_key() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        let mut status = app_status("t_a", "running", 8081);
+        status.ws_port = Some(9091);
+        apps.insert("api:v2".to_string(), status);
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        // Normal route: "api" with deployment_id "v2"
+        let api_entry = snap.iter().find(|e| e.app_name == "api").unwrap();
+        assert_eq!(api_entry.deployment_id, Some("v2".to_string()));
+        // WS route: "api-ws" with deployment_id "v2-ws"
+        let ws_entry = snap.iter().find(|e| e.app_name == "api-ws").unwrap();
+        assert_eq!(ws_entry.deployment_id, Some("v2-ws".to_string()));
+        assert_eq!(ws_entry.port, 9091);
+    }
+
     /// Mixed statuses: one running, one crashed. Only running survives.
     #[tokio::test]
     async fn apply_heartbeat_with_mixed_statuses() {
@@ -411,5 +452,152 @@ mod tests {
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].app_name, "api");
+    }
+
+    // ── push_now tests ────────────────────────────────────────────────
+
+    fn test_config(admin_url: &str) -> Config {
+        Config {
+            nats_url: "nats://localhost:4222".into(),
+            caddy_admin_url: admin_url.to_string(),
+            region: "test".into(),
+            cert_file: "/tmp/cert.pem".into(),
+            key_file: "/tmp/key.pem".into(),
+            listen_http: ":80".into(),
+            listen_https: ":443".into(),
+            refresh_debounce_ms: 1000,
+            http_to_https: true,
+            admin_token: None,
+            control_plane_api_url: "http://localhost:8080".into(),
+            internal_token: None,
+            control_plane_url: String::new(),
+            service_token: String::new(),
+            domain_poll_interval: Duration::from_secs(30),
+            caddy_admin_listen: "localhost:2019".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_now_sends_config_to_caddy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/load"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = Config {
+            refresh_debounce_ms: 1, // fast debounce for tests
+            ..test_config(&server.uri())
+        };
+        let table = Arc::new(RoutingTable::new());
+        let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
+        let cache: SharedCache = Default::default();
+
+        push_now(&cfg, &table, &caddy, &cache)
+            .await
+            .expect("push_now should succeed");
+    }
+
+    #[tokio::test]
+    async fn push_now_propagates_caddy_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/load"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+
+        let cfg = test_config(&server.uri());
+        let table = Arc::new(RoutingTable::new());
+        let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
+        let cache: SharedCache = Default::default();
+
+        let err = push_now(&cfg, &table, &caddy, &cache)
+            .await
+            .expect_err("push_now should fail with 502");
+        assert!(
+            err.to_string().contains("502"),
+            "err should mention 502, got: {err}"
+        );
+    }
+
+    // ── spawn_renderer tests ─────────────────────────────────────────
+
+    /// Notify triggers a Caddy reload. Verifies the spawn→notify→debounce→push
+    /// chain works end-to-end with a real debounce delay.
+    #[tokio::test]
+    async fn spawn_renderer_reloads_caddy_on_notify() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/load"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let cfg = Config {
+            refresh_debounce_ms: 1,
+            ..test_config(&server.uri())
+        };
+        let table = Arc::new(RoutingTable::new());
+        let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
+        let cache: SharedCache = Default::default();
+        let notify = Arc::new(Notify::new());
+
+        // Notify BEFORE spawn: tokio::sync::Notify stores a pending
+        // notification when no task is waiting, so the spawned task's
+        // first notified().await will observe it immediately.
+        notify.notify_one();
+
+        spawn_renderer(cfg, table, caddy, cache, notify.clone());
+
+        // Wait for debounce (1ms) + push to complete.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── spawn_pruner / pruner_tick tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn pruner_tick_removes_stale_entries() {
+        let table = Arc::new(RoutingTable::new());
+        let _notify = Arc::new(Notify::new());
+
+        // Insert an entry with a recent timestamp (should not be pruned).
+        table
+            .upsert("t_a", "api", None, 100, "1.2.3.4", 8081, "running")
+            .await;
+        assert_eq!(table.len().await, 1);
+
+        // remove_stale with zero duration prunes everything.
+        let removed = table.remove_stale(Duration::from_secs(0)).await;
+        assert_eq!(removed.len(), 1, "should prune the entry");
+        assert_eq!(table.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pruner_tick_skips_fresh_entries() {
+        let table = Arc::new(RoutingTable::new());
+        let _notify = Arc::new(Notify::new());
+
+        table
+            .upsert("t_a", "api", None, 100, "1.2.3.4", 8081, "running")
+            .await;
+
+        // remove_stale with a very long duration keeps everything.
+        let removed = table.remove_stale(Duration::from_secs(9999)).await;
+        assert!(removed.is_empty());
+        assert_eq!(table.len().await, 1);
     }
 }
