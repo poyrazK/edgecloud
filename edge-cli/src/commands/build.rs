@@ -7,7 +7,7 @@
 //! languages can coexist in the same checkout (e.g. a workspace that
 //! runs an integration fixture in JS against a Rust handler).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,9 +19,28 @@ pub fn run(path: &Path, lang: LangArg) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = &edge_toml.project.name;
 
+    // Cross-check the CLI `--lang` against `edge.toml`'s
+    // `[project] language`. Mismatches used to surface as a confusing
+    // missing-artifact error at deploy time (finding 2 of the
+    // PR #221 review); rejecting here is the user-friendly fix.
+    // The toml wins when `--lang` is omitted because the toml is the
+    // authoritative record of what the project was scaffolded as.
+    let toml_lang = edge_toml.project.language_or_default();
+    if toml_lang != lang.as_str() {
+        anyhow::bail!(
+            "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
+             Re-run with `--lang {toml}` (or remove the `language` line from edge.toml) so \
+             build and deploy stay in sync.",
+            flag = lang.as_str(),
+            toml = toml_lang,
+        );
+    }
+
     println!(
         "Building '{}' (target: {}, language: {})...",
-        project_name, edge_toml.project.target, lang,
+        project_name,
+        edge_toml.project.target,
+        lang.as_str(),
     );
 
     match lang {
@@ -40,8 +59,8 @@ pub fn run(path: &Path, lang: LangArg) -> Result<()> {
 /// - `js`   → `target/javy/<name>.wasm`                  (javy output)
 /// - any other value defaults to the rust path; callers should
 ///   reject unknown values before reaching here.
-pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> PathBuf {
-    match lang {
+pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<PathBuf> {
+    let artifact = match lang {
         "rust" => project_root
             .join("target")
             .join("wasm32-wasip2")
@@ -51,17 +70,14 @@ pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> PathBuf {
             .join("target")
             .join("javy")
             .join(format!("{}.wasm", name)),
-        // Unknown language — fall back to the rust path. The caller
-        // (build / deploy) is expected to validate the value before
-        // reaching this helper and surface a friendly error; this
-        // fallback keeps `path_for` total so a bad value can't crash
-        // a read-only command that happens to look at the toml.
-        _ => project_root
-            .join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{}.wasm", name)),
-    }
+        other => {
+            anyhow::bail!(
+                "unsupported language {other:?}: supported values are `rust` or `js`. \
+                 Fix `[project] language` in edge.toml (or remove it to fall back to `rust`)."
+            );
+        }
+    };
+    Ok(artifact)
 }
 
 /// Locate the `javy` binary on PATH. Testable seam: pass any
@@ -93,7 +109,7 @@ fn build_rust(path: &Path, project_name: &str) -> Result<()> {
         anyhow::bail!("cargo build failed");
     }
 
-    let artifact = path_for(path, project_name, "rust");
+    let artifact = path_for(path, project_name, "rust").context("resolving rust artifact path")?;
     if !artifact.exists() {
         anyhow::bail!("artifact not found at {}", artifact.display());
     }
@@ -120,8 +136,8 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     let entry = path.join("index.js");
     if !entry.is_file() {
         anyhow::bail!(
-            "`index.js` not found in {} — create it (matching the `edge init --lang=js` \
-             starter) or pass the JS entry point as the positional.",
+            "`index.js` not found in {} — create it at the project root \
+             (matching the `edge init --lang=js` starter).",
             path.display(),
         );
     }
@@ -184,7 +200,7 @@ mod tests {
     #[test]
     fn path_for_returns_rust_target_dir() {
         let root = Path::new("/proj");
-        let got = path_for(root, "myapp", "rust");
+        let got = path_for(root, "myapp", "rust").expect("rust is a supported language");
         assert_eq!(
             got,
             PathBuf::from("/proj/target/wasm32-wasip2/release/myapp.wasm")
@@ -194,21 +210,40 @@ mod tests {
     #[test]
     fn path_for_returns_javy_target_dir() {
         let root = Path::new("/proj");
-        let got = path_for(root, "myapp", "js");
+        let got = path_for(root, "myapp", "js").expect("js is a supported language");
         assert_eq!(got, PathBuf::from("/proj/target/javy/myapp.wasm"));
     }
 
     #[test]
-    fn path_for_falls_back_to_rust_for_unknown_language() {
-        // Defensive: an unrecognized lang falls back to the rust path
-        // rather than panicking, so a read-only command (status,
-        // apps get) that incidentally looks at the toml doesn't
-        // crash on a stale language field.
+    fn path_for_rejects_unknown_language_with_clear_error() {
+        // The old `_` arm silently routed unknown languages to the
+        // rust path, which made typos (e.g. `language = "ruby"`) surface
+        // as a confusing missing-file error at deploy time instead of
+        // a friendly unknown-language error. The helper is now the one
+        // place that knows the supported set.
         let root = Path::new("/proj");
-        let got = path_for(root, "myapp", "ruby");
-        assert_eq!(
-            got,
-            PathBuf::from("/proj/target/wasm32-wasip2/release/myapp.wasm")
+        let err = path_for(root, "myapp", "ruby")
+            .expect_err("unknown language must error, not fall back");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported language") && msg.contains("\"ruby\""),
+            "expected unsupported-language error mentioning \"ruby\", got: {msg}"
+        );
+    }
+
+    #[test]
+    fn path_for_rejects_empty_string_with_clear_error() {
+        // Combined with `Project::language_or_default`, an empty
+        // string in the toml now resolves to "rust" before reaching
+        // here. But callers that bypass the default (e.g. a future
+        // direct API) should still get a clear error, not a
+        // silent fall-through.
+        let root = Path::new("/proj");
+        let err =
+            path_for(root, "myapp", "").expect_err("empty language must error, not fall back");
+        assert!(
+            format!("{err:#}").contains("unsupported language"),
+            "expected unsupported-language error, got: {err:#}"
         );
     }
 }

@@ -4,27 +4,16 @@ use crate::output;
 use crate::LangArg;
 use anyhow::Result;
 
-/// `[project]` block in the Rust starter's `edge.toml`. The `language`
-/// line is now written explicitly (issue #317) so the file is
-/// self-documenting and `grep language` finds it without inferring
-/// from defaults.
-const EDGE_TOML_HEADER: &str = r#"[project]
+/// `[project]` block template shared by all starter languages. Two
+/// placeholders: `{name}` (the project name from the CLI arg) and
+/// `{language}` (the lowercase `LangArg` form, e.g. `"rust"`/`"js"`).
+/// Keeping a single template prevents the JS and Rust scaffolds from
+/// drifting on `target` / `version` as new languages are added.
+const EDGE_TOML_HEADER_TEMPLATE: &str = r#"[project]
 name = "{name}"
 version = "0.1.0"
 target = "wasm32-wasip2"
-language = "rust"
-
-[deployment]
-"#;
-
-/// JS variant of the `[project]` block. Differs only in `language`;
-/// `target = "wasm32-wasip2"` stays because Javy emits Preview 2
-/// components — the wasm target is invariant across languages.
-const EDGE_TOML_HEADER_JS: &str = r#"[project]
-name = "{name}"
-version = "0.1.0"
-target = "wasm32-wasip2"
-language = "js"
+language = "{language}"
 
 [deployment]
 "#;
@@ -126,10 +115,13 @@ pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
     println!(
         "  cd {} && edge build{}",
         name,
-        if lang == LangArg::Rust {
-            ""
-        } else {
-            " --lang=js"
+        // Only emit `--lang=<x>` for non-default languages so the
+        // Rust hint stays uncluttered. `as_str()` is the single
+        // source of truth — adding Python or Go here would only
+        // require adding the variant to `LangArg`.
+        match lang {
+            LangArg::Rust => String::new(),
+            other => format!(" --lang={}", other.as_str()),
         }
     );
     output::hint("Next: edge auth signup  (or `edge auth login` if you already have an API key)");
@@ -144,11 +136,7 @@ pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
 
 /// Rust starter: edge.toml + Cargo.toml + src/main.rs + .gitignore.
 fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
-    let mut edge_toml = EDGE_TOML_HEADER.replace("{name}", name);
-    if let Some(url) = api {
-        edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
-    }
-    std::fs::write(dir.join("edge.toml"), edge_toml)?;
+    write_edge_toml(dir, name, LangArg::Rust, api)?;
 
     let cargo_toml = CARGO_TOML_TEMPLATE.replace("{name}", name);
     std::fs::write(dir.join("Cargo.toml"), cargo_toml)?;
@@ -166,11 +154,7 @@ fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result
 /// `index.js` at the project root into a Preview 2 component under
 /// `target/javy/<name>.wasm`.
 fn scaffold_js(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
-    let mut edge_toml = EDGE_TOML_HEADER_JS.replace("{name}", name);
-    if let Some(url) = api {
-        edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
-    }
-    std::fs::write(dir.join("edge.toml"), edge_toml)?;
+    write_edge_toml(dir, name, LangArg::Js, api)?;
 
     let index_js = INDEX_JS_TEMPLATE.replace("{name}", name);
     std::fs::write(dir.join("index.js"), index_js)?;
@@ -179,11 +163,39 @@ fn scaffold_js(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// Render `edge.toml` from [`EDGE_TOML_HEADER_TEMPLATE`] and write it
+/// to `<dir>/edge.toml`. Shared by every language scaffold so the
+/// header can't drift between starters.
+fn write_edge_toml(
+    dir: &std::path::Path,
+    name: &str,
+    lang: LangArg,
+    api: Option<&str>,
+) -> Result<()> {
+    let mut edge_toml = EDGE_TOML_HEADER_TEMPLATE
+        .replace("{name}", name)
+        .replace("{language}", lang.as_str());
+    if let Some(url) = api {
+        edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
+    }
+    std::fs::write(dir.join("edge.toml"), edge_toml)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// Render the shared `edge.toml` template with both placeholders
+    /// substituted, mirroring what `write_edge_toml` does at runtime.
+    /// Keeps the language-specific test bodies short.
+    fn render_header(name: &str, lang: super::LangArg) -> String {
+        super::EDGE_TOML_HEADER_TEMPLATE
+            .replace("{name}", name)
+            .replace("{language}", lang.as_str())
+    }
+
     #[test]
     fn test_edge_toml_header_substitution() {
-        let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        let result = render_header("myapp", super::LangArg::Rust);
         assert!(result.contains(r#"name = "myapp""#));
         assert!(result.contains("version = \"0.1.0\""));
         assert!(result.contains("wasm32-wasip2"));
@@ -191,14 +203,14 @@ mod tests {
 
     #[test]
     fn test_edge_toml_header_valid_toml() {
-        let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        let result = render_header("myapp", super::LangArg::Rust);
         let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
         assert_eq!(parsed["project"]["name"].as_str(), Some("myapp"));
     }
 
     #[test]
     fn test_edge_toml_with_api_section() {
-        let mut result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        let mut result = render_header("myapp", super::LangArg::Rust);
         result.push_str(
             &super::EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", "https://api.example.com"),
         );
@@ -241,7 +253,7 @@ mod tests {
 
     #[test]
     fn rust_header_includes_language_line() {
-        let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
+        let result = render_header("myapp", super::LangArg::Rust);
         // Explicit `language = "rust"` line makes the toml
         // self-documenting; missing it is a UX wart for greppers.
         assert!(
@@ -252,7 +264,7 @@ mod tests {
 
     #[test]
     fn js_header_includes_language_line() {
-        let result = super::EDGE_TOML_HEADER_JS.replace("{name}", "myapp");
+        let result = render_header("myapp", super::LangArg::Js);
         assert!(
             result.contains(r#"language = "js""#),
             "expected language = \"js\" in: {result}"
@@ -264,7 +276,7 @@ mod tests {
 
     #[test]
     fn js_header_round_trips_through_parser() {
-        let result = super::EDGE_TOML_HEADER_JS.replace("{name}", "myapp");
+        let result = render_header("myapp", super::LangArg::Js);
         let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
         assert_eq!(parsed["project"]["language"].as_str(), Some("js"));
         assert_eq!(parsed["project"]["target"].as_str(), Some("wasm32-wasip2"));

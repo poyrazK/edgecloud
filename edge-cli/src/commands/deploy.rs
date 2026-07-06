@@ -9,6 +9,7 @@ use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
+use crate::LangArg;
 
 /// Dispatch to the upload or activate path based on whether `--id` was given.
 ///
@@ -23,6 +24,11 @@ use crate::state::State;
 /// #74). It is forwarded to the upload path; the activate path
 /// ignores it because the flag was already set at upload time and
 /// is read from the deployment row by ActivateDeployment.
+///
+/// `lang` is the source-language override. `Some(l)` requires the
+/// toml's `[project] language` to also resolve to `l`; mismatches
+/// surface as a clear error so a stale `rust` path can't be served
+/// for a Javy artifact. `None` defers to the toml entirely.
 #[cfg(feature = "network")]
 pub fn run(
     path: &Path,
@@ -31,11 +37,12 @@ pub fn run(
     regions: &[String],
     auto_rollback: bool,
     file: Option<&Path>,
+    lang: Option<LangArg>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions, auto_rollback, file)
+    run_upload(path, app, regions, auto_rollback, file, lang)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -48,6 +55,9 @@ pub fn run(
 /// get `auto_rollback_enabled = true`, which gates the
 /// worker-driven auto-rollback trigger and the heartbeat-driven
 /// stability-window promotion.
+/// `lang`: optional source-language override. `None` reads the
+/// project's `edge.toml`; `Some(l)` cross-checks the toml against `l`
+/// before resolving the artifact path.
 #[cfg(feature = "network")]
 fn run_upload(
     path: &Path,
@@ -55,12 +65,33 @@ fn run_upload(
     regions: &[String],
     auto_rollback: bool,
     file: Option<&Path>,
+    lang: Option<LangArg>,
 ) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
         app.to_string()
     } else {
         edge_toml.project.name.clone()
+    };
+    let toml_lang = edge_toml.project.language_or_default();
+    // Resolve the language used for the artifact-path lookup.
+    // `Some(l)` overrides only when it agrees with the toml — that
+    // mirrors `edge build`'s cross-check (finding 2 of the PR #221
+    // review) and prevents "stale toml says rust, Javy artifact
+    // exists" from silently serving the wrong file. `None` defers
+    // to the toml, which is the authoritative source.
+    let effective_lang = match lang {
+        Some(flag_lang) if flag_lang.as_str() != toml_lang => {
+            anyhow::bail!(
+                "`--lang {flag}` does not match `[project] language = {toml_value:?}` in edge.toml. \
+                 Re-run with `--lang {toml_value}` (or remove the `language` line from edge.toml) so \
+                 build and deploy stay in sync.",
+                flag = flag_lang.as_str(),
+                toml_value = toml_lang,
+            );
+        }
+        Some(flag_lang) => flag_lang.as_str().to_string(),
+        None => toml_lang.to_string(),
     };
     // Artifact path is language-aware (issue #317): Rust projects
     // land at `target/wasm32-wasip2/release/<name>.wasm`, JS at
@@ -70,7 +101,8 @@ fn run_upload(
     // `--file` still overrides when present.
     let artifact = match file {
         Some(f) => f.to_path_buf(),
-        None => build::path_for(path, &app_name, edge_toml.project.language_or_default()),
+        None => build::path_for(path, &app_name, &effective_lang)
+            .context("resolving deploy artifact path")?,
     };
 
     let wasm_bytes = std::fs::read(&artifact).map_err(|e| {
@@ -194,6 +226,7 @@ pub fn run(
     _regions: &[String],
     _auto_rollback: bool,
     _file: Option<&Path>,
+    _lang: Option<LangArg>,
 ) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
