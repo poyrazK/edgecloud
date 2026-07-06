@@ -27,6 +27,37 @@ pub enum AppInstanceStatus {
     Hung,
 }
 
+impl AppInstanceStatus {
+    /// Returns `true` if the app is actively serving (Running or Starting).
+    /// `Crashed`, `Hung`, and `Stopping` are not serving.
+    #[allow(dead_code)]
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting
+        )
+    }
+
+    /// Returns `true` if the app has reached a terminal failure state
+    /// that requires supervisor intervention (Crashed or Hung).
+    #[allow(dead_code)]
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
+        )
+    }
+
+    /// Returns the restart count if the app is Crashed, 0 otherwise.
+    #[allow(dead_code)]
+    pub fn restart_count(&self) -> u32 {
+        match self {
+            AppInstanceStatus::Crashed { restart_count } => *restart_count,
+            _ => 0,
+        }
+    }
+}
+
 /// A single running app instance.
 #[allow(dead_code)]
 pub struct AppInstance {
@@ -114,5 +145,130 @@ impl WorkerState {
             engine,
             last_task_received_at: std::sync::Mutex::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── AppInstanceStatus::is_active ─────────────────────────────────
+
+    #[test]
+    fn running_is_active() {
+        assert!(AppInstanceStatus::Running.is_active());
+    }
+
+    #[test]
+    fn starting_is_active() {
+        assert!(AppInstanceStatus::Starting.is_active());
+    }
+
+    #[test]
+    fn stopping_is_not_active() {
+        assert!(!AppInstanceStatus::Stopping.is_active());
+    }
+
+    #[test]
+    fn crashed_is_not_active() {
+        assert!(!AppInstanceStatus::Crashed { restart_count: 3 }.is_active());
+    }
+
+    #[test]
+    fn hung_is_not_active() {
+        assert!(!AppInstanceStatus::Hung.is_active());
+    }
+
+    // ── AppInstanceStatus::is_terminal ───────────────────────────────
+
+    #[test]
+    fn running_is_not_terminal() {
+        assert!(!AppInstanceStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn starting_is_not_terminal() {
+        assert!(!AppInstanceStatus::Starting.is_terminal());
+    }
+
+    #[test]
+    fn stopping_is_not_terminal() {
+        assert!(!AppInstanceStatus::Stopping.is_terminal());
+    }
+
+    #[test]
+    fn crashed_is_terminal() {
+        assert!(AppInstanceStatus::Crashed { restart_count: 5 }.is_terminal());
+    }
+
+    #[test]
+    fn hung_is_terminal() {
+        assert!(AppInstanceStatus::Hung.is_terminal());
+    }
+
+    // ── AppInstanceStatus::restart_count ─────────────────────────────
+
+    #[test]
+    fn restart_count_running_is_zero() {
+        assert_eq!(AppInstanceStatus::Running.restart_count(), 0);
+    }
+
+    #[test]
+    fn restart_count_crashed_returns_value() {
+        assert_eq!(
+            AppInstanceStatus::Crashed { restart_count: 7 }.restart_count(),
+            7
+        );
+    }
+
+    #[test]
+    fn restart_count_hung_is_zero() {
+        assert_eq!(AppInstanceStatus::Hung.restart_count(), 0);
+    }
+
+    #[test]
+    fn restart_count_starting_is_zero() {
+        assert_eq!(AppInstanceStatus::Starting.restart_count(), 0);
+    }
+
+    // ── AppInstanceStatus equality (derived) ─────────────────────────
+
+    #[test]
+    fn same_variants_are_equal() {
+        assert_eq!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Crashed { restart_count: 3 }
+        );
+    }
+
+    #[test]
+    fn different_restart_counts_are_not_equal() {
+        assert_ne!(
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            AppInstanceStatus::Crashed { restart_count: 5 }
+        );
+    }
+
+    #[test]
+    fn different_variants_are_not_equal() {
+        assert_ne!(AppInstanceStatus::Running, AppInstanceStatus::Hung);
+    }
+
+    // ── WorkerState ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_worker_state_is_empty() {
+        let engine = Engine::default();
+        let state = WorkerState::new(engine);
+        assert!(state.apps.is_empty());
+        assert_eq!(state.apps.len(), 0);
+    }
+
+    #[test]
+    fn new_worker_state_last_task_is_none() {
+        let engine = Engine::default();
+        let state = WorkerState::new(engine);
+        let last = state.last_task_received_at.lock().unwrap();
+        assert!(last.is_none());
     }
 }
