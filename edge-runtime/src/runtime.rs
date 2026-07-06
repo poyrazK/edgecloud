@@ -290,12 +290,25 @@ impl Clone for RuntimeState {
     fn clone(&self) -> Self {
         // Persistent stores — Arc-clone (cheap, shared with other tenants).
         // Per-app simple types — must be Clone. Each is Arc-based internally.
+        //
         // wasi: state — `WasiCtx` is rebuilt from the stored env `HashMap`
         // because `wasmtime_wasi::WasiCtx` is not `Clone` in 25.x.
         // `ResourceTable` is fresh so per-`Store` resource handles from
-        // one request don't leak to the next. The `socket_addr_check`
-        // closure is `Arc`-backed inside `SocketAddrCheck`, so the
-        // re-built `WasiCtx` shares the same closure with the original.
+        // one request don't leak to the next.
+        //
+        // Sharing semantics across clones:
+        //   * `egress: Arc<EgressPolicy>` — SHARED via Arc. A `swap()`
+        //     on the original Arc is visible to all clones.
+        //   * `socket_mode: SocketEgressPolicy` — `Copy`, so each clone
+        //     captures its own snapshot. Set once via the worker
+        //     bootstrap (`Config::from_env`); never changes at runtime.
+        //   * `tenant_id: String` — cloned per clone.
+        //   * The `SocketAddrCheck` closure inside the new `WasiCtx`
+        //     is FRESHLY CONSTRUCTED per clone (mirrors the wasmtime
+        //     pattern of rebuilding the whole sockets context per
+        //     Store). It captures the same `Arc<EgressPolicy>` and the
+        //     same `self.socket_mode`, but the closure trait object is
+        //     a new allocation; it is NOT shared across clones.
         Self {
             kv_store: self.kv_store.clone(),
             cache: self.cache.clone(),
