@@ -126,6 +126,12 @@ pub struct HeartbeatMessage {
     /// always set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_addr: Option<String>,
+    /// The tenant this worker belongs to. Added so the control plane can
+    /// auto-register the worker from a heartbeat when the FK constraint on
+    /// worker_status trips (fixes issue #297). Optional for backward compat
+    /// with old workers; new workers always set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     pub apps: HashMap<String, AppStatus>,
     /// Capacity headroom for the cluster autoscaler. `None` on pre-#85
     /// workers so old control planes and the autoscaler handle legacy
@@ -194,13 +200,14 @@ pub struct MetricSample {
 
 impl HeartbeatMessage {
     /// Create a new heartbeat with the current timestamp.
-    pub fn new(worker_id: String, region: String, worker_addr: String) -> Self {
+    pub fn new(worker_id: String, region: String, worker_addr: String, tenant_id: String) -> Self {
         Self {
             msg_type: "heartbeat".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             worker_id,
             region,
             worker_addr: Some(worker_addr),
+            tenant_id: Some(tenant_id),
             apps: HashMap::new(),
             cluster_headroom: None,
         }
@@ -223,6 +230,7 @@ mod tests {
             "w_fra_abc".to_string(),
             "fra".to_string(),
             "203.0.113.10".to_string(),
+            "t_test".to_string(),
         );
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(
@@ -238,7 +246,12 @@ mod tests {
     /// fires only on `None`; `Some("")` round-trips as `""`.
     #[test]
     fn heartbeat_wire_format_preserves_empty_addr_as_empty_string() {
-        let hb = HeartbeatMessage::new("w_fra_abc".to_string(), "fra".to_string(), String::new());
+        let hb = HeartbeatMessage::new(
+            "w_fra_abc".to_string(),
+            "fra".to_string(),
+            String::new(),
+            "t_test".to_string(),
+        );
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(
             json.contains(r#""worker_addr":"""#),
@@ -258,6 +271,7 @@ mod tests {
             worker_id: "w_fra_abc".to_string(),
             region: "fra".to_string(),
             worker_addr: None,
+            tenant_id: None,
             apps: HashMap::new(),
             cluster_headroom: None,
         };
@@ -277,6 +291,7 @@ mod tests {
             "w_fra_abc".to_string(),
             "fra".to_string(),
             "203.0.113.10".to_string(),
+            "t_test".to_string(),
         );
         let json = serde_json::to_string(&hb).expect("serialize");
         let parsed: HeartbeatMessage =

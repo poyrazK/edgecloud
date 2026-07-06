@@ -971,6 +971,7 @@ impl Supervisor {
             self.config.worker_id.clone(),
             self.config.region.clone(),
             self.config.worker_addr.clone(),
+            self.config.worker_tenant_id.clone(),
         );
 
         let state = self.state.read().await;

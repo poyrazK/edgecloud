@@ -189,11 +189,32 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 		// No NATS connection — skip subscription (e.g., in tests)
 		return nil
 	}
-	ch := make(chan *natsio.Msg, 100)
+	// Buffer 5000 messages to handle bursts. At 30s/heartbeat per worker,
+	// this accommodates ~150k concurrent workers without overflow.
+	ch := make(chan *natsio.Msg, 5000)
 	sub, err := s.nc.ChanSubscribe("edgecloud.heartbeats.>", ch)
 	if err != nil {
 		return fmt.Errorf("subscribing to heartbeats: %w", err)
 	}
+
+	// Monitor channel depth every minute and log when it's getting full
+	// so operators can tune the buffer before messages are dropped.
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if depth := len(ch); depth > 4000 {
+					log.Printf("heartbeat: channel depth = %d (capacity %d) — near capacity, messages may be dropped", depth, cap(ch))
+				} else if depth > 2000 {
+					log.Printf("heartbeat: channel depth = %d (capacity %d)", depth, cap(ch))
+				}
+			}
+		}
+	}()
 
 	go func() {
 		for {
@@ -209,17 +230,18 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 			}
 		}
 	}()
+	log.Printf("heartbeat: subscribed to edgecloud.heartbeats.> (buffer=%d)", cap(ch))
 	return nil
 }
 
 func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	var hb struct {
-		Type       string          `json:"type"`
-		Timestamp  time.Time       `json:"timestamp"`
-		WorkerID   string          `json:"worker_id"`
-		Region     string          `json:"region"`
-		WorkerAddr string          `json:"worker_addr"`
-		Apps       json.RawMessage `json:"apps"`
+		Type           string          `json:"type"`
+		Timestamp      time.Time       `json:"timestamp"`
+		WorkerID       string          `json:"worker_id"`
+		Region         string          `json:"region"`
+		WorkerAddr     string          `json:"worker_addr"`
+		Apps           json.RawMessage `json:"apps"`
 		// TenantID is sent by the worker so the control plane can
 		// scope stability evaluation to the right row. Heartbeats
 		// from the same worker may carry different tenants (the
@@ -235,8 +257,28 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		ClusterHeadroom json.RawMessage `json:"cluster_headroom"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
+		// Log the raw message preview so operators can diagnose wire format
+		// mismatches (the root cause of issue #297). A best-effort partial
+		// unmarshal extracts the worker_id for identification even when the
+		// full struct fails.
+		rawPreview := string(msg.Data)
+		if len(rawPreview) > 1024 {
+			rawPreview = rawPreview[:1024] + "..."
+		}
+		workerID := extractHeartbeatWorkerID(msg.Data)
+		log.Printf("heartbeat: failed to parse from worker %s: %v (raw: %s)", workerID, err, rawPreview)
 		return
 	}
+
+	// Extract tenant_id from the top-level field. When absent (pre-#297
+	// workers), fall back to extracting it from the first app's status
+	// in the apps map. This makes the auto-register fallback (below)
+	// actually work instead of being dead code.
+	tenantID := hb.TenantID
+	if tenantID == "" && len(hb.Apps) > 0 {
+		tenantID = extractTenantIDFromApps(hb.Apps)
+	}
+
 	if err := s.workerRepo.UpdateLastSeen(ctx, hb.WorkerID); err != nil {
 		log.Printf("heartbeat: failed to update last_seen for %s: %v", hb.WorkerID, err)
 	}
@@ -258,9 +300,9 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		// The FK constraint `worker_status_worker_id_fkey` fires when
 		// the worker hasn't been registered yet. Auto-register with a
 		// skeleton row so the status can be persisted (issue #283).
-		if strings.Contains(err.Error(), "worker_status_worker_id_fkey") && hb.TenantID != "" {
-			log.Printf("heartbeat: auto-registering unregistered worker %s (region=%s, tenant=%s)", hb.WorkerID, hb.Region, hb.TenantID)
-			if _, regErr := s.workerRepo.Upsert(ctx, hb.TenantID, &domain.RegisterWorkerRequest{
+		if strings.Contains(err.Error(), "worker_status_worker_id_fkey") && tenantID != "" {
+			log.Printf("heartbeat: auto-registering unregistered worker %s (region=%s, tenant=%s)", hb.WorkerID, hb.Region, tenantID)
+			if _, regErr := s.workerRepo.Upsert(ctx, tenantID, &domain.RegisterWorkerRequest{
 				WorkerID: hb.WorkerID,
 				Region:   hb.Region,
 			}); regErr != nil {
@@ -273,13 +315,21 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		}
 	}
 
+	// Log success so operators can monitor heartbeat health via structured
+	// logs (grep: "heartbeat: processed from"). Note: len(hb.Apps) is the
+	// raw JSON byte length, not the app count; we log it as a rough size
+	// indicator. The actual app count would require decoding the JSON.
+	log.Printf("heartbeat: processed from %s (region=%s, tenant=%s, apps_bytes=%d)",
+		hb.WorkerID, hb.Region, tenantID, len(hb.Apps))
+
 	// Stability-window evaluate. Only fires when the heartbeat
-	// carries a tenant_id and apps — the AppSpec on the wire is the
+	// carries a tenant_id and apps, and when the activeRepo is wired
+	// (nil in tests or bootstrap mode). The AppSpec on the wire is the
 	// source of truth for "which apps is this worker serving for
 	// this tenant right now?". Heartbeats without apps are treated
 	// as the worker's "I'm idle" signal — nothing to evaluate.
-	if hb.TenantID != "" && len(hb.Apps) > 0 {
-		s.evaluateStability(ctx, hb.TenantID, hb.Apps)
+	if s.activeRepo != nil && tenantID != "" && len(hb.Apps) > 0 {
+		s.evaluateStability(ctx, tenantID, hb.Apps)
 	}
 
 	// Decode app statuses to sum outbound bytes and enforce the per-tenant
@@ -287,7 +337,7 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	// which we treat as "no data" — we log but do not act on a 0-byte total
 	// so a single old worker cannot cause a false quota violation.
 	// Dispatched in a separate goroutine so DB round-trips in quota enforcement
-	// do not block the NATS heartbeat drain goroutine (which has a fixed 100-msg
+	// do not block the NATS heartbeat drain goroutine (which has a fixed 5000-msg
 	// buffer and will drop overflow messages if the drain stalls).
 	//
 	// context.WithoutCancel strips the subscriber's cancellation signal so that
@@ -307,6 +357,38 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	if s.metricsAgg != nil {
 		s.ingestMetrics(hb.Apps)
 	}
+}
+
+// extractHeartbeatWorkerID does a best-effort partial unmarshal of raw
+// heartbeat JSON to extract the worker_id for error logging when the
+// full struct can't be parsed. Returns "unknown" on failure.
+func extractHeartbeatWorkerID(data []byte) string {
+	var partial struct {
+		WorkerID string `json:"worker_id"`
+	}
+	if err := json.Unmarshal(data, &partial); err != nil {
+		return "unknown"
+	}
+	return partial.WorkerID
+}
+
+// extractTenantIDFromApps extracts the tenant_id from the first app's
+// status in a heartbeat's apps map. Used as a fallback when the top-level
+// tenant_id is absent (pre-#297 workers). Returns "" if no tenant_id is
+// found in any app.
+func extractTenantIDFromApps(appsRaw json.RawMessage) string {
+	var appsMap map[string]struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(appsRaw, &appsMap); err != nil {
+		return ""
+	}
+	for _, app := range appsMap {
+		if app.TenantID != "" {
+			return app.TenantID
+		}
+	}
+	return ""
 }
 
 // ingestMetrics decodes the apps JSON from a heartbeat and feeds each app's
