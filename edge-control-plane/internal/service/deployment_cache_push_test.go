@@ -211,8 +211,8 @@ func (f fakeArtifactStore) SaveAndHash(_ context.Context, _, _, _ string, _ io.R
 }
 
 // OpenFormat returns the same as Open (the pusher doesn't ask for .cwasm).
-func (f fakeArtifactStore) OpenFormat(_ context.Context, _, _, _, _ string) (io.ReadCloser, error) {
-	return f.Open(nil, "", "", "")
+func (f fakeArtifactStore) OpenFormat(ctx context.Context, _, _, _, _ string) (io.ReadCloser, error) {
+	return f.Open(ctx, "", "", "")
 }
 
 // Delete is a no-op (the pusher doesn't delete).
