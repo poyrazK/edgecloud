@@ -16,3 +16,13 @@ ture = "ture"
 inser = "inser"
 alue = "alue"
 
+# Files excluded from spell-checking. Reasons:
+# - signer_test.go: pins a well-known Ed25519 base64url signature
+#   fixture whose random bytes (e.g. "HVEA", "HAA") coincidentally
+#   look like English words. The test failure mode is caught by
+#   the deterministic-signature test case; the typos run
+#   conflicts without removing real word-check coverage.
+[files]
+extend-ignore-re = [
+  "edge-control-plane/internal/signing/signer_test\\.go",
+]

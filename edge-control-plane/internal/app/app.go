@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -571,8 +572,16 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 // loadSigner constructs a *signing.Signer from the validated config.
 // Precedence matches `signing.LoadFromEnv`: file path (KeyPath)
 // wins over inline (Key). The config validator has already rejected
-// the case where both are empty, so exactly one path here is taken.
+// the case where both are empty, so exactly one path here is taken —
+// but this function is also reachable from tests that bypass Load
+// (the bundled-config regression guard bypasses Load and asserts the
+// error is logged in a stable way). The empty-guard here returns the
+// same sentinel error the validator would emit, so callers see one
+// consistent message regardless of which layer caught it.
 func loadSigner(cfg *config.SigningConfig) (*signing.Signer, error) {
+	if cfg.KeyPath == "" && cfg.Key == "" {
+		return nil, fmt.Errorf("%w: EDGE_SIGNING_KEY_PATH (or EDGE_SIGNING_KEY) is required (issue #307)", signing.ErrInvalidKey)
+	}
 	if cfg.KeyPath != "" {
 		return signing.LoadFromFile(cfg.KeyPath, cfg.KeyID)
 	}
