@@ -222,18 +222,47 @@ pub fn render_routes(
                     .collect::<Vec<_>>())
             };
 
+            // Resolve effective rate limit for this route.
+            // Priority: per-app override (group_sorted[0]) > global default > disabled.
+            let first = group_sorted[0];
+            let rps = first
+                .rate_limit_rps
+                .or(Some(cfg.rate_limit_rps_default))
+                .unwrap_or(0);
+            let burst = first
+                .rate_limit_burst
+                .or(Some(cfg.rate_limit_burst_default))
+                .unwrap_or(0);
+
+            let mut handle_chain = Vec::new();
+
+            // Inject rate_limit handler when rps > 0.
+            if rps > 0 {
+                let burst = if burst > 0 { burst } else { rps };
+                handle_chain.push(json!({
+                    "handler": "rate_limit",
+                    "rates": {
+                        "rps": rps,
+                        "burst": burst,
+                    },
+                    "key": "{http.request.host}",
+                }));
+            }
+
+            handle_chain.push(json!({
+                "handler": "reverse_proxy",
+                "upstreams": upstreams,
+                "health_checks": {
+                    "active": {"uri": "/", "expect_status": 2}
+                }
+            }));
+
             json!({
                 "match": [{"host": [host]}],
                 "handle": [{
                     "handler": "subroute",
                     "routes": [{
-                        "handle": [{
-                            "handler": "reverse_proxy",
-                            "upstreams": upstreams,
-                            "health_checks": {
-                                "active": {"uri": "/", "expect_status": 2}
-                            }
-                        }]
+                        "handle": handle_chain,
                     }]
                 }],
                 "terminal": true
@@ -254,6 +283,22 @@ pub fn render_routes(
         })
         .collect();
 
+    // Build a (tenant, app) → rate limit lookup for FQDN routes.
+    let rate_limit_index: HashMap<(String, String), (u32, u32)> = entries
+        .iter()
+        .map(|e| {
+            let rps = e
+                .rate_limit_rps
+                .or(Some(cfg.rate_limit_rps_default))
+                .unwrap_or(0);
+            let burst = e
+                .rate_limit_burst
+                .or(Some(cfg.rate_limit_burst_default))
+                .unwrap_or(0);
+            ((e.tenant_id.clone(), e.app_name.clone()), (rps, burst))
+        })
+        .collect();
+
     // FQDN routes: sort by FQDN for deterministic output.
     let mut sorted_fqdns: Vec<&FqdnBinding> = fqdns.iter().collect();
     sorted_fqdns.sort_by(|a, b| a.fqdn.cmp(&b.fqdn));
@@ -267,24 +312,36 @@ pub fn render_routes(
         else {
             continue;
         };
+
+        // Resolve rate limit for this FQDN route from its (tenant, app).
+        let (fqdn_rps, fqdn_burst) = rate_limit_index
+            .get(&(b.tenant_id.clone(), b.app_name.clone()))
+            .copied()
+            .unwrap_or((0, 0));
+
+        let mut fqdn_handle_chain = Vec::new();
+        if fqdn_rps > 0 {
+            let burst = if fqdn_burst > 0 { fqdn_burst } else { fqdn_rps };
+            fqdn_handle_chain.push(json!({
+                "handler": "rate_limit",
+                "rates": { "rps": fqdn_rps, "burst": burst },
+                "key": "{http.request.host}",
+            }));
+        }
+        fqdn_handle_chain.push(json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
+            "health_checks": {
+                "active": {"uri": "/", "expect_status": 2}
+            }
+        }));
+
         routes.push(json!({
             "match": [{"host": [b.fqdn]}],
             "handle": [{
                 "handler": "subroute",
                 "routes": [{
-                    "handle": [{
-                        "handler": "reverse_proxy",
-                        "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
-                        // Same liveness probe as the synthetic-host
-                        // route above: without it, Caddy only marks
-                        // the upstream unhealthy when an active
-                        // connection fails, so custom-domain traffic
-                        // gets routed to dead workers until the next
-                        // failure. See PR #133 review finding #3.
-                        "health_checks": {
-                            "active": {"uri": "/", "expect_status": 2}
-                        }
-                    }]
+                    "handle": fqdn_handle_chain,
                 }]
             }],
             "terminal": true,
@@ -372,6 +429,8 @@ mod tests {
             weight: 100,
             worker_addr: addr.to_string(),
             port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
             last_seen: Instant::now(),
         }
     }
@@ -391,6 +450,8 @@ mod tests {
             weight,
             worker_addr: addr.to_string(),
             port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
             last_seen: Instant::now(),
         }
     }
@@ -422,6 +483,8 @@ mod tests {
             service_token: String::new(),
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
         }
     }
 

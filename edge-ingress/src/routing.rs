@@ -47,6 +47,10 @@ pub struct RouteEntry {
     pub weight: u8,
     pub worker_addr: String,
     pub port: u16,
+    /// Per-app rate limit in requests per second. `None` = use global default.
+    pub rate_limit_rps: Option<u32>,
+    /// Per-app burst size. `None` = use global default.
+    pub rate_limit_burst: Option<u32>,
     pub last_seen: Instant,
 }
 
@@ -143,6 +147,36 @@ impl RoutingTable {
         port: u16,
         status: &str,
     ) {
+        self.upsert_with_rate_limit(
+            tenant_id,
+            app_name,
+            deployment_id,
+            weight,
+            worker_addr,
+            port,
+            status,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    /// Upsert a route with optional per-app rate limits. When
+    /// `rate_limit_rps` and `rate_limit_burst` are `None`, the global
+    /// defaults from `Config` are used at render time.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_with_rate_limit(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        deployment_id: Option<&str>,
+        weight: u8,
+        worker_addr: &str,
+        port: u16,
+        status: &str,
+        rate_limit_rps: Option<u32>,
+        rate_limit_burst: Option<u32>,
+    ) {
         let key = match deployment_id {
             Some(id) => AppKey::with_deployment(tenant_id, app_name, id),
             None => AppKey::new(tenant_id, app_name),
@@ -161,6 +195,8 @@ impl RoutingTable {
                 weight,
                 worker_addr: worker_addr.to_string(),
                 port,
+                rate_limit_rps,
+                rate_limit_burst,
                 last_seen: Instant::now(),
             },
         );
