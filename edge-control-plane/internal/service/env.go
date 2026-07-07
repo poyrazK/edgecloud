@@ -111,23 +111,39 @@ func (s *EnvService) DecryptEnvMapBulk(ctx context.Context, tenantID string, app
 	return out, nil
 }
 
-// ReEncryptAll fetches all environment variables, decrypts them, and
-// re-encrypts them with the active key. Returns the number of values re-encrypted.
+// ReEncryptAll decrypts every env value across all tenants and re-encrypts
+// with the current active key. Used after key rotation to migrate old-format
+// or old-key values to the new key. Returns the total number of values
+// re-encrypted. Safe to run concurrently with active deploys — each env
+// value is read-decrypt-write under the row's upsert semantics.
 func (s *EnvService) ReEncryptAll(ctx context.Context) (int, error) {
-	tenants, apps, err := s.appEnvRepo.ListAllApps(ctx)
-	if err != nil {
-		return 0, err
+	if s.encryptor == nil {
+		return 0, fmt.Errorf("encryption is disabled (no key configured)")
 	}
 
-	total := 0
+	tenants, apps, err := s.appEnvRepo.ListAllApps(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("listing apps: %w", err)
+	}
+
+	var total int
 	for i := range tenants {
-		envs, err := s.ListEnv(ctx, tenants[i], apps[i])
+		rows, err := s.appEnvRepo.List(ctx, tenants[i], apps[i])
 		if err != nil {
-			return total, err
+			return total, fmt.Errorf("listing env for %s/%s: %w", tenants[i], apps[i], err)
 		}
-		for _, e := range envs {
-			if err := s.SetEnv(ctx, e.TenantID, e.AppName, e.EnvKey, e.EnvValue); err != nil {
-				return total, err
+		for _, row := range rows {
+			decrypted, err := s.encryptor.Decrypt(row.EnvValue)
+			if err != nil {
+				return total, fmt.Errorf("decrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+			}
+			reEncrypted, err := s.encryptor.Encrypt(decrypted)
+			if err != nil {
+				return total, fmt.Errorf("re-encrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+			}
+			row.EnvValue = reEncrypted
+			if err := s.appEnvRepo.Set(ctx, &row); err != nil {
+				return total, fmt.Errorf("writing %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
 			}
 			total++
 		}

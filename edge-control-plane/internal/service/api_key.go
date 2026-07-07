@@ -203,8 +203,10 @@ func (s *APIKeyService) RotateAPIKey(ctx context.Context, tenantID, id string) (
 	}
 
 	// Expire the old key immediately.
-	if err := s.apiKeyRepo.Delete(ctx, oldKey.ID); err != nil {
-		return nil, "", fmt.Errorf("deleting old api key: %w", err)
+	now := time.Now()
+	oldKey.ExpiresAt = &now
+	if err := s.apiKeyRepo.Update(ctx, oldKey); err != nil {
+		return nil, "", fmt.Errorf("expiring old api key: %w", err)
 	}
 
 	if err := s.apiKeyRepo.Create(ctx, newKey); err != nil {

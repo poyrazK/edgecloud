@@ -203,8 +203,8 @@ func TestAPIKeyRepository_Update_Success(t *testing.T) {
 
 	key := &domain.APIKey{ID: "k_1", Name: "renamed", Role: domain.RoleViewer, ExpiresAt: nil}
 
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`)).
-		WithArgs(key.ID, key.Name, key.Role).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3, expires_at = $4 WHERE id = $1`)).
+		WithArgs(key.ID, key.Name, key.Role, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := repo.Update(context.Background(), key); err != nil {
@@ -221,8 +221,8 @@ func TestAPIKeyRepository_Update_NameOnly(t *testing.T) {
 
 	key := &domain.APIKey{ID: "k_1", Name: "renamed", Role: domain.RoleDeveloper, ExpiresAt: nil}
 
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3 WHERE id = $1`)).
-		WithArgs(key.ID, key.Name, key.Role).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE api_keys SET name = $2, role = $3, expires_at = $4 WHERE id = $1`)).
+		WithArgs(key.ID, key.Name, key.Role, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := repo.Update(context.Background(), key); err != nil {

@@ -327,3 +327,268 @@ func TestWorkerAuth_HeaderWinsWhenBothPresent(t *testing.T) {
 		t.Errorf("status = %d, want %d (header should win when both present)", rec.Code, http.StatusOK)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// kid-based key selection tests — Sprint 2 JWT key rotation
+// ---------------------------------------------------------------------------
+
+func TestVerifyWorkerJWT_WithKidKeyring(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "test-secret-key1-32-bytes-long!!",
+			"key2": "test-secret-key2-32-bytes-long!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "key1"
+	tokenString, err := token.SignedString([]byte("test-secret-key1-32-bytes-long!!"))
+	if err != nil {
+		t.Fatalf("failed to sign token: %v", err)
+	}
+
+	result, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Fatalf("VerifyWorkerJWT: %v", err)
+	}
+	if result.WorkerID != "w_fra_abc123" {
+		t.Errorf("worker_id = %s, want w_fra_abc123", result.WorkerID)
+	}
+}
+
+func TestVerifyWorkerJWT_KidMatchesSecondaryKey(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "test-secret-key1-32-bytes-long!!",
+			"key2": "test-secret-key2-32-bytes-long!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "key2"
+	tokenString, _ := token.SignedString([]byte("test-secret-key2-32-bytes-long!!"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Errorf("should verify with key2 when kid=key2: %v", err)
+	}
+}
+
+func TestVerifyWorkerJWT_UnknownKidRejected(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "test-secret-key1-32-bytes-long!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "unknown"
+	tokenString, _ := token.SignedString([]byte("some-key"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for unknown kid, got nil")
+	}
+}
+
+func TestVerifyWorkerJWT_KnownKidWrongKeyRejected(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "test-secret-key1-32-bytes-long!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	// kid=key1 but signed with wrong key
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "key1"
+	tokenString, _ := token.SignedString([]byte("wrong-key-32-bytes-long!!!!!!!"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err == nil {
+		t.Error("expected error for wrong key with known kid, got nil")
+	}
+}
+
+func TestVerifyWorkerJWT_NoKidFallbackToSecret(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Secret:    "legacy-secret-32-bytes-long-for-test!",
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "keyring-secret-32-bytes-long!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	// No kid header, should fall back to Secret.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("legacy-secret-32-bytes-long-for-test!"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Errorf("should fall back to Secret when no kid: %v", err)
+	}
+}
+
+func TestVerifyWorkerJWT_NoKidFallsBackToActiveKey(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "default",
+		Keys: map[string]string{
+			"default": "default-key-32-bytes-long-in-keys!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("default-key-32-bytes-long-in-keys!!"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Errorf("should fall back to active key when no kid and no Secret: %v", err)
+	}
+}
+
+func TestVerifyWorkerJWT_LegacySecretStillWorks(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "test-secret-32-bytes-long-for-legacy!"}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_tenant1",
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString([]byte("test-secret-32-bytes-long-for-legacy!"))
+
+	_, err := VerifyWorkerJWT(tokenString, cfg)
+	if err != nil {
+		t.Errorf("legacy config (Secret only) should still work: %v", err)
+	}
+}
+
+func TestResolveSigningKey_ActiveKidReturnsCorrectKey(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "key1-secret-32-bytes-long-test-abc123",
+			"key2": "key2-secret-32-bytes-long-test-xyz789",
+		},
+	}
+	key, err := cfg.ResolveSigningKey()
+	if err != nil {
+		t.Fatalf("ResolveSigningKey: %v", err)
+	}
+	if string(key) != "key1-secret-32-bytes-long-test-abc123" {
+		t.Errorf("key = %q, want key1 secret", string(key))
+	}
+}
+
+func TestResolveSigningKey_LegacyFallback(t *testing.T) {
+	cfg := WorkerJWTConfig{Secret: "legacy-secret-32-bytes-long-for-test!"}
+	key, err := cfg.ResolveSigningKey()
+	if err != nil {
+		t.Fatalf("ResolveSigningKey: %v", err)
+	}
+	if string(key) != "legacy-secret-32-bytes-long-for-test!" {
+		t.Errorf("key = %q, want legacy secret", string(key))
+	}
+}
+
+func TestResolveSigningKey_NoConfig(t *testing.T) {
+	cfg := WorkerJWTConfig{}
+	_, err := cfg.ResolveSigningKey()
+	if err == nil {
+		t.Error("expected error for empty config, got nil")
+	}
+}
+
+func TestWorkerAuth_KeyringRoundTrip(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Issuer:    "edgecloud",
+		ActiveKID: "key1",
+		Keys: map[string]string{
+			"key1": "keyring-secret-32-bytes-abcdef123456!!",
+		},
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: "w_fra_abc123",
+		TenantID: "t_keyring",
+		Apps:     []string{"my-app"},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token.Header["kid"] = "key1"
+	tokenString, _ := token.SignedString([]byte("keyring-secret-32-bytes-abcdef123456!!"))
+
+	gotTenantID := ""
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTenantID = GetWorkerTenantID(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	middleware := WorkerAuth(cfg)(handler)
+
+	req := httptest.NewRequest("GET", "/api/internal/download/d_abc", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	rec := httptest.NewRecorder()
+	middleware.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if gotTenantID != "t_keyring" {
+		t.Errorf("tenant_id = %s, want t_keyring", gotTenantID)
+	}
+}
