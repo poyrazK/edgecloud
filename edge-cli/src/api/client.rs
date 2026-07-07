@@ -165,6 +165,9 @@ pub struct DeployResponse {
     /// it in lazily; treated as "use default" downstream in that case.
     #[serde(default)]
     pub regions: Vec<String>,
+    /// Desired replica count (issue #316). 0 means no threshold.
+    #[serde(default)]
+    pub desired_replicas: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -563,6 +566,7 @@ impl ApiClient {
         wasm_bytes: &[u8],
         regions: &[String],
         auto_rollback: bool,
+        replicas: usize,
     ) -> Result<DeployResponse> {
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         // Always parse the URL so we can append optional query params
@@ -586,6 +590,11 @@ impl ApiClient {
             parsed
                 .query_pairs_mut()
                 .append_pair("auto-rollback", "true");
+        }
+        if replicas > 0 {
+            parsed
+                .query_pairs_mut()
+                .append_pair("replicas", &replicas.to_string());
         }
         url = parsed.to_string();
 

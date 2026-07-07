@@ -198,6 +198,13 @@ enum Command {
         #[arg(long)]
         auto_rollback: bool,
 
+        /// Desired number of workers to run this deployment in each
+        /// region (issue #316). 0 means no threshold. Every worker
+        /// already receives every TaskMessage (fan-out) — this is a
+        /// monitoring threshold, not a scheduling constraint.
+        #[arg(long, default_value_t = 0)]
+        replicas: usize,
+
         /// Deploy as a preview with a unique staging URL.
         /// The app is deployed under a suffixed name (e.g. `myapp--preview-abc123`)
         /// so it gets its own `https://{tenant}-{app}--preview-{hash}.edgecloud.dev` URL.
@@ -431,6 +438,7 @@ fn main() -> Result<()> {
             id,
             regions,
             auto_rollback,
+            replicas,
             file,
             preview,
             promote,
@@ -450,6 +458,7 @@ fn main() -> Result<()> {
                 id.as_deref(),
                 &regions,
                 auto_rollback,
+                replicas,
                 file.as_deref(),
                 lang,
             )

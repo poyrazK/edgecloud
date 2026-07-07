@@ -251,6 +251,22 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		return
 	}
 
+	// Issue #316: under-replication check. Log a warning when an app
+	// has desired_replicas > 0 but fewer workers are heartbeating it.
+	// This is a monitoring threshold — no scheduling action is taken.
+	// A proper worker-count query (e.g. counting distinct workers with
+	// status="running" for each app per region) can be added in a
+	// follow-up once the heartbeat status table is reliably populated.
+	for _, j := range publishable {
+		if j.DesiredReplicas > 0 {
+			// TODO(issue-#316-followup): count actual heartbeating workers
+			// per (tenant, app, region) from the worker_statuses table.
+			// For now, log the desired count for operator visibility.
+			log.Printf("reconcile: tenant=%s app=%s desired_replicas=%d (worker count check deferred to follow-up)",
+				tenantID, j.AppName, j.DesiredReplicas)
+		}
+	}
+
 	// Bulk-fetch env vars for every publishable active app in one round trip.
 	appNames := make([]string, len(publishable))
 	for i, j := range publishable {

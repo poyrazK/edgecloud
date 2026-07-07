@@ -17,6 +17,10 @@ pub struct State {
     /// See `commands/deploy::run` and the `--regions` flag.
     #[serde(default)]
     pub regions: Vec<String>,
+    /// Desired replica count (issue #316). 0 means no threshold.
+    /// `#[serde(default)]` for backward compat with pre-#316 state.json.
+    #[serde(default)]
+    pub desired_replicas: usize,
 }
 
 impl State {
@@ -57,6 +61,7 @@ mod tests {
             app_name: "myapp".to_string(),
             live_url: "https://example.test".to_string(),
             regions: vec!["us-east".to_string(), "eu-west".to_string()],
+            desired_replicas: 3,
         };
         original.save(dir.path()).unwrap();
         let loaded = State::load(dir.path()).unwrap();
@@ -64,6 +69,7 @@ mod tests {
         assert_eq!(loaded.app_name, "myapp");
         assert_eq!(loaded.live_url, "https://example.test");
         assert_eq!(loaded.regions, vec!["us-east", "eu-west"]);
+        assert_eq!(loaded.desired_replicas, 3);
     }
 
     // TestStateLoad_LegacyFileWithoutRegions pins the
@@ -111,6 +117,7 @@ mod tests {
             app_name: "app".to_string(),
             live_url: "https://x.test".to_string(),
             regions: vec!["us-east".to_string(), "ap-south".to_string()],
+            desired_replicas: 5,
         };
         state.save(dir.path()).unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".edge").join("state.json")).unwrap();

@@ -36,13 +36,14 @@ pub fn run(
     id: Option<&str>,
     regions: &[String],
     auto_rollback: bool,
+    replicas: usize,
     file: Option<&Path>,
     lang: Option<LangArg>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions, auto_rollback, file, lang)
+    run_upload(path, app, regions, auto_rollback, replicas, file, lang)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -64,6 +65,7 @@ fn run_upload(
     app: &str,
     regions: &[String],
     auto_rollback: bool,
+    replicas: usize,
     file: Option<&Path>,
     lang: Option<LangArg>,
 ) -> Result<()> {
@@ -111,7 +113,7 @@ fn run_upload(
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback)?;
+    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback, replicas)?;
 
     let live_url = resp.url.clone();
     // Persist the regions the server actually accepted (it may
@@ -128,6 +130,7 @@ fn run_upload(
         app_name,
         live_url,
         regions: persisted_regions,
+        desired_replicas: resp.desired_replicas,
     };
     state.save(path)?;
 
@@ -225,6 +228,7 @@ pub fn run(
     _id: Option<&str>,
     _regions: &[String],
     _auto_rollback: bool,
+    _replicas: usize,
     _file: Option<&Path>,
     _lang: Option<LangArg>,
 ) -> Result<()> {
@@ -244,6 +248,7 @@ mod tests {
             // don't touch regions. The serde round-trip tests for
             // state.json live in state/mod.rs.
             regions: vec![],
+            desired_replicas: 0,
         }
     }
 
@@ -275,6 +280,7 @@ mod tests {
             app_name: "myapp".to_string(),
             live_url: String::new(),
             regions: vec![],
+            desired_replicas: 0,
         };
         let got = url_to_print(Some(&s), "myapp");
         assert_eq!(got, None);
