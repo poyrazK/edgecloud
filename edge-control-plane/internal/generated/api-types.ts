@@ -781,6 +781,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/internal/rate-limits/{tenantID}/{appName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Per-app rate limit override for the ingress
+         * @description Returns per-app rate limit overrides consumed by the edge-ingress
+         *     ratelimit fetcher. Both fields default to 0 (no override).
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                    appName: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Rate limit override */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @description Requests per second (0 = no override) */
+                            rps?: number;
+                            /** @description Burst size (0 = no override) */
+                            burst?: number;
+                        };
+                    };
+                };
+                /** @description Invalid app name or tenant ID */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description App not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/domains": {
         parameters: {
             query?: never;

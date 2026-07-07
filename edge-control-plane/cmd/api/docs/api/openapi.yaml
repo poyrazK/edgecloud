@@ -2666,6 +2666,42 @@ paths:
         '200':
           description: Traffic split data
 
+  /api/v1/internal/rate-limits/{tenantID}/{appName}:
+    get:
+      summary: Per-app rate limit override for the ingress
+      description: |
+        Returns per-app rate limit overrides consumed by the edge-ingress
+        ratelimit fetcher. Both fields default to 0 (no override).
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: appName
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Rate limit override
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rps:
+                    type: integer
+                    description: Requests per second (0 = no override)
+                  burst:
+                    type: integer
+                    description: Burst size (0 = no override)
+        '400':
+          description: Invalid app name or tenant ID
+        '404':
+          description: App not found
+
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)
   # -------------------------------------------------------------------------

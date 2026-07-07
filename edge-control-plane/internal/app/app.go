@@ -178,7 +178,7 @@ func New(
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
-	trafficHandler := handler.NewTrafficHandler(trafficSvc)
+	trafficHandler := handler.NewTrafficHandler(trafficSvc, appRepo)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
 	workerStatusHandler := handler.NewWorkerStatusHandler(workerSvc)
@@ -395,6 +395,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// apply Caddy weights for canary/blue-green traffic splits.
 	mux.HandleFunc("GET /api/v1/internal/traffic/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
+	})
+
+	// Per-app rate limit overrides for the ingress ratelimit fetcher (issue #305).
+	mux.HandleFunc("GET /api/v1/internal/rate-limits/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetRateLimitsInternal)).ServeHTTP(w, r)
 	})
 
 	// Secrets admin endpoints (X-Internal-Token auth).
