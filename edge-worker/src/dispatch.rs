@@ -1382,6 +1382,8 @@ mod synthetic_response_tests {
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1439,6 +1441,8 @@ mod synthetic_response_tests {
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
         };
 
         let dispatch = HandlerDispatch::new(
