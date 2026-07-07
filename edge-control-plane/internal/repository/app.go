@@ -156,3 +156,15 @@ func (r *AppRepository) InsertIfNotExists(ctx context.Context, app *domain.App) 
 	err := r.db.GetContext(ctx, &inserted, query, app.ID, app.TenantID, app.Name, app.Description, app.CreatedAt)
 	return inserted, err
 }
+
+// GetRateLimit returns the per-app rate limit override for (tenantID, appName).
+// Returns (nil, nil) when the app does not exist.
+func (r *AppRepository) GetRateLimit(ctx context.Context, tenantID, appName string) (*domain.AppRateLimit, error) {
+	var rl domain.AppRateLimit
+	query := `SELECT rate_limit_rps AS rps, rate_limit_burst AS burst FROM apps WHERE tenant_id = $1 AND name = $2`
+	err := r.db.GetContext(ctx, &rl, query, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &rl, err
+}

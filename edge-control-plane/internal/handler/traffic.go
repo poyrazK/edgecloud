@@ -14,6 +14,7 @@ import (
 // TrafficHandler handles traffic split HTTP requests.
 type TrafficHandler struct {
 	trafficSvc TrafficServiceInterface
+	appRepo    AppRepoInterface
 }
 
 // TrafficServiceInterface is the subset of service.TrafficService needed by the handler.
@@ -22,9 +23,17 @@ type TrafficServiceInterface interface {
 	GetTraffic(ctx context.Context, tenantID, appName string) ([]*domain.TrafficSplit, error)
 }
 
+// AppRepoInterface is the narrow contract the handler needs for reading
+// per-app rate limits. Defined here so handler tests can inject a mock
+// without standing up the full repository (matching the pattern used by
+// InternalDomainServiceInterface in internal.go).
+type AppRepoInterface interface {
+	GetRateLimit(ctx context.Context, tenantID, appName string) (*domain.AppRateLimit, error)
+}
+
 // NewTrafficHandler creates a TrafficHandler.
-func NewTrafficHandler(trafficSvc TrafficServiceInterface) *TrafficHandler {
-	return &TrafficHandler{trafficSvc: trafficSvc}
+func NewTrafficHandler(trafficSvc TrafficServiceInterface, appRepo AppRepoInterface) *TrafficHandler {
+	return &TrafficHandler{trafficSvc: trafficSvc, appRepo: appRepo}
 }
 
 // SetTraffic handles PUT /api/v1/apps/{appName}/traffic.
@@ -118,5 +127,38 @@ func (h *TrafficHandler) GetTrafficInternal(w http.ResponseWriter, r *http.Reque
 		"splits":   splits,
 	}); err != nil {
 		log.Printf("GetTrafficInternal: failed to encode response: %v", err)
+	}
+}
+
+// GetRateLimitsInternal handles GET /api/v1/internal/rate-limits/{tenantID}/{appName}.
+// Mounted under InternalAuth (shared-secret header), this is the read endpoint
+// the edge-ingress ratelimit fetcher polls to discover per-app rate limit overrides.
+// Returns the rate limits on 200, empty object {} if both are 0 (no override),
+// or 404 if the app doesn't exist.
+func (h *TrafficHandler) GetRateLimitsInternal(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		http.Error(w, `{"error": "invalid tenant id"}`, http.StatusBadRequest)
+		return
+	}
+
+	rl, err := h.appRepo.GetRateLimit(r.Context(), tenantID, appName)
+	if err != nil {
+		log.Printf("GetRateLimitsInternal: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if rl == nil {
+		http.Error(w, `{"error": "app not found"}`, http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(rl); err != nil {
+		log.Printf("GetRateLimitsInternal: failed to encode response: %v", err)
 	}
 }
