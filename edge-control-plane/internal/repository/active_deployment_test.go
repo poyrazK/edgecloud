@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,11 +80,11 @@ func TestActiveDeploymentRepository_ActivateFlipsLastGood(t *testing.T) {
 				WillReturnRows(sqlmock.NewRows([]string{
 					"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
 					"auto_rollback_enabled", "stable_since",
-					"regions_published", "regions_failed",
+					"regions_published", "regions_failed", "regions_cached",
 					"last_publish_at", "last_publish_attempt_id",
 				}).AddRow(tenantID, appName, current.id, current.lastGood,
 					false, nil,
-					"{}", "{}",
+					"{}", "{}", "{}",
 					nil, nil,
 				))
 		}
@@ -254,7 +255,7 @@ func TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood(t *testing.T) {
 	mock.ExpectQuery(`WITH updated AS`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
@@ -334,6 +335,73 @@ func TestAppendRegionsFailed_IssuesExpectedStatement(t *testing.T) {
 	}
 }
 
+// TestAppendRegionsCached_IssuesExpectedStatement (issue #332, PR 2)
+// pins the SQL shape of the new AppendRegionsCached helper. Mirrors
+// the dedup-mechanics pin on the publish helper (above) but for
+// the cache state: `regions_cached = (SELECT COALESCE(array_agg(DISTINCT r), '{}')
+// FROM unnest(regions_cached || $3::text[]) AS r)`. The signature
+// is intentionally one-arg lighter than the publish helper
+// (no attemptID column, no timestamp — see the doc comment on
+// AppendRegionsCached for why).
+func TestAppendRegionsCached_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_cached = (`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.AppendRegionsCached(context.Background(), "t_test", "myapp",
+		[]string{"us-east", "eu-west"}, time.Now()); err != nil {
+		t.Fatalf("AppendRegionsCached: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestAppendRegionsCached_DedupesRegions is a table-driven check
+// that the SQL pattern removes dupes. WithArgs(sqlmock.AnyArg())
+// lets us pass `[]string{"fra", "fra", "iad"}` through and assert
+// sqlmock is satisfied — but the actual dedup is enforced
+// server-side by `unnest() || $3::text[]` + DISTINCT. This test
+// is a contract pin for the SQL params + a regression guard for
+// future refactors that change the arg order or drop DISTINCT
+// (sqlmock would catch that immediately by failing the WithArgs
+// match).
+func TestAppendRegionsCached_DedupesRegions(t *testing.T) {
+	tests := [][]string{
+		{"fra"},
+		{"fra", "iad"},
+		{"fra", "fra", "iad"},
+		{"fra", "iad", "fra", "iad"},
+	}
+	for _, regions := range tests {
+		t.Run(strings.Join(regions, ","), func(t *testing.T) {
+			db, mock, cleanup := newActiveDeploymentMockDB(t)
+			defer cleanup()
+			repo := NewActiveDeploymentRepository(db)
+
+			mock.ExpectExec(regexp.QuoteMeta(
+				`UPDATE active_deployments SET regions_cached = (`,
+			)).
+				WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+
+			if err := repo.AppendRegionsCached(context.Background(), "t_test", "myapp",
+				regions, time.Now()); err != nil {
+				t.Fatalf("AppendRegionsCached: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("sqlmock expectations not met: %v", err)
+			}
+		})
+	}
+}
+
 // TestSet_ResetsPublishStateOnReactivation pins the re-activation
 // behavior documented in the Set comment: the DO UPDATE branch
 // resets the four per-region publish-state columns. This is
@@ -388,12 +456,12 @@ func TestListByTenantWithDeployment_HappyPath(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
-		"auto_rollback_enabled", "stable_since", "regions_published",
+		"auto_rollback_enabled", "stable_since", "regions_published", "regions_cached",
 		"regions_failed", "last_publish_at", "last_publish_attempt_id",
 		"hash", "regions",
 	}).
-		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, "hash1", pq.StringArray{"global"}).
-		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"us-east", "eu-west"}, pq.StringArray{}, nil, nil, "hash2", pq.StringArray{"us-east", "eu-west"})
+		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, pq.StringArray{"global"}, nil, nil, "hash1", pq.StringArray{"global"}).
+		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"us-east", "eu-west"}, pq.StringArray{}, pq.StringArray{"us-east", "eu-west"}, nil, nil, "hash2", pq.StringArray{"us-east", "eu-west"})
 
 	mock.ExpectQuery(`SELECT.*active_deployments ad.*JOIN deployments d`).
 		WithArgs("t_a").
@@ -432,18 +500,18 @@ func TestListByTenantWithDeployment_OrphanPassesThrough(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
-		"auto_rollback_enabled", "stable_since", "regions_published",
+		"auto_rollback_enabled", "stable_since", "regions_published", "regions_cached",
 		"regions_failed", "last_publish_at", "last_publish_attempt_id",
 		"hash", "regions",
 	}).
 		// happy app
-		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, "hash1", pq.StringArray{"global"}).
+		AddRow("t_a", "app1", "d_1", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, pq.StringArray{"global"}, nil, nil, "hash1", pq.StringArray{"global"}).
 		// orphan: d_2 has no match in deployments, so the LEFT JOIN
 		// returns SQL NULL for hash and regions. The NULL is fed in
 		// as a typed nil so the sql driver reports IsNull=true on
 		// the column — otherwise the scan would attempt string
 		// conversion on an untyped nil and fail before our check.
-		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, nil, nil, nil, nil)
+		AddRow("t_a", "app2", "d_2", nil, false, nil, pq.StringArray{"global"}, pq.StringArray{}, pq.StringArray{"global"}, nil, nil, nil, nil)
 
 	mock.ExpectQuery(`SELECT.*active_deployments ad.*JOIN deployments d`).
 		WithArgs("t_a").

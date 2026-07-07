@@ -773,6 +773,21 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	for _, r := range current.RegionsFailed {
 		mustRetry[r] = struct{}{}
 	}
+	// alreadyCached (issue #332, Layer 3): regions whose
+	// edge-artifact-cache binary already holds the artifact bytes
+	// from a prior activation. The cache-push loop below skips
+	// these regions (no PUT); the NATS publish loop still runs
+	// for them, since the worker may not have received the prior
+	// TaskMessage (NATS workqueue dedupes by message id, but the
+	// two messages are different so the worker will get a refresh).
+	// The skipped regions are recorded in `cached` for the 502
+	// envelope; on a future re-activation with the same row, both
+	// `alreadyPublished` AND `alreadyCached` keep re-publishing /
+	// skipping respectively — until a new Set wipes them.
+	alreadyCached := make(map[string]struct{}, len(current.RegionsCached))
+	for _, r := range current.RegionsCached {
+		alreadyCached[r] = struct{}{}
+	}
 
 	// toPublish = (regions ∪ regions_failed) − regions_published
 	// Preserves input order for log determinism.
@@ -819,14 +834,31 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	// Skip conditions (region in `toPublish` is NOT pushed when):
 	//   - s.cachePusher is nil (cache feature disabled at runtime)
 	//   - s.regionArtifactCaches[region] is unset or empty
+	//   - region is in `alreadyCached` (PR 2): Set wipes
+	//     RegionsCached to '{}' on re-activation, so this branch
+	//     only fires on retries within a single activation cycle
+	//     (or after a fresh activation where the cache survives
+	//     across activations — the re-push is skipped).
 	//
-	// PR 2 will add a `regions_cached` DB column to short-circuit
-	// already-cached regions on retry; for PR 1 the cache push
-	// fires on every attempt (idempotent on the server side).
+	// The third condition means cache push is best-effort +
+	// idempotent: a successful push on activation A leaves
+	// RegionsCached populated; activation B sees the region in
+	// alreadyCached and skips — no network traffic for regions
+	// whose cache already has the bytes. If the cache between
+	// activations is wiped, the next activation re-pushes (because
+	// Set wipes RegionsCached to '{}' before the cache loop
+	// runs).
 	var cached []string
 	var cacheFailed []string
 	if s.cachePusher != nil && len(s.regionArtifactCaches) > 0 {
 		for _, region := range toPublish {
+			if _, ok := alreadyCached[region]; ok {
+				// Already cached from a prior activation. Record as
+				// skipped so the 502 envelope can list it; don't
+				// attempt a redundant push.
+				cached = append(cached, region)
+				continue
+			}
 			cacheURL, ok := s.regionArtifactCaches[region]
 			if !ok || cacheURL == "" {
 				// No cache configured for this region; the worker
@@ -859,12 +891,15 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	// 502 envelope than a misleading 500 caused by an audit-log
 	// write failing.
 	//
-	// Both appends share one tx so the row's (regions_published,
-	// regions_failed, last_publish_at, last_publish_attempt_id) stay
-	// consistent even if the process crashes mid-write. Within the
-	// closure, returning the first error aborts the tx and Rollback
-	// discards the first append — the desired atomicity.
-	if len(published) > 0 || len(failed) > 0 {
+	// All three appends (regions_published, regions_failed,
+	// regions_cached) share one tx so the row's per-region state
+	// stays consistent even if the process crashes mid-write. Within
+	// the closure, returning the first error aborts the tx and
+	// Rollback discards every append — the desired atomicity. PR 2
+	// (issue #332) added `regions_cached` to this same tx so the
+	// cache-history counter can't diverge from the publish state on
+	// partial failure.
+	if len(published) > 0 || len(failed) > 0 || len(cached) > 0 {
 		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 			txRepo := s.activeRepo.WithTx(tx)
 			if len(published) > 0 {
@@ -875,6 +910,20 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 			if len(failed) > 0 {
 				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
 					return fmt.Errorf("append regions_failed: %w", err)
+				}
+			}
+			// AppendRegionsCached is invoked whenever the cache loop
+			// ran and either succeeded OR skipped (alreadyCached).
+			// In the skip case the region is still in `cached`
+			// (logged above) so the next activation sees it
+			// there. In the success case it's a real merge into
+			// the existing set. `cached` is non-empty only when the
+			// pusher ran; in the no-op case (cache disabled or no
+			// region has a cache URL) we skip the tx entirely via
+			// the outer guard.
+			if len(cached) > 0 {
+				if err := txRepo.AppendRegionsCached(ctx, tenantID, appName, cached, now); err != nil {
+					return fmt.Errorf("append regions_cached: %w", err)
 				}
 			}
 			return nil

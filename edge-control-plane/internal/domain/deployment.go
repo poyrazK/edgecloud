@@ -104,6 +104,27 @@ type ActiveDeployment struct {
 	// next activate (see issue #127 Risk 3 — a stale
 	// RegionsPublished must not mask a real failure).
 	RegionsFailed pq.StringArray `db:"regions_failed"`
+	// RegionsCached (issue #332, Layer 3) is the deduped set of
+	// regions whose edge-artifact-cache binary currently holds the
+	// activation artifact bytes. On a re-activation, publishSwap
+	// subtracts this from the cache-push loop so already-cached
+	// regions are not re-pushed over the network. The NATS
+	// TaskMessage still fires for these regions — only the cache
+	// PUT is skipped, since workers may not have received the prior
+	// publish (e.g. due to NATS workqueue delay).
+	//
+	// The DO UPDATE branch of ActiveDeploymentRepository.Set wipes
+	// the publish-state columns (RegionsPublished, RegionsFailed,
+	// LastPublishAt, LastPublishAttemptID) on re-activation, AND
+	// RegionsCached — so a re-activation starts fresh and the next
+	// activation retries the cache push from scratch. This matches
+	// the "I just activated, so no regions have been processed yet
+	// for THIS activation" mental model documented on
+	// RegionsPublished above.
+	//
+	// pq.StringArray for the same reason as Deployment.Regions:
+	// lib/pq's Scanner requires it for TEXT[].
+	RegionsCached pq.StringArray `db:"regions_cached"`
 	// LastPublishAt is the wall-clock timestamp of the most recent
 	// (per-region) publish attempt, regardless of outcome. Useful
 	// for the operator escape hatch `SELECT last_publish_at FROM

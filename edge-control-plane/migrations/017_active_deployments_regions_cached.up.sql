@@ -1,0 +1,24 @@
+-- Issue #332 (Layer 3: Push-to-Edge Artifact Distribution) — track the
+-- per-region artifact-cache push outcome.
+--
+-- `regions_cached` is the deduped set of regions whose edge-artifact-cache
+-- binary currently holds the artifact bytes. On a re-activation, the
+-- service layer (publishSwap in service/deployment.go) subtracts this
+-- from the cache-push loop so already-cached regions are not re-pushed
+-- over the network. The NATS TaskMessage still fires for these regions
+-- (the worker may not have received the prior publish), but the cache
+-- PUT is skipped.
+--
+-- We deliberately do NOT add `regions_cache_failed` here. A failed
+-- cache push remains visible only in the 502 envelope for the
+-- lifetime of one activation; the next activation retries transparently.
+-- That keeps the column count low and matches how `regions_published`
+-- works for NATS publish retries.
+--
+-- Placement + column type mirror the existing `regions_published` /
+-- `regions_failed` columns from migration 010 so the Get / GetForUpdate
+-- / ListByTenant column lists in repository/active_deployment.go stay
+-- in a stable order. `IF NOT EXISTS` makes the migration safe to
+-- re-run.
+ALTER TABLE active_deployments
+    ADD COLUMN IF NOT EXISTS regions_cached TEXT[] NOT NULL DEFAULT '{}';
