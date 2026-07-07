@@ -1474,26 +1474,32 @@ mod synthetic_response_tests {
 
     #[test]
     fn budget_ticks_100ms_at_10ms_gives_10() {
-        assert_eq!((100u64 / 10u64.max(1)).max(1), 10);
+        // request_budget_ms (100) / tick_ms (10) = 10 ticks, clamped to ≥1
+        let budget: u64 = 100;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 10);
     }
 
     #[test]
     fn budget_ticks_5ms_at_10ms_floors_at_1() {
-        assert_eq!((5u64 / 10u64.max(1)).max(1), 1);
+        let budget: u64 = 5;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 1);
     }
 
     #[test]
-    fn budget_ticks_zero_ms_floors_at_1() {
-        assert_eq!((0u64 / 10u64.max(1)).max(1), 1);
+    fn budget_ticks_zero_budget_floors_at_1() {
+        let budget: u64 = 0;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 1);
     }
 
     #[test]
-    fn tick_ms_zero_is_clamped_to_1() {
-        assert_eq!(0u64.max(1), 1);
-    }
-
-    #[test]
-    fn tick_ms_normal_passthrough() {
-        assert_eq!(10u64.max(1), 10);
+    fn tick_ms_zero_clamped_to_1() {
+        let tick: u64 = 0;
+        assert_eq!(tick.max(1), 1);
     }
 }
