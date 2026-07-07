@@ -134,6 +134,42 @@ pub struct Supervisor {
     pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
 }
 
+/// Convert a MetricsAccumulator snapshot into the heartbeat wire format.
+pub fn accumulate_metrics(
+    snapshot: &edge_runtime::interfaces::observe::MetricsSnapshot,
+) -> Vec<MetricSample> {
+    let mut samples = Vec::with_capacity(
+        snapshot.counters.len() + snapshot.gauges.len() + snapshot.histograms.len(),
+    );
+    for c in &snapshot.counters {
+        samples.push(MetricSample {
+            name: c.name.clone(),
+            kind: MetricKind::Counter,
+            value: c.value as f64,
+            labels: c.labels.clone(),
+        });
+    }
+    for g in &snapshot.gauges {
+        samples.push(MetricSample {
+            name: g.name.clone(),
+            kind: MetricKind::Gauge,
+            value: g.value,
+            labels: g.labels.clone(),
+        });
+    }
+    for (name, entries) in &snapshot.histograms {
+        for (value, labels) in entries {
+            samples.push(MetricSample {
+                name: name.clone(),
+                kind: MetricKind::HistogramSample,
+                value: *value,
+                labels: labels.clone(),
+            });
+        }
+    }
+    samples
+}
+
 impl Supervisor {
     /// HTTP `/sync` fallback (issue #53). When NATS is silent for
     /// longer than `worker_sync_threshold_secs`, the worker falls back
@@ -1140,37 +1176,7 @@ impl Supervisor {
             // respectively — matching the heartbeat wire format in
             // edge-worker/src/messages.rs.
             let metrics = if let Some(ref acc) = inst.metrics_acc {
-                let msnap = acc.snapshot();
-                let mut samples = Vec::with_capacity(
-                    msnap.counters.len() + msnap.gauges.len() + msnap.histograms.len(),
-                );
-                for c in msnap.counters {
-                    samples.push(MetricSample {
-                        name: c.name,
-                        kind: MetricKind::Counter,
-                        value: c.value as f64,
-                        labels: c.labels,
-                    });
-                }
-                for g in msnap.gauges {
-                    samples.push(MetricSample {
-                        name: g.name,
-                        kind: MetricKind::Gauge,
-                        value: g.value,
-                        labels: g.labels,
-                    });
-                }
-                for (name, entries) in msnap.histograms {
-                    for (value, labels) in entries {
-                        samples.push(MetricSample {
-                            name: name.clone(),
-                            kind: MetricKind::HistogramSample,
-                            value,
-                            labels,
-                        });
-                    }
-                }
-                samples
+                accumulate_metrics(&acc.snapshot())
             } else {
                 vec![]
             };
@@ -1497,6 +1503,96 @@ mod tests {
     #[test]
     fn exit_code_hung_is_some() {
         assert_eq!(app_status_exit_code(&AppInstanceStatus::Hung), Some(1));
+    }
+
+    // ── accumulate_metrics tests ──────────────────────────────────────
+
+    use edge_runtime::interfaces::observe::{MetricEntry, MetricsSnapshot};
+
+    #[test]
+    fn accumulate_metrics_empty() {
+        let snap = MetricsSnapshot {
+            counters: vec![],
+            gauges: vec![],
+            histograms: std::collections::HashMap::new(),
+        };
+        let result = accumulate_metrics(&snap);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn accumulate_metrics_includes_counter() {
+        let snap = MetricsSnapshot {
+            counters: vec![MetricEntry {
+                name: "req_count".into(),
+                value: 42,
+                labels: vec![("tenant".into(), "t1".into())],
+            }],
+            gauges: vec![],
+            histograms: std::collections::HashMap::new(),
+        };
+        let result = accumulate_metrics(&snap);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "req_count");
+        assert_eq!(result[0].kind, MetricKind::Counter);
+        assert_eq!(result[0].value, 42.0);
+    }
+
+    #[test]
+    fn accumulate_metrics_includes_gauge() {
+        let snap = MetricsSnapshot {
+            counters: vec![],
+            gauges: vec![MetricEntry {
+                name: "cpu_temp".into(),
+                value: 75.0,
+                labels: vec![],
+            }],
+            histograms: std::collections::HashMap::new(),
+        };
+        let result = accumulate_metrics(&snap);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "cpu_temp");
+        assert_eq!(result[0].kind, MetricKind::Gauge);
+        assert_eq!(result[0].value, 75.0);
+    }
+
+    #[test]
+    fn accumulate_metrics_includes_histogram() {
+        let mut histograms = std::collections::HashMap::new();
+        histograms.insert(
+            "latency".into(),
+            vec![(100.0, vec![("pct".into(), "50".into())])],
+        );
+        let snap = MetricsSnapshot {
+            counters: vec![],
+            gauges: vec![],
+            histograms,
+        };
+        let result = accumulate_metrics(&snap);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "latency");
+        assert_eq!(result[0].kind, MetricKind::HistogramSample);
+    }
+
+    #[test]
+    fn accumulate_metrics_all_three_types() {
+        let mut histograms = std::collections::HashMap::new();
+        histograms.insert("latency".into(), vec![(5.0, vec![])]);
+        let snap = MetricsSnapshot {
+            counters: vec![MetricEntry {
+                name: "c".into(),
+                value: 1,
+                labels: vec![],
+            }],
+            gauges: vec![MetricEntry {
+                name: "g".into(),
+                value: 2.0,
+                labels: vec![],
+            }],
+            histograms,
+        };
+        let result = accumulate_metrics(&snap);
+        assert_eq!(result.len(), 3);
     }
 
     // ── compute_app_diff tests ──────────────────────────────────────
