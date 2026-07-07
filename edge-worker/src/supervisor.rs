@@ -1800,10 +1800,7 @@ impl Supervisor {
     ) -> anyhow::Result<()> {
         let mut stream = self
             .nats
-            .subscribe_tasks(
-                &self.config.region,
-                &self.config.consumer_name,
-            )
+            .subscribe_tasks(&self.config.region, &self.config.consumer_name)
             .await?;
         tracing::info!(
             region = %self.config.region,

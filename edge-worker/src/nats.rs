@@ -37,10 +37,7 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// Build the JetStream consumer config for subscribing to task messages.
 /// Extracted as a pure function so the wire contract can be unit-tested
 /// without a real NATS connection.
-pub fn build_consumer_config(
-    consumer_name: &str,
-    region: &str,
-) -> PushConsumerConfig {
+pub fn build_consumer_config(consumer_name: &str, region: &str) -> PushConsumerConfig {
     let deliver_subject = format!("_INBOX.task.{}", consumer_name);
     PushConsumerConfig {
         name: Some(consumer_name.to_string()),
@@ -228,7 +225,10 @@ pub(crate) mod tests {
     #[test]
     fn consumer_config_has_no_queue_group() {
         let cfg = build_consumer_config("c1", "sfo");
-        assert!(cfg.deliver_group.is_none(), "fan-out mode: deliver_group must be None");
+        assert!(
+            cfg.deliver_group.is_none(),
+            "fan-out mode: deliver_group must be None"
+        );
     }
 
     #[test]
