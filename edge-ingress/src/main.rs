@@ -11,6 +11,7 @@ mod config;
 mod domains;
 pub mod heartbeats;
 mod messages;
+mod ratelimit;
 mod routing;
 pub mod traffic;
 

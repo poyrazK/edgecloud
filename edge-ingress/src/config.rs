@@ -63,6 +63,15 @@ pub struct Config {
     /// `0.0.0.0:2019` for Docker). Defaults to `localhost:2019` which
     /// matches Caddy's own default. Override with `CADDY_ADMIN_LISTEN`.
     pub caddy_admin_listen: String,
+    /// Default per-app rate limit in requests per second. 0 = disabled.
+    /// Override with `RATE_LIMIT_RPS_DEFAULT`.
+    pub rate_limit_rps_default: u32,
+    /// Default per-app burst size. 0 = disabled.
+    /// Override with `RATE_LIMIT_BURST_DEFAULT`.
+    pub rate_limit_burst_default: u32,
+    /// How often to poll the control plane for per-app rate limit overrides.
+    /// Default 60s. 0 = disabled. Override with `RATE_LIMIT_FETCH_INTERVAL`.
+    pub rate_limit_fetch_interval: Duration,
 }
 
 impl Config {
@@ -133,6 +142,18 @@ impl Config {
             domain_poll_interval,
             caddy_admin_listen: std::env::var("CADDY_ADMIN_LISTEN")
                 .unwrap_or_else(|_| "localhost:2019".into()),
+            rate_limit_rps_default: std::env::var("RATE_LIMIT_RPS_DEFAULT")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            rate_limit_burst_default: std::env::var("RATE_LIMIT_BURST_DEFAULT")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            rate_limit_fetch_interval: std::env::var("RATE_LIMIT_FETCH_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(60)),
         })
     }
 }

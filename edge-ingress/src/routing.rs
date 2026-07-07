@@ -47,6 +47,10 @@ pub struct RouteEntry {
     pub weight: u8,
     pub worker_addr: String,
     pub port: u16,
+    /// Per-app rate limit in requests per second. `None` = use global default.
+    pub rate_limit_rps: Option<u32>,
+    /// Per-app burst size. `None` = use global default.
+    pub rate_limit_burst: Option<u32>,
     pub last_seen: Instant,
 }
 
@@ -161,6 +165,8 @@ impl RoutingTable {
                 weight,
                 worker_addr: worker_addr.to_string(),
                 port,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
                 last_seen: Instant::now(),
             },
         );
