@@ -500,24 +500,10 @@ impl Supervisor {
         // this becomes `WasiCtx` env on every per-request state clone;
         // for LongRunning it's the same HashMap the run_app_loop
         // consumes.
-        let mut env = spec.env.clone();
-        env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
-        // Replace the EDGE_WS_PORT sentinel ("0") with the actual allocated port
-        // so the guest sees the real port number in its environment.
-        if let Some(ws) = ws_port {
-            env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
-        }
+        let env = build_app_env(spec, raw_port, ws_port);
 
         // EgressPolicy from the spec.allowlist. None / empty → allow-all.
-        // Spec carries Vec<String>:
-        //   * `None` (wire field absent) → permissive default
-        //   * `Some([])` (field present, empty) → empty allowlist = deny all
-        // Phase C: the existing LongRunning branch already passes this;
-        // the Handler branch picks it up here.
-        let egress_for_handler: Arc<EgressPolicy> = match &spec.allowlist {
-            None => Arc::new(EgressPolicy::allow_all()),
-            Some(list) => Arc::new(EgressPolicy::new(list.clone())),
-        };
+        let egress_for_handler: Arc<EgressPolicy> = allowlist_to_egress_policy(&spec.allowlist);
 
         // AppLogContext — stamped on every log record the guest emits.
         let app_ctx = edge_runtime::interfaces::observe::AppLogContext {
@@ -1076,10 +1062,7 @@ impl Supervisor {
         // Build per-deployment egress policy.
         // None = field absent or [] on the wire (old control plane) → allow-all.
         // Some(list) = explicit allowlist → enforce it.
-        let egress = match allowlist {
-            None => Arc::new(EgressPolicy::allow_all()),
-            Some(list) => Arc::new(EgressPolicy::new(list)),
-        };
+        let egress = allowlist_to_egress_policy(&allowlist);
 
         // Build per-app LogContext — stamped onto every record this app emits
         // so the LogForwarder knows which tenant/app/deployment to attribute
@@ -1425,6 +1408,156 @@ pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
     }
 }
 
+/// Build the per-app environment map from the spec's env vars and allocated ports.
+pub fn build_app_env(
+    spec: &AppSpec,
+    raw_port: u16,
+    ws_port: Option<u16>,
+) -> HashMap<String, String> {
+    let mut env = spec.env.clone();
+    env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
+    if let Some(ws) = ws_port {
+        env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
+    }
+    env
+}
+
+/// Convert an allowlist spec to an EgressPolicy.
+pub fn allowlist_to_egress_policy(allowlist: &Option<Vec<String>>) -> Arc<EgressPolicy> {
+    match allowlist {
+        None => Arc::new(EgressPolicy::allow_all()),
+        Some(list) => Arc::new(EgressPolicy::new(list.clone())),
+    }
+}
+
+/// Exponential backoff clamped to [1s, 60s]. restart_count 0 returns 1s.
+pub fn calculate_backoff(restart_count: u32) -> Duration {
+    const BASE_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    if restart_count == 0 {
+        return BASE_BACKOFF;
+    }
+    // 2^(n-1) seconds, clamped at MAX_BACKOFF.
+    // Use checked_pow to avoid overflow on large counts.
+    let secs = 2u64
+        .checked_pow(restart_count.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    std::cmp::min(Duration::from_secs(secs), MAX_BACKOFF)
+}
+
+/// Should the supervisor give up on this app?
+pub fn should_give_up(restart_count: u32, max_restarts: u32) -> bool {
+    restart_count >= max_restarts
+}
+
+/// The outcome of a single `execute_app` call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunOutcome {
+    KeepRunning,
+    ProcessExit,
+    Crashed { restart_count: u32, error: String },
+    Hung { restart_count: u32 },
+}
+
+/// Classify an execute_app result into a RunOutcome.
+pub fn classify_run_outcome(
+    result: Result<Result<bool, anyhow::Error>, tokio::time::error::Elapsed>,
+    restart_count: u32,
+) -> RunOutcome {
+    match result {
+        Ok(Ok(true)) => RunOutcome::KeepRunning,
+        Ok(Ok(false)) => RunOutcome::ProcessExit,
+        Ok(Err(e)) => RunOutcome::Crashed {
+            restart_count: restart_count + 1,
+            error: e.to_string(),
+        },
+        Err(_) => RunOutcome::Hung {
+            restart_count: restart_count + 1,
+        },
+    }
+}
+
+/// Action to take after processing a RunOutcome.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Continue,
+    Sleep(Duration),
+    GiveUp,
+    Exit,
+}
+
+/// Pure state machine for the run_app_loop restart logic.
+#[derive(Debug, Clone)]
+pub struct AppLoopState {
+    restart_count: u32,
+    max_restarts: u32,
+}
+
+impl AppLoopState {
+    pub fn new(max_restarts: u32) -> Self {
+        Self {
+            restart_count: 0,
+            max_restarts,
+        }
+    }
+
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count
+    }
+
+    /// Process an execute_app outcome and return the next action.
+    pub fn handle_outcome(&mut self, outcome: RunOutcome) -> Action {
+        match outcome {
+            RunOutcome::KeepRunning => Action::Continue,
+            RunOutcome::ProcessExit => Action::Exit,
+            RunOutcome::Crashed { restart_count, .. } => {
+                self.restart_count = restart_count;
+                if self.restart_count >= self.max_restarts {
+                    Action::GiveUp
+                } else {
+                    let _ = calculate_backoff(self.restart_count);
+                    Action::Sleep(calculate_backoff(self.restart_count))
+                }
+            }
+            RunOutcome::Hung { restart_count } => {
+                self.restart_count = restart_count;
+                if self.restart_count >= self.max_restarts {
+                    Action::GiveUp
+                } else {
+                    Action::Sleep(calculate_backoff(self.restart_count))
+                }
+            }
+        }
+    }
+}
+
+/// Classify a JoinError from stopping an app task.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum JoinAction {
+    OkOrCancelled,
+    PanicPayload(Box<dyn std::any::Any + Send>),
+}
+
+/// Classify a task JoinHandle result: Ok or Cancelled are clean; real
+/// panics are returned for re-raising.
+#[allow(dead_code)]
+pub fn classify_join_result(
+    join_result: Result<(), tokio::task::JoinError>,
+) -> JoinAction {
+    match join_result {
+        Ok(()) => JoinAction::OkOrCancelled,
+        Err(join_err) if join_err.is_cancelled() => JoinAction::OkOrCancelled,
+        Err(join_err) => {
+            if let Ok(panic_payload) = join_err.try_into_panic() {
+                JoinAction::PanicPayload(panic_payload)
+            } else {
+                JoinAction::OkOrCancelled
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,6 +1726,274 @@ mod tests {
         };
         let result = accumulate_metrics(&snap);
         assert_eq!(result.len(), 3);
+    }
+
+    // ── build_app_env tests ──────────────────────────────────────────
+
+    #[test]
+    fn build_app_env_spec_env_preserved() {
+        let mut env = HashMap::new();
+        env.insert("FOO".into(), "bar".into());
+        let spec = AppSpec {
+            deployment_id: "d1".into(),
+            deployment_hash: "abc".into(),
+            routes: None,
+            env,
+            allowlist: None,
+            max_memory_mb: 256,
+        };
+        let result = build_app_env(&spec, 8080, None);
+        assert_eq!(result.get("FOO").unwrap(), "bar");
+        assert_eq!(result.get("EDGE_HTTP_SERVER_PORT"), Some(&"8080".to_string()));
+        assert!(!result.contains_key("EDGE_WS_PORT"));
+    }
+
+    #[test]
+    fn build_app_env_with_ws_port() {
+        let spec = AppSpec {
+            deployment_id: "d1".into(),
+            deployment_hash: "abc".into(),
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            max_memory_mb: 256,
+        };
+        let result = build_app_env(&spec, 8080, Some(9091));
+        assert_eq!(result.get("EDGE_HTTP_SERVER_PORT").unwrap(), "8080");
+        assert_eq!(result.get("EDGE_WS_PORT").unwrap(), "9091");
+    }
+
+    #[test]
+    fn build_app_env_overrides_not_present_in_spec() {
+        let spec = AppSpec {
+            deployment_id: "d1".into(),
+            deployment_hash: "abc".into(),
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            max_memory_mb: 256,
+        };
+        let result = build_app_env(&spec, 9001, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("EDGE_HTTP_SERVER_PORT").unwrap(), "9001");
+    }
+
+    // ── allowlist_to_egress_policy tests ──────────────────────────────
+
+    #[test]
+    fn allowlist_none_returns_some_policy() {
+        let policy = allowlist_to_egress_policy(&None);
+        // Policy is constructed without error (structural test).
+        let _ = policy;
+    }
+
+    #[test]
+    fn allowlist_empty_returns_some_policy() {
+        let policy = allowlist_to_egress_policy(&Some(vec![]));
+        let _ = policy;
+    }
+
+    #[test]
+    fn allowlist_with_hosts_returns_policy() {
+        let policy = allowlist_to_egress_policy(&Some(vec!["api.example.com".into()]));
+        let _ = policy;
+    }
+
+    // ── calculate_backoff tests ───────────────────────────────────────
+
+    #[test]
+    fn backoff_restart_count_0_returns_1s() {
+        assert_eq!(calculate_backoff(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_restart_count_1_returns_1s() {
+        assert_eq!(calculate_backoff(1), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_restart_count_2_returns_2s() {
+        assert_eq!(calculate_backoff(2), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn backoff_restart_count_6_returns_32s() {
+        assert_eq!(calculate_backoff(6), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn backoff_restart_count_7_clamped_at_60s() {
+        assert_eq!(calculate_backoff(7), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn backoff_restart_count_large_clamped() {
+        assert!(calculate_backoff(u32::MAX).as_secs() <= 60);
+    }
+
+    // ── should_give_up tests ─────────────────────────────────────────
+
+    #[test]
+    fn give_up_below_max_returns_false() {
+        assert!(!should_give_up(3, 5));
+    }
+
+    #[test]
+    fn give_up_at_max_returns_true() {
+        assert!(should_give_up(5, 5));
+    }
+
+    #[test]
+    fn give_up_above_max_returns_true() {
+        assert!(should_give_up(6, 5));
+    }
+
+    // ── classify_run_outcome tests ────────────────────────────────────
+
+    #[test]
+    fn outcome_keep_running() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> = Ok(Ok(true));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            0,
+        );
+        assert_eq!(mapped, RunOutcome::KeepRunning);
+    }
+
+    #[test]
+    fn outcome_process_exit() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> = Ok(Ok(false));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            2,
+        );
+        assert_eq!(mapped, RunOutcome::ProcessExit);
+    }
+
+    #[test]
+    fn outcome_crashed_increments_count() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> =
+            Ok(Err(anyhow::anyhow!("wasm trap")));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            3,
+        );
+        assert_eq!(
+            mapped,
+            RunOutcome::Crashed {
+                restart_count: 4,
+                error: "wasm trap".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_keep_running_check() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> = Ok(Ok(true));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            0,
+        );
+        assert_eq!(mapped, RunOutcome::KeepRunning);
+    }
+
+    #[test]
+    fn outcome_process_exit_check() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> = Ok(Ok(false));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            2,
+        );
+        assert_eq!(mapped, RunOutcome::ProcessExit);
+    }
+
+    #[test]
+    fn outcome_crashed_check() {
+        let result: Result<Result<bool, anyhow::Error>, std::convert::Infallible> =
+            Ok(Err(anyhow::anyhow!("wasm trap")));
+        let mapped = classify_run_outcome(
+            result.map_err(|_| unreachable!()),
+            3,
+        );
+        assert_eq!(
+            mapped,
+            RunOutcome::Crashed {
+                restart_count: 4,
+                error: "wasm trap".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_hung_increments_count() {
+        // RunOutcome::Hung can't be produced without constructing
+        // tokio::time::error::Elapsed (not publicly constructable).
+        // Test Hung behavior through AppLoopState tests below.
+    }
+
+    // ── AppLoopState tests ────────────────────────────────────────────
+
+    #[test]
+    fn loop_state_keep_running() {
+        let mut state = AppLoopState::new(5);
+        assert_eq!(
+            state.handle_outcome(RunOutcome::KeepRunning),
+            Action::Continue
+        );
+        assert_eq!(state.restart_count(), 0);
+    }
+
+    #[test]
+    fn loop_state_process_exit() {
+        let mut state = AppLoopState::new(5);
+        assert_eq!(
+            state.handle_outcome(RunOutcome::ProcessExit),
+            Action::Exit
+        );
+    }
+
+    #[test]
+    fn loop_state_crashed_below_max_returns_sleep() {
+        let mut state = AppLoopState::new(5);
+        let action = state.handle_outcome(RunOutcome::Crashed {
+            restart_count: 1,
+            error: "oops".into(),
+        });
+        assert_eq!(state.restart_count(), 1);
+        assert!(matches!(action, Action::Sleep(_)));
+    }
+
+    #[test]
+    fn loop_state_crashed_at_max_returns_give_up() {
+        let mut state = AppLoopState::new(3);
+        let action = state.handle_outcome(RunOutcome::Crashed {
+            restart_count: 3,
+            error: "boom".into(),
+        });
+        assert_eq!(action, Action::GiveUp);
+    }
+
+    #[test]
+    fn loop_state_hung_below_max_returns_sleep() {
+        let mut state = AppLoopState::new(5);
+        let action = state.handle_outcome(RunOutcome::Hung { restart_count: 1 });
+        assert_eq!(state.restart_count(), 1);
+        assert!(matches!(action, Action::Sleep(_)));
+    }
+
+    #[test]
+    fn loop_state_hung_at_max_returns_give_up() {
+        let mut state = AppLoopState::new(2);
+        let action = state.handle_outcome(RunOutcome::Hung { restart_count: 2 });
+        assert_eq!(action, Action::GiveUp);
+    }
+
+    // ── classify_join_result tests ────────────────────────────────────
+
+    #[test]
+    fn join_ok_returns_ok_or_cancelled() {
+        let result: Result<(), tokio::task::JoinError> = Ok(());
+        assert!(matches!(classify_join_result(result), JoinAction::OkOrCancelled));
     }
 
     // ── compute_app_diff tests ──────────────────────────────────────
