@@ -189,6 +189,7 @@ impl LayerHarness {
             last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
                 std::time::Instant::now(),
             ))),
+            max_memory_mb: 256,
         };
 
         let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -367,6 +368,7 @@ async fn l6_request_body_over_cap_returns_413() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -418,7 +420,8 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
-        ))), // 10 MB — generous
+        ))),
+        max_memory_mb: 256, // 10 MB — generous
     })
     .await;
 
@@ -496,6 +499,7 @@ async fn l7_per_request_timeout_returns_500() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     };
 
     let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -735,6 +739,7 @@ async fn l11_guest_calls_process_get_env() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -784,6 +789,7 @@ async fn l12_guest_calls_time_now() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -837,6 +843,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -914,6 +921,7 @@ async fn l14_guest_calls_cache_round_trip() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -988,6 +996,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -1049,6 +1058,7 @@ async fn l16_guest_schedules_task() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -1100,6 +1110,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     }
 }
 
@@ -1392,6 +1403,7 @@ async fn l27_process_get_all_env() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
     let cl = make_client();
@@ -1479,6 +1491,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 
@@ -1942,6 +1955,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
             std::time::Instant::now(),
         ))),
+        max_memory_mb: 256,
     })
     .await;
 

@@ -548,7 +548,7 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id stri
 	if err != nil || deployment == nil {
 		return nil, err
 	}
-	if deployment.TenantID != tenantID {
+	if tenantID != "*" && tenantID != "" && deployment.TenantID != tenantID {
 		return nil, nil // not found for this tenant
 	}
 	return deployment, nil
