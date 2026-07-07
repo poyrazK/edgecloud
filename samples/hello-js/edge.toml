@@ -1,0 +1,8 @@
+[project]
+name = "hello-js"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = "js"
+
+[deployment]
+api = "https://api.edgecloud.dev"
