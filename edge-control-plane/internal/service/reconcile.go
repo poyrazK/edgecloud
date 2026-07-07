@@ -61,6 +61,12 @@ type reconcileQuotas interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 }
 
+// reconcileWorkers is the subset of *repository.WorkerRepository the
+// ReconcileService needs for under-replication monitoring (issue #316).
+type reconcileWorkers interface {
+	CountRunningWorkers(ctx context.Context, tenantID string, appNames []string) (map[string]int, error)
+}
+
 // ReconcileService periodically publishes a TaskMessage::FullSync per
 // (tenant, region) so workers can recover from lost or stale NATS
 // task_update messages. Idempotent: the worker's diff logic treats
@@ -86,6 +92,7 @@ type ReconcileService struct {
 	activeRepo    reconcileActiveDeployments
 	appEnvRepo    reconcileAppEnvs
 	quotaRepo     reconcileQuotas
+	workerRepo    reconcileWorkers
 	publisher     nats.Publisher
 	defaultRegion string
 	envDecrypter  TrafficEnvDecrypter // nil = plaintext pass-through
@@ -96,6 +103,7 @@ func NewReconcileService(
 	activeRepo reconcileActiveDeployments,
 	appEnvRepo reconcileAppEnvs,
 	quotaRepo reconcileQuotas,
+	workerRepo reconcileWorkers,
 	publisher nats.Publisher,
 	defaultRegion string,
 ) *ReconcileService {
@@ -107,6 +115,7 @@ func NewReconcileService(
 		activeRepo:    activeRepo,
 		appEnvRepo:    appEnvRepo,
 		quotaRepo:     quotaRepo,
+		workerRepo:    workerRepo,
 		publisher:     publisher,
 		defaultRegion: defaultRegion,
 	}
@@ -251,27 +260,28 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		return
 	}
 
-	// Issue #316: under-replication check. Log a warning when an app
-	// has desired_replicas > 0 but fewer workers are heartbeating it.
-	// This is a monitoring threshold — no scheduling action is taken.
-	// A proper worker-count query (e.g. counting distinct workers with
-	// status="running" for each app per region) can be added in a
-	// follow-up once the heartbeat status table is reliably populated.
-	for _, j := range publishable {
-		if j.DesiredReplicas > 0 {
-			// TODO(issue-#316-followup): count actual heartbeating workers
-			// per (tenant, app, region) from the worker_statuses table.
-			// For now, log the desired count for operator visibility.
-			log.Printf("reconcile: tenant=%s app=%s desired_replicas=%d (worker count check deferred to follow-up)",
-				tenantID, j.AppName, j.DesiredReplicas)
-		}
-	}
-
-	// Bulk-fetch env vars for every publishable active app in one round trip.
+	// Issue #316: under-replication check. Query how many distinct workers
+	// report each app as running; warn if below desired_replicas.
 	appNames := make([]string, len(publishable))
 	for i, j := range publishable {
 		appNames[i] = j.AppName
 	}
+	runningCounts, err := s.workerRepo.CountRunningWorkers(ctx, tenantID, appNames)
+	if err != nil {
+		log.Printf("reconcile: tenant=%s: CountRunningWorkers: %v; skipping under-replication check", tenantID, err)
+	} else {
+		for _, j := range publishable {
+			if j.DesiredReplicas > 0 {
+				count := runningCounts[j.AppName]
+				if count < j.DesiredReplicas {
+					log.Printf("reconcile: tenant=%s app=%s region=%s: under-replicated: have=%d want=%d",
+						tenantID, j.AppName, s.defaultRegion, count, j.DesiredReplicas)
+				}
+			}
+		}
+	}
+
+	// Bulk-fetch env vars for every publishable active app in one round trip.
 	allEnvs, err := s.appEnvRepo.ListByApps(ctx, tenantID, appNames)
 	if err != nil {
 		log.Printf("reconcile: tenant=%s: list envs (bulk): %v; publishing without env", tenantID, err)

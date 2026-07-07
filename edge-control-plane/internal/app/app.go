@@ -122,7 +122,7 @@ func New(
 	// pulls deployment hash + regions via ListByTenantWithDeployment
 	// in a single round trip (N+1 elimination).
 	reconcileSvc := service.NewReconcileService(
-		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, workerRepo, publisher, cfg.Region,
 	)
 
 	// Wire secrets encryption (if configured). Supports both legacy
