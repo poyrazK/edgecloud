@@ -282,6 +282,7 @@ async fn test_app_lifecycle() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
 
@@ -436,6 +437,7 @@ async fn test_stop_all_apps() {
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
+            cpu_budget_ms: None,
             routes: None,
         };
         let msg = TaskMessage::TaskUpdate {
@@ -497,6 +499,7 @@ async fn test_artifact_hash_match_starts_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -549,6 +552,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let bad_msg = TaskMessage::TaskUpdate {
@@ -581,6 +585,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let good_msg = TaskMessage::TaskUpdate {
@@ -643,6 +648,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -709,6 +715,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -760,6 +767,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1065,6 +1073,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1246,6 +1255,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1587,6 +1597,7 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
     };
     let mut apps = HashMap::new();
     apps.insert("myapp".to_string(), bad_app);
@@ -1719,6 +1730,7 @@ async fn test_supervisor_lazy_starting_and_eviction() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
 

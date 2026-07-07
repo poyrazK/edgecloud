@@ -53,6 +53,7 @@ type AppConfig struct {
 	Env                 map[string]string `json:"env"`
 	Allowlist           []string          `json:"allowlist"`
 	MaxMemoryMB         int               `json:"max_memory_mb"`
+	CpuBudgetMS         int               `json:"cpu_budget_ms"`
 }
 
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
@@ -153,6 +154,7 @@ func BuildAppConfig(
 		Env:                 env,
 		Allowlist:           allowlist,
 		MaxMemoryMB:         maxMemoryMB,
+		CpuBudgetMS:         1000,
 	}
 	if len(routes) > 0 {
 		cfg.Routes = routes
