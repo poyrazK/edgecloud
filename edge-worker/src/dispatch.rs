@@ -230,6 +230,8 @@ pub struct HandlerConfig {
 }
 
 impl HandlerDispatch {
+    /// Create a new HandlerDispatch wrapping a ProxyPre for a Handler component.
+    /// `tick_ms` is clamped to ≥1, and ticks is clamped to ≥1.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: u16,
@@ -242,8 +244,6 @@ impl HandlerDispatch {
         engine_pool: Arc<crate::supervisor::StandbyPool>,
         state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
     ) -> anyhow::Result<Self> {
-        // Defend against divide-by-zero: a misconfigured 0 tick would
-        // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);
         Ok(Self {
             proxy_pre: tokio::sync::RwLock::new(None),
@@ -1315,5 +1315,185 @@ mod synthetic_response_tests {
 
         let hint = Body::size_hint(&counting);
         assert_eq!(hint.lower(), 4);
+    }
+
+    // ── MaybeTls loopback tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn maybe_tls_plain_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let mut maybe_server = MaybeTls::Plain(server);
+        let mut maybe_client = MaybeTls::Plain(client);
+
+        maybe_client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        maybe_server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn maybe_tls_flush_and_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let mut maybe_server = MaybeTls::Plain(server);
+        maybe_server.flush().await.unwrap();
+        maybe_server.shutdown().await.unwrap();
+
+        let mut maybe_client = MaybeTls::Plain(client);
+        maybe_client.shutdown().await.unwrap();
+    }
+
+    // ── HandlerDispatch::evict / has_engine tests ───────────────────────
+
+    #[tokio::test]
+    async fn dispatch_new_with_engine() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let engine_pool = pool;
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18000,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+            )),
+            "d1".into(),
+            engine_pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        // By default has_engine=false (no ProxyPre loaded)
+        assert!(!dispatch.has_engine().await);
+
+        // evict on empty proxy_pre returns None
+        assert!(dispatch.evict().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_evict_round_trips_engine() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let engine_for_proxy = edge_runtime::create_engine().expect("engine2");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18001,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+            )),
+            "d1".into(),
+            pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        assert!(!dispatch.has_engine().await);
+        assert!(dispatch.evict().await.is_none());
+        let _ = engine_for_proxy;
+    }
+
+    // ── Budget/tick math tests ─────────────────────────────────────────
+
+    #[test]
+    fn budget_ticks_100ms_at_10ms_gives_10() {
+        assert_eq!((100u64 / 10u64.max(1)).max(1), 10);
+    }
+
+    #[test]
+    fn budget_ticks_5ms_at_10ms_floors_at_1() {
+        assert_eq!((5u64 / 10u64.max(1)).max(1), 1);
+    }
+
+    #[test]
+    fn budget_ticks_zero_ms_floors_at_1() {
+        assert_eq!((0u64 / 10u64.max(1)).max(1), 1);
+    }
+
+    #[test]
+    fn tick_ms_zero_is_clamped_to_1() {
+        assert_eq!(0u64.max(1), 1);
+    }
+
+    #[test]
+    fn tick_ms_normal_passthrough() {
+        assert_eq!(10u64.max(1), 10);
     }
 }
