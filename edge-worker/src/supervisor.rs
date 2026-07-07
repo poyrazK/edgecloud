@@ -111,6 +111,199 @@ impl StandbyPool {
     }
 }
 
+// ── build_heartbeat integration tests ──────────────────────────────────
+// These tests construct a real Supervisor with seeded WorkerState and
+// verify the heartbeat wire format. No Docker required, but they need
+// the handler.wasm fixture file linked into edge_runtime.
+
+#[cfg(test)]
+mod heartbeat_integration_tests {
+    use super::*;
+    use crate::auth::WorkerJwtSigner;
+    use crate::downloader::Downloader;
+    use crate::log_forwarder::LogForwarder;
+    use crate::port_pool::PortPool;
+
+    fn cp_config() -> Config {
+        Config {
+            worker_id: "w_test".to_string(),
+            region: "fra".to_string(),
+            worker_addr: "127.0.0.1:9000".to_string(),
+            worker_tenant_id: "t_test".to_string(),
+            nats_url: String::new(),
+            control_plane_url: "http://localhost:0".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp"),
+            heartbeat_interval_secs: 30,
+            health_check_timeout_secs: 30,
+            worker_sync_threshold_secs: 30,
+            port_cooldown_secs: 1,
+            starting_port: 10000,
+            max_memory_mb: 256,
+            epoch_tick_ms: 10,
+            epoch_deadline_ticks: 100,
+            queue_group: "test".to_string(),
+            consumer_name: "test".to_string(),
+            task_stream_replicas: 1,
+            worker_jwt_secret: String::new(),
+            worker_jwt_kid: None,
+            worker_jwt_issuer: String::new(),
+            worker_bootstrap_secret: String::new(),
+            handler_request_budget_ms: 1000,
+            handler_max_request_body_bytes: 0,
+            tls_cert_path: None,
+            tls_key_path: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            standby_pool_size: 1,
+        }
+    }
+
+    fn load_handler_fixture(
+        engine: &wasmtime::Engine,
+    ) -> wasmtime::component::InstancePre<edge_runtime::RuntimeState> {
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("handler.wasm fixture not found");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let component = wasmtime::component::Component::from_binary(engine, &bytes)
+            .expect("compile handler component");
+        let linker = edge_runtime::create_component_linker_handler(engine).expect("create linker");
+        linker.instantiate_pre(&component).expect("instantiate_pre")
+    }
+
+    fn build_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
+        let jwt = WorkerJwtSigner::new(
+            String::new(),
+            None,
+            String::new(),
+            "w_test",
+            "fra",
+            "t_test",
+        );
+        let nats = Arc::new(crate::nats::tests::MockNatsClient::new());
+        Arc::new(Supervisor {
+            config: cp_config(),
+            state,
+            downloader: Arc::new(Downloader::new(
+                "http://localhost:0".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                jwt.clone(),
+            )),
+            port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
+            nats: nats as Arc<dyn NatsClient>,
+            log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
+            jwt_signer: jwt,
+            http: reqwest::Client::new(),
+            engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+        })
+    }
+
+    fn make_app(
+        instance_pre: wasmtime::component::InstancePre<edge_runtime::RuntimeState>,
+        status: AppInstanceStatus,
+        ws_port: Option<u16>,
+    ) -> Arc<Mutex<AppInstance>> {
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18000,
+            status,
+            meter,
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port,
+        }))
+    }
+
+    #[tokio::test]
+    async fn heartbeat_empty_state() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert_eq!(hb.worker_id, "w_test");
+        assert_eq!(hb.region, "fra");
+        assert!(hb.apps.is_empty());
+        assert!(hb.cluster_headroom.is_some());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_one_running_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert_eq!(hb.apps.len(), 1);
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.status, "running");
+        assert_eq!(s.tenant_id, "t_test");
+        assert_eq!(s.port, 18000);
+        assert_eq!(s.request_count, 2);
+        assert!(s.ws_port.is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_crashed_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(
+            instance_pre,
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            None,
+        );
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.status, "crashed");
+        assert_eq!(s.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_with_ws_port() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, Some(19091));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.ws_port, Some(19091));
+    }
+}
+
 /// The main supervisor — manages all running apps for this worker node.
 #[allow(dead_code)]
 pub struct Supervisor {
