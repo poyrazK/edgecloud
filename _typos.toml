@@ -1,28 +1,31 @@
-[default.extend-words]
-edgecloud = "edgecloud"
-edgeclouderz = "edgeclouderz"
-wasmtime = "wasmtime"
-wasi = "wasi"
-clippy = "clippy"
-gofmt = "gofmt"
-golangci = "golangci"
-staticcheck = "staticcheck"
-errcheck = "errcheck"
-govet = "govet"
-ineffassign = "ineffassign"
-typecheck = "typecheck"
-unparseable = "unparseable"
-ture = "ture"
-inser = "inser"
-alue = "alue"
-
+[default]
+extend-words = [
+    "edgecloud",
+    "edgeclouderz",
+    "wasmtime",
+    "wasi",
+    "clippy",
+    "gofmt",
+    "golangci",
+    "staticcheck",
+    "errcheck",
+    "govet",
+    "ineffassign",
+    "typecheck",
+    "unparseable",
+    # Pre-existing entries below — kept verbatim from the file's
+    # pre-PR state so the typos run continues to allow the same
+    # identifiers it did before this PR.
+    "ture",
+    "inser",
+    "alue",
+]
 # Files excluded from spell-checking. Reasons:
 # - signer_test.go: pins a well-known Ed25519 base64url signature
 #   fixture whose random bytes (e.g. "HVEA", "HAA") coincidentally
 #   look like English words. The test failure mode is caught by
 #   the deterministic-signature test case; the typos run
 #   conflicts without removing real word-check coverage.
-[files]
 extend-ignore-re = [
-  "edge-control-plane/internal/signing/signer_test\\.go",
+    "edge-control-plane/internal/signing/signer_test\\.go",
 ]
