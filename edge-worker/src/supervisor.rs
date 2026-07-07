@@ -1955,6 +1955,7 @@ pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
 }
 
 /// Exponential backoff: min(1s × 2^(n-1), 60s).
+#[allow(dead_code)]
 pub fn calculate_backoff(restart_count: u32) -> Duration {
     const BASE: Duration = Duration::from_secs(1);
     const MAX: Duration = Duration::from_secs(60);
@@ -1969,6 +1970,7 @@ pub fn calculate_backoff(restart_count: u32) -> Duration {
 }
 
 /// Build the per-app environment map.
+#[allow(dead_code)]
 pub fn build_app_env(
     spec_env: &HashMap<String, String>,
     raw_port: u16,
@@ -1983,6 +1985,7 @@ pub fn build_app_env(
 }
 
 /// Parse a raw NATS task message payload into a TaskMessage.
+#[allow(dead_code)]
 pub fn parse_task_payload(payload: &[u8]) -> anyhow::Result<TaskMessage> {
     serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("invalid task payload: {}", e))
 }
