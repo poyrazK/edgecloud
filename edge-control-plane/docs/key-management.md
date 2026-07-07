@@ -39,19 +39,35 @@ chown edge-control-plane:edge /etc/edge/signing.key
 Generate the **public** key (in the format the worker consumes):
 
 ```bash
-# Public key from a 32-byte seed can be derived via Python:
+# Derive the Ed25519 public key from the 32-byte seed. Ed25519 pubkey
+# derivation per RFC 8032 §5.1.2 is NOT a simple SHA-512 truncation —
+# it's a clamping + scalar-multiply of the seed against the Ed25519
+# base point. Use a real Ed25519 library.
+#
+# Option A: Go (always available alongside the control plane binary):
+go run ./cmd/printpub -key /etc/edge/signing.key
+#
+# Option B: Python with the `cryptography` package:
 python3 -c "
-import hashlib
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 seed = bytes.fromhex(open('/etc/edge/signing.key').read().strip())
-# Ed25519 public key from seed = SHA-512(seed)[32:64]
-h = hashlib.sha512(seed).digest()
-pub = h[32:]
-print(pub.hex())
+sk = Ed25519PrivateKey.from_private_bytes(seed)
+print(sk.public_key().public_bytes_raw().hex())
 "
 ```
 
 The resulting 64-character hex string is what workers pass as
-`EDGE_SIGNING_PUBKEY`.
+`EDGE_SIGNING_PUBKEY`. (`cmd/printpub` is a small `main.go` in the
+control-plane repo — see `cmd/printpub/main.go`. It loads the seed
+via `signing.LoadFromFile` and prints `PublicKeyHex()`. Operators
+without Go access can use Option B with PyNaCl as a one-off:
+`pip install pynacl && python3 -c "from nacl.signing import SigningKey; print(SigningKey(bytes.fromhex(open('/etc/edge/signing.key').read().strip())).verify_key.encode().hex())"`.)
+
+> Note: a previously-shipped version of this doc had a wrong recipe
+> that derived the pubkey as `SHA-512(seed)[32:]`. That is NOT the
+> Ed25519 derivation; signatures verified under such a "pubkey" will
+> never match. If you followed that recipe, re-derive with one of the
+> options above before deploying the worker.
 
 ## Control plane configuration
 

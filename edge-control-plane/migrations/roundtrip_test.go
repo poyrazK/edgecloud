@@ -341,8 +341,10 @@ var wantTypes = map[string]map[string]string{
 		"status":                "text",
 		"hash":                  "text",
 		"created_at":            "timestamptz",
-		"regions":               "_text", // 008_deployments_regions — TEXT[]
-		"auto_rollback_enabled": "bool",  // 009_add_auto_rollback
+		"regions":               "_text",        // 008_deployments_regions — TEXT[]
+		"auto_rollback_enabled": "bool",         // 009_add_auto_rollback
+		"signature":             "text",         // 017_add_signature (nullable)
+		"signing_key_id":        "text",         // 017_add_signature (nullable)
 	},
 	"active_deployments": {
 		"tenant_id":               "text",

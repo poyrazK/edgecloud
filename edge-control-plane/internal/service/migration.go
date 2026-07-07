@@ -499,12 +499,13 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	deployment.Signature = sig
 	deployment.SigningKeyID = s.signer.KeyID()
 	if updateErr := s.deploymentRepo.UpdateHashAndSignature(ctx, deployment); updateErr != nil {
-		// Create is called twice in the Migrate path: once before
-		// SaveAndHash (to record the row early so the AppService
-		// quota check fires), and once via UpdateHashAndSignature
-		// after signing. A failure here means the signature didn't
-		// make it to disk.
-		// Compensate: remove the row + the artifact.
+		// Create runs once at line ~458 *before* SaveAndHash (so the
+		// quota check fires against a real row); the post-SaveAndHash
+		// fields (hash, signature, signing_key_id) are filled in by
+		// this UPDATE. A failure here means the row was created but
+		// the signature never reached disk — compensate by removing
+		// both the row and the artifact so the tenant doesn't see a
+		// "deployed" deployment that the worker can't verify.
 		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)
 		}
