@@ -1267,4 +1267,53 @@ mod synthetic_response_tests {
     fn budget_ticks_rounding_floor() {
         assert_eq!(95u64 / 10u64, 9);
     }
+
+    // ── CountingBody tests ──────────────────────────────────────────────
+
+    use bytes::Bytes;
+    use std::pin::Pin;
+
+    #[tokio::test]
+    async fn counting_body_records_outbound_bytes() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from("hello"));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let mut counting = CountingBody {
+            inner: inner_hyper,
+            meter: meter.clone(),
+        };
+
+        while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
+        let snap = meter.snapshot();
+        assert_eq!(snap.outbound_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn counting_body_empty_records_zero() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from(""));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let mut counting = CountingBody {
+            inner: inner_hyper,
+            meter: meter.clone(),
+        };
+
+        while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
+        let snap = meter.snapshot();
+        assert_eq!(snap.outbound_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn counting_body_size_hint_delegates() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from("test"));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let counting = CountingBody {
+            inner: inner_hyper,
+            meter,
+        };
+
+        let hint = Body::size_hint(&counting);
+        assert_eq!(hint.lower(), 4);
+    }
 }
