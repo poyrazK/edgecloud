@@ -16,7 +16,12 @@ import (
 // invalidate every signature already issued.
 
 const testHashHex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // sha256("")
-const testDeploymentID = "d_00000000-0000-0000-0000-000000000001"
+// Deployment ID was chosen so the deterministic Ed25519 signature
+// over (sha256("") || testDeploymentID) does not contain any
+// English-looking base64 substrings ("HAVE", "HAS", etc.) — the
+// typos run would otherwise flag the well-known fixture below as
+// spelling mistakes. See TestSigner_DeterministicSignature.
+const testDeploymentID = "d_00000000000000000000"
 
 //  1. roundtrip: a freshly-generated key signs a real sha256("") and
 //     the same key verifies the resulting signature. The signature
@@ -73,11 +78,10 @@ func TestSigner_DeterministicSignature(t *testing.T) {
 	// changes, every existing signature on a running deployment
 	// becomes un-verifiable — intentional breakage, not an
 	// accident. Computed once with the deterministic zero-seed
-	// signer over (sha256("") ‖ "d_00000000-0000-0000-0000-000000000001").
-	// The base64 below contains substrings that the typo-checker
-	// heuristically flags; see the deterministic-fixture test for the
-	// real wire-format drift check.
-	const want = "ZqBP0mLys4PlNDuM2viHVEA13kcz8EbA4xOjIpjO4YPmPM5NWgFxzSuyrUsZVY6_ZcsI7zFGXXcjjI2stG9HAA" // typos:ignore-line
+	// signer over (sha256("") ‖ testDeploymentID). The base64 below
+	// is intentionally free of English-looking substrings so the
+	// typo-checker doesn't flag it (see the testDeploymentID comment).
+	const want = "5zf8l-yfPBjEZjt8_fNZ_1SnmczHywrcKWaUUDmNAAntz6uM4lVlmyC-5x7jWWTWH6WdZQ4hX9xY7siiMztdDA"
 	if sig1 != want {
 		t.Errorf("signature drift — the well-known test fixture no longer matches the implementation\n  got:  %s\n  want: %s", sig1, want)
 	}
