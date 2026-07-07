@@ -204,7 +204,11 @@ impl Supervisor {
 
         if has_changes {
             let heartbeat = self.build_heartbeat().await;
-            if let Err(e) = self.nats.publish_heartbeat(&self.config.region, &heartbeat).await {
+            if let Err(e) = self
+                .nats
+                .publish_heartbeat(&self.config.region, &heartbeat)
+                .await
+            {
                 tracing::error!(err = %e, "failed to publish immediate heartbeat");
             } else {
                 tracing::info!("successfully published immediate heartbeat for route propagation");
