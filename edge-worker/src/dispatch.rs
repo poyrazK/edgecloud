@@ -173,9 +173,7 @@ impl AsyncWrite for MaybeTls {
 pub struct HandlerDispatch {
     /// TCP port assigned to this app by `PortPool`.
     port: u16,
-    /// Per-request wasmtime epoch deadline (in ticks, where each tick
-    /// is `tick_ms`).
-    request_budget_ticks: u64,
+
     /// Engine-clock tick interval (ms) — how often the per-app ticker
     /// calls `engine.increment_epoch()`. Defaults to 1 if the caller
     /// passes 0.
@@ -228,13 +226,14 @@ pub struct HandlerConfig {
     pub socket_mode: SocketEgressPolicy,
     pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     pub max_memory_mb: u64,
+    pub cpu_budget_ms: u64,
 }
 
 impl HandlerDispatch {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: u16,
-        request_budget_ms: u64,
+        _request_budget_ms: u64,
         epoch_tick_ms: u64,
         config: HandlerConfig,
         tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -246,11 +245,9 @@ impl HandlerDispatch {
         // Defend against divide-by-zero: a misconfigured 0 tick would
         // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);
-        let ticks = request_budget_ms / tick_ms;
         Ok(Self {
             proxy_pre: tokio::sync::RwLock::new(None),
             port,
-            request_budget_ticks: ticks.max(1),
             tick_ms,
             config: Arc::new(config),
             tls_config,
@@ -679,7 +676,8 @@ impl HandlerDispatch {
         // Uses the configured max_memory_mb limit.
         let mut store =
             edge_runtime::create_store(engine, self.config.max_memory_mb, request_state);
-        store.set_epoch_deadline(self.request_budget_ticks);
+        let ticks = self.config.cpu_budget_ms / self.tick_ms;
+        store.set_epoch_deadline(ticks.max(1));
 
         // Build the incoming-request / response-outparam handles the
         // guest will see. `new_incoming_request` records the URL +

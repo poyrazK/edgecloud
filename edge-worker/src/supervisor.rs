@@ -419,6 +419,7 @@ mod heartbeat_integration_tests {
                 env: HashMap::new(),
                 allowlist: None,
                 max_memory_mb: 256,
+                cpu_budget_ms: None,
             },
         );
         let msg = TaskMessage::TaskUpdate {
@@ -545,6 +546,7 @@ mod heartbeat_integration_tests {
                 env: HashMap::new(),
                 allowlist: None,
                 max_memory_mb: 256,
+                cpu_budget_ms: None,
             },
         );
         let msg = TaskMessage::TaskUpdate {
@@ -1075,6 +1077,9 @@ impl Supervisor {
                 socket_mode: self.config.socket_mode,
                 last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
                 max_memory_mb: spec.max_memory_mb,
+                cpu_budget_ms: spec
+                    .cpu_budget_ms
+                    .unwrap_or(self.config.handler_request_budget_ms),
             };
 
             let tls_config =
@@ -2004,6 +2009,7 @@ mod tests {
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
+            cpu_budget_ms: None,
         }
     }
 
@@ -2336,6 +2342,7 @@ mod tests {
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ))),
             max_memory_mb: 256,
+            cpu_budget_ms: 1000,
         };
 
         let config_b = HandlerConfig {
@@ -2357,6 +2364,7 @@ mod tests {
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
             max_memory_mb: 256,
+            cpu_budget_ms: 1000,
         };
 
         let downloader = Arc::new(crate::downloader::Downloader::new(
