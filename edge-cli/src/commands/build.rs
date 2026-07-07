@@ -15,35 +15,55 @@ use crate::config::EdgeToml;
 use crate::LangArg;
 
 /// Compile the project to WebAssembly.
-pub fn run(path: &Path, lang: LangArg) -> Result<()> {
+///
+/// `lang` is the optional source language override. When `None`,
+/// reads `[project] language` from `edge.toml` (falling back to
+/// `"rust"` for legacy projects). When `Some(l)`, cross-checks
+/// against the toml and rejects mismatches.
+pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = &edge_toml.project.name;
-
-    // Cross-check the CLI `--lang` against `edge.toml`'s
-    // `[project] language`. Mismatches used to surface as a confusing
-    // missing-artifact error at deploy time (finding 2 of the
-    // PR #221 review); rejecting here is the user-friendly fix.
-    // The toml wins when `--lang` is omitted because the toml is the
-    // authoritative record of what the project was scaffolded as.
     let toml_lang = edge_toml.project.language_or_default();
-    if toml_lang != lang.as_str() {
-        anyhow::bail!(
-            "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
-             Re-run with `--lang {toml}` (or remove the `language` line from edge.toml) so \
-             build and deploy stay in sync.",
-            flag = lang.as_str(),
-            toml = toml_lang,
-        );
-    }
+
+    // Resolve effective language: flag wins if provided, otherwise toml.
+    let effective = match lang {
+        Some(flag) => {
+            // Cross-check the CLI `--lang` against `edge.toml`'s
+            // `[project] language`. Mismatches used to surface as a confusing
+            // missing-artifact error at deploy time (finding 2 of the
+            // PR #221 review); rejecting here is the user-friendly fix.
+            if flag.as_str() != toml_lang {
+                anyhow::bail!(
+                    "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
+                     Re-run with `--lang {toml}` (or remove the `language` line from edge.toml) so \
+                     build and deploy stay in sync.",
+                    flag = flag.as_str(),
+                    toml = toml_lang,
+                );
+            }
+            flag
+        }
+        None => {
+            // Parse the toml language string into a LangArg.
+            match toml_lang {
+                "rust" => LangArg::Rust,
+                "js" => LangArg::Js,
+                other => anyhow::bail!(
+                    "unsupported language {other:?} in `[project] language` in edge.toml. \
+                     Supported values: `rust`, `js`."
+                ),
+            }
+        }
+    };
 
     println!(
         "Building '{}' (target: {}, language: {})...",
         project_name,
         edge_toml.project.target,
-        lang.as_str(),
+        effective.as_str(),
     );
 
-    match lang {
+    match effective {
         LangArg::Rust => build_rust(path, project_name),
         LangArg::Js => build_js(path, project_name),
     }

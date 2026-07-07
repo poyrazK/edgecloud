@@ -138,14 +138,12 @@ enum Command {
 
     /// Compile the project to WebAssembly.
     Build {
-        /// Source language to build. When omitted, defaults to `rust`.
-        /// If the project's `[project] language` in `edge.toml` is set
-        /// (e.g. `js`) and `--lang` is also passed, the two must agree —
-        /// mismatches are rejected with a clear error pointing at the
-        /// conflicting values so the user fixes the toml instead of
-        /// silently building the wrong artifact.
-        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
-        lang: LangArg,
+        /// Source language to build. When omitted, reads `[project] language`
+        /// from `edge.toml` (falling back to `rust`). If both `--lang` and
+        /// the toml are set, they must agree — mismatches are rejected with
+        /// a clear error so you never accidentally build the wrong artifact.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
     },
 
     /// Upload the artifact to the edgeCloud control plane, or activate a stored one.
@@ -288,11 +286,11 @@ enum Command {
 
     /// Local development server with hot-reload.
     Dev {
-        /// Source language to build. Must match `[project] language`
-        /// in `edge.toml` (the dev server does not cross-check — pass
-        /// the same value you used for `edge build`).
-        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
-        lang: LangArg,
+        /// Source language to build. When omitted, reads `[project] language`
+        /// from `edge.toml` (falling back to `rust`). Must match the toml
+        /// when both are set — mismatches are rejected with a clear error.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
     },
 
     /// Open the deployed URL in a browser.

@@ -32,23 +32,43 @@ use crate::LangArg;
 /// command hardcoded cargo + the Rust path, so `edge dev` after
 /// `edge init --lang=js myapp` failed with a misleading
 /// "Could not find Cargo.toml" (finding 3 of the PR #221 review).
-pub fn run(path: &Path, lang: LangArg) -> Result<()> {
+pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = edge_toml.project.name.clone();
+    let toml_lang = edge_toml.project.language_or_default();
+    let effective = match lang {
+        Some(flag) => {
+            if flag.as_str() != toml_lang {
+                anyhow::bail!(
+                    "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
+                     Re-run with `--lang {toml}` (or remove the `language` line from edge.toml) so \
+                     build and deploy stay in sync.",
+                    flag = flag.as_str(),
+                    toml = toml_lang,
+                );
+            }
+            flag
+        }
+        None => match toml_lang {
+            "rust" => LangArg::Rust,
+            "js" => LangArg::Js,
+            other => anyhow::bail!(
+                "unsupported language {other:?} in `[project] language` in edge.toml. \
+                 Supported values: `rust`, `js`."
+            ),
+        },
+    };
+
     let port = 8080;
 
     println!("Starting dev server for '{}'...", project_name);
 
-    // Initial build — delegate to the same dispatch the user sees
-    // from `edge build`, so JS projects invoke javy, not cargo.
-    build_project(path, lang)?;
+    // Initial build.
+    build_project(path, effective)?;
 
     // Resolve the artifact through `build::path_for` so the path
-    // layout stays in one place. We don't use the returned `Result`
-    // shape (the path is computed, not read), so we unwrap the
-    // `Result` knowing the value comes from the user's `--lang`
-    // flag which has already been validated by clap.
-    let artifact = build::path_for(path, &project_name, lang.as_str())
+    // layout stays in one place.
+    let artifact = build::path_for(path, &project_name, effective.as_str())
         .context("resolving dev artifact path")?;
 
     if !artifact.exists() {
@@ -118,7 +138,7 @@ pub fn run(path: &Path, lang: LangArg) -> Result<()> {
                 }
 
                 // Rebuild.
-                if let Err(e) = build_project(path, lang) {
+                if let Err(e) = build_project(path, effective) {
                     output::warn(&format!("Build failed: {e}"));
                     continue;
                 }
