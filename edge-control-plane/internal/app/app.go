@@ -562,8 +562,8 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 		return def
 	}
 	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Printf("%s=%q invalid; using default %s", envName, v, def)
+	if err != nil || d <= 0 {
+		log.Printf("%s=%q is not a valid positive duration; using default %s", envName, v, def)
 		return def
 	}
 	return d
