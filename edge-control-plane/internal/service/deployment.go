@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -896,11 +897,6 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 			Err:         ErrPublishFailed,
 		}
 	}
-	// All regions published successfully via NATS, but some
-	// cache pushes failed. Surface a *PublishError so the handler
-	// 502 path lights up the cache fields; the wrapped sentinel
-	// is still ErrPublishFailed so the existing `errors.Is` check
-	// in the handler keeps matching.
 	if len(cacheFailed) > 0 {
 		return &PublishError{
 			Published:   published,
@@ -910,7 +906,103 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 			Err:         ErrPublishFailed,
 		}
 	}
+
+	// Block until active workers confirm they have started the deployment (issue #331, Layer 3).
+	if err := s.waitForWorkers(ctx, tenantID, appName, deploymentID, regions); err != nil {
+		log.Printf("waitForWorkers failed/timeout: %v", err)
+		return &PublishError{
+			Published:   published,
+			Failed:      regions,
+			Cached:      cached,
+			CacheFailed: cacheFailed,
+			Err:         ErrPublishFailed,
+		}
+	}
+
 	return nil
+}
+
+func (s *DeploymentService) waitForWorkers(ctx context.Context, tenantID, appName, deploymentID string, regions []string) error {
+	workerRepo := repository.NewWorkerRepository(s.db)
+
+	workers, err := workerRepo.List(ctx)
+	if err != nil {
+		return fmt.Errorf("listing workers: %w", err)
+	}
+
+	targetRegions := make(map[string]struct{}, len(regions))
+	for _, r := range regions {
+		targetRegions[r] = struct{}{}
+	}
+
+	var targetWorkers []string
+	now := time.Now()
+	for _, w := range workers {
+		if _, exists := targetRegions[w.Region]; exists {
+			// A worker is active if it sent a heartbeat within the last 90 seconds.
+			if now.Sub(w.LastSeen) <= 90*time.Second {
+				targetWorkers = append(targetWorkers, w.ID)
+			}
+		}
+	}
+
+	if len(targetWorkers) == 0 {
+		// No active workers in the target regions. Nothing to wait for.
+		return nil
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		statuses, err := workerRepo.GetLatestStatuses(ctx, targetWorkers)
+		if err != nil {
+			return fmt.Errorf("getting worker statuses: %w", err)
+		}
+
+		allConfirmed := true
+		for _, wID := range targetWorkers {
+			ws, ok := statuses[wID]
+			if !ok {
+				allConfirmed = false
+				break
+			}
+
+			var apps map[string]domain.AppStatus
+			if err := json.Unmarshal(ws.Apps, &apps); err != nil {
+				allConfirmed = false
+				break
+			}
+
+			confirmed := false
+			for rawKey, app := range apps {
+				currAppName := rawKey
+				if i := strings.IndexByte(rawKey, ':'); i >= 0 {
+					currAppName = rawKey[:i]
+				}
+
+				if currAppName == appName && app.DeploymentID == deploymentID && app.Status == "running" {
+					confirmed = true
+					break
+				}
+			}
+
+			if !confirmed {
+				allConfirmed = false
+				break
+			}
+		}
+
+		if allConfirmed {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for workers in regions %v to confirm deployment %s", regions, deploymentID)
 }
 
 // RollbackDeployment atomically swaps the active deployment back to the

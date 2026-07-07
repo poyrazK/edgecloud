@@ -178,6 +178,8 @@ impl Supervisor {
 
         let diff = compute_app_diff(&current_apps, &desired_apps);
 
+        let has_changes = !diff.apps_to_stop.is_empty() || !diff.apps_to_start.is_empty();
+
         for app_name in &diff.apps_to_stop {
             if let Err(e) = self.stop_app(&tenant_id, app_name).await {
                 tracing::error!(
@@ -197,6 +199,19 @@ impl Supervisor {
                     err = %e,
                     "failed to start app"
                 );
+            }
+        }
+
+        if has_changes {
+            let heartbeat = self.build_heartbeat().await;
+            if let Err(e) = self
+                .nats
+                .publish_heartbeat(&self.config.region, &heartbeat)
+                .await
+            {
+                tracing::error!(err = %e, "failed to publish immediate heartbeat");
+            } else {
+                tracing::info!("successfully published immediate heartbeat for route propagation");
             }
         }
 
