@@ -74,11 +74,10 @@ func TestSigner_DeterministicSignature(t *testing.T) {
 	// becomes un-verifiable — intentional breakage, not an
 	// accident. Computed once with the deterministic zero-seed
 	// signer over (sha256("") ‖ "d_00000000-0000-0000-0000-000000000001").
-	// typos:ignore — random base64 bytes spell English-looking words
-	// ("HVEA", "HAA"); the typo-checker heuristic is the wrong tool
-	// for binary fixtures, the deterministic-fixture test catches
-	// real wire-format drift.
-	const want = "ZqBP0mLys4PlNDuM2viHVEA13kcz8EbA4xOjIpjO4YPmPM5NWgFxzSuyrUsZVY6_ZcsI7zFGXXcjjI2stG9HAA"
+	// The base64 below contains substrings that the typo-checker
+	// heuristically flags; see the deterministic-fixture test for the
+	// real wire-format drift check.
+	const want = "ZqBP0mLys4PlNDuM2viHVEA13kcz8EbA4xOjIpjO4YPmPM5NWgFxzSuyrUsZVY6_ZcsI7zFGXXcjjI2stG9HAA" // typos:ignore-line
 	if sig1 != want {
 		t.Errorf("signature drift — the well-known test fixture no longer matches the implementation\n  got:  %s\n  want: %s", sig1, want)
 	}
