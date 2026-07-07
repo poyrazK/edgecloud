@@ -304,6 +304,93 @@ mod heartbeat_integration_tests {
     }
 }
 
+// ── extracted pure functions tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod extracted_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── calculate_backoff ──────────────────────────────────────────
+
+    #[test]
+    fn backoff_r0_is_1s() {
+        assert_eq!(calculate_backoff(0), Duration::from_secs(1));
+    }
+    #[test]
+    fn backoff_r1_is_1s() {
+        assert_eq!(calculate_backoff(1), Duration::from_secs(1));
+    }
+    #[test]
+    fn backoff_r2_is_2s() {
+        assert_eq!(calculate_backoff(2), Duration::from_secs(2));
+    }
+    #[test]
+    fn backoff_r3_is_4s() {
+        assert_eq!(calculate_backoff(3), Duration::from_secs(4));
+    }
+    #[test]
+    fn backoff_large_clamped() {
+        assert!(calculate_backoff(u32::MAX).as_secs() <= 60);
+    }
+
+    // ── build_app_env ──────────────────────────────────────────────
+
+    #[test]
+    fn env_adds_http_port() {
+        let env = build_app_env(&HashMap::new(), 8080, None);
+        assert_eq!(env.get("EDGE_HTTP_SERVER_PORT"), Some(&"8080".to_string()));
+    }
+    #[test]
+    fn env_adds_ws_port() {
+        let env = build_app_env(&HashMap::new(), 8080, Some(9091));
+        assert_eq!(env.get("EDGE_WS_PORT"), Some(&"9091".to_string()));
+    }
+    #[test]
+    fn env_preserves_existing() {
+        let mut base = HashMap::new();
+        base.insert("FOO".into(), "bar".into());
+        let env = build_app_env(&base, 8080, None);
+        assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    // ── parse_task_payload ─────────────────────────────────────────
+
+    #[test]
+    fn parse_valid_task_update() {
+        let json = r#"{"type":"task_update","timestamp":"","tenant_id":"t1","apps":{}}"#;
+        let msg = parse_task_payload(json.as_bytes()).expect("parse");
+        match msg {
+            TaskMessage::TaskUpdate { ref tenant_id, .. } => assert_eq!(tenant_id, "t1"),
+            other => panic!("expected TaskUpdate, got {:?}", other),
+        }
+    }
+    #[test]
+    fn parse_valid_full_sync() {
+        let json = r#"{"type":"full_sync","timestamp":"","tenant_id":"t2","apps":{}}"#;
+        let msg = parse_task_payload(json.as_bytes()).expect("parse");
+        match msg {
+            TaskMessage::FullSync { ref tenant_id, .. } => assert_eq!(tenant_id, "t2"),
+            other => panic!("expected FullSync, got {:?}", other),
+        }
+    }
+    #[test]
+    fn parse_invalid_json_returns_err() {
+        assert!(parse_task_payload(b"garbage").is_err());
+    }
+}
+
+// ── allowlist_to_egress_policy ──────────────────────────────────────
+
+/// Convert an allowlist spec to an EgressPolicy.
+#[allow(dead_code)]
+pub fn allowlist_to_egress_policy(allowlist: &Option<Vec<String>>) -> Arc<EgressPolicy> {
+    match allowlist {
+        None => Arc::new(EgressPolicy::allow_all()),
+        Some(list) => Arc::new(EgressPolicy::new(list.clone())),
+    }
+}
+
 /// The main supervisor — manages all running apps for this worker node.
 #[allow(dead_code)]
 pub struct Supervisor {
@@ -1610,6 +1697,39 @@ pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
         }
         AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
     }
+}
+
+/// Exponential backoff: min(1s × 2^(n-1), 60s).
+pub fn calculate_backoff(restart_count: u32) -> Duration {
+    const BASE: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    if restart_count == 0 {
+        return BASE;
+    }
+    // Use checked_pow to avoid overflow.
+    let secs = 2u64
+        .checked_pow(restart_count.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    std::cmp::min(Duration::from_secs(secs), MAX)
+}
+
+/// Build the per-app environment map.
+pub fn build_app_env(
+    spec_env: &HashMap<String, String>,
+    raw_port: u16,
+    ws_port: Option<u16>,
+) -> HashMap<String, String> {
+    let mut env = spec_env.clone();
+    env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
+    if let Some(ws) = ws_port {
+        env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
+    }
+    env
+}
+
+/// Parse a raw NATS task message payload into a TaskMessage.
+pub fn parse_task_payload(payload: &[u8]) -> anyhow::Result<TaskMessage> {
+    serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("invalid task payload: {}", e))
 }
 
 #[cfg(test)]
