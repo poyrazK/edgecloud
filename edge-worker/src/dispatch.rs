@@ -227,6 +227,7 @@ pub struct HandlerConfig {
     /// startup and the supervisor copies it into `HandlerConfig`.
     pub socket_mode: SocketEgressPolicy,
     pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    pub max_memory_mb: u64,
 }
 
 impl HandlerDispatch {
@@ -674,10 +675,10 @@ impl HandlerDispatch {
         // this Arc clone once we drop the request_state into create_store.
         let exit_code_arc = Arc::clone(&request_state.exit_code);
 
-        // 256 MiB memory cap per request — generous for FaaS
-        // workloads but bounds memory-bomb guests. Matches the
-        // LongRunning branch's hardcoded cap from the v0.1 era.
-        let mut store = edge_runtime::create_store(engine, 256, request_state);
+        // Memory cap per request — bounds memory-bomb guests.
+        // Uses the configured max_memory_mb limit.
+        let mut store =
+            edge_runtime::create_store(engine, self.config.max_memory_mb, request_state);
         store.set_epoch_deadline(self.request_budget_ticks);
 
         // Build the incoming-request / response-outparam handles the

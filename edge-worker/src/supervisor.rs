@@ -1074,6 +1074,7 @@ impl Supervisor {
                 metrics_acc: metrics_acc.clone(),
                 socket_mode: self.config.socket_mode,
                 last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
+                max_memory_mb: spec.max_memory_mb,
             };
 
             let tls_config =
@@ -2334,6 +2335,7 @@ mod tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ))),
+            max_memory_mb: 256,
         };
 
         let config_b = HandlerConfig {
@@ -2354,6 +2356,7 @@ mod tests {
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
+            max_memory_mb: 256,
         };
 
         let downloader = Arc::new(crate::downloader::Downloader::new(

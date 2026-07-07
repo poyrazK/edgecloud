@@ -247,11 +247,7 @@ impl Config {
             worker_jwt_kid: std::env::var("WORKER_JWT_KID").ok(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
-            worker_tenant_id: std::env::var("WORKER_TENANT_ID").context(
-                "WORKER_TENANT_ID not set — a tenant ID is required (e.g. t_abc123). \
-                     This is the ID of the tenant whose apps this worker hosts. \
-                     All outbound calls to /api/internal/* are scoped to this tenant.",
-            )?,
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID").unwrap_or_else(|_| "*".into()),
             handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
             handler_max_request_body_bytes: parse_env_u64(
                 "HANDLER_MAX_REQUEST_BODY_BYTES",

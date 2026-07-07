@@ -245,3 +245,10 @@ func RequireWorkerRole(role string) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// IsSharedWorker returns true if the context represents a multi-tenant/shared worker.
+// A worker is shared if its tenant ID is wildcard ("*") or empty string.
+func IsSharedWorker(ctx context.Context) bool {
+	tID := GetWorkerTenantID(ctx)
+	return tID == "*" || tID == ""
+}

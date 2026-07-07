@@ -159,7 +159,11 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	deploymentID := r.PathValue("deploymentID")
 
-	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
+	lookupTenant := tenantID
+	if middleware.IsSharedWorker(r.Context()) {
+		lookupTenant = "*"
+	}
+	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), lookupTenant, deploymentID)
 	if err != nil || deployment == nil {
 		httperror.NotFoundCtx(w, r, "not found")
 		return
@@ -329,6 +333,12 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	if appName != req.AppName {
 		httperror.BadRequestCtx(w, r, "app_name in URL and body must match")
+		return
+	}
+
+	jwtTenant := middleware.GetWorkerTenantID(r.Context())
+	if jwtTenant != "" && jwtTenant != "*" && jwtTenant != req.TenantID {
+		httperror.ForbiddenCtx(w, r, "tenant mismatch")
 		return
 	}
 
