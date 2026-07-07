@@ -47,6 +47,7 @@ pub enum ExecutionModel {
 ///
 /// The previous `starts_with` form silently misclassified any name
 /// beginning with the prefix.
+#[allow(dead_code)]
 const HANDLER_EXPORT: &str = "wasi:http/incoming-handler";
 
 /// Returns `true` if `name` matches the handler export key either
@@ -54,6 +55,7 @@ const HANDLER_EXPORT: &str = "wasi:http/incoming-handler";
 ///
 /// Separated from `detect_execution_model` so the matching logic is
 /// unit-testable without a real `Component`.
+#[allow(dead_code)]
 pub(crate) fn is_handler_export(name: &str) -> bool {
     // Exact match (no version in the export key).
     if name == HANDLER_EXPORT {
@@ -78,6 +80,7 @@ pub(crate) fn is_handler_export(name: &str) -> bool {
 /// as `Handler`. LongRunning is the default — `_start` is canonical for
 /// WASI Preview 2 components and we don't require any specific
 /// signature beyond that.
+#[allow(dead_code)]
 pub fn detect_execution_model(component: &Component) -> ExecutionModel {
     let ty = component.component_type();
     // `ComponentType::exports` needs the engine because canonical-ABI
@@ -90,6 +93,27 @@ pub fn detect_execution_model(component: &Component) -> ExecutionModel {
         }
     }
     ExecutionModel::LongRunning
+}
+
+/// A fast-path execution model detector that does not require full WebAssembly compilation.
+/// We look for a `wasi:http/incoming-handler` export which indicates a FaaS function.
+pub fn detect_execution_model_from_bytes(bytes: &[u8]) -> ExecutionModel {
+    match wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .find_map(|p| match p {
+            Ok(wasmparser::Payload::ExportSection(s)) => Some(s),
+            _ => None,
+        }) {
+        Some(exports) => {
+            for e in exports.into_iter().flatten() {
+                if e.name.contains("wasi:http/incoming-handler") {
+                    return ExecutionModel::Handler;
+                }
+            }
+            ExecutionModel::LongRunning
+        }
+        None => ExecutionModel::LongRunning,
+    }
 }
 
 #[cfg(test)]

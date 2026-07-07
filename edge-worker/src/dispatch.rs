@@ -56,7 +56,6 @@ use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -172,11 +171,6 @@ impl AsyncWrite for MaybeTls {
 /// `hyper`-based server bound to `0.0.0.0:port`. One instance per
 /// `(tenant_id, app_name)` is stored on the `AppInstance`.
 pub struct HandlerDispatch {
-    /// `wasmtime_wasi_http::ProxyPre` — pre-instantiated component
-    /// that exports `wasi:http/incoming-handler`. Cheap to clone
-    /// (Arc-shared); we hand a clone to each per-request task so
-    /// `proxy_pre.instantiate_async(&mut store)` is parallel-safe.
-    proxy_pre: HandlerProxyPre,
     /// TCP port assigned to this app by `PortPool`.
     port: u16,
     /// Per-request wasmtime epoch deadline (in ticks, where each tick
@@ -188,9 +182,13 @@ pub struct HandlerDispatch {
     tick_ms: u64,
     /// Per-app context shared across all requests (tenant_id, egress,
     /// meter, log_sink, app_ctx). Cheap to clone (`Arc`-heavy).
-    config: Arc<HandlerConfig>,
+    pub config: Arc<HandlerConfig>,
     /// Optional TLS server config for encrypted connections (issue #209).
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    downloader: Arc<crate::downloader::Downloader>,
+    deployment_id: String,
+    engine_pool: Arc<crate::supervisor::StandbyPool>,
+    proxy_pre: tokio::sync::RwLock<Option<HandlerProxyPre>>,
 }
 
 /// Per-app context handed to every FaaS request.
@@ -227,35 +225,45 @@ pub struct HandlerConfig {
     /// itself; the worker's `Config::from_env` reads it once at
     /// startup and the supervisor copies it into `HandlerConfig`.
     pub socket_mode: SocketEgressPolicy,
+    pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl HandlerDispatch {
-    /// Build a dispatcher from a pre-instantiated component.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        instance_pre: InstancePre<RuntimeState>,
         port: u16,
         request_budget_ms: u64,
         epoch_tick_ms: u64,
         config: HandlerConfig,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        downloader: Arc<crate::downloader::Downloader>,
+        deployment_id: String,
+        engine_pool: Arc<crate::supervisor::StandbyPool>,
     ) -> anyhow::Result<Self> {
-        let proxy_pre = HandlerProxyPre::new(instance_pre).map_err(|e| {
-            anyhow::anyhow!(
-                "ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"
-            )
-        })?;
         // Defend against divide-by-zero: a misconfigured 0 tick would
         // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);
         let ticks = request_budget_ms / tick_ms;
         Ok(Self {
-            proxy_pre,
+            proxy_pre: tokio::sync::RwLock::new(None),
             port,
             request_budget_ticks: ticks.max(1),
             tick_ms,
             config: Arc::new(config),
             tls_config,
+            downloader,
+            deployment_id,
+            engine_pool,
         })
+    }
+
+    /// Expose for integration tests so they can skip the Downloader.
+    #[allow(dead_code)]
+    pub async fn set_proxy_pre(
+        &self,
+        pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>,
+    ) {
+        *self.proxy_pre.write().await = Some(pre);
     }
 
     /// Spawn the HTTP server on `0.0.0.0:port`. Returns once the
@@ -298,7 +306,9 @@ impl HandlerDispatch {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let ticker_engine = self.proxy_pre.engine().clone();
+        // The engine could change during lazy-loading, so the ticker needs
+        // to dynamically fetch the latest engine. We use a channel or shared ref.
+        let server_ref = self.clone();
         let tick_ms = self.tick_ms;
         let ticker_shutdown = shutdown_flag.clone();
         let ticker_handle = thread::Builder::new()
@@ -311,7 +321,14 @@ impl HandlerDispatch {
                 if ticker_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                ticker_engine.increment_epoch();
+
+                let maybe_engine = {
+                    let lock = server_ref.proxy_pre.blocking_read();
+                    lock.as_ref().map(|p: &HandlerProxyPre| p.engine().clone())
+                };
+                if let Some(engine) = maybe_engine {
+                    engine.increment_epoch();
+                }
             })
             .with_context(|| {
                 format!(
@@ -498,6 +515,11 @@ pub fn check_body_cap(
 }
 
 impl HandlerDispatch {
+    pub async fn evict(&self) -> Option<wasmtime::Engine> {
+        let mut lock = self.proxy_pre.write().await;
+        lock.take().map(|proxy_pre| proxy_pre.engine().clone())
+    }
+
     /// Dispatch a single HTTP request through `ProxyPre`.
     /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
     /// `lib.rs`. Key differences from that example:
@@ -535,6 +557,67 @@ impl HandlerDispatch {
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
+        {
+            let mut lock = self.config.last_request_at.lock().await;
+            *lock = Some(std::time::Instant::now());
+        }
+
+        // Lazy instantiation: check if we have a ProxyPre.
+        let proxy_pre = {
+            let lock = self.proxy_pre.read().await;
+            if lock.is_some() {
+                lock.as_ref().unwrap().clone()
+            } else {
+                drop(lock);
+                let mut write_lock = self.proxy_pre.write().await;
+                if write_lock.is_none() {
+                    let engine = self.engine_pool.acquire().await;
+                    let cwasm_path = self.downloader.cwasm_path(&self.deployment_id);
+
+                    let component = if cwasm_path.exists() {
+                        match tokio::fs::read(&cwasm_path).await {
+                            Ok(cwasm_bytes) => unsafe {
+                                wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
+                            }
+                            .ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let component = match component {
+                        Some(c) => c,
+                        None => {
+                            let wasm_path = self.downloader.cache_path(&self.deployment_id);
+                            let bytes = tokio::fs::read(&wasm_path).await?;
+                            let engine_for_spawn = engine.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                wasmtime::component::Component::from_binary(
+                                    &engine_for_spawn,
+                                    &bytes,
+                                )
+                            })
+                            .await
+                            .unwrap()
+                            {
+                                Ok(c) => c,
+                                Err(e) => return Err(anyhow::anyhow!("JIT failed: {e}")),
+                            }
+                        }
+                    };
+
+                    let linker = edge_runtime::create_component_linker_handler(&engine)?;
+                    let instance_pre = linker.instantiate_pre(&component)?;
+                    let p = HandlerProxyPre::new(instance_pre)?;
+                    *write_lock = Some(p.clone());
+                    p
+                } else {
+                    write_lock.as_ref().unwrap().clone()
+                }
+            }
+        };
+
         // Body-cap pre-check. Prevents a FaaS guest from being asked to
         // handle a 10 GB POST that we'd then have to buffer into the
         // 256 MiB wasmtime memory cap. We trust Content-Length as the
@@ -559,7 +642,7 @@ impl HandlerDispatch {
             }
         }
 
-        let engine = self.proxy_pre.engine();
+        let engine = proxy_pre.engine();
 
         // Per-request RuntimeState — fresh ResourceTable, fresh
         // WasiCtx (rebuilt from the stored env HashMap), shared
@@ -614,7 +697,6 @@ impl HandlerDispatch {
         self.config.meter.record_request();
         let tenant_for_log = self.config.tenant_id.clone();
         let app_name_for_log = self.config.app_ctx.app_name.clone();
-        let proxy_pre = self.proxy_pre.clone();
 
         // Spawn the guest concurrently so the host can start serving
         // the response body as soon as the guest calls

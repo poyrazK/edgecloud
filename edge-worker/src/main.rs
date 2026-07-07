@@ -256,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         log_forwarder: log_forwarder.clone(),
         jwt_signer: jwt_signer.clone(),
         http,
+        engine_pool: Arc::new(crate::supervisor::StandbyPool::new(10)?),
     });
 
     let heartbeat_supervisor = supervisor.clone();
@@ -288,6 +289,22 @@ async fn main() -> anyhow::Result<()> {
                             tracing::error!(err = %e, "failed to publish heartbeat");
                         }
                     }
+                }
+            }
+        }
+    });
+
+    let evict_supervisor = supervisor.clone();
+    let shutdown_tx_for_evict = shutdown_tx.clone();
+    let mut shutdown_rx_for_evict = shutdown_tx_for_evict.subscribe();
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx_for_evict.recv() => break,
+                _ = ticker.tick() => {
+                    evict_supervisor.evict_idle_apps(Duration::from_secs(300)).await;
                 }
             }
         }

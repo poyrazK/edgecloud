@@ -171,7 +171,7 @@ impl TestHarness {
             queue_group: "test-pinning-group".to_string(),
             consumer_name: "test-consumer".to_string(),
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
-            worker_jwt_kid: None,
+            worker_jwt_kid: Some("test-kid".to_string()),
             worker_jwt_issuer: "edgecloud".to_string(),
             worker_tenant_id: "t_test".to_string(),
             handler_request_budget_ms: 1000,
@@ -1689,4 +1689,96 @@ async fn build_supervisor_only_with_cp(
     // semantics, we intentionally forget the NATS container here.
     std::mem::forget(guard._nats_container);
     Ok(guard.supervisor)
+}
+
+#[tokio::test]
+async fn test_supervisor_lazy_starting_and_eviction() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_deploy_001"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // Step 1: send TaskMessage to start an app
+    let spec = AppSpec {
+        deployment_id: "d_deploy_001".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: None,
+        max_memory_mb: 256,
+        routes: None,
+    };
+
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-15T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("test-app".to_string(), spec)]),
+    };
+
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check state. Since it's lazy, there shouldn't be an engine yet.
+    let dispatch = {
+        let state = harness.supervisor.state.read().await;
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
+        let inst_locked = inst.lock().await;
+        assert_eq!(
+            inst_locked.execution_model,
+            edge_worker::detect::ExecutionModel::Handler
+        );
+        inst_locked.dispatch.clone().unwrap()
+    };
+
+    assert!(
+        dispatch.evict().await.is_none(),
+        "Engine should be None because it is lazily started"
+    );
+
+    // Simulate request by hitting the port
+    let port = {
+        let state = harness.supervisor.state.read().await;
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
+        let p = inst.lock().await.port;
+        p
+    };
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .get(format!("http://127.0.0.1:{}", port))
+        .send()
+        .await;
+
+    // Give it a moment to process
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check state. Engine should exist now.
+    let engine = dispatch.evict().await;
+    assert!(
+        engine.is_some(),
+        "Engine should be Some because it was started"
+    );
+
+    // Free it
+    if let Some(e) = engine {
+        harness.supervisor.engine_pool.release(e);
+    }
 }

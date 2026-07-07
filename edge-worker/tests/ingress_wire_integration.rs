@@ -47,6 +47,7 @@ fn wire_test_config(
     worker_addr: &str,
 ) -> edge_worker::config::Config {
     edge_worker::config::Config {
+        worker_jwt_kid: None,
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: worker_addr.to_string(),
@@ -64,7 +65,6 @@ fn wire_test_config(
         queue_group: "ingress-wire-group".to_string(),
         consumer_name: format!("ingress-wire-{worker_id}"),
         worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
