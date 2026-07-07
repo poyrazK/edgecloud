@@ -14,6 +14,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
 // DeploymentHandler handles deployment HTTP requests.
@@ -21,17 +22,14 @@ type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
 	trafficSvc    *service.TrafficService
-	// rollbackSvc is a narrow contract for the rollback handler so the
-	// test can stub it without standing up the full *service.DeploymentService
-	// (DB + NATS + publisher + artifact store). The concrete
-	// *service.DeploymentService satisfies it.
-	rollbackSvc deploymentRollbacker
-	// activateSvc mirrors rollbackSvc for the Activate handler — narrow
-	// contract lets tests stub the activate path without the full service
-	// surface. Concrete *service.DeploymentService satisfies it.
-	activateSvc deploymentActivator
-	// promoteSvc is the narrow contract for the Promote handler.
-	promoteSvc deploymentPromoter
+	rollbackSvc   deploymentRollbacker
+	activateSvc   deploymentActivator
+	promoteSvc    deploymentPromoter
+	// artifactStore is used by the precompile step to read .wasm and write .cwasm.
+	artifactStore storage.ArtifactStore
+	// wasm2cwasmPath is the path to the wasm2cwasm binary for AOT pre-compilation.
+	// Empty = skip pre-compilation.
+	wasm2cwasmPath string
 }
 
 // deploymentRollbacker is the narrow contract the Rollback handler needs.
@@ -54,18 +52,16 @@ type deploymentPromoter interface {
 	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService, artifactStore storage.ArtifactStore, wasm2cwasmPath string) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
 		trafficSvc:    trafficSvc,
-		// Concrete *service.DeploymentService satisfies the narrow interfaces.
-		// nil is also fine for tests that only exercise the workerSvc path
-		// (e.g. AppIngress) — those methods never touch rollbackSvc /
-		// activateSvc.
-		rollbackSvc: deploymentSvc,
-		activateSvc: deploymentSvc,
-		promoteSvc:  deploymentSvc,
+		rollbackSvc:   deploymentSvc,
+		activateSvc:   deploymentSvc,
+		promoteSvc:    deploymentSvc,
+		artifactStore: artifactStore,
+		wasm2cwasmPath: wasm2cwasmPath,
 	}
 }
 
@@ -392,6 +388,14 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 			httperror.InternalErrorCtx(w, r)
 			return
 		}
+
+		// Fire-and-forget precompilation in the background so the
+		// activation response is not blocked by compilation time.
+		if h.wasm2cwasmPath != "" && h.artifactStore != nil {
+			ctx := context.WithoutCancel(r.Context())
+			go service.PrecompileCwasm(ctx, h.artifactStore, h.wasm2cwasmPath, tenantID, appName, deploymentID)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
 			log.Printf("Activate: failed to encode response: %v", err)

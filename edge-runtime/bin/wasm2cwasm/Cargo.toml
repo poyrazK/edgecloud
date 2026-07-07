@@ -1,0 +1,10 @@
+[package]
+name = "wasm2cwasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wasmtime = { version = "=45.0.3", features = ["component-model"] }
+edge-runtime = { path = "../.." }
+anyhow = "1"

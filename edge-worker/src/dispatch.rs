@@ -616,7 +616,10 @@ impl HandlerDispatch {
                                     match c.serialize() {
                                         Ok(serialized) => {
                                             tokio::spawn(async move {
-                                                if let Err(e) = tokio::fs::write(&cwasm_path_clone, &serialized).await {
+                                                if let Err(e) =
+                                                    tokio::fs::write(&cwasm_path_clone, &serialized)
+                                                        .await
+                                                {
                                                     tracing::warn!(
                                                         path = %cwasm_path_clone.display(),
                                                         err = %e,

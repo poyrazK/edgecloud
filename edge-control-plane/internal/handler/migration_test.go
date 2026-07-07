@@ -81,6 +81,10 @@ func (m *mockArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, d
 	return nil, nil
 }
 
+func (m *mockArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return nil
+}
+
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	return nil
 }

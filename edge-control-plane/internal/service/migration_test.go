@@ -130,6 +130,19 @@ func (m *mockArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, d
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+func (m *mockArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	key := tenantID + "/" + appName + "/" + deploymentID + "." + format
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if m.artifacts == nil {
+		m.artifacts = make(map[string][]byte)
+	}
+	m.artifacts[key] = data
+	return nil
+}
+
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	key := tenantID + "/" + appName + "/" + deploymentID
 	m.deleteCalls = append(m.deleteCalls, key)
