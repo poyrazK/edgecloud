@@ -411,6 +411,7 @@ mod tests {
             caddy_admin_listen: "localhost:2019".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
             control_plane_api_url: "http://localhost:8080".into(),
             internal_token: None,
         };
@@ -596,6 +597,7 @@ mod tests {
             caddy_admin_listen: "localhost:2019".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
             control_plane_api_url: "http://localhost:8080".into(),
             internal_token: None,
         }

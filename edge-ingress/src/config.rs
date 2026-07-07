@@ -69,6 +69,9 @@ pub struct Config {
     /// Default per-app burst size. 0 = disabled.
     /// Override with `RATE_LIMIT_BURST_DEFAULT`.
     pub rate_limit_burst_default: u32,
+    /// How often to poll the control plane for per-app rate limit overrides.
+    /// Default 60s. 0 = disabled. Override with `RATE_LIMIT_FETCH_INTERVAL`.
+    pub rate_limit_fetch_interval: Duration,
 }
 
 impl Config {
@@ -147,6 +150,10 @@ impl Config {
                 .unwrap_or_else(|_| "0".into())
                 .parse()
                 .unwrap_or(0),
+            rate_limit_fetch_interval: std::env::var("RATE_LIMIT_FETCH_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(60)),
         })
     }
 }

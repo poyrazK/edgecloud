@@ -50,6 +50,7 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         caddy_admin_listen: "localhost:2019".into(),
         rate_limit_rps_default: 0,
         rate_limit_burst_default: 0,
+        rate_limit_fetch_interval: Duration::from_secs(60),
     }
 }
 
