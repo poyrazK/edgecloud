@@ -59,7 +59,6 @@ use edge_worker::supervisor::Supervisor;
 ///     run in CI).
 pub fn should_skip_integration_tests() -> bool {
     std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
-        || std::env::var("CI").is_ok()
         || !std::path::Path::new("/var/run/docker.sock").exists()
 }
 

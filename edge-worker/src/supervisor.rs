@@ -1394,7 +1394,7 @@ impl Supervisor {
         // driven entirely by last_good_deployment_id.
         let current_deployment_id = meter.deployment_id.clone();
 
-        loop {
+        'outer: loop {
             tokio::select! {
                 // Graceful shutdown signal from supervisor
                 _ = &mut shutdown_rx => {
@@ -1430,6 +1430,7 @@ impl Supervisor {
                         Ok(Ok(true)) => {
                             // Component wants to keep running (blocking call returned normally).
                             // Loop back and re-execute — this supports long-running HTTP servers.
+                            sleep(Duration::from_millis(10)).await;
                             continue;
                         }
                         Ok(Ok(false)) => {
@@ -1494,7 +1495,13 @@ impl Supervisor {
                                 "app crashed, restarting in {:?}",
                                 backoff
                             );
-                            sleep(backoff).await;
+                            tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    tracing::info!("app received shutdown signal during crash backoff");
+                                    break 'outer;
+                                }
+                                _ = sleep(backoff) => {}
+                            }
                         }
                         Err(_elapsed) => {
                             // Health check timeout — app hung.
@@ -1543,7 +1550,13 @@ impl Supervisor {
                                 });
                                 break;
                             }
-                            sleep(backoff).await;
+                            tokio::select! {
+                                _ = &mut shutdown_rx => {
+                                    tracing::info!("app received shutdown signal during hung backoff");
+                                    break 'outer;
+                                }
+                                _ = sleep(backoff) => {}
+                            }
                         }
                     }
                 }

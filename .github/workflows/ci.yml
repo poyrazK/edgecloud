@@ -73,6 +73,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+      SKIP_INTEGRATION_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -390,3 +391,37 @@ jobs:
         with:
           name: lcov-rust
           path: lcov-rust.info
+
+  # ============================================================
+  # RUST-INTEGRATION — Run Docker-based integration tests
+  # ============================================================
+  rust-integration:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run integration tests
+        run: |
+          cargo nextest run --workspace \
+            -E 'binary(integration_tests) | binary(ingress_wire_integration) | binary(integration)'

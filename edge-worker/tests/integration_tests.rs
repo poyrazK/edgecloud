@@ -42,6 +42,12 @@ use edge_test_helpers::{
     should_skip_integration_tests, start_nats, SupervisorGuard,
 };
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,edge_worker=debug,edge_runtime=debug")
+        .try_init();
+}
+
 /// Test WASM component bytes — a minimal component that exports `handle` and `_start`.
 fn test_component_bytes() -> &'static [u8] {
     include_bytes!("fixtures/test-handle.wasm")
@@ -73,6 +79,7 @@ fn test_config(
     nats_url: String,
     control_plane_url: String,
 ) -> Config {
+    let pid_offset = (std::process::id() % 1000) as u16;
     Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
@@ -82,7 +89,7 @@ fn test_config(
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -104,9 +111,6 @@ fn test_config(
         standby_pool_size: 10,
     }
 }
-
-/// Timeout for subscribing to heartbeats.
-const HEARTBEAT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time to wait for the full test harness to start (container + NATS connection).
 const HARNESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -149,6 +153,7 @@ impl TestHarness {
     async fn new_inner() -> anyhow::Result<Self> {
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
+        let pid_offset = (std::process::id() % 1000) as u16;
 
         // Delegate supervisor wiring to the shared helper. The per-test
         // tempdir is threaded through Config.cache_dir so cache-poisoning
@@ -165,7 +170,7 @@ impl TestHarness {
             worker_sync_threshold_secs: 60,
             health_check_timeout_secs: 60,
             port_cooldown_secs: 60,
-            starting_port: 18_000,
+            starting_port: 18_000 + pid_offset,
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
@@ -202,20 +207,6 @@ impl TestHarness {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
-async fn subscribe_heartbeats(nats_url: &str, region: &str) -> anyhow::Result<HeartbeatMessage> {
-    let client = async_nats::connect(nats_url).await?;
-    let subject = format!("edgecloud.heartbeats.{}", region);
-    let mut sub = client.subscribe(subject).await?;
-    let msg = timeout(HEARTBEAT_SUBSCRIBE_TIMEOUT, sub.next())
-        .await
-        .context("heartbeat subscription timed out")?
-        .context("no heartbeat message received")?;
-    let heartbeat =
-        serde_json::from_slice::<HeartbeatMessage>(&msg.payload).context("parse heartbeat")?;
-    Ok(heartbeat)
-}
 
 /// Helper: wait for an app to appear in state with Running status.
 ///
@@ -265,6 +256,7 @@ async fn test_app_lifecycle() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -351,6 +343,7 @@ async fn test_heartbeat_published() {
 }
 
 async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     // Start a NATS container directly (no `SupervisorGuard` here because
     // this test doesn't bind the container to the supervisor struct; it
     // forgets it explicitly so it stays alive for the test's duration,
@@ -368,7 +361,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -390,6 +383,14 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
+    // Connect and subscribe first
+    let client = async_nats::connect(&nats_url).await?;
+    let subject = format!("edgecloud.heartbeats.{}", "test-region");
+    let mut sub = client.subscribe(subject).await?;
+
+    // Give NATS server a moment to register the subscription
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
     // Build and publish a heartbeat manually
     let heartbeat = supervisor.build_heartbeat().await;
     supervisor
@@ -398,14 +399,14 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         .await
         .context("publish heartbeat")?;
 
-    // Subscribe and receive it
-    let received = timeout(
-        Duration::from_secs(5),
-        subscribe_heartbeats(&nats_url, "test-region"),
-    )
-    .await
-    .context("heartbeat subscription timed out")?
-    .context("subscribe_heartbeats")?;
+    // Receive it
+    let msg = timeout(Duration::from_secs(5), sub.next())
+        .await
+        .context("heartbeat subscription timed out")?
+        .context("no heartbeat message received")?;
+
+    let received: HeartbeatMessage =
+        serde_json::from_slice(&msg.payload).context("parse heartbeat")?;
 
     assert_eq!(received.worker_id, "test-worker");
     assert_eq!(received.region, "test-region");
@@ -481,6 +482,7 @@ async fn test_artifact_hash_match_starts_app() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -524,6 +526,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -618,6 +621,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    init_tracing();
 
     let harness = TestHarness::new().await.expect("create test harness");
 
@@ -811,6 +815,7 @@ async fn test_queue_group_pinning() {
 }
 
 async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     // Single NATS container, shared by both workers and the publisher.
     let (nats_container, nats_url) = start_nats().await;
 
@@ -831,7 +836,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_000 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -863,7 +868,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        starting_port: 18_200 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -1653,6 +1658,7 @@ async fn build_supervisor_only_with_cp(
     tenant_id: &str,
     control_plane_url: &str,
 ) -> anyhow::Result<Arc<Supervisor>> {
+    let pid_offset = (std::process::id() % 1000) as u16;
     let config = Config {
         worker_id: worker_id.to_string(),
         region: region.to_string(),
@@ -1664,7 +1670,7 @@ async fn build_supervisor_only_with_cp(
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 19_500,
+        starting_port: 19_500 + pid_offset,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
