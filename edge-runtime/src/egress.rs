@@ -707,4 +707,16 @@ mod tests {
             .check_address("127.0.0.1:80".parse().unwrap())
             .is_err());
     }
+
+    #[test]
+    fn hostname_pinning_default_is_empty() {
+        // Smoke: the cache type compiles + the default constructor
+        // produces an empty cache. End-to-end HostnamePinned-mode
+        // semantics are covered in `socket_egress::tests`; this is a
+        // sanity check for the import surface.
+        use crate::socket_egress::HostnamePinning;
+        let pinning = HostnamePinning::default();
+        assert!(pinning.snapshot().is_empty());
+        assert!(!pinning.contains("x", "127.0.0.1".parse().unwrap()));
+    }
 }

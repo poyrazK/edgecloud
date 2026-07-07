@@ -32,11 +32,12 @@
 //! the effective deny-all behavior of wasmtime's `SocketAddrCheck::default()`.
 //! See [`SocketEgressPolicy::from_env`] for the parsing rules.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wasmtime_wasi::sockets::SocketAddrUse;
 
@@ -158,6 +159,58 @@ impl std::fmt::Display for SocketEgressPolicy {
 /// Type that `WasiCtxBuilder::socket_addr_check` accepts on wasmtime-wasi
 /// 45.0.3 (verified at `wasmtime-wasi-45.0.3/src/ctx.rs:397-406`).
 type SocketAddrCheckFuture = Pin<Box<dyn Future<Output = bool> + Send + Sync>>;
+
+/// Per-`Network` resolution cache that backs the dormant
+/// `SocketEgressPolicy::HostnamePinned` mode. Each entry records
+/// `(hostname → set of resolved IPs)` as observed by the host impl
+/// `wasi:sockets/ip-name-lookup::resolve-addresses`.
+///
+/// Today the cache is populated manually by tests only (the upstream
+/// closure hook documented in `docs/upstream-wasmtime-resolve-check.patch`
+/// hasn't been merged yet). When the upstream PR lands, the runtime
+/// `Host for WasiSocketsCtxView::resolve_addresses` impl calls
+/// [`HostnamePinning::record`] before the upstream resolver runs, and
+/// the connect-side closure consults [`HostnamePinning::contains`].
+///
+/// `Arc<Mutex<...>>` so a fresh `RuntimeState` (per-request in the
+/// dispatch path) shares one cache for the lifetime of the dispatch
+/// instance. The `Mutex` is short-held (a single hashmap lookup) and
+/// the cache is read-mostly; contention is negligible.
+#[derive(Debug, Default)]
+pub struct HostnamePinning {
+    by_hostname: Mutex<HashMap<String, HashSet<IpAddr>>>,
+}
+
+impl HostnamePinning {
+    /// Record `ips` as observed under `hostname`. The host impl calls
+    /// this from `wasi:sockets/ip-name-lookup::resolve-addresses`.
+    pub fn record(&self, hostname: &str, ips: impl IntoIterator<Item = IpAddr>) {
+        let mut guard = self
+            .by_hostname
+            .lock()
+            .expect("HostnamePinning mutex poisoned");
+        guard.entry(hostname.to_string()).or_default().extend(ips);
+    }
+
+    /// Returns `true` if `ip` was observed under `hostname`. The
+    /// connect-side closure consults this in `HostnamePinned` mode.
+    pub fn contains(&self, hostname: &str, ip: IpAddr) -> bool {
+        let guard = self
+            .by_hostname
+            .lock()
+            .expect("HostnamePinning mutex poisoned");
+        guard.get(hostname).map_or(false, |set| set.contains(&ip))
+    }
+
+    /// Snapshot the full cache (for tests + debug logging). Cheap
+    /// clone of a `HashMap<String, HashSet<IpAddr>>`.
+    pub fn snapshot(&self) -> HashMap<String, HashSet<IpAddr>> {
+        self.by_hostname
+            .lock()
+            .expect("HostnamePinning mutex poisoned")
+            .clone()
+    }
+}
 
 /// Build the closure consumed by `WasiCtxBuilder::socket_addr_check`.
 ///
@@ -412,5 +465,56 @@ mod tests {
     #[test]
     fn default_is_block_all() {
         assert_eq!(SocketEgressPolicy::default(), SocketEgressPolicy::BlockAll);
+    }
+
+    // ── HostnamePinning cache ──────────────────────────────────────────
+    //
+    // The cache is dormant until the upstream wasmtime-wasi PR (see
+    // docs/upstream-wasmtime-resolve-check.patch) merges. The tests
+    // populate it directly via `HostnamePinning::record` to verify the
+    // shape and the read API.
+
+    #[test]
+    fn hostname_pinning_default_is_empty() {
+        let pinning = HostnamePinning::default();
+        assert!(!pinning.contains("anything", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert!(pinning.snapshot().is_empty());
+    }
+
+    #[test]
+    fn hostname_pinning_record_then_contains() {
+        let pinning = HostnamePinning::default();
+        pinning.record("api.example.com", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        assert!(pinning.contains("api.example.com", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!pinning.contains("api.example.com", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        // Different hostname: not found even if the IP matches.
+        assert!(!pinning.contains("other.example.com", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn hostname_pinning_record_dedupes_ips() {
+        // `record` is idempotent for the same IP — multiple
+        // `resolve-next-address` calls return the same set.
+        let pinning = HostnamePinning::default();
+        pinning.record("h", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        pinning.record("h", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        assert_eq!(pinning.snapshot().get("h").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hostname_pinning_record_multiple_ips_same_hostname() {
+        let pinning = HostnamePinning::default();
+        pinning.record(
+            "api.example.com",
+            [
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            ],
+        );
+        let snap = pinning.snapshot();
+        let set = snap.get("api.example.com").unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(set.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
     }
 }

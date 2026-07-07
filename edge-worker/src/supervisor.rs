@@ -423,6 +423,7 @@ impl Supervisor {
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
                     metrics_acc: metrics_acc.clone(),
                     socket_mode: self.config.socket_mode,
+                    hostname_pinning: self.config.hostname_pinning.clone(),
                 };
 
                 let tls_config =
@@ -487,6 +488,7 @@ impl Supervisor {
                 let metrics_acc_for_loop = metrics_acc.clone();
 
                 let socket_mode_for_loop = self.config.socket_mode;
+                let hostname_pinning_for_loop = self.config.hostname_pinning.clone();
                 let handle = tokio::spawn(async move {
                     Self::run_app_loop(
                         instance_pre_clone,
@@ -504,6 +506,7 @@ impl Supervisor {
                         log_forwarder,
                         metrics_acc_for_loop,
                         socket_mode_for_loop,
+                        hostname_pinning_for_loop,
                     )
                     .await;
                     tracing::info!(app_name = %app_name_str, "app task exited");
@@ -694,6 +697,7 @@ impl Supervisor {
         log_forwarder: Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
+        hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -737,6 +741,7 @@ impl Supervisor {
                         &log_forwarder,
                         metrics_acc.clone(),
                         socket_mode,
+                        hostname_pinning.clone(),
                     ),
                 ) => {
                     match result {
@@ -882,6 +887,7 @@ impl Supervisor {
         log_forwarder: &Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
+        hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -917,6 +923,7 @@ impl Supervisor {
             app_ctx,
             metrics_acc,
             socket_mode,
+            hostname_pinning,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed

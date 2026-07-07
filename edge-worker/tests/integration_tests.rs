@@ -100,6 +100,7 @@ fn test_config(
         tls_cert_path: None,
         tls_key_path: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
     }
 }
 
@@ -179,6 +180,7 @@ impl TestHarness {
             tls_cert_path: None,
             tls_key_path: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -381,6 +383,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         tls_cert_path: None,
         tls_key_path: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -841,6 +844,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         tls_cert_path: None,
         tls_key_path: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -871,6 +875,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         tls_cert_path: None,
         tls_key_path: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1670,6 +1675,7 @@ async fn build_supervisor_only_with_cp(
         tls_cert_path: None,
         tls_key_path: None,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
     };
 
     let guard = build_supervisor_with(config).await;

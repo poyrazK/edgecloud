@@ -227,6 +227,15 @@ pub struct HandlerConfig {
     /// itself; the worker's `Config::from_env` reads it once at
     /// startup and the supervisor copies it into `HandlerConfig`.
     pub socket_mode: SocketEgressPolicy,
+    /// Per-`Network` resolution cache backing the dormant
+    /// `SocketEgressPolicy::HostnamePinned` mode. Arc-shared with
+    /// `RuntimeState::hostname_pinning` so observations from the
+    /// upstream-resolve hook on one dispatch are visible to the next.
+    /// `Arc::new(HostnamePinning::default())` in tests; the supervisor
+    /// uses `Config::hostname_pinning` (added in commit 3) once the
+    /// upstream PR merges. The cache is dormant today (no upstream
+    /// hook populates it) — see `docs/upstream-wasmtime-resolve-check.patch`.
+    pub hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
 }
 
 impl HandlerDispatch {
@@ -554,6 +563,7 @@ impl HandlerDispatch {
             self.config.app_ctx.clone(),
             self.config.metrics_acc.clone(),
             self.config.socket_mode,
+            self.config.hostname_pinning.clone(),
         );
 
         // Clone the shared exit-code flag BEFORE moving `request_state`

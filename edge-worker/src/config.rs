@@ -3,6 +3,7 @@
 use anyhow::Context;
 use edge_runtime::socket_egress::SocketEgressPolicy;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
 // env vars and consumed by the supervisor (PR #64 follow-up). They plumb
@@ -144,6 +145,14 @@ pub struct Config {
     /// flagged as a perf regression). Mirrors the
     /// `handler_max_request_body_bytes` pattern above.
     pub socket_mode: SocketEgressPolicy,
+    /// Per-`Network` resolution cache backing the dormant
+    /// `SocketEgressPolicy::HostnamePinned` mode. The worker constructs
+    /// a single `HostnamePinning` at startup and copies it into every
+    /// `HandlerConfig` (issue #309 hostname-pinned follow-up). The
+    /// cache is dormant today — the upstream wasmtime-wasi patch
+    /// (see `docs/upstream-wasmtime-resolve-check.patch`) is the
+    /// load-bearing piece that lets the host impl populate it.
+    pub hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
 }
 
 impl Config {
@@ -248,6 +257,7 @@ impl Config {
             tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             socket_mode: SocketEgressPolicy::from_env(),
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::default()),
         })
     }
 

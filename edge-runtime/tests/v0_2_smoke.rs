@@ -63,6 +63,7 @@ fn state() -> RuntimeState {
         },
         None,
         SocketEgressPolicy::default(),
+        Arc::new(edge_runtime::socket_egress::HostnamePinning::default()),
     )
 }
 
