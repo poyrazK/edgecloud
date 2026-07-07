@@ -16,6 +16,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -236,6 +237,13 @@ type DeploymentService struct {
 	// to pull from the CP's /api/internal/download/. Set via
 	// SetRegionArtifactCaches.
 	regionArtifactCaches map[string]string
+	// signer signs every new deployment's artifact (issue #307).
+	// Required — set by the constructor; a nil signer would cause
+	// `Deploy` to return an error. The signature + signing_key_id
+	// are stamped onto the row before the INSERT, then copied onto
+	// the `AppConfig.DeploymentSignature` field of the published
+	// TaskMessage so workers can verify before instantiation.
+	signer *signing.Signer
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
 	// target any region — both in `Deploy` (when the HTTP request
@@ -256,6 +264,7 @@ func NewDeploymentService(
 	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
+	signer *signing.Signer,
 ) *DeploymentService {
 	// Defensive: never let the service run with an empty default
 	// region. A blank region would build a NATS subject like
@@ -276,6 +285,7 @@ func NewDeploymentService(
 		artifactStore:  artifactStore,
 		publisher:      publisher,
 		defaultRegion:  defaultRegion,
+		signer:         signer,
 	}
 }
 
@@ -438,6 +448,22 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 				return saveErr
 			}
 			deployment.Hash = hex.EncodeToString(hash)
+			// Sign the artifact (issue #307). Signature is over
+			// `sha256(artifact) || deployment.ID`; binding to the
+			// id prevents DB-replay. Sign happens inside the tx so
+			// a signing failure rolls the row back alongside the
+			// artifact (the temp file is unlinked by SaveAndHash
+			// on its own error path; the row insert is the only
+			// state we own here).
+			if s.signer == nil {
+				return fmt.Errorf("signing is not configured (deployment service requires a signer at construction)")
+			}
+			sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID)
+			if signErr != nil {
+				return fmt.Errorf("signing artifact: %w", signErr)
+			}
+			deployment.Signature = sig
+			deployment.SigningKeyID = s.signer.KeyID()
 			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
 				return fmt.Errorf("creating deployment: %w", err)
 			}
@@ -486,8 +512,20 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			err = saveErr
 		} else {
 			deployment.Hash = hex.EncodeToString(hash)
-			if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
-				err = fmt.Errorf("creating deployment: %w", createErr)
+			// Sign the artifact (issue #307). Same logic as the
+			// tx branch above; here it happens after the row is
+			// about to be inserted, so a signing error returns
+			// without inserting.
+			if s.signer == nil {
+				err = fmt.Errorf("signing is not configured (deployment service requires a signer at construction)")
+			} else if sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID); signErr != nil {
+				err = fmt.Errorf("signing artifact: %w", signErr)
+			} else {
+				deployment.Signature = sig
+				deployment.SigningKeyID = s.signer.KeyID()
+				if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
+					err = fmt.Errorf("creating deployment: %w", createErr)
+				}
 			}
 		}
 	}
@@ -685,6 +723,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			appName: nats.BuildAppConfig(
 				deploymentID,
 				deployment.Hash,
+				deployment.Signature,
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -1016,6 +1055,7 @@ func (s *DeploymentService) waitForWorkers(ctx context.Context, tenantID, appNam
 func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error) {
 	var rolledBackID string
 	var deploymentHash string
+	var deploymentSignature string
 	var regions []string
 	var tenant *domain.Tenant
 	var envs []domain.AppEnv
@@ -1046,6 +1086,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("previous deployment %s not found", rolledBackID)
 		}
 		deploymentHash = dep.Hash
+		deploymentSignature = dep.Signature
 		// Use the rolled-BACK-TO deployment's regions so we publish
 		// to exactly the regions where this artifact was originally
 		// destined. Previously this published to "global" only, which
@@ -1136,6 +1177,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			appName: nats.BuildAppConfig(
 				rolledBackID,
 				deploymentHash,
+				deploymentSignature,
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -1221,6 +1263,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 				ad.AppName: nats.BuildAppConfig(
 					ad.DeploymentID,
 					deployment.Hash,
+					deployment.Signature, // issue #307
 					envMap,
 					tenant.AllowlistedDestinations,
 					maxMemoryMB,

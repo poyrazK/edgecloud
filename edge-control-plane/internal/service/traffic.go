@@ -237,6 +237,7 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 			appName: nats.BuildAppConfig(
 				dep.ID,
 				dep.Hash,
+				dep.Signature, // issue #307
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -310,9 +311,10 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 			return fmt.Errorf("deployment %q not found", sp.DeploymentID)
 		}
 		routes[i] = nats.DeploymentRoute{
-			DeploymentID:   sp.DeploymentID,
-			DeploymentHash: d.Hash,
-			Weight:         sp.Weight,
+			DeploymentID:        sp.DeploymentID,
+			DeploymentHash:      d.Hash,
+			DeploymentSignature: d.Signature, // issue #307: per-route signature
+			Weight:              sp.Weight,
 		}
 		if i == 0 {
 			primaryHash = d.Hash
@@ -344,6 +346,7 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 			appName: nats.BuildAppConfig(
 				splits[0].DeploymentID, // primary; Routes drives worker behavior
 				primaryHash,
+				routes[0].DeploymentSignature, // primary signature (issue #307)
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,

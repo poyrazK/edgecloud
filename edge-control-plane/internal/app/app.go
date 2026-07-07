@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
 )
@@ -77,6 +79,19 @@ func New(
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
+	// Load the Ed25519 signing key (issue #307). The config validator
+	// already enforced that at least one of KeyPath / Key is set;
+	// here we resolve the actual signer and surface any load-time
+	// errors (malformed key, missing file) as a fatal startup
+	// condition rather than a runtime failure on the first Deploy.
+	signer, err := loadSigner(&cfg.Signing)
+	if err != nil {
+		log.Fatalf("loading signing key: %v", err)
+	}
+	if cfg.Signing.KeyID == "" {
+		log.Printf("WARNING: EDGE_SIGNING_KEY_ID is empty; rotation semantics will be ambiguous. Set a logical key id (e.g. \"k1\") before shipping rotation code.")
+	}
+
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(
@@ -84,7 +99,7 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
+		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, signer,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
@@ -97,6 +112,7 @@ func New(
 	migrationSvc := service.NewMigrationService(
 		deploymentRepo, artifactStore,
 		cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath,
+		signer,
 	)
 	trafficSvc := service.NewTrafficService(
 		db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo,
@@ -556,4 +572,23 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// loadSigner constructs a *signing.Signer from the validated config.
+// Precedence matches `signing.LoadFromEnv`: file path (KeyPath)
+// wins over inline (Key). The config validator has already rejected
+// the case where both are empty, so exactly one path here is taken —
+// but this function is also reachable from tests that bypass Load
+// (the bundled-config regression guard bypasses Load and asserts the
+// error is logged in a stable way). The empty-guard here returns the
+// same sentinel error the validator would emit, so callers see one
+// consistent message regardless of which layer caught it.
+func loadSigner(cfg *config.SigningConfig) (*signing.Signer, error) {
+	if cfg.KeyPath == "" && cfg.Key == "" {
+		return nil, fmt.Errorf("%w: EDGE_SIGNING_KEY_PATH (or EDGE_SIGNING_KEY) is required (issue #307)", signing.ErrInvalidKey)
+	}
+	if cfg.KeyPath != "" {
+		return signing.LoadFromFile(cfg.KeyPath, cfg.KeyID)
+	}
+	return signing.LoadFromRaw([]byte(cfg.Key), cfg.KeyID)
 }

@@ -5,6 +5,8 @@ import (
 	"embed"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,6 +22,18 @@ var emptyFS embed.FS
 
 func testConfig(t *testing.T, artifactPath string) *config.Config {
 	t.Helper()
+	// Write a dummy Ed25519 signing key file (issue #307). The file's
+	// contents don't need to be a real key — loadSigner is called
+	// once and fails fast at the parsing step if the file is empty,
+	// so we write a 32-byte all-zero "seed" that the signing package
+	// accepts via ed25519.NewKeyFromSeed. The signing-key requirement
+	// was added by issue #307 and every New() call needs a key on
+	// disk; tests don't sign anything so the actual key bytes are
+	// irrelevant.
+	keyPath := filepath.Join(t.TempDir(), "test_signing.key")
+	if err := os.WriteFile(keyPath, make([]byte, 32), 0o600); err != nil {
+		t.Fatalf("write fixture signing key: %v", err)
+	}
 	return &config.Config{
 		Database: config.DatabaseConfig{
 			Host: "localhost", Port: 5432, User: "test", Password: "test", Name: "test", SSLMode: "disable",
@@ -35,6 +49,13 @@ func testConfig(t *testing.T, artifactPath string) *config.Config {
 		Storage: config.StorageConfig{
 			ArtifactBackend: "fs",
 			ArtifactPath:    artifactPath,
+		},
+		// Issue #307: signing key is required for the CP to start.
+		// Without this, New() log.Fatalf's with the missing-key
+		// error and the test binary exits 1.
+		Signing: config.SigningConfig{
+			KeyPath: keyPath,
+			KeyID:   "test-k1",
 		},
 	}
 }
