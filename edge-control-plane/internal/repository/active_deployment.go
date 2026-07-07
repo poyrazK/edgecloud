@@ -45,26 +45,55 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	// and the flag follows the deployment row, not the active slot.
 	//
 	// Per-region publish-state columns (regions_published,
-	// regions_failed, last_publish_at, last_publish_attempt_id) ARE in
-	// the DO UPDATE clause and are reset to their zero values on
-	// re-activation. This is intentional: a re-activation is a fresh
-	// publish cycle, so the prior activation's "regions already
-	// notified" history must not mask regions that need (re)publishing
-	// on this activation. AppendRegionsPublished /
-	// AppendRegionsFailed repopulate the columns after the publish loop.
+	// regions_failed, last_publish_at, last_publish_attempt_id) AND
+	// the per-region cache-state columns (regions_cached,
+	// regions_cache_failed) ARE in the DO UPDATE clause. The four
+	// publish-state columns are reset to their zero values on
+	// re-activation — intentional: a re-activation is a fresh publish
+	// cycle, so the prior activation's "regions already notified"
+	// history must not mask regions that need (re)publishing on this
+	// activation. AppendRegionsPublished / AppendRegionsFailed
+	// repopulate the columns after the publish loop.
+	//
+	// The two cache-state columns use a CONDITIONAL wipe:
+	//
+	//	regions_cached       = CASE WHEN deployment_id = $3 THEN regions_cached       ELSE $8 END
+	//	regions_cache_failed = CASE WHEN deployment_id = $3 THEN regions_cache_failed ELSE $9 END
+	//
+	// i.e. they are preserved when the active row is being upserted
+	// with the SAME deployment_id (a no-op re-activation — e.g. a
+	// retry, a Rollback to the same id, a deploy + immediate re-
+	// activate), and wiped to '$8' / '$9' (the caller-supplied zero
+	// arrays) only when the deployment_id is CHANGING. This is
+	// required for issue #332 Layer 3: the cache-skip-on-activation
+	// logic in publishSwap consults current.RegionsCached to decide
+	// whether to push bytes to each region. If Set unconditionally
+	// wiped RegionsCached on every upsert, the cache-skip branch
+	// could never fire — the row would always read empty after a
+	// Set, defeating the optimization.
+	//
+	// Note: the new deployment_id only commits inside the DO UPDATE
+	// branch (the INSERT branch inserts a row that didn't exist, so
+	// RegionsCached is implicitly empty there). The CASE expression
+	// on the INSERT branch would short-circuit to $8 / $9 anyway (the
+	// SELECT sees the just-inserted value, which equals $3, so the
+	// THEN branch would pick the empty INSERT value — no observable
+	// difference), but the simpler form is to write the same
+	// CASE expression in both branches for symmetry.
 	query := `INSERT INTO active_deployments (
 		tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled,
-		regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	ON CONFLICT (tenant_id, app_name) DO UPDATE SET
 		deployment_id = $3,
 		last_good_deployment_id = $4,
 		auto_rollback_enabled = $5,
 		regions_published = $6,
 		regions_failed = $7,
-		regions_cached = $8,
-		last_publish_at = $9,
-		last_publish_attempt_id = $10`
+		regions_cached = CASE WHEN active_deployments.deployment_id = $3 THEN active_deployments.regions_cached ELSE $8 END,
+		regions_cache_failed = CASE WHEN active_deployments.deployment_id = $3 THEN active_deployments.regions_cache_failed ELSE $9 END,
+		last_publish_at = $10,
+		last_publish_attempt_id = $11`
 	// pq.StringArray must be non-nil for the NOT NULL DEFAULT '{}'
 	// columns to take a value rather than a SQL NULL. domain.StringArrayFrom
 	// converts nil → empty pq.StringArray. Same for the *time.Time and
@@ -72,9 +101,10 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	regionsPublished := domain.StringArrayFrom(ad.RegionsPublished)
 	regionsFailed := domain.StringArrayFrom(ad.RegionsFailed)
 	regionsCached := domain.StringArrayFrom(ad.RegionsCached)
+	regionsCacheFailed := domain.StringArrayFrom(ad.RegionsCacheFailed)
 	_, err := r.db.ExecContext(ctx, query,
 		ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled,
-		regionsPublished, regionsFailed, regionsCached, ad.LastPublishAt, ad.LastPublishAttemptID,
+		regionsPublished, regionsFailed, regionsCached, regionsCacheFailed, ad.LastPublishAt, ad.LastPublishAttemptID,
 	)
 	return err
 }
@@ -230,7 +260,7 @@ var (
 
 func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -243,7 +273,7 @@ func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName 
 // deployment_id ↔ last_good_deployment_id atomically. Pair with WithTx.
 func (r *ActiveDeploymentRepository) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -258,7 +288,7 @@ func (r *ActiveDeploymentRepository) Delete(ctx context.Context, tenantID, appNa
 
 func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
 	var ads []domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1`
 	err := r.db.SelectContext(ctx, &ads, query, tenantID)
 	return ads, err
 }
@@ -306,7 +336,7 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 	query := `
 		SELECT ad.tenant_id, ad.app_name, ad.deployment_id, ad.last_good_deployment_id,
 		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
-		       ad.regions_failed, ad.last_publish_at, ad.last_publish_attempt_id,
+		       ad.regions_failed, ad.regions_cached, ad.last_publish_at, ad.last_publish_attempt_id,
 		       d.hash, d.regions
 		FROM active_deployments ad
 		LEFT JOIN deployments d ON d.id = ad.deployment_id
@@ -355,44 +385,63 @@ func (r *ActiveDeploymentRepository) AppendRegionsPublished(ctx context.Context,
 	return err
 }
 
-// AppendRegionsCached atomically merges `regions` into the
-// `regions_cached` array on the (tenant, app) active row (issue #332,
-// Layer 3). Called by publishSwap after the per-region cache-push
-// loop completes, inside the same repository.Transaction block as
-// AppendRegionsPublished / AppendRegionsFailed — so all three appends
-// are atomic: if any one fails, the tx rolls back the others.
+// AppendRegionsCacheState (issue #332, PR 2 follow-up) atomically
+// merges `succeeded` into the `regions_cached` array AND `failed` into
+// the `regions_cache_failed` array on the (tenant, app) active row,
+// in a single UPDATE statement. Called by publishSwap after the
+// per-region cache-push loop completes, inside the same
+// repository.Transaction block as AppendRegionsPublished /
+// AppendRegionsFailed — so all three appends are atomic: if any one
+// fails, the tx rolls back the others.
 //
-// Deliberately does NOT add a corresponding `regions_cache_failed`
-// column or clear it on retry — a cache push that fails on this
-// activation will be retried on the next activation (because Set
-// wipes RegionsCached to '{}' in the DO UPDATE clause on
-// re-activation). That keeps the column count low and matches the
-// idempotent semantics of a regional cache: it's OK if the artifact
-// is overwritten by a re-push, since the content is identical.
+// The two-column single-UPDATE shape is required for atomicity: a
+// two-UPDATE version would let a reader observe the success
+// (regions_cached) without the matching failure
+// (regions_cache_failed), and vice versa. Combining the dedup
+// logic into one statement keeps the array math server-side and
+// avoids a row-level read-modify-write cycle in the application.
+//
+// `succeeded` carries the regions where the cache push returned
+// 2xx. `failed` carries the regions where the cache push errored
+// (timeout, non-2xx, transport). The two slices are disjoint
+// per-call (publishSwap's cache loop partitions into one or the
+// other) — the SQL does NOT enforce that, so a caller that
+// accidentally passes the same region in both would end up with
+// it in BOTH arrays. publishSwap is the only caller today and it
+// never does that; if a future caller is added, the partitioning
+// invariant must be documented there.
 //
 // `ts` is intentionally NOT stamped onto the row. A
 // `last_cache_pushed_at` audit column would be noise here — cache
 // pushes are best-effort, not a financial metric, and overloading
 // the existing `last_publish_at` would conflate two semantics. If
 // operators want per-region cache freshness they can `ls
-// <cache_base_path>/<tenant>/<app>/<id>.wasm` directly.
+// <cache_base_path>/<tenant>/<app>/<id>.wasm` directly. The
+// parameter is kept for signature symmetry with
+// AppendRegionsPublished / AppendRegionsFailed (which DO stamp
+// last_publish_at) and reserved for a future audit column.
 //
 // Re-adding the same region is a no-op for the array contents
 // (UNNEST + array_agg + DISTINCT collapses dupes) but DOES re-run
 // the UPDATE row-locks. Acceptable: this is rare (only retries
 // with overlapping regions) and the lock contention is bounded by
 // the activation window.
-func (r *ActiveDeploymentRepository) AppendRegionsCached(ctx context.Context, tenantID, appName string, regions []string, ts time.Time) error {
+func (r *ActiveDeploymentRepository) AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error {
 	query := `
 		UPDATE active_deployments
 		SET regions_cached = (
 			SELECT COALESCE(array_agg(DISTINCT r), '{}')
 			FROM unnest(regions_cached || $3::text[]) AS r
+		),
+		regions_cache_failed = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_cache_failed || $4::text[]) AS r
 		)
 		WHERE tenant_id = $1 AND app_name = $2
 	`
-	regionsArr := domain.StringArrayFrom(regions)
-	_, err := r.db.ExecContext(ctx, query, tenantID, appName, regionsArr)
+	succeededArr := domain.StringArrayFrom(succeeded)
+	failedArr := domain.StringArrayFrom(failed)
+	_, err := r.db.ExecContext(ctx, query, tenantID, appName, succeededArr, failedArr)
 	return err
 }
 

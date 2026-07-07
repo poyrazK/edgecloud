@@ -313,22 +313,35 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 // callers don't need to repeat the sentinel check.
 //
 // Issue #332: the envelope additionally surfaces the per-region
-// artifact-cache push outcome (`regions_cached`, `regions_cache_failed`)
-// so operators can distinguish "NATS publish failed" from "cache
-// push failed" from the same 502 body. Pre-#332 clients parsing
-// `regions_published` / `regions_failed` see no change.
+// artifact-cache push outcome (`regions_cached_succeeded`,
+// `regions_cached_skipped`, `regions_cache_failed`) so operators
+// can distinguish "NATS publish failed" from "cache push failed"
+// from the same 502 body. Pre-#332 clients parsing
+// `regions_published` / `regions_failed` see no change. The
+// `regions_cached` key is preserved as the union of
+// `regions_cached_succeeded` + `regions_cached_skipped` for
+// backward-compat with PR-2 clients that read it.
 func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
 	details := map[string]any{
-		"regions_published":    []string{},
-		"regions_failed":       []string{},
-		"regions_cached":       []string{},
-		"regions_cache_failed": []string{},
+		"regions_published":        []string{},
+		"regions_failed":           []string{},
+		"regions_cached_succeeded": []string{},
+		"regions_cached_skipped":   []string{},
+		"regions_cached":           []string{},
+		"regions_cache_failed":     []string{},
 	}
 	var pubErr *service.PublishError
 	if errors.As(err, &pubErr) {
 		details["regions_published"] = pubErr.Published
 		details["regions_failed"] = pubErr.Failed
-		details["regions_cached"] = pubErr.Cached
+		details["regions_cached_succeeded"] = pubErr.CachedSucceeded
+		details["regions_cached_skipped"] = pubErr.CachedSkipped
+		// Backward-compat: union the two Cached slices into the
+		// pre-PR-2-follow-up `regions_cached` key.
+		merged := make([]string, 0, len(pubErr.CachedSucceeded)+len(pubErr.CachedSkipped))
+		merged = append(merged, pubErr.CachedSucceeded...)
+		merged = append(merged, pubErr.CachedSkipped...)
+		details["regions_cached"] = merged
 		details["regions_cache_failed"] = pubErr.CacheFailed
 	}
 	httperror.BadGatewayCtx(w, r, staticMessage, details)

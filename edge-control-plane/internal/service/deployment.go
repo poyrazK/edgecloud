@@ -170,14 +170,23 @@ var (
 type PublishError struct {
 	Published []string
 	Failed    []string
-	// Cached and CacheFailed (issue #332) carry the per-region
-	// outcome of the optional per-region artifact-cache push that
-	// runs before the NATS TaskMessage publish. Always populated
-	// (as empty slices, not nil, when the cache feature is
-	// disabled) so the 502 envelope handler doesn't have to nil-check.
-	Cached      []string
-	CacheFailed []string
-	Err         error
+	// CachedSucceeded, CachedSkipped, and CacheFailed (issue #332,
+	// PR 2 follow-up) carry the per-region outcome of the optional
+	// per-region artifact-cache push that runs before the NATS
+	// TaskMessage publish. The two Cached* slices are disjoint:
+	// CachedSucceeded is the regions where the push returned 2xx;
+	// CachedSkipped is the regions where the row's RegionsCached
+	// already contained the region (no push attempted); CacheFailed
+	// is the regions where the push errored. Always populated (as
+	// empty slices, not nil, when the cache feature is disabled) so
+	// the 502 envelope handler doesn't have to nil-check.
+	//
+	// Pre-PR-2 callers that read the Cached field should migrate to
+	// CachedSucceeded (the union of the two is the same data).
+	CachedSucceeded []string
+	CachedSkipped   []string
+	CacheFailed     []string
+	Err             error
 }
 
 // Error renders the publish error in a stable human-readable form.
@@ -191,8 +200,9 @@ func (e *PublishError) Error() string {
 	}
 	msg := fmt.Sprintf("%s (published=%v, failed=%v)",
 		e.Err.Error(), e.Published, e.Failed)
-	if len(e.Cached) > 0 || len(e.CacheFailed) > 0 {
-		msg += fmt.Sprintf(" (cached=%v, cache_failed=%v)", e.Cached, e.CacheFailed)
+	if len(e.CachedSucceeded) > 0 || len(e.CachedSkipped) > 0 || len(e.CacheFailed) > 0 {
+		msg += fmt.Sprintf(" (cached_succeeded=%v, cached_skipped=%v, cache_failed=%v)",
+			e.CachedSucceeded, e.CachedSkipped, e.CacheFailed)
 	}
 	return msg
 }
@@ -825,38 +835,49 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	// Per-region artifact-cache push (issue #332, Layer 3). Runs
 	// BEFORE the NATS publish so the worker has the artifact in
 	// the local cache by the time it receives the TaskMessage.
-	// Best-effort: a push failure does NOT add the region to
-	// `failed` (the NATS publish still happens; the worker will
-	// pull from the CP). The region is recorded separately in
-	// `cacheFailed` for the 502 envelope, and `cached` records
-	// successes.
+	//
+	// Cache push failures are best-effort: a push failure does NOT
+	// add the region to `failed` (the NATS publish still happens
+	// and the worker falls back to pulling the artifact from the
+	// control plane's /api/internal/download/). The failure is
+	// recorded separately in `cacheFailed` and persisted via
+	// AppendRegionsCacheState so an operator can see which regions
+	// are currently failing in the row's regions_cache_failed
+	// column — but the activation return value is NOT shaped by
+	// cache failures. The 502 envelope is reserved for NATS publish
+	// failures (worker was never notified).
 	//
 	// Skip conditions (region in `toPublish` is NOT pushed when):
 	//   - s.cachePusher is nil (cache feature disabled at runtime)
 	//   - s.regionArtifactCaches[region] is unset or empty
-	//   - region is in `alreadyCached` (PR 2): Set wipes
-	//     RegionsCached to '{}' on re-activation, so this branch
-	//     only fires on retries within a single activation cycle
-	//     (or after a fresh activation where the cache survives
-	//     across activations — the re-push is skipped).
+	//   - region is in `alreadyCached`: a Set with the same
+	//     deployment_id preserves RegionsCached via the CASE WHEN
+	//     in the DO UPDATE clause (PR 2 follow-up), so this branch
+	//     fires on a re-activation of the same deployment where the
+	//     cache is still warm from a prior activation. The cache
+	//     bytes are identical, so a redundant push is wasted work.
 	//
 	// The third condition means cache push is best-effort +
 	// idempotent: a successful push on activation A leaves
-	// RegionsCached populated; activation B sees the region in
-	// alreadyCached and skips — no network traffic for regions
-	// whose cache already has the bytes. If the cache between
-	// activations is wiped, the next activation re-pushes (because
-	// Set wipes RegionsCached to '{}' before the cache loop
-	// runs).
-	var cached []string
+	// RegionsCached populated; activation B (same id) sees the
+	// region in alreadyCached and skips — no network traffic for
+	// regions whose cache already has the bytes. If the cache
+	// between activations is wiped, the next activation re-pushes
+	// (because the cache pusher's Push call returns an error and
+	// the region ends up in cacheFailed, NOT cachedSucceeded, so
+	// the row's RegionsCached is NOT updated for that region).
+	var cachedSucceeded []string
+	var cachedSkipped []string
 	var cacheFailed []string
 	if s.cachePusher != nil && len(s.regionArtifactCaches) > 0 {
 		for _, region := range toPublish {
 			if _, ok := alreadyCached[region]; ok {
 				// Already cached from a prior activation. Record as
-				// skipped so the 502 envelope can list it; don't
-				// attempt a redundant push.
-				cached = append(cached, region)
+				// skipped so the row reflects "no push was needed";
+				// don't attempt a redundant push. Persisted via
+				// AppendRegionsCacheState alongside the success
+				// slice below.
+				cachedSkipped = append(cachedSkipped, region)
 				continue
 			}
 			cacheURL, ok := s.regionArtifactCaches[region]
@@ -870,7 +891,7 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 				cacheFailed = append(cacheFailed, region)
 				continue
 			}
-			cached = append(cached, region)
+			cachedSucceeded = append(cachedSucceeded, region)
 		}
 	}
 
@@ -891,15 +912,17 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	// 502 envelope than a misleading 500 caused by an audit-log
 	// write failing.
 	//
-	// All three appends (regions_published, regions_failed,
-	// regions_cached) share one tx so the row's per-region state
-	// stays consistent even if the process crashes mid-write. Within
-	// the closure, returning the first error aborts the tx and
-	// Rollback discards every append — the desired atomicity. PR 2
-	// (issue #332) added `regions_cached` to this same tx so the
-	// cache-history counter can't diverge from the publish state on
-	// partial failure.
-	if len(published) > 0 || len(failed) > 0 || len(cached) > 0 {
+	// All four appends (regions_published, regions_failed,
+	// regions_cached, regions_cache_failed) share one tx so the
+	// row's per-region state stays consistent even if the process
+	// crashes mid-write. Within the closure, returning the first
+	// error aborts the tx and Rollback discards every append — the
+	// desired atomicity. PR 2 (issue #332) added `regions_cached`
+	// to this same tx; PR 2 follow-up replaced it with the
+	// `AppendRegionsCacheState` helper that updates both
+	// regions_cached (succeeded+skipped) and regions_cache_failed
+	// in a single statement.
+	if len(published) > 0 || len(failed) > 0 || len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
 		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 			txRepo := s.activeRepo.WithTx(tx)
 			if len(published) > 0 {
@@ -912,18 +935,21 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 					return fmt.Errorf("append regions_failed: %w", err)
 				}
 			}
-			// AppendRegionsCached is invoked whenever the cache loop
-			// ran and either succeeded OR skipped (alreadyCached).
-			// In the skip case the region is still in `cached`
-			// (logged above) so the next activation sees it
-			// there. In the success case it's a real merge into
-			// the existing set. `cached` is non-empty only when the
-			// pusher ran; in the no-op case (cache disabled or no
-			// region has a cache URL) we skip the tx entirely via
-			// the outer guard.
-			if len(cached) > 0 {
-				if err := txRepo.AppendRegionsCached(ctx, tenantID, appName, cached, now); err != nil {
-					return fmt.Errorf("append regions_cached: %w", err)
+			// AppendRegionsCacheState is invoked whenever the
+			// cache loop ran. `succeeded` is the deduped union of
+			// cachedSucceeded (real push returned 2xx) and
+			// cachedSkipped (already cached from a prior
+			// activation, no push attempted) — both go into
+			// regions_cached so the next activation's alreadyCached
+			// check fires. `failed` goes into regions_cache_failed.
+			// In the no-op case (cache disabled or no region has a
+			// cache URL) we skip the tx entirely via the outer
+			// guard.
+			if len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
+				mergedSucceeded := append([]string{}, cachedSucceeded...)
+				mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
+				if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
+					return fmt.Errorf("append regions_cache_state: %w", err)
 				}
 			}
 			return nil
@@ -932,31 +958,21 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 		}
 	}
 
-	// A cache push failure is reported alongside the NATS publish
-	// result, not as a fatal activation failure (the NATS publish
-	// still went out, the worker will pull from the CP). The 502
-	// envelope exposes both to the operator.
+	// Only NATS publish failures trigger the 502 envelope. Cache
+	// push failures are best-effort — see the comment above the
+	// cache loop — and are persisted in the row's
+	// regions_cache_failed column for operator visibility. The
+	// worker still receives the TaskMessage for those regions
+	// (the NATS publish succeeded) and will fall back to the
+	// control plane's download endpoint.
 	if len(failed) > 0 {
 		return &PublishError{
-			Published:   published,
-			Failed:      failed,
-			Cached:      cached,
-			CacheFailed: cacheFailed,
-			Err:         ErrPublishFailed,
-		}
-	}
-	// All regions published successfully via NATS, but some
-	// cache pushes failed. Surface a *PublishError so the handler
-	// 502 path lights up the cache fields; the wrapped sentinel
-	// is still ErrPublishFailed so the existing `errors.Is` check
-	// in the handler keeps matching.
-	if len(cacheFailed) > 0 {
-		return &PublishError{
-			Published:   published,
-			Failed:      failed,
-			Cached:      cached,
-			CacheFailed: cacheFailed,
-			Err:         ErrPublishFailed,
+			Published:       published,
+			Failed:          failed,
+			CachedSucceeded: cachedSucceeded,
+			CachedSkipped:   cachedSkipped,
+			CacheFailed:     cacheFailed,
+			Err:             ErrPublishFailed,
 		}
 	}
 	return nil

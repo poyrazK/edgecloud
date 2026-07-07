@@ -161,6 +161,7 @@ var wantColumns = map[string][]string{
 		"stable_since",            // 009_add_auto_rollback
 		"regions_published",       // 010_active_deployments_regions
 		"regions_failed",          // 010_active_deployments_regions
+		"regions_cached",          // 017_active_deployments_regions_cached
 		"last_publish_at",         // 010_active_deployments_regions
 		"last_publish_attempt_id", // 010_active_deployments_regions
 	},

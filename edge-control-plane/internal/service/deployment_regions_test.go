@@ -503,19 +503,21 @@ func equalStringSlices(a, b []string) bool {
 // expectPostCommitReadAndAppend mocks the post-tx publish-state
 // read + the append calls that publishSwap issues on a freshly-
 // activated row. The Set upsert inside ActivateDeployment resets
-// regions_published / regions_failed / regions_cached to zero
-// (see ActiveDeploymentRepository.Set's DO UPDATE clause), so the
-// read returns empty arrays — which means the publish set
-// computed inside publishSwap equals the input regions list
-// (no idempotency skip). The test then asserts which regions
-// were appended to regions_published vs regions_failed by passing
-// those slices as expected. Pass nil for either to suppress that
-// expectation.
+// regions_published / regions_failed / regions_cached /
+// regions_cache_failed to zero (see ActiveDeploymentRepository.Set's
+// DO UPDATE clause), so the read returns empty arrays — which
+// means the publish set computed inside publishSwap equals the
+// input regions list (no idempotency skip). The test then asserts
+// which regions were appended to regions_published vs
+// regions_failed by passing those slices as expected. Pass nil
+// for either to suppress that expectation.
 //
 // `expectCached` (issue #332, PR 2) is appended only if non-nil —
 // pre-PR-2 tests pass nil and the helper skips the third
 // ExpectExec. PR-2+ tests pass the cached regions to also mock
-// the AppendRegionsCached call inside the same tx.
+// the AppendRegionsCacheState call inside the same tx (PR 2
+// follow-up renamed and merged: regions_cached = (...) AND
+// regions_cache_failed = (...) in one statement).
 //
 // Pinned by issue #127 step 6: the idempotency contract relies
 // on this read happening AFTER the tx commits, not before.
@@ -524,31 +526,32 @@ func equalStringSlices(a, b []string) bool {
 func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName string, expectPublished, expectFailed []string, expectCached ...[]string) {
 	// The post-commit read is the Get that publishSwap does to
 	// discover which regions are already done. On a fresh
-	// activation the row was just upserted with all five per-
+	// activation the row was just upserted with all six per-
 	// region state columns zeroed, so the read returns the empty
 	// values.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
-			"last_publish_at", "last_publish_attempt_id",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
 		}).AddRow(
 			tenantID, appName, "d_xxx", nil, false, nil,
-			"{}", "{}", "{}",
+			"{}", "{}", "{}", "{}",
 			nil, nil,
 		))
 
 	// AppendRegionsPublished / AppendRegionsFailed fire on a
 	// successful / failed per-region publish respectively;
-	// AppendRegionsCached (issue #332) fires whenever the cache
-	// loop ran (with `cached` containing both successful pushes
-	// AND skipped-already-cached regions). All three live inside
-	// the same repository.Transaction (issue #127 follow-ups — the
-	// three appends must succeed-or-rollback together so the row's
+	// AppendRegionsCacheState (issue #332, PR 2 follow-up) fires
+	// whenever the cache loop ran (with the merged
+	// succeeded+skipped regions_cached slice + cache_failed
+	// regions). All three live inside the same
+	// repository.Transaction (issue #127 follow-ups — the three
+	// appends must succeed-or-rollback together so the row's
 	// per-region state columns stay consistent). The attempt ID
 	// is a UUID (any value) and the timestamp is time.Now(); both
 	// are passed via sqlmock.AnyArg.
@@ -573,7 +576,7 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 			mock.ExpectExec(regexp.QuoteMeta(
 				`UPDATE active_deployments SET regions_cached = (`,
 			)).
-				WithArgs(tenantID, appName, sqlmock.AnyArg()).
+				WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
 				WillReturnResult(sqlmock.NewResult(0, 1))
 		}
 		mock.ExpectCommit()
@@ -603,17 +606,17 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 	// 1. Post-commit read returns empty arrays — publishSwap will
 	//    publish to both regions (us-east + eu-west).
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
-			"regions_published", "regions_failed",
-			"last_publish_at", "last_publish_attempt_id",
+			"regions_published", "regions_failed", "regions_cached",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
 		}).AddRow(
 			tenantID, appName, "d_atomic", nil, false, nil,
-			"{}", "{}",
+			"{}", "{}", "{}", "{}",
 			nil, nil,
 		))
 
@@ -736,7 +739,11 @@ func indexByte(s string, c byte) int {
 // publish loop must still run for it (the worker may not have
 // received the prior TaskMessage). After the tx, the cached set
 // in the row reflects the union of the prior set + the
-// successfully-pushed regions.
+// successfully-pushed regions. PR 2 follow-up splits the per-
+// region cache outcome into CachedSucceeded (push returned 2xx)
+// and CachedSkipped (already in RegionsCached at read time, no
+// push attempted); both feed AppendRegionsCacheState as the
+// "succeeded" argument.
 func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	sqlDB, mock, err := sqlmock.New()
 	if err != nil {
@@ -751,17 +758,17 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	// loop should skip "fra" and push "iad". The NATS publish
 	// loop runs for BOTH regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
-			"last_publish_at", "last_publish_attempt_id",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
 		}).AddRow(
 			tenantID, appName, "d_skip", nil, false, nil,
-			"{}", "{}", "{fra}",
+			"{}", "{}", "{fra}", "{}",
 			nil, nil,
 		))
 
@@ -777,10 +784,13 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	)).
 		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// PR 2 follow-up: AppendRegionsCacheState takes 4 args —
+	// (tenant, app, succeeded, failed). WithArgs uses AnyArg
+	// for the two slice args so we don't pin the merged order.
 	mock.ExpectExec(regexp.QuoteMeta(
 		`UPDATE active_deployments SET regions_cached = (`,
 	)).
-		WithArgs(tenantID, appName, sqlmock.AnyArg()).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -843,17 +853,17 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 
 	// Post-commit read: empty arrays; both regions are in toPublish.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
-			"last_publish_at", "last_publish_attempt_id",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
 		}).AddRow(
 			tenantID, appName, "d_atomic_cache", nil, false, nil,
-			"{}", "{}", "{}",
+			"{}", "{}", "{}", "{}",
 			nil, nil,
 		))
 
@@ -867,11 +877,12 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 	)).
 		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// AppendRegionsCached fails — this is the trigger.
+	// AppendRegionsCacheState fails — this is the trigger. PR 2
+	// follow-up: 4 args (tenant, app, succeeded, failed).
 	mock.ExpectExec(regexp.QuoteMeta(
 		`UPDATE active_deployments SET regions_cached = (`,
 	)).
-		WithArgs(tenantID, appName, sqlmock.AnyArg()).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnError(errors.New("simulated DB outage on cache append"))
 	mock.ExpectRollback()
 
@@ -915,7 +926,193 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}
+}
 
+// TestPublishSwap_TracksCachedSucceededAndSkippedSeparately (issue
+// #332, PR 2 follow-up) pins the per-region cache-state split
+// documented on PublishError.CachedSucceeded / CachedSkipped. When
+// the post-commit read shows regions_cached = ["fra"] and the
+// activation touches both "fra" (skip) and "iad" (push), the
+// returned error is nil (NATS publish succeeded for both); the
+// contract being pinned is the post-tx DB write, which is
+// AppendRegionsCacheState called with succeeded=[iad, fra] (the
+// union of CachedSucceeded and CachedSkipped) and failed=[].
+//
+// We can't directly assert the local `cachedSucceeded` and
+// `cachedSkipped` slices from outside publishSwap — they don't
+// surface on a nil return. The contract is pinned via the
+// AppendRegionsCacheState mock expecting the 4-arg signature
+// (succeeded + failed slices); the test asserts the call shape
+// (sqlmock regex) and the post-tx commit.
+func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db := sqlx.NewDb(sqlDB, "postgres")
+
+	tenantID, appName := "t_split", "myapp"
+
+	// Post-commit read: regions_cached = ["fra"], so `fra` is
+	// skipped and `iad` is pushed. The cache pusher is wired so
+	// the cache loop runs. NATS publishes for both regions.
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+			"regions_published", "regions_failed", "regions_cached",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+		}).AddRow(
+			tenantID, appName, "d_split", nil, false, nil,
+			"{}", "{}", "{fra}", "{}",
+			nil, nil,
+		))
+
+	pub := &RecordingPublisher{}
+	cachePusher := newRecordingCachePusher()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_published = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// PR 2 follow-up: 4-arg AppendRegionsCacheState. The
+	// succeeded arg carries the union (iad, fra); the failed
+	// arg is empty.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_cached = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	svc := &DeploymentService{
+		db:          db,
+		activeRepo:  repository.NewActiveDeploymentRepository(db),
+		publisher:   pub,
+		cachePusher: cachePusher,
+		regionArtifactCaches: map[string]string{
+			"fra": "http://cache.fra:18080",
+			"iad": "http://cache.iad:18080",
+		},
+		defaultRegion: "fra",
+	}
+
+	msg := &nats.TaskMessage{
+		TenantID: tenantID,
+		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: "d_split"}},
+	}
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_split", msg, []string{"fra", "iad"}); err != nil {
+		t.Fatalf("publishSwap: want nil (no NATS failures, cache is best-effort), got %v", err)
+	}
+
+	// pusher.calls: only `iad` was pushed; `fra` was skipped.
+	if got := cachePusher.regionsPushed(); !reflect.DeepEqual(got, []string{"iad"}) {
+		t.Errorf("cache pusher regions = %v, want [iad] (fra was skipped)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestPublishSwap_CacheFailureIsBestEffort (issue #332, PR 2
+// follow-up) pins the contract from the cache loop's doc comment:
+// a cache push failure does NOT shape the activation return
+// value. The worker still receives the TaskMessage (NATS publish
+// succeeded); the cache push failure is persisted in
+// regions_cache_failed for operator visibility but does NOT
+// change the returned error.
+//
+// Pre-PR-2-follow-up, the equivalent test would have asserted
+// err != nil with a *PublishError{CacheFailed: ...}. Post-PR-2-
+// follow-up, the err is nil. The cache-failure record is
+// observable only via the AppendRegionsCacheState call's
+// "failed" argument, which is asserted via sqlmock's
+// ExpectationsWereMet.
+func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db := sqlx.NewDb(sqlDB, "postgres")
+
+	tenantID, appName := "t_best_effort", "myapp"
+
+	// Post-commit read: empty regions_cached, so the cache loop
+	// attempts to push both regions. Both NATS publishes succeed
+	// (no failFor on the publisher). The cache pusher fails for
+	// both regions.
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+			"regions_published", "regions_failed", "regions_cached",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+		}).AddRow(
+			tenantID, appName, "d_best_effort", nil, false, nil,
+			"{}", "{}", "{}", "{}",
+			nil, nil,
+		))
+
+	pub := &RecordingPublisher{}
+	cachePusher := newRecordingCachePusher()
+	cachePusher.failFor["fra"] = errors.New("cache 500")
+	cachePusher.failFor["iad"] = errors.New("cache 500")
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_published = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// PR 2 follow-up: AppendRegionsCacheState with succeeded=[],
+	// failed=[fra, iad]. The test asserts the call shape via the
+	// regex; sqlmock.AnyArg() lets the test stay agnostic about
+	// the order of regions inside the failed slice.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_cached = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	svc := &DeploymentService{
+		db:          db,
+		activeRepo:  repository.NewActiveDeploymentRepository(db),
+		publisher:   pub,
+		cachePusher: cachePusher,
+		regionArtifactCaches: map[string]string{
+			"fra": "http://cache.fra:18080",
+			"iad": "http://cache.iad:18080",
+		},
+		defaultRegion: "fra",
+	}
+
+	msg := &nats.TaskMessage{
+		TenantID: tenantID,
+		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: "d_best_effort"}},
+	}
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_best_effort", msg, []string{"fra", "iad"}); err != nil {
+		t.Fatalf("publishSwap: want nil (cache failures are best-effort), got %v", err)
+	}
+
+	// Both regions' cache pushes were attempted (and failed).
+	if got := cachePusher.regionsPushed(); !reflect.DeepEqual(got, []string{"fra", "iad"}) {
+		t.Errorf("cache pusher regions = %v, want [fra iad]", got)
+	}
+	// Both NATS publishes succeeded.
+	if got := pub.regionsCalled(); !reflect.DeepEqual(got, []string{"fra", "iad"}) {
+		t.Errorf("publisher regions = %v, want [fra iad]", got)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
 	}

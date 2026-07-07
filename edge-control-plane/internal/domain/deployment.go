@@ -125,6 +125,21 @@ type ActiveDeployment struct {
 	// pq.StringArray for the same reason as Deployment.Regions:
 	// lib/pq's Scanner requires it for TEXT[].
 	RegionsCached pq.StringArray `db:"regions_cached"`
+	// RegionsCacheFailed (issue #332, PR 2 follow-up) is the
+	// deduped set of regions whose last cache-push attempt failed.
+	// Persisted so an operator can query the row and see which
+	// regions are currently failing, and so a future retry that
+	// preserves the active row knows which regions to re-push.
+	// Mirrors the asymmetry between regions_published (successes)
+	// and regions_failed (failures) on the NATS publish side.
+	//
+	// The same Set wipe contract applies: wiped to '{}' on
+	// re-activation of a different deployment_id. PR 2 follow-up
+	// makes the wipe conditional on the deployment_id changing so
+	// the cache-skip actually engages on canary+promote cycles.
+	//
+	// pq.StringArray for the same reason as Deployment.Regions.
+	RegionsCacheFailed pq.StringArray `db:"regions_cache_failed"`
 	// LastPublishAt is the wall-clock timestamp of the most recent
 	// (per-region) publish attempt, regardless of outcome. Useful
 	// for the operator escape hatch `SELECT last_publish_at FROM

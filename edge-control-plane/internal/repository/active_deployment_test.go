@@ -255,15 +255,15 @@ func TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood(t *testing.T) {
 	mock.ExpectQuery(`WITH updated AS`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
-			"regions_published", "regions_failed",
-			"last_publish_at", "last_publish_attempt_id",
+			"regions_published", "regions_failed", "regions_cached",
+			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
 		}).AddRow("t_test", "myapp", "d_v2", nil, true, nil,
-			"{}", "{}",
+			"{}", "{}", "{}", "{}",
 			nil, nil,
 		))
 
@@ -335,15 +335,17 @@ func TestAppendRegionsFailed_IssuesExpectedStatement(t *testing.T) {
 	}
 }
 
-// TestAppendRegionsCached_IssuesExpectedStatement (issue #332, PR 2)
-// pins the SQL shape of the new AppendRegionsCached helper. Mirrors
-// the dedup-mechanics pin on the publish helper (above) but for
-// the cache state: `regions_cached = (SELECT COALESCE(array_agg(DISTINCT r), '{}')
-// FROM unnest(regions_cached || $3::text[]) AS r)`. The signature
-// is intentionally one-arg lighter than the publish helper
-// (no attemptID column, no timestamp — see the doc comment on
-// AppendRegionsCached for why).
-func TestAppendRegionsCached_IssuesExpectedStatement(t *testing.T) {
+// TestAppendRegionsCacheState_IssuesExpectedStatement (issue #332,
+// PR 2 follow-up) pins the SQL shape of the new
+// AppendRegionsCacheState helper. Replaces the pre-PR-2-follow-up
+// AppendRegionsCached: a single UPDATE that touches BOTH
+// regions_cached (succeeded) and regions_cache_failed (failed)
+// in one statement, both with the
+// `unnest(<col> || $N::text[])` + `array_agg(DISTINCT r)` dedup
+// pattern. The signature is one-arg lighter than the publish
+// helper (no attemptID column, no timestamp — see the doc comment
+// on AppendRegionsCacheState for why `ts` is reserved-only).
+func TestAppendRegionsCacheState_IssuesExpectedStatement(t *testing.T) {
 	db, mock, cleanup := newActiveDeploymentMockDB(t)
 	defer cleanup()
 	repo := NewActiveDeploymentRepository(db)
@@ -351,36 +353,40 @@ func TestAppendRegionsCached_IssuesExpectedStatement(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(
 		`UPDATE active_deployments SET regions_cached = (`,
 	)).
-		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := repo.AppendRegionsCached(context.Background(), "t_test", "myapp",
-		[]string{"us-east", "eu-west"}, time.Now()); err != nil {
-		t.Fatalf("AppendRegionsCached: %v", err)
+	if err := repo.AppendRegionsCacheState(context.Background(), "t_test", "myapp",
+		[]string{"us-east", "eu-west"}, []string{}, time.Now()); err != nil {
+		t.Fatalf("AppendRegionsCacheState: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 
-// TestAppendRegionsCached_DedupesRegions is a table-driven check
-// that the SQL pattern removes dupes. WithArgs(sqlmock.AnyArg())
-// lets us pass `[]string{"fra", "fra", "iad"}` through and assert
+// TestAppendRegionsCacheState_DedupesRegions is a table-driven
+// check that the SQL pattern removes dupes from BOTH the
+// succeeded and the failed slice. WithArgs(sqlmock.AnyArg()) lets
+// us pass `[]string{"fra", "fra", "iad"}` through and assert
 // sqlmock is satisfied — but the actual dedup is enforced
-// server-side by `unnest() || $3::text[]` + DISTINCT. This test
+// server-side by `unnest() || $N::text[]` + DISTINCT. This test
 // is a contract pin for the SQL params + a regression guard for
 // future refactors that change the arg order or drop DISTINCT
 // (sqlmock would catch that immediately by failing the WithArgs
 // match).
-func TestAppendRegionsCached_DedupesRegions(t *testing.T) {
-	tests := [][]string{
-		{"fra"},
-		{"fra", "iad"},
-		{"fra", "fra", "iad"},
-		{"fra", "iad", "fra", "iad"},
+func TestAppendRegionsCacheState_DedupesRegions(t *testing.T) {
+	tests := []struct {
+		succeeded []string
+		failed    []string
+	}{
+		{[]string{"fra"}, nil},
+		{[]string{"fra", "iad"}, []string{}},
+		{[]string{"fra", "fra", "iad"}, []string{"iad", "iad"}},
+		{[]string{"fra", "iad", "fra", "iad"}, []string{"fra"}},
 	}
-	for _, regions := range tests {
-		t.Run(strings.Join(regions, ","), func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(strings.Join(tc.succeeded, ",")+"|"+strings.Join(tc.failed, ","), func(t *testing.T) {
 			db, mock, cleanup := newActiveDeploymentMockDB(t)
 			defer cleanup()
 			repo := NewActiveDeploymentRepository(db)
@@ -388,12 +394,12 @@ func TestAppendRegionsCached_DedupesRegions(t *testing.T) {
 			mock.ExpectExec(regexp.QuoteMeta(
 				`UPDATE active_deployments SET regions_cached = (`,
 			)).
-				WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+				WithArgs("t_test", "myapp", sqlmock.AnyArg(), sqlmock.AnyArg()).
 				WillReturnResult(sqlmock.NewResult(0, 1))
 
-			if err := repo.AppendRegionsCached(context.Background(), "t_test", "myapp",
-				regions, time.Now()); err != nil {
-				t.Fatalf("AppendRegionsCached: %v", err)
+			if err := repo.AppendRegionsCacheState(context.Background(), "t_test", "myapp",
+				tc.succeeded, tc.failed, time.Now()); err != nil {
+				t.Fatalf("AppendRegionsCacheState: %v", err)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Errorf("sqlmock expectations not met: %v", err)
@@ -435,6 +441,94 @@ func TestSet_ResetsPublishStateOnReactivation(t *testing.T) {
 		// re-activation contract holds.
 	})
 	if err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestSet_PreservesRegionsCachedOnSameDeploymentId (issue #332, PR 2
+// follow-up) pins the conditional-wipe contract: when Set is called
+// with the same deployment_id the row already has, the DO UPDATE
+// branch must preserve regions_cached (and regions_cache_failed)
+// via the CASE WHEN active_deployments.deployment_id = $3 THEN
+// active_deployments.regions_cached ELSE $8 END shape — NOT
+// overwrite them with the caller-supplied $8.
+//
+// The cache-skip-on-activation logic in publishSwap consults
+// current.RegionsCached to decide whether to push bytes to each
+// region; if Set unconditionally wiped RegionsCached on every
+// upsert, the cache-skip branch could never fire after a
+// re-activation.
+//
+// We assert the SQL shape directly (the `CASE WHEN` predicate must
+// be present, and the THEN branch must reference the existing
+// column) — sqlmock doesn't execute the statement, so a regression
+// to `regions_cached = $8` would still pass WithArgs but fail
+// this regex.
+func TestSet_PreservesRegionsCachedOnSameDeploymentId(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	// Match the full INSERT statement by regex. The CASE shape
+	// is the contract — the args are not constrained beyond the
+	// (tenant, app) prefix.
+	mock.ExpectExec(`(?s)INSERT INTO active_deployments.*regions_cached = CASE WHEN active_deployments\.deployment_id = \$3 THEN active_deployments\.regions_cached ELSE \$8 END.*regions_cache_failed = CASE WHEN active_deployments\.deployment_id = \$3 THEN active_deployments\.regions_cache_failed ELSE \$9 END`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Set(context.Background(), &domain.ActiveDeployment{
+		TenantID:            "t_test",
+		AppName:             "myapp",
+		DeploymentID:        "d_same",
+		AutoRollbackEnabled: false,
+		// Non-empty cache arrays so a regression that wrote $8
+		// (the caller value) over the row's value would be
+		// visible in the SQL — sqlmock can't compare the
+		// actual row state, but the SQL shape contract holds
+		// regardless of the caller's slice contents.
+		RegionsCached:      pq.StringArray{"fra", "iad"},
+		RegionsCacheFailed: pq.StringArray{"iad"},
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestSet_WipesOnDifferentDeploymentId pins the ELSE branch of the
+// conditional CASE: when Set is called with a DIFFERENT
+// deployment_id, the new value $8 / $9 MUST overwrite the row's
+// prior value (the fresh-publish-cycle contract from PR 2). The
+// re-activation path on a different deployment starts the cache
+// history over; the prior activation's regions_cached is no longer
+// relevant.
+//
+// We assert the SQL body — the CASE shape is present (i.e. the
+// same-id re-activation would preserve, but a different-id
+// activation would wipe). The contract for "wipe" is the SQL
+// shape itself; the row's prior value cannot be observed from
+// outside Postgres, so the test pins the conditional-wipe shape
+// against a regression that drops the CASE entirely.
+func TestSet_WipesOnDifferentDeploymentId(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	// Match the full INSERT statement. The CASE shape must
+	// still be present — a regression to the unconditional
+	// `regions_cached = $8` form would fail this regex.
+	mock.ExpectExec(`(?s)INSERT INTO active_deployments.*regions_cached = CASE WHEN active_deployments\.deployment_id = \$3 THEN active_deployments\.regions_cached ELSE \$8 END.*regions_cache_failed = CASE WHEN active_deployments\.deployment_id = \$3 THEN active_deployments\.regions_cache_failed ELSE \$9 END`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Set(context.Background(), &domain.ActiveDeployment{
+		TenantID:            "t_test",
+		AppName:             "myapp",
+		DeploymentID:        "d_new", // would-be new id; CASE shape is what we're testing
+		AutoRollbackEnabled: false,
+	}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

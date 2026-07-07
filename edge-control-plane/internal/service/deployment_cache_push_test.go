@@ -11,8 +11,9 @@ import (
 )
 
 // TestPublishError_RendersCacheFields confirms the Error() helper
-// surfaces Cached / CacheFailed when populated, and omits the
-// suffix entirely when unused (pre-#332 wire compatibility).
+// surfaces CachedSucceeded / CachedSkipped / CacheFailed when
+// populated, and omits the suffix entirely when unused (pre-#332
+// wire compatibility).
 func TestPublishError_RendersCacheFields(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -23,13 +24,14 @@ func TestPublishError_RendersCacheFields(t *testing.T) {
 		{
 			name: "all fields set",
 			err: &PublishError{
-				Published:   []string{"fra"},
-				Failed:      []string{"iad"},
-				Cached:      []string{"fra"},
-				CacheFailed: []string{"iad"},
-				Err:         ErrPublishFailed,
+				Published:       []string{"fra"},
+				Failed:          []string{"iad"},
+				CachedSucceeded: []string{"fra"},
+				CachedSkipped:   []string{"fra"},
+				CacheFailed:     []string{"iad"},
+				Err:             ErrPublishFailed,
 			},
-			mustContain: []string{"published=[fra]", "failed=[iad]", "cached=[fra]", "cache_failed=[iad]"},
+			mustContain: []string{"published=[fra]", "failed=[iad]", "cached_succeeded=[fra]", "cached_skipped=[fra]", "cache_failed=[iad]"},
 		},
 		{
 			name: "no cache feature used",
@@ -41,15 +43,16 @@ func TestPublishError_RendersCacheFields(t *testing.T) {
 			mustContain: []string{"published=[fra]", "failed=[iad]"},
 		},
 		{
-			name: "cache pushes failed but NATS publish succeeded",
+			name: "cache pushes failed but NATS publish succeeded (PR 2 follow-up: NOT a PublishError)",
 			err: &PublishError{
-				Published:   []string{"fra", "iad"},
-				Failed:      nil,
-				Cached:      []string{"fra"},
-				CacheFailed: []string{"iad"},
-				Err:         ErrPublishFailed,
+				Published:       []string{"fra", "iad"},
+				Failed:          nil,
+				CachedSucceeded: []string{"fra"},
+				CachedSkipped:   []string{"iad"},
+				CacheFailed:     nil,
+				Err:             ErrPublishFailed,
 			},
-			mustContain: []string{"published=[fra iad]", "cached=[fra]", "cache_failed=[iad]"},
+			mustContain: []string{"published=[fra iad]", "cached_succeeded=[fra]", "cached_skipped=[iad]"},
 		},
 	}
 	for _, tc := range tests {
