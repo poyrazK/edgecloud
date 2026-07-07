@@ -157,9 +157,9 @@ mod heartbeat_integration_tests {
         }
     }
 
-    fn load_handler_fixture(engine: &wasmtime::Engine)
-        -> wasmtime::component::InstancePre<edge_runtime::RuntimeState>
-    {
+    fn load_handler_fixture(
+        engine: &wasmtime::Engine,
+    ) -> wasmtime::component::InstancePre<edge_runtime::RuntimeState> {
         let paths = [
             "tests/fixtures/handler.wasm",
             "edge-worker/tests/fixtures/handler.wasm",
@@ -172,38 +172,41 @@ mod heartbeat_integration_tests {
         let bytes = std::fs::read(&wasm_path).unwrap();
         let component = wasmtime::component::Component::from_binary(engine, &bytes)
             .expect("compile handler component");
-        let linker = edge_runtime::create_component_linker_handler(engine)
-            .expect("create linker");
+        let linker = edge_runtime::create_component_linker_handler(engine).expect("create linker");
         linker.instantiate_pre(&component).expect("instantiate_pre")
     }
 
-    fn build_supervisor(
-        state: Arc<RwLock<WorkerState>>,
-    ) -> Arc<Supervisor> {
+    fn build_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
         let jwt = WorkerJwtSigner::new(
-            String::new(), None, String::new(),
-            "w_test", "fra", "t_test",
+            String::new(),
+            None,
+            String::new(),
+            "w_test",
+            "fra",
+            "t_test",
         );
         let nats = Arc::new(crate::nats::tests::MockNatsClient::new());
         Arc::new(Supervisor {
             config: cp_config(),
             state,
             downloader: Arc::new(Downloader::new(
-                "http://localhost:0".to_string(), std::path::PathBuf::from("/tmp"), jwt.clone(),
+                "http://localhost:0".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                jwt.clone(),
             )),
             port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
             nats: nats as Arc<dyn NatsClient>,
-            log_forwarder: LogForwarder::new(
-                "http://localhost:0", "w_test", "fra", jwt.clone(),
-            ),
+            log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
             jwt_signer: jwt,
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
         })
     }
 
-    fn make_app(instance_pre: wasmtime::component::InstancePre<edge_runtime::RuntimeState>,
-        status: AppInstanceStatus, ws_port: Option<u16>,
+    fn make_app(
+        instance_pre: wasmtime::component::InstancePre<edge_runtime::RuntimeState>,
+        status: AppInstanceStatus,
+        ws_port: Option<u16>,
     ) -> Arc<Mutex<AppInstance>> {
         let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
         meter.record_request();
@@ -245,7 +248,11 @@ mod heartbeat_integration_tests {
         let instance_pre = load_handler_fixture(&engine);
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let app = make_app(instance_pre, AppInstanceStatus::Running, None);
-        state.write().await.apps.insert(("t_test".into(), "my-app".into()), app);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         assert_eq!(hb.apps.len(), 1);
@@ -262,8 +269,16 @@ mod heartbeat_integration_tests {
         let engine = edge_runtime::create_engine().expect("engine");
         let instance_pre = load_handler_fixture(&engine);
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
-        let app = make_app(instance_pre, AppInstanceStatus::Crashed { restart_count: 3 }, None);
-        state.write().await.apps.insert(("t_test".into(), "my-app".into()), app);
+        let app = make_app(
+            instance_pre,
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            None,
+        );
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -277,7 +292,11 @@ mod heartbeat_integration_tests {
         let instance_pre = load_handler_fixture(&engine);
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let app = make_app(instance_pre, AppInstanceStatus::Running, Some(19091));
-        state.write().await.apps.insert(("t_test".into(), "my-app".into()), app);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
