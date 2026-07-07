@@ -302,6 +302,71 @@ mod heartbeat_integration_tests {
         let s = hb.apps.get("my-app").expect("app present");
         assert_eq!(s.ws_port, Some(19091));
     }
+
+    // ── snapshot_current_apps tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_empty_state_returns_empty() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let snap = sup.snapshot_current_apps("t_test").await;
+        assert!(snap.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_filters_by_tenant() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        // Query for a different tenant -> empty
+        let snap = sup.snapshot_current_apps("t_other").await;
+        assert!(snap.is_empty());
+        // Query for the correct tenant -> found
+        let snap = sup.snapshot_current_apps("t_test").await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.get("my-app").unwrap().0, "d1");
+    }
+
+    // ── stop_all_apps / reset_meters_after tests ────────────────────
+
+    #[tokio::test]
+    async fn stop_all_apps_empty_is_noop() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        sup.stop_all_apps().await;
+        assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_meters_after_empty_no_panic() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let hb = HeartbeatMessage::new("w1".into(), "fra".into(), "1.2.3.4:0".into(), "t1".into());
+        sup.reset_meters_after(&hb).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_sync_stamps_watchdog() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let result = sup.fetch_sync().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        let state_guard = sup.state.read().await;
+        let last = state_guard.last_task_received_at.lock().unwrap();
+        assert!(last.is_some());
+    }
 }
 
 // ── extracted pure functions tests ──────────────────────────────────────
