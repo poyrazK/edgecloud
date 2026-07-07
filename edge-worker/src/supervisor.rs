@@ -1698,7 +1698,12 @@ mod tests {
 
         struct NullSink;
         impl edge_runtime::interfaces::observe::LogSink for NullSink {
-            fn push(&self, _record: edge_runtime::interfaces::observe::LogRecord, _ctx: edge_runtime::interfaces::observe::AppLogContext) {}
+            fn push(
+                &self,
+                _record: edge_runtime::interfaces::observe::LogRecord,
+                _ctx: edge_runtime::interfaces::observe::AppLogContext,
+            ) {
+            }
         }
 
         // We compile a dummy component to get a real ProxyPre and InstancePre
@@ -1707,12 +1712,18 @@ mod tests {
             "tests/fixtures/handler.wasm",
             "edge-worker/tests/fixtures/handler.wasm",
         ];
-        let wasm_path = paths.iter().map(std::path::PathBuf::from).find(|p| p.exists()).expect("fixture handler.wasm missing");
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("fixture handler.wasm missing");
         let bytes = std::fs::read(&wasm_path).unwrap();
-        let component = wasmtime::component::Component::from_binary(&engine_for_compile, &bytes).unwrap();
+        let component =
+            wasmtime::component::Component::from_binary(&engine_for_compile, &bytes).unwrap();
         let linker = edge_runtime::create_component_linker_handler(&engine_for_compile).unwrap();
         let instance_pre = linker.instantiate_pre(&component).unwrap();
-        let proxy_pre = wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre.clone()).unwrap();
+        let proxy_pre =
+            wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre.clone()).unwrap();
 
         // Release the engine back to the pool
         pool.release(engine_for_compile);
@@ -1726,12 +1737,17 @@ mod tests {
                 tenant_id: "test-tenant".to_string(),
                 deployment_id: "dep-a".to_string(),
             },
-            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-a".to_string())),
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-a".to_string(),
+            )),
             env: HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
-            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now() - std::time::Duration::from_secs(10)))),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ))),
         };
 
         let config_b = HandlerConfig {
@@ -1743,7 +1759,10 @@ mod tests {
                 tenant_id: "test-tenant".to_string(),
                 deployment_id: "dep-b".to_string(),
             },
-            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-b".to_string())),
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-b".to_string(),
+            )),
             env: HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
@@ -1757,29 +1776,35 @@ mod tests {
             crate::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""),
         ));
 
-        let dispatch_a = Arc::new(HandlerDispatch::new(
-            18001,
-            1000,
-            10,
-            config_a,
-            None,
-            downloader.clone(),
-            "dep-a".to_string(),
-            pool.clone(),
-            state.clone(),
-        ).unwrap());
+        let dispatch_a = Arc::new(
+            HandlerDispatch::new(
+                18001,
+                1000,
+                10,
+                config_a,
+                None,
+                downloader.clone(),
+                "dep-a".to_string(),
+                pool.clone(),
+                state.clone(),
+            )
+            .unwrap(),
+        );
 
-        let dispatch_b = Arc::new(HandlerDispatch::new(
-            18002,
-            1000,
-            10,
-            config_b,
-            None,
-            downloader.clone(),
-            "dep-b".to_string(),
-            pool.clone(),
-            state.clone(),
-        ).unwrap());
+        let dispatch_b = Arc::new(
+            HandlerDispatch::new(
+                18002,
+                1000,
+                10,
+                config_b,
+                None,
+                downloader.clone(),
+                "dep-b".to_string(),
+                pool.clone(),
+                state.clone(),
+            )
+            .unwrap(),
+        );
 
         // Put the proxy_pre into dispatch_a, and make it hold the engine
         dispatch_a.set_proxy_pre(proxy_pre).await;
@@ -1791,7 +1816,10 @@ mod tests {
             tenant_id: "test-tenant".to_string(),
             port: 18001,
             status: AppInstanceStatus::Running,
-            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-a".to_string())),
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-a".to_string(),
+            )),
             shutdown_tx: None,
             shutdown_tx_broadcast: None,
             instance_pre: instance_pre.clone(),
@@ -1809,7 +1837,10 @@ mod tests {
             tenant_id: "test-tenant".to_string(),
             port: 18002,
             status: AppInstanceStatus::Running,
-            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-b".to_string())),
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-b".to_string(),
+            )),
             shutdown_tx: None,
             shutdown_tx_broadcast: None,
             instance_pre: instance_pre.clone(),
@@ -1823,12 +1854,32 @@ mod tests {
 
         {
             let mut guard = state.write().await;
-            guard.apps.insert(("test-tenant".to_string(), "app-a".to_string()), Arc::new(Mutex::new(app_a)));
-            guard.apps.insert(("test-tenant".to_string(), "app-b".to_string()), Arc::new(Mutex::new(app_b)));
+            guard.apps.insert(
+                ("test-tenant".to_string(), "app-a".to_string()),
+                Arc::new(Mutex::new(app_a)),
+            );
+            guard.apps.insert(
+                ("test-tenant".to_string(), "app-b".to_string()),
+                Arc::new(Mutex::new(app_b)),
+            );
         }
 
         // Initially, app_a has an engine in memory.
-        assert!(state.read().await.apps.get(&("test-tenant".to_string(), "app-a".to_string())).unwrap().lock().await.dispatch.as_ref().unwrap().has_engine().await);
+        assert!(
+            state
+                .read()
+                .await
+                .apps
+                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .unwrap()
+                .lock()
+                .await
+                .dispatch
+                .as_ref()
+                .unwrap()
+                .has_engine()
+                .await
+        );
 
         // Let's acquire the engine to empty the pool!
         let _e1 = pool.acquire(&state).await;
@@ -1839,7 +1890,25 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Eviction should have been successful, taking the engine from app_a
-        assert!(elapsed.as_millis() >= 450, "Should timeout waiting, then try eviction");
-        assert!(!state.read().await.apps.get(&("test-tenant".to_string(), "app-a".to_string())).unwrap().lock().await.dispatch.as_ref().unwrap().has_engine().await, "app-a should have been evicted");
+        assert!(
+            elapsed.as_millis() >= 450,
+            "Should timeout waiting, then try eviction"
+        );
+        assert!(
+            !state
+                .read()
+                .await
+                .apps
+                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .unwrap()
+                .lock()
+                .await
+                .dispatch
+                .as_ref()
+                .unwrap()
+                .has_engine()
+                .await,
+            "app-a should have been evicted"
+        );
     }
 }
