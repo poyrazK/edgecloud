@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
         log_forwarder: log_forwarder.clone(),
         jwt_signer: jwt_signer.clone(),
         http,
-        engine_pool: Arc::new(crate::supervisor::StandbyPool::new(10)?),
+        engine_pool: Arc::new(crate::supervisor::StandbyPool::new(config.standby_pool_size)?),
     });
 
     let heartbeat_supervisor = supervisor.clone();

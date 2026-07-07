@@ -101,6 +101,7 @@ fn test_config(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     }
 }
 
@@ -181,6 +182,7 @@ impl TestHarness {
             tls_key_path: None,
             worker_bootstrap_secret: String::new(),
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            standby_pool_size: 10,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -384,6 +386,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -845,6 +848,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -876,6 +880,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1676,6 +1681,7 @@ async fn build_supervisor_only_with_cp(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
 
     let guard = build_supervisor_with(config).await;

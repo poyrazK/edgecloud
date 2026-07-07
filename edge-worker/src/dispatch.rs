@@ -189,6 +189,7 @@ pub struct HandlerDispatch {
     deployment_id: String,
     engine_pool: Arc<crate::supervisor::StandbyPool>,
     proxy_pre: tokio::sync::RwLock<Option<HandlerProxyPre>>,
+    state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
 }
 
 /// Per-app context handed to every FaaS request.
@@ -239,6 +240,7 @@ impl HandlerDispatch {
         downloader: Arc<crate::downloader::Downloader>,
         deployment_id: String,
         engine_pool: Arc<crate::supervisor::StandbyPool>,
+        state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
     ) -> anyhow::Result<Self> {
         // Defend against divide-by-zero: a misconfigured 0 tick would
         // NaN the math. Default to 1 ms.
@@ -254,6 +256,7 @@ impl HandlerDispatch {
             downloader,
             deployment_id,
             engine_pool,
+            state,
         })
     }
 
@@ -520,6 +523,11 @@ impl HandlerDispatch {
         lock.take().map(|proxy_pre| proxy_pre.engine().clone())
     }
 
+    pub async fn has_engine(&self) -> bool {
+        let lock = self.proxy_pre.read().await;
+        lock.is_some()
+    }
+
     /// Dispatch a single HTTP request through `ProxyPre`.
     /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
     /// `lib.rs`. Key differences from that example:
@@ -571,7 +579,7 @@ impl HandlerDispatch {
                 drop(lock);
                 let mut write_lock = self.proxy_pre.write().await;
                 if write_lock.is_none() {
-                    let engine = self.engine_pool.acquire().await;
+                    let engine = self.engine_pool.acquire(&self.state).await;
                     let cwasm_path = self.downloader.cwasm_path(&self.deployment_id);
 
                     let component = if cwasm_path.exists() {

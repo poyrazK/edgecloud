@@ -42,15 +42,68 @@ impl StandbyPool {
         })
     }
 
-    pub async fn acquire(&self) -> wasmtime::Engine {
+    pub async fn acquire(&self, state: &RwLock<WorkerState>) -> wasmtime::Engine {
         let mut rx = self.pool.lock().await;
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(engine)) => engine,
             _ => {
-                tracing::warn!("StandbyPool exhausted; creating transient engine");
-                edge_runtime::create_engine().expect("fallback engine must build")
+                // Try to evict the LRU FaaS app
+                if let Some(engine) = self.evict_lru_app(state).await {
+                    engine
+                } else {
+                    tracing::warn!("StandbyPool exhausted and no idle apps to evict; creating transient engine");
+                    edge_runtime::create_engine().expect("fallback engine must build")
+                }
             }
         }
+    }
+
+    async fn evict_lru_app(&self, state: &RwLock<WorkerState>) -> Option<wasmtime::Engine> {
+        let apps = {
+            let guard = state.read().await;
+            guard.apps.clone()
+        };
+
+        let mut candidate: Option<(std::time::Instant, Arc<Mutex<AppInstance>>)> = None;
+
+        for ((_tenant_id, _app_name), app_mutex) in apps {
+            let app = app_mutex.lock().await;
+            if app.execution_model == ExecutionModel::Handler {
+                if let Some(ref dispatch) = app.dispatch {
+                    if dispatch.has_engine().await {
+                        let last_req_opt = {
+                            let lock = dispatch.config.last_request_at.lock().await;
+                            *lock
+                        };
+                        if let Some(last_req) = last_req_opt {
+                            match candidate {
+                                None => {
+                                    candidate = Some((last_req, app_mutex.clone()));
+                                }
+                                Some((oldest_req, _)) if last_req < oldest_req => {
+                                    candidate = Some((last_req, app_mutex.clone()));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, app_mutex)) = candidate {
+            let app = app_mutex.lock().await;
+            if let Some(ref dispatch) = app.dispatch {
+                if let Some(engine) = dispatch.evict().await {
+                    tracing::info!(
+                        "StandbyPool exhausted: evicting least-recently-used app to reclaim engine"
+                    );
+                    return Some(engine);
+                }
+            }
+        }
+
+        None
     }
 
     pub fn release(&self, engine: wasmtime::Engine) {
@@ -484,6 +537,7 @@ impl Supervisor {
                 self.downloader.clone(),
                 spec.deployment_id.clone(),
                 self.engine_pool.clone(),
+                self.state.clone(),
             )?;
 
             let dispatch = Arc::new(dispatch);
@@ -1593,10 +1647,13 @@ mod tests {
     #[tokio::test]
     async fn test_standby_pool_acquire_and_release() {
         let pool = StandbyPool::new(2).expect("failed to create pool");
+        let engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = RwLock::new(WorkerState::new(engine));
+
         // Acquire 2 engines (should be fast, no 500ms delay)
         let start = std::time::Instant::now();
-        let e1 = pool.acquire().await;
-        let _e2 = pool.acquire().await;
+        let e1 = pool.acquire(&state).await;
+        let _e2 = pool.acquire(&state).await;
         assert!(start.elapsed().as_millis() < 500, "Should not timeout");
 
         // Release 1
@@ -1604,7 +1661,7 @@ mod tests {
 
         // We should be able to acquire again fast
         let start2 = std::time::Instant::now();
-        let _e3 = pool.acquire().await;
+        let _e3 = pool.acquire(&state).await;
         assert!(
             start2.elapsed().as_millis() < 500,
             "Should not timeout after release"
@@ -1614,14 +1671,16 @@ mod tests {
     #[tokio::test]
     async fn test_standby_pool_exhaustion_fallback() {
         let pool = StandbyPool::new(1).expect("failed to create pool");
+        let engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = RwLock::new(WorkerState::new(engine));
 
         // Acquire the only engine in the pool
-        let _e1 = pool.acquire().await;
+        let _e1 = pool.acquire(&state).await;
 
         // The pool is now empty. The next acquire should timeout (500ms) and fallback
         // to a new transient engine without crashing.
         let start = std::time::Instant::now();
-        let _e2 = pool.acquire().await;
+        let _e2 = pool.acquire(&state).await;
         let elapsed = start.elapsed();
 
         // It should have taken at least 500ms for the timeout
@@ -1629,5 +1688,158 @@ mod tests {
             elapsed.as_millis() >= 450,
             "Should have hit the timeout before fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn test_standby_pool_lru_eviction() {
+        let pool = Arc::new(StandbyPool::new(1).expect("failed to create pool"));
+        let base_engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(base_engine.clone())));
+
+        struct NullSink;
+        impl edge_runtime::interfaces::observe::LogSink for NullSink {
+            fn push(&self, _record: edge_runtime::interfaces::observe::LogRecord, _ctx: edge_runtime::interfaces::observe::AppLogContext) {}
+        }
+
+        // We compile a dummy component to get a real ProxyPre and InstancePre
+        let engine_for_compile = pool.acquire(&state).await; // Get pre-warmed engine
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths.iter().map(std::path::PathBuf::from).find(|p| p.exists()).expect("fixture handler.wasm missing");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let component = wasmtime::component::Component::from_binary(&engine_for_compile, &bytes).unwrap();
+        let linker = edge_runtime::create_component_linker_handler(&engine_for_compile).unwrap();
+        let instance_pre = linker.instantiate_pre(&component).unwrap();
+        let proxy_pre = wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre.clone()).unwrap();
+
+        // Release the engine back to the pool
+        pool.release(engine_for_compile);
+
+        let config_a = HandlerConfig {
+            tenant_id: "test-tenant".to_string(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(NullSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "app-a".to_string(),
+                tenant_id: "test-tenant".to_string(),
+                deployment_id: "dep-a".to_string(),
+            },
+            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-a".to_string())),
+            env: HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now() - std::time::Duration::from_secs(10)))),
+        };
+
+        let config_b = HandlerConfig {
+            tenant_id: "test-tenant".to_string(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(NullSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "app-b".to_string(),
+                tenant_id: "test-tenant".to_string(),
+                deployment_id: "dep-b".to_string(),
+            },
+            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-b".to_string())),
+            env: HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
+        };
+
+        let downloader = Arc::new(crate::downloader::Downloader::new(
+            "http://localhost".to_string(),
+            std::path::PathBuf::from("/tmp"),
+            crate::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""),
+        ));
+
+        let dispatch_a = Arc::new(HandlerDispatch::new(
+            18001,
+            1000,
+            10,
+            config_a,
+            None,
+            downloader.clone(),
+            "dep-a".to_string(),
+            pool.clone(),
+            state.clone(),
+        ).unwrap());
+
+        let dispatch_b = Arc::new(HandlerDispatch::new(
+            18002,
+            1000,
+            10,
+            config_b,
+            None,
+            downloader.clone(),
+            "dep-b".to_string(),
+            pool.clone(),
+            state.clone(),
+        ).unwrap());
+
+        // Put the proxy_pre into dispatch_a, and make it hold the engine
+        dispatch_a.set_proxy_pre(proxy_pre).await;
+
+        // Create two FaaS apps: app A and app B.
+        let app_a = AppInstance {
+            deployment_id: "dep-a".to_string(),
+            app_name: "app-a".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            port: 18001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-a".to_string())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: instance_pre.clone(),
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: Some(dispatch_a),
+            metrics_acc: None,
+            ws_port: None,
+        };
+
+        let app_b = AppInstance {
+            deployment_id: "dep-b".to_string(),
+            app_name: "app-b".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            port: 18002,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(edge_runtime::RequestMeter::new("test-tenant".to_string(), "dep-b".to_string())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: instance_pre.clone(),
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: Some(dispatch_b),
+            metrics_acc: None,
+            ws_port: None,
+        };
+
+        {
+            let mut guard = state.write().await;
+            guard.apps.insert(("test-tenant".to_string(), "app-a".to_string()), Arc::new(Mutex::new(app_a)));
+            guard.apps.insert(("test-tenant".to_string(), "app-b".to_string()), Arc::new(Mutex::new(app_b)));
+        }
+
+        // Initially, app_a has an engine in memory.
+        assert!(state.read().await.apps.get(&("test-tenant".to_string(), "app-a".to_string())).unwrap().lock().await.dispatch.as_ref().unwrap().has_engine().await);
+
+        // Let's acquire the engine to empty the pool!
+        let _e1 = pool.acquire(&state).await;
+
+        // Pool is now empty. Acquiring again should trigger LRU eviction on app-a (which has the engine) because app-a's last_request_at is older than app-b's.
+        let start = std::time::Instant::now();
+        let _e2 = pool.acquire(&state).await;
+        let elapsed = start.elapsed();
+
+        // Eviction should have been successful, taking the engine from app_a
+        assert!(elapsed.as_millis() >= 450, "Should timeout waiting, then try eviction");
+        assert!(!state.read().await.apps.get(&("test-tenant".to_string(), "app-a".to_string())).unwrap().lock().await.dispatch.as_ref().unwrap().has_engine().await, "app-a should have been evicted");
     }
 }

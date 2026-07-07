@@ -153,6 +153,9 @@ pub struct Config {
     /// flagged as a perf regression). Mirrors the
     /// `handler_max_request_body_bytes` pattern above.
     pub socket_mode: SocketEgressPolicy,
+    /// Configured size of the warm standby pool of Wasmtime engines.
+    /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
+    pub standby_pool_size: usize,
 }
 
 impl Config {
@@ -258,6 +261,7 @@ impl Config {
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
+            standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
         })
     }
 

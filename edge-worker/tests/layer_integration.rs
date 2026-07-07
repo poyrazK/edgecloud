@@ -191,6 +191,10 @@ impl LayerHarness {
             ))),
         };
 
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            edge_worker::state::WorkerState::new(engine.clone()),
+        ));
+
         let dispatch = Arc::new({
             let d = HandlerDispatch::new(
                 port,
@@ -205,6 +209,7 @@ impl LayerHarness {
                 )),
                 "test-deploy".to_string(),
                 std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()),
+                state,
             )
             .unwrap();
             d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap())
@@ -493,6 +498,10 @@ async fn l7_per_request_timeout_returns_500() {
         ))),
     };
 
+    let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+        edge_worker::state::WorkerState::new(engine.clone()),
+    ));
+
     let dispatch = Arc::new({
         let d = HandlerDispatch::new(
             port,
@@ -507,6 +516,7 @@ async fn l7_per_request_timeout_returns_500() {
             )),
             "test-deploy".to_string(),
             std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()),
+            state,
         )
         .unwrap();
         d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap())
@@ -585,6 +595,10 @@ async fn spawn_handler_with_tls_config(
 
     let port = ephemeral_port().expect("bind ephemeral port");
 
+    let state = std::sync::Arc::new(tokio::sync::RwLock::new(
+        edge_worker::state::WorkerState::new(engine.clone()),
+    ));
+
     let dispatch = Arc::new({
         let d = HandlerDispatch::new(
             port,
@@ -599,6 +613,7 @@ async fn spawn_handler_with_tls_config(
             )),
             "test-deploy".to_string(),
             std::sync::Arc::new(edge_worker::supervisor::StandbyPool::new(0).unwrap()),
+            state,
         )
         .unwrap();
         d.set_proxy_pre(wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre).unwrap())
