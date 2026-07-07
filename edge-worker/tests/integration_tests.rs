@@ -798,12 +798,13 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     );
 }
 
-/// Issue #316: fan-out mode removed queue-group pinning. Every worker
-/// receives every TaskMessage and the supervisor's diff logic handles
-/// duplicates. This test was removed because the behavior it verified
-/// (exactly-once delivery via queue group) is no longer desired — each
-/// worker independently reconciles against its running state.
+// Issue #316: fan-out mode removed queue-group pinning. Every worker
+// receives every TaskMessage and the supervisor's diff logic handles
+// duplicates. This test was removed because the behavior it verified
+// (exactly-once delivery via queue group) is no longer desired — each
+// worker independently reconciles against its running state.
 
+#[allow(dead_code)]
 /// Wait until `app_name` is `Running` in any of `supervisors`. Returns
 /// which supervisor saw it (Some(index)) or None if none did within the
 /// timeout.
@@ -1638,6 +1639,4 @@ async fn test_supervisor_lazy_starting_and_eviction() {
     if let Some(e) = engine {
         harness.supervisor.engine_pool.release(e);
     }
-}
- }
 }

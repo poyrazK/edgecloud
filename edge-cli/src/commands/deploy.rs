@@ -29,6 +29,7 @@ use crate::LangArg;
 /// toml's `[project] language` to also resolve to `l`; mismatches
 /// surface as a clear error so a stale `rust` path can't be served
 /// for a Javy artifact. `None` defers to the toml entirely.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "network")]
 pub fn run(
     path: &Path,
