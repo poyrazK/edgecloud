@@ -598,6 +598,7 @@ impl HandlerDispatch {
                             let wasm_path = self.downloader.cache_path(&self.deployment_id);
                             let bytes = tokio::fs::read(&wasm_path).await?;
                             let engine_for_spawn = engine.clone();
+                            let cwasm_path_clone = cwasm_path.clone();
                             match tokio::task::spawn_blocking(move || {
                                 wasmtime::component::Component::from_binary(
                                     &engine_for_spawn,
@@ -607,7 +608,33 @@ impl HandlerDispatch {
                             .await
                             .unwrap()
                             {
-                                Ok(c) => c,
+                                Ok(c) => {
+                                    // Serialize to .cwasm for future cache hits in a
+                                    // background task so the initial request is not delayed.
+                                    match c.serialize() {
+                                        Ok(serialized) => {
+                                            tokio::spawn(async move {
+                                                if let Err(e) =
+                                                    tokio::fs::write(&cwasm_path_clone, &serialized)
+                                                        .await
+                                                {
+                                                    tracing::warn!(
+                                                        path = %cwasm_path_clone.display(),
+                                                        err = %e,
+                                                        "failed to write serialized component to AOT cache"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                err = %e,
+                                                "failed to serialize compiled component"
+                                            );
+                                        }
+                                    }
+                                    c
+                                }
                                 Err(e) => return Err(anyhow::anyhow!("JIT failed: {e}")),
                             }
                         }

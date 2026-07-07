@@ -776,12 +776,12 @@ func isValidRegionIdentifier(s string) bool {
 type MigrationConfig struct {
 	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
 	WasiSdkPath     string `yaml:"wasi_sdk_path"     env:"WASI_SDK_PATH"     envDefault:"/usr/local/wasi-sdk/bin"`
-	// RustcPath is the absolute path to a rustc binary capable of
-	// targeting wasm32-wasip2 (i.e. `rustup target add wasm32-wasip2`
-	// has been run on the host). Used by the migration service when
-	// language == "rust" to compile the transformed source into a
-	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
-	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
+	RustcPath       string `yaml:"rustc_path"        env:"RUSTC_PATH"        envDefault:"rustc"`
+	// Wasm2CwasmPath is the path to the wasm2cwasm binary used to
+	// pre-compile .wasm artifacts to .cwasm during activation. When
+	// empty, the pre-compilation step is skipped and workers JIT-compile
+	// lazily on first load. Set via EDGE_WASM2CWASM_PATH env var.
+	Wasm2CwasmPath string `yaml:"wasm2cwasm_path" env:"EDGE_WASM2CWASM_PATH"`
 }
 
 // SigningConfig configures the Ed25519 signing key used to sign

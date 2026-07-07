@@ -34,6 +34,9 @@ func (m *mockRollbackArtifactStore) Save(ctx context.Context, tenantID, appName,
 func (m *mockRollbackArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
 	return nil, nil
 }
+func (m *mockRollbackArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return nil
+}
 func (m *mockRollbackArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	return m.deleteFn(ctx, tenantID, appName, deploymentID)
 }

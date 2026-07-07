@@ -183,7 +183,7 @@ func New(
 
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc, artifactStore, cfg.Migration.Wasm2CwasmPath)
 	envHandler := handler.NewEnvHandler(envSvc)
 	// PR #195 / commit 2d61f94 (fold SetSyncBuilder into NewInternalHandler)
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6

@@ -146,6 +146,11 @@ func (s *RemoteArtifactStore) Save(ctx context.Context, tenantID, appName, deplo
 	return s.cache.Save(ctx, tenantID, appName, deploymentID, r)
 }
 
+// SaveFormat writes only to the local cache (same as Save — peers pull on first miss).
+func (s *RemoteArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return s.cache.SaveFormat(ctx, tenantID, appName, deploymentID, format, r)
+}
+
 // Open checks the local cache and falls back to a peer CP GET.
 // On cache hit, the FSArtifactStore's ReadCloser is returned directly.
 // On cache miss, the artifact is fetched from the peer, streamed to a
