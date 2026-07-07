@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"regexp"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // RecordingPublisher implements nats.Publisher by capturing every
@@ -559,6 +561,13 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 		}
 		mock.ExpectCommit()
 	}
+
+	// Mock worker list query inside waitForWorkers
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`,
+	)).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "tenant_id", "region", "ip", "memory_mb", "last_seen", "created_at",
+	}))
 }
 
 // TestPublishSwap_AppendsAreAtomic covers the issue #127 follow-up
@@ -650,5 +659,78 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 	// expectation" error. We assert below for an explicit signal.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v (Rollback should have fired after the failed append)", err)
+	}
+}
+
+func TestPublishSwap_WaitForWorkers(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+	db := sqlx.NewDb(sqlDB, "postgres")
+
+	tenantID, appName, deploymentID := "t_wait", "myapp", "d_new123"
+
+	// Mock post-commit read returning empty arrays.
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
+			"regions_published", "regions_failed",
+			"last_publish_at", "last_publish_attempt_id",
+		}).AddRow(
+			tenantID, appName, "d_old", nil, false, nil,
+			"{}", "{}",
+			nil, nil,
+		))
+
+	// Mock transaction begin, Appends, and commit.
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_published = (`,
+	)).
+		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	// Mock worker list returning one active worker in us-east.
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`,
+	)).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "tenant_id", "region", "ip", "memory_mb", "last_seen", "created_at",
+	}).AddRow("w_us-east_1", tenantID, "us-east", "127.0.0.1", 4096, time.Now(), time.Now()))
+
+	// Mock GetLatestStatuses returning status where app is "running" and has deploymentID.
+	appsJSON := `{"myapp":{"status":"running","exit_code":0,"deployment_id":"d_new123","tenant_id":"t_wait","port":8080}}`
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT DISTINCT ON (worker_id) worker_id, apps, last_report FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`,
+	)).WithArgs(pq.Array([]string{"w_us-east_1"})).
+		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
+			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
+
+	pub := newRecordingPublisher()
+	svc := &DeploymentService{
+		db:         db,
+		activeRepo: repository.NewActiveDeploymentRepository(db),
+		publisher:  pub,
+	}
+
+	msg := &nats.TaskMessage{
+		TenantID: tenantID,
+		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: deploymentID}},
+	}
+	err = svc.publishSwap(context.Background(), tenantID, appName, deploymentID, msg, []string{"us-east"})
+	if err != nil {
+		t.Fatalf("publishSwap failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
 	}
 }

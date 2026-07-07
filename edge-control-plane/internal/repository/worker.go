@@ -7,6 +7,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // WorkerRepository handles worker data access.
@@ -135,6 +136,7 @@ func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName s
 		SELECT
 			apps.key                                    AS app_name,
 			apps.value->>'status'                       AS status,
+			apps.value->>'deployment_id'                AS deployment_id,
 			worker_status.last_report                   AS last_heartbeat,
 			workers.region                              AS region,
 			workers.id                                  AS worker_id,
@@ -142,7 +144,7 @@ func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName s
 		FROM workers
 		JOIN worker_status ON worker_status.worker_id = workers.id
 		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
-		WHERE apps.key = $1
+		WHERE split_part(apps.key, ':', 1) = $1
 		  AND apps.value->>'tenant_id' = $2
 		ORDER BY worker_status.last_report DESC
 		LIMIT 1`
@@ -238,7 +240,7 @@ func (r *WorkerRepository) GetLatestStatuses(ctx context.Context, workerIDs []st
 	// sqlx + the pgx driver accept []string as a Postgres text[] array,
 	// which binds to ANY($1) directly.
 	query := `SELECT DISTINCT ON (worker_id) worker_id, apps, last_report FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`
-	if err := r.db.SelectContext(ctx, &rows, query, workerIDs); err != nil {
+	if err := r.db.SelectContext(ctx, &rows, query, pq.Array(workerIDs)); err != nil {
 		return nil, err
 	}
 	for _, ws := range rows {
