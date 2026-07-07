@@ -13,5 +13,6 @@ pub mod config;
 pub mod domains;
 pub mod heartbeats;
 pub mod messages;
+pub mod ratelimit;
 pub mod routing;
 pub mod traffic;

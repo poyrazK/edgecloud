@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::caddy::{render_routes, CaddyClient};
 use crate::config::Config;
 use crate::messages::HeartbeatMessage;
+use crate::ratelimit::SharedRateLimitCache;
 use crate::routing::{RouteEntry, RoutingTable};
 use crate::traffic::{spawn_fetcher, SharedCache};
 use reqwest::Client;
@@ -51,24 +52,37 @@ pub async fn run(
 
     // Traffic-split cache shared between the fetcher and the renderer.
     let traffic_cache: SharedCache = Default::default();
+    // Rate-limit cache shared between the fetcher and the renderer.
+    let rate_limit_cache: SharedRateLimitCache = Default::default();
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("reqwest Client must build");
     let traffic_cache_for_renderer = traffic_cache.clone();
     let traffic_cache_for_push = traffic_cache.clone();
+    let rate_limit_cache_for_renderer = rate_limit_cache.clone();
+    let rate_limit_cache_for_push = rate_limit_cache.clone();
     spawn_fetcher(
-        http_client,
+        http_client.clone(),
         cfg.control_plane_api_url.clone(),
         traffic_cache.clone(),
         cfg.internal_token.clone(),
         table.clone(),
+    );
+    crate::ratelimit::spawn_rate_limit_fetcher(
+        http_client,
+        cfg.control_plane_api_url.clone(),
+        rate_limit_cache.clone(),
+        cfg.internal_token.clone(),
+        table.clone(),
+        cfg.rate_limit_fetch_interval,
     );
     spawn_renderer(
         cfg.clone(),
         table.clone(),
         caddy.clone(),
         traffic_cache_for_renderer,
+        rate_limit_cache_for_renderer,
         render_notify.clone(),
     );
     spawn_pruner(table.clone(), render_notify.clone());
@@ -76,7 +90,15 @@ pub async fn run(
     // Push the initial empty config so Caddy's admin API has a known state
     // before the first heartbeat lands. (Otherwise Caddy might still be
     // serving its default config, e.g. `:2019` admin only.)
-    if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache_for_push).await {
+    if let Err(e) = push_now(
+        &cfg,
+        &table,
+        &caddy,
+        &traffic_cache_for_push,
+        &rate_limit_cache_for_push,
+    )
+    .await
+    {
         warn!(err = %e, "initial Caddy load failed (will retry on first heartbeat)");
     }
 
@@ -182,6 +204,7 @@ fn spawn_renderer(
     table: Arc<RoutingTable>,
     caddy: Arc<CaddyClient>,
     traffic_cache: SharedCache,
+    rate_limit_cache: SharedRateLimitCache,
     notify: Arc<Notify>,
 ) {
     tokio::spawn(async move {
@@ -194,7 +217,8 @@ fn spawn_renderer(
             // burst. That's acceptable for v1; if it becomes a problem,
             // switch to a trailing-edge debounce using a watch channel.
             sleep(Duration::from_millis(cfg.refresh_debounce_ms)).await;
-            if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache).await {
+            if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache).await
+            {
                 error!(err = %e, "Caddy reload failed");
             } else {
                 debug!("Caddy config reloaded");
@@ -224,11 +248,13 @@ async fn push_now(
     table: &RoutingTable,
     caddy: &CaddyClient,
     traffic_cache: &SharedCache,
+    rate_limit_cache: &SharedRateLimitCache,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
     let fqdns = table.fqdn_snapshot().await;
     let traffic_cache = traffic_cache.read().await;
-    let json = render_routes(&snap, &fqdns, cfg, &traffic_cache);
+    let rate_limit_cache = rate_limit_cache.read().await;
+    let json = render_routes(&snap, &fqdns, cfg, &traffic_cache, &rate_limit_cache);
     caddy.load_config(&json).await
 }
 
@@ -481,6 +507,7 @@ mod tests {
             caddy_admin_listen: "localhost:2019".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
         }
     }
 
@@ -504,8 +531,9 @@ mod tests {
         let table = Arc::new(RoutingTable::new());
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
+        let rl_cache: SharedRateLimitCache = Default::default();
 
-        push_now(&cfg, &table, &caddy, &cache)
+        push_now(&cfg, &table, &caddy, &cache, &rl_cache)
             .await
             .expect("push_now should succeed");
     }
@@ -527,8 +555,9 @@ mod tests {
         let table = Arc::new(RoutingTable::new());
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
+        let rl_cache: SharedRateLimitCache = Default::default();
 
-        let err = push_now(&cfg, &table, &caddy, &cache)
+        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache)
             .await
             .expect_err("push_now should fail with 502");
         assert!(
@@ -561,6 +590,7 @@ mod tests {
         let table = Arc::new(RoutingTable::new());
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
+        let rl_cache: SharedRateLimitCache = Default::default();
         let notify = Arc::new(Notify::new());
 
         // Notify BEFORE spawn: tokio::sync::Notify stores a pending
@@ -568,7 +598,7 @@ mod tests {
         // first notified().await will observe it immediately.
         notify.notify_one();
 
-        spawn_renderer(cfg, table, caddy, cache, notify.clone());
+        spawn_renderer(cfg, table, caddy, cache, rl_cache, notify.clone());
 
         // Wait for debounce (1ms) + push to complete.
         tokio::time::sleep(Duration::from_millis(500)).await;
