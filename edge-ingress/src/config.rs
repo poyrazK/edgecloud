@@ -66,6 +66,19 @@ pub struct Config {
     /// Listen address for the Prometheus /metrics HTTP endpoint
     /// (e.g. `:9091`). Set via `INGRESS_METRICS_LISTEN` (default `:9091`).
     pub metrics_listen: String,
+    /// Max concurrent connections across the entire ingress. 0 = unlimited.
+    /// Set via `INGRESS_MAX_CONNS`.
+    pub max_conns: u32,
+    /// Max concurrent connections per client IP. 0 = unlimited.
+    /// Set via `INGRESS_MAX_CONNS_PER_IP`.
+    pub max_conns_per_ip: u32,
+    /// Per-IP rate limit: max requests per second from a single remote host.
+    /// 0 = disabled. Applied globally before per-app rate limits.
+    /// Set via `INGRESS_PER_IP_RPS`.
+    pub per_ip_rps: u32,
+    /// Per-IP rate limit burst size. 0 = uses `per_ip_rps`.
+    /// Set via `INGRESS_PER_IP_BURST`.
+    pub per_ip_burst: u32,
     /// Default per-app rate limit in requests per second. 0 = disabled.
     /// Override with `RATE_LIMIT_RPS_DEFAULT`.
     pub rate_limit_rps_default: u32,
@@ -167,6 +180,22 @@ impl Config {
                 .unwrap_or_else(|_| "localhost:2019".into()),
             metrics_listen: std::env::var("INGRESS_METRICS_LISTEN")
                 .unwrap_or_else(|_| ":9091".into()),
+            max_conns: std::env::var("INGRESS_MAX_CONNS")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            max_conns_per_ip: std::env::var("INGRESS_MAX_CONNS_PER_IP")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            per_ip_rps: std::env::var("INGRESS_PER_IP_RPS")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            per_ip_burst: std::env::var("INGRESS_PER_IP_BURST")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
             rate_limit_rps_default: std::env::var("RATE_LIMIT_RPS_DEFAULT")
                 .unwrap_or_else(|_| "0".into())
                 .parse()
@@ -501,6 +530,28 @@ mod tests {
         set_var("INGRESS_METRICS_LISTEN", "0.0.0.0:9092");
         let cfg = Config::from_env().expect("metrics listen test");
         assert_eq!(cfg.metrics_listen, "0.0.0.0:9092");
+
+        // 16. Defaults for DDoS protection fields
+        unset_all_config_vars();
+        set_required_vars();
+        let cfg = Config::from_env().expect("ddos defaults test");
+        assert_eq!(cfg.max_conns, 0, "max_conns defaults to 0");
+        assert_eq!(cfg.max_conns_per_ip, 0, "max_conns_per_ip defaults to 0");
+        assert_eq!(cfg.per_ip_rps, 0, "per_ip_rps defaults to 0");
+        assert_eq!(cfg.per_ip_burst, 0, "per_ip_burst defaults to 0");
+
+        // 17. DDoS protection field overrides
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("INGRESS_MAX_CONNS", "5000");
+        set_var("INGRESS_MAX_CONNS_PER_IP", "100");
+        set_var("INGRESS_PER_IP_RPS", "50");
+        set_var("INGRESS_PER_IP_BURST", "100");
+        let cfg = Config::from_env().expect("ddos override test");
+        assert_eq!(cfg.max_conns, 5000);
+        assert_eq!(cfg.max_conns_per_ip, 100);
+        assert_eq!(cfg.per_ip_rps, 50);
+        assert_eq!(cfg.per_ip_burst, 100);
 
         // Clean up
         unset_all_config_vars();

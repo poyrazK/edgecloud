@@ -401,14 +401,38 @@ pub fn render_routes(
         }));
     }
 
+    // Prepend a global per-IP rate limit route when configured.
+    // This runs before per-app routing so a single abusive IP gets
+    // 429'd regardless of which app it's hitting.
+    if cfg.per_ip_rps > 0 {
+        let burst = if cfg.per_ip_burst > 0 {
+            cfg.per_ip_burst
+        } else {
+            cfg.per_ip_rps
+        };
+        let global_rl_route = json!({
+            "match": [{"remote_ip": {"ranges": ["0.0.0.0/0"]}}],
+            "handle": [{
+                "handler": "rate_limit",
+                "rates": { "rps": cfg.per_ip_rps, "burst": burst },
+                "key": "{http.request.remote_host}",
+            }],
+            "terminal": false
+        });
+        routes.insert(0, global_rl_route);
+    }
+
     let mut servers = serde_json::Map::new();
-    servers.insert(
-        SERVER_NAME_HTTPS.to_string(),
-        json!({
-            "listen": [cfg.listen_https],
-            "routes": routes,
-        }),
-    );
+    let mut edge_https = serde_json::Map::new();
+    edge_https.insert("listen".to_string(), json!([cfg.listen_https]));
+    edge_https.insert("routes".to_string(), json!(routes));
+    if cfg.max_conns > 0 {
+        edge_https.insert("max_conns".to_string(), json!(cfg.max_conns));
+    }
+    if cfg.max_conns_per_ip > 0 {
+        edge_https.insert("max_conns_per_ip".to_string(), json!(cfg.max_conns_per_ip));
+    }
+    servers.insert(SERVER_NAME_HTTPS.to_string(), Value::Object(edge_https));
     if cfg.http_to_https {
         servers.insert(
             SERVER_NAME_HTTP.to_string(),
@@ -561,6 +585,10 @@ mod tests {
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
             metrics_listen: ":9091".into(),
+            max_conns: 0,
+            max_conns_per_ip: 0,
+            per_ip_rps: 0,
+            per_ip_burst: 0,
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
@@ -926,6 +954,118 @@ mod tests {
             "FQDN route must probe uri=/healthz (matches config default)"
         );
         assert_eq!(active["expect_status"], 2);
+    }
+
+    // ── DDoS / abuse protection tests ───────────────────────────────
+
+    /// Global per-IP rate limit route is prepended when configured.
+    #[test]
+    fn global_per_ip_rate_limit_prepended_when_configured() {
+        let mut cfg = test_cfg();
+        cfg.per_ip_rps = 50;
+        cfg.per_ip_burst = 100;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        // First route must be the global per-IP rate limit.
+        let first = &routes[0];
+        assert_eq!(
+            first["handle"][0]["handler"], "rate_limit",
+            "first route must be rate_limit handler"
+        );
+        assert_eq!(first["handle"][0]["rates"]["rps"], 50);
+        assert_eq!(first["handle"][0]["rates"]["burst"], 100);
+        assert_eq!(
+            first["handle"][0]["key"], "{http.request.remote_host}",
+            "per-IP rate limit must key on remote_host"
+        );
+        assert!(
+            first["match"][0]["remote_ip"]["ranges"]
+                .as_array()
+                .is_some(),
+            "must have remote_ip match"
+        );
+        // The app route should still be there as the second route.
+        let second = &routes[1];
+        assert_eq!(second["match"][0]["host"][0], "t_acme-api.edgecloud.dev");
+    }
+
+    /// Global per-IP rate limit is omitted when zero.
+    #[test]
+    fn global_per_ip_rate_limit_omitted_when_zero() {
+        let mut cfg = test_cfg();
+        cfg.per_ip_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        // First route must be the app, not a rate limit handler.
+        let first = &routes[0];
+        assert_ne!(
+            first["handle"][0]["handler"].as_str().unwrap_or(""),
+            "rate_limit",
+            "first route must not be rate_limit when per_ip_rps=0"
+        );
+        assert_eq!(routes.len(), 1, "only the app route should exist");
+    }
+
+    /// Connection caps are injected into the server block when configured.
+    #[test]
+    fn max_conns_injected_into_server_block() {
+        let mut cfg = test_cfg();
+        cfg.max_conns = 1000;
+        cfg.max_conns_per_ip = 50;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+        );
+        let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
+        assert_eq!(server["max_conns"], 1000);
+        assert_eq!(server["max_conns_per_ip"], 50);
+    }
+
+    /// Connection caps are absent from the server block when zero.
+    #[test]
+    fn max_conns_omitted_when_zero() {
+        let mut cfg = test_cfg();
+        cfg.max_conns = 0;
+        cfg.max_conns_per_ip = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+        );
+        let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
+        assert!(
+            server.get("max_conns").is_none(),
+            "max_conns must be absent when zero"
+        );
+        assert!(
+            server.get("max_conns_per_ip").is_none(),
+            "max_conns_per_ip must be absent when zero"
+        );
     }
 
     // -----------------------------------------------------------------
