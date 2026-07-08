@@ -40,7 +40,7 @@ func TestDeploymentRepository_Create(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
-		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(d.Regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID).
+		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(d.Regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID, d.BuildAttestation, d.DesiredReplicas).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Create(context.Background(), d); err != nil {
@@ -67,7 +67,7 @@ func TestDeploymentRepository_Create_NilRegionsUsesEmptyArray(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
-		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(pq.StringArray{}), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID).
+		WithArgs(d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(pq.StringArray{}), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID, d.BuildAttestation, d.DesiredReplicas).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := repo.Create(context.Background(), d); err != nil {
@@ -85,7 +85,8 @@ func TestDeploymentRepository_GetByID(t *testing.T) {
 	now := time.Now()
 	rows := sqlmock.NewRows([]string{
 		"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled",
-	}).AddRow("d_1", "t_1", "hello", domain.StatusDeployed, "abc", pq.StringArray{"fra"}, now, true)
+		"signature", "signing_key_id", "build_attestation", "desired_replicas",
+	}).AddRow("d_1", "t_1", "hello", domain.StatusDeployed, "abc", pq.StringArray{"fra"}, now, true, "", "", []byte{}, 0)
 
 	mock.ExpectQuery(`SELECT id.*FROM deployments WHERE`).
 		WithArgs("d_1").
@@ -132,8 +133,9 @@ func TestDeploymentRepository_ListByApp(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled",
-	}).AddRow("d_1", "t_1", "hello", "deployed", "hash1", pq.StringArray{"fra"}, time.Now(), false).
-		AddRow("d_2", "t_1", "hello", "active", "hash2", pq.StringArray{"sfo"}, time.Now(), false)
+		"signature", "signing_key_id", "build_attestation", "desired_replicas",
+	}).AddRow("d_1", "t_1", "hello", "deployed", "hash1", pq.StringArray{"fra"}, time.Now(), false, "", "", []byte{}, 0).
+		AddRow("d_2", "t_1", "hello", "active", "hash2", pq.StringArray{"sfo"}, time.Now(), false, "", "", []byte{}, 0)
 
 	mock.ExpectQuery(`SELECT id.*FROM deployments WHERE.*ORDER BY created_at DESC`).
 		WithArgs("t_1", "hello").
@@ -154,7 +156,8 @@ func TestDeploymentRepository_ListByAppPaginated(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled",
-	}).AddRow("d_1", "t_1", "hello", "deployed", "hash1", pq.StringArray{}, time.Now(), false)
+		"signature", "signing_key_id", "build_attestation", "desired_replicas",
+	}).AddRow("d_1", "t_1", "hello", "deployed", "hash1", pq.StringArray{}, time.Now(), false, "", "", []byte{}, 0)
 
 	mock.ExpectQuery(`SELECT id.*FROM deployments WHERE.*ORDER BY created_at DESC LIMIT.*OFFSET`).
 		WithArgs("t_1", "hello", 10, 5).

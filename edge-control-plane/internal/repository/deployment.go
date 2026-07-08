@@ -39,14 +39,18 @@ func (r *DeploymentRepository) Create(ctx context.Context, d *domain.Deployment)
 	if regions == nil {
 		regions = pq.StringArray{}
 	}
-	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID)
+	// `build_attestation` is `JSONB NULLABLE` (migration 020); an
+	// empty json.RawMessage maps to SQL NULL, which is the right
+	// shape for "no attestation yet" rows (pre-PR2 deployments or a
+	// deploy that didn't supply build metadata).
+	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID, d.BuildAttestation, d.DesiredReplicas)
 	return err
 }
 
 func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
 	var d domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id = $1`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id = $1`
 	err := r.db.GetContext(ctx, &d, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -56,14 +60,14 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.
 
 func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName)
 	return deployments, err
 }
 
 func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
 	return deployments, err
 }
@@ -81,21 +85,24 @@ func (r *DeploymentRepository) UpdateStatus(ctx context.Context, id, status stri
 }
 
 // UpdateHashAndSignature writes the post-artifact-save fields
-// (`hash`, `signature`, `signing_key_id`) on a row created earlier in
-// the same request. Used by the migration service, which creates the
-// row with empty hash before `SaveAndHash` (so the AppService quota
-// check fires), then fills in the real hash + signature after the
-// artifact is on disk. Idempotent: returns nil if no row was
-// affected (the row was deleted by a concurrent compensating write).
+// (`hash`, `signature`, `signing_key_id`, `build_attestation`) on a
+// row created earlier in the same request. Used by the migration
+// service, which creates the row with empty hash before
+// `SaveAndHash` (so the AppService quota check fires), then fills
+// in the real hash + signature + attestation after the artifact is
+// on disk. Idempotent: returns nil if no row was affected (the row
+// was deleted by a concurrent compensating write).
 //
 // Called from `service.MigrationService.MigrateTree` and (via the
 // same code path) from the test-helper `mockDeploymentRepo`. Issues
 // #307: signing was added after the row was created, so the original
-// "Create-only" flow no longer fits.
+// "Create-only" flow no longer fits. PR2 adds the build_attestation
+// column to the same UPDATE so the row stays single-write-atomic:
+// callers don't have to do a follow-up PATCH after this UPDATE.
 func (r *DeploymentRepository) UpdateHashAndSignature(ctx context.Context, d *domain.Deployment) error {
 	res, err := r.db.ExecContext(ctx,
-		`UPDATE deployments SET hash = $2, signature = $3, signing_key_id = $4 WHERE id = $1`,
-		d.ID, d.Hash, d.Signature, d.SigningKeyID)
+		`UPDATE deployments SET hash = $2, signature = $3, signing_key_id = $4, build_attestation = $5 WHERE id = $1`,
+		d.ID, d.Hash, d.Signature, d.SigningKeyID, d.BuildAttestation)
 	if err != nil {
 		return err
 	}

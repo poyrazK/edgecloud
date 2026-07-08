@@ -253,6 +253,11 @@ pub fn transform_tree_for_language_with_app_name(
                         use crate::report::{ErrorInfo, MigrationStatus};
                         FileReport {
                             path: e.path.clone(),
+                            sha256: if e.source.is_empty() {
+                                String::new()
+                            } else {
+                                crate::report::sha256_hex(e.source.as_bytes())
+                            },
                             status: MigrationStatus::Failed,
                             patterns_detected: Vec::new(),
                             transformations: Vec::new(),
@@ -298,7 +303,11 @@ fn transform_tree_c(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport>
             }
             None => MigrationReport::from_pattern_matches(app_name, matches),
         };
-        file_reports.push(FileReport::from_report(entry.path.clone(), report));
+        file_reports.push(FileReport::from_report(
+            entry.path.clone(),
+            report,
+            &entry.source,
+        ));
     }
     file_reports
 }
@@ -314,7 +323,11 @@ fn transform_tree_rust(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileRepo
     for entry in &entries {
         let matches = analyzer.analyze(&entry.source);
         let report = MigrationReport::from_pattern_matches(app_name, matches);
-        file_reports.push(FileReport::from_report(entry.path.clone(), report));
+        file_reports.push(FileReport::from_report(
+            entry.path.clone(),
+            report,
+            &entry.source,
+        ));
     }
     file_reports
 }

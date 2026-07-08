@@ -19,6 +19,13 @@ open = "5.0"
 notify = "6.1"
 regex = "1.10"
 walkdir = "2.5"
+# Used by `edge build` to compute a deterministic SHA-256 over the
+# project's source tree (issue #307 PR2: SLSA L1 provenance). The
+# digest is uploaded to the control plane via the multipart
+# `build_metadata` form field and folded into the SLSA envelope's
+# `materials[].digest.sha256` slots.
+sha2 = "0.10"
+hex = "0.4"
 
 dirs = "5.0"
 # Used by `edge logs --follow` to install a SIGINT handler so the

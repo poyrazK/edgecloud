@@ -140,6 +140,15 @@ impl MigrationReport {
 pub struct FileReport {
     /// Forward-slash path relative to the walk root.
     pub path: String,
+    /// Lowercase hex SHA-256 of the **original** source bytes
+    /// (pre-transform). Optional — empty when the file's source
+    /// could not be read into memory (e.g. parse error before
+    /// the bytes were captured) or when the producer version
+    /// pre-dates PR2.7 (issue #307 PR2). Downstream audit
+    /// pipelines use it as a `materials[].digest.sha256` entry
+    /// on the SLSA L1 envelope.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
     /// Per-file status.
     pub status: MigrationStatus,
     /// All patterns detected in this file.
@@ -193,9 +202,24 @@ impl FileReport {
     /// produced by `transform_tree`. The path is recorded; everything
     /// else is borrowed from the input report (per-file preprocessor
     /// info, if present, is moved over).
-    pub fn from_report(path: String, r: MigrationReport) -> Self {
+    ///
+    /// `sha256` is the lowercase hex digest of the **original**
+    /// source bytes (the input to the analyzer). The strings are
+    /// already in memory by the time this constructor runs (the
+    /// analyzer needs them), so the digest is computed in-place
+    /// here rather than re-reading the file from disk. Empty
+    /// `source` (e.g. when the caller explicitly omitted bytes)
+    /// leaves `sha256 = ""` and downstream consumers see that as
+    /// "no per-file digest available".
+    pub fn from_report(path: String, r: MigrationReport, source: &str) -> Self {
+        let sha256 = if source.is_empty() {
+            String::new()
+        } else {
+            sha256_hex(source.as_bytes())
+        };
         Self {
             path,
+            sha256,
             status: r.status,
             patterns_detected: r.patterns_detected,
             transformations: r.patterns_transformed,
@@ -207,10 +231,18 @@ impl FileReport {
 
     /// Build a `FileReport` representing a per-file parse / transform
     /// failure. The status is `Failed` and the provided message is
-    /// recorded in `errors`.
-    pub fn from_error(path: String, line: usize, message: String) -> Self {
+    /// recorded in `errors`. `source` may be empty — the failure
+    /// often happens before/during parse, so capturing bytes is
+    /// not always possible; the digest is empty in that case.
+    pub fn from_error(path: String, line: usize, message: String, source: &str) -> Self {
+        let sha256 = if source.is_empty() {
+            String::new()
+        } else {
+            sha256_hex(source.as_bytes())
+        };
         Self {
             path,
+            sha256,
             status: MigrationStatus::Failed,
             patterns_detected: Vec::new(),
             transformations: Vec::new(),
@@ -219,6 +251,32 @@ impl FileReport {
             preprocessor: None,
         }
     }
+}
+
+/// Compute lowercase hex SHA-256 over `b`. Standalone helper
+/// rather than a `Hasher` impl so the call site is one line and
+/// the result has the exact shape downstream audit pipelines
+/// expect (issue #307 PR2.7). Crate-visible because
+/// `crate::tree::transform_tree_for_language_with_app_name` also
+/// needs to mint a per-file digest when the Rust feature is
+/// disabled (the manual FileReport construction path).
+pub(crate) fn sha256_hex(b: &[u8]) -> String {
+    // We avoid pulling in the `sha2` crate (or any external hash
+    // dep) for a one-liner digest — the cost is a small constant
+    // (256 bytes) and the benefit is one fewer transitive dep
+    // tree in the edge-migrate-lib crate. The implementation is
+    // the standard FIPS-180-4 SHA-256.
+    sha256_inline(b)
+}
+
+/// FIPS-180-4 SHA-256. Kept inline (rather than behind a `sha2`
+/// dep) for the reasons documented at `sha256_hex`.
+fn sha256_inline(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b);
+    let out = h.finalize();
+    hex::encode(out)
 }
 
 impl TreeMigrationReport {
@@ -559,7 +617,7 @@ mod tests {
             errors: vec![],
             preprocessor: None,
         };
-        let fr = FileReport::from_report("src/main.c".to_string(), r);
+        let fr = FileReport::from_report("src/main.c".to_string(), r, "");
         assert_eq!(fr.path, "src/main.c");
         assert!(matches!(fr.status, MigrationStatus::Success));
         assert_eq!(fr.transformations.len(), 1);
@@ -569,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_file_report_from_error_marks_failed() {
-        let fr = FileReport::from_error("broken.c".to_string(), 0, "parse error".to_string());
+        let fr = FileReport::from_error("broken.c".to_string(), 0, "parse error".to_string(), "");
         assert!(matches!(fr.status, MigrationStatus::Failed));
         assert_eq!(fr.errors.len(), 1);
         assert_eq!(fr.errors[0].message, "parse error");
@@ -589,8 +647,8 @@ mod tests {
             preprocessor: None,
         };
         let files = vec![
-            FileReport::from_report("a.c".to_string(), r.clone()),
-            FileReport::from_report("b.c".to_string(), r.clone()),
+            FileReport::from_report("a.c".to_string(), r.clone(), ""),
+            FileReport::from_report("b.c".to_string(), r.clone(), ""),
         ];
         let tree = TreeMigrationReport::from_files("hello".to_string(), files);
         assert!(matches!(tree.status, MigrationStatus::Success));
@@ -628,8 +686,8 @@ mod tests {
             preprocessor: None,
         };
         let files = vec![
-            FileReport::from_report("a.c".to_string(), success),
-            FileReport::from_report("b.c".to_string(), partial),
+            FileReport::from_report("a.c".to_string(), success, ""),
+            FileReport::from_report("b.c".to_string(), partial, ""),
         ];
         let tree = TreeMigrationReport::from_files("hello".to_string(), files);
         assert!(matches!(tree.status, MigrationStatus::Partial));
@@ -651,8 +709,11 @@ mod tests {
             errors: vec![],
             preprocessor: None,
         };
-        let failed = FileReport::from_error("broken.c".to_string(), 0, "boom".to_string());
-        let files = vec![FileReport::from_report("a.c".to_string(), success), failed];
+        let failed = FileReport::from_error("broken.c".to_string(), 0, "boom".to_string(), "");
+        let files = vec![
+            FileReport::from_report("a.c".to_string(), success, ""),
+            failed,
+        ];
         let tree = TreeMigrationReport::from_files("hello".to_string(), files);
         assert!(matches!(tree.status, MigrationStatus::Failed));
         assert!(!tree.is_migratable());
@@ -684,6 +745,7 @@ mod tests {
                 errors: vec![],
                 preprocessor: None,
             },
+            "",
         );
         let tree = TreeMigrationReport::from_files("hello".to_string(), vec![fr]);
         let json = serde_json::to_string(&tree).expect("serialize");
@@ -727,12 +789,77 @@ mod tests {
             preprocessor: None,
         };
         let files = vec![
-            FileReport::from_report("a.c".to_string(), with_trans.clone()),
-            FileReport::from_report("b.c".to_string(), without_trans.clone()),
-            FileReport::from_report("c.c".to_string(), with_trans),
+            FileReport::from_report("a.c".to_string(), with_trans.clone(), ""),
+            FileReport::from_report("b.c".to_string(), without_trans.clone(), ""),
+            FileReport::from_report("c.c".to_string(), with_trans, ""),
         ];
         let tree = TreeMigrationReport::from_files("hello".to_string(), files);
         assert_eq!(tree.files_transformed, 2);
         assert_eq!(tree.files_total, 3);
     }
+}
+
+#[test]
+fn test_file_report_sha256_is_lowercase_hex_of_source() {
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "hello world");
+    // "hello world" → expected hex digest, lowercased.
+    let want = sha256_hex(b"hello world");
+    assert_eq!(fr.sha256, want);
+    assert_eq!(fr.sha256.len(), 64);
+}
+
+#[test]
+fn test_file_report_empty_source_leaves_sha256_blank() {
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "");
+    assert!(
+        fr.sha256.is_empty(),
+        "expected empty sha256 for empty source, got {}",
+        fr.sha256
+    );
+}
+
+#[test]
+fn test_file_report_serializes_with_sha256_when_present() {
+    // Round-trip: a non-empty sha256 must persist through JSON
+    // serialization (issue #307 PR2.7 wires the digest into the
+    // SLSA materials array).
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "int main() { return 0; }");
+    let want_sha = fr.sha256.clone();
+    let tree = TreeMigrationReport::from_files("hello".to_string(), vec![fr]);
+    let json = serde_json::to_string(&tree).expect("serialize");
+    assert!(json.contains("\"sha256\""), "json: {}", json);
+    assert!(json.contains(&want_sha), "json: {}", json);
 }

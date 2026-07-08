@@ -9,8 +9,10 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use crate::config::EdgeToml;
+use crate::state::BuildMetadata;
 use crate::LangArg;
 
 /// Compile the project to WebAssembly.
@@ -97,6 +99,8 @@ pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<Pa
 
 /// Build via `cargo build --target wasm32-wasip2 --release`.
 fn build_rust(path: &Path, project_name: &str) -> Result<()> {
+    let started_iso = iso8601_now();
+
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
         .current_dir(path)
@@ -110,6 +114,36 @@ fn build_rust(path: &Path, project_name: &str) -> Result<()> {
     let artifact = path_for(path, project_name, "rust").context("resolving rust artifact path")?;
     if !artifact.exists() {
         anyhow::bail!("artifact not found at {}", artifact.display());
+    }
+
+    // Issue #307 PR2 — capture build-time metadata into
+    // .edge/build_metadata.json so the deploy path can upload
+    // it as the multipart `build_metadata` form field. The
+    // control plane uses these fields to populate the SLSA L1
+    // envelope's `predicate.buildTools[]` and
+    // `predicate.invocation.parameters` entries.
+    //
+    // Toolchain fields are best-effort: a missing toolchain
+    // binary just leaves an empty string, and the envelope
+    // builder on the server side already treats empty fields
+    // as "unknown". `source_digest` is the same digest the
+    // server-side edge-migrate analysis mints per-file —
+    // surface-level mismatch is OK, the server uses the
+    // authoritative value when compiling.
+    let build_metadata = BuildMetadata {
+        toolchain_rustc: capture_tool_version("rustc", &["--version"]),
+        toolchain_cargo: capture_tool_version("cargo", &["--version"]),
+        toolchain_clang: String::new(),
+        toolchain_rustup: capture_tool_version("rustup", &["show", "active-toolchain"]),
+        target: "wasm32-wasip2".to_string(),
+        profile: "release".to_string(),
+        source_digest: compute_source_digest(path).unwrap_or_default(),
+        build_started_on: started_iso,
+    };
+    if let Err(e) = build_metadata.save(path) {
+        // Non-fatal — the deploy path treats missing build
+        // metadata as best-effort. Log and continue.
+        eprintln!("warning: failed to write build_metadata.json: {e}");
     }
 
     println!("✓ Built successfully");
@@ -276,6 +310,191 @@ mod tests {
         assert!(
             format!("{err:#}").contains("unsupported language"),
             "expected unsupported-language error, got: {err:#}"
+        );
+    }
+}
+
+/// Invoke `tool args…` and return stdout trimmed. Returns an
+/// empty string when the tool isn't on PATH (so the SLSA
+/// envelope's `buildTools[]` list simply omits unavailable
+/// tools — the upload is still well-formed, just with a
+/// partial toolchain picture).
+fn capture_tool_version(tool: &str, args: &[&str]) -> String {
+    match Command::new(tool).args(args).output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Compute a deterministic SHA-256 over the project's Rust
+/// source bytes (src/**/*.rs). The result is hex-encoded and
+/// fits the SLSA `materials[].digest.sha256` slot on the
+/// server-side envelope. We deliberately use Cargo's source
+/// layout (`src/**/*.rs`), not just the entrypoint — the
+/// SLSA spec asks for "all sources that contributed to the
+/// build", and `src/` is the canonical Rust layout here.
+///
+/// Returns `Err` only on IO errors; an empty project (no
+/// `src/` dir) returns the SHA-256 of zero bytes, which the
+/// downstream audit pipeline sees as "no source manifest was
+/// available for this build".
+fn compute_source_digest(project_dir: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let src_dir = project_dir.join("src");
+    if src_dir.is_dir() {
+        collect_rs_files(&src_dir, &mut entries)?;
+    }
+
+    // Sort for deterministic hash on different filesystems /
+    // walkdir orders. SLSA wants the materials in a stable
+    // order so the envelope signature doesn't churn every
+    // build.
+    entries.sort();
+
+    let mut hasher = Sha256::new();
+    for entry in &entries {
+        // Append a length-prefixed path + file contents. The
+        // path is included so two projects with identical
+        // files but different layouts get distinct digests.
+        let relpath = entry
+            .strip_prefix(project_dir)
+            .unwrap_or(entry)
+            .to_string_lossy();
+        hasher.update(relpath.as_bytes());
+        hasher.update([0u8]); // separator (NUL is unlikely in paths)
+        let contents = std::fs::read(entry)
+            .with_context(|| format!("reading source file {}", entry.display()))?;
+        hasher.update(&contents);
+        hasher.update([0u8]);
+    }
+
+    let digest = hasher.finalize();
+    Ok(hex::encode(digest))
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// RFC3339 / ISO 8601 timestamp with seconds precision,
+/// in UTC. Used as `build_started_on` on the SLSA envelope.
+fn iso8601_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    // Avoid bringing in chrono — split the Unix epoch into
+    // y/m/d/h/m/s inline. Accurate through year 2100.
+    let (year, month, day, hour, min, sec) = epoch_to_civil(secs);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z",
+        year = year,
+        month = month,
+        day = day,
+        hour = hour,
+        min = min,
+        sec = sec,
+    )
+}
+
+/// Convert seconds-since-Unix-epoch to UTC (Y, M, D, h, m, s).
+/// Floored at 1970-01-01 00:00:00 for negative inputs (clamp).
+fn epoch_to_civil(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let time_of_day = secs % 86400;
+    let hour = (time_of_day / 3600) as u32;
+    let min = ((time_of_day % 3600) / 60) as u32;
+    let sec = (time_of_day % 60) as u32;
+
+    // Algorithm from Howard Hinnant's date algorithms.
+    // http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y_final = if m <= 2 { y + 1 } else { y };
+    (y_final as i32, m, d, hour, min, sec)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn capture_tool_version_returns_empty_when_missing() {
+        // `definitely-not-a-real-tool-xyz` shouldn't be on
+        // any test host's PATH. Empty string is the
+        // documented "tool unavailable" sentinel.
+        let got = capture_tool_version("definitely-not-a-real-tool-xyz", &["--version"]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn iso8601_now_is_iso_format() {
+        let s = iso8601_now();
+        // e.g. "2026-07-08T14:21:00Z" — 20 chars exactly.
+        assert_eq!(s.len(), 20);
+        assert!(s.ends_with('Z'));
+        assert_eq!(s.chars().nth(4), Some('-'));
+        assert_eq!(s.chars().nth(7), Some('-'));
+        assert_eq!(s.chars().nth(10), Some('T'));
+        assert_eq!(s.chars().nth(13), Some(':'));
+        assert_eq!(s.chars().nth(16), Some(':'));
+    }
+
+    #[test]
+    fn compute_source_digest_is_stable_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(src_dir.join("b.rs"), "fn b() {}").unwrap();
+
+        let d1 = compute_source_digest(dir.path()).unwrap();
+        let d2 = compute_source_digest(dir.path()).unwrap();
+        assert_eq!(d1, d2);
+        assert_eq!(d1.len(), 64);
+    }
+
+    #[test]
+    fn compute_source_digest_changes_when_source_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.rs"), "fn a() {}").unwrap();
+
+        let d1 = compute_source_digest(dir.path()).unwrap();
+        std::fs::write(src_dir.join("a.rs"), "fn a() { 1 }").unwrap();
+        let d2 = compute_source_digest(dir.path()).unwrap();
+        assert_ne!(d1, d2);
+    }
+
+    #[test]
+    fn compute_source_digest_no_src_dir_returns_zero_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = compute_source_digest(dir.path()).unwrap();
+        // SHA-256 of zero bytes is well-known.
+        assert_eq!(
+            d,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }

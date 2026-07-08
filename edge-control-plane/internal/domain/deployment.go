@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/lib/pq"
@@ -59,6 +60,20 @@ type Deployment struct {
 	// deployment in each region (issue #316). 0 means "no threshold"
 	// — the reconcile loop won't warn about under-replication.
 	DesiredReplicas int `db:"desired_replicas" json:"desired_replicas"`
+	// BuildAttestation is the DSSE-wrapped, signed in-toto Statement
+	// v0.1 envelope for this deployment (issue #307 PR2). Stored as
+	// JSONB so downstream audit pipelines can query structured fields
+	// without a wire round-trip. Empty bytes (= nil JSONB in SQL) for
+	// pre-PR2 rows and for deployments where the operator hasn't
+	// supplied build metadata; the EDGE_PROVENANCE_REQUIRED env var
+	// (default false) gates whether absence is a 4xx. Typed as
+	// json.RawMessage so we marshal the envelope verbatim — the CP
+	// never re-parses or rewrites it, preserving the canonical bytes
+	// the verifier reconstructs.
+	//
+	// `omitempty` on the wire so pre-PR2 API consumers don't see a
+	// new field in list / status responses.
+	BuildAttestation json.RawMessage `db:"build_attestation" json:"build_attestation,omitempty"`
 }
 
 // Deployment status constants.

@@ -258,6 +258,44 @@ func (k *Keyring) Sign(hashHex, deploymentID string) (sig string, kid string, er
 	return sig, k.active, nil
 }
 
+// SignBytes signs an arbitrary payload with the active key and
+// returns `(base64url-no-pad signature, kid, error)`. Same shape
+// as Sign but without the deployment-id binding — used by issue
+// #307 PR2 to sign in-toto Statement envelopes.
+//
+// The active kid is returned so the caller can stamp it into the
+// DSSE wrapper's `keyid` field. Like Sign, the kid is always
+// Keyring.ActiveKeyID() — there's no per-call kid override because
+// the active-kid pointer is the keyring's single source of truth
+// for "what is currently producing signatures".
+func (k *Keyring) SignBytes(msg []byte) (sig string, kid string, err error) {
+	s, ok := k.keys[k.active]
+	if !ok {
+		return "", "", fmt.Errorf("%w: active kid %q not in keyring", ErrInvalidKey, k.active)
+	}
+	sig, err = s.SignBytes(msg)
+	if err != nil {
+		return "", "", err
+	}
+	return sig, k.active, nil
+}
+
+// VerifyBytes verifies a signature produced by SignBytes. Resolves
+// the key by `kid` (same way Verify does); empty kid falls back to
+// DefaultKeyID so a verifier that doesn't care about kid rotation
+// can still verify a default-kid envelope.
+func (k *Keyring) VerifyBytes(msg []byte, signatureB64, kid string) (bool, error) {
+	if kid == "" {
+		kid = DefaultKeyID
+	}
+	s, ok := k.keys[kid]
+	if !ok {
+		return false, fmt.Errorf("%w: kid %q not in keyring (loaded: %s)",
+			ErrInvalidKey, kid, sortedKids(k.keys))
+	}
+	return s.VerifyBytes(msg, signatureB64)
+}
+
 // Verify is the CP-side verification helper used by tests and
 // operator tooling. Resolves the key by `kid` (the same way the
 // worker does on the other side of the wire); empty `kid` falls

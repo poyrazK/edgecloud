@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/provenance"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
@@ -118,28 +122,69 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap the body at MaxArtifactSize. http.MaxBytesReader returns a
-	// typed *http.MaxBytesError when the cap is exceeded, which we
-	// map to 413 below. The body is now streamed directly to the
-	// service via r.Body — no io.ReadAll here. The service peeks
-	// the wasm magic bytes inside its transaction callback and
-	// hands the remaining stream to ArtifactStore.SaveAndHash,
-	// which hashes and writes in a single io.Copy pass. This drops
-	// the prior ~3× RAM amplification (handler ReadAll → service
-	// ReadAll → io.Copy) for the 100 MiB artifact case.
+	// PR2 — wire-format break: the deploy request is now
+	// `multipart/form-data` with one required `file` part (the wasm
+	// artifact bytes) and one optional `build_metadata` part (a JSON
+	// object the CLI captured at build time). The raw-octet-stream
+	// shape used by older CLIs is rejected with 415 — the CLI ships
+	// alongside the server, so a wire break is acceptable per the
+	// release notes for issue #307 PR2.
 	//
-	// For requests with a Content-Length header (the common case),
-	// we pre-check the advertised size and reject oversize uploads
-	// before any I/O. For chunked uploads (ContentLength == -1),
-	// MaxBytesReader fires during streaming and the service
-	// surfaces the *http.MaxBytesError, which we map to 413 below.
-	if r.ContentLength > service.MaxArtifactSize {
-		http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+	// The streaming multipart.Reader approach keeps the file
+	// bytes flowing directly into the service's io.Reader, no
+	// RAM buffering of the artifact. The optional `build_metadata`
+	// part is parsed in-memory (a few KiB) so the service can
+	// construct the SLSA L1 Statement envelope with toolchain
+	// info — PR2.6 threads it through the service signature.
+	mediaType, params, mterr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mterr != nil || !strings.HasPrefix(mediaType, "multipart/") {
+		http.Error(w, `{"error":"deploy now requires multipart/form-data with a 'file' part (issue #307 PR2); upgrade the edge CLI"}`,
+			http.StatusUnsupportedMediaType)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
+	boundary := params["boundary"]
+	if boundary == "" {
+		http.Error(w, `{"error":"missing multipart boundary"}`, http.StatusBadRequest)
+		return
+	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback, desiredReplicas)
+	// Cap the request body at MaxArtifactSize. MaxBytesReader
+	// surfaces *http.MaxBytesError mid-stream that we map to 413.
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
+	mr := multipart.NewReader(r.Body, boundary)
+
+	filePart, buildMetadata, mperr := extractDeployParts(mr)
+	if mperr != nil {
+		// *http.MaxBytesError surfaces here when the multipart
+		// body exceeds the cap. Map to 413 first; everything else
+		// is 400 (malformed multipart).
+		var maxErr *http.MaxBytesError
+		if errors.As(mperr, &maxErr) {
+			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, `{"error":"`+mperr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+	defer func() { _ = filePart.Close() }()
+
+	// Decode the optional `build_metadata` form field into a
+	// CLISideMetadata struct. A missing or malformed value is
+	// best-effort: the service builds an envelope with "unknown"
+	// toolchain fields rather than refusing the deploy. We
+	// intentionally swallow the error here — anything > 0 bytes
+	// is a valid JSON object or an operator-typo; either way,
+	// the deploy proceeds and the audit pipeline can flag the
+	// missing provenance later.
+	var cliMeta *provenance.CLISideMetadata
+	if len(buildMetadata) > 0 {
+		var parsed provenance.CLISideMetadata
+		if jerr := json.Unmarshal(buildMetadata, &parsed); jerr == nil {
+			cliMeta = &parsed
+		}
+	}
+
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, filePart, regions, autoRollback, desiredReplicas, cliMeta)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -660,4 +705,76 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("AppIngress ready true: failed to encode response: %v", err)
 	}
+}
+
+// extractDeployParts walks the multipart body looking for the required
+// `file` part and the optional `build_metadata` part. Returns:
+//   - the file `*multipart.Part` (already positioned at the first byte
+//     of the wasm artifact), so the caller can stream it directly into
+//     the service's io.Reader;
+//   - the build_metadata bytes (possibly nil if the part was absent or
+//     malformed — non-fatal; the service will use a default envelope);
+//   - a non-nil error only when the request is structurally broken
+//     (missing file part, malformed MIME headers, etc.). A missing
+//     `build_metadata` is NOT an error.
+//
+// Parts other than `file` and `build_metadata` are silently drained
+// and discarded, so the request body's bytes don't leak through to
+// the file part stream.
+func extractDeployParts(mr *multipart.Reader) (*multipart.Part, []byte, error) {
+	var (
+		filePart       *multipart.Part
+		buildMetaBytes []byte
+	)
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("read multipart: %w", err)
+		}
+		switch p.FormName() {
+		case "file":
+			if filePart != nil {
+				_ = p.Close()
+				return nil, nil, fmt.Errorf("multiple 'file' parts")
+			}
+			filePart = p
+		case "build_metadata":
+			if buildMetaBytes != nil {
+				_ = p.Close()
+				return nil, nil, fmt.Errorf("multiple 'build_metadata' parts")
+			}
+			// Cap the metadata payload at 64 KiB. A real entry is
+			// ~300 bytes; 64 KiB is generous headroom for forward
+			// compat without permitting a multi-MiB JSON DoS.
+			const maxBuildMeta = 64 * 1024
+			lr := io.LimitReader(p, maxBuildMeta+1)
+			meta, readErr := io.ReadAll(lr)
+			_ = p.Close()
+			if readErr != nil {
+				// Non-fatal: PR2 envelope builder drops unknown
+				// metadata rather than rejecting the deploy.
+				meta = nil
+			}
+			if int64(len(meta)) > maxBuildMeta {
+				// Oversize metadata is non-fatal too — drop and
+				// let the envelope be built with "unknown"
+				// toolchain fields. Errs on the side of
+				// availability per the deploy path's SLA.
+				meta = nil
+			}
+			buildMetaBytes = meta
+		default:
+			// Silently drain and discard unknown parts so the
+			// `file` part's bytes remain contiguous.
+			_, _ = io.Copy(io.Discard, p)
+			_ = p.Close()
+		}
+	}
+	if filePart == nil {
+		return nil, nil, fmt.Errorf("missing 'file' part")
+	}
+	return filePart, buildMetaBytes, nil
 }

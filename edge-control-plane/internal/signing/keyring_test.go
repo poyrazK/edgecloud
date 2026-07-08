@@ -297,3 +297,73 @@ func hexEncode(t *testing.T, s *Signer) string {
 func errIsInvalidKey(err error) bool {
 	return errors.Is(err, ErrInvalidKey)
 }
+
+// Keyring.SignBytes — same shape as Sign but for arbitrary payloads.
+// Used by PR2's provenance signing; the deployment-id binding of
+// Sign doesn't apply.
+func TestKeyring_SignBytes_Roundtrip(t *testing.T) {
+	ring := TestKeyring(t)
+	payload := []byte(`{"subject":{"name":"app.wasm"}}`)
+
+	sig, kid, err := ring.SignBytes(payload)
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	if kid != ring.ActiveKeyID() {
+		t.Errorf("SignBytes returned kid %q, want active kid %q", kid, ring.ActiveKeyID())
+	}
+	if sig == "" {
+		t.Fatal("SignBytes returned empty signature")
+	}
+
+	ok, err := ring.VerifyBytes(payload, sig, kid)
+	if err != nil {
+		t.Fatalf("VerifyBytes: %v", err)
+	}
+	if !ok {
+		t.Error("VerifyBytes returned false on a signature SignBytes just produced")
+	}
+}
+
+// SignBytes picks the active key — same dispatch as Sign. Build a
+// 2-key keyring, set the active kid to the SECOND one, sign a
+// payload, verify under both kids. The signature must verify
+// under the second kid and fail under the first.
+func TestKeyring_SignBytes_UsesActiveKey(t *testing.T) {
+	a := genKey(t)
+	b := genKey(t)
+	ring, err := LoadKeyringFromInline(
+		"ka = "+hexEncode(t, a)+"\nkb = "+hexEncode(t, b)+"\n",
+		"kb",
+	)
+	if err != nil {
+		t.Fatalf("LoadKeyringFromInline: %v", err)
+	}
+
+	payload := []byte("payload signed by kb")
+	sig, kid, err := ring.SignBytes(payload)
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	if kid != "kb" {
+		t.Errorf("SignBytes kid = %q, want kb", kid)
+	}
+
+	// Must verify under the key that produced it.
+	if ok, err := ring.VerifyBytes(payload, sig, "kb"); err != nil || !ok {
+		t.Errorf("VerifyBytes(kb) ok=%v err=%v; want true nil", ok, err)
+	}
+	// Must NOT verify under a different key in the same keyring.
+	if ok, err := ring.VerifyBytes(payload, sig, "ka"); err != nil || ok {
+		t.Errorf("VerifyBytes(ka) ok=%v err=%v; want false nil", ok, err)
+	}
+}
+
+// Empty payload rejected at the keyring layer (delegates to the
+// Signer-level guard).
+func TestKeyring_SignBytes_RejectsEmpty(t *testing.T) {
+	ring := TestKeyring(t)
+	if _, _, err := ring.SignBytes(nil); err == nil {
+		t.Error("SignBytes(nil): expected error, got nil")
+	}
+}

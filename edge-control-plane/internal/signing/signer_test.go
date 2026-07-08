@@ -227,3 +227,73 @@ func TestParsePrivateKey_RawSeedWithTrailingWhitespaceByteIsNotTrimmed(t *testin
 		}
 	}
 }
+
+// SignBytes / VerifyBytes — arbitrary-payload signing used by the
+// PR2 SLSA provenance path. The deployment-id binding of Sign is
+// intentionally absent here; the verifier must canonicalize the
+// payload the same way the signer did (see the provenance package
+// for the canonicalization helper used in production).
+func TestSigner_SignBytes_Roundtrip(t *testing.T) {
+	s := TestKey(t)
+	payload := []byte(`{"hello":"world","n":42}`)
+	sig, err := s.SignBytes(payload)
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	if sig == "" {
+		t.Fatal("SignBytes returned empty signature")
+	}
+	ok, err := s.VerifyBytes(payload, sig)
+	if err != nil {
+		t.Fatalf("VerifyBytes: %v", err)
+	}
+	if !ok {
+		t.Error("VerifyBytes returned false on a signature SignBytes just produced")
+	}
+}
+
+// Empty payload must be rejected — sign-then-verify of empty bytes
+// would produce a well-formed but meaningless signature, which is
+// worse than failing loud at sign time.
+func TestSigner_SignBytes_RejectsEmpty(t *testing.T) {
+	s := TestKey(t)
+	if _, err := s.SignBytes(nil); err == nil {
+		t.Error("SignBytes(nil): expected error, got nil")
+	}
+	if _, err := s.SignBytes([]byte{}); err == nil {
+		t.Error("SignBytes([]byte{}): expected error, got nil")
+	}
+}
+
+// VerifyBytes must reject a signature produced by a DIFFERENT key.
+// Pinned so a future refactor that accidentally uses the wrong pub
+// (e.g. swaps s.pub with s.priv[:32]) fails loudly.
+func TestSigner_VerifyBytes_RejectsCrossKey(t *testing.T) {
+	signer := TestKey(t)
+	attacker := FreshTestKey(t)
+
+	payload := []byte("victim payload")
+	sig, err := signer.SignBytes(payload)
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+
+	// The attacker's key MUST NOT verify the victim's signature.
+	ok, err := attacker.VerifyBytes(payload, sig)
+	if err != nil {
+		t.Fatalf("VerifyBytes (cross-key): %v", err)
+	}
+	if ok {
+		t.Error("attacker.VerifyBytes returned true on a signature produced by a different key")
+	}
+
+	// Tampering with the payload must also fail (the signature is
+	// over the exact bytes; any byte change is detectable).
+	ok, err = signer.VerifyBytes(append(payload, '!'), sig)
+	if err != nil {
+		t.Fatalf("VerifyBytes (tampered): %v", err)
+	}
+	if ok {
+		t.Error("VerifyBytes returned true on a tampered payload")
+	}
+}
