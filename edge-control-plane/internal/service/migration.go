@@ -42,6 +42,35 @@ var ErrClangFailed = fmt.Errorf("wasi-sdk clang compilation failed")
 // ErrRustcFailed is returned when the rustc subprocess fails.
 var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 
+// ErrWasmToolsFailed is returned when the wasm-tools component-wrap
+// subprocess fails (issue #415). Distinct from ErrRustcFailed so
+// operators can grep for wrap-vs-compile failures separately.
+var ErrWasmToolsFailed = fmt.Errorf("wasm-tools component wrap failed")
+
+// ErrCargoBuildFailed is returned when the cargo build subprocess
+// fails or the synthesized Cargo project is malformed (issue #415).
+// Bare rustc cannot resolve the wit_bindgen::generate! proc-macro
+// or its wasi:* dependency surface, so the rust migration path
+// shells out to cargo instead.
+var ErrCargoBuildFailed = fmt.Errorf("cargo build failed")
+
+// C-path WIT version audit (issue #415):
+//
+// The C path (`clang --target=wasm32-wasip2 -nostdlib <source>`)
+// relies on wasi-sdk's bundled clang + wit-component encoder.
+// The most recent wasi-sdk releases (≥ 24) bundle a
+// wit-component encoder that emits wasi:http@0.2.1 (matching
+// the wasmtime 45.0.3 linker). Operators on older wasi-sdk
+// (< 24) would hit the same wasi:http@0.2.4 mismatch the Rust
+// path did before #415.
+//
+// We do not pin the C path's clang to a specific bundle
+// because the operator's installed wasi-sdk is the runtime
+// contract for the C path; if a 0.2.4 regression surfaces,
+// the fix is "upgrade wasi-sdk" — same as the upstream
+// recommendation. Track any future C-path break in:
+// https://github.com/edgeclouderz/edge-cloud/issues/415 (audit)
+
 // DeploymentRepoInterface abstracts deployment creation for testing.
 type DeploymentRepoInterface interface {
 	Create(ctx context.Context, d *domain.Deployment) error
@@ -96,9 +125,33 @@ type MigrationService struct {
 	artifactStore   storage.ArtifactStore
 	edgeMigratePath string
 	wasiSdkPath     string
-	// rustcPath is the absolute path to a rustc binary capable of
-	// targeting wasm32-wasip2. Used when language == "rust".
+	// rustcPath is the absolute path to a rustc binary. The rust
+	// migration path (language == "rust") uses cargo build — not
+	// bare rustc — so the binary is invoked transitively. The
+	// `cargo` binary on $PATH is what does the work; this field is
+	// retained for the C-with-extra-rust-deps edge case (currently
+	// unused but kept for forward-compat).
 	rustcPath string
+	// wasmToolsPath is the absolute path to a `wasm-tools` binary
+	// capable of running `wasm-tools component new`. Used to wrap the
+	// cargo-produced core module into a wasi:http@0.2.1 component
+	// (issue #415). When the binary is not on PATH the rust
+	// migration path returns ErrWasmToolsFailed before any compile
+	// work.
+	wasmToolsPath string
+	// cargoPath is the absolute path to a `cargo` binary capable of
+	// resolving the synthetic Cargo.toml the rust migration path
+	// writes into its temp dir. Same error semantics as
+	// wasmToolsPath.
+	cargoPath string
+	// witDir is the absolute path to a directory containing the
+	// canonical edge-cloud WIT tree (edge-cloud.wit + deps/*). The
+	// path is passed to `wit_bindgen::generate!` via its `path:`
+	// argument. The MigrationService is constructed with a
+	// per-process materialized copy of the embedded FS at
+	// edge-control-plane/internal/service/wit/; see
+	// NewMigrationService for the materialization step.
+	witDir string
 	// keyring stamps every new deployment's artifact (issue #307 PR1;
 	// was a single `*signing.Signer` before PR1). Required — set by
 	// the constructor; a nil keyring would cause `Migrate` and
@@ -109,10 +162,16 @@ type MigrationService struct {
 }
 
 // NewMigrationService creates a MigrationService.
+//
+// The constructor materializes the embedded WIT tree (see the wit
+// subpackage) into a per-process tmp dir and caches the absolute
+// path on the returned service. Operators who want a stable path
+// can set EDGE_WIT_DIR; the constructor uses that path verbatim
+// without touching the embedded copy.
 func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
 	artifactStore storage.ArtifactStore,
-	edgeMigratePath, wasiSdkPath, rustcPath string,
+	edgeMigratePath, wasiSdkPath, rustcPath, wasmToolsPath, cargoPath, witDir string,
 	keyring *signing.Keyring,
 ) *MigrationService {
 	return &MigrationService{
@@ -121,8 +180,219 @@ func NewMigrationService(
 		edgeMigratePath: edgeMigratePath,
 		wasiSdkPath:     wasiSdkPath,
 		rustcPath:       rustcPath,
+		wasmToolsPath:   wasmToolsPath,
+		cargoPath:       cargoPath,
+		witDir:          witDir,
 		keyring:         keyring,
 	}
+}
+
+// injectWitBindgen prepends a `wit_bindgen::generate!({ ... })` block
+// to the transformed Rust source and rewrites the transformer's
+// `use wasi::` imports to `use crate::wasi::` so they resolve
+// against the bindings the macro generates (issue #415,
+// edge-migrate-lib's rust_transformer.rs:44-50 + wit-bindgen 0.45's
+// `generate_all` placement convention — bindings land under
+// `crate::wasi::*`, not at the root). The macro emits the
+// `mod wasi { ... }` declarations the trailing `use` statements
+// need to be able to find. `path:` points at the materialized
+// canonical WIT tree (see wit.Materialize); `world` matches
+// `edge-runtime-handler`, the only world the FaaS migration path
+// supports today.
+func (s *MigrationService) injectWitBindgen(transformed []byte) []byte {
+	// Embed the WIT dir as a Rust string literal via `%q`. Go's `%q`
+	// quotes and escapes for Go syntax (not Rust), but for the
+	// characters our WIT dir can legally contain — ASCII
+	// backslashes and double quotes — the escape rules happen to
+	// match. os.MkdirTemp results on Linux/macOS don't contain
+	// backslashes; paths on Windows do and `%q` doubles each one,
+	// which is also valid Rust.
+	macro := []byte(fmt.Sprintf(
+		`wit_bindgen::generate!({
+    world: "edge-runtime-handler",
+    path: %q,
+    generate_all,
+});
+`, s.witDir))
+	// Rewrite the transformer's `use wasi::` imports so they
+	// resolve under `crate::wasi::` (wit-bindgen 0.45 generates
+	// items under `crate::wasi::*`, not at the crate root).
+	//
+	// Known limitation: the transformer's bare call sites
+	// (`filesystem::open(...)`, `filesystem::write(...)`,
+	// `TcpSocket::new(AddressFamily::Ipv4)`, etc.) were authored
+	// against rustc 1.93.0's bundled wit-component adapter API,
+	// which differs from the one generated by wit-bindgen 0.45.
+	// Capturing that incompatibility is follow-up issue #416;
+	// the Rust migration tests in this file are tagged with the
+	// expected-failure note below. Once the transformer is
+	// updated to emit against `crate::wasi::*` (matching the
+	// sample), this helper will fully wire end-to-end.
+	src := bytes.ReplaceAll(transformed, []byte("use wasi::"), []byte("use crate::wasi::"))
+	out := make([]byte, 0, len(macro)+len(src))
+	out = append(out, macro...)
+	out = append(out, src...)
+	return out
+}
+
+// compileRustAsComponent compiles the injected Rust source into a
+// wasm32 core module by shelling out to cargo (issue #415). It
+// creates a self-contained synthetic Cargo project in a per-call
+// tmp dir, writes Cargo.toml + src/lib.rs, runs
+// `cargo build --target wasm32-unknown-unknown --release`, and
+// returns the absolute path to the produced core module. The
+// caller is responsible for os.RemoveAll-ing the tmp dir and for
+// wrapping the core module into a component via wrapAsComponent.
+//
+// Bare `rustc` is insufficient because `wit_bindgen::generate!`
+// is a procedural macro that needs cargo's dependency resolution
+// (`--extern`, registry fetch, proc-macro loading) — exactly
+// mirroring samples/hello/Cargo.toml post-PR-#414.
+func (s *MigrationService) compileRustAsComponent(
+	ctx context.Context,
+	injected []byte,
+	appName string,
+	tmpBase string,
+) (coreWasmPath string, cargoDir string, err error) {
+	// Sanitize appName to a Rust package-name-compatible identifier
+	// (lowercase alnum + dashes, must start with a letter — package
+	// names can't start with a digit). The handler has already
+	// validated `^[a-z0-9][a-z0-9-]{0,62}$` so this is just
+	// defense-in-depth.
+	pkgName := sanitizeRustPackageName(appName)
+
+	dir, mkErr := os.MkdirTemp(tmpBase, "migrate-cargo-*")
+	if mkErr != nil {
+		return "", "", fmt.Errorf("compileRustAsComponent: mkdir: %w", mkErr)
+	}
+	cargoDir = dir
+
+	// Best-effort cleanup. Storing paths in named returns so the
+	// caller still sees them even on the error path.
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+
+	// Cargo.toml — pinned to wit-bindgen 0.45 to match the
+	// canonical samples/hello project (PR #414).
+	cargoToml := fmt.Sprintf(`[package]
+name = %q
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.45"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+`, pkgName)
+	if wErr := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte(cargoToml), 0o644); wErr != nil {
+		return "", dir, fmt.Errorf("compileRustAsComponent: write Cargo.toml: %w", wErr)
+	}
+
+	if mErr := os.MkdirAll(filepath.Join(dir, "src"), 0o755); mErr != nil {
+		return "", dir, fmt.Errorf("compileRustAsComponent: mkdir src: %w", mErr)
+	}
+	if wErr := os.WriteFile(filepath.Join(dir, "src", "lib.rs"), injected, 0o644); wErr != nil {
+		return "", dir, fmt.Errorf("compileRustAsComponent: write src/lib.rs: %w", wErr)
+	}
+
+	cmd := exec.CommandContext(ctx, s.cargoPath,
+		"build",
+		"--target", "wasm32-unknown-unknown",
+		"--release",
+		"--manifest-path", filepath.Join(dir, "Cargo.toml"),
+		"--target-dir", filepath.Join(dir, "target"),
+	)
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = stderr
+	cmd.Stdout = &bytes.Buffer{} // discard
+	if runErr := cmd.Run(); runErr != nil {
+		// Surface the cargo diagnostics so the caller can attach
+		// them to the typed error.
+		return "", dir, fmt.Errorf("%w: %s: %s",
+			ErrCargoBuildFailed, runErr.Error(), truncateStderr(stderr.String()))
+	}
+
+	core := filepath.Join(dir, "target", "wasm32-unknown-unknown", "release", pkgName+".wasm")
+	if _, statErr := os.Stat(core); statErr != nil {
+		return "", dir, fmt.Errorf("%w: expected output not found at %s", ErrCargoBuildFailed, core)
+	}
+	return core, dir, nil
+}
+
+// wrapAsComponent wraps a wasm32 core module into a wasi component
+// by invoking `wasm-tools component new --world
+// edge-runtime-handler` in place (issue #415). The wrap rewrites
+// the same path in place so the caller's path reference still
+// points at the component after the call returns. Mirrors the
+// precompile.PrecompileCwasm exec pattern at precompile.go:50-73.
+func (s *MigrationService) wrapAsComponent(
+	ctx context.Context,
+	coreWasmPath string,
+) error {
+	cmd := exec.CommandContext(ctx, s.wasmToolsPath,
+		"component", "new",
+		"--world", "edge-runtime-handler",
+		coreWasmPath,
+		"-o", coreWasmPath,
+	)
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = stderr
+	cmd.Stdout = &bytes.Buffer{}
+	if err := cmd.Run(); err != nil {
+		// Surface wasm-tools' diagnostics so the caller can
+		// explain *why* the wrap failed (most often: missing
+		// `wasi:http/incoming-handler` impl in the user source).
+		return fmt.Errorf("%w: %s: %s",
+			ErrWasmToolsFailed, err.Error(), truncateStderr(stderr.String()))
+	}
+	return nil
+}
+
+// truncateStderr keeps the error message bounded. rustc/clang/cargo/
+// wasm-tools can emit kilobytes of diagnostics; we only need the
+// tail for actionability.
+func truncateStderr(s string) string {
+	const max = 4 * 1024
+	if len(s) <= max {
+		return s
+	}
+	return "...(truncated)...\n" + s[len(s)-max:]
+}
+
+// sanitizeRustPackageName turns an edge-cloud app name into a
+// package-name-safe Rust identifier. Edge app names already match
+// `^[a-z0-9][a-z0-9-]{0,62}$` per the handler; this only needs to
+// replace non-identifier characters (dashes) and guarantee a
+// non-empty, alpha-leading result.
+func sanitizeRustPackageName(name string) string {
+	if name == "" {
+		return "edge_app"
+	}
+	out := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			out = append(out, c)
+		case c == '-':
+			out = append(out, '_')
+		default:
+			out = append(out, '_')
+		}
+	}
+	if out[0] >= '0' && out[0] <= '9' {
+		out = append([]byte{'a'}, out...)
+	}
+	return string(out)
 }
 
 // Migrate transforms the given C or Rust source to WASI source,
@@ -300,41 +570,41 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	var compileSentinel error
 	switch language {
 	case "rust":
-		// Write the transformed source to <tmp>.rs so rustc can
-		// read it by path.
-		tmpRs, err := os.CreateTemp("", "migrate-*.rs")
+		// Two-step pipeline (issue #415): inject
+		// `wit_bindgen::generate!` at byte 0, then `cargo build
+		// --target wasm32-unknown-unknown --release` (bare rustc
+		// cannot resolve the proc-macro), then `wasm-tools
+		// component new` to wrap the core module into a
+		// wasi:http@0.2.1 component.
+		injected := s.injectWitBindgen([]byte(transformed))
+		corePath, cargoDir, err := s.compileRustAsComponent(ctx, injected, appName, os.TempDir())
 		if err != nil {
-			return nil, fmt.Errorf("creating temp rs file: %w", err)
-		}
-		tmpRsPath := tmpRs.Name()
-		defer func() {
-			if removeErr := os.Remove(tmpRsPath); removeErr != nil && !os.IsNotExist(removeErr) {
-				log.Printf("migration service: failed to remove temp rs file: %v", removeErr)
+			defer func() { _ = os.RemoveAll(cargoDir) }()
+			compileSentinel = errors.Unwrap(err)
+			if compileSentinel == nil {
+				compileSentinel = ErrCargoBuildFailed
 			}
-		}()
-		if _, err := tmpRs.WriteString(transformed); err != nil {
-			if closeErr := tmpRs.Close(); closeErr != nil {
-				log.Printf("migration service: failed to close temp rs file: %v", closeErr)
-			}
-			return nil, fmt.Errorf("writing temp rs: %w", err)
+			compileErrMsg = err.Error()
+			break
 		}
-		if err := tmpRs.Close(); err != nil {
-			log.Printf("migration service: failed to close temp rs file: %v", err)
+		// The cargoDir is cleaned up once the wrap completes (or
+		// is cleaned up by the deferred RemoveAll on this branch).
+		defer func() { _ = os.RemoveAll(cargoDir) }()
+		// Move the cargo-produced core into tmpWasmPath so the
+		// rest of the flow (size check, SaveAndHash, signature)
+		// operates on a single canonical path. Then wrap in
+		// place.
+		if err := os.Rename(corePath, tmpWasmPath); err != nil {
+			compileErrMsg = fmt.Sprintf("moving cargo output to %s: %v", tmpWasmPath, err)
+			compileSentinel = ErrCargoBuildFailed
+			break
 		}
-
-		rustcCmd := exec.CommandContext(ctx, s.rustcPath,
-			"--target", "wasm32-wasip2",
-			"--crate-type=cdylib",
-			"--edition", "2021",
-			"-o", tmpWasmPath,
-			tmpRsPath,
-		)
-		var rustcErr bytes.Buffer
-		rustcCmd.Stderr = &rustcErr
-		compileSentinel = ErrRustcFailed
-		if err := rustcCmd.Run(); err != nil {
-			compileErrMsg = fmt.Sprintf("rustc failed: %s — %s", err, rustcErr.String())
+		if err := s.wrapAsComponent(ctx, tmpWasmPath); err != nil {
+			compileSentinel = ErrWasmToolsFailed
+			compileErrMsg = err.Error()
+			break
 		}
+		// success — compileErrMsg stays empty
 	default: // "c"
 		clangBin := filepath.Join(s.wasiSdkPath, "clang")
 		clangCmd := exec.CommandContext(ctx, clangBin,
@@ -849,6 +1119,16 @@ func (s *MigrationService) MigrateTree(
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("no files in tree")
 	}
+	// Issue #415: multi-file Rust trees are not supported in the
+	// cargo-based pipeline yet. The legacy bare-rustc path emitted
+	// wasi:http@0.2.4 (rejected by wasmtime 45.0.3); the fix
+	// requires a synthesized Cargo.toml + multi-file src/lib.rs
+	// wrapper, which is a follow-up. Reject at the service boundary
+	// (handler maps to 400). Single-file Rust is routed through
+	// `Migrate` instead.
+	if language == "rust" {
+		return nil, fmt.Errorf("rust tree-mode migration is not supported; submit a single-file project via POST /api/v1/migrate")
+	}
 
 	// Create a temp dir for the source files + transformed output.
 	tmpDir, err := os.MkdirTemp("", "migrate-tree-*.d")
@@ -1059,45 +1339,22 @@ func (s *MigrationService) MigrateTree(
 	}()
 
 	var compileErrMsg string
-	switch language {
-	case "rust":
-		// rustc takes a list of input files plus --crate-type=cdylib
-		// so all .rs files compile to one wasm. Note: a multi-file
-		// Rust tree typically needs a Cargo.toml in the temp dir;
-		// that's a v2 follow-up. For v1 the developer is expected
-		// to upload a single-file Rust project, or multiple .rs
-		// files that don't have cross-module `mod` decls.
-		args := []string{
-			"--target", "wasm32-wasip2",
-			"--crate-type=cdylib",
-			"--edition", "2021",
-			"-o", tmpWasmPath,
-		}
-		for _, wf := range written {
-			args = append(args, wf.wasiCPath)
-		}
-		rustcCmd := exec.CommandContext(ctx, s.rustcPath, args...)
-		var rustcErrBuf bytes.Buffer
-		rustcCmd.Stderr = &rustcErrBuf
-		if err := rustcCmd.Run(); err != nil {
-			compileErrMsg = fmt.Sprintf("rustc failed: %s — %s", err, rustcErrBuf.String())
-		}
-	default: // "c"
-		clangBin := filepath.Join(s.wasiSdkPath, "clang")
-		args := []string{
-			"--target=wasm32-wasip2", "-nostdlib",
-			"-I", tmpDir,
-			"-o", tmpWasmPath,
-		}
-		for _, wf := range written {
-			args = append(args, wf.wasiCPath)
-		}
-		clangCmd := exec.CommandContext(ctx, clangBin, args...)
-		var clangErrBuf bytes.Buffer
-		clangCmd.Stderr = &clangErrBuf
-		if err := clangCmd.Run(); err != nil {
-			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErrBuf.String())
-		}
+	// Issue #415: MigrateTree rejects language=="rust" at function
+	// entry; only C reaches this compile switch.
+	clangBin := filepath.Join(s.wasiSdkPath, "clang")
+	args := []string{
+		"--target=wasm32-wasip2", "-nostdlib",
+		"-I", tmpDir,
+		"-o", tmpWasmPath,
+	}
+	for _, wf := range written {
+		args = append(args, wf.wasiCPath)
+	}
+	clangCmd := exec.CommandContext(ctx, clangBin, args...)
+	var clangErrBuf bytes.Buffer
+	clangCmd.Stderr = &clangErrBuf
+	if err := clangCmd.Run(); err != nil {
+		compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErrBuf.String())
 	}
 
 	if compileErrMsg != "" {

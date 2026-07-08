@@ -1,0 +1,134 @@
+package edge:cloud@0.2.0;
+
+interface kv-store {
+  get: func(key: string) -> option<list<u8>>;
+  set: func(key: string, value: list<u8>, ttl-secs: option<u32>);
+  delete: func(key: string);
+  list-keys: func(prefix: string) -> list<string>;
+  get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+  set-many: func(items: list<tuple<string, list<u8>, option<u32>>>);
+  delete-many: func(keys: list<string>);
+  exists: func(key: string) -> bool;
+  clear: func();
+}
+
+interface cache {
+  get: func(key: string) -> option<list<u8>>;
+  set: func(key: string, value: list<u8>, ttl-secs: option<u32>);
+  delete: func(key: string);
+  clear: func();
+  size: func() -> u32;
+  exists: func(key: string) -> bool;
+  list-keys: func(prefix: string) -> list<string>;
+  get-many: func(keys: list<string>) -> list<option<list<u8>>>;
+  set-many: func(items: list<tuple<string, list<u8>, option<u32>>>);
+  delete-many: func(keys: list<string>);
+}
+
+interface observe {
+  enum log-level {
+    error,
+    warn,
+    info,
+    debug,
+    trace,
+  }
+
+  record log-record {
+    timestamp-ms: u64,
+    level: log-level,
+    message: string,
+    labels: list<tuple<string, string>>,
+  }
+
+  increment-counter: func(name: string, labels: list<tuple<string, string>>);
+  record-gauge: func(name: string, value: f64, labels: list<tuple<string, string>>);
+  record-histogram: func(name: string, value: f64, labels: list<tuple<string, string>>);
+  emit-log: func(level: string, message: string, labels: list<tuple<string, string>>);
+  emit-log-record: func(r: log-record);
+}
+
+interface time {
+  now: func() -> u64;
+  sleep: func(duration-ms: u64);
+  resolution: func() -> u64;
+}
+
+interface scheduling {
+  schedule-once: func(delay-ms: u64, payload: list<u8>) -> string;
+  schedule-repeating: func(interval-ms: u64, payload: list<u8>) -> string;
+  cancel-scheduled: func(id: string);
+}
+
+interface process {
+  get-env: func(key: string) -> option<string>;
+  get-all-env: func() -> list<tuple<string, string>>;
+  get-args: func() -> list<string>;
+  get-cwd: func() -> result<string, string>;
+  exit: func(code: u32);
+}
+
+// Long-running world. Components implement _start and self-host any
+// TCP servers they need via wasi:sockets. They can also make outbound
+// HTTP calls via wasi:http/outgoing-handler.
+//
+// v0.2 NOTE: native `async func` ABI is not yet available — wit-parser
+// 0.217 (bundled with wasmtime 25) does not recognize the `async`
+// keyword. Every function below is plain `func(...)`; the host impls
+// are sync and bridge host-internal async work via
+// `tokio::Handle::current().block_on(...)`. The async ABI migration is
+// deferred to v0.3 (tracks wit-parser >= 0.244).
+//
+// The world pulls in the canonical `wasi:cli/command` wasi:* surface
+// via `include` rather than re-importing each interface. The wasi:cli
+// world supplies wasi:io/{error,streams,poll}, wasi:clocks/{monotonic,
+// wall}-clock, wasi:filesystem/{types,preopens}, wasi:random/*,
+// wasi:sockets/*, wasi:cli/*; we then layer our edge:cloud/* imports
+// on top. At Rust link time we call `wasmtime_wasi::add_to_linker_async`
+// (registers every wasi:cli/command Host impl) and
+// `wasmtime_wasi_http::add_only_http_to_linker_async` (registers
+// wasi:http/{outgoing-handler,types}) — see `linker.rs`.
+world edge-runtime {
+  include wasi:cli/command@0.2.1;
+
+  // edge:cloud — host-provided tenant interfaces
+  import kv-store;
+  import cache;
+  import observe;
+  import time;
+  import scheduling;
+  import process;
+}
+
+// FaaS world. Components implement wasi:http/incoming-handler and the
+// host calls them per request. The host owns the TCP listener; the
+// guest is short-lived per call.
+//
+// We pull in wasi:cli/command (same wasi:* surface as the long-running
+// world) for filesystem + clocks + randomness + IO + sockets. The
+// `wasi:http/incoming-handler` export is what the worker uses to
+// dispatch per request via `wasmtime_wasi_http::ProxyPre`. The
+// `wasi:http/outgoing-handler` + `wasi:http/types` imports come for
+// free via the `add_only_http_to_linker_async` call in linker.rs.
+world edge-runtime-handler {
+  include wasi:cli/command@0.2.1;
+
+  // edge:cloud — host-provided tenant interfaces
+  import kv-store;
+  import cache;
+  import observe;
+  import time;
+  import scheduling;
+  import process;
+
+  // The handler export — this is what detect::detect_execution_model
+  // routes through wasmtime_wasi_http::ProxyPre. The guest's `handle`
+  // is called once per inbound request via
+  // `proxy.wasi_http_incoming_handler().call_handle(...)`.
+  export wasi:http/incoming-handler@0.2.1;
+
+  // The guest may make outbound HTTP calls (e.g., call a third-party
+  // API). The runtime's wasi:http wiring routes these through the
+  // supervisor's EgressPolicy.
+  import wasi:http/outgoing-handler@0.2.1;
+}

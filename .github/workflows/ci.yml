@@ -353,6 +353,33 @@ jobs:
           path: edge-control-plane/test-logs.txt
 
   # ============================================================
+  # WIT-DRIFT-CHECK — keep the vendored WIT tree in sync
+  # ============================================================
+  # The CP's Rust migration path (issue #415) embeds the canonical
+  # WIT tree at edge-control-plane/internal/service/wit/ so the
+  # binary is self-contained at runtime. The canonical source
+  # remains at the top-level wit/ directory (promoted in PR #414).
+  # This job fails if the two diverge so the vendored copy can't
+  # silently rot.
+  wit-drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff canonical vs vendored WIT
+        run: |
+          # Exclude embed.go — it's the Go embed shim, not part of
+          # the canonical WIT tree (which lives at the top-level
+          # wit/ directory). Without --exclude, the drift check
+          # would always fail because the vendored copy has one
+          # extra file.
+          if ! diff -r --exclude embed.go wit edge-control-plane/internal/service/wit > wit-drift.txt; then
+            echo "::error::wit-drift-check failed: the vendored copy under edge-control-plane/internal/service/wit is out of sync with the canonical source under wit/. Re-sync via 'cp -R wit/. edge-control-plane/internal/service/wit/' and commit the result. Full diff:"
+            cat wit-drift.txt
+            exit 1
+          fi
+
+  # ============================================================
   # TYPOS — spell check source files
   # ============================================================
   typos:

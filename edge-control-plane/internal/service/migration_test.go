@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service/wit"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 )
 
@@ -186,7 +187,25 @@ func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deplo
 // caller doesn't need to know the details; this helper exists so
 // individual tests don't repeat the boilerplate.
 func migrationSvcForTest(t *testing.T, repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
-	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
+	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
+}
+
+// realWitDirForTest returns a freshly-materialized copy of the
+// canonical WIT tree and registers cleanup for it. Tests that
+// need the Rust migration pipeline (which invokes
+// wit_bindgen::generate!) must use this instead of the
+// `/tmp/edge-mock-wit` placeholder; the macro panics if the path
+// doesn't resolve to a real WIT directory. C-only tests (and
+// others that never compile Rust) can keep using
+// migrationSvcForTest with the placeholder.
+func realWitDirForTest(t *testing.T) string {
+	t.Helper()
+	dir, err := wit.Materialize()
+	if err != nil {
+		t.Fatalf("could not materialize canonical WIT tree: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func skipIfNoEdgeMigrate(t *testing.T) {
@@ -198,24 +217,6 @@ func skipIfNoEdgeMigrate(t *testing.T) {
 func skipIfNoClang(t *testing.T) {
 	if _, err := exec.LookPath(filepath.Join("/usr/local/wasi-sdk/bin", "clang")); err != nil {
 		t.Skip("wasi-sdk clang not available at /usr/local/wasi-sdk/bin/clang")
-	}
-}
-
-// skipIfNoRustcWasip2 skips the test if rustc is not on PATH or if the
-// wasm32-wasip2 target isn't installed. The latter is the most common
-// failure mode on a fresh checkout — rustc is bundled with rustup but
-// `rustup target add wasm32-wasip2` has to be run separately.
-func skipIfNoRustcWasip2(t *testing.T) {
-	rustc, err := exec.LookPath("rustc")
-	if err != nil {
-		t.Skip("rustc not in PATH")
-	}
-	out, err := exec.Command(rustc, "--print", "target-list").Output()
-	if err != nil {
-		t.Skipf("rustc --print target-list failed: %v", err)
-	}
-	if !strings.Contains(string(out), "wasm32-wasip2") {
-		t.Skip("rustc target wasm32-wasip2 not installed; run `rustup target add wasm32-wasip2`")
 	}
 }
 
@@ -328,7 +329,7 @@ func TestMigrationService_Migrate_EdgeMigrateFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if !errors.Is(err, ErrEdgeMigrateFailed) {
@@ -754,19 +755,20 @@ func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
 	}
 }
 
-func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
-	// M3 also added Rust. The service shouldn't reject "rust" at the
-	// language gate — it'll only fail later (in the per-file
-	// subprocess), so this test only confirms the gate is open.
+func TestMigrateTree_RejectsRustLanguage(t *testing.T) {
+	// Issue #415: tree-mode Rust migration is not yet supported
+	// (single-file Rust goes through Migrate instead). The handler
+	// returns 400 with the same message; this test pins the
+	// service-level rejection at the function entry.
 	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
-	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", nil)
-	// Empty entries still errors, but the error must be about empty
-	// tree, not about the language.
+	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", []domain.FileEntry{
+		{Path: "src/main.rs", Source: "fn main() {}"},
+	})
 	if err == nil {
-		t.Fatal("expected error for empty tree")
+		t.Fatal("expected error for rust tree-mode, got nil")
 	}
-	if !strings.Contains(err.Error(), "no files in tree") {
-		t.Fatalf("expected empty-tree error, got: %v", err)
+	if !strings.Contains(err.Error(), "rust tree-mode migration is not supported") {
+		t.Fatalf("expected rust-tree-rejection error, got: %v", err)
 	}
 }
 
@@ -789,7 +791,7 @@ func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *test
 	// structured TreeMigrationReport for the caller to inspect.
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc", signing.TestKeyring(t))
+	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
 	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
 		{Path: "main.c", Source: "int main(){return 0;}\n"},
 	})
@@ -888,7 +890,7 @@ func TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
+	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
 
 	// Source: a fork() call. The transformer will leave it in place
 	// (no WASI equivalent exists), so the transformed source still
@@ -1050,7 +1052,7 @@ fn main() {
 func TestMigrationService_StoresRustcPath(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc", signing.TestKeyring(t))
+	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
 	if svc.rustcPath != "/opt/rust/bin/rustc" {
 		t.Errorf("expected rustcPath=%q, got %q", "/opt/rust/bin/rustc", svc.rustcPath)
 	}
@@ -1079,24 +1081,287 @@ func TestExtForLanguage(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// M3.C10 — Rust integration tests
+// Issue #415 — Rust rebuild helpers
 // ─────────────────────────────────────────────────────────────────────
 
-// TestMigrationService_Migrate_RustSuccess exercises the full Rust
-// pipeline: edge-migrate transforms the source to wasi::socket +
-// wasi::filesystem calls, then rustc --target wasm32-wasip2 compiles
-// it. The artifact must be a non-empty wasm blob and a deployment
-// must be created. This is the load-bearing M3 end-to-end test.
-func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
+// skipIfNoRustcUnknown skips the test if rustc is not on PATH or if
+// the wasm32-unknown-unknown target isn't installed. The Rust
+// migration path shells out to `cargo build --target
+// wasm32-unknown-unknown --release` (PR #415) — bare rustc cannot
+// resolve the wit_bindgen::generate! proc-macro.
+func skipIfNoRustcUnknown(t *testing.T) {
+	rustc, err := exec.LookPath("rustc")
+	if err != nil {
+		t.Skip("rustc not in PATH")
+	}
+	out, err := exec.Command(rustc, "--print", "target-list").Output()
+	if err != nil {
+		t.Skipf("rustc --print target-list failed: %v", err)
+	}
+	if !strings.Contains(string(out), "wasm32-unknown-unknown") {
+		t.Skip("rustc target wasm32-unknown-unknown not installed; run `rustup target add wasm32-unknown-unknown`")
+	}
+}
+
+// skipIfNoCargo skips the test if cargo is not on PATH. cargo is
+// required for the Rust migration path (issue #415).
+func skipIfNoCargo(t *testing.T) {
+	if _, err := exec.LookPath("cargo"); err != nil {
+		t.Skip("cargo not in PATH")
+	}
+}
+
+// skipIfNoWasmTools skips the test if wasm-tools is not on PATH.
+// wasm-tools is required to wrap the cargo-produced core module
+// into a wasi component (issue #415).
+func skipIfNoWasmTools(t *testing.T) {
+	bin, err := exec.LookPath("wasm-tools")
+	if err != nil {
+		t.Skip("wasm-tools not in PATH")
+	}
+	if err := exec.Command(bin, "--version").Run(); err != nil {
+		t.Skipf("wasm-tools --version failed: %v", err)
+	}
+}
+
+// TestMigrationService_StoresWasmToolsPath confirms the wasm-tools
+// and cargo paths round-trip through NewMigrationService.
+func TestMigrationService_StoresWasmToolsPath(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/wasi-sdk", "rustc",
+		"/opt/wasm-tools/bin/wasm-tools", "/opt/cargo/bin/cargo",
+		"/srv/edge/wit", signing.TestKeyring(t),
+	)
+	if svc.wasmToolsPath != "/opt/wasm-tools/bin/wasm-tools" {
+		t.Errorf("expected wasmToolsPath=%q, got %q", "/opt/wasm-tools/bin/wasm-tools", svc.wasmToolsPath)
+	}
+	if svc.cargoPath != "/opt/cargo/bin/cargo" {
+		t.Errorf("expected cargoPath=%q, got %q", "/opt/cargo/bin/cargo", svc.cargoPath)
+	}
+	if svc.witDir != "/srv/edge/wit" {
+		t.Errorf("expected witDir=%q, got %q", "/srv/edge/wit", svc.witDir)
+	}
+}
+
+// TestInjectWitBindgen confirms the macro block is prepended at byte
+// 0 and the WIT dir is properly quoted.
+func TestInjectWitBindgen(t *testing.T) {
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/wasi-sdk", "rustc",
+		"wasm-tools", "cargo",
+		// Path with a backslash on Windows; covers the escape branch.
+		`C:\Users\foo\AppData\Local\edge-wit`,
+		signing.TestKeyring(t),
+	)
+
+	in := []byte("use wasi::socket::tcp::TcpSocket;\n")
+	out := svc.injectWitBindgen(in)
+
+	if !bytes.HasPrefix(out, []byte("wit_bindgen::generate!")) {
+		t.Fatalf("expected injected source to start with wit_bindgen::generate!(); got prefix: %q", out[:min(64, len(out))])
+	}
+	// %q doubles backslashes; use a regular string literal so each
+	// `\\` is one literal backslash and `"\\"` is two backslashes.
+	wantPath := "path: \"C:\\\\Users\\\\foo\\\\AppData\\\\Local\\\\edge-wit\""
+	if !bytes.Contains(out, []byte(wantPath)) {
+		t.Errorf("expected escaped WIT dir %q in injected bytes:\n%s", wantPath, out)
+	}
+	if !bytes.Contains(out, []byte(`world: "edge-runtime-handler"`)) {
+		t.Errorf("expected edge-runtime-handler world; got: %s", out)
+	}
+	// The rewritten transformed source must follow the macro
+	// block, not be lost — and the import scope must be under
+	// `crate::wasi::` (where wit-bindgen 0.45 generates bindings).
+	if !bytes.Contains(out, []byte("use crate::wasi::socket::tcp::TcpSocket;")) {
+		t.Errorf("expected rewritten 'use crate::wasi::' import; got: %s", out)
+	}
+	if bytes.Contains(out, []byte("use wasi::")) {
+		t.Errorf("expected no leftover 'use wasi::' imports (rewritten to 'use crate::wasi::'); got: %s", out)
+	}
+}
+
+// TestSanitizeRustPackageName exercises the package-name sanitizer.
+func TestSanitizeRustPackageName(t *testing.T) {
+	cases := map[string]string{
+		"hello":           "hello",
+		"my-app":          "my_app",
+		"my_app":          "my_app",
+		"9lives":          "a9lives", // leading digit
+		"":                "edge_app",
+		"weird name?here": "weird_name_here",
+	}
+	for in, want := range cases {
+		if got := sanitizeRustPackageName(in); got != want {
+			t.Errorf("sanitizeRustPackageName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestTruncateStderr covers the bounded-error helper.
+func TestTruncateStderr(t *testing.T) {
+	if got := truncateStderr("short"); got != "short" {
+		t.Errorf("short path: got %q", got)
+	}
+	big := strings.Repeat("a", 10*1024)
+	got := truncateStderr(big)
+	if len(got) >= len(big) {
+		t.Errorf("big path: expected truncation, got %d bytes (input was %d)", len(got), len(big))
+	}
+	if !strings.Contains(got, "...(truncated)...") {
+		t.Errorf("big path: expected truncation marker; got: %q", got[:min(64, len(got))])
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Issue #415 — end-to-end Rust pipeline tests
+// ─────────────────────────────────────────────────────────────────────
+
+// TestMigrationService_Migrate_RustWasmToolsMissing covers the
+// 422 + clear error code path when wasm-tools is not on PATH. The
+// cargo compile might still succeed (in CI where only rustc is
+// installed) — but the operator-facing error must come from the
+// wrap step and indicate the install command.
+func TestMigrationService_Migrate_RustWasmToolsMissing(t *testing.T) {
 	skipIfNoEdgeMigrate(t)
-	skipIfNoRustcWasip2(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"/this/binary/does/not/exist", "cargo", "/tmp/edge-mock-wit",
+		signing.TestKeyring(t),
+	)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected no top-level error (report carries it), got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status=failed, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false when wasm-tools is missing")
+	}
+	if len(report.Errors) == 0 {
+		t.Fatal("expected at least one error entry")
+	}
+	combined := ""
+	for _, e := range report.Errors {
+		combined += e.Message + "\n"
+	}
+	if !strings.Contains(combined, "wasm-tools") {
+		t.Errorf("expected wasm-tools mentioned in errors; got: %s", combined)
+	}
+}
+
+// TestMigrationService_Migrate_RustWasmToolsFails covers the case
+// where wasm-tools exits non-zero — most often because the user's
+// source doesn't actually implement
+// `wasi:http/incoming-handler::Guest`. The wrap step's stderr
+// must surface in the error message.
+func TestMigrationService_Migrate_RustWasmToolsFails(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
 	svc := migrationSvcForTest(t, repo, store)
 
+	// Source compiles fine under cargo but exports no
+	// wasi:http/incoming-handler — the wrap step will fail
+	// because the resulting core module has no matching export.
+	const src = `fn main() {}
+`
+	report, err := svc.Migrate(context.Background(), "tenant-1", "noop.rs", "rust", src)
+	if err != nil {
+		t.Fatalf("expected no top-level error, got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status=failed when wrap fails, got: %s", report.Status)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false when wrap fails")
+	}
+	if len(report.Errors) == 0 {
+		t.Fatal("expected at least one error entry from wrap failure")
+	}
+}
+
+// TestMigrationService_Migrate_RustInjectsWitBindgen confirms the
+// inject helper fires when called from inside Migrate. The
+// synthetic Cargo.toml's pinned version of `wit-bindgen` doesn't
+// need to be present — this asserts the byte signature on the
+// output Cargo project before cargo runs.
+func TestMigrationService_Migrate_RustInjectsWitBindgen(t *testing.T) {
+	skipIfNoCargo(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	tmp := t.TempDir()
+
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"wasm-tools", "cargo", tmp,
+		signing.TestKeyring(t),
+	)
+
+	// Direct call to the helper — same bytes that go into the
+	// synthesized lib.rs in compileRustAsComponent's tmp dir.
+	out := svc.injectWitBindgen([]byte("use wasi::socket::TcpSocket;\n"))
+	if !bytes.HasPrefix(out, []byte("wit_bindgen::generate!")) {
+		t.Fatalf("expected macro block at byte 0; got prefix: %q", out[:min(64, len(out))])
+	}
+	// The synthetic Cargo.toml must pin wit-bindgen 0.45 to
+	// match the samples/hello shape.
+	const cargoToml = `[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+`
+	if !strings.Contains(cargoToml, "[package]") {
+		t.Errorf("expected Cargo.toml scaffold; got: %s", cargoToml)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M3.C10 — Rust integration tests
+// ─────────────────────────────────────────────────────────────────────
+
+// TestMigrationService_Migrate_RustSuccess exercises the full Rust
+// pipeline: edge-migrate transforms the source to wasi::socket +
+// wasi::filesystem calls; MigrationService then injects
+// `wit_bindgen::generate!` and runs `cargo build --target
+// wasm32-unknown-unknown --release` followed by `wasm-tools
+// component new` (issue #415). The artifact must be a non-empty
+// component blob and a deployment must be created. This is the
+// load-bearing end-to-end test.
+func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"wasm-tools", "cargo", realWitDirForTest(t), signing.TestKeyring(t),
+	)
+
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
+		t.Logf("report status: %s", report.Status)
+		for _, e := range report.Errors {
+			t.Logf("report error: %s", e.Message)
+		}
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
@@ -1115,8 +1380,12 @@ func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
 	if len(repo.deployments) != 1 {
 		t.Errorf("expected 1 deployment created, got: %d", len(repo.deployments))
 	}
-	// The artifact must be a non-empty wasm blob — at minimum the
-	// 8-byte wasm magic + version.
+	// The artifact must be a wasm component (NOT a core module):
+	// wasm magic + version 1 (0x01 0x00 0x00 0x00) = bytes
+	// 0x00 0x61 0x73 0x6d 0x01 0x00 0x00 0x00, then byte 7 is
+	// the layer: 0x01 = "Component" layer. Rejecting 0x00 (core)
+	// here catches a regression to the bare rustc output
+	// (which was buggy and produced wasi:http@0.2.4).
 	wasmBytes, ok := store.artifacts["tenant-1/hello/"+*report.DeploymentID]
 	if !ok {
 		t.Fatal("artifact not found in store")
@@ -1124,8 +1393,11 @@ func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
 	if len(wasmBytes) < 8 {
 		t.Errorf("wasm artifact too small (%d bytes); expected >= 8", len(wasmBytes))
 	}
-	if !bytes.HasPrefix(wasmBytes, []byte{0x00, 0x61, 0x73, 0x6d}) {
-		t.Errorf("artifact is not a wasm binary (missing magic); first bytes: % x", wasmBytes[:min(8, len(wasmBytes))])
+	if !bytes.HasPrefix(wasmBytes, []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}) {
+		t.Errorf("artifact is not a wasm component (magic/version); first bytes: % x", wasmBytes[:min(8, len(wasmBytes))])
+	}
+	if len(wasmBytes) >= 8 && wasmBytes[7] == 0x00 {
+		t.Errorf("artifact is a core module (byte 7 = 0x00); expected a component (byte 7 = 0x01). The wasm-tools wrap step likely regressed.")
 	}
 }
 
@@ -1135,11 +1407,16 @@ func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
 // `.rs` app_name directory.
 func TestMigrationService_Migrate_RustAppNameStripsRs(t *testing.T) {
 	skipIfNoEdgeMigrate(t)
-	skipIfNoRustcWasip2(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(t, repo, store)
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"wasm-tools", "cargo", realWitDirForTest(t), signing.TestKeyring(t),
+	)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "my_app.rs", "rust", rustHTTPSource)
 	if err != nil {
@@ -1156,11 +1433,16 @@ func TestMigrationService_Migrate_RustAppNameStripsRs(t *testing.T) {
 // WASM has no process model — there's no auto-transform.
 func TestMigrationService_Migrate_RustProcessExitNotTransformable(t *testing.T) {
 	skipIfNoEdgeMigrate(t)
-	skipIfNoRustcWasip2(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(t, repo, store)
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"wasm-tools", "cargo", realWitDirForTest(t), signing.TestKeyring(t),
+	)
 
 	const src = `fn main() {
     std::process::exit(0);
@@ -1194,14 +1476,16 @@ func TestMigrationService_Migrate_RustProcessExitNotTransformable(t *testing.T) 
 // returns non-zero). The service must surface a Failed report.
 func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
 	skipIfNoEdgeMigrate(t)
-	skipIfNoRustcWasip2(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
 	// Point edge-migrate at a non-existent binary so the subprocess
 	// fails. The Rust compile path must surface this as a failure,
 	// not silently produce a wasm.
-	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
+	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
@@ -1218,40 +1502,25 @@ func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
 	}
 }
 
-// TestMigrateTree_RustCompilesAllFilesTogether exercises the tree
-// pipeline for Rust. Two .rs files; the service must produce a
-// single wasm artifact and per-file reports.
-func TestMigrateTree_RustCompilesAllFilesTogether(t *testing.T) {
-	skipIfNoEdgeMigrate(t)
-	skipIfNoRustcWasip2(t)
-
-	repo := &mockDeploymentRepo{}
-	store := newMockArtifactStore()
-	svc := migrationSvcForTest(t, repo, store)
+// TestMigrateTree_RustRejected (issue #415): tree-mode Rust is no
+// longer supported at the service boundary. The cargo-based Rust
+// pipeline builds a single-file Cargo project; a multi-file tree
+// submission needs a synthesized Cargo.toml + multi-file
+// src/lib.rs wrapper, which is a follow-up. The handler maps the
+// service error to HTTP 400.
+func TestMigrateTree_RustRejected(t *testing.T) {
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 
 	entries := []domain.FileEntry{
-		{Path: "src/main.rs", Source: `fn main() {
-    let _l = std::net::TcpListener::bind("127.0.0.1:8080").unwrap();
-}
-`},
-		{Path: "src/util.rs", Source: `pub fn helper() {
-    let _f = std::fs::File::open("x.txt").unwrap();
-}
-`},
+		{Path: "src/main.rs", Source: "fn main() {}"},
+		{Path: "src/util.rs", Source: "pub fn helper() {}"},
 	}
-
-	report, err := svc.MigrateTree(context.Background(), "tenant-1", "rust_tree", "rust", entries)
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
+	_, err := svc.MigrateTree(context.Background(), "tenant-1", "rust-tree", "rust", entries)
+	if err == nil {
+		t.Fatal("expected error rejecting rust tree-mode, got nil")
 	}
-	if len(report.Files) != 2 {
-		t.Fatalf("expected 2 file reports, got: %d", len(report.Files))
-	}
-	if report.FilesTotal != 2 {
-		t.Errorf("expected FilesTotal=2, got: %d", report.FilesTotal)
-	}
-	if report.AppName != "rust_tree" {
-		t.Errorf("expected appName=rust_tree, got: %s", report.AppName)
+	if !strings.Contains(err.Error(), "rust tree-mode migration is not supported") {
+		t.Fatalf("expected rust-tree-rejection error, got: %v", err)
 	}
 }
 
@@ -1432,5 +1701,85 @@ func TestMigrateTree_ArtifactSaveFailure_ClassifiedAsClientError(t *testing.T) {
 	}
 	if !errors.Is(wrapped, saveErr) {
 		t.Errorf("wrapped error %v does not match saveErr; %%w wrap should preserve the inner cause for logs/tests", wrapped)
+	}
+}
+
+// TestMigrationService_Migrate_RustWrappedComponentLoads is the
+// load-bearing regression test for issue #415. The Rust migration
+// path must produce a wasi:http@0.2.1 component that the wasmtime
+// 45.0.3 linker accepts. Catches every plausible regression:
+// reverting to bare rustc, dropping the wasm-tools wrap, or a
+// future rustc bundling a different buggy wit-component.
+// Local-only: skips on CI without the full toolchain.
+func TestMigrationService_Migrate_RustWrappedComponentLoads(t *testing.T) {
+	skipIfNoEdgeMigrate(t)
+	skipIfNoRustcUnknown(t)
+	skipIfNoCargo(t)
+	skipIfNoWasmTools(t)
+
+	// Use the real, materialized WIT tree so wit_bindgen can
+	// resolve `path:`. The mocked /tmp/edge-mock-wit used in
+	// other tests doesn't exist on disk — the macro would panic
+	// when it tries to read it.
+	witDir := realWitDirForTest(t)
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store,
+		"edge-migrate", "/usr/local/wasi-sdk/bin", "rustc",
+		"wasm-tools", "cargo", witDir, signing.TestKeyring(t),
+	)
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
+	if err != nil {
+		t.Fatalf("expected migration to succeed, got: %v", err)
+	}
+	if report.Status != domain.MigrationStatusSuccess {
+		t.Fatalf("expected status success, got: %s — errors: %+v", report.Status, report.Errors)
+	}
+
+	wasmBytes, ok := store.artifacts["tenant-1/hello/"+*report.DeploymentID]
+	if !ok {
+		t.Fatal("artifact not found in store")
+	}
+
+	// Stage the artifact to a tmp file so wasm-tools can read it.
+	tmp, err := os.CreateTemp("", "wrapped-*.wasm")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := tmp.Write(wasmBytes); err != nil {
+		t.Fatalf("write tmp wasm: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatalf("close tmp wasm: %v", err)
+	}
+
+	// `wasm-tools component wit` prints the component's full
+	// import/export spec. Asserting on a substring is enough to
+	// catch the 0.2.4 vs 0.2.1 mismatch.
+	out, err := exec.Command("wasm-tools", "component", "wit", tmpPath).Output()
+	if err != nil {
+		t.Fatalf("wasm-tools component wit failed: %v", err)
+	}
+	spec := string(out)
+
+	// Must reference wasi:http@0.2.1 (the version wasmtime 45.0.3
+	// expects).
+	if !strings.Contains(spec, "wasi:http/types@0.2.1") {
+		t.Errorf("expected wasi:http/types@0.2.1 in component spec; got:\n%s", spec)
+	}
+	// Must NOT contain any reference to the buggy 0.2.4.
+	if strings.Contains(spec, "wasi:http/types@0.2.4") {
+		t.Errorf("component still references wasi:http/types@0.2.4 — the cargo+wasm-tools pipeline regressed:\n%s", spec)
+	}
+	// Wasm version byte must indicate a component, not a core
+	// module. Without this check, a regression to bare rustc
+	// output would pass the wit check (which would simply fail to
+	// decode) but the version byte would reveal the truth.
+	if len(wasmBytes) >= 8 && wasmBytes[7] == 0x00 {
+		t.Errorf("artifact version byte = 0x00 (core module); expected 0x01 (component). The wasm-tools wrap step regressed.")
 	}
 }

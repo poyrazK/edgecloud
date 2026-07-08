@@ -791,6 +791,22 @@ type MigrationConfig struct {
 	// empty, the pre-compilation step is skipped and workers JIT-compile
 	// lazily on first load. Set via EDGE_WASM2CWASM_PATH env var.
 	Wasm2CwasmPath string `yaml:"wasm2cwasm_path" env:"EDGE_WASM2CWASM_PATH"`
+	// WasmToolsPath is the path to the wasm-tools binary used by the
+	// rust migration path to wrap the cargo-produced core module into a
+	// wasi:http@0.2.1 component (issue #415 — wasi:http version
+	// mismatch). The default "wasm-tools" resolves via $PATH. Operators
+	// must install wasm-tools on the CP host (cargo install
+	// wasm-tools --locked). The migration returns 422 with a clear
+	// error if this binary is missing.
+	WasmToolsPath string `yaml:"wasm_tools_path" env:"EDGE_WASM_TOOLS_PATH" envDefault:"wasm-tools"`
+	// CargoPath is the path to the cargo binary used by the rust
+	// migration path to compile the user-submitted source against the
+	// canonical WIT tree (issue #415 — bare rustc cannot resolve the
+	// wit_bindgen::generate! proc-macro or its wasi:* dependency
+	// surface). The default "cargo" resolves via $PATH. The migration
+	// returns 422 with a clear error if this binary is missing or
+	// the wasm32-unknown-unknown target is not installed.
+	CargoPath string `yaml:"cargo_path" env:"EDGE_CARGO_PATH" envDefault:"cargo"`
 }
 
 // SigningConfig configures the Ed25519 signing key used to sign
