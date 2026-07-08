@@ -79,6 +79,37 @@ CI jobs:
 
 `.github/workflows/preview.yml` is a `deploy-preview` job that is **DISABLED** (`if: false`) — the underlying action had a `$CARGO_HOME/bin` PATH-propagation bug. Until that lands, no PR previews deploy.
 
+## Agent Behavior
+
+These rules govern how this repo expects Claude (or any other agent reading `CLAUDE.md`) to operate during a session. They override any default agent instincts where they conflict.
+
+### Stick to the problem. Don't run away.
+
+- **When you spot a problem in passing, don't ignore it.** If you're working on task A and notice a real bug, missing test, or stale doc in an adjacent area, surface it — either fix it as part of the current change (if it's tiny and obviously related) or file it as a separate issue via `gh issue create` and keep moving. Never silently leave known defects in the working tree.
+- **Don't bounce.** If a tool fails, a build breaks, or a test fails, dig in until you understand the failure mode and either fix it or hand back a precise `needs input:` describing the unblock. Don't loop the same failing command five times hoping it'll start working.
+- **When you can't make progress, ask.** Use `needs input:` for decisions where guessing costs more than a round-trip. Use `failed:` when the framing itself is wrong (wrong repo, missing binary, premise contradicted by the code). Use plain text when a sensible default exists — make the call, note the assumption, keep going.
+
+### Don't spawn subagents unless it's truly necessary.
+
+- **Do the work yourself.** Use `Read` / `Grep` / `Glob` / `Bash` / `Edit` / `Write` directly. Subagents are for fan-out searches across many files when you only need the conclusion, not the file dumps — and even then, prefer targeted `Grep` first.
+- **Justified subagent use:** sweeping the repo for all references to a symbol that's about to be renamed; cross-cutting audit work that needs to read dozens of files in parallel; reproducing a flaky CI failure that requires stepping through a long log. Each one should be a deliberate `Agent` call with a tight scope, not a habit.
+- **Avoid subagents for:** reading one file, making one edit, running one test, debugging a stack trace you can see. Those are faster (and cheaper) inline.
+- **Don't chain subagents.** A subagent that spawns a subagent that spawns a subagent is almost always wrong — by the third hop you can't reason about what any of them actually saw.
+
+### Ship the work, don't stop at "ready to ship."
+
+- **Small commits on a fresh branch from `main`.** Each commit should be a self-contained, reviewable unit. Don't bundle an unrelated refactor with a bug fix. Don't dump 30 files in one commit.
+- **Verify before pushing.** Run the relevant tests (`cargo nextest run --workspace`, `go test ./...`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`) and read the output. If a test fails, fix it — don't push red.
+- **Push and open a draft PR.** Use `gh pr create --draft`. Never push to `main` / `master` directly, never force-push, never merge your own PRs.
+- **Watch CI until it's green.** After opening the PR, poll `gh pr checks <number>` (or `gh run watch`) until all required jobs pass. If a job fails, debug from the logs (`gh run view <id> --log-failed`), fix the cause, push, re-poll. Don't mark the task done with red checks pending.
+- **Pull latest `main` after merge.** Once the PR is merged (the user will usually say "merged" or it'll show up in `gh pr list --state merged`), run `git checkout main && git pull --ff-only`. If `main` has moved while your branch was open, the next task starts on top of the new tip.
+
+### Code is not done until tests and docs ship.
+
+- **Write tests for every behavior change.** New Rust code → `cargo test` in the affected crate + integration tests under `tests/` if the change crosses module boundaries. New Go service → unit tests in `internal/service/<name>_test.go` and, if it touches SQL, a roundtrip test in `migrations/` tagged `integration` that runs against a `postgres:16` service container (per `go-test-integration` job).
+- **Update docs to match.** If you change a public API, an interface, a CLI subcommand, an env var, or a deployment contract, update the relevant doc (`CLAUDE.md`, `whitepaper.md`, `edge-migrate/docs/design.md`, `edge-ingress/README.md`, or a `docs/*.md` runbook) in the same commit. Don't let the doc lag the code.
+- **Cite sources in prose.** When a section claims "X is at Y", the reader should be able to grep for it. Use `path:line` form (`edge-runtime/src/runtime.rs:836`) wherever practical; cite the file without a line only when the line number is unstable.
+
 ## End-to-End Architecture
 
 A request flows through the system like this:
