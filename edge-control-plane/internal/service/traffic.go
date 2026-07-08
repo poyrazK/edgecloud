@@ -237,7 +237,8 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 			appName: nats.BuildAppConfig(
 				dep.ID,
 				dep.Hash,
-				dep.Signature, // issue #307
+				dep.Signature,    // issue #307
+				dep.SigningKeyID, // issue #307 PR1: per-key kid
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -304,6 +305,7 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	// top-level AppConfig.DeploymentHash only covers the primary). All
 	// routes share the same env/allowlist/max_memory from the app config.
 	var primaryHash string
+	var primarySigningKeyID string // issue #307 PR1
 	routes := make([]nats.DeploymentRoute, len(splits))
 	for i, sp := range splits {
 		d, ok := deployments[sp.DeploymentID]
@@ -313,11 +315,16 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 		routes[i] = nats.DeploymentRoute{
 			DeploymentID:        sp.DeploymentID,
 			DeploymentHash:      d.Hash,
-			DeploymentSignature: d.Signature, // issue #307: per-route signature
+			DeploymentSignature: d.Signature,    // issue #307: per-route signature
+			SigningKeyID:        d.SigningKeyID, // issue #307 PR1: per-key kid
 			Weight:              sp.Weight,
 		}
 		if i == 0 {
 			primaryHash = d.Hash
+			// Save the primary's kid so the top-level AppConfig
+			// SigningKeyID reflects the same key used for the
+			// primary route (issue #307 PR1).
+			primarySigningKeyID = d.SigningKeyID
 		}
 	}
 
@@ -347,6 +354,7 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 				splits[0].DeploymentID, // primary; Routes drives worker behavior
 				primaryHash,
 				routes[0].DeploymentSignature, // primary signature (issue #307)
+				primarySigningKeyID,           // issue #307 PR1: per-key kid
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,

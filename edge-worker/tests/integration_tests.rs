@@ -29,7 +29,7 @@ use edge_worker::config::Config;
 use edge_worker::messages::{AppSpec, HeartbeatMessage, TaskMessage};
 use edge_worker::state::AppInstanceStatus;
 use edge_worker::supervisor::Supervisor;
-use edge_worker::verifier::SignatureVerifier;
+use edge_worker::verifier::Keyring;
 
 // Shared test harness: NATS container startup, skip predicate, and
 // Supervisor wiring. See `edge-test-helpers/src/lib.rs` for the
@@ -110,8 +110,8 @@ fn test_config(
         // assert hash-path behavior; new signature tests override this
         // by setting a verifier via a per-test Downloader).
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     }
 }
 
@@ -161,15 +161,13 @@ impl TestHarness {
     }
 
     /// Like [`Self::new_inner`], but wires a real
-    /// `SignatureVerifier` into the supervisor's `Downloader`
-    /// (issue #307 PR2). Used by the 4 signature-positive
-    /// integration tests. Pass `Some(verifier)` to enable
-    /// signature verification; the supervisor's
+    /// `Keyring` into the supervisor's `Downloader`
+    /// (issue #307 PR1 follow-up; was a single-pubkey verifier in PR2).
+    /// Used by the 4 signature-positive integration tests. Pass
+    /// `Some(verifier)` to enable signature verification; the supervisor's
     /// `require_signature` config field still controls whether
     /// missing signatures are rejected.
-    async fn new_with_verifier(
-        signature_verifier: Option<Arc<SignatureVerifier>>,
-    ) -> anyhow::Result<Self> {
+    async fn new_with_verifier(signature_verifier: Option<Arc<Keyring>>) -> anyhow::Result<Self> {
         let mock_server = MockServer::start().await;
         let cache_dir = tempfile::TempDir::new().context("create cache tempdir")?;
 
@@ -208,8 +206,8 @@ impl TestHarness {
             // Issue #307 PR2: signature config — defaults match the
             // test_config helper (off for non-signing tests).
             require_signature: false,
-            signing_pubkey: None,
-            signing_pubkey_path: None,
+            signing_keyring: None,
+            signing_keyring_path: None,
         };
 
         let sup_guard = build_supervisor_with(config, signature_verifier).await;
@@ -229,7 +227,7 @@ impl TestHarness {
     /// from `signing_key`. Mirrors the Go side's `signing.TestKey()` —
     /// callers sign test messages with the same key they pass in
     /// here.
-    pub async fn with_verifier(verifier: Arc<SignatureVerifier>) -> anyhow::Result<Self> {
+    pub async fn with_verifier(verifier: Arc<Keyring>) -> anyhow::Result<Self> {
         timeout(
             HARNESS_STARTUP_TIMEOUT,
             Self::new_with_verifier(Some(verifier)),
@@ -307,9 +305,7 @@ async fn test_app_lifecycle() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -326,6 +322,7 @@ async fn test_app_lifecycle() {
         deployment_id: "d_deploy_001".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -437,8 +434,8 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         // Issue #307 PR2: signature config off for this test (it's a
         // queue-group pinning regression, not a signing test).
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -472,9 +469,7 @@ async fn test_stop_all_apps() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -492,6 +487,7 @@ async fn test_stop_all_apps() {
             deployment_id: format!("d_deploy_{:03}", i),
             deployment_hash: test_component_hash(),
             deployment_signature: None,
+            signing_key_id: None,
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
@@ -543,9 +539,7 @@ async fn test_artifact_hash_match_starts_app() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -561,6 +555,7 @@ async fn test_artifact_hash_match_starts_app() {
         deployment_id: "d_hash_match".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -594,9 +589,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -621,6 +614,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         deployment_id: "d_hash_bad".to_string(),
         deployment_hash: wrong_hash,
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -655,6 +649,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         deployment_id: "d_hash_good".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -698,9 +693,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -725,6 +718,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         deployment_id: "d_cache_redownload".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -770,9 +764,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -799,6 +791,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         deployment_id: "d_cache_dbl_bad".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -841,9 +834,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -858,6 +849,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         deployment_id: "d_download_500".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -981,9 +973,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1009,6 +999,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         deployment_id: "d_log_emit".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
@@ -1151,9 +1142,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1198,6 +1187,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
         deployment_id: "d_log_emit_sla".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
@@ -1540,6 +1530,7 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
         deployment_id: "d_broken".to_string(),
         deployment_hash: "tooshort".to_string(), // not 64 hex chars
         deployment_signature: None,
+        signing_key_id: None,
         routes: None,
         env: HashMap::new(),
         allowlist: None,
@@ -1643,8 +1634,8 @@ async fn build_supervisor_only_with_cp(
         // the signing path is exercised by the dedicated signature
         // tests; the fetch_sync tests focus on the /sync fallback.
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     };
 
     let guard = build_supervisor_unsigned(config).await;
@@ -1700,9 +1691,7 @@ async fn test_artifact_signature_match_starts_app() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1721,6 +1710,7 @@ async fn test_artifact_signature_match_starts_app() {
         deployment_id: dep_id.to_string(),
         deployment_hash: hash,
         deployment_signature: Some(sig),
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -1757,9 +1747,7 @@ async fn test_artifact_signature_mismatch_rejects_app() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1780,6 +1768,7 @@ async fn test_artifact_signature_mismatch_rejects_app() {
         deployment_id: dep_id.to_string(),
         deployment_hash: hash,
         deployment_signature: Some(wrong_sig),
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -1814,9 +1803,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1836,6 +1823,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         deployment_id: dep_id.to_string(),
         deployment_hash: hash.clone(),
         deployment_signature: Some(good_sig.clone()),
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -1873,6 +1861,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         deployment_id: dep_id.to_string(),
         deployment_hash: hash,
         deployment_signature: Some(bad_sig),
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -1909,9 +1898,7 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
     }
 
     let sk = SigningKey::from_bytes(&[0u8; 32]);
-    let verifier = Arc::new(SignatureVerifier {
-        pub_key: sk.verifying_key(),
-    });
+    let verifier = Arc::new(Keyring::single(sk.verifying_key()));
     let harness = TestHarness::with_verifier(verifier)
         .await
         .expect("create test harness");
@@ -1938,6 +1925,7 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
         deployment_id: "d_replay_target".to_string(),
         deployment_hash: hash,
         deployment_signature: Some(sig),
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
@@ -1988,7 +1976,7 @@ async fn test_artifact_missing_signature_rejects_when_required() {
     );
     config.cache_dir = cache_dir.path().to_path_buf();
     config.require_signature = true;
-    config.signing_pubkey = Some("ab".repeat(32));
+    config.signing_keyring = Some("ab".repeat(32));
     let sup_guard = build_supervisor_unsigned(config).await;
     let supervisor = sup_guard.supervisor.clone();
     // The container is owned by the guard; we keep it alive
@@ -2003,6 +1991,7 @@ async fn test_artifact_missing_signature_rejects_when_required() {
         deployment_id: "d_no_sig".to_string(),
         deployment_hash: test_component_hash(),
         deployment_signature: None,
+        signing_key_id: None,
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,

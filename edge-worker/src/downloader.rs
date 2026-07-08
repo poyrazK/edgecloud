@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::WorkerJwtSigner;
-use crate::verifier::SignatureVerifier;
+use crate::verifier::Keyring;
 
 /// Downloads Wasm artifacts from the control plane with local cache.
 pub struct Downloader {
@@ -14,20 +14,19 @@ pub struct Downloader {
     control_plane_url: String,
     cache_dir: PathBuf,
     jwt_signer: Arc<WorkerJwtSigner>,
-    /// Optional Ed25519 signature verifier (issue #307, PR2). `None`
-    /// when the worker is started with `EDGE_REQUIRE_SIGNATURE=false`
-    /// (the rollout escape hatch) — in that mode, `get_artifact`
-    /// accepts unsigned artifacts, and the supervisor's
-    /// `require_signature` guard already short-circuits any
-    /// `None`-signature AppSpec before this method is reached for
+    /// Optional Ed25519 signing keyring (issue #307 PR2 + PR1 follow-up
+    /// multi-keyring). `None` when the worker is started with
+    /// `EDGE_REQUIRE_SIGNATURE=false` (the rollout escape hatch) — in
+    /// that mode, `get_artifact` accepts unsigned artifacts, and the
+    /// supervisor's `require_signature` guard already short-circuits
+    /// any `None`-signature AppSpec before this method is reached for
     /// "verification required" workers. Tests that don't exercise
     /// signing also pass `None`.
     ///
-    /// `pub(crate)` so the supervisor's `start_app` early-reject
-    /// guard can read it (defensive check that
-    /// `require_signature=true` always implies a verifier was
-    /// constructed).
-    pub(crate) signature_verifier: Option<Arc<SignatureVerifier>>,
+    /// `pub(crate)` so the supervisor's `start_app` early-reject guard
+    /// can read it (defensive check that `require_signature=true`
+    /// always implies a keyring was constructed).
+    pub(crate) signature_verifier: Option<Arc<Keyring>>,
 }
 
 impl Downloader {
@@ -35,7 +34,7 @@ impl Downloader {
         control_plane_url: String,
         cache_dir: PathBuf,
         jwt_signer: Arc<WorkerJwtSigner>,
-        signature_verifier: Option<Arc<SignatureVerifier>>,
+        signature_verifier: Option<Arc<Keyring>>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -56,20 +55,24 @@ impl Downloader {
     ///
     /// `expected_signature` is the base64url(no-pad) Ed25519 signature
     /// over `(sha256(artifact) || deployment_id)`, carried by the
-    /// AppSpec. When the worker is configured with a verifier
+    /// AppSpec. `expected_signature_kid` is the key id used to
+    /// produce it (issue #307 PR1 follow-up multi-keyring) — `None`
+    /// or `Some("")` resolves against the keyring's default key.
+    /// When the worker is configured with a keyring
     /// (`signature_verifier.is_some()`), the signature is verified
     /// BOTH in the cache fast-path AND the fresh-download path —
     /// re-verification on cache hit means a tampered cache file
     /// cannot bypass signature checks. Verification errors
     /// invalidate the cache and re-download, mirroring the
     /// hash-mismatch path. When the worker is configured without a
-    /// verifier, `expected_signature` MUST be `None` (the
+    /// keyring, `expected_signature` MUST be `None` (the
     /// supervisor's `require_signature` guard enforces this).
     pub async fn get_artifact(
         &self,
         deployment_id: &str,
         expected_hash: &str,
         expected_signature: Option<&str>,
+        expected_signature_kid: Option<&str>,
     ) -> anyhow::Result<bytes::Bytes> {
         let cache_path = self.cache_path(deployment_id);
 
@@ -101,6 +104,7 @@ impl Downloader {
                             &data,
                             expected_hash,
                             expected_signature,
+                            expected_signature_kid,
                             deployment_id,
                             self.signature_verifier.as_deref(),
                         ) {
@@ -180,6 +184,7 @@ impl Downloader {
             &data,
             expected_hash,
             expected_signature,
+            expected_signature_kid,
             deployment_id,
             self.signature_verifier.as_deref(),
         )?;
@@ -311,7 +316,8 @@ impl Downloader {
     }
 }
 
-/// Verify the Ed25519 signature over `(sha256(bytes) || deployment_id)`.
+/// Verify the Ed25519 signature over `(sha256(bytes) || deployment_id)`
+/// against the worker's signing keyring.
 ///
 /// The signed message layout mirrors the Go control plane's
 /// `internal/signing/signer.go::Sign` byte-for-byte:
@@ -325,20 +331,27 @@ impl Downloader {
 /// verify_signature via a shared hash state. The redundant SHA-256
 /// is sub-microsecond on any real wasm artifact.
 ///
+/// `expected_signature_kid` is the kid from the AppSpec. `None` or
+/// `Some("")` (the legacy CP form) both resolve against the
+/// keyring's default key — see `Keyring::verify` for the exact
+/// normalization rule and the rationale pinning it.
+///
 /// Returns `Ok(())` on a valid signature. Returns `Err` on:
 ///
-/// - no verifier configured (a no-op when the worker is in
+/// - no keyring configured (a no-op when the worker is in
 ///   `EDGE_REQUIRE_SIGNATURE=false` mode AND `expected_signature`
 ///   is `None`; an error otherwise — see caller logic in
 ///   `get_artifact`).
-/// - `expected_signature` is `None` but a verifier is configured
+/// - `expected_signature` is `None` but a keyring is configured
 ///   (the supervisor should have caught this earlier; we double-
 ///   check here so the worker fails closed on a wire-shape
 ///   contract violation).
 /// - signature wire-format error (empty / non-base64url / wrong
 ///   decoded length / ed25519-dalek rejected the sig shape).
-/// - signature is well-formed but does not match `(hash || id)` —
-///   a `verify()` returning `Ok(false)`.
+/// - the kid did not resolve to a key in the keyring
+///   (`UnknownKey` error variant; surfaces config drift cleanly).
+/// - signature is well-formed but does not match `(hash || id)`
+///   for the resolved key — a `verify()` returning `Ok(false)`.
 ///
 /// Each error path includes `deployment_id` in the `tracing::error!`
 /// message so an operator can correlate a reject to a specific
@@ -347,16 +360,17 @@ fn verify_signature(
     bytes: &[u8],
     expected_hash: &str,
     expected_signature: Option<&str>,
+    expected_signature_kid: Option<&str>,
     deployment_id: &str,
-    verifier: Option<&SignatureVerifier>,
+    keyring: Option<&Keyring>,
 ) -> anyhow::Result<()> {
-    let verifier = match verifier {
-        Some(v) => v,
-        // No verifier: only acceptable when the AppSpec ALSO has no
+    let keyring = match keyring {
+        Some(k) => k,
+        // No keyring: only acceptable when the AppSpec ALSO has no
         // signature. The caller's get_artifact already logs a
-        // warning for the "verifier None + sig Some" combination
+        // warning for the "keyring None + sig Some" combination
         // (operator should set EDGE_REQUIRE_SIGNATURE); here we
-        // short-circuit cleanly on the "verifier None + sig None"
+        // short-circuit cleanly on the "keyring None + sig None"
         // case.
         None => return Ok(()),
     };
@@ -383,7 +397,7 @@ fn verify_signature(
         anyhow::bail!("deployment_signature is empty for {deployment_id}");
     }
 
-    match verifier.verify(expected_hash, deployment_id, sig) {
+    match keyring.verify(expected_hash, deployment_id, sig, expected_signature_kid) {
         Ok(true) => {
             tracing::debug!(
                 deployment_id,
@@ -397,7 +411,7 @@ fn verify_signature(
                 deployment_id,
                 "Ed25519 artifact signature verify returned false — refusing to instantiate. \
                  The signature does not match (hash || deployment_id) for the configured pubkey. \
-                 Check that EDGE_SIGNING_PUBKEY matches the CP's EDGE_SIGNING_KEY[_PATH] and \
+                 Check that EDGE_SIGNING_KEYRING matches the CP's active signing key and \
                  that the deployment hasn't been tampered with."
             );
             anyhow::bail!(
@@ -409,7 +423,7 @@ fn verify_signature(
             tracing::error!(
                 deployment_id,
                 err = %e,
-                "Ed25519 signature wire-format error — refusing to instantiate"
+                "Ed25519 signature wire-format or keyring error — refusing to instantiate"
             );
             anyhow::bail!("artifact signature for {deployment_id} malformed: {e}");
         }
@@ -626,7 +640,7 @@ mod tests {
             .expect("pre-populate cache");
 
         let result = downloader
-            .get_artifact("d_unit_cache_hit", &hash, None)
+            .get_artifact("d_unit_cache_hit", &hash, None, None)
             .await
             .expect("cache hit must succeed");
         assert_eq!(result.as_ref(), bytes.as_slice());
@@ -667,7 +681,7 @@ mod tests {
             .expect("pre-populate tampered cache");
 
         let result = downloader
-            .get_artifact("d_unit_redownload", &good_hash, None)
+            .get_artifact("d_unit_redownload", &good_hash, None, None)
             .await
             .expect("re-downloaded bytes must verify and return");
         assert_eq!(result.as_ref(), good_bytes.as_slice());
@@ -722,7 +736,7 @@ mod tests {
         let hash = sha256_hex(b"any bytes");
 
         let err = downloader
-            .get_artifact("d_unit_500", &hash, None)
+            .get_artifact("d_unit_500", &hash, None, None)
             .await
             .expect_err("500 from server must propagate as Err");
         let msg = err.to_string();
@@ -782,9 +796,7 @@ mod tests {
         // Deterministic test signer (zero seed, matches Go side).
         let seed = [0u8; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
-            pub_key: sk.verifying_key(),
-        });
+        let verifier = std::sync::Arc::new(crate::verifier::Keyring::single(sk.verifying_key()));
         // Sign over (hash_raw || deployment_id) the way the Go signer does.
         let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
         let dep_id = "d_signed_match";
@@ -807,7 +819,7 @@ mod tests {
             Some(verifier),
         );
         let result = downloader
-            .get_artifact(dep_id, &hash, Some(&sig))
+            .get_artifact(dep_id, &hash, Some(&sig), None)
             .await
             .expect("cache hit with valid sig must succeed");
         assert_eq!(result.as_ref(), bytes.as_slice());
@@ -846,9 +858,7 @@ mod tests {
         let seed_b = [1u8; 32]; // distinct key
         let sk_a = ed25519_dalek::SigningKey::from_bytes(&seed_a);
         let sk_b = ed25519_dalek::SigningKey::from_bytes(&seed_b);
-        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
-            pub_key: sk_a.verifying_key(),
-        });
+        let verifier = std::sync::Arc::new(crate::verifier::Keyring::single(sk_a.verifying_key()));
         // Sign with the WRONG key (sk_b) — verifier is sk_a's pubkey.
         let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
         let dep_id = "d_signed_bad";
@@ -871,7 +881,7 @@ mod tests {
             Some(verifier),
         );
         let err = downloader
-            .get_artifact(dep_id, &hash, Some(&sig))
+            .get_artifact(dep_id, &hash, Some(&sig), None)
             .await
             .expect_err("wrong-key signature must be rejected");
         let msg = err.to_string();
@@ -897,9 +907,7 @@ mod tests {
 
         let seed = [0u8; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
-            pub_key: sk.verifying_key(),
-        });
+        let verifier = std::sync::Arc::new(crate::verifier::Keyring::single(sk.verifying_key()));
         let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
         let dep_id = "d_signed_cache_reverify";
         let mut msg = Vec::with_capacity(32 + dep_id.len());
@@ -931,7 +939,7 @@ mod tests {
 
         // First call: valid sig — should return the bytes.
         let result = downloader
-            .get_artifact(dep_id, &hash, Some(&good_sig))
+            .get_artifact(dep_id, &hash, Some(&good_sig), None)
             .await
             .expect("valid sig must succeed");
         assert_eq!(result.as_ref(), bytes.as_slice());
@@ -941,7 +949,7 @@ mod tests {
         // reject the tampered sig. Since the test sets no mock
         // for the download path, the error propagates.
         let err = downloader
-            .get_artifact(dep_id, &hash, Some(&bad_sig))
+            .get_artifact(dep_id, &hash, Some(&bad_sig), None)
             .await
             .expect_err("tampered sig on cache hit must re-verify and reject");
         let msg = err.to_string();
@@ -967,9 +975,7 @@ mod tests {
 
         let seed = [0u8; 32];
         let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
-            pub_key: sk.verifying_key(),
-        });
+        let verifier = std::sync::Arc::new(crate::verifier::Keyring::single(sk.verifying_key()));
 
         // No cache — go straight to download. No mock mounted: a
         // download attempt would fail with a 404 from wiremock.
@@ -980,7 +986,7 @@ mod tests {
             Some(verifier),
         );
         let err = downloader
-            .get_artifact("d_missing_sig", &hash, None)
+            .get_artifact("d_missing_sig", &hash, None, None)
             .await
             .expect_err("None signature with verifier must be rejected");
         let msg = err.to_string();
@@ -1163,7 +1169,7 @@ mod tests {
         let downloader = Downloader::new(server.uri(), cache_dir, signer, None);
 
         let _ = downloader
-            .get_artifact("d_unit_auth", &good_hash, None)
+            .get_artifact("d_unit_auth", &good_hash, None, None)
             .await
             .expect("download should succeed");
 

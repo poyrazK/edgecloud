@@ -1,6 +1,7 @@
 package signing
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -185,5 +186,44 @@ func TestSigner_VerifyRejectsTamperedSignature(t *testing.T) {
 	}
 	if ok {
 		t.Error("Verify returned true for a tampered signature")
+	}
+}
+
+// Regression: parsePrivateKey must not trim whitespace bytes out of
+// raw input. A 32-byte seed is allowed to contain any byte —
+// including 0x20 (space), 0x09 (tab), 0x0a (LF), 0x0d (CR). If the
+// trailing byte of a raw seed happens to be one of those, an
+// older version of trimASCII would strip it, leaving 31 bytes and
+// producing a confusing "got 31" error. The fix detects hex-vs-raw
+// before trimming, so raw input passes through untouched. (Found
+// via `-shuffle on` + `-count=N` stress on issue #307 PR1's
+// keyring tests; reproduced locally and pinned here.)
+func TestParsePrivateKey_RawSeedWithTrailingWhitespaceByteIsNotTrimmed(t *testing.T) {
+	for _, trailing := range []byte{' ', '\t', '\n', '\r'} {
+		seed := make([]byte, ed25519.SeedSize)
+		// Deterministic non-zero seed body so a successful parse
+		// produces a real key, not all-zero garbage.
+		for i := range seed[:31] {
+			seed[i] = byte(i + 1)
+		}
+		seed[31] = trailing
+
+		priv, err := parsePrivateKey(seed)
+		if err != nil {
+			t.Fatalf("trailing=%#x: parsePrivateKey returned error: %v", trailing, err)
+		}
+		if len(priv) != ed25519.PrivateKeySize {
+			t.Fatalf("trailing=%#x: returned priv has len=%d, want %d", trailing, len(priv), ed25519.PrivateKeySize)
+		}
+		// Round-trip: the seed the parser saw must equal what we
+		// passed in. If trimASCII stripped the trailing byte, the
+		// first 31 bytes would be reinterpreted as a different
+		// seed and produce a different public key.
+		gotSeed := priv.Seed()
+		for i := range gotSeed {
+			if gotSeed[i] != seed[i] {
+				t.Fatalf("trailing=%#x: seed byte %d differs: got %#x want %#x", trailing, i, gotSeed[i], seed[i])
+			}
+		}
 	}
 }

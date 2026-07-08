@@ -99,12 +99,13 @@ type MigrationService struct {
 	// rustcPath is the absolute path to a rustc binary capable of
 	// targeting wasm32-wasip2. Used when language == "rust".
 	rustcPath string
-	// signer stamps every new deployment's artifact (issue #307).
-	// Required — set by the constructor; a nil signer would cause
-	// `Migrate` and `MigrateTree` to return an error. Mirrors
-	// `DeploymentService.signer` so artifacts produced by either
-	// service carry the same key id.
-	signer *signing.Signer
+	// keyring stamps every new deployment's artifact (issue #307 PR1;
+	// was a single `*signing.Signer` before PR1). Required — set by
+	// the constructor; a nil keyring would cause `Migrate` and
+	// `MigrateTree` to return an error. Mirrors
+	// `DeploymentService.keyring` so artifacts produced by either
+	// service carry the same active key id.
+	keyring *signing.Keyring
 }
 
 // NewMigrationService creates a MigrationService.
@@ -112,7 +113,7 @@ func NewMigrationService(
 	deploymentRepo DeploymentRepoInterface,
 	artifactStore storage.ArtifactStore,
 	edgeMigratePath, wasiSdkPath, rustcPath string,
-	signer *signing.Signer,
+	keyring *signing.Keyring,
 ) *MigrationService {
 	return &MigrationService{
 		deploymentRepo:  deploymentRepo,
@@ -120,7 +121,7 @@ func NewMigrationService(
 		edgeMigratePath: edgeMigratePath,
 		wasiSdkPath:     wasiSdkPath,
 		rustcPath:       rustcPath,
-		signer:          signer,
+		keyring:         keyring,
 	}
 }
 
@@ -489,15 +490,15 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	// signature — a report without a signed row would tell the
 	// tenant "your code is deployed" while leaving the worker with
 	// no way to verify it.
-	if s.signer == nil {
-		return nil, fmt.Errorf("signing is not configured (migration service requires a signer at construction)")
+	if s.keyring == nil {
+		return nil, fmt.Errorf("signing is not configured (migration service requires a keyring at construction)")
 	}
-	sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID)
+	sig, kid, signErr := s.keyring.Sign(deployment.Hash, deployment.ID)
 	if signErr != nil {
 		return nil, fmt.Errorf("signing artifact: %w", signErr)
 	}
 	deployment.Signature = sig
-	deployment.SigningKeyID = s.signer.KeyID()
+	deployment.SigningKeyID = kid
 	if updateErr := s.deploymentRepo.UpdateHashAndSignature(ctx, deployment); updateErr != nil {
 		// Create runs once at line ~458 *before* SaveAndHash (so the
 		// quota check fires against a real row); the post-SaveAndHash
@@ -1224,15 +1225,15 @@ func (s *MigrationService) MigrateTree(
 	// exists) and will fail; to make this work we have to use a
 	// real Update path. Since `DeploymentRepoInterface` only
 	// exposes Create, we AddUpdate here as well (see below).
-	if s.signer == nil {
-		return nil, fmt.Errorf("signing is not configured (migration service requires a signer at construction)")
+	if s.keyring == nil {
+		return nil, fmt.Errorf("signing is not configured (migration service requires a keyring at construction)")
 	}
-	sig, signErr := s.signer.Sign(deployment.Hash, deployment.ID)
+	sig, kid, signErr := s.keyring.Sign(deployment.Hash, deployment.ID)
 	if signErr != nil {
 		return nil, fmt.Errorf("signing artifact: %w", signErr)
 	}
 	deployment.Signature = sig
-	deployment.SigningKeyID = s.signer.KeyID()
+	deployment.SigningKeyID = kid
 	if err := s.deploymentRepo.UpdateHashAndSignature(ctx, deployment); err != nil {
 		if delErr := s.deploymentRepo.DeleteByID(ctx, depID); delErr != nil {
 			log.Printf("rollback DeleteByID failed after sign-then-update: deployment_id=%s error=%v", depID, delErr)

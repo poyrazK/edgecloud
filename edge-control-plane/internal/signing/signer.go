@@ -78,57 +78,51 @@ func LoadFromRaw(data []byte, keyID string) (*Signer, error) {
 	return newSigner(priv, keyID), nil
 }
 
-// LoadFromEnv reads the signing key from one of two environment
-// variables, in order:
-//
-//  1. EDGE_SIGNING_KEY_PATH — path to a raw or hex key file
-//  2. EDGE_SIGNING_KEY      — inline 32-byte (64-hex-char) or 64-byte
-//     (128-hex-char) key value
-//
-// `keyID` comes from EDGE_SIGNING_KEY_ID. Returns ErrInvalidKey (or
-// an os error) if neither variable is set. The CP should call this
-// at startup and fail-fast if it errors — a control plane without a
-// signing key cannot sign new artifacts, and Deploy should refuse
-// rather than silently produce unsigned rows.
-func LoadFromEnv() (*Signer, error) {
-	keyID := os.Getenv("EDGE_SIGNING_KEY_ID")
-	if path := os.Getenv("EDGE_SIGNING_KEY_PATH"); path != "" {
-		return LoadFromFile(path, keyID)
-	}
-	if inline := os.Getenv("EDGE_SIGNING_KEY"); inline != "" {
-		priv, err := parsePrivateKey([]byte(inline))
-		if err != nil {
-			return nil, fmt.Errorf("parsing EDGE_SIGNING_KEY: %w", err)
-		}
-		return newSigner(priv, keyID), nil
-	}
-	return nil, fmt.Errorf("%w: set EDGE_SIGNING_KEY_PATH or EDGE_SIGNING_KEY", ErrInvalidKey)
-}
+// LoadFromEnv on this type was removed in issue #307 follow-up PR1.
+// Use `signing.LoadFromEnv` (keyring.go) which returns a `*Keyring`
+// and supports both the new `EDGE_SIGNING_KEYRING[_PATH]` format
+// and the legacy `EDGE_SIGNING_KEY[_PATH]` env vars (one-key shim,
+// logs a deprecation warning).
 
 // parsePrivateKey accepts the byte, hex-32, hex-64, and raw-64 forms
 // documented on LoadFromFile.
+//
+// Trimming: only the hex (ASCII) path gets surrounding-whitespace
+// stripping. The raw-byte path MUST NOT trim because a random
+// 32- or 64-byte key can legitimately contain bytes that look like
+// ASCII whitespace (0x09/0x0a/0x0d/0x20); trimming those would
+// corrupt the key and surface as a confusing "got N" length error.
+// Detecting raw-vs-hex first, then trimming only the hex branch,
+// keeps the two paths independent.
 func parsePrivateKey(data []byte) (ed25519.PrivateKey, error) {
-	trimmed := trimASCII(data)
-	// Hex-encoded forms (only ASCII input) are detected by
-	// even-length, all-hex, and twice the byte length of the
-	// equivalent raw form. Raw forms (32 or 64 bytes) are accepted
-	// as-is.
-	if isLikelyHex(trimmed) {
-		raw, err := hex.DecodeString(string(trimmed))
+	// First, look for the hex fingerprint on the ORIGINAL input
+	// (before any trimming). All-hex + even-length + length in the
+	// accepted hex set (64 or 128) is unambiguous evidence of a hex
+	// payload; everything else is treated as raw bytes.
+	if isLikelyHex(data) && (len(data) == 64 || len(data) == 128) {
+		hexStr := string(trimASCII(data))
+		raw, err := hex.DecodeString(hexStr)
 		if err != nil {
 			return nil, fmt.Errorf("%w: hex decode: %v", ErrInvalidKey, err)
 		}
-		return parsePrivateKey(raw)
+		switch len(raw) {
+		case 32:
+			return ed25519.NewKeyFromSeed(raw), nil
+		case 64:
+			return ed25519.PrivateKey(raw), nil
+		default:
+			return nil, fmt.Errorf("%w: hex decoded to %d raw bytes, want 32 or 64", ErrInvalidKey, len(raw))
+		}
 	}
-	switch len(trimmed) {
+	switch len(data) {
 	case 32:
 		// Raw seed.
-		return ed25519.NewKeyFromSeed(trimmed), nil
+		return ed25519.NewKeyFromSeed(data), nil
 	case 64:
 		// Raw private key (seed || public, RFC 8032 §5.1.2).
-		return ed25519.PrivateKey(trimmed), nil
+		return ed25519.PrivateKey(data), nil
 	default:
-		return nil, fmt.Errorf("%w: expected 32 or 64 raw bytes (or 64/128 hex), got %d", ErrInvalidKey, len(trimmed))
+		return nil, fmt.Errorf("%w: expected 32 or 64 raw bytes (or 64/128 hex), got %d", ErrInvalidKey, len(data))
 	}
 }
 

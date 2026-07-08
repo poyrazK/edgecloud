@@ -5,8 +5,9 @@
 // EDGE_SIGNING_PUBKEY_PATH).
 //
 // Usage:
-//   go run ./cmd/printpub -key /etc/edge/signing.key
-//   go run ./cmd/printpub -key /etc/edge/signing.key -key-id k1   # diagnostic; key_id is metadata, not crypto
+//
+//	go run ./cmd/printpub -key /etc/edge/signing.key
+//	go run ./cmd/printpub -key /etc/edge/signing.key -key-id k1   # diagnostic; key_id is metadata, not crypto
 //
 // The hex output is the Ed25519 public key derived per RFC 8032 §5.1.2
 // from the 32-byte seed (or 64-byte raw key). crypto/ed25519 does the

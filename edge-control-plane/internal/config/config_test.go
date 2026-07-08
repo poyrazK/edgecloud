@@ -37,7 +37,7 @@ var testSigningKeyPath = func() string {
 // testdata/test_signing.key if the file is missing. Deterministic
 // (all-zeros) because the test fixture only validates the file
 // *loading* path — there is no cryptographic material in play; the
-// signing tests use `signing.TestKey(t)` (also all-zero seed) for
+// signing tests use `signing.TestKeyring(t)` (also all-zero seed) for
 // their own assertions.
 func ensureTestSigningKey(t *testing.T) {
 	t.Helper()

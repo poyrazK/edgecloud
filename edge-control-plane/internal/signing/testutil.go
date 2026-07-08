@@ -61,3 +61,22 @@ func FreshTestKey(t *testing.T) *Signer {
 	}
 	return &Signer{priv: priv, pub: pub, keyID: "test-fresh"}
 }
+
+// TestKeyring returns the deterministic test key wrapped in a
+// 1-entry Keyring (kid = "test-k1"). Use this anywhere a service
+// constructor wants a *Keyring (issue #307 PR1). The Signer used
+// underneath is the same TestKey() returns, so the well-known
+// signature fixture in TestSigner_DeterministicSignature keeps
+// matching whatever the test signs through the Keyring.
+func TestKeyring(t *testing.T) *Keyring {
+	t.Helper()
+	return KeyringFromSigner(TestKey(t), "test-k1")
+}
+
+// FreshTestKeyring returns a freshly-generated Keyring wrapping a
+// fresh Signer (kid = "test-fresh"). Mirror of FreshTestKey for
+// callers that need an independent keypair.
+func FreshTestKeyring(t *testing.T) *Keyring {
+	t.Helper()
+	return KeyringFromSigner(FreshTestKey(t), "test-fresh")
+}

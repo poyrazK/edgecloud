@@ -1,4 +1,5 @@
-//! Ed25519 artifact-signature verifier (issue #307, PR2 of 2).
+//! Ed25519 artifact-signature verifier with keyring support (issue #307 PR2 +
+//! issue #307 follow-up PR1 — multi-keyring with per-key `kid`).
 //!
 //! The control plane (`edge-control-plane/internal/signing/signer.go`)
 //! signs every deployment's artifact at upload time and persists the
@@ -37,16 +38,22 @@
 //!   base64url(**no padding**) — 64 raw Ed25519 bytes encode to
 //!   86 chars. Standard base64 (`+/=`) is rejected at the decode
 //!   step.
+//! - **Key ID** (carried by `AppSpec.signing_key_id`, PR1 follow-up):
+//!   optional short operator-chosen label (e.g. `"k1"`) identifying
+//!   which key in the worker's keyring signed this artifact. Absent
+//!   (`None`) on legacy deployments — the keyring's **default key**
+//!   is used. An empty-string `signing_key_id` is treated identically
+//!   to `None` (legacy control planes emit empty rather than null for
+//!   string fields).
 //!
 //! ## Key configuration
 //!
-//! The worker holds a single public key in v1 (rotation is a
-//! follow-up). It is loaded from either `EDGE_SIGNING_PUBKEY` (inline
-//! 64 hex chars) or `EDGE_SIGNING_PUBKEY_PATH` (file with 64 hex
-//! chars), and the public key is wrapped in a `SignatureVerifier`.
-//! Resolution is done in `crate::main` and the verifier is passed to
-//! `Downloader::new`.
+//! `Keyring` replaces the single-pubkey `SignatureVerifier` of PR2.
+//! Operators load one or more public keys from a TOML/JSON file at
+//! startup; the worker resolves a key by `kid` for each artifact.
+//! See `Config::signing_keyring[_path]` for resolution order.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -57,30 +64,181 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 const SIG_BYTES: usize = 64;
 /// 32-byte public key, hex-encoded with no leading 0x → 64 chars.
 const PUBKEY_HEX_LEN: usize = 64;
+/// Implicit fallback kid when an artifact arrives without a kid OR with
+/// `kid == ""` (the legacy control-plane form). Keeping this as a single
+/// named constant lets a future "explicit kid = default" override
+/// ripple to one place.
+pub(crate) const DEFAULT_KID: &str = "default";
 
-/// Verifier holding a single Ed25519 public key. The key is parsed
-/// once at startup and reused for every artifact; `verify` is
-/// allocation-free on the success path aside from the wire-format
-/// decode.
+/// Multi-key verifier — one `VerifyingKey` per `kid`, plus an implicit
+/// `default` fallback for artifacts that omit `signing_key_id`.
 ///
-/// `pub_key` is `pub` (not `pub(crate)`) so the public surface
-/// only exposes `from_hex`, `from_file`, and `verify` — the bare
-/// key bytes are an internal detail. Tests and integration
-/// helpers in the worker crate (and downstream test crates) need
-/// to set the field directly when constructing a verifier from a
-/// pre-derived key (e.g. when running an end-to-end test that
-/// uses a deterministic test keypair rather than hex-decoding an
-/// env var). The field is read-only in the public API sense —
-/// nothing in the public surface mutates it after construction.
+/// Constructed once at worker startup; wrapped in `std::sync::RwLock`
+/// at the supervisor boundary so an operator-driven reload (or a
+/// later hot-reload PR) can swap the map without restarting. The
+/// `verify` call itself does not take the lock — that's a caller
+/// concern. The `pub` fields exist so the test-helper crate
+/// (`edge-test-helpers`) can construct a `Keyring` directly from a
+/// raw keypair, mirroring the PR2 pattern.
 #[derive(Clone, Debug)]
-pub struct SignatureVerifier {
-    pub pub_key: VerifyingKey,
+pub struct Keyring {
+    /// kid → verifying-key lookup. Always non-empty by construction:
+    /// at minimum holds the `DEFAULT_KID` entry.
+    pub keys: BTreeMap<String, VerifyingKey>,
+}
+
+impl Keyring {
+    /// Build a keyring from a TOML-style line-by-line file. Each
+    /// non-comment line is `<kid> = <64-lowercase-hex>`. Whitespace
+    /// around the `=` is tolerated; blank lines and lines starting
+    /// with `#` are skipped. A literal `[defaults]` block is NOT
+    /// supported in this constructor — pass the desired default kid
+    /// explicitly via `with_default_kid`.
+    ///
+    /// The file MUST contain at least one entry. Returns an error if
+    /// the file is empty, contains a malformed line, or contains a
+    /// duplicate kid.
+    pub fn from_file(p: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(p)
+            .map_err(|e| anyhow::anyhow!("reading keyring file {}: {e}", p.display()))?;
+        Self::from_inline(&raw)
+    }
+
+    /// Parse an inline keyring payload (same format as `from_file`).
+    /// Used by `Config::from_env` when `EDGE_SIGNING_KEYRING` is set
+    /// without a backing file.
+    pub fn from_inline(raw: &str) -> anyhow::Result<Self> {
+        let mut keys = BTreeMap::new();
+        for (lineno, line) in raw.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Expect `<kid> = <64-hex>`. Split on the first `=` so a
+            // hex value containing `=` (it can't, but defensively) is
+            // taken as one piece.
+            let Some((kid_part, pk_part)) = trimmed.split_once('=') else {
+                anyhow::bail!(
+                    "keyring line {}: expected `<kid> = <64-hex>`, got {trimmed:?}",
+                    lineno + 1
+                );
+            };
+            let kid = kid_part.trim();
+            let pk_hex = pk_part.trim();
+            if kid.is_empty() {
+                anyhow::bail!("keyring line {}: kid must be non-empty", lineno + 1);
+            }
+            if keys.contains_key(kid) {
+                anyhow::bail!("keyring line {}: duplicate kid {kid:?}", lineno + 1);
+            }
+            let pub_key = parse_pubkey_hex(pk_hex)
+                .map_err(|e| anyhow::anyhow!("keyring line {}: {e}", lineno + 1))?;
+            keys.insert(kid.to_string(), pub_key);
+        }
+        if keys.is_empty() {
+            anyhow::bail!("keyring is empty; expected at least one `<kid> = <64-hex>` line");
+        }
+        Ok(Self { keys })
+    }
+
+    /// Construct a single-key keyring from a raw `VerifyingKey`.
+    /// Convenience constructor for tests and for the
+    /// `EDGE_SIGNING_KEYRING` env-var fallback when the operator
+    /// passes a lone pubkey (kid defaults to `DEFAULT_KID`).
+    #[allow(dead_code)] // used by integration_tests.rs and Downloader; bin target sees no callers
+    pub fn single(pub_key: VerifyingKey) -> Self {
+        let mut keys = BTreeMap::new();
+        keys.insert(DEFAULT_KID.to_string(), pub_key);
+        Self { keys }
+    }
+
+    /// Verify that `signature_b64` is a valid Ed25519 signature over
+    /// `sha256_raw_32_bytes(deployment_id_bytes) || deployment_id_bytes`,
+    /// resolved against `kid`. The hash bytes are reconstructed from
+    /// `hash_hex`. The `kid` interpretation:
+    ///
+    /// - `kid = None` **or** `kid = Some("")` → look up under `DEFAULT_KID`.
+    /// - `kid = Some(k)` where `k != ""` → look up under `keys[k]`.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — the signature is valid for this hash + id pair.
+    /// - `Ok(false)` — the signature parsed cleanly but `verify`
+    ///   returned false. This is a *cryptographic* rejection (wrong
+    ///   key, wrong id, tampered bytes, replay), not a wire-format
+    ///   bug.
+    /// - `Err(SigError)` — the input is malformed at the wire-format
+    ///   level (empty id, non-hex hash, bad base64, wrong length,
+    ///   ed25519-dalek rejected the sig shape, or the kid did not
+    ///   resolve to a key in the keyring).
+    pub fn verify(
+        &self,
+        hash_hex: &str,
+        deployment_id: &str,
+        signature_b64: &str,
+        kid: Option<&str>,
+    ) -> Result<bool, SigError> {
+        // 1. Empty deployment_id — defensive, the Go signer refuses
+        // to emit one, but the worker must never accept it.
+        if deployment_id.is_empty() {
+            return Err(SigError::EmptyDeploymentID);
+        }
+
+        // 2. Resolve the kid. Empty string from a legacy CP is
+        // normalized to "use the default key" — this is the most
+        // likely silent foot-gun, so it is treated identically to
+        // `None` and pinned by a unit test.
+        let resolved_kid: &str = match kid {
+            None => DEFAULT_KID,
+            Some("") => DEFAULT_KID,
+            Some(k) => k,
+        };
+        let pub_key = self
+            .keys
+            .get(resolved_kid)
+            .ok_or_else(|| SigError::UnknownKey {
+                kid: resolved_kid.to_string(),
+            })?;
+
+        // 3. Re-validate hash hex shape so a corrupted deployment_hash
+        // field is surfaced here, not buried inside the base64 decode.
+        let hash_bytes = parse_hash_hex(hash_hex)?;
+
+        // 4. Base64url(no-pad) decode. `URL_SAFE_NO_PAD` is strict —
+        // any `+`, `/`, or `=` character causes the decode to fail,
+        // which is exactly the property the PR1 contract requires.
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(signature_b64)
+            .map_err(|e| SigError::InvalidBase64(e.to_string()))?;
+
+        // 5. Length check before ed25519-dalek sees the bytes.
+        if sig_bytes.len() != SIG_BYTES {
+            return Err(SigError::WrongLength {
+                got: sig_bytes.len(),
+            });
+        }
+
+        // 6. Reconstruct the signed payload: raw hash bytes || raw
+        // deployment_id bytes. Matches the Go signer byte-for-byte.
+        let mut msg = Vec::with_capacity(32 + deployment_id.len());
+        msg.extend_from_slice(&hash_bytes);
+        msg.extend_from_slice(deployment_id.as_bytes());
+
+        // 7. Parse the signature. `Signature::from_slice` validates
+        // the encoded point's structure; a malformed sig is a
+        // wire-format error, not a verify-false.
+        let sig = Signature::from_slice(&sig_bytes)
+            .map_err(|e| SigError::InvalidEd25519(e.to_string()))?;
+
+        // 8. Cryptographic verify. `Ok(false)` is the normal rejection
+        // path for tampered bytes, wrong key, wrong id, etc.
+        Ok(pub_key.verify(&msg, &sig).is_ok())
+    }
 }
 
 /// Typed errors for the verifier. Each variant carries enough context
 /// to debug from the worker log without re-running with extra flags.
 ///
-/// Mirror [`crate::downloader::verify_hash`]'s style: empty / wrong
+/// Mirror `crate::downloader::verify_hash`'s style: empty / wrong
 /// length / non-lowercase / mismatch are distinct error cases so a
 /// regression on any one is obvious in the test diff.
 #[derive(Debug, thiserror::Error)]
@@ -95,8 +253,8 @@ pub enum SigError {
     /// debug a corrupted field.
     #[error("signature has wrong length: expected 64, got {got}")]
     WrongLength { got: usize },
-    /// `hash_hex` or the public key was not 64 lowercase hex chars.
-    /// `kind` is a short label so the error log is self-describing.
+    /// `hash_hex` was not 64 lowercase hex chars. `kind` is a short
+    /// label so the error log is self-describing.
     #[error("invalid {kind} hex: {msg}")]
     InvalidHex { kind: &'static str, msg: String },
     /// `deployment_id` is empty. The Go signer rejects empty ids, so
@@ -110,111 +268,32 @@ pub enum SigError {
     /// rejection.
     #[error("malformed Ed25519 signature: {0}")]
     InvalidEd25519(String),
+    /// `kid` was non-empty but did not resolve to a key in the
+    /// keyring. Distinct from `verify` returning `Ok(false)` — this
+    /// is a configuration bug (worker's keyring doesn't know about
+    /// the kid the CP signed with), not a signature mismatch.
+    #[error("unknown signing-key id {kid:?}; not present in worker keyring")]
+    UnknownKey { kid: String },
 }
 
-impl SignatureVerifier {
-    /// Build a verifier from a 64-char lowercase hex public key
-    /// (the format `cmd/printpub` emits in the control-plane repo).
-    pub fn from_hex(s: &str) -> anyhow::Result<Self> {
-        if s.len() != PUBKEY_HEX_LEN {
-            anyhow::bail!(
-                "signing pubkey must be exactly {PUBKEY_HEX_LEN} lowercase hex chars (got {})",
-                s.len()
-            );
-        }
-        if !s.bytes().all(is_lower_hex) {
-            anyhow::bail!(
-                "signing pubkey must contain only lowercase hex (0-9, a-f); uppercase or \
-                 non-hex chars are rejected to surface configuration drift early"
-            );
-        }
-        let raw = decode_hex_32(s).map_err(|e| anyhow::anyhow!("decoding pubkey hex: {e}"))?;
-        let pub_key = VerifyingKey::from_bytes(&raw)
-            .map_err(|e| anyhow::anyhow!("ed25519 pubkey rejected: {e}"))?;
-        Ok(Self { pub_key })
+/// Parse a 64-character lowercase hex string into a `VerifyingKey`.
+/// Kept crate-private — only `Keyring::from_inline` and the test
+/// crate need it.
+fn parse_pubkey_hex(s: &str) -> anyhow::Result<VerifyingKey> {
+    if s.len() != PUBKEY_HEX_LEN {
+        anyhow::bail!(
+            "signing pubkey must be exactly {PUBKEY_HEX_LEN} lowercase hex chars (got {})",
+            s.len()
+        );
     }
-
-    /// Build a verifier from a file containing the 64-char lowercase
-    /// hex public key. Trailing whitespace / newlines are tolerated
-    /// (operator keys are often hand-pasted or extracted from
-    /// `cmd/printpub` with a trailing newline).
-    pub fn from_file(p: &Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(p)
-            .map_err(|e| anyhow::anyhow!("reading signing pubkey file {}: {e}", p.display()))?;
-        // Trim trailing whitespace only — we keep the strict 64-char
-        // length check so a file with embedded newlines is rejected
-        // by from_hex rather than silently coerced.
-        let trimmed = raw.trim_end();
-        Self::from_hex(trimmed)
+    if !s.bytes().all(is_lower_hex) {
+        anyhow::bail!(
+            "signing pubkey must contain only lowercase hex (0-9, a-f); uppercase or \
+             non-hex chars are rejected to surface configuration drift early"
+        );
     }
-
-    /// Verify that `signature_b64` is a valid Ed25519 signature over
-    /// `sha256_raw_32_bytes(deployment_id_bytes) || deployment_id_bytes`,
-    /// where the hash bytes are reconstructed from `hash_hex`.
-    ///
-    /// Returns:
-    /// - `Ok(true)` — the signature is valid for this hash + id pair.
-    /// - `Ok(false)` — the signature parsed cleanly but `verify`
-    ///   returned false. This is a *cryptographic* rejection (wrong
-    ///   key, wrong id, tampered bytes, replay), not a wire-format
-    ///   bug.
-    /// - `Err(SigError)` — the input is malformed at the wire-format
-    ///   level (empty id, non-hex hash, bad base64, wrong length,
-    ///   ed25519-dalek rejected the sig shape).
-    ///
-    /// The split between `Ok(false)` and `Err` matters: a tampered
-    /// `deployments.signature` column should be a `verify` false
-    /// (operator can investigate), but a corrupted column with
-    /// non-base64 content should be a typed wire-format error (the
-    /// schema itself is broken; fix the producer).
-    pub fn verify(
-        &self,
-        hash_hex: &str,
-        deployment_id: &str,
-        signature_b64: &str,
-    ) -> Result<bool, SigError> {
-        // 1. Empty deployment_id — defensive, the Go signer refuses
-        // to emit one, but the worker must never accept it.
-        if deployment_id.is_empty() {
-            return Err(SigError::EmptyDeploymentID);
-        }
-
-        // 2. Re-validate hash hex shape so a corrupted deployment_hash
-        // field is surfaced here, not buried inside the base64 decode
-        // (and so the verify-false / wire-error split above holds
-        // even when the hash is the bad field).
-        let hash_bytes = parse_hash_hex(hash_hex)?;
-
-        // 3. Base64url(no-pad) decode. `URL_SAFE_NO_PAD` is strict —
-        // any `+`, `/`, or `=` character causes the decode to fail,
-        // which is exactly the property the PR1 contract requires.
-        let sig_bytes = URL_SAFE_NO_PAD
-            .decode(signature_b64)
-            .map_err(|e| SigError::InvalidBase64(e.to_string()))?;
-
-        // 4. Length check before ed25519-dalek sees the bytes.
-        if sig_bytes.len() != SIG_BYTES {
-            return Err(SigError::WrongLength {
-                got: sig_bytes.len(),
-            });
-        }
-
-        // 5. Reconstruct the signed payload: raw hash bytes || raw
-        // deployment_id bytes. Matches the Go signer byte-for-byte.
-        let mut msg = Vec::with_capacity(32 + deployment_id.len());
-        msg.extend_from_slice(&hash_bytes);
-        msg.extend_from_slice(deployment_id.as_bytes());
-
-        // 6. Parse the signature. `Signature::from_slice` validates
-        // the encoded point's structure; a malformed sig is a
-        // wire-format error, not a verify-false.
-        let sig = Signature::from_slice(&sig_bytes)
-            .map_err(|e| SigError::InvalidEd25519(e.to_string()))?;
-
-        // 7. Cryptographic verify. `Ok(false)` is the normal rejection
-        // path for tampered bytes, wrong key, wrong id, etc.
-        Ok(self.pub_key.verify(&msg, &sig).is_ok())
-    }
+    let raw = decode_hex_32(s).map_err(|e| anyhow::anyhow!("decoding pubkey hex: {e}"))?;
+    VerifyingKey::from_bytes(&raw).map_err(|e| anyhow::anyhow!("ed25519 pubkey rejected: {e}"))
 }
 
 // ── helpers shared with downloader.rs (mirroring verify_hash) ────────────
@@ -279,32 +358,26 @@ fn parse_hash_hex(s: &str) -> Result<[u8; 32], SigError> {
 
 #[cfg(test)]
 mod tests {
-    //! The 8 cases mirror the Go signer's `signer_test.go` set, in the
-    //! same order — a regression in any of them means the signed
-    //! message layout, wire format, or key format drifted.
+    //! The verification cases mirror the Go signer's `signer_test.go`
+    //! matrix. PR1 (keyring follow-up) adds cases for kid resolution:
+    //! default-key fallback, explicit kid, unknown kid, and the
+    //! empty-string-kid normalization.
 
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
     /// SHA-256 of the empty string, in lowercase hex.
-    /// Matches the Go side's `testHashHex` fixture in
-    /// `internal/signing/signer_test.go`.
     const TEST_HASH_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     /// Deployment id chosen by PR1's `signer_test.go` (so any fixture
     /// that ships in this crate matches what the Go side produces).
     const TEST_DEPLOYMENT_ID: &str = "d_00000000000000000000";
 
-    /// 32-byte all-zero seed → deterministic test keypair. Mirrors
-    /// the Go side's `signing.TestKey()`.
-    fn test_keypair() -> (SigningKey, SignatureVerifier) {
-        let seed = [0u8; 32];
+    /// 32-byte all-zero seed → deterministic test keypair.
+    fn test_keypair(seed_byte: u8) -> (SigningKey, VerifyingKey) {
+        let seed = [seed_byte; 32];
         let sk = SigningKey::from_bytes(&seed);
         let vk = sk.verifying_key();
-        // Build the verifier from the raw public key bytes so the
-        // test exercises the same VerifyingKey construction the
-        // production from_hex path uses.
-        let verifier = SignatureVerifier { pub_key: vk };
-        (sk, verifier)
+        (sk, vk)
     }
 
     /// Helper: sign `hash_hex || deployment_id` exactly the way the
@@ -318,206 +391,273 @@ mod tests {
         URL_SAFE_NO_PAD.encode(sig.to_bytes())
     }
 
-    // 1. Happy path: a freshly-signed signature over a real
-    //    (hash, deployment_id) pair verifies. Mirrors
-    //    `TestSigner_RoundtripFreshKey` in the Go test.
+    fn pubkey_hex(vk: &VerifyingKey) -> String {
+        let bytes = vk.to_bytes();
+        let mut hex = String::with_capacity(64);
+        for b in bytes {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    }
+
+    // ---- PR2 cases (mirrored from the previous file) ----
+
     #[test]
     fn verify_accepts_valid_signature() {
-        let (sk, verifier) = test_keypair();
+        let (sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let sig = sign_for_test(&sk, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
-        let ok = verifier
-            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig)
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig, None)
             .expect("verify should not error on a well-formed signature");
-        assert!(ok, "valid signature must verify as Ok(true)");
+        assert!(ok);
     }
 
-    // 2. Uppercase hex hash → Err(InvalidHex). Mirrors
-    //    `TestSigner_RejectsUppercaseHexHash` — the wire format
-    //    is strict lowercase, mirroring the `verify_hash` style.
     #[test]
     fn verify_rejects_uppercase_hex_hash() {
-        let (_sk, verifier) = test_keypair();
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let bad = TEST_HASH_HEX.to_uppercase();
-        let err = verifier
-            .verify(&bad, TEST_DEPLOYMENT_ID, "valid_b64_placeholder")
-            .expect_err("uppercase hex hash must be rejected at the pre-check");
-        assert!(
-            matches!(err, SigError::InvalidHex { kind: "hash", .. }),
-            "expected SigError::InvalidHex(hash), got: {err:?}"
-        );
+        let err = keyring
+            .verify(&bad, TEST_DEPLOYMENT_ID, "valid_b64_placeholder", None)
+            .expect_err("uppercase hex hash must be rejected");
+        assert!(matches!(err, SigError::InvalidHex { kind: "hash", .. }));
     }
 
-    // 3. Empty signature → Err(InvalidBase64). Mirrors the
-    //    `verify_hash`'s empty-hash rejection: the wire format
-    //    refuses empty, doesn't silently skip the check.
     #[test]
     fn verify_rejects_empty_signature() {
-        let (_sk, verifier) = test_keypair();
-        let err = verifier
-            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, "")
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
+        let err = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, "", None)
             .expect_err("empty signature must be rejected");
-        // base64url decode of "" returns Ok([]) (empty input is valid
-        // base64), so the failure mode is WrongLength { got: 0 }.
-        // Both are wire-format errors; either is acceptable here.
-        assert!(
-            matches!(
-                err,
-                SigError::InvalidBase64(_) | SigError::WrongLength { got: 0 }
-            ),
-            "expected InvalidBase64 or WrongLength(0), got: {err:?}"
-        );
+        assert!(matches!(
+            err,
+            SigError::InvalidBase64(_) | SigError::WrongLength { got: 0 }
+        ));
     }
 
-    // 4. Signature decodes to non-64 bytes → Err(WrongLength).
-    //    Mirrors `TestSigner_RejectsWrongLengthHash` in spirit
-    //    (length-mismatch is its own typed error).
     #[test]
     fn verify_rejects_wrong_length_signature() {
-        let (_sk, verifier) = test_keypair();
-        // 32 raw bytes base64url-encoded = 43 chars.
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let short = URL_SAFE_NO_PAD.encode([0u8; 32]);
-        let err = verifier
-            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &short)
+        let err = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &short, None)
             .expect_err("32-byte signature must be rejected as wrong length");
-        assert!(
-            matches!(err, SigError::WrongLength { got: 32 }),
-            "expected WrongLength(32), got: {err:?}"
-        );
+        assert!(matches!(err, SigError::WrongLength { got: 32 }));
     }
 
-    // 5. Standard base64 (with `+/=`) is rejected. Mirrors
-    //    `TestSigner_VerifyRejectsStandardBase64` — only base64url
-    //    no-pad is the wire format.
     #[test]
     fn verify_rejects_standard_base64() {
         use base64::engine::general_purpose::STANDARD;
-        let (_sk, verifier) = test_keypair();
-        // Build a fake 64-byte sig and encode it with standard
-        // base64. The decode is the part that must fail.
-        let raw_sig = [0xAAu8; 64];
-        let standard = STANDARD.encode(raw_sig);
-        let err = verifier
-            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &standard)
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
+        let standard = STANDARD.encode([0xAAu8; 64]);
+        let err = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &standard, None)
             .expect_err("standard base64 must be rejected");
-        assert!(
-            matches!(err, SigError::InvalidBase64(_)),
-            "expected SigError::InvalidBase64, got: {err:?}"
-        );
+        assert!(matches!(err, SigError::InvalidBase64(_)));
     }
 
-    // 6. Signature decodes cleanly but is cryptographically invalid
-    //    (the wrong key signed it, or the bytes are random).
-    //    Returns Ok(false), NOT Err. Mirrors
-    //    `TestSigner_VerifyRejectsTamperedSignature`.
     #[test]
     fn verify_returns_false_on_random_signature() {
-        let (_sk, verifier) = test_keypair();
-        // Random 64-byte signature that decodes cleanly but
-        // doesn't match (TEST_HASH_HEX, TEST_DEPLOYMENT_ID).
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let random_sig = URL_SAFE_NO_PAD.encode([0x42u8; 64]);
-        let ok = verifier
-            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &random_sig)
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &random_sig, None)
             .expect("verify should not error on a well-formed but wrong signature");
-        assert!(!ok, "random sig must verify as Ok(false), not Ok(true)");
+        assert!(!ok);
     }
 
-    // 7. Signature valid over a different deployment_id → Ok(false).
-    //    Mirrors `TestSigner_RejectsReplayAcrossDeploymentIDs` —
-    //    this is the binding check that prevents DB-replay.
     #[test]
     fn verify_rejects_replay_across_deployment_ids() {
-        let (sk, verifier) = test_keypair();
+        let (sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let sig = sign_for_test(&sk, TEST_HASH_HEX, "d_original");
-        let ok = verifier
-            .verify(TEST_HASH_HEX, "d_replay", &sig)
+        let ok = keyring
+            .verify(TEST_HASH_HEX, "d_replay", &sig, None)
             .expect("verify should not error on a well-formed but wrong-id signature");
-        assert!(
-            !ok,
-            "signature over deployment A must NOT verify against deployment B"
-        );
+        assert!(!ok);
     }
 
-    // 8. Signature valid over a different hash → Ok(false). Mirrors
-    //    the hash-binding case in `TestSigner_RejectsReplayAcrossDeploymentIDs`:
-    //    the signed payload includes the hash, so a swap of
-    //    `deployments.hash` to a different value (even with the
-    //    original sig column untouched) must fail verification.
     #[test]
     fn verify_rejects_replay_across_hashes() {
-        let (sk, verifier) = test_keypair();
+        let (sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
         let sig = sign_for_test(&sk, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
-        // All-zeros is a syntactically valid 64-hex hash, so the
-        // failure is cryptographic (verify-false), not wire-format.
         let other_hash = "0".repeat(64);
-        let ok = verifier
-            .verify(&other_hash, TEST_DEPLOYMENT_ID, &sig)
+        let ok = keyring
+            .verify(&other_hash, TEST_DEPLOYMENT_ID, &sig, None)
             .expect("verify should not error on a well-formed but wrong-hash signature");
-        assert!(!ok, "signature over hash A must NOT verify against hash B");
+        assert!(!ok);
     }
 
-    // ── from_hex / from_file tests ────────────────────────────────────
+    // ---- PR1 (follow-up) cases: keyring kid resolution ----
 
-    /// from_hex accepts a 64-lowercase-hex pubkey. The test keypair's
-    /// verifying key is a real RFC-8032-compliant 32-byte public key,
-    /// so we can round-trip it through from_hex.
+    /// `kid = None` and a single-key keyring verifies successfully.
     #[test]
-    fn from_hex_accepts_valid_pubkey() {
-        let (_sk, verifier) = test_keypair();
-        // Render the verifying key as 64 lowercase hex chars.
-        let pk_bytes = verifier.pub_key.to_bytes();
-        let mut hex = String::with_capacity(64);
-        for b in pk_bytes {
-            use std::fmt::Write;
-            let _ = write!(hex, "{b:02x}");
-        }
-        let parsed = SignatureVerifier::from_hex(&hex).expect("valid hex must parse");
-        assert_eq!(parsed.pub_key.to_bytes(), pk_bytes);
+    fn verify_no_kid_single_key_keyring() {
+        let (sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
+        let sig = sign_for_test(&sk, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig, None)
+            .expect("verify");
+        assert!(ok);
     }
 
-    /// from_hex rejects uppercase — same defensive style as
-    /// verify_hash.
+    /// `kid = Some("")` (legacy CP form) resolves to the default key.
+    /// The most likely silent foot-gun: a pre-PR1-follow-up control
+    /// plane emits an empty-string kid instead of null. The worker
+    /// MUST treat it identically to `None`, not crash on the empty
+    /// key lookup.
     #[test]
-    fn from_hex_rejects_uppercase() {
-        let (_sk, verifier) = test_keypair();
-        let pk_bytes = verifier.pub_key.to_bytes();
-        let mut hex = String::with_capacity(64);
-        for b in pk_bytes {
-            use std::fmt::Write;
-            let _ = write!(hex, "{b:02X}"); // uppercase
-        }
-        let err = SignatureVerifier::from_hex(&hex).expect_err("uppercase must be rejected");
+    fn verify_empty_kid_falls_back_to_default_key() {
+        let (sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
+        let sig = sign_for_test(&sk, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig, Some(""))
+            .expect("empty-string kid must resolve to default key");
+        assert!(ok);
+    }
+
+    /// `kid = Some("k1")` resolves to the matching key in a multi-key
+    /// keyring. Two distinct test keypairs have separate sigs; the
+    /// right key verifies.
+    #[test]
+    fn verify_explicit_kid_resolves_in_multi_key_keyring() {
+        let (sk1, vk1) = test_keypair(1);
+        let (_sk2, vk2) = test_keypair(2);
+        let mut keys = BTreeMap::new();
+        keys.insert("k1".to_string(), vk1);
+        keys.insert("k2".to_string(), vk2);
+        let keyring = Keyring { keys };
+
+        let sig = sign_for_test(&sk1, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig, Some("k1"))
+            .expect("explicit kid must verify against matching key");
+        assert!(ok);
+    }
+
+    /// `kid = Some("unknown")` returns `UnknownKey`, not `Ok(false)`.
+    /// Distinct error type so an operator can diagnose
+    /// "keyring config drift" from "signature does not verify."
+    #[test]
+    fn verify_unknown_kid_returns_unknown_key_error() {
+        let (_sk, vk) = test_keypair(0);
+        let keyring = Keyring::single(vk);
+        let err = keyring
+            .verify(
+                TEST_HASH_HEX,
+                TEST_DEPLOYMENT_ID,
+                "valid_b64_placeholder",
+                Some("k_does_not_exist"),
+            )
+            .expect_err("unknown kid must produce UnknownKey");
         assert!(
-            format!("{err:#}").contains("lowercase"),
-            "expected lowercase in error, got: {err}"
+            matches!(err, SigError::UnknownKey { ref kid } if kid == "k_does_not_exist"),
+            "expected UnknownKey(k_does_not_exist), got: {err:?}"
         );
     }
 
-    /// from_hex rejects wrong-length input.
+    /// Wrong kid for a valid signature → `Ok(false)`, not `UnknownKey`.
+    /// The signature was correctly formed for `vk2` but `k1` was
+    /// requested; the lookup succeeds, the verify fails. This is the
+    /// path operators hit when they rotate keys but forget to update
+    /// the CP's `EDGE_SIGNING_KEY_ID`.
     #[test]
-    fn from_hex_rejects_wrong_length() {
-        let err = SignatureVerifier::from_hex("abcd").expect_err("short input must be rejected");
+    fn verify_wrong_kid_for_valid_signature_returns_false() {
+        let (sk1, vk1) = test_keypair(1);
+        let (sk2, vk2) = test_keypair(2);
+        let mut keys = BTreeMap::new();
+        keys.insert("k1".to_string(), vk1);
+        keys.insert("k2".to_string(), vk2);
+        let keyring = Keyring { keys };
+
+        // Sign with sk2 (kid k2's key).
+        let sig = sign_for_test(&sk2, TEST_HASH_HEX, TEST_DEPLOYMENT_ID);
+        // Verify claiming kid k1 — sig won't match.
+        let ok = keyring
+            .verify(TEST_HASH_HEX, TEST_DEPLOYMENT_ID, &sig, Some("k1"))
+            .expect("verify should not error on well-formed sig + wrong key");
+        assert!(!ok, "sig for k2 must not verify against k1");
+        // Suppress unused warning on sk1 — it's only there to make
+        // the keypair identities distinct.
+        let _ = sk1;
+    }
+
+    // ---- from_inline / from_file ----
+
+    #[test]
+    fn from_inline_accepts_multiple_keys() {
+        let (_sk1, vk1) = test_keypair(1);
+        let (_sk2, vk2) = test_keypair(2);
+        let raw = format!(
+            "k1 = {}\nk2 = {}\n# comment line\n\nk3 = {}\n",
+            pubkey_hex(&vk1),
+            pubkey_hex(&vk2),
+            pubkey_hex(&vk1), // duplicate vk1, different kid — both legit
+        );
+        let keyring = Keyring::from_inline(&raw).expect("parse multi-key keyring");
+        assert_eq!(keyring.keys.len(), 3);
+        assert!(keyring.keys.contains_key("k1"));
+        assert!(keyring.keys.contains_key("k2"));
+        assert!(keyring.keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn from_inline_rejects_duplicate_kid() {
+        let (_sk, vk) = test_keypair(0);
+        let raw = format!("k1 = {}\nk1 = {}\n", pubkey_hex(&vk), pubkey_hex(&vk),);
+        let err = Keyring::from_inline(&raw).expect_err("duplicate kid must error");
         assert!(
-            format!("{err:#}").contains("64 lowercase hex"),
-            "expected length hint, got: {err}"
+            err.to_string().contains("duplicate kid"),
+            "expected duplicate-kid error, got: {err}"
         );
     }
 
-    /// from_file reads a 64-hex file (with trailing newline tolerated)
-    /// and constructs a verifier.
     #[test]
-    fn from_file_reads_pubkey_with_trailing_newline() {
-        let (_sk, verifier) = test_keypair();
-        let pk_bytes = verifier.pub_key.to_bytes();
-        let mut hex = String::with_capacity(65);
-        for b in pk_bytes {
-            use std::fmt::Write;
-            let _ = write!(hex, "{b:02x}");
-        }
-        hex.push('\n'); // simulate a hand-pasted file
+    fn from_inline_rejects_empty() {
+        let err = Keyring::from_inline("").expect_err("empty keyring must error");
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_inline_rejects_malformed_line() {
+        let err = Keyring::from_inline("not a valid line").expect_err("malformed line must error");
+        assert!(
+            err.to_string().contains("expected `<kid> = <64-hex>`"),
+            "expected malformed-line error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_inline_rejects_invalid_pubkey_hex() {
+        let err = Keyring::from_inline("k1 = zzzz_not_hex").expect_err("bad hex must error");
+        assert!(
+            err.to_string().contains("lowercase hex")
+                || err.to_string().contains("non-hex")
+                || err.to_string().contains("wrong"),
+            "expected hex-shape error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_file_reads_keyring_with_trailing_whitespace() {
+        let (_sk, vk) = test_keypair(0);
+        let raw = format!("k1 = {}\n", pubkey_hex(&vk));
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("pub.hex");
-        std::fs::write(&path, &hex).expect("write pubkey file");
-        let parsed = SignatureVerifier::from_file(&path).expect("file load should succeed");
-        assert_eq!(parsed.pub_key.to_bytes(), pk_bytes);
+        let path = dir.path().join("keyring.txt");
+        std::fs::write(&path, &raw).expect("write keyring");
+        let keyring = Keyring::from_file(&path).expect("file load should succeed");
+        assert_eq!(keyring.keys.len(), 1);
     }
 }

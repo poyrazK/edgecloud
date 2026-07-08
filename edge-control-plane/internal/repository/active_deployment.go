@@ -313,7 +313,13 @@ type JoinedActiveDeployment struct {
 	domain.ActiveDeployment
 	Hash      sql.NullString `db:"hash"`
 	Signature sql.NullString `db:"signature"`
-	Regions   pq.StringArray `db:"regions"`
+	// SigningKeyID mirrors the deployments.signing_key_id column
+	// (issue #307 follow-up PR1). Picked up by reconcile / full_sync
+	// to populate AppConfig.SigningKeyID on the NATS wire so workers
+	// can pick the right pubkey from their keyring. Empty for legacy
+	// rows (NULL column) — workers treat empty as "default key".
+	SigningKeyID sql.NullString `db:"signing_key_id"`
+	Regions      pq.StringArray `db:"regions"`
 }
 
 // ListByTenantWithDeployment returns one row per active deployment
@@ -340,7 +346,7 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
 		       ad.regions_failed, ad.regions_cached, ad.regions_cache_failed,
 		       ad.last_publish_at, ad.last_publish_attempt_id,
-		       d.hash, d.signature, d.regions
+		       d.hash, d.signature, d.signing_key_id, d.regions
 		FROM active_deployments ad
 		LEFT JOIN deployments d ON d.id = ad.deployment_id
 		WHERE ad.tenant_id = $1

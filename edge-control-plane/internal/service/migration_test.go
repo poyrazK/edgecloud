@@ -186,7 +186,7 @@ func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deplo
 // caller doesn't need to know the details; this helper exists so
 // individual tests don't repeat the boilerplate.
 func migrationSvcForTest(t *testing.T, repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
-	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
+	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
 }
 
 func skipIfNoEdgeMigrate(t *testing.T) {
@@ -328,7 +328,7 @@ func TestMigrationService_Migrate_EdgeMigrateFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if !errors.Is(err, ErrEdgeMigrateFailed) {
@@ -789,7 +789,7 @@ func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *test
 	// structured TreeMigrationReport for the caller to inspect.
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc", signing.TestKey(t))
+	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc", signing.TestKeyring(t))
 	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
 		{Path: "main.c", Source: "int main(){return 0;}\n"},
 	})
@@ -888,7 +888,7 @@ func TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
+	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
 
 	// Source: a fork() call. The transformer will leave it in place
 	// (no WASI equivalent exists), so the transformed source still
@@ -1050,7 +1050,7 @@ fn main() {
 func TestMigrationService_StoresRustcPath(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc", signing.TestKey(t))
+	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc", signing.TestKeyring(t))
 	if svc.rustcPath != "/opt/rust/bin/rustc" {
 		t.Errorf("expected rustcPath=%q, got %q", "/opt/rust/bin/rustc", svc.rustcPath)
 	}
@@ -1201,7 +1201,7 @@ func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
 	// Point edge-migrate at a non-existent binary so the subprocess
 	// fails. The Rust compile path must surface this as a failure,
 	// not silently produce a wasm.
-	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
+	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKeyring(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
