@@ -99,9 +99,13 @@ type WorkerService struct {
 	stableWindow time.Duration
 	metricsAgg   *MetricsAggregator
 	// dedupeCache maps `dedupe_id` → expiry time. Entries are evicted
-	// lazily on read (when a present-but-expired key is touched) and
-	// opportunistically by the background sweeper below. Bounded by
-	// the number of active (worker, deployment) pairs at any moment.
+	// lazily on read — when a present-but-expired key is touched in
+	// `dedupeSeen`, it is deleted and re-recorded with a fresh TTL.
+	// Bounded by the number of active (worker, deployment) pairs at
+	// any moment. Note: both `checkOutboundQuota` and `checkRequestCount`
+	// call `dedupeSeen` per app on every heartbeat (two goroutines per
+	// delivery), so a redelivered heartbeat does 2× Load + Store per
+	// app — negligible at 30s cadence but worth knowing.
 	dedupeCache sync.Map
 }
 
