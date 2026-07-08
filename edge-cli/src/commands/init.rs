@@ -18,6 +18,7 @@ language = "{language}"
 [deployment]
 "#;
 
+#[allow(dead_code)]
 const EDGE_TOML_HEADER_JS: &str = r#"[project]
 name = "{name}"
 version = "0.1.0"
@@ -100,6 +101,7 @@ globalThis.handleRequest = handleRequest;
 /// written as plain single braces here (NOT `{{` / `}}` — this is a
 /// raw string, not a `format!` invocation, so brace escaping is
 /// unnecessary and would render literally in the output).
+#[allow(dead_code)]
 const INDEX_JS_TEMPLATE: &str = r#"// {name} — built with edgeCloud (JavaScript via Javy).
 //
 // The runtime hands you a Fetch-style Request and expects a Response
@@ -368,5 +370,10 @@ mod tests {
         // brace balance is even — a basic sanity check.
         let result = super::INDEX_JS_TEMPLATE.replace("{name}", "myapp");
         let opens = result.matches('{').count();
+        let closes = result.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "unbalanced braces in index.js template: {opens} open vs {closes} close"
+        );
     }
 }
