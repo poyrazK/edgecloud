@@ -588,6 +588,13 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("WORKER_JWT_SECRET", None),
+            // Issue #307 PR2: this test predates signature
+            // verification; lock the secure-by-default invariant off so
+            // its absence doesn't trigger the new "no pubkey, refusing
+            // to start" validator when this test runs after one that
+            // unset `EDGE_REQUIRE_SIGNATURE` (nextest reorders across
+            // worker threads).
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
         ]);
         let cfg = Config::from_env().expect("from_env with no JWT secret");
         assert_eq!(
