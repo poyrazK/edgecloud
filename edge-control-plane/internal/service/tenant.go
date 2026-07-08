@@ -90,15 +90,45 @@ type TenantServiceInterface interface {
 	DeleteTenant(ctx context.Context, id string) error
 }
 
+// Package-level interfaces for testability. The concrete
+// *repository.* types satisfy these interfaces structurally.
+
+// tenantRepoForTenantSvc is the subset of *repository.TenantRepository
+// methods used by TenantService.
+type tenantRepoForTenantSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.TenantRepository
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	Create(ctx context.Context, tenant *domain.Tenant) error
+	Update(ctx context.Context, tenant *domain.Tenant) error
+	Delete(ctx context.Context, id string) error
+	List(ctx context.Context) ([]domain.Tenant, error)
+}
+
+// quotaRepoForTenantSvc is the subset of *repository.QuotaRepository
+// methods used by TenantService.
+type quotaRepoForTenantSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
+	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+	Create(ctx context.Context, quota *domain.Quota) error
+	Update(ctx context.Context, quota *domain.Quota) error
+}
+
+// apiKeyRepoForTenantSvc is the subset of *repository.APIKeyRepository
+// methods used by TenantService.
+type apiKeyRepoForTenantSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.APIKeyRepository
+	Create(ctx context.Context, k *domain.APIKey) error
+}
+
 // TenantService handles tenant business logic.
 type TenantService struct {
 	db         *sqlx.DB
-	tenantRepo *repository.TenantRepository
-	quotaRepo  *repository.QuotaRepository
-	apiKeyRepo *repository.APIKeyRepository
+	tenantRepo tenantRepoForTenantSvc
+	quotaRepo  quotaRepoForTenantSvc
+	apiKeyRepo apiKeyRepoForTenantSvc
 }
 
-func NewTenantService(db *sqlx.DB, tenantRepo *repository.TenantRepository, quotaRepo *repository.QuotaRepository, apiKeyRepo *repository.APIKeyRepository) *TenantService {
+func NewTenantService(db *sqlx.DB, tenantRepo tenantRepoForTenantSvc, quotaRepo quotaRepoForTenantSvc, apiKeyRepo apiKeyRepoForTenantSvc) *TenantService {
 	return &TenantService{db: db, tenantRepo: tenantRepo, quotaRepo: quotaRepo, apiKeyRepo: apiKeyRepo}
 }
 

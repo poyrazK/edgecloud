@@ -519,3 +519,94 @@ func TestDomainService_ListAllDomains_ReturnsRows(t *testing.T) {
 		t.Fatalf("len(domains) = %d, want 2", len(got))
 	}
 }
+
+func TestDomainService_ListDomains_ReturnsRows(t *testing.T) {
+	repo := &mockDomainRepo{
+		listByAppFn: func(ctx context.Context, tenantID, appName string) ([]domain.Domain, error) {
+			return []domain.Domain{
+				{ID: "dom_1", FQDN: "api.acme.com", TenantID: tenantID, AppName: appName},
+				{ID: "dom_2", FQDN: "web.acme.com", TenantID: tenantID, AppName: appName},
+			}, nil
+		},
+	}
+	svc := domainSvcForTest(repo, &mockAppLookupForDomain{})
+	got, err := svc.ListDomains(context.Background(), "t_a", "api")
+	if err != nil {
+		t.Fatalf("ListDomains: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(domains) = %d, want 2", len(got))
+	}
+}
+
+func TestDomainService_ListDomains_Empty(t *testing.T) {
+	svc := domainSvcForTest(&mockDomainRepo{}, &mockAppLookupForDomain{})
+	got, err := svc.ListDomains(context.Background(), "t_a", "api")
+	if err != nil {
+		t.Fatalf("ListDomains: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("len(domains) = %d, want 0", len(got))
+	}
+}
+
+func TestDomainService_GetDomainByID_Found(t *testing.T) {
+	repo := &mockDomainRepo{
+		getByIDFn: func(ctx context.Context, id string) (*domain.Domain, error) {
+			return &domain.Domain{ID: id, FQDN: "api.acme.com"}, nil
+		},
+	}
+	svc := domainSvcForTest(repo, &mockAppLookupForDomain{})
+	d, err := svc.GetDomainByID(context.Background(), "dom_1")
+	if err != nil {
+		t.Fatalf("GetDomainByID: %v", err)
+	}
+	if d == nil || d.ID != "dom_1" {
+		t.Errorf("unexpected domain: %+v", d)
+	}
+}
+
+func TestDomainService_GetDomainByID_NotFound(t *testing.T) {
+	svc := domainSvcForTest(&mockDomainRepo{}, &mockAppLookupForDomain{})
+	d, err := svc.GetDomainByID(context.Background(), "dom_missing")
+	if err != nil {
+		t.Fatalf("GetDomainByID: %v", err)
+	}
+	if d != nil {
+		t.Errorf("expected nil, got %+v", d)
+	}
+}
+
+func TestDomainService_UpdateStatus_HappyPath(t *testing.T) {
+	repo := &mockDomainRepo{
+		updateStatusFn: func(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error) {
+			return true, nil
+		},
+	}
+	svc := domainSvcForTest(repo, &mockAppLookupForDomain{})
+	err := svc.UpdateStatus(context.Background(), "dom_1", domain.DomainStatusActive, nil)
+	if err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+}
+
+func TestDomainService_UpdateStatus_NotFound(t *testing.T) {
+	repo := &mockDomainRepo{
+		updateStatusFn: func(ctx context.Context, id string, status domain.DomainStatus, lastError *string) (bool, error) {
+			return false, nil
+		},
+	}
+	svc := domainSvcForTest(repo, &mockAppLookupForDomain{})
+	err := svc.UpdateStatus(context.Background(), "dom_missing", domain.DomainStatusActive, nil)
+	if !errors.Is(err, ErrDomainNotFound) {
+		t.Fatalf("UpdateStatus = %v, want ErrDomainNotFound", err)
+	}
+}
+
+func TestDomainService_GetDomain_NotFound(t *testing.T) {
+	svc := domainSvcForTest(&mockDomainRepo{}, &mockAppLookupForDomain{})
+	_, err := svc.GetDomain(context.Background(), "t_a", "api", "api.acme.com")
+	if !errors.Is(err, ErrDomainNotFound) {
+		t.Fatalf("GetDomain = %v, want ErrDomainNotFound", err)
+	}
+}

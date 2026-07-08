@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
@@ -572,5 +574,82 @@ func TestAppService_Update_NotFound(t *testing.T) {
 	})
 	if !errors.Is(err, ErrAppNotFound) {
 		t.Errorf("Update() error = %v, want ErrAppNotFound", err)
+	}
+}
+
+func TestAppService_GetForUpdate_Found(t *testing.T) {
+	repo := &mockAppRepo{
+		getForUpdateFunc: func(_ context.Context, tenantID, appName string) (*domain.App, error) {
+			return &domain.App{TenantID: tenantID, Name: appName}, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	app, err := svc.GetForUpdate(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("GetForUpdate: %v", err)
+	}
+	if app == nil || app.Name != "myapp" {
+		t.Errorf("unexpected app: %+v", app)
+	}
+}
+
+func TestAppService_GetForUpdate_NotFound(t *testing.T) {
+	svc := appSvcForTest(&mockAppRepo{}, &mockQuotaRepoForApps{})
+	app, err := svc.GetForUpdate(context.Background(), "t_test", "missing")
+	if err != nil {
+		t.Fatalf("GetForUpdate: %v", err)
+	}
+	if app != nil {
+		t.Errorf("expected nil, got %+v", app)
+	}
+}
+
+func TestAppService_Delete_HappyPath(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM app_env`).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(`DELETE FROM active_deployments`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM deployments`).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+	mock.ExpectCommit()
+
+	repo := &mockAppRepo{
+		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
+			return true, nil
+		},
+	}
+	svc := &AppService{
+		db:         db,
+		appRepo:    repo,
+		quotaRepo:  &mockQuotaRepoForApps{},
+		appEnvRepo: repository.NewAppEnvRepository(db),
+		activeRepo: repository.NewActiveDeploymentRepository(db),
+		deployRepo: repository.NewDeploymentRepository(db),
+	}
+	if err := svc.Delete(context.Background(), "t_test", "myapp"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+func TestAppService_Delete_NotFound(t *testing.T) {
+	repo := &mockAppRepo{
+		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
+			return false, nil
+		},
+	}
+	svc := &AppService{
+		appRepo:   repo,
+		quotaRepo: &mockQuotaRepoForApps{},
+	}
+	err := svc.Delete(context.Background(), "t_test", "missing")
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Errorf("Delete() error = %v, want ErrAppNotFound", err)
 	}
 }

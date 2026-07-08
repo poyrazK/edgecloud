@@ -576,3 +576,238 @@ func TestAPIKeyService_UpdateAPIKey_InvalidRole(t *testing.T) {
 		t.Fatal("expected error for invalid role, got nil")
 	}
 }
+
+func TestAPIKeyService_CreateAPIKey_HappyPath(t *testing.T) {
+	var created *domain.APIKey
+	repo := &mockAPIKeyRepo{
+		createFn: func(_ context.Context, k *domain.APIKey) error {
+			created = k
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+
+	apiKey, raw, err := svc.CreateAPIKey(context.Background(), "t_test", "my-key", domain.RoleDeveloper, nil)
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	if raw == "" {
+		t.Fatal("raw key is empty")
+	}
+	if len(raw) != 64 {
+		t.Errorf("raw key length = %d, want 64", len(raw))
+	}
+	if created == nil {
+		t.Fatal("create was not called")
+	}
+	if created.TenantID != "t_test" || created.Name != "my-key" {
+		t.Errorf("unexpected api key: %+v", created)
+	}
+	if apiKey.ID != created.ID {
+		t.Error("returned api key does not match created one")
+	}
+	if apiKey.ExpiresAt != nil {
+		t.Error("ExpiresAt should be nil when no ttlHours")
+	}
+}
+
+func TestAPIKeyService_CreateAPIKey_WithTTL(t *testing.T) {
+	ttl := 48
+	repo := &mockAPIKeyRepo{
+		createFn: func(_ context.Context, k *domain.APIKey) error {
+			if k.ExpiresAt == nil {
+				t.Fatal("expected non-nil ExpiresAt")
+			}
+			exp := *k.ExpiresAt
+			now := time.Now()
+			if exp.Before(now.Add(47*time.Hour)) || exp.After(now.Add(49*time.Hour)) {
+				t.Errorf("ExpiresAt = %v, want ~48h from now", exp)
+			}
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	_, _, err := svc.CreateAPIKey(context.Background(), "t_test", "my-key", domain.RoleDeveloper, &ttl)
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+}
+
+func TestAPIKeyService_CreateAPIKey_InvalidRole(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	_, _, err := svc.CreateAPIKey(context.Background(), "t_test", "my-key", "superadmin", nil)
+	if err == nil {
+		t.Fatal("expected error for invalid role")
+	}
+}
+
+func TestAPIKeyService_ListAPIKeys(t *testing.T) {
+	repo := &mockAPIKeyRepo{
+		listByTenantFn: func(_ context.Context, tenantID string) ([]domain.APIKey, error) {
+			return []domain.APIKey{
+				{ID: "k_1", Name: "key1", TenantID: tenantID},
+				{ID: "k_2", Name: "key2", TenantID: tenantID},
+			}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	keys, err := svc.ListAPIKeys(context.Background(), "t_test")
+	if err != nil {
+		t.Fatalf("ListAPIKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("got %d keys, want 2", len(keys))
+	}
+}
+
+func TestAPIKeyService_ListAPIKeys_Empty(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = &mockAPIKeyRepo{}
+	keys, err := svc.ListAPIKeys(context.Background(), "t_test")
+	if err != nil {
+		t.Fatalf("ListAPIKeys: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("got %d keys, want 0", len(keys))
+	}
+}
+
+func TestAPIKeyService_GetByID_Found(t *testing.T) {
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id, Name: "my-key", TenantID: "t_test"}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	key, err := svc.GetByID(context.Background(), "k_1")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if key == nil || key.ID != "k_1" {
+		t.Errorf("unexpected key: %+v", key)
+	}
+}
+
+func TestAPIKeyService_GetByID_NotFound(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = &mockAPIKeyRepo{}
+	key, err := svc.GetByID(context.Background(), "k_missing")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if key != nil {
+		t.Errorf("expected nil, got %+v", key)
+	}
+}
+
+func TestAPIKeyService_DeleteAPIKey_HappyPath(t *testing.T) {
+	var deletedID string
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id, TenantID: "t_test"}, nil
+		},
+		deleteFn: func(_ context.Context, id string) error {
+			deletedID = id
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	if err := svc.DeleteAPIKey(context.Background(), "t_test", "k_1"); err != nil {
+		t.Fatalf("DeleteAPIKey: %v", err)
+	}
+	if deletedID != "k_1" {
+		t.Errorf("deletedID = %q, want k_1", deletedID)
+	}
+}
+
+func TestAPIKeyService_DeleteAPIKey_WrongTenant(t *testing.T) {
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id, TenantID: "t_other"}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	err := svc.DeleteAPIKey(context.Background(), "t_test", "k_1")
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound, got %v", err)
+	}
+}
+
+func TestAPIKeyService_DeleteAPIKey_NotFound(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = &mockAPIKeyRepo{}
+	err := svc.DeleteAPIKey(context.Background(), "t_test", "k_missing")
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound, got %v", err)
+	}
+}
+
+func TestAPIKeyService_RotateAPIKey_HappyPath(t *testing.T) {
+	var expired bool
+	var createdKey *domain.APIKey
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id, TenantID: "t_test", Name: "original", Role: domain.RoleOwner}, nil
+		},
+		updateFn: func(_ context.Context, k *domain.APIKey) error {
+			if k.ID == "k_1" {
+				expired = k.ExpiresAt != nil && k.ExpiresAt.Before(time.Now())
+			}
+			return nil
+		},
+		createFn: func(_ context.Context, k *domain.APIKey) error {
+			createdKey = k
+			return nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	newKey, raw, err := svc.RotateAPIKey(context.Background(), "t_test", "k_1")
+	if err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+	if raw == "" {
+		t.Fatal("raw key is empty")
+	}
+	if !expired {
+		t.Error("old key was not expired")
+	}
+	if newKey.ID == "k_1" {
+		t.Error("new key should have a different ID")
+	}
+	if newKey.Name != "original" || newKey.Role != domain.RoleOwner {
+		t.Errorf("new key should inherit name/role: %+v", newKey)
+	}
+	if createdKey == nil {
+		t.Error("create was not called for new key")
+	}
+}
+
+func TestAPIKeyService_RotateAPIKey_NotFound(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = &mockAPIKeyRepo{}
+	_, _, err := svc.RotateAPIKey(context.Background(), "t_test", "k_missing")
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound, got %v", err)
+	}
+}
+
+func TestAPIKeyService_RotateAPIKey_WrongTenant(t *testing.T) {
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id, TenantID: "t_other"}, nil
+		},
+	}
+	svc := NewAPIKeyService(nil)
+	svc.apiKeyRepo = repo
+	_, _, err := svc.RotateAPIKey(context.Background(), "t_test", "k_1")
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound, got %v", err)
+	}
+}

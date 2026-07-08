@@ -11,6 +11,22 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
+// cmdRunner abstracts os/exec for testability.
+type cmdRunner interface {
+	Run(ctx context.Context, name string, args ...string) (stderr string, err error)
+}
+
+// osCmdRunner is the production implementation that delegates to exec.CommandContext.
+type osCmdRunner struct{}
+
+func (osCmdRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stderr.String(), err
+}
+
 // PrecompileCwasm reads a previously stored .wasm artifact, compiles it
 // to .cwasm using the wasm2cwasm binary, and stores the result.
 //
@@ -22,6 +38,11 @@ import (
 // EDGE_WASM2CWASM_PATH env var). When empty, the precompile step
 // is skipped silently (the worker will lazily compile on first load).
 func PrecompileCwasm(ctx context.Context, store storage.ArtifactStore, wasm2cwasmPath, tenantID, appName, deploymentID string) {
+	precompileCwasm(ctx, store, wasm2cwasmPath, tenantID, appName, deploymentID, osCmdRunner{})
+}
+
+// precompileCwasm is the inner implementation with an injectable cmdRunner for testing.
+func precompileCwasm(ctx context.Context, store storage.ArtifactStore, wasm2cwasmPath, tenantID, appName, deploymentID string, runner cmdRunner) {
 	if wasm2cwasmPath == "" {
 		return // precompilation not configured
 	}
@@ -63,12 +84,10 @@ func PrecompileCwasm(ctx context.Context, store storage.ArtifactStore, wasm2cwas
 	}
 
 	// Run wasm2cwasm binary.
-	cmd := exec.CommandContext(ctx, wasm2cwasmPath, inputPath, outputPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	stderr, err := runner.Run(ctx, wasm2cwasmPath, inputPath, outputPath)
+	if err != nil {
 		log.Printf("PrecompileCwasm: wasm2cwasm failed for %s/%s/%s: %v (stderr: %s)",
-			tenantID, appName, deploymentID, err, stderr.String())
+			tenantID, appName, deploymentID, err, stderr)
 		return
 	}
 
