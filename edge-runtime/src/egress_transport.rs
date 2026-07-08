@@ -188,7 +188,9 @@ pub(crate) async fn send_request_handler(
         .uri()
         .authority()
         .ok_or(ErrorCode::HttpRequestUriInvalid)?;
-    let host = auth.host();
+    // Capture host as `String` so we keep using it after `sender.send_request`
+    // has consumed `request`. `auth.host()` returns a borrow tied to the URI.
+    let host: String = auth.host().to_string();
     let port = if let Some(p) = auth.port_u16() {
         p
     } else if use_tls {
@@ -198,7 +200,7 @@ pub(crate) async fn send_request_handler(
     };
 
     // 3. Pre-resolve + IP-validate. This is the rebinding defense.
-    let addr = resolve_validated(host, port, egress, tenant_id, connect_timeout).await?;
+    let addr = resolve_validated(&host, port, egress, tenant_id, connect_timeout).await?;
 
     // 4. TCP connect to the IP literal — kernel does NOT re-resolve.
     let tcp_stream = timeout(connect_timeout, TcpStream::connect(addr))
@@ -221,7 +223,7 @@ pub(crate) async fn send_request_handler(
         #[cfg(feature = "egress-tls")]
         {
             use rustls::pki_types::ServerName;
-            let domain = ServerName::try_from(host)
+            let domain = ServerName::try_from(host.as_str())
                 .map_err(|e| {
                     tracing::warn!(
                         tenant_id = %tenant_id,
@@ -297,12 +299,46 @@ pub(crate) async fn send_request_handler(
         .build()
         .expect("comes from valid request");
 
-    // 7. Send the request and assemble the typed response.
-    let resp = timeout(first_byte_timeout, sender.send_request(request))
+    // 7. Send the request.
+    let response = timeout(first_byte_timeout, sender.send_request(request))
         .await
         .map_err(|_| ErrorCode::ConnectionReadTimeout)?
-        .map_err(hyper_request_error)?
-        .map(|body| body.map_err(hyper_request_error).boxed_unsync());
+        .map_err(hyper_request_error)?;
+
+    // 8. Redirect-bypass guard (issue #207).
+    //
+    // Our hyper clone does NOT auto-follow redirects — it sends one
+    // request and returns one response — so a guest that re-issues via
+    // `wasi:http/outgoing-handler` would already re-run `egress.check`
+    // on the redirect target. This guard is belt-and-braces: it catches
+    // guest code that bypasses `outgoing-handler` to follow redirects
+    // (e.g. by parsing the Location manually and re-using the open TCP
+    // socket via `wasi:sockets/tcp`), which would otherwise reuse this
+    // connection's destination without any policy check.
+    //
+    // Only 3xx responses get checked (per RFC 7231 §7.1.2 the Location
+    // header on non-redirect responses is meaningless). Only absolute
+    // Location URLs are validated — relative URLs need request-URI
+    // resolution which is the guest's responsibility.
+    if (300..400).contains(&response.status().as_u16()) {
+        if let Err(reason) =
+            validate_location(response.headers().get(hyper::header::LOCATION), egress)
+        {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                host = %host,
+                status = %response.status(),
+                reason = %reason,
+                "egress redirect denied"
+            );
+            return Err(ErrorCode::InternalError(Some(reason)));
+        }
+    }
+
+    // 9. Assemble the typed response with body + worker driver.
+    let (parts, body) = response.into_parts();
+    let body = body.map_err(hyper_request_error).boxed_unsync();
+    let resp = http::Response::from_parts(parts, body);
 
     Ok(IncomingResponse {
         resp,
@@ -325,6 +361,135 @@ pub(crate) fn spawn_send_request_handler(
         Ok(send_request_handler(request, config, &egress, &tenant_id).await)
     });
     HostFutureIncomingResponse::pending(handle)
+}
+
+/// Validate a redirect `Location` header against the egress policy.
+///
+/// Returns `Ok(())` for `None` (no Location → no redirect target to check),
+/// non-UTF-8 values (unparseable → let the guest decide), and relative URLs
+/// (resolution needs the request URI, which is the guest's responsibility).
+///
+/// Only absolute `http://` / `https://` URLs are checked. Returns
+/// `Err(reason)` if the URL fails `EgressPolicy::check` — this is the
+/// defense-in-depth catch for guest code that bypasses
+/// `wasi:http/outgoing-handler` to follow redirects via the open
+/// `wasi:sockets/tcp` connection (issue #207).
+fn validate_location(
+    location: Option<&hyper::header::HeaderValue>,
+    egress: &EgressPolicy,
+) -> Result<(), String> {
+    let Some(value) = location else {
+        return Ok(());
+    };
+    let Ok(loc_str) = value.to_str() else {
+        // Non-ASCII Location. Don't try to parse — let the guest decide.
+        return Ok(());
+    };
+    if !(loc_str.starts_with("http://") || loc_str.starts_with("https://")) {
+        // Relative URL — needs request-URI resolution the guest owns.
+        return Ok(());
+    }
+    egress.check(loc_str)
+}
+
+#[cfg(test)]
+mod validate_location_tests {
+    use super::validate_location;
+    use crate::egress::EgressPolicy;
+    use hyper::header::HeaderValue;
+
+    #[test]
+    fn no_location_passes() {
+        let egress = EgressPolicy::allow_all();
+        assert!(validate_location(None, &egress).is_ok());
+    }
+
+    #[test]
+    fn relative_location_passes_to_guest() {
+        let egress = EgressPolicy::allow_all();
+        let loc = HeaderValue::from_static("/v2/charges");
+        assert!(validate_location(Some(&loc), &egress).is_ok());
+        // Protocol-relative: "//evil.com/path" — neither http:// nor https://
+        // prefix, so we don't try to resolve. Guest must handle.
+        let loc = HeaderValue::from_static("//evil.com/path");
+        assert!(validate_location(Some(&loc), &egress).is_ok());
+    }
+
+    #[test]
+    fn non_utf8_location_passes_to_guest() {
+        let egress = EgressPolicy::allow_all();
+        // HeaderValue::from_bytes with invalid utf-8
+        let bytes: &[u8] = b"http://\xff\xfe/x";
+        let value = HeaderValue::from_bytes(bytes).expect("valid header bytes");
+        assert!(validate_location(Some(&value), &egress).is_ok());
+    }
+
+    #[test]
+    fn redirect_to_loopback_denied() {
+        let egress = EgressPolicy::allow_all();
+        let loc = HeaderValue::from_static("http://127.0.0.1/admin");
+        let err = validate_location(Some(&loc), &egress).unwrap_err();
+        assert!(
+            err.contains("egress denied"),
+            "expected 'egress denied' in reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn redirect_to_cloud_metadata_denied() {
+        let egress = EgressPolicy::allow_all();
+        // 169.254.169.254 = AWS/Azure/GCP IMDS — must always be denied.
+        let loc = HeaderValue::from_static(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        );
+        let err = validate_location(Some(&loc), &egress).unwrap_err();
+        assert!(err.contains("egress denied"), "got: {err}");
+    }
+
+    #[test]
+    fn redirect_to_metadata_hostname_denied() {
+        let egress = EgressPolicy::allow_all();
+        // AWS EC2 hostname
+        let loc = HeaderValue::from_static("http://instance-data.ec2.internal/latest/");
+        let err = validate_location(Some(&loc), &egress).unwrap_err();
+        assert!(err.contains("egress denied"), "got: {err}");
+    }
+
+    #[test]
+    fn redirect_to_uncategorized_host_denied_by_allowlist() {
+        // Empty allowlist = default-deny.
+        let egress = EgressPolicy::new(vec![]);
+        let loc = HeaderValue::from_static("https://evil.example.com/");
+        let err = validate_location(Some(&loc), &egress).unwrap_err();
+        assert!(
+            err.contains("egress denied") || err.contains("allowlist"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn redirect_to_host_not_in_tenant_allowlist_denied() {
+        let egress = EgressPolicy::new(vec!["api.stripe.com".into()]);
+        let loc = HeaderValue::from_static("https://evil.example.com/");
+        let err = validate_location(Some(&loc), &egress).unwrap_err();
+        assert!(err.contains("egress denied"), "got: {err}");
+    }
+
+    #[test]
+    fn redirect_to_allowlisted_host_passes() {
+        // Tenant allowlist permits api.stripe.com — a 302 to that host
+        // (e.g. v1 → v2) is fine.
+        let egress = EgressPolicy::new(vec!["api.stripe.com".into()]);
+        let loc = HeaderValue::from_static("https://api.stripe.com/v2/charges");
+        assert!(validate_location(Some(&loc), &egress).is_ok());
+    }
+
+    #[test]
+    fn redirect_to_allowlisted_host_with_wildcard_passes() {
+        let egress = EgressPolicy::new(vec!["*.stripe.com".into()]);
+        let loc = HeaderValue::from_static("https://api.stripe.com/v1/charges");
+        assert!(validate_location(Some(&loc), &egress).is_ok());
+    }
 }
 
 // ── Test-only DNS resolver seam ─────────────────────────────────────

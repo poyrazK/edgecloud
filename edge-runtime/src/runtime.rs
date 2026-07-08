@@ -308,14 +308,26 @@ impl WasiView for RuntimeState {
 /// `WasiHttpImpl<&mut T>::send_request` → `T::http().hooks.send_request`
 /// (where `T::http()` returns the `WasiHttpCtxView` and `hooks` is our
 /// `&mut EgressHttpHooks`) → `EgressPolicy::check(url)` → either
-/// denied (returns `Err`) or forwarded to the canonical
-/// `default_send_request` impl.
+/// denied (returns `Err`) or forwarded to `egress_transport`,
+/// which pre-resolves the hostname, validates every resolved IP against
+/// `EgressPolicy::check_resolved_ip`, and connects to the validated IP
+/// literal — closing the TOCTOU window between the pre-check and the
+/// kernel's own resolver inside `default_send_request`.
 ///
-/// The check runs PRE-DNS, so a denied host NEVER leaves the worker.
-/// The DNS-rebinding guard (`EgressPolicy::check_resolved_ip`) is
-/// best-effort in v0.2 — wasmtime-wasi-http 45 has no `connect_hook`
-/// for IP-level enforcement. See the `egress` field and plan §C-3
-/// "DNS-rebinding guard" decision.
+/// The host check runs PRE-DNS, so a denied host NEVER leaves the
+/// worker. The DNS-rebinding guard is enforced at IP granularity inside
+/// `egress_transport`, not via a separate `connect_hook` (which
+/// wasmtime-wasi-http 45 does not expose). With the `egress-tls`
+/// feature enabled, the same module also terminates TLS itself so SNI
+/// keeps using the hostname while the underlying TCP socket binds to
+/// the validated literal — closing the second-order TOCTOU between
+/// TCP-connect and TLS-handshake.
+///
+/// Follow-up for v0.3: `wasi:sockets/ip-name-lookup` is a separate
+/// egress surface that bypasses `wasi:http` entirely (raw DNS APIs the
+/// guest calls directly). It needs its own `Host` override that funnels
+/// through the same `EgressPolicy::check_resolved_ip` gate; today it is
+/// left to wasmtime-wasi-http's default resolver, which is unguarded.
 pub(crate) struct EgressHttpHooks {
     pub(crate) egress: Arc<EgressPolicy>,
     pub(crate) tenant_id: String,
@@ -344,20 +356,18 @@ impl WasiHttpHooks for EgressHttpHooks {
             let diagnostics = format!("egress denied: {reason}");
             return Err(HttpError::from(ErrorCode::InternalError(Some(diagnostics))));
         }
-// Egress allowlist passed — defer to our custom DNS-rebinding-
+        // Egress allowlist passed — defer to our custom DNS-rebinding-
         // aware send_request handler in `egress_transport`. It
         // pre-resolves via `tokio::net::lookup_host`, validates each
         // candidate IP against `egress.check_resolved_ip`, then connects
         // to the validated IP literal — so the kernel cannot re-resolve
-        // and serve a poisoned record on the second query.
-        //
-        // Note: origin/main has an inline `lookup_host`-based check that
-        // calls `default_send_request` after the IP validation. The
-        // release/v0.2-egress-hardening branch's egress_transport module
-        // is the canonical v0.2 implementation — it does the same IP
-        // validation but uses `spawn_send_request_handler` to keep the
-        // resolution and connection on a single async task so the kernel
-        // cannot re-resolve mid-flight. Keeping that path here.
+        // and serve a poisoned record on the second query. This also
+        // subsumes the inline `std::net::ToSocketAddrs` rebinding check
+        // that PR #288 added on main; having both would be redundant
+        // (and the inline check races the actual `default_send_request`
+        // resolver, while egress_transport connects to a literal IP and
+        // — when the `egress-tls` feature is on — terminates TLS itself
+        // to also close the second-order TOCTOU).
         Ok(crate::egress_transport::spawn_send_request_handler(
             request,
             config,
