@@ -12,6 +12,7 @@ mod nats;
 mod port_pool;
 mod state;
 mod supervisor;
+mod verifier;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use crate::nats::NatsClientImpl;
 use crate::port_pool::PortPool;
 use crate::state::WorkerState;
 use crate::supervisor::Supervisor;
+use crate::verifier::SignatureVerifier;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -212,6 +214,51 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     tracing::info!(dir = %config.cache_dir.display(), "cache directory ready");
 
+    // Build the Ed25519 signature verifier (issue #307, PR2).
+    // Resolution order matches `Config::from_env`:
+    //   1. EDGE_SIGNING_PUBKEY_PATH (file) — production recommendation
+    //   2. EDGE_SIGNING_PUBKEY (inline 64 hex)
+    //   3. None + require_signature=false → verifier = None + warn
+    //   4. None + require_signature=true → unreachable: Config::from_env
+    //      already bailed in that case.
+    let signature_verifier: Option<Arc<SignatureVerifier>> = match (
+        config.signing_pubkey.as_deref(),
+        config.signing_pubkey_path.as_deref(),
+    ) {
+        (_, Some(p)) => match SignatureVerifier::from_file(std::path::Path::new(p)) {
+            Ok(v) => {
+                tracing::info!(
+                    path = p,
+                    "loaded Ed25519 signing pubkey from EDGE_SIGNING_PUBKEY_PATH"
+                );
+                Some(Arc::new(v))
+            }
+            Err(e) => {
+                anyhow::bail!("loading EDGE_SIGNING_PUBKEY_PATH {p:?}: {e}");
+            }
+        },
+        (Some(h), _) => match SignatureVerifier::from_hex(h) {
+            Ok(v) => {
+                tracing::info!("loaded Ed25519 signing pubkey from EDGE_SIGNING_PUBKEY");
+                Some(Arc::new(v))
+            }
+            Err(e) => {
+                anyhow::bail!("parsing EDGE_SIGNING_PUBKEY: {e}");
+            }
+        },
+        (None, None) if config.require_signature => {
+            unreachable!("config validation should have caught require_signature=true + no key");
+        }
+        (None, None) => {
+            tracing::warn!(
+                "signature verification disabled: no EDGE_SIGNING_PUBKEY[_PATH] configured \
+                     and EDGE_REQUIRE_SIGNATURE=false. Unsigned artifacts will be accepted. \
+                     This is the rollout escape hatch and should NOT be set in production."
+            );
+            None
+        }
+    };
+
     // Create the shared wasmtime engine (shared for compilation caching across apps)
     let engine = edge_runtime::create_engine()?;
     tracing::info!("wasmtime engine created");
@@ -224,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
         jwt_signer.clone(),
+        signature_verifier.clone(),
     ));
 
     // Initialize port pool
