@@ -115,6 +115,26 @@ operators rotate the key via a ConfigMap mount without restarting
 the process on a key change (the worker reads the file once at
 boot).
 
+**Pubkey resolution order (worker startup):**
+
+1. `EDGE_SIGNING_PUBKEY_PATH` — file with the 64-char lowercase hex
+   pubkey (trailing newline tolerated). Wins if set.
+2. `EDGE_SIGNING_PUBKEY` — inline 64-char lowercase hex pubkey.
+3. Neither set + `EDGE_REQUIRE_SIGNATURE=false` → verifier is `None`
+   and the worker accepts unsigned artifacts (the rollout escape
+   hatch).
+4. Neither set + `EDGE_REQUIRE_SIGNATURE=true` → worker refuses to
+   start with a clear error naming all three env vars. Operators
+   seeing this should either set one of the pubkey env vars or
+   explicitly opt into the unsigned mode.
+
+**Signed message layout** (for operators debugging a failing verify
+or running a non-Go verifier out-of-band): the worker reconstructs
+the signed payload as `sha256_raw_32_bytes || deployment_id_bytes`
+— the raw 32-byte hash, **not** the hex form. Any non-Go verifier
+must hash the artifact, take the raw 32 bytes, append the raw
+`deployment_id` bytes, and verify with the public key.
+
 ## Rotation
 
 The rotation story is being finalized in a follow-up PR. The shape
