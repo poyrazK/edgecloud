@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -123,8 +124,10 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     // heartbeats::run awaits it; it never fires (no domain poller
     // exists here) but the boot push fires from `push_now` directly.
     let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let pipeline = tokio::spawn(async move {
-        heartbeats::run(run_cfg, run_table, run_caddy, pipeline_notify).await
+    let pipeline_shutdown = CancellationToken::new();
+    let pipeline = tokio::spawn({
+        let pn = pipeline_notify.clone();
+        async move { heartbeats::run(run_cfg, run_table, run_caddy, pn, CancellationToken::new()).await }
     });
 
     // Give the pipeline a beat to subscribe to NATS.
@@ -217,7 +220,7 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
         let run_table = table.clone();
         let run_caddy = caddy.clone();
         let n = pipeline_notify.clone();
-        async move { heartbeats::run(run_cfg, run_table, run_caddy, n).await }
+        async move { heartbeats::run(run_cfg, run_table, run_caddy, n, CancellationToken::new()).await }
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -328,7 +331,14 @@ async fn heartbeat_without_worker_addr_is_ignored() {
     let run_caddy = caddy.clone();
     let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let pipeline = tokio::spawn(async move {
-        heartbeats::run(run_cfg, run_table, run_caddy, pipeline_notify).await
+        heartbeats::run(
+            run_cfg,
+            run_table,
+            run_caddy,
+            pipeline_notify,
+            CancellationToken::new(),
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 /// A traffic split for one app: deployment_id → weight.
@@ -525,15 +526,23 @@ pub fn spawn_fetcher(
     cache: SharedCache,
     internal_token: Option<String>,
     table: Arc<crate::routing::RoutingTable>,
+    shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         let fetch_interval = Duration::from_secs(30);
         let mut ticker = tokio::time::interval(fetch_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            let snap = table.snapshot().await;
-            process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("traffic fetcher: shutdown signal received, stopping");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let snap = table.snapshot().await;
+                    process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
+                }
+            }
         }
     });
 }

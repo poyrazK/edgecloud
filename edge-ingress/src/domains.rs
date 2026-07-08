@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -79,7 +80,12 @@ const MAX_CONSECUTIVE_AUTH_ERRORS: u32 = 3;
 /// itself fails to build (which is unrecoverable) OR the control
 /// plane has rejected our token repeatedly (rotated JWT secret,
 /// revoked ingest token, etc.) — see `MAX_CONSECUTIVE_AUTH_ERRORS`.
-pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notify>) -> Result<()> {
+pub async fn run(
+    cfg: Config,
+    table: Arc<RoutingTable>,
+    render_notify: Arc<Notify>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     if cfg.control_plane_url.is_empty() {
         info!("CONTROL_PLANE_URL unset; domain poller disabled");
         return Ok(());
@@ -104,64 +110,59 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
 
     let mut consecutive_auth_errors: u32 = 0;
     loop {
-        ticker.tick().await;
-        match fetch_and_apply(&http, &url, &cfg.service_token, &table).await {
-            Ok((added, removed)) => {
-                metrics::counter!("ingress.domain_poll.total", "status" => "success").increment(1);
-                // Reset on any success — the previous auth failures
-                // (if any) were transient, the token is working now.
-                consecutive_auth_errors = 0;
-                if !added.is_empty() || !removed.is_empty() {
-                    info!(
-                        added = added.len(),
-                        removed = removed.len(),
-                        "domain table updated"
-                    );
-                    debug!(?added, ?removed, "domain table diff");
-                    render_notify.notify_one();
-                } else {
-                    debug!("domain poll: no changes");
-                }
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("domain poller: shutdown signal received, stopping");
+                return Ok(());
             }
-            Err(e) => {
-                // Typed match on PollError::HttpStatus — replaces
-                // the previous substring match on "401"/"403" that
-                // would have broken on any error message containing
-                // those digits for unrelated reasons. The closure
-                // also matches on 403 because the handler
-                // distinguishes 401 (bad/expired token) from 403
-                // (token good, role wrong) and both should fail-fast
-                // after the budget.
-                let status = match &e {
-                    PollError::HttpStatus { status, .. } => Some(*status),
-                    _ => None,
-                };
-                let is_auth = matches!(status, Some(401) | Some(403));
-                if is_auth {
-                    metrics::counter!("ingress.domain_poll.total", "status" => "auth_error")
-                        .increment(1);
-                    consecutive_auth_errors += 1;
-                    if consecutive_auth_errors >= MAX_CONSECUTIVE_AUTH_ERRORS {
-                        error!(
-                            err = %e,
-                            count = consecutive_auth_errors,
-                            "domain poller got {MAX_CONSECUTIVE_AUTH_ERRORS} consecutive 401/403 — failing fast (likely rotated INGRESS_SERVICE_TOKEN); restart with the new token from the control plane's ingest token file"
-                        );
-                        return Err(e.into());
+            _ = ticker.tick() => {
+                match fetch_and_apply(&http, &url, &cfg.service_token, &table).await {
+                    Ok((added, removed)) => {
+                        metrics::counter!("ingress.domain_poll.total", "status" => "success").increment(1);
+                        consecutive_auth_errors = 0;
+                        if !added.is_empty() || !removed.is_empty() {
+                            info!(
+                                added = added.len(),
+                                removed = removed.len(),
+                                "domain table updated"
+                            );
+                            debug!(?added, ?removed, "domain table diff");
+                            render_notify.notify_one();
+                        } else {
+                            debug!("domain poll: no changes");
+                        }
                     }
-                    warn!(
-                        err = %e,
-                        count = consecutive_auth_errors,
-                        max = MAX_CONSECUTIVE_AUTH_ERRORS,
-                        "domain poll auth error; will retry"
-                    );
-                } else {
-                    metrics::counter!("ingress.domain_poll.total", "status" => "failure")
-                        .increment(1);
-                    // Transient error — reset the auth-error counter
-                    // so a single 503 doesn't burn the budget.
-                    consecutive_auth_errors = 0;
-                    warn!(err = %e, "domain poll failed; will retry on next tick");
+                    Err(e) => {
+                        let status = match &e {
+                            PollError::HttpStatus { status, .. } => Some(*status),
+                            _ => None,
+                        };
+                        let is_auth = matches!(status, Some(401) | Some(403));
+                        if is_auth {
+                            metrics::counter!("ingress.domain_poll.total", "status" => "auth_error")
+                                .increment(1);
+                            consecutive_auth_errors += 1;
+                            if consecutive_auth_errors >= MAX_CONSECUTIVE_AUTH_ERRORS {
+                                error!(
+                                    err = %e,
+                                    count = consecutive_auth_errors,
+                                    "domain poller got {MAX_CONSECUTIVE_AUTH_ERRORS} consecutive 401/403 — failing fast (likely rotated INGRESS_SERVICE_TOKEN); restart with the new token from the control plane's ingest token file"
+                                );
+                                return Err(e.into());
+                            }
+                            warn!(
+                                err = %e,
+                                count = consecutive_auth_errors,
+                                max = MAX_CONSECUTIVE_AUTH_ERRORS,
+                                "domain poll auth error; will retry"
+                            );
+                        } else {
+                            metrics::counter!("ingress.domain_poll.total", "status" => "failure")
+                                .increment(1);
+                            consecutive_auth_errors = 0;
+                            warn!(err = %e, "domain poll failed; will retry on next tick");
+                        }
+                    }
                 }
             }
         }
@@ -439,7 +440,9 @@ mod tests {
         // a key/cert order bug. Marked `#[allow(dead_code)]` on the
         // struct in caddy.rs.
         let notify = std::sync::Arc::new(Notify::new());
-        run(cfg, table, notify).await.unwrap();
+        run(cfg, table, notify, CancellationToken::new())
+            .await
+            .unwrap();
     }
 
     /// Three consecutive 401/403 responses from the control plane
@@ -474,7 +477,8 @@ mod tests {
         let notify = std::sync::Arc::new(Notify::new());
 
         // Spawn `run` and wait up to 2s for it to return Err.
-        let run_handle = tokio::spawn(async move { run(cfg, table, notify).await });
+        let run_handle =
+            tokio::spawn(async move { run(cfg, table, notify, CancellationToken::new()).await });
         let result = tokio::time::timeout(Duration::from_secs(2), run_handle)
             .await
             .expect("run loop didn't return within 2s")
@@ -516,7 +520,8 @@ mod tests {
         let table = std::sync::Arc::new(RoutingTable::new());
         let notify = std::sync::Arc::new(Notify::new());
 
-        let run_handle = tokio::spawn(async move { run(cfg, table, notify).await });
+        let run_handle =
+            tokio::spawn(async move { run(cfg, table, notify, CancellationToken::new()).await });
         let result = tokio::time::timeout(Duration::from_secs(2), run_handle)
             .await
             .expect("run loop didn't return within 2s")
@@ -572,7 +577,7 @@ mod tests {
         // Poller: spawn run() so it loops on its own interval.
         let notify_for_poller = notify.clone();
         let _run_handle = tokio::spawn(async move {
-            let _ = run(cfg, table, notify_for_poller).await;
+            let _ = run(cfg, table, notify_for_poller, CancellationToken::new()).await;
         });
 
         // Bound the wait — if the Notify never fires, the listener

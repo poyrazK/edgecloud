@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use tokio::sync::Notify;
 use tokio::time::{interval, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::caddy::{render_routes, CaddyClient};
@@ -37,6 +38,7 @@ pub async fn run(
     table: Arc<RoutingTable>,
     caddy: Arc<CaddyClient>,
     render_notify: Arc<Notify>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let client = async_nats::connect(&cfg.nats_url)
         .await
@@ -59,13 +61,18 @@ pub async fn run(
     let traffic_cache_for_push = traffic_cache.clone();
     let rate_limit_cache_for_renderer = rate_limit_cache.clone();
     let rate_limit_cache_for_push = rate_limit_cache.clone();
+
+    // Spawn background tasks with the shutdown token.
+    let fetcher_shutdown = shutdown.clone();
     spawn_fetcher(
         http_client.clone(),
         cfg.control_plane_api_url.clone(),
         traffic_cache.clone(),
         cfg.internal_token.clone(),
         table.clone(),
+        fetcher_shutdown,
     );
+    let rl_fetcher_shutdown = shutdown.clone();
     crate::ratelimit::spawn_rate_limit_fetcher(
         http_client,
         cfg.control_plane_api_url.clone(),
@@ -73,7 +80,9 @@ pub async fn run(
         cfg.internal_token.clone(),
         table.clone(),
         cfg.rate_limit_fetch_interval,
+        rl_fetcher_shutdown,
     );
+    let renderer_shutdown = shutdown.clone();
     spawn_renderer(
         cfg.clone(),
         table.clone(),
@@ -81,8 +90,15 @@ pub async fn run(
         traffic_cache_for_renderer,
         rate_limit_cache_for_renderer,
         render_notify.clone(),
+        renderer_shutdown,
     );
-    spawn_pruner(table.clone(), render_notify.clone(), cfg.clone());
+    let pruner_shutdown = shutdown.clone();
+    spawn_pruner(
+        table.clone(),
+        render_notify.clone(),
+        cfg.clone(),
+        pruner_shutdown,
+    );
 
     // Push the initial empty config so Caddy's admin API has a known state
     // before the first heartbeat lands. (Otherwise Caddy might still be
@@ -232,45 +248,66 @@ fn spawn_renderer(
     traffic_cache: SharedCache,
     rate_limit_cache: SharedRateLimitCache,
     notify: Arc<Notify>,
+    shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut previous: Option<PreviousState> = None;
         loop {
-            notify.notified().await;
-            // Coalesce bursty notifications: sleep the debounce, then push.
-            sleep(Duration::from_millis(cfg.refresh_debounce_ms)).await;
-            if let Err(e) = push_now(
-                &cfg,
-                &table,
-                &caddy,
-                &traffic_cache,
-                &rate_limit_cache,
-                &mut previous,
-            )
-            .await
-            {
-                error!(err = %e, "Caddy reload failed");
-                // On error reset previous state so the next push is a full reload.
-                previous = None;
-            } else {
-                debug!("Caddy config reloaded");
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("renderer: shutdown signal received; performing final push");
+                    let _ = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache, &mut previous).await;
+                    break;
+                }
+                _ = notify.notified() => {
+                    // Coalesce bursty notifications: sleep the debounce, then push.
+                    sleep(Duration::from_millis(cfg.refresh_debounce_ms)).await;
+                    if let Err(e) = push_now(
+                        &cfg,
+                        &table,
+                        &caddy,
+                        &traffic_cache,
+                        &rate_limit_cache,
+                        &mut previous,
+                    )
+                    .await
+                    {
+                        error!(err = %e, "Caddy reload failed");
+                        // On error reset previous state so the next push is a full reload.
+                        previous = None;
+                    } else {
+                        debug!("Caddy config reloaded");
+                    }
+                }
             }
         }
     });
 }
 
-fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>, cfg: Config) {
+fn spawn_pruner(
+    table: Arc<RoutingTable>,
+    notify: Arc<Notify>,
+    cfg: Config,
+    shutdown: CancellationToken,
+) {
     tokio::spawn(async move {
         let mut ticker = interval(cfg.prune_interval);
         // Skip the first immediate tick.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            let removed = table.remove_stale(cfg.stale_timeout).await;
-            if !removed.is_empty() {
-                metrics::counter!("ingress.pruner.removed_total").increment(removed.len() as u64);
-                warn!(?removed, "pruned stale routes");
-                notify.notify_one();
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("pruner: shutdown signal received, stopping");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let removed = table.remove_stale(cfg.stale_timeout).await;
+                    if !removed.is_empty() {
+                        metrics::counter!("ingress.pruner.removed_total").increment(removed.len() as u64);
+                        warn!(?removed, "pruned stale routes");
+                        notify.notify_one();
+                    }
+                }
             }
         }
     });
@@ -918,7 +955,15 @@ mod tests {
         // first notified().await will observe it immediately.
         notify.notify_one();
 
-        spawn_renderer(cfg, table, caddy, cache, rl_cache, notify.clone());
+        spawn_renderer(
+            cfg,
+            table,
+            caddy,
+            cache,
+            rl_cache,
+            notify.clone(),
+            CancellationToken::new(),
+        );
 
         // Wait for debounce (1ms) + push to complete.
         tokio::time::sleep(Duration::from_millis(500)).await;
