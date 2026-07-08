@@ -19,6 +19,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "scheduling")]
+use tokio::runtime::Handle;
 
 /// WebSocket message type as defined by RFC 6455.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,8 +120,13 @@ impl CloseInfo {
 /// A single active WebSocket connection.
 struct Connection {
     stream: TcpStream,
-    /// Partial frame buffer for fragmented messages.
+    /// Partial frame buffer (incomplete frame data between reads).
     read_buf: Vec<u8>,
+    /// Accumulated payload across fragments of a fragmented message.
+    fragmented_payload: Vec<u8>,
+    /// Opcode of the first frame in a fragmented message (e.g. 0x1 for text).
+    /// `None` when not accumulating fragments.
+    fragmented_opcode: Option<u8>,
     /// Set to true when a Close frame has been sent.
     close_sent: bool,
     /// Set to true when a Close frame has been received.
@@ -164,6 +171,11 @@ impl WebSocket {
     ///
     /// Blocks until a client connects, performs the HTTP Upgrade
     /// handshake (RFC 6455 Section 4), and returns a connection handle.
+    ///
+    /// When running under a tokio runtime (production), the blocking
+    /// accept + upgrade is offloaded to `spawn_blocking` to avoid
+    /// starving the tokio worker thread. Falls back to direct blocking
+    /// when no runtime is available (unit tests).
     pub fn accept(&self, listener: u32) -> Result<u32, String> {
         let listener = {
             let listeners = self.listeners.lock().unwrap();
@@ -173,20 +185,45 @@ impl WebSocket {
                 .clone()
         };
 
-        // Accept a TCP connection (blocking in a spawned thread).
-        let (mut stream, _peer_addr) = listener
-            .accept()
-            .map_err(|e| format!("accept failed: {e}"))?;
+        #[cfg(feature = "scheduling")]
+        let stream = {
+            let listener = listener.clone();
+            let upgrade = move || -> Result<TcpStream, String> {
+                let (mut stream, _peer_addr) = listener
+                    .accept()
+                    .map_err(|e| format!("accept failed: {e}"))?;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .map_err(|e| format!("set read timeout: {e}"))?;
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .map_err(|e| format!("set write timeout: {e}"))?;
+                Self::perform_upgrade(&mut stream)?;
+                Ok(stream)
+            };
 
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|e| format!("set read timeout: {e}"))?;
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|e| format!("set write timeout: {e}"))?;
+            if let Ok(rt) = Handle::try_current() {
+                rt.block_on(tokio::task::spawn_blocking(upgrade))
+                    .map_err(|e| format!("blocking accept panicked: {e}"))?
+            } else {
+                upgrade()
+            }?
+        };
 
-        // Perform HTTP Upgrade handshake.
-        Self::perform_upgrade(&mut stream)?;
+        #[cfg(not(feature = "scheduling"))]
+        let stream = {
+            let (mut stream, _peer_addr) = listener
+                .accept()
+                .map_err(|e| format!("accept failed: {e}"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|e| format!("set read timeout: {e}"))?;
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|e| format!("set write timeout: {e}"))?;
+            Self::perform_upgrade(&mut stream)?;
+            stream
+        };
 
         let handle = self.alloc_handle();
         let mut connections = self.connections.lock().unwrap();
@@ -195,6 +232,8 @@ impl WebSocket {
             Connection {
                 stream,
                 read_buf: Vec::new(),
+                fragmented_payload: Vec::new(),
+                fragmented_opcode: None,
                 close_sent: false,
                 close_received: false,
             },
@@ -323,9 +362,11 @@ impl WebSocket {
 
     /// Receive the next complete WebSocket message.
     ///
-    /// Handles fragmentation (FIN + continuation frames) transparently —
-    /// returns only after a frame with FIN=1 is received.
+    /// Handles fragmentation (FIN + continuation frames) transparently
+    /// per RFC 6455 §5.4 — accumulates fragments until FIN=1 is received.
     /// Client-to-server frames are masked; we unmask them here.
+    /// Control frames (Ping/Pong/Close) interleaved between fragments are
+    /// handled immediately (Ping → Pong response, Pong → ignored).
     pub fn receive(&self, conn: u32) -> Result<(Vec<u8>, MessageType), CloseInfo> {
         let mut connections = self.connections.lock().unwrap();
         let conn = connections.get_mut(&conn).ok_or_else(|| CloseInfo {
@@ -340,41 +381,68 @@ impl WebSocket {
             });
         }
 
-        // Use any buffered data first.
-        if !conn.read_buf.is_empty() {
-            let buf = std::mem::take(&mut conn.read_buf);
-            return Self::parse_frame(&buf, conn);
-        }
+        loop {
+            // Get data: prefer buffered data, otherwise read from stream.
+            let buf = if !conn.read_buf.is_empty() {
+                std::mem::take(&mut conn.read_buf)
+            } else {
+                let mut read_buf = [0u8; 65536];
+                match conn.stream.read(&mut read_buf) {
+                    Ok(0) => {
+                        return Err(CloseInfo {
+                            code: 1006,
+                            reason: "connection closed".into(),
+                        })
+                    }
+                    Ok(n) => read_buf[..n].to_vec(),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if conn.fragmented_opcode.is_some() {
+                            return Err(CloseInfo {
+                                code: 1006,
+                                reason: "fragmentation timed out".into(),
+                            });
+                        }
+                        return Err(CloseInfo {
+                            code: 1006,
+                            reason: "no data available".into(),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(CloseInfo {
+                            code: 1006,
+                            reason: format!("read error: {e}"),
+                        })
+                    }
+                }
+            };
 
-        // Read from the stream.
-        let mut read_buf = [0u8; 65536];
-        match conn.stream.read(&mut read_buf) {
-            Ok(0) => Err(CloseInfo {
-                code: 1006,
-                reason: "connection closed".into(),
-            }),
-            Ok(n) => {
-                let buf = read_buf[..n].to_vec();
-                Self::parse_frame(&buf, conn)
+            match Self::parse_frame(&buf, conn) {
+                FrameParseOutcome::Message(data, ty) => return Ok((data, ty)),
+                FrameParseOutcome::MoreFragments => continue,
+                FrameParseOutcome::Pong => continue,
+                FrameParseOutcome::CloseReceived(ci) => return Err(ci),
+                FrameParseOutcome::ProtocolError(ci) => return Err(ci),
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(CloseInfo {
-                code: 1006,
-                reason: "no data available".into(),
-            }),
-            Err(e) => Err(CloseInfo {
-                code: 1006,
-                reason: format!("read error: {e}"),
-            }),
         }
     }
 
-    fn parse_frame(buf: &[u8], conn: &mut Connection) -> Result<(Vec<u8>, MessageType), CloseInfo> {
+    /// Parse a single WebSocket frame from `buf`.
+    ///
+    /// **RFC 6455 §5.4 fragmentation handling:**
+    /// - FIN=0 + opcode ≠ 0x0 → first fragment: stores opcode + payload in
+    ///   `conn.fragmented_opcode` / `conn.fragmented_payload`, returns `MoreFragments`.
+    /// - FIN=0/1 + opcode = 0x0 → continuation: appends payload to
+    ///   `conn.fragmented_payload`. Returns `MoreFragments` unless FIN=1 (final),
+    ///   in which case returns the reassembled `Message`.
+    /// - FIN=1 + opcode ≠ 0x0 → non-fragmented: returns `Message` directly.
+    ///
+    /// **Control frames** (opcode 0x8-0xF) are handled immediately per
+    /// RFC 6455 §5.4: Ping → Pong response written to stream, returns `Pong`.
+    /// Pong → returns `Pong`. Close → returns `CloseReceived`.
+    fn parse_frame(buf: &[u8], conn: &mut Connection) -> FrameParseOutcome {
         if buf.len() < 2 {
             conn.read_buf = buf.to_vec();
-            return Err(CloseInfo {
-                code: 1003,
-                reason: "incomplete frame header".into(),
-            });
+            return FrameParseOutcome::MoreFragments;
         }
 
         let b0 = buf[0];
@@ -383,27 +451,20 @@ impl WebSocket {
         let opcode = b0 & 0x0F;
         let masked = (b1 & 0x80) != 0;
         let mut payload_len = (b1 & 0x7F) as u64;
-
         let mut offset = 2usize;
 
         // Extended payload length.
         if payload_len == 126 {
             if buf.len() < 4 {
                 conn.read_buf = buf.to_vec();
-                return Err(CloseInfo {
-                    code: 1003,
-                    reason: "incomplete extended length".into(),
-                });
+                return FrameParseOutcome::MoreFragments;
             }
             payload_len = u16::from_be_bytes([buf[2], buf[3]]) as u64;
             offset = 4;
         } else if payload_len == 127 {
             if buf.len() < 10 {
                 conn.read_buf = buf.to_vec();
-                return Err(CloseInfo {
-                    code: 1003,
-                    reason: "incomplete extended length 64".into(),
-                });
+                return FrameParseOutcome::MoreFragments;
             }
             payload_len = u64::from_be_bytes([
                 buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
@@ -415,10 +476,7 @@ impl WebSocket {
         let mask_key = if masked {
             if buf.len() < offset + 4 {
                 conn.read_buf = buf.to_vec();
-                return Err(CloseInfo {
-                    code: 1003,
-                    reason: "incomplete mask key".into(),
-                });
+                return FrameParseOutcome::MoreFragments;
             }
             let key = [
                 buf[offset],
@@ -436,10 +494,7 @@ impl WebSocket {
         let end = offset + payload_len as usize;
         if buf.len() < end {
             conn.read_buf = buf.to_vec();
-            return Err(CloseInfo {
-                code: 1003,
-                reason: "incomplete payload".into(),
-            });
+            return FrameParseOutcome::MoreFragments;
         }
 
         let mut payload = buf[offset..end].to_vec();
@@ -451,38 +506,83 @@ impl WebSocket {
             }
         }
 
-        // Handle fragmentation: if FIN=0, buffer and wait for continuation.
-        if !fin && opcode != 0x0 {
-            // First frame of a fragmented message.
-            conn.read_buf = buf[end..].to_vec();
-            // Store partial frame info — for simplicity, buffer the whole
-            // thing and wait for continuation frames.
-            // We re-queue the remaining data and return a signal.
-            conn.read_buf = buf.to_vec(); // Store everything, will re-parse
-            return Err(CloseInfo {
-                code: 1003,
-                reason: "fragmentation not yet supported".into(),
-            });
-        }
-
-        // Store any extra data for next read.
+        // Store any extra data after this frame for the next read.
         if end < buf.len() {
             conn.read_buf = buf[end..].to_vec();
         } else {
             conn.read_buf.clear();
         }
 
-        // Map opcode to message type.
-        let msg_type = message_type_from_opcode(opcode)?;
-
-        // Handle Close frame.
-        if opcode == 0x8 {
-            conn.close_received = true;
-            let ci = CloseInfo::from_frame_payload(&payload);
-            return Err(ci);
+        // Control frames (opcode 0x8-0xF) — handle immediately per RFC 6455 §5.4.
+        // Control frames MAY be interleaved between fragments of a data message.
+        if opcode >= 0x8 {
+            return match opcode {
+                0x8 => {
+                    conn.close_received = true;
+                    FrameParseOutcome::CloseReceived(CloseInfo::from_frame_payload(&payload))
+                }
+                0x9 => {
+                    // Respond with Pong frame immediately (RFC 6455 §5.5.3).
+                    // We have `&mut Connection` so we can write to the stream.
+                    let pong_frame = encode_frame(&payload, &MessageType::Pong, false);
+                    let _ = (&conn.stream).write_all(&pong_frame);
+                    FrameParseOutcome::Pong
+                }
+                0xA => FrameParseOutcome::Pong,
+                _ => FrameParseOutcome::ProtocolError(CloseInfo {
+                    code: 1002,
+                    reason: format!("unknown control opcode: 0x{opcode:x}"),
+                }),
+            };
         }
 
-        Ok((payload, msg_type))
+        // Data frames (opcode 0x0-0x7)
+
+        // Continuation frame (opcode = 0x0) — must be mid-fragmentation.
+        if opcode == 0x0 {
+            let Some(_) = conn.fragmented_opcode else {
+                return FrameParseOutcome::ProtocolError(CloseInfo {
+                    code: 1002,
+                    reason: "unexpected continuation frame".into(),
+                });
+            };
+            conn.fragmented_payload.extend_from_slice(&payload);
+            if fin {
+                // Final continuation frame — complete message ready.
+                let full_payload = std::mem::take(&mut conn.fragmented_payload);
+                let original_opcode = conn.fragmented_opcode.take().unwrap();
+                let msg_type = match message_type_from_opcode(original_opcode) {
+                    Ok(ty) => ty,
+                    Err(ci) => return FrameParseOutcome::ProtocolError(ci),
+                };
+                return FrameParseOutcome::Message(full_payload, msg_type);
+            }
+            // More continuation frames coming.
+            return FrameParseOutcome::MoreFragments;
+        }
+
+        // Non-continuation data frame
+        if conn.fragmented_opcode.is_some() {
+            // Already accumulating fragments — expected a continuation frame.
+            return FrameParseOutcome::ProtocolError(CloseInfo {
+                code: 1002,
+                reason: "expected continuation frame".into(),
+            });
+        }
+
+        if !fin {
+            // First fragment of a fragmented message (FIN=0, opcode ≠ 0x0).
+            conn.fragmented_opcode = Some(opcode);
+            conn.fragmented_payload = payload;
+            return FrameParseOutcome::MoreFragments;
+        }
+
+        // Non-fragmented message (FIN=1, opcode ≠ 0x0).
+        let msg_type = match message_type_from_opcode(opcode) {
+            Ok(ty) => ty,
+            Err(ci) => return FrameParseOutcome::ProtocolError(ci),
+        };
+        FrameParseOutcome::Message(payload, msg_type)
     }
 
     /// Close the WebSocket connection.
@@ -518,6 +618,20 @@ impl Default for WebSocket {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Result of parsing a single WebSocket frame.
+enum FrameParseOutcome {
+    /// A complete message (non-fragmented or final-continuation).
+    Message(Vec<u8>, MessageType),
+    /// Start or continuation of a fragmented message — need more data.
+    MoreFragments,
+    /// A Pong frame received (or a Ping that we responded to) — continue.
+    Pong,
+    /// A Close frame received.
+    CloseReceived(CloseInfo),
+    /// A protocol error occurred.
+    ProtocolError(CloseInfo),
 }
 
 // ── RFC 6455 helpers ─────────────────────────────────────────────────────
@@ -845,6 +959,333 @@ mod tests {
         assert_eq!(msg_type, MessageType::Close);
 
         server.join().expect("server thread");
+    }
+
+    // ── Fragmentation tests ──────────────────────────────────────────
+
+    /// Helper: encode a WebSocket frame with FIN=0 (fragment).
+    /// `fin` controls the FIN bit; pass `false` for a fragment frame.
+    fn encode_fragment(data: &[u8], kind: &MessageType, fin: bool, masked: bool) -> Vec<u8> {
+        let opcode = opcode_for(kind);
+        let mut frame = Vec::new();
+        let b0 = if fin { 0x80 | opcode } else { opcode };
+        frame.push(b0);
+        let len = data.len();
+        if len < 126 {
+            let mut b1 = len as u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+        } else if len <= 0xFFFF {
+            let mut b1 = 126u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            let mut b1 = 127u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        if masked {
+            frame.extend_from_slice(&[0u8; 4]);
+        }
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// Helper: encode a continuation frame (opcode=0x0).
+    fn encode_continuation(data: &[u8], fin: bool, masked: bool) -> Vec<u8> {
+        let mut frame = Vec::new();
+        let b0 = if fin { 0x80 } else { 0x00 };
+        frame.push(b0);
+        let len = data.len();
+        if len < 126 {
+            let mut b1 = len as u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+        } else if len <= 0xFFFF {
+            let mut b1 = 126u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            let mut b1 = 127u8;
+            if masked {
+                b1 |= 0x80;
+            }
+            frame.push(b1);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        if masked {
+            frame.extend_from_slice(&[0u8; 4]);
+        }
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    #[test]
+    fn fragmented_text_message_2_frames() {
+        let ws = WebSocket::new();
+        let port = get_free_port();
+        let listener = ws.listen(port).expect("listen");
+
+        let ws_server = Arc::new(ws);
+        let ws_clone = ws_server.clone();
+        let server = thread::spawn(move || {
+            let conn = ws_clone.accept(listener).expect("accept");
+            let (data, msg_type) = ws_clone.receive(conn).expect("receive fragmented");
+            assert_eq!(msg_type, MessageType::Text);
+            assert_eq!(String::from_utf8_lossy(&data), "Hello, fragmented!");
+            // Echo back
+            ws_clone
+                .send(conn, &data, MessageType::Text)
+                .expect("send echo");
+            // Close
+            let result = ws_clone.receive(conn);
+            assert!(result.is_err());
+            ws_clone
+                .close(conn, CloseInfo::new(1000, "ok"))
+                .expect("close");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Client: connect + upgrade
+        let mut stream = do_upgrade_client(port, "dGhlIHNhbXBsZSBub25jZQ==");
+        // Send first fragment: "Hello, "
+        let frag1 = encode_fragment(b"Hello, ", &MessageType::Text, false, true);
+        stream.write_all(&frag1).expect("write frag1");
+        // Send continuation (final): "fragmented!"
+        let frag2 = encode_continuation(b"fragmented!", true, true);
+        stream.write_all(&frag2).expect("write frag2");
+        // Read echo
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read echo");
+        let (payload, msg_type) = parse_client_frame(&buf[..n]);
+        assert_eq!(msg_type, MessageType::Text);
+        assert_eq!(String::from_utf8_lossy(&payload), "Hello, fragmented!");
+        // Close
+        let close = encode_frame(&1000u16.to_be_bytes(), &MessageType::Close, true);
+        stream.write_all(&close).expect("write close");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fragmented_text_message_3_frames() {
+        let ws = Arc::new(WebSocket::new());
+        let port = get_free_port();
+        let listener = ws.listen(port).expect("listen");
+
+        let ws_server = ws.clone();
+        let server = thread::spawn(move || {
+            let conn = ws_server.accept(listener).expect("accept");
+            let (data, msg_type) = ws_server.receive(conn).expect("receive 3-fragment");
+            assert_eq!(msg_type, MessageType::Text);
+            assert_eq!(String::from_utf8_lossy(&data), "Three fragments!");
+            ws_server
+                .send(conn, &data, MessageType::Text)
+                .expect("send echo");
+            let _ = ws_server.receive(conn);
+            ws_server
+                .close(conn, CloseInfo::new(1000, "ok"))
+                .expect("close");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = do_upgrade_client(port, "dGhlIHNhbXBsZSBub25jZQ==");
+        stream
+            .write_all(&encode_fragment(b"Three ", &MessageType::Text, false, true))
+            .expect("frag1");
+        stream
+            .write_all(&encode_continuation(b"fragm", false, true))
+            .expect("frag2");
+        stream
+            .write_all(&encode_continuation(b"ents!", true, true))
+            .expect("frag3");
+
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read echo");
+        let (payload, msg_type) = parse_client_frame(&buf[..n]);
+        assert_eq!(msg_type, MessageType::Text);
+        assert_eq!(String::from_utf8_lossy(&payload), "Three fragments!");
+
+        let close = encode_frame(&1000u16.to_be_bytes(), &MessageType::Close, true);
+        stream.write_all(&close).expect("write close");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn fragmented_binary_3_frames() {
+        let ws = Arc::new(WebSocket::new());
+        let port = get_free_port();
+        let listener = ws.listen(port).expect("listen");
+
+        let ws_server = ws.clone();
+        let server = thread::spawn(move || {
+            let conn = ws_server.accept(listener).expect("accept");
+            let (data, msg_type) = ws_server.receive(conn).expect("receive fragmented binary");
+            assert_eq!(msg_type, MessageType::Binary);
+            assert_eq!(data, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+            ws_server
+                .send(conn, &data, MessageType::Binary)
+                .expect("send echo");
+            let _ = ws_server.receive(conn);
+            ws_server
+                .close(conn, CloseInfo::new(1000, "ok"))
+                .expect("close");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = do_upgrade_client(port, "dGhlIHNhbXBsZSBub25jZQ==");
+        stream
+            .write_all(&encode_fragment(
+                &[0x01, 0x02],
+                &MessageType::Binary,
+                false,
+                true,
+            ))
+            .expect("frag1");
+        stream
+            .write_all(&encode_continuation(&[0x03], false, true))
+            .expect("frag2");
+        stream
+            .write_all(&encode_continuation(&[0x04, 0x05], true, true))
+            .expect("frag3");
+
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read echo");
+        let (payload, msg_type) = parse_client_frame(&buf[..n]);
+        assert_eq!(msg_type, MessageType::Binary);
+        assert_eq!(payload, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+
+        let close = encode_frame(&1000u16.to_be_bytes(), &MessageType::Close, true);
+        stream.write_all(&close).expect("write close");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn interleaved_ping_during_fragmentation_does_not_disrupt() {
+        let ws = Arc::new(WebSocket::new());
+        let port = get_free_port();
+        let listener = ws.listen(port).expect("listen");
+
+        let ws_server = ws.clone();
+        let server = thread::spawn(move || {
+            let conn = ws_server.accept(listener).expect("accept");
+            // Receive fragmented message with interleaved ping
+            let (data, msg_type) = ws_server.receive(conn).expect("receive after ping");
+            assert_eq!(msg_type, MessageType::Text);
+            assert_eq!(String::from_utf8_lossy(&data), "Hello!");
+            ws_server
+                .send(conn, &data, MessageType::Text)
+                .expect("send echo");
+            let _ = ws_server.receive(conn);
+            ws_server
+                .close(conn, CloseInfo::new(1000, "ok"))
+                .expect("close");
+        });
+
+        thread::sleep(Duration::from_secs(1));
+
+        let mut stream = do_upgrade_client(port, "dGhlIHNhbXBsZSBub25jZQ==");
+        // Send first fragment
+        stream
+            .write_all(&encode_fragment(b"He", &MessageType::Text, false, true))
+            .expect("frag1");
+        // Send a ping mid-fragmentation
+        let ping = encode_fragment(b"ping", &MessageType::Ping, true, true);
+        stream.write_all(&ping).expect("ping");
+        // Wait for server's pong response
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read pong");
+        let (_payload, msg_type) = parse_client_frame(&buf[..n]);
+        assert_eq!(msg_type, MessageType::Pong, "should get Pong for our Ping");
+        // Send final continuation
+        stream
+            .write_all(&encode_continuation(b"llo!", true, true))
+            .expect("frag3");
+
+        let n = stream.read(&mut buf).expect("read echo");
+        let (payload, msg_type) = parse_client_frame(&buf[..n]);
+        assert_eq!(msg_type, MessageType::Text);
+        assert_eq!(String::from_utf8_lossy(&payload), "Hello!");
+
+        let close = encode_frame(&1000u16.to_be_bytes(), &MessageType::Close, true);
+        stream.write_all(&close).expect("write close");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn unexpected_continuation_frame_returns_protocol_error() {
+        let ws = Arc::new(WebSocket::new());
+        let port = get_free_port();
+        let listener = ws.listen(port).expect("listen");
+
+        let ws_server = ws.clone();
+        let server = thread::spawn(move || {
+            let conn = ws_server.accept(listener).expect("accept");
+            let result = ws_server.receive(conn);
+            assert!(
+                result.is_err(),
+                "continuation without fragment should error"
+            );
+            let err = result.unwrap_err();
+            assert_eq!(err.code, 1002, "should get protocol error");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = do_upgrade_client(port, "dGhlIHNhbXBsZSBub25jZQ==");
+        // Send a continuation frame without a preceding fragment
+        stream
+            .write_all(&encode_continuation(b"no fragment!", true, true))
+            .expect("write continuation");
+        server.join().expect("server thread");
+    }
+
+    // ── Helper for client WebSocket upgrade ──────────────────────────
+
+    /// Connect to `port` and perform the HTTP Upgrade handshake.
+    /// Returns the upgraded `TcpStream`.
+    fn do_upgrade_client(port: u16, key: &str) -> TcpStream {
+        let upgrade_req = format!(
+            "GET /chat HTTP/1.1\r\n\
+             Host: server.example.com\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             \r\n"
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("client connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        use std::io::Write;
+        stream
+            .write_all(upgrade_req.as_bytes())
+            .expect("write upgrade");
+        // Read and validate the 101 response
+        let mut resp_buf = [0u8; 4096];
+        let n = stream.read(&mut resp_buf).expect("read response");
+        let resp = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp.contains("101"), "expected 101, got: {resp}");
+        stream
     }
 
     // ── Helpers ───────────────────────────────────────────────────────

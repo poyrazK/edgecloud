@@ -885,12 +885,6 @@ fn build_wasi_ctx_for_tenant(
         let tenant_dir = base.join(tenant_id);
         match std::fs::create_dir_all(&tenant_dir) {
             Ok(()) => {
-                // wasmtime-wasi 25 requires explicit DirPerms/FilePerms
-                // for preopened_dir — read-write is the canonical edge-
-                // cloud semantic (tenants upload and serve from their own
-                // directory). Refusing READ would block every fixture that
-                // reads `index.html` etc. WRITE is required so e.g. the
-                // migrate flow can persist generated `.c` to disk.
                 if let Err(e) =
                     builder.preopened_dir(&tenant_dir, "/", DirPerms::all(), FilePerms::all())
                 {
@@ -914,10 +908,6 @@ fn build_wasi_ctx_for_tenant(
     }
 
     // Socket-level egress policy: install the closure before `.build()`.
-    // The closure is the only public injection point in wasmtime-wasi
-    // 45.0.3 — `WasiSocketsCtx`'s fields are `pub(crate)`. See
-    // `socket_egress.rs` for the dispatch table per `SocketEgressPolicy`
-    // × `SocketAddrUse`.
     builder.socket_addr_check(make_socket_addr_check(
         egress.clone(),
         mode,
