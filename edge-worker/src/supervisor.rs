@@ -1971,9 +1971,10 @@ pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
 /// Map an AppInstanceStatus to its heartbeat exit_code.
 pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
     match status {
-        AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Draining | AppInstanceStatus::Stopping => {
-            None
-        }
+        AppInstanceStatus::Running
+        | AppInstanceStatus::Starting
+        | AppInstanceStatus::Draining
+        | AppInstanceStatus::Stopping => None,
         AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
     }
 }

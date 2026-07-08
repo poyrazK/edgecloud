@@ -591,7 +591,8 @@ impl HandlerDispatch {
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
-        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _guard = InFlightGuard(self.in_flight.clone());
 
         {
