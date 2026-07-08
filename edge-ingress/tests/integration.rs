@@ -124,10 +124,9 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     // heartbeats::run awaits it; it never fires (no domain poller
     // exists here) but the boot push fires from `push_now` directly.
     let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let pipeline_shutdown = CancellationToken::new();
     let pipeline = tokio::spawn({
-        let pn = pipeline_notify.clone();
-        async move { heartbeats::run(run_cfg, run_table, run_caddy, pn, CancellationToken::new()).await }
+        let pipe_n = pipeline_notify.clone();
+        async move { heartbeats::run(run_cfg, run_table, run_caddy, pipe_n, CancellationToken::new()).await }
     });
 
     // Give the pipeline a beat to subscribe to NATS.
