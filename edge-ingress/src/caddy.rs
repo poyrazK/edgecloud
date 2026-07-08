@@ -385,9 +385,7 @@ pub fn render_routes(
         fqdn_handle_chain.push(json!({
             "handler": "reverse_proxy",
             "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
-            "health_checks": {
-                "active": {"uri": "/", "expect_status": 2}
-            }
+            "health_checks": health_checks_block(cfg)
         }));
 
         routes.push(json!({
@@ -468,6 +466,26 @@ pub fn render_routes(
     Value::Object(root)
 }
 
+/// Build the Caddy health_checks block from config. Emits active checks
+/// with configurable interval/timeout/uri/max_fails, and passive checks
+/// for additional failure detection.
+fn health_checks_block(cfg: &Config) -> serde_json::Value {
+    json!({
+        "active": {
+            "uri": cfg.health_check_uri,
+            "expect_status": 2,
+            "interval": cfg.health_check_interval.as_secs_f64().to_string() + "s",
+            "timeout": cfg.health_check_timeout.as_secs_f64().to_string() + "s",
+            "max_fails": cfg.health_check_max_fails,
+        },
+        "passive": {
+            "fail_duration": "30s",
+            "max_fails": 2,
+            "unhealthy_request_count": 3,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +564,12 @@ mod tests {
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
+            stale_timeout: Duration::from_secs(60),
+            prune_interval: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(10),
+            health_check_timeout: Duration::from_secs(3),
+            health_check_uri: "/healthz".into(),
+            health_check_max_fails: 2,
         }
     }
 
@@ -898,8 +922,8 @@ mod tests {
         let fqdn_route = &routes[1];
         let active = &fqdn_route["handle"][0]["routes"][0]["handle"][0]["health_checks"]["active"];
         assert_eq!(
-            active["uri"], "/",
-            "FQDN route must probe uri=/ (matches the synthetic-host route shape)"
+            active["uri"], "/healthz",
+            "FQDN route must probe uri=/healthz (matches config default)"
         );
         assert_eq!(active["expect_status"], 2);
     }

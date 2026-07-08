@@ -24,9 +24,6 @@ use crate::routing::{RouteEntry, RoutingTable};
 use crate::traffic::{spawn_fetcher, SharedCache};
 use reqwest::Client;
 
-const STALE_AFTER: Duration = Duration::from_secs(180);
-const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Connect to NATS, subscribe, and pump heartbeats into the routing table.
 /// Returns when the subscription ends (e.g., NATS disconnect). The caller
 /// is expected to re-invoke this in a loop with backoff, mirroring the
@@ -85,7 +82,7 @@ pub async fn run(
         rate_limit_cache_for_renderer,
         render_notify.clone(),
     );
-    spawn_pruner(table.clone(), render_notify.clone());
+    spawn_pruner(table.clone(), render_notify.clone(), cfg.clone());
 
     // Push the initial empty config so Caddy's admin API has a known state
     // before the first heartbeat lands. (Otherwise Caddy might still be
@@ -247,14 +244,14 @@ fn spawn_renderer(
     });
 }
 
-fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>) {
+fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>, cfg: Config) {
     tokio::spawn(async move {
-        let mut ticker = interval(PRUNE_INTERVAL);
+        let mut ticker = interval(cfg.prune_interval);
         // Skip the first immediate tick.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let removed = table.remove_stale(STALE_AFTER).await;
+            let removed = table.remove_stale(cfg.stale_timeout).await;
             if !removed.is_empty() {
                 metrics::counter!("ingress.pruner.removed_total").increment(removed.len() as u64);
                 warn!(?removed, "pruned stale routes");
@@ -600,6 +597,12 @@ mod tests {
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
+            stale_timeout: Duration::from_secs(60),
+            prune_interval: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(10),
+            health_check_timeout: Duration::from_secs(3),
+            health_check_uri: "/healthz".into(),
+            health_check_max_fails: 2,
         }
     }
 

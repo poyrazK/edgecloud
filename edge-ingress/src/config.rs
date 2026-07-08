@@ -75,6 +75,26 @@ pub struct Config {
     /// How often to poll the control plane for per-app rate limit overrides.
     /// Default 60s. 0 = disabled. Override with `RATE_LIMIT_FETCH_INTERVAL`.
     pub rate_limit_fetch_interval: Duration,
+    // ── Failure detection (issue #fast-failure-detection) ────────────
+    /// How long without a heartbeat before a worker's routes are pruned.
+    /// Default 60s (2 missed beats at 30s interval). Override with
+    /// `STALE_TIMEOUT`. Parsed as a Go-style duration (e.g. `60s`, `30s`).
+    pub stale_timeout: Duration,
+    /// How often the pruner scans for stale routes. Default 30s.
+    /// Override with `PRUNE_INTERVAL`. Parsed as a Go-style duration.
+    pub prune_interval: Duration,
+    /// How often Caddy performs active health checks on each upstream.
+    /// Default 10s. Override with `HEALTH_CHECK_INTERVAL`.
+    pub health_check_interval: Duration,
+    /// Timeout for each active health check probe. Default 3s.
+    /// Override with `HEALTH_CHECK_TIMEOUT`.
+    pub health_check_timeout: Duration,
+    /// URI path for active health checks. Default "/healthz".
+    /// Override with `HEALTH_CHECK_URI`.
+    pub health_check_uri: String,
+    /// Number of consecutive failed health checks before marking upstream
+    /// unhealthy. Default 2. Override with `HEALTH_CHECK_MAX_FAILS`.
+    pub health_check_max_fails: u32,
 }
 
 impl Config {
@@ -159,6 +179,28 @@ impl Config {
                 .ok()
                 .and_then(|v| humantime::parse_duration(&v).ok())
                 .unwrap_or(Duration::from_secs(60)),
+            stale_timeout: std::env::var("STALE_TIMEOUT")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(60)),
+            prune_interval: std::env::var("PRUNE_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(30)),
+            health_check_interval: std::env::var("HEALTH_CHECK_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(10)),
+            health_check_timeout: std::env::var("HEALTH_CHECK_TIMEOUT")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(3)),
+            health_check_uri: std::env::var("HEALTH_CHECK_URI")
+                .unwrap_or_else(|_| "/healthz".into()),
+            health_check_max_fails: std::env::var("HEALTH_CHECK_MAX_FAILS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
         })
     }
 }
