@@ -225,4 +225,53 @@ mod tests {
     fn handler_without_wasi_prefix_does_not_match() {
         assert!(!is_handler_export("custom:http/incoming-handler@0.2.1"));
     }
+
+    // ── detect_execution_model_from_bytes tests ────────────────────────
+
+    #[test]
+    fn detect_handler_from_fixture_bytes() {
+        // Load the handler fixture wasm and verify detect_execution_model_from_bytes
+        // classifies it as Handler.
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("handler.wasm fixture not found");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        assert_eq!(
+            detect_execution_model_from_bytes(&bytes),
+            ExecutionModel::Handler
+        );
+    }
+
+    #[test]
+    fn detect_long_running_from_minimal_wasm() {
+        // A minimal valid wasm module (magic + version, no sections at all)
+        // has no handler export → LongRunning.
+        let minimal = b"\x00asm\x01\x00\x00\x00";
+        assert_eq!(
+            detect_execution_model_from_bytes(minimal),
+            ExecutionModel::LongRunning
+        );
+    }
+
+    #[test]
+    fn detect_from_empty_bytes_returns_long_running() {
+        assert_eq!(
+            detect_execution_model_from_bytes(b""),
+            ExecutionModel::LongRunning
+        );
+    }
+
+    #[test]
+    fn detect_from_invalid_wasm_bytes_returns_long_running() {
+        assert_eq!(
+            detect_execution_model_from_bytes(b"not-wasm"),
+            ExecutionModel::LongRunning
+        );
+    }
 }

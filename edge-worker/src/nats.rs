@@ -450,4 +450,23 @@ pub(crate) mod tests {
         let client = MockNatsClient::new();
         assert_eq!(client.term_count(), 0);
     }
+
+    // ── nats_err tests ──────────────────────────────────────────────
+
+    #[test]
+    fn nats_err_converts_display_to_anyhow_with_prefix() {
+        let err: anyhow::Error = nats_err("connection refused");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("nats:"));
+        assert!(msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn nats_err_works_with_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nats: connect");
+        let err: anyhow::Error = nats_err(io_err);
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("nats:"));
+        assert!(msg.contains("connect"));
+    }
 }
