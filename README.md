@@ -15,6 +15,17 @@
 | `api` | `edge-control-plane/cmd/api/main.go` | Go control plane — HTTP API for tenants and operators. |
 | `migrate` | `edge-control-plane/cmd/migrate/main.go` | Go DB migrator — schema migrations for the control plane. |
 
+## Quick start (macOS)
+
+> One command brings up the full stack — Postgres, NATS, control plane, worker, ingress, Caddy, and a seeded test deployment — in the foreground with prefixed logs and Ctrl+C cleanup.
+>
+> ```sh
+> make dev-install   # one-time: brew formulae + rustup target
+> make dev           # bring up the stack
+> ```
+>
+> After `READY` is printed, the script prints both the direct worker URL and the Caddy-routed URL. See `scripts/dev-up.sh` for what each phase does. The four-terminal recipe below remains valid for users who want manual control.
+
 ## Module Map
 
 ```
@@ -143,6 +154,12 @@ edge deploy
 
 | Target | Description |
 |---|---|
+| `make dev` | Bring up the full stack in the foreground (Postgres + NATS + CP + worker + ingress + Caddy + seeded sample). Ctrl+C to stop. |
+| `make dev-install` | One-time prereq install (brew formulae + `rustup target add wasm32-wasip2`). |
+| `make dev-prereqs` | Verify prereqs without installing anything. |
+| `make dev-config` | Regenerate `~/.edgecloud/env.sh` and `edge-control-plane/config.local.yaml` without launching the stack. |
+| `make dev-down` | Stop Postgres + NATS containers (preserves the volume). |
+| `make dev-clean` | Stop everything and wipe `~/.edgecloud`. Add `--purge` to also wipe the artifact registry. |
 | `make infra-up` | Start Postgres + NATS containers |
 | `make infra-reset` | Wipe volumes, restart, re-migrate |
 | `make migrate` | Run pending DB migrations |
