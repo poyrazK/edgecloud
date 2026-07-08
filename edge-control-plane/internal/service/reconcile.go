@@ -61,6 +61,12 @@ type reconcileQuotas interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 }
 
+// reconcileWorkers is the subset of *repository.WorkerRepository the
+// ReconcileService needs for under-replication monitoring (issue #316).
+type reconcileWorkers interface {
+	CountRunningWorkers(ctx context.Context, tenantID string, appNames []string) (map[string]int, error)
+}
+
 // ReconcileService periodically publishes a TaskMessage::FullSync per
 // (tenant, region) so workers can recover from lost or stale NATS
 // task_update messages. Idempotent: the worker's diff logic treats
@@ -86,6 +92,7 @@ type ReconcileService struct {
 	activeRepo    reconcileActiveDeployments
 	appEnvRepo    reconcileAppEnvs
 	quotaRepo     reconcileQuotas
+	workerRepo    reconcileWorkers
 	publisher     nats.Publisher
 	defaultRegion string
 	envDecrypter  TrafficEnvDecrypter // nil = plaintext pass-through
@@ -96,6 +103,7 @@ func NewReconcileService(
 	activeRepo reconcileActiveDeployments,
 	appEnvRepo reconcileAppEnvs,
 	quotaRepo reconcileQuotas,
+	workerRepo reconcileWorkers,
 	publisher nats.Publisher,
 	defaultRegion string,
 ) *ReconcileService {
@@ -107,6 +115,7 @@ func NewReconcileService(
 		activeRepo:    activeRepo,
 		appEnvRepo:    appEnvRepo,
 		quotaRepo:     quotaRepo,
+		workerRepo:    workerRepo,
 		publisher:     publisher,
 		defaultRegion: defaultRegion,
 	}
@@ -251,11 +260,28 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		return
 	}
 
-	// Bulk-fetch env vars for every publishable active app in one round trip.
+	// Issue #316: under-replication check. Query how many distinct workers
+	// report each app as running; warn if below desired_replicas.
 	appNames := make([]string, len(publishable))
 	for i, j := range publishable {
 		appNames[i] = j.AppName
 	}
+	runningCounts, err := s.workerRepo.CountRunningWorkers(ctx, tenantID, appNames)
+	if err != nil {
+		log.Printf("reconcile: tenant=%s: CountRunningWorkers: %v; skipping under-replication check", tenantID, err)
+	} else {
+		for _, j := range publishable {
+			if j.DesiredReplicas > 0 {
+				count := runningCounts[j.AppName]
+				if count < j.DesiredReplicas {
+					log.Printf("reconcile: tenant=%s app=%s region=%s: under-replicated: have=%d want=%d",
+						tenantID, j.AppName, s.defaultRegion, count, j.DesiredReplicas)
+				}
+			}
+		}
+	}
+
+	// Bulk-fetch env vars for every publishable active app in one round trip.
 	allEnvs, err := s.appEnvRepo.ListByApps(ctx, tenantID, appNames)
 	if err != nil {
 		log.Printf("reconcile: tenant=%s: list envs (bulk): %v; publishing without env", tenantID, err)

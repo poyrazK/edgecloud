@@ -55,6 +55,10 @@ type Deployment struct {
 	// are not affected). Stored on the deployments row too so operators
 	// can audit "which deployments opted in" via the list endpoint.
 	AutoRollbackEnabled bool `db:"auto_rollback_enabled" json:"auto_rollback_enabled"`
+	// DesiredReplicas is the number of workers that should run this
+	// deployment in each region (issue #316). 0 means "no threshold"
+	// — the reconcile loop won't warn about under-replication.
+	DesiredReplicas int `db:"desired_replicas" json:"desired_replicas"`
 }
 
 // Deployment status constants.
@@ -131,6 +135,10 @@ type ActiveDeployment struct {
 	// NATS stream UI surfaces message ids, but the CP-side table
 	// needs a copy for the join to be useful.
 	LastPublishAttemptID *string `db:"last_publish_attempt_id"`
+	// DesiredReplicas is the number of workers that should run this
+	// deployment in each region (issue #316). 0 means "no threshold".
+	// Copied from the deployments row at activate time.
+	DesiredReplicas int `db:"desired_replicas"`
 }
 
 // AppEnv stores environment variables for an app.

@@ -4,19 +4,6 @@ use anyhow::Context;
 use edge_runtime::socket_egress::SocketEgressPolicy;
 use std::path::PathBuf;
 
-// `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
-// env vars and consumed by the supervisor (PR #64 follow-up). They plumb
-// per-app wasmtime limits: StoreLimits for memory, and an epoch ticker +
-// deadline for CPU budgets. The previous PR deferred the wiring; this PR
-// closes the loop and removes the dead_code allow.
-//
-// `queue_group` and `consumer_name` (PR #96) drive the JetStream push
-// consumer: every worker in a region joins `queue_group` so a TaskMessage
-// is delivered to exactly one worker, and `consumer_name` is the durable
-// cursor identity (derived from `worker_id` by default).
-
-use crate::nats::DEFAULT_QUEUE_GROUP;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub worker_id: String,
@@ -52,11 +39,6 @@ pub struct Config {
     /// With the default tick of 10 ms and deadline of 100, each call has a
     /// ~1 s CPU budget. Tune via `EPOCH_DEADLINE_TICKS`.
     pub epoch_deadline_ticks: u64,
-    /// NATS queue group this worker subscribes to. All workers in a region
-    /// join the same group so that NATS delivers each `TaskMessage` to
-    /// exactly one worker — preventing duplicate app starts across workers.
-    /// Override with `EDGE_QUEUE_GROUP`.
-    pub queue_group: String,
     /// Durable JetStream consumer name. Derived from `worker_id` by default
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
@@ -217,8 +199,6 @@ impl Config {
         }
         Ok(Config {
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
-            queue_group: std::env::var("EDGE_QUEUE_GROUP")
-                .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
             consumer_name,
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,

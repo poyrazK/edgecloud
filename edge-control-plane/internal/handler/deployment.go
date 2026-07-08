@@ -74,6 +74,7 @@ type deployResponse struct {
 	URL                 string   `json:"url"`
 	Regions             []string `json:"regions"`
 	AutoRollbackEnabled bool     `json:"auto_rollback_enabled"`
+	DesiredReplicas     int      `json:"desired_replicas"`
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +110,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse `?replicas=N` (issue #316). Defaults to 0 (no threshold).
+	// Must be a non-negative integer.
+	desiredReplicas, rerr := parseIntQuery(r.URL.Query().Get("replicas"), 0)
+	if rerr != nil {
+		http.Error(w, `{"error": "`+rerr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Cap the body at MaxArtifactSize. http.MaxBytesReader returns a
 	// typed *http.MaxBytesError when the cap is exceeded, which we
 	// map to 413 below. The body is now streamed directly to the
@@ -130,7 +139,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback, desiredReplicas)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -237,6 +246,23 @@ func parseBoolQuery(raw string, defaultVal bool) (bool, error) {
 		return defaultVal, nil
 	}
 	return strconv.ParseBool(raw)
+}
+
+// parseIntQuery parses a query-string integer with a default when the
+// parameter is absent. Returns an error for unparseable values so the
+// caller can return 400. Negative values are rejected.
+func parseIntQuery(raw string, defaultVal int) (int, error) {
+	if raw == "" {
+		return defaultVal, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer %q", raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("negative value not allowed: %d", n)
+	}
+	return n, nil
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {

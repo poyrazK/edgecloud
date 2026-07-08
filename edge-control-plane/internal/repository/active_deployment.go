@@ -73,6 +73,7 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	_, err := r.db.ExecContext(ctx, query,
 		ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled,
 		regionsPublished, regionsFailed, ad.LastPublishAt, ad.LastPublishAttemptID,
+		ad.DesiredReplicas,
 	)
 	return err
 }

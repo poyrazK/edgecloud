@@ -331,7 +331,7 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
@@ -413,6 +413,10 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		// deployments opted in. The flag is copied onto the
 		// active_deployments row by ActivateDeployment.
 		AutoRollbackEnabled: autoRollback,
+		// Persist the desired replica count (issue #316). 0 means
+		// "no threshold" — the reconcile loop won't warn about
+		// under-replication.
+		DesiredReplicas: desiredReplicas,
 	}
 
 	// Wrap the row insert and the artifact save in a transaction
@@ -654,6 +658,9 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			// path and the heartbeat-driven stability window
 			// both read from the active row.
 			AutoRollbackEnabled: deployment.AutoRollbackEnabled,
+			// Copy the desired replica count (issue #316). The
+			// reconcile loop uses this as a monitoring threshold.
+			DesiredReplicas: deployment.DesiredReplicas,
 		}); err != nil {
 			return fmt.Errorf("setting active deployment: %w", err)
 		}

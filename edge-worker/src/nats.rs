@@ -1,11 +1,11 @@
 //! NATS client for task subscription and heartbeat publishing.
 //!
-//! Workers subscribe to the `edgecloud.tasks.<region>` JetStream stream as
-//! members of a queue group. NATS delivers each `TaskMessage` to exactly
-//! one worker in the group, preventing duplicate app starts across workers
-//! in the same region (issue #86). The control plane's publisher is
-//! unchanged — it still publishes to the subject; the queue-group is a
-//! consumer-side property.
+//! Workers subscribe to the `edgecloud.tasks.<region>` JetStream stream
+//! without a queue group — every worker receives every `TaskMessage`
+//! (fan-out, issue #316). Workers already diff desired vs. running state
+//! in the supervisor, so duplicate task messages are no-ops. The ingress
+//! discovers workers via heartbeats and handles multiple upstreams for
+//! the same app natively.
 
 use std::time::Duration;
 
@@ -22,8 +22,6 @@ use crate::messages::HeartbeatMessage;
 pub const TASK_STREAM: &str = "edgecloud-tasks";
 /// Subject wildcard that captures all `edgecloud.tasks.<region>` traffic.
 pub const TASK_SUBJECT_WILDCARD: &str = "edgecloud.tasks.>";
-/// Default queue group all workers in a region join.
-pub const DEFAULT_QUEUE_GROUP: &str = "edgecloud-workers";
 
 /// Stream of JetStream task messages. Items expose `.ack()` / `.ack_with()`
 /// for flow control.
@@ -39,17 +37,13 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// Build the JetStream consumer config for subscribing to task messages.
 /// Extracted as a pure function so the wire contract can be unit-tested
 /// without a real NATS connection.
-pub fn build_consumer_config(
-    consumer_name: &str,
-    queue_group: &str,
-    region: &str,
-) -> PushConsumerConfig {
+pub fn build_consumer_config(consumer_name: &str, region: &str) -> PushConsumerConfig {
     let deliver_subject = format!("_INBOX.task.{}", consumer_name);
     PushConsumerConfig {
         name: Some(consumer_name.to_string()),
         durable_name: Some(consumer_name.to_string()),
         deliver_subject,
-        deliver_group: Some(queue_group.to_string()),
+        deliver_group: None,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
         filter_subject: format!("edgecloud.tasks.{}", region),
@@ -80,7 +74,9 @@ pub fn heartbeat_subject(region: &str) -> String {
 /// Trait for NATS operations — allows test doubles and fakes.
 #[async_trait]
 pub trait NatsClient: Send + Sync + 'static {
-    /// Subscribe to task updates for a region as a member of `queue_group`.
+    /// Subscribe to task updates for a region (fan-out, no queue group —
+    /// issue #316). Every worker in the region receives every
+    /// `TaskMessage`; the supervisor's diff logic handles duplicates.
     ///
     /// `consumer_name` is the durable consumer identity. Workers should pick
     /// a stable name (typically derived from `worker_id`) so that on restart
@@ -89,7 +85,6 @@ pub trait NatsClient: Send + Sync + 'static {
     async fn subscribe_tasks(
         &self,
         region: &str,
-        queue_group: &str,
         consumer_name: &str,
     ) -> anyhow::Result<TaskMessageStream>;
 
@@ -144,7 +139,6 @@ impl NatsClient for NatsClientImpl {
     async fn subscribe_tasks(
         &self,
         region: &str,
-        queue_group: &str,
         consumer_name: &str,
     ) -> anyhow::Result<TaskMessageStream> {
         // Idempotent — works whether or not the control plane already
@@ -157,12 +151,10 @@ impl NatsClient for NatsClientImpl {
             .map_err(nats_err)
             .context("tasks stream missing after EnsureStream")?;
 
-        // Queue-grouped durable push consumer with explicit ack. The
-        // server picks the delivery subject; `deliver_group` is the
-        // queue-group name — NATS load-balances messages across consumers
-        // in the same group, preventing duplicate app starts across
-        // workers in the same region (issue #86).
-        let config = build_consumer_config(consumer_name, queue_group, region);
+        // Durable push consumer with explicit ack (no queue group —
+        // issue #316 fan-out). Every worker in the region receives every
+        // `TaskMessage`; the supervisor's diff logic handles duplicates.
+        let config = build_consumer_config(consumer_name, region);
         let consumer: jetstream::consumer::PushConsumer = stream
             .get_or_create_consumer(consumer_name, config)
             .await
@@ -225,44 +217,47 @@ pub(crate) mod tests {
 
     #[test]
     fn consumer_config_has_correct_name() {
-        let cfg = build_consumer_config("my-consumer", "my-group", "fra");
+        let cfg = build_consumer_config("my-consumer", "fra");
         assert_eq!(cfg.name.as_deref(), Some("my-consumer"));
         assert_eq!(cfg.durable_name.as_deref(), Some("my-consumer"));
     }
 
     #[test]
-    fn consumer_config_has_correct_queue_group() {
-        let cfg = build_consumer_config("c1", "wg-prod", "sfo");
-        assert_eq!(cfg.deliver_group.as_deref(), Some("wg-prod"));
+    fn consumer_config_has_no_queue_group() {
+        let cfg = build_consumer_config("c1", "sfo");
+        assert!(
+            cfg.deliver_group.is_none(),
+            "fan-out mode: deliver_group must be None"
+        );
     }
 
     #[test]
     fn consumer_config_filter_subject_matches_region() {
-        let cfg = build_consumer_config("c1", "g1", "fra");
+        let cfg = build_consumer_config("c1", "fra");
         assert_eq!(cfg.filter_subject, "edgecloud.tasks.fra");
     }
 
     #[test]
     fn consumer_config_has_explicit_ack() {
-        let cfg = build_consumer_config("c1", "g1", "fra");
+        let cfg = build_consumer_config("c1", "fra");
         assert_eq!(cfg.ack_policy, jetstream::consumer::AckPolicy::Explicit);
     }
 
     #[test]
     fn consumer_config_deliver_policy_is_all() {
-        let cfg = build_consumer_config("c1", "g1", "fra");
+        let cfg = build_consumer_config("c1", "fra");
         assert_eq!(cfg.deliver_policy, jetstream::consumer::DeliverPolicy::All);
     }
 
     #[test]
     fn consumer_config_max_deliver_is_twenty() {
-        let cfg = build_consumer_config("c1", "g1", "fra");
+        let cfg = build_consumer_config("c1", "fra");
         assert_eq!(cfg.max_deliver, 20);
     }
 
     #[test]
     fn consumer_config_deliver_subject_contains_consumer_name() {
-        let cfg = build_consumer_config("my-worker-42", "g1", "fra");
+        let cfg = build_consumer_config("my-worker-42", "fra");
         assert!(cfg.deliver_subject.contains("my-worker-42"));
     }
 
@@ -349,7 +344,6 @@ pub(crate) mod tests {
         async fn subscribe_tasks(
             &self,
             _region: &str,
-            _queue_group: &str,
             _consumer_name: &str,
         ) -> anyhow::Result<TaskMessageStream> {
             anyhow::bail!("subscribe_tasks not implemented in mock")
