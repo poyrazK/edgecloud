@@ -126,7 +126,16 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let pipeline = tokio::spawn({
         let pipe_n = pipeline_notify.clone();
-        async move { heartbeats::run(run_cfg, run_table, run_caddy, pipe_n, CancellationToken::new()).await }
+        async move {
+            heartbeats::run(
+                run_cfg,
+                run_table,
+                run_caddy,
+                pipe_n,
+                CancellationToken::new(),
+            )
+            .await
+        }
     });
 
     // Give the pipeline a beat to subscribe to NATS.
