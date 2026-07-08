@@ -1,4 +1,4 @@
-//! `edge env set` and `edge env list`.
+//! `edge env set`, `edge env list`, and `edge env delete`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -42,6 +42,20 @@ pub fn list_vars(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Delete an environment variable for the app.
+#[cfg(feature = "network")]
+pub fn delete_var(path: &Path, key: &str) -> Result<()> {
+    let state =
+        State::load(path).with_context(|| "no deployment found — run `edge deploy` first")?;
+    let edge_toml = EdgeToml::from_path(path)?;
+
+    let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
+    client.delete_env(&state.app_name, key)?;
+
+    output::success(&format!("{} deleted", key));
+    Ok(())
+}
+
 #[cfg(not(feature = "network"))]
 pub fn set_var(_path: &Path, _key: &str, _value: &str) -> Result<()> {
     anyhow::bail!("env requires network support; rebuild with --features network")
@@ -49,5 +63,10 @@ pub fn set_var(_path: &Path, _key: &str, _value: &str) -> Result<()> {
 
 #[cfg(not(feature = "network"))]
 pub fn list_vars(_path: &Path) -> Result<()> {
+    anyhow::bail!("env requires network support; rebuild with --features network")
+}
+
+#[cfg(not(feature = "network"))]
+pub fn delete_var(_path: &Path, _key: &str) -> Result<()> {
     anyhow::bail!("env requires network support; rebuild with --features network")
 }

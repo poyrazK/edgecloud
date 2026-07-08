@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use edge_runtime::interfaces::observe::MetricsAccumulator;
 use edge_runtime::RequestMeter;
 use tokio::sync::Mutex;
 use wasmtime::component::InstancePre;
@@ -69,6 +70,15 @@ pub struct AppInstance {
     /// (the spawned task is a placeholder pending the per-request
     /// wiring) — see `supervisor::start_app`.
     pub dispatch: Option<Arc<HandlerDispatch>>,
+    /// Shared metrics accumulator for this app instance. Guest
+    /// `edge:observe` metric calls write into this, and the heartbeat
+    /// builder snapshots it every 30s to populate `observer_metrics`
+    /// on the wire. `None` before the app is running (the accumulator
+    /// is created in `run_app_loop` / `start_app`).
+    pub metrics_acc: Option<Arc<MetricsAccumulator>>,
+    /// If EDGE_WS_PORT was requested, holds the allocated port number.
+    /// Reported in heartbeats so the ingress can route WS traffic.
+    pub ws_port: Option<u16>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.

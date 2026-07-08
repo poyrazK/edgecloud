@@ -63,10 +63,14 @@ fn wire_test_config(
         queue_group: "ingress-wire-group".to_string(),
         consumer_name: format!("ingress-wire-{worker_id}"),
         worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     }
 }
 

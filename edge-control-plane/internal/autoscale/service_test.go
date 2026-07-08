@@ -527,8 +527,8 @@ func TestEvaluateAll_ScaleUpOnShortage(t *testing.T) {
 	})
 
 	body, _ := json.Marshal(map[string]any{
-		"worker_id": "w_fra_abc",
-		"region":    "fra",
+		"worker_id":        "w_fra_abc",
+		"region":           "fra",
 		"cluster_headroom": map[string]any{"app_slots": 10},
 	})
 	s.handleHeartbeat(natsMsg(body))

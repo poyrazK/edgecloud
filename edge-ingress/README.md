@@ -87,6 +87,7 @@ curl http://127.0.0.1:2019/config/ | jq .apps.http.servers.edge_https.routes
 |------------------------|-------------------------------|----------------------------------------|
 | `NATS_URL`             | `nats://localhost:4222`       | Where the binary subscribes for heartbeats. |
 | `CADDY_ADMIN_URL`      | `http://127.0.0.1:2019`       | Caddy's JSON admin endpoint.           |
+| `CADDY_ADMIN_LISTEN`   | `localhost:2019`              | Listen address written into the rendered Caddy config's `admin` block. **Set to `0.0.0.0:2019` when Caddy runs in Docker** so the host can reach the admin API. Without this, every `POST /load` resets the admin binding to `localhost:2019` inside the container. |
 | `CADDY_ADMIN_TOKEN`    | unset                         | If set, sent as `Authorization: Bearer <token>`. **Must match the value on the Caddy process** (`CADDY_ADMIN_TOKEN` env var on the `caddy:2` image). |
 | `INGRESS_LISTEN_HTTP`  | `:80`                         | Bind address for the :80 server (308 redirect to HTTPS). |
 | `INGRESS_LISTEN_HTTPS` | `:443`                        | Bind address for the :443 server.       |
@@ -130,6 +131,12 @@ the next heartbeat burst — trigger one with a NATS `pub` if needed).
   the same value, otherwise `POST /load` returns 401. The default
   `caddy:2` Docker image has the admin on `:2019` — only expose that port
   to `edge-ingress`, not to the public internet.
+
+- **Caddy admin in Docker**: the default `caddy:2` image binds its admin
+  API to `localhost:2019` **inside the container**, making it unreachable
+  from the host via port mapping. Use a `Caddyfile` with `admin 0.0.0.0:2019`
+  or set `CADDY_ADMIN_LISTEN=0.0.0.0:2019` on the ingress (which writes the
+  `admin` block into every config push, so it persists across reloads).
 
 - **Reload volume**: 30s heartbeats × N workers × M apps. `POST /load` on a
   500-route Caddyfile is ~50ms; the ingress handles thousands of routes

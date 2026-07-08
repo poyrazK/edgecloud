@@ -299,6 +299,31 @@ impl Guest for Component {
                 scheduling::cancel_scheduled(id);
                 return_text(out, 200, b"ok");
             }
+            // ── SSE / streaming ────────────────────────────────────
+            "/sse" => {
+                let count: usize = get_query_param(query, "count")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5);
+
+                let headers = Fields::new();
+                let _ = headers.set("content-type", &[b"text/event-stream".to_vec()]);
+                let _ = headers.set("cache-control", &[b"no-cache".to_vec()]);
+                let resp = OutgoingResponse::new(headers);
+                resp.set_status_code(200).unwrap();
+                let body_handle = resp.body().expect("response body");
+                let stream = body_handle.write().expect("output stream");
+
+                // Deliver headers immediately — the host starts serving
+                // the response while we continue writing body chunks.
+                ResponseOutparam::set(out, Ok(resp));
+
+                for i in 0..count {
+                    let msg = format!("id: {}\ndata: {{\"event\":{}}}\n\n", i, i);
+                    stream.blocking_write_and_flush(msg.as_bytes()).unwrap();
+                }
+                let _ =
+                    crate::wasi::http::types::OutgoingBody::finish(body_handle, None);
+            }
             _ => {
                 return_json(out, 404, br#"{"error":"not found"}"#);
             }

@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 /// Default labels used when none are provided.
 const DEFAULT_LABELS: &[(String, String)] = &[];
@@ -15,6 +16,42 @@ const DEFAULT_LABELS: &[(String, String)] = &[];
 /// chokepoint for both `emit_log` and `emit_log_record`) so both entry
 /// points are covered.
 pub const MAX_LOG_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// Simple token bucket for per-tenant log rate limiting.
+/// Refills at `rate` tokens per second, with a burst capacity of 2× rate.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+    max_tokens: f64,
+    refill_rate_per_sec: f64,
+}
+
+impl TokenBucket {
+    fn new(rate_per_sec: usize, burst: usize) -> Self {
+        let max = burst.max(rate_per_sec) as f64;
+        Self {
+            tokens: max,
+            last_refill: Instant::now(),
+            max_tokens: max,
+            refill_rate_per_sec: rate_per_sec as f64,
+        }
+    }
+
+    /// Attempt to consume one token. Returns `true` if allowed, `false`
+    /// if the bucket is empty (rate limit hit). Refills on each check.
+    fn try_take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate_per_sec).min(self.max_tokens);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Label pairs for metric metadata.
 type MetricLabels = Vec<(String, String)>;
@@ -407,6 +444,12 @@ pub struct Observer {
     /// changing the wire format. The guest still sees a silent no-op
     /// on the drop — only operators see the count.
     dropped_size_cap_count: AtomicU64,
+    /// Per-tenant log rate limiter. Keyed by tenant_id, each entry is
+    /// a simple token bucket that refills at LOG_RATE_LIMIT_PER_SECOND
+    /// tokens/s (default 1000). When a bucket is empty, the log record
+    /// is silently dropped. Prevents a misbehaving guest from saturating
+    /// the LogForwarder for all tenants on the same worker.
+    rate_limiters: Mutex<std::collections::HashMap<String, TokenBucket>>,
 }
 
 impl Default for Observer {
@@ -435,6 +478,7 @@ impl Observer {
             app_ctx: config.app_ctx,
             min_log_level: config.min_log_level,
             dropped_size_cap_count: AtomicU64::new(0),
+            rate_limiters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -555,7 +599,24 @@ impl Observer {
         // tenant/worker identity, batching, and transport. Per-app
         // AppLogContext travels with the record so downstream sinks don't
         // need a separate lookup.
+        //
+        // Rate-limit per tenant so a misbehaving guest cannot saturate the
+        // LogForwarder for all tenants on the same worker.
+        if !self.check_rate_limit(&self.app_ctx.tenant_id) {
+            return;
+        }
         self.log_sink.push(record.clone(), self.app_ctx.clone());
+    }
+
+    /// Per-tenant token bucket rate limiter. Returns `true` if the record
+    /// is allowed through, `false` if it should be dropped.
+    fn check_rate_limit(&self, tenant_id: &str) -> bool {
+        let rate = 1000;
+        let mut limiters = self.rate_limiters.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = limiters
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| TokenBucket::new(rate, rate * 2));
+        bucket.try_take()
     }
 
     /// Returns the current value of a counter for testing.

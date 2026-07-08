@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use edge_runtime::interfaces::observe::{AppLogContext, LogLevel, LogRecord, LogSink};
-use serde::Serialize;
+use edge_spool::Spool;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::Notify;
 
@@ -71,19 +72,19 @@ const BYTE_OVERHEAD_PER_ENTRY: usize = 200;
 /// `ts` is intentionally absent — the DB DEFAULT NOW() stamps the row at
 /// insert time, avoiding per-worker clock skew from contaminating the
 /// ordering of logs in the same batch.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct WireEntry {
     tenant_id: String,
     deployment_id: String,
     app_name: String,
     worker_id: String,
     region: String,
-    level: &'static str,
+    level: String,
     message: String,
     labels: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IngestLogsRequest {
     entries: Vec<WireEntry>,
 }
@@ -133,14 +134,29 @@ pub struct LogForwarder {
     /// racing two POSTs that would each drain their own buffer slice and
     /// produce 2× the request load on the control plane.
     flush_in_flight: AtomicBool,
+    /// Optional disk spool. When set, failed batches (5xx/network errors)
+    /// are persisted to disk so they survive worker restarts. Replayed
+    /// on startup via `replay_spool()`.
+    spool: Option<Spool>,
 }
 
 impl LogForwarder {
+    #[allow(dead_code)]
     pub fn new(
         control_plane_url: impl Into<String>,
         worker_id: impl Into<String>,
         region: impl Into<String>,
         jwt_signer: Arc<WorkerJwtSigner>,
+    ) -> Arc<Self> {
+        Self::new_with_spool(control_plane_url, worker_id, region, jwt_signer, None)
+    }
+
+    pub fn new_with_spool(
+        control_plane_url: impl Into<String>,
+        worker_id: impl Into<String>,
+        region: impl Into<String>,
+        jwt_signer: Arc<WorkerJwtSigner>,
+        spool: Option<Spool>,
     ) -> Arc<Self> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -165,6 +181,7 @@ impl LogForwarder {
             hard_cap,
             byte_notify_threshold: BYTE_NOTIFY_THRESHOLD,
             flush_in_flight: AtomicBool::new(false),
+            spool,
         })
     }
 
@@ -287,10 +304,90 @@ impl LogForwarder {
                         status = status.as_u16(),
                         "logs dropped: 5xx (no retry in MVP)"
                     );
+                    self.persist_failed_batch(&body).await;
                 }
             }
             Err(e) => {
                 tracing::error!(count, err = %e, "logs dropped: HTTP error");
+                self.persist_failed_batch(&body).await;
+            }
+        }
+    }
+
+    /// Persist a failed batch to the disk spool.
+    async fn persist_failed_batch(&self, body: &IngestLogsRequest) {
+        let spool = match &self.spool {
+            Some(s) => s,
+            None => return,
+        };
+        let json = serde_json::to_value(body).unwrap_or_default();
+        if let Err(e) = spool.append(&json).await {
+            tracing::error!(err = %e, "log_forwarder: spool append failed");
+        }
+    }
+
+    /// Replay persisted batches on startup.
+    pub async fn replay_spool(&self) {
+        let spool = match &self.spool {
+            Some(s) => s,
+            None => return,
+        };
+        let batches = match spool.drain(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(err = %e, "log_forwarder: spool drain failed");
+                return;
+            }
+        };
+        if batches.is_empty() {
+            return;
+        }
+        tracing::info!(
+            batch_count = batches.len(),
+            "log_forwarder: replaying spool"
+        );
+
+        for batch_json in &batches {
+            let body: IngestLogsRequest = match serde_json::from_value(batch_json.clone()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let url = format!("{}/api/internal/logs", self.control_plane_url);
+            let token = self.jwt_signer.sign();
+            let count = body.entries.len();
+
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await;
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let _ = resp.bytes().await;
+                    if status.is_success() {
+                        tracing::debug!(count, "log_forwarder: replayed spool batch");
+                    } else if status.is_client_error() {
+                        tracing::error!(
+                            count,
+                            status = status.as_u16(),
+                            "log_forwarder: replay dropped: 4xx"
+                        );
+                    } else {
+                        tracing::warn!(
+                            count,
+                            status = status.as_u16(),
+                            "log_forwarder: replay re-spooling"
+                        );
+                        let _ = spool.append(batch_json).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(count, err = %e, "log_forwarder: replay re-spooling");
+                    let _ = spool.append(batch_json).await;
+                }
             }
         }
     }
@@ -315,7 +412,7 @@ impl LogSink for LogForwarder {
             app_name: ctx.app_name,
             worker_id: self.worker_id.clone(),
             region: self.region.clone(),
-            level: log_level_to_string(record.level),
+            level: log_level_to_string(record.level).to_string(),
             message: record.message,
             labels: labels_to_json(record.labels),
         };
@@ -390,6 +487,7 @@ mod tests {
     fn forwarder() -> Arc<LogForwarder> {
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -422,7 +520,7 @@ mod tests {
         let state = f.state.lock().unwrap();
         assert_eq!(state.buffer.len(), 1);
         assert_eq!(state.buffer[0].message, "hello");
-        assert_eq!(state.buffer[0].level, "info");
+        assert_eq!(state.buffer[0].level, "info".to_string());
         assert_eq!(state.buffer[0].app_name, "my-app");
         assert_eq!(state.buffer[0].worker_id, "w_test");
         assert_eq!(state.buffer[0].region, "test-region");
@@ -453,7 +551,7 @@ mod tests {
         f.push(record(LogLevel::Debug, "d"), ctx());
         f.push(record(LogLevel::Trace, "t"), ctx());
         let state = f.state.lock().unwrap();
-        let levels: Vec<&str> = state.buffer.iter().map(|e| e.level).collect();
+        let levels: Vec<&str> = state.buffer.iter().map(|e| e.level.as_str()).collect();
         assert_eq!(levels, vec!["error", "warn", "info", "debug", "trace"]);
     }
 
@@ -491,6 +589,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -518,6 +617,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -547,6 +647,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -576,6 +677,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -656,6 +758,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -707,6 +810,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -737,6 +841,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -774,6 +879,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",
@@ -811,6 +917,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test-region",

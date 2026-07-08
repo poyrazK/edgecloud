@@ -28,9 +28,9 @@ func TestTenantRepository_Create(t *testing.T) {
 	defer cleanup()
 
 	tnt := &domain.Tenant{
-		ID:                     "t_1",
-		Name:                   "acme",
-		Plan:                   "free",
+		ID:                      "t_1",
+		Name:                    "acme",
+		Plan:                    "free",
 		AllowlistedDestinations: pq.StringArray{"*.example.com"},
 	}
 
@@ -48,9 +48,9 @@ func TestTenantRepository_Create_EmptyAllowlist(t *testing.T) {
 	defer cleanup()
 
 	tnt := &domain.Tenant{
-		ID:                     "t_2",
-		Name:                   "empty",
-		Plan:                   "free",
+		ID:                      "t_2",
+		Name:                    "empty",
+		Plan:                    "free",
 		AllowlistedDestinations: pq.StringArray{},
 	}
 
@@ -130,9 +130,9 @@ func TestTenantRepository_Update(t *testing.T) {
 	defer cleanup()
 
 	tnt := &domain.Tenant{
-		ID:                     "t_1",
-		Name:                   "acme-v2",
-		Plan:                   "pro",
+		ID:                      "t_1",
+		Name:                    "acme-v2",
+		Plan:                    "pro",
 		AllowlistedDestinations: pq.StringArray{"*.acme.com"},
 	}
 

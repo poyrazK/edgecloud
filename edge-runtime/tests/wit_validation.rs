@@ -159,6 +159,11 @@ fn edge_runtime_world_has_correct_imports() {
         Some(5),
         "process should have 5 functions"
     );
+    assert_eq!(
+        imports.remove("websocket"),
+        Some(5),
+        "websocket should have 5 functions"
+    );
 
     // No unexpected interfaces.
     assert!(
@@ -203,6 +208,7 @@ fn edge_runtime_handler_world_has_correct_imports() {
     assert_eq!(imports.remove("time"), Some(3));
     assert_eq!(imports.remove("scheduling"), Some(3));
     assert_eq!(imports.remove("process"), Some(5));
+    assert_eq!(imports.remove("websocket"), Some(5));
 
     assert!(
         imports.is_empty(),

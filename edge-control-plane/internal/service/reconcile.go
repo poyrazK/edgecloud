@@ -32,7 +32,7 @@ var ErrTenantNotFoundInReconcile = errors.New("tenant not found")
 // actually detect "not found" because tenant is a slice that can be
 // empty for unrelated reasons (e.g. a fresh DB, or pagination later).
 type reconcileTenants interface {
-	List(ctx context.Context) ([]domain.Tenant, error)
+	ListActive(ctx context.Context) ([]domain.Tenant, error)
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
@@ -88,6 +88,7 @@ type ReconcileService struct {
 	quotaRepo     reconcileQuotas
 	publisher     nats.Publisher
 	defaultRegion string
+	envDecrypter  TrafficEnvDecrypter // nil = plaintext pass-through
 }
 
 func NewReconcileService(
@@ -109,6 +110,11 @@ func NewReconcileService(
 		publisher:     publisher,
 		defaultRegion: defaultRegion,
 	}
+}
+
+// SetEnvDecrypter injects the decrypter for env values at publish.
+func (s *ReconcileService) SetEnvDecrypter(dec TrafficEnvDecrypter) {
+	s.envDecrypter = dec
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires immediately
@@ -155,7 +161,7 @@ func (s *ReconcileService) Run(ctx context.Context, interval time.Duration) {
 // logged-and-continued so a single bad tenant doesn't take the whole
 // sweep down.
 func (s *ReconcileService) RunOnce(ctx context.Context) error {
-	tenants, err := s.tenantRepo.List(ctx)
+	tenants, err := s.tenantRepo.ListActive(ctx)
 	if err != nil {
 		return err
 	}
@@ -260,7 +266,13 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		if envByApp[e.AppName] == nil {
 			envByApp[e.AppName] = make(map[string]string)
 		}
-		envByApp[e.AppName][e.EnvKey] = e.EnvValue
+		v := e.EnvValue
+		if s.envDecrypter != nil {
+			if d, err := s.envDecrypter.Decrypt(e.EnvValue); err == nil {
+				v = d
+			}
+		}
+		envByApp[e.AppName][e.EnvKey] = v
 	}
 
 	maxMemoryMB := 256
@@ -413,7 +425,13 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 		if envByApp[e.AppName] == nil {
 			envByApp[e.AppName] = make(map[string]string)
 		}
-		envByApp[e.AppName][e.EnvKey] = e.EnvValue
+		v := e.EnvValue
+		if s.envDecrypter != nil {
+			if d, err := s.envDecrypter.Decrypt(e.EnvValue); err == nil {
+				v = d
+			}
+		}
+		envByApp[e.AppName][e.EnvKey] = v
 	}
 
 	maxMemoryMB := 256

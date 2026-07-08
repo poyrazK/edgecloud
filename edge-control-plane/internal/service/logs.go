@@ -89,6 +89,15 @@ type LogQuery struct {
 	MinLvl string // canonical level string; "" = no filter
 	Levels []string
 	Limit  int
+	Offset int
+}
+
+// LogListResult wraps the entries, effective limit, and an optional
+// next-offset indicator for pagination.
+type LogListResult struct {
+	Entries    []domain.LogEntry
+	Limit      int
+	NextOffset *int // nil when there are no more pages
 }
 
 // LogEntryLister is the repository subset LogService consumes. Defined locally
@@ -138,21 +147,17 @@ func ResolveLimit(requested int) int {
 //     in the future) should not blow up the query.
 //   - MinLvl: empty → no filter (Levels slice nil). Unknown → ErrInvalidLevel.
 //   - Limit: ≤0 → DefaultLogLimit (100). >MaxLogLimit (1000) → MaxLogLimit.
+//   - Offset: ≥0. Negative values are clamped to 0 by the handler.
 //
-// The second return value is the *effective* limit — the post-clamp value
-// actually applied to the query. Callers (the HTTP handler) echo it back in
-// the response envelope so a client that asked for `limit=2000` sees the
-// real bound. Deriving it here, not in the handler, keeps the policy in
-// one place: changing the clamp buckets later only touches this file.
-//
-// The returned entries are ordered newest-first; the index
-// idx_logs_tenant_app_ts (tenant_id, app_name, ts DESC) covers the WHERE +
-// ORDER BY.
+// Returns a LogListResult with entries, effective limit, and an optional
+// NextOffset pointer. When len(entries) == limit there may be more rows
+// beyond the current page; NextOffset is set to offset + len(entries) so
+// the caller can request the next page.
 func (s *LogService) ListByTenantApp(
 	ctx context.Context, tenantID, appName string, q LogQuery,
-) ([]domain.LogEntry, int, error) {
+) (*LogListResult, error) {
 	if q.MinLvl != "" && LogLevelOrdinal(q.MinLvl) < 0 {
-		return nil, 0, fmt.Errorf("%w: %q", ErrInvalidLevel, q.MinLvl)
+		return nil, fmt.Errorf("%w: %q", ErrInvalidLevel, q.MinLvl)
 	}
 
 	since := q.Since
@@ -171,9 +176,21 @@ func (s *LogService) ListByTenantApp(
 		Since:  since,
 		Levels: levels,
 		Limit:  limit,
+		Offset: q.Offset,
 	})
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return entries, limit, nil
+
+	var nextOffset *int
+	if len(entries) == limit {
+		no := q.Offset + len(entries)
+		nextOffset = &no
+	}
+
+	return &LogListResult{
+		Entries:    entries,
+		Limit:      limit,
+		NextOffset: nextOffset,
+	}, nil
 }

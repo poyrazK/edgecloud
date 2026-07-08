@@ -42,10 +42,27 @@ const (
 	RoleIngest = "ingest"
 )
 
-// WorkerJWTConfig holds the HMAC secret and expected issuer.
+// WorkerJWTConfig holds the HMAC secrets and expected issuer for
+// verifying worker JWTs. Supports two modes:
+//
+//  1. Legacy: a single Secret (no kid header in tokens).
+//  2. Keyring: ActiveKID + Keys map. Tokens with a kid header are
+//     verified against the matching key in Keys. Tokens without kid
+//     fall back to Secret (if set) or the active key (if only Keys).
 type WorkerJWTConfig struct {
+	// Secret is a single JWT signing secret.
+	// DEPRECATED: use Keys + ActiveKID instead.
 	Secret string
+	// Issuer is the expected `iss` claim. Empty = skip issuer check.
 	Issuer string
+	// ActiveKID is the key ID used for signing new tokens.
+	// Only needed by callers that sign tokens (mintIngressToken).
+	// Verification uses whichever kid the token carries.
+	ActiveKID string
+	// Keys maps kid → secret for verification. When set, tokens with
+	// a kid header are verified against the matching key; tokens
+	// without kid fall back to Secret.
+	Keys map[string]string
 }
 
 const (
@@ -58,6 +75,12 @@ const (
 
 // VerifyWorkerJWT parses and validates a HMAC-SHA256 JWT.
 //
+// Key selection (in priority order):
+//  1. If the token's `kid` header matches an entry in `cfg.Keys`, use that key.
+//  2. If `kid` is present but not in `cfg.Keys`, fall back to `cfg.Secret`.
+//  3. If `kid` is absent and `cfg.Secret` is set, use it (legacy compat).
+//  4. If `kid` is absent and only `cfg.Keys` is configured, try the active key.
+//
 // `exp` is required (jwt.WithExpirationRequired) so a token with no
 // expiration cannot be replayed indefinitely after JWT_SECRET rotation.
 // `iss` is enforced via jwt.WithIssuer(cfg.Issuer); the library skips
@@ -68,17 +91,12 @@ const (
 // leave it empty.
 func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, error) {
 	opts := []jwt.ParserOption{jwt.WithExpirationRequired()}
-	// Always call WithIssuer. The library short-circuits the iss check
-	// when the supplied issuer is empty (c.iss == ""), so the behavior
-	// is identical to the previous `if cfg.Issuer != ""` guard. The
-	// explicit call makes the intent visible and removes a layer of
-	// conditional indirection that the library handles internally.
 	opts = append(opts, jwt.WithIssuer(cfg.Issuer))
 	token, err := jwt.ParseWithClaims(tokenString, &WorkerClaims{}, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(cfg.Secret), nil
+		return cfg.resolveKey(token)
 	}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
@@ -88,6 +106,53 @@ func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, er
 		return nil, errors.New("invalid claims")
 	}
 	return claims, nil
+}
+
+// resolveKey selects the verification key for an incoming JWT.
+// Separate from VerifyWorkerJWT so ResolveSigningKey and this can
+// share the lookup logic without circular calls.
+func (cfg *WorkerJWTConfig) resolveKey(token *jwt.Token) ([]byte, error) {
+	// 1. kid header present and Keys configured.
+	if kid, ok := token.Header["kid"].(string); ok && kid != "" && len(cfg.Keys) > 0 {
+		if secret, ok := cfg.Keys[kid]; ok {
+			return []byte(secret), nil
+		}
+		// kid is in the token but not in our keyring. Fall through to
+		// Secret fallback so a token signed with a recently-removed key
+		// is still accepted during the transition window.
+	}
+
+	// 2. Legacy Secret fallback.
+	if cfg.Secret != "" {
+		return []byte(cfg.Secret), nil
+	}
+
+	// 3. Keyring configured, no Secret. Use the active key as default.
+	if len(cfg.Keys) > 0 && cfg.ActiveKID != "" {
+		if secret, ok := cfg.Keys[cfg.ActiveKID]; ok {
+			return []byte(secret), nil
+		}
+	}
+
+	return nil, errors.New("no matching signing key found")
+}
+
+// ResolveSigningKey returns the signing key bytes for the active key.
+// Used by mintIngressToken to choose which key signs new tokens.
+// Priority: cfg.Keys[cfg.ActiveKID] → []byte(cfg.Secret).
+func (cfg WorkerJWTConfig) ResolveSigningKey() ([]byte, error) {
+	// Prefer keyring with active KID.
+	if len(cfg.Keys) > 0 && cfg.ActiveKID != "" {
+		if secret, ok := cfg.Keys[cfg.ActiveKID]; ok {
+			return []byte(secret), nil
+		}
+		return nil, fmt.Errorf("active_kid %q not found in keys", cfg.ActiveKID)
+	}
+	// Fallback to legacy Secret.
+	if cfg.Secret != "" {
+		return []byte(cfg.Secret), nil
+	}
+	return nil, errors.New("no signing key configured: set jwt.secret or jwt.keys")
 }
 
 // WorkerAuth returns a middleware that verifies Bearer JWT on the request.

@@ -12,10 +12,12 @@ use wasmtime::component::InstancePre;
 
 use crate::config::Config;
 use crate::detect::{detect_execution_model, ExecutionModel};
-use crate::dispatch::{HandlerConfig, HandlerDispatch};
+use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
-use crate::messages::{AppSpec, AppStatus, HeartbeatMessage, TaskMessage};
+use crate::messages::{
+    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
+};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -160,10 +162,21 @@ impl Supervisor {
             self.stop_app(tenant_id, app_name).await?;
         }
 
-        // Acquire a port.
+        // Acquire an HTTP port.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
             pool.acquire().expect("port pool exhausted")
+        };
+
+        // Acquire a WebSocket port if the spec requests one via the
+        // EDGE_WS_PORT env var. The guest is expected to listen on this
+        // port via wasi:sockets for WebSocket upgrade traffic (issue #312).
+        let wants_ws = spec.env.contains_key("EDGE_WS_PORT");
+        let ws_port = if wants_ws {
+            let mut pool = self.port_pool.lock().await;
+            Some(pool.acquire().expect("port pool exhausted"))
+        } else {
+            None
         };
 
         // Download artifact (blocking on first request).
@@ -179,6 +192,9 @@ impl Supervisor {
             Err(e) => {
                 let mut pool = self.port_pool.lock().await;
                 pool.release(raw_port);
+                if let Some(ws) = ws_port {
+                    pool.release(ws);
+                }
                 return Err(e);
             }
         };
@@ -256,6 +272,11 @@ impl Supervisor {
         // consumes.
         let mut env = spec.env.clone();
         env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
+        // Replace the EDGE_WS_PORT sentinel ("0") with the actual allocated port
+        // so the guest sees the real port number in its environment.
+        if let Some(ws) = ws_port {
+            env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
+        }
 
         // EgressPolicy from the spec.allowlist. None / empty → allow-all.
         // Spec carries Vec<String>:
@@ -274,6 +295,12 @@ impl Supervisor {
             tenant_id: tenant_id.to_string(),
             deployment_id: spec.deployment_id.clone(),
         };
+
+        // Shared metrics accumulator — guest edge:observe metric calls
+        // write into this, and build_heartbeat snapshots it every 30s.
+        let metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>> = Some(
+            Arc::new(edge_runtime::interfaces::observe::MetricsAccumulator::new()),
+        );
 
         // Own tenant_id before the spawn — `start_app` borrows it as &str,
         // but the tokio::spawn future must be 'static, so we move an owned
@@ -314,14 +341,18 @@ impl Supervisor {
                     meter: meter.clone(),
                     env: env.clone(),
                     max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                    metrics_acc: metrics_acc.clone(),
                 };
 
+                let tls_config =
+                    try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
                 let dispatch = HandlerDispatch::new(
                     instance_pre.clone(),
                     raw_port,
                     self.config.handler_request_budget_ms,
                     self.config.epoch_tick_ms,
                     handler_config,
+                    tls_config,
                 )?;
 
                 let dispatch = Arc::new(dispatch);
@@ -372,6 +403,7 @@ impl Supervisor {
                 let downloader_clone = self.downloader.clone();
                 let log_forwarder = self.log_forwarder.clone();
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                let metrics_acc_for_loop = metrics_acc.clone();
 
                 let handle = tokio::spawn(async move {
                     Self::run_app_loop(
@@ -388,6 +420,7 @@ impl Supervisor {
                         allowlist,
                         downloader_clone,
                         log_forwarder,
+                        metrics_acc_for_loop,
                     )
                     .await;
                     tracing::info!(app_name = %app_name_str, "app task exited");
@@ -414,6 +447,8 @@ impl Supervisor {
             ticker: Some(ticker),
             execution_model,
             dispatch,
+            metrics_acc,
+            ws_port,
         }));
 
         self.state.write().await.apps.insert(
@@ -574,6 +609,7 @@ impl Supervisor {
         allowlist: Option<Vec<String>>,
         downloader: Arc<Downloader>,
         log_forwarder: Arc<LogForwarder>,
+        metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -615,6 +651,7 @@ impl Supervisor {
                         allowlist.clone(),
                         &app_name,
                         &log_forwarder,
+                        metrics_acc.clone(),
                     ),
                 ) => {
                     match result {
@@ -758,6 +795,7 @@ impl Supervisor {
         allowlist: Option<Vec<String>>,
         app_name: &str,
         log_forwarder: &Arc<LogForwarder>,
+        metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -787,6 +825,7 @@ impl Supervisor {
             egress,
             log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
             app_ctx,
+            metrics_acc,
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed
@@ -861,6 +900,48 @@ impl Supervisor {
                 AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
             };
             let snap = inst.meter.snapshot();
+
+            // Snapshot the app's MetricsAccumulator (guest edge:observe
+            // metric calls) if one was wired. The three metric kinds
+            // map to MetricKind::Counter, Gauge, and HistogramSample
+            // respectively — matching the heartbeat wire format in
+            // edge-worker/src/messages.rs.
+            let metrics = if let Some(ref acc) = inst.metrics_acc {
+                let msnap = acc.snapshot();
+                let mut samples = Vec::with_capacity(
+                    msnap.counters.len() + msnap.gauges.len() + msnap.histograms.len(),
+                );
+                for c in msnap.counters {
+                    samples.push(MetricSample {
+                        name: c.name,
+                        kind: MetricKind::Counter,
+                        value: c.value as f64,
+                        labels: c.labels,
+                    });
+                }
+                for g in msnap.gauges {
+                    samples.push(MetricSample {
+                        name: g.name,
+                        kind: MetricKind::Gauge,
+                        value: g.value,
+                        labels: g.labels,
+                    });
+                }
+                for (name, entries) in msnap.histograms {
+                    for (value, labels) in entries {
+                        samples.push(MetricSample {
+                            name: name.clone(),
+                            kind: MetricKind::HistogramSample,
+                            value,
+                            labels,
+                        });
+                    }
+                }
+                samples
+            } else {
+                vec![]
+            };
+
             msg.apps.insert(
                 app_name.clone(),
                 AppStatus {
@@ -869,12 +950,21 @@ impl Supervisor {
                     exit_code,
                     request_count: snap.request_count,
                     outbound_bytes: snap.outbound_bytes,
-                    observer_metrics: Vec::new(),
+                    observer_metrics: metrics,
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
+                    ws_port: inst.ws_port,
                 },
             );
         }
+
+        // Populate cluster headroom for the autoscaler (issue #85).
+        let free_slots = self.port_pool.lock().await.free_slots();
+        msg.cluster_headroom = Some(ClusterHeadroom {
+            cpu_pct: None,
+            mem_pct: None,
+            app_slots: free_slots,
+        });
 
         msg
     }

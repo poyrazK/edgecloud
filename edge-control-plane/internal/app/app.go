@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -31,17 +32,17 @@ type App struct {
 	// Handler is the complete http.Handler with all middleware and routes applied.
 	Handler http.Handler
 
-	// Region, JWTSecret, JWTIssuer, and ArtifactPath are exposed so
-	// main.go can mint the ingress service token at startup.
-	Region       string
-	JWTSecret    string
-	JWTIssuer    string
-	ArtifactPath string
+	// Region, WorkerJWTConfig, and ArtifactPath are exposed so main.go
+	// can mint the ingress service token at startup.
+	Region          string
+	WorkerJWTConfig middleware.WorkerJWTConfig
+	ArtifactPath    string
 
 	// Background service references. RunBackground starts all three.
 	WorkerSvc    *service.WorkerService
 	ReconcileSvc *service.ReconcileService
 	LogGC        *service.LogGCService
+	WorkerGC     *service.WorkerGCService
 	AutoscaleSvc *autoscale.Service
 }
 
@@ -83,7 +84,7 @@ func New(
 	envSvc := service.NewEnvService(appEnvRepo)
 	metricsAgg := service.NewMetricsAggregator()
 	workerSvc := service.NewWorkerService(
-		workerRepo, quotaRepo, activeDeploymentRepo,
+		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 	)
 	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
@@ -101,6 +102,31 @@ func New(
 	reconcileSvc := service.NewReconcileService(
 		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
 	)
+
+	// Wire secrets encryption (if configured). Supports both legacy
+	// (secrets_master_key) and keyring (secrets.active_key_id + keys) config.
+	var secretsEnc *service.SecretEncryptor
+	var encErr error
+	if cfg.Secrets.ActiveKeyID != "" {
+		secretsEnc, encErr = service.NewSecretEncryptorFromConfig(cfg.Secrets.ActiveKeyID, cfg.Secrets.Keys)
+	} else if cfg.SecretsMasterKey != "" {
+		secretsEnc, encErr = service.NewSecretEncryptorFromLegacy(cfg.SecretsMasterKey)
+	}
+	if encErr != nil {
+		log.Fatalf("failed to create secrets encryptor: %v", encErr)
+	}
+	if secretsEnc != nil {
+		envSvc.SetSecretEncryptor(secretsEnc)
+		deploymentSvc.SetEnvService(envSvc)
+		trafficSvc.SetEnvDecrypter(secretsEnc)
+		reconcileSvc.SetEnvDecrypter(secretsEnc)
+	}
+
+	webhookRepo := repository.NewWebhookRepository(db)
+	webhookSvc := service.NewWebhookService(webhookRepo)
+	deploymentSvc.SetWebhookService(webhookSvc)
+	webhookHandler := handler.NewWebhookHandler(webhookSvc)
+
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
@@ -129,6 +155,10 @@ func New(
 	}
 
 	// ── Handlers ──────────────────────────────────────────────────
+	auditRepo := repository.NewAuditRepository(db)
+	auditor := service.NewAuditor(auditRepo)
+	handler.DefaultAuditor = auditor
+
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
@@ -137,7 +167,7 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -156,8 +186,10 @@ func New(
 	// Tenant rate limiter: applied after auth on all /api/v1/* routes.
 	// Zero-value configs use defaults set in config.Load().
 	tenantLimiter := middleware.NewRateLimiter(cfg.RateLimit.TenantRate, cfg.RateLimit.TenantBurst)
-	// IP rate limiter: applied on unauthenticated public endpoints.
-	ipLimiter := middleware.NewRateLimiter(cfg.RateLimit.IPRate, cfg.RateLimit.IPBurst)
+	// Bootstrap rate limiter: tight limit for self-signup abuse prevention.
+	bootstrapLimiter := middleware.NewRateLimiter(2, 5)
+	// Tenant creation limiter: per-IP cap (10 per hour) to prevent DB fill.
+	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -166,12 +198,29 @@ func New(
 	// internal operator access only. Do not expose this path on the public LB.
 	mux.HandleFunc("GET /metrics", metricsHandler.GetAllMetrics)
 
-	// Health check
+	// Health check — pings the database (and optionally NATS) so load
+	// balancers and orchestrators stop routing traffic to a control plane
+	// instance with a dead database connection (issue #142).
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(`{"status":"ok"}`)); err != nil {
-			log.Printf("Health check: failed to write response: %v", err)
+		if err := db.PingContext(r.Context()); err != nil {
+			log.Printf("Health check: DB ping failed: %v", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+			return
 		}
+		// Optional NATS connectivity check. A NATS outage doesn't kill
+		// the API server (it still serves reads), but surfacing it in
+		// the health check gives operators an early signal.
+		if nc := publisher.Conn(); nc != nil {
+			if err := nc.FlushTimeout(2 * time.Second); err != nil {
+				log.Printf("Health check: NATS ping failed: %v", err)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
 	// OpenAPI spec — served as raw YAML
@@ -214,8 +263,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	})
 
 	// Public endpoints (no auth required) — IP rate limited
-	mux.Handle("POST /api/v1/tenants", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(tenantHandler.Bootstrap)))
-	mux.Handle("POST /api/v1/keys", ipLimiter.Middleware(middleware.ClientIP)(http.HandlerFunc(apiKeyHandler.Create)))
+	mux.Handle("POST /api/v1/tenants",
+		handler.DefaultTenantCreationLimiter.Middleware(
+			bootstrapLimiter.Middleware(middleware.ClientIP)(
+				http.HandlerFunc(tenantHandler.Bootstrap)),
+		))
 
 	// Deprecated: redirect old /api/... paths to /api/v1/... for clients still
 	// on the old contract. Workers use /api/internal/... (unversioned).
@@ -231,10 +283,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("POST /api/tenants", redirectTo("/api/v1/tenants"))
 	mux.HandleFunc("GET /api/keys", redirectTo("/api/v1/keys"))
+	mux.HandleFunc("POST /api/keys", redirectTo("/api/v1/keys"))
 	mux.HandleFunc("DELETE /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
+	mux.HandleFunc("PUT /api/keys/{keyID}", redirectTo("/api/v1/keys/"+"{keyID}"))
 	mux.HandleFunc("GET /api/apps", redirectTo("/api/v1/apps"))
 	mux.HandleFunc("GET /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("POST /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
+	mux.HandleFunc("PUT /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("DELETE /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/apps/{appName}/active", redirectTo("/api/v1/apps/"+"{appName}/active"))
 	mux.HandleFunc("GET /api/apps/{appName}/ingress", redirectTo("/api/v1/apps/"+"{appName}/ingress"))
@@ -261,9 +316,6 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("DELETE /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
-	mux.HandleFunc("GET /api/internal/download/{deploymentID}", redirectTo("/api/internal/download/"+"{deploymentID}"))
-	mux.HandleFunc("POST /api/internal/workers", redirectTo("/api/internal/workers"))
-	mux.HandleFunc("GET /api/internal/workers", redirectTo("/api/internal/workers"))
 
 	// Protected API routes
 	api := http.NewServeMux()
@@ -274,6 +326,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/list/{appName}", deploymentHandler.List)
 	api.HandleFunc("POST /api/v1/apps/{appName}/activate/{deploymentID}", deploymentHandler.Activate)
 	api.HandleFunc("POST /api/v1/apps/{appName}/rollback", deploymentHandler.Rollback)
+	api.HandleFunc("POST /api/v1/apps/{appName}/promote/{deploymentID}", deploymentHandler.Promote)
 	api.HandleFunc("GET /api/v1/apps/{appName}/active", deploymentHandler.GetActive)
 	api.HandleFunc("GET /api/v1/apps/{appName}/status", workerStatusHandler.Get)
 	api.HandleFunc("GET /api/v1/auth/whoami", authHandler.Whoami)
@@ -284,12 +337,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
+	api.HandleFunc("PUT /api/v1/apps/{appName}", appHandler.Update)
 	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
 	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
 	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
+	api.HandleFunc("PUT /api/v1/keys/{keyID}", apiKeyHandler.Update)
 	api.HandleFunc("DELETE /api/v1/keys/{keyID}", apiKeyHandler.Delete)
+	api.HandleFunc("POST /api/v1/keys/{keyID}/rotate", apiKeyHandler.Rotate)
 	api.HandleFunc("GET /api/v1/egress", egressHandler.Get)
 	api.HandleFunc("PUT /api/v1/egress", egressHandler.Update)
 	api.HandleFunc("GET /api/v1/apps/{appName}/logs", logHandler.List)
@@ -299,6 +355,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains", domainHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Get)
 	api.HandleFunc("DELETE /api/v1/apps/{appName}/domains/{fqdn}", domainHandler.Remove)
+
+	// Webhook CRUD routes
+	api.HandleFunc("POST /api/v1/webhooks", webhookHandler.Create)
+	api.HandleFunc("GET /api/v1/webhooks", webhookHandler.List)
+	api.HandleFunc("PUT /api/v1/webhooks/{webhookID}", webhookHandler.Update)
+	api.HandleFunc("DELETE /api/v1/webhooks/{webhookID}", webhookHandler.Delete)
 
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
@@ -329,6 +391,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
 	})
 
+	// Secrets admin endpoints (X-Internal-Token auth).
+	secretsHandler := handler.NewSecretsAdminHandler(secretsEnc, envSvc)
+	mux.HandleFunc("GET /api/v1/admin/secrets/keys", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(secretsHandler.ListKeys)).ServeHTTP(w, r)
+	})
+	mux.HandleFunc("POST /api/v1/admin/secrets/re-encrypt", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(secretsHandler.ReEncrypt)).ServeHTTP(w, r)
+	})
+
 	// Internal endpoints (worker-facing, JWT auth).
 	internalMux := http.NewServeMux()
 	internalMux.HandleFunc("GET /api/internal/download/{deploymentID}", internalHandler.Download)
@@ -349,8 +420,10 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)(http.HandlerFunc(internalHandler.UpdateDomainStatus)))
 
 	workerJWTConfig := middleware.WorkerJWTConfig{
-		Secret: cfg.JWT.Secret,
-		Issuer: cfg.JWT.Issuer,
+		Secret:    cfg.JWT.Secret,
+		Issuer:    cfg.JWT.Issuer,
+		ActiveKID: cfg.JWT.ActiveKID,
+		Keys:      cfg.JWT.Keys,
 	}
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT OR an X-Internal-Token header.
@@ -367,15 +440,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)
 
 	return &App{
-		Handler:      wrappedHandler,
-		Region:       cfg.Region,
-		JWTSecret:    cfg.JWT.Secret,
-		JWTIssuer:    cfg.JWT.Issuer,
-		ArtifactPath: cfg.Storage.ArtifactPath,
-		WorkerSvc:    workerSvc,
-		ReconcileSvc: reconcileSvc,
-		LogGC:        service.NewLogGCService(logEntryRepo),
-		AutoscaleSvc: autoscaleSvc,
+		Handler:         wrappedHandler,
+		Region:          cfg.Region,
+		WorkerJWTConfig: workerJWTConfig,
+		ArtifactPath:    cfg.Storage.ArtifactPath,
+		WorkerSvc:       workerSvc,
+		ReconcileSvc:    reconcileSvc,
+		LogGC:           service.NewLogGCService(logEntryRepo),
+		WorkerGC:        service.NewWorkerGCService(workerRepo),
+		AutoscaleSvc:    autoscaleSvc,
 	}
 }
 
@@ -397,6 +470,11 @@ func (a *App) RunBackground(ctx context.Context) {
 	// Periodic full-state reconcile (issue #53). Tunable via RECONCILE_INTERVAL.
 	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
 	go a.ReconcileSvc.Run(ctx, reconcileInterval)
+
+	// Stale worker GC. Tunable via env (WORKER_GC_INTERVAL, WORKER_MAX_AGE).
+	workerGCInterval := parseDurationEnv("WORKER_GC_INTERVAL", 5*time.Minute)
+	workerMaxAge := parseDurationEnv("WORKER_MAX_AGE", 15*time.Minute)
+	go a.WorkerGC.Run(ctx, workerGCInterval, workerMaxAge)
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately.

@@ -1,3 +1,4 @@
+-- +migrate Down
 -- Reverse of 011_domains_cascade.up.sql. Drops the cascading FK
 -- constraint; the orphan-on-delete behaviour returns.
 

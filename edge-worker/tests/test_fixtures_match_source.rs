@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 const EXPECTED_HANDLER_HASH: &str =
-    "bdfa0c7c85511da95427c44d5db627863b765d92b735958000600c9a4448a05a";
+    "3841fd5e654adbb784c7db600aecb09accb41072efc09e50e85f1968927ecc44";
 
 fn sha256_hex(bytes: &[u8]) -> String {
     // Production SHA-256 via the `sha2` crate (already a regular

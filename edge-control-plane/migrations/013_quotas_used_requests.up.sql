@@ -1,3 +1,4 @@
+-- +migrate Up
 -- 013_quotas_used_requests.up.sql
 -- Adds per-tenant request-count metering to the quotas table.
 -- `used_request_count` reuses the existing `quota_period_start` (added by 009)
@@ -7,11 +8,9 @@
 --
 -- Plan→cap values mirror internal/domain/plans.go:31-55. Keep both files in
 -- sync when adding new tiers or adjusting caps.
-BEGIN;
-
 ALTER TABLE quotas
-    ADD COLUMN max_requests_per_month INT   NOT NULL DEFAULT 100000,
-    ADD COLUMN used_request_count     BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS max_requests_per_month INT   NOT NULL DEFAULT 100000,
+    ADD COLUMN IF NOT EXISTS used_request_count     BIGINT NOT NULL DEFAULT 0;
 
 -- Backfill existing rows from tenants.plan so paid-tier tenants don't
 -- silently drop to free-tier caps after this migration. Unrecognized
@@ -27,5 +26,3 @@ UPDATE quotas q
    END
   FROM tenants t
  WHERE q.tenant_id = t.id;
-
-COMMIT;

@@ -698,6 +698,7 @@ mod tests {
 
         let signer = crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test",
@@ -735,6 +736,7 @@ mod tests {
     fn test_signer() -> std::sync::Arc<crate::auth::WorkerJwtSigner> {
         crate::auth::WorkerJwtSigner::new(
             b"test-secret".to_vec(),
+            None,
             "edgecloud",
             "w_test",
             "test",

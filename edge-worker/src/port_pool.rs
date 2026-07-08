@@ -70,6 +70,14 @@ impl PortPool {
         None
     }
 
+    /// Number of immediately allocatable ports (the autoscaler's capacity
+    /// signal). Does not count the sequential fallback range — when
+    /// `available` drops to zero, the worker is effectively at capacity.
+    pub fn free_slots(&mut self) -> u32 {
+        self.reap_cooled_ports();
+        self.available.len() as u32
+    }
+
     /// Release a port back into cooldown.
     /// Guard against double-release: if the port is already cooling down, this
     /// is a no-op.

@@ -1,3 +1,4 @@
+-- +migrate Down
 DROP TABLE IF EXISTS worker_status;
 DROP TABLE IF EXISTS workers;
 DROP TABLE IF EXISTS app_env;

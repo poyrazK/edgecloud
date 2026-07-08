@@ -53,9 +53,9 @@ func main() {
 	if err := publisher.EnsureStream(nats.StreamConfig{
 		Name:      nats.TaskStreamName,
 		Subjects:  []string{"edgecloud.tasks.>"},
-		Retention: natsio.WorkQueuePolicy,
+		Retention: natsio.InterestPolicy,
 		MaxAge:    24 * time.Hour,
-		Replicas:  3,
+		Replicas:  cfg.NATS.Replicas,
 	}); err != nil {
 		log.Fatalf("Failed to ensure NATS stream: %v", err)
 	}
@@ -71,7 +71,7 @@ func main() {
 	// ── Ingress Service Token ─────────────────────────────────────
 	region := os.Getenv("APP_REGION")
 	if region != "" {
-		tok, err := mintIngressToken(application.JWTSecret, application.JWTIssuer, region)
+		tok, err := mintIngressToken(application.WorkerJWTConfig, region)
 		if err != nil {
 			log.Fatalf("failed to mint ingress token: %v", err)
 		}

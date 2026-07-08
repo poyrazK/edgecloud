@@ -129,7 +129,7 @@ func (s *FSArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 	if err != nil {
 		return fmt.Errorf("creating artifact temp file: %w", err)
 	}
-cleanup := func() { _ = os.Remove(tmp) }
+	cleanup := func() { _ = os.Remove(tmp) }
 
 	if _, err := io.Copy(f, r); err != nil {
 		_ = f.Close()

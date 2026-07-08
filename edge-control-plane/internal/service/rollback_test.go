@@ -14,7 +14,9 @@ type mockRollbackDeploymentRepo struct {
 	deleteByIDFn func(ctx context.Context, id string) error
 }
 
-func (m *mockRollbackDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error { return nil }
+func (m *mockRollbackDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
+	return nil
+}
 func (m *mockRollbackDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
 	return m.deleteByIDFn(ctx, id)
 }
@@ -69,7 +71,9 @@ func TestRollbackArtifactSave_StoreDeleteNotFoundOk(t *testing.T) {
 func TestRollbackArtifactSave_StoreDeleteOtherErrorLogged(t *testing.T) {
 	saveErr := errors.New("crash")
 	repo := &mockRollbackDeploymentRepo{deleteByIDFn: func(ctx context.Context, id string) error { return nil }}
-	store := &mockRollbackArtifactStore{deleteFn: func(ctx context.Context, tenantID, appName, deploymentID string) error { return errors.New("permission denied") }}
+	store := &mockRollbackArtifactStore{deleteFn: func(ctx context.Context, tenantID, appName, deploymentID string) error {
+		return errors.New("permission denied")
+	}}
 
 	got := rollbackArtifactSave(context.Background(), repo, store, "t_1", "hello", "d_1", saveErr)
 	if !errors.Is(got, saveErr) {

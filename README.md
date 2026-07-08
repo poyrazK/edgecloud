@@ -81,7 +81,85 @@ cargo test --workspace                             # Rust unit tests
 
 Integration tests self-skip without Docker — see [CLAUDE.md](./CLAUDE.md#build--test) for flags.
 
-## Docs
+## Local Development
+
+### Prerequisites
+
+- Docker (for Postgres and NATS via `docker compose`)
+- Rust nightly (via `rustup`)
+- Go 1.23+
+- A Caddy binary on `$PATH` (for the ingress)
+
+### Quick start (four terminals)
+
+**Terminal 1 — Infrastructure:**
+```sh
+make infra-up      # Postgres :5432 + NATS :4222 in the background
+```
+
+**Terminal 2 — Database schema:**
+```sh
+make migrate       # apply all pending schema migrations
+```
+
+**Terminal 3 — Control plane:**
+```sh
+make run-api       # starts the Go API on :8080
+```
+
+**Terminal 4 — Worker + Ingress:**
+```sh
+# Worker: env var values must match what the control plane expects.
+#   - WORKER_ID     e.g. w_fra_dev
+#   - REGION        must match the control plane's CONTROL_PLANE_REGION (default: "global")
+#   - WORKER_TENANT_ID   the tenant whose apps this worker hosts
+#   - WORKER_JWT_SECRET  must match JWT_SECRET from edge-control-plane/config.yaml
+export REGION=global WORKER_ID=w_global_dev \
+  WORKER_TENANT_ID=t_system \
+  WORKER_JWT_SECRET=change-me-in-production \
+  CONTROL_PLANE_URL=http://localhost:8080
+make run-worker    # starts edge-worker
+
+# Ingress (separate terminal):
+cargo run --bin edge-ingress
+```
+
+### Seeding test data
+
+Once the stack is running (`docker compose`, `migrate`, `api`), register a test tenant and deploy an app:
+
+```sh
+# Sign up a tenant
+edge auth signup --plan free
+
+# Create an app
+cd /tmp && mkdir myapp && cd myapp
+cargo init --lib
+# Write your WASI component, then:
+edge deploy
+```
+
+### Makefile targets
+
+| Target | Description |
+|---|---|
+| `make infra-up` | Start Postgres + NATS containers |
+| `make infra-reset` | Wipe volumes, restart, re-migrate |
+| `make migrate` | Run pending DB migrations |
+| `make run-api` | Start the Go control plane |
+| `make run-worker` | Start the Rust worker (set env vars first) |
+| `make help` | Show all targets |
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| worker heartbeats fail with FK error | Worker not registered — auto-registration was added in PR #284, make sure you're on latest `main` |
+| control plane logs DB connection errors | Postgres not yet ready after `docker compose up -d` — wait, then retry |
+| `TASK_STREAM_REPLICAS` error | Non-clustered NATS needs `TASK_STREAM_REPLICAS=1` (see PR #268) |
+| Caddy fails to read TLS cert | When running in Docker, cert paths must be container-accessible (issue #281) |
+
+## Doc / Business
 
 | File | Role |
 |---|---|

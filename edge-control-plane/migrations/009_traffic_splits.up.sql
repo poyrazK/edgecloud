@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add `app_traffic_splits` table for issue #84 (canary/blue-green deploys).
 -- Stores one row per (app, deployment, weight). Sum of weights per app = 100.
 -- The primary deployment (weight=100) is also recorded here when using
@@ -6,7 +7,7 @@
 -- The ingress fetches this table via GET /api/v1/apps/{appName}/traffic
 -- to render weighted Caddy upstreams.
 
-CREATE TABLE app_traffic_splits (
+CREATE TABLE IF NOT EXISTS app_traffic_splits (
     tenant_id       TEXT NOT NULL,
     app_name        TEXT NOT NULL,
     deployment_id   TEXT NOT NULL REFERENCES deployments(id),
@@ -17,4 +18,4 @@ CREATE TABLE app_traffic_splits (
 
 -- Index for fetching all splits for a given app (used by GET /traffic and
 -- by the ingress on startup and after each Caddy reload).
-CREATE INDEX idx_ats_tenant_app ON app_traffic_splits(tenant_id, app_name);
+CREATE INDEX IF NOT EXISTS idx_ats_tenant_app ON app_traffic_splits(tenant_id, app_name);

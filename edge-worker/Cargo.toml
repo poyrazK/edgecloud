@@ -24,6 +24,7 @@ bytes = "1.0"
 futures = "0.3"
 chrono = "0.4"
 edge-runtime = { path = "../edge-runtime" }
+edge-spool = { path = "../edge-spool" }
 wasmtime = { version = "=45.0.3", features = ["component-model", "async", "anyhow"] }
 # `ProxyPre<RuntimeState>` for Handler (FaaS) components — see
 # `src/dispatch.rs`. Pairs with `wasmtime-wasi-http` in edge-runtime.
@@ -46,13 +47,20 @@ http-body-util = "0.1"
 # types come from hyper directly, so we need a direct dep. Pulled with
 # `client` because wasmtime-wasi-http's default_send_request depends on the
 # hyper client internals.
-hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+
+# TLS support for HandlerDispatch FaaS endpoint (issue #209).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
+# Generate self-signed TLS certs for the try_load_tls_config test (issue #209).
+rcgen = { version = "0.13", features = ["pem"] }
 # Shared test harness: NATS container startup, skip predicate, and
 # Supervisor wiring (formerly duplicated across integration_tests.rs,
 # ingress_wire_integration.rs, and edge-ingress/tests/integration.rs).

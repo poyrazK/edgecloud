@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add the `regions` column to `deployments` for issue #82 (multi-region
 -- deploys, v1). The column stores the list of regions a deployment is
 -- replicated to; the activate path loops over this list and publishes one
@@ -14,4 +15,4 @@
 -- cross-region deploys require either a shared artifact store or per-region
 -- control-plane federation; that work is tracked separately.
 
-ALTER TABLE deployments ADD COLUMN regions TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS regions TEXT[] NOT NULL DEFAULT '{}';

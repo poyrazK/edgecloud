@@ -192,6 +192,96 @@ mod tests {
         let cache = TrafficSplitCache::default();
         assert!(cache.known_apps().is_empty());
     }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_weights() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "splits": [
+                    {"deployment_id": "d1", "weight": 80},
+                    {"deployment_id": "d2", "weight": 20}
+                ]}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "app1", None).await;
+
+        match outcome {
+            FetchOutcome::Ok(weights) => {
+                assert_eq!(weights.get("d1"), Some(&80));
+                assert_eq!(weights.get("d2"), Some(&20));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_none_on_404() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/traffic/t1/no-such-app",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "no-such-app", None).await;
+
+        match outcome {
+            FetchOutcome::Transient(reason) => {
+                assert!(
+                    reason.contains("404"),
+                    "expected 404 in transient reason, got {reason}"
+                );
+            }
+            other => panic!("expected Transient(404), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_returns_unauthorized_on_401() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome = fetch_app_split(&http, &mock_server.uri(), "t1", "app1", None).await;
+
+        assert!(matches!(outcome, FetchOutcome::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn fetch_app_split_sends_internal_token_header() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .and(wiremock::matchers::header("X-Internal-Token", "s3cret"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "splits": [] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let outcome =
+            fetch_app_split(&http, &mock_server.uri(), "t1", "app1", Some("s3cret")).await;
+
+        assert!(matches!(outcome, FetchOutcome::Ok(_)));
+    }
 }
 
 /// Outcome of a single traffic-split fetch. The spawn_fetcher loop uses
@@ -298,6 +388,7 @@ pub fn spawn_fetcher(
     api_url: String,
     cache: SharedCache,
     internal_token: Option<String>,
+    table: Arc<crate::routing::RoutingTable>,
 ) {
     tokio::spawn(async move {
         let fetch_interval = Duration::from_secs(30);
@@ -305,11 +396,19 @@ pub fn spawn_fetcher(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Derive the app list from the routing table, not the cache.
+            // The cache starts empty and is only populated by this loop,
+            // so relying on cache.known_apps() creates a chicken-and-egg
+            // bug where no apps are ever fetched (issue #152).
             let apps: Vec<(String, String)> = {
-                let mut cache = cache.write().await;
-                cache.evict_stale();
-                cache.known_apps()
+                let snap = table.snapshot().await;
+                let mut seen = std::collections::HashSet::new();
+                for entry in snap {
+                    seen.insert((entry.tenant_id, entry.app_name));
+                }
+                seen.into_iter().collect()
             };
+            cache.write().await.evict_stale();
             let mut tick_unauthorized_logged = false;
             for (tenant_id, app_name) in apps {
                 let outcome = fetch_app_split(

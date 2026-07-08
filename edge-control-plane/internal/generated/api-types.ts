@@ -132,7 +132,13 @@ export interface paths {
         };
         /** Get a specific app */
         get: operations["getApp"];
-        put?: never;
+        /**
+         * Update mutable fields of an app
+         * @description Updates the mutable fields (currently only `description`) of
+         *     an existing app. Nullable fields: omit the field or send `null`
+         *     to leave it unchanged; send `""` to clear it.
+         */
+        put: operations["updateApp"];
         /** Create a new app */
         post: operations["createApp"];
         delete?: never;
@@ -223,6 +229,29 @@ export interface paths {
          *     weighted routing between multiple deployments.
          */
         post: operations["activateDeployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/apps/{appName}/promote/{deploymentID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Promote a preview deployment to production
+         * @description Activates a deployment under a different app name than it was
+         *     originally deployed under. Used to promote a preview deployment
+         *     (deployed under a suffixed name like `myapp--preview-abc123`) to
+         *     the real app name. The deployment must belong to the same tenant.
+         */
+        post: operations["promoteDeployment"];
         delete?: never;
         options?: never;
         head?: never;
@@ -484,10 +513,28 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /** Update an API key's name or role */
+        put: operations["updateAPIKey"];
         post?: never;
         /** Revoke an API key */
         delete: operations["deleteAPIKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/keys/{keyID}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate an API key (generate new key, expire old one) */
+        post: operations["rotateAPIKey"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -531,6 +578,42 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all webhooks for the authenticated tenant */
+        get: operations["listWebhooks"];
+        put?: never;
+        /** Create a new webhook subscription */
+        post: operations["createWebhook"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/webhooks/{webhookID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update a webhook subscription */
+        put: operations["updateWebhook"];
+        post?: never;
+        /** Delete a webhook subscription */
+        delete: operations["deleteWebhook"];
         options?: never;
         head?: never;
         patch?: never;
@@ -621,6 +704,40 @@ export interface paths {
         get: operations["listAutoscaleEvents"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/secrets/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List key IDs in the secrets keyring */
+        get: operations["listSecretsKeys"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/secrets/re-encrypt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Re-encrypt all env values with the active key */
+        post: operations["reEncryptSecrets"];
         delete?: never;
         options?: never;
         head?: never;
@@ -903,12 +1020,100 @@ export interface components {
              */
             created_at?: string;
         };
+        UpdateAPIKeyRequest: {
+            /**
+             * @description New name. Omit to leave unchanged.
+             * @example renamed-key
+             */
+            name?: string;
+            /**
+             * @description New role. Omit to leave unchanged. Valid roles: 'developer', 'owner', 'viewer'.
+             * @example viewer
+             */
+            role?: string;
+        };
+        CreateWebhookRequest: {
+            /**
+             * Format: uri
+             * @description HTTPS callback URL.
+             * @example https://hooks.example.com/deploy
+             */
+            url: string;
+            /**
+             * @description HMAC signing secret (min 16 chars).
+             * @example whsec_abc123def456
+             */
+            secret: string;
+            /**
+             * @description Event types that trigger this webhook.
+             * @example [
+             *       "deploy",
+             *       "activate"
+             *     ]
+             */
+            events: ("deploy" | "activate" | "rollback" | "auto_rollback")[];
+            /**
+             * @description Optional description.
+             * @example Production deploy notifications
+             */
+            description?: string;
+        };
+        Webhook: {
+            /** @example wh_abc123 */
+            id?: string;
+            /** @example t_abc123 */
+            tenant_id?: string;
+            /** @example https://hooks.example.com/deploy */
+            url?: string;
+            /**
+             * @example [
+             *       "deploy",
+             *       "activate"
+             *     ]
+             */
+            events?: string[];
+            /** @example Production deploy notifications */
+            description?: string;
+            /** @example true */
+            enabled?: boolean;
+            /**
+             * Format: date-time
+             * @example 2026-07-03T18:00:00Z
+             */
+            created_at?: string;
+        };
+        UpdateWebhookRequest: {
+            /**
+             * Format: uri
+             * @description HTTPS callback URL. Omit to leave unchanged.
+             */
+            url?: string;
+            /** @description New HMAC signing secret. Omit to leave unchanged. */
+            secret?: string;
+            /** @description Replace event types. Omit to leave unchanged. */
+            events?: string[];
+            /** @description Replace description. Omit to leave unchanged. */
+            description?: string;
+            /** @description Enable or disable. Omit to leave unchanged. */
+            enabled?: boolean;
+        };
+        WebhookListResponse: {
+            webhooks?: components["schemas"]["Webhook"][];
+        };
         CreateAppRequest: {
             /**
              * @description Optional human-readable description.
              * @example Main web app
              */
             description?: string;
+        };
+        UpdateAppRequest: {
+            /**
+             * @description New description. Send `null` or omit to leave unchanged.
+             *     Send `""` to clear the description.
+             * @example Updated description
+             */
+            description?: string | null;
         };
         App: {
             /** @example a_abc123 */
@@ -1779,6 +1984,37 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    updateApp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAppRequest"];
+            };
+        };
+        responses: {
+            /** @description App updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["App"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
     createApp: {
         parameters: {
             query?: never;
@@ -1923,6 +2159,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActivateResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    promoteDeployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Target app name for promotion. */
+                appName: string;
+                /** @description The deployment ID to promote (from a preview deploy). */
+                deploymentID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deployment promoted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example promoted */
+                        status?: string;
+                    };
                 };
             };
             401: components["responses"]["Unauthorized"];
@@ -2403,6 +2670,37 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    updateAPIKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The API key ID to update. */
+                keyID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAPIKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description API key updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIKeyInfo"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
     deleteAPIKey: {
         parameters: {
             query?: never;
@@ -2423,6 +2721,32 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    rotateAPIKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The API key ID to rotate. */
+                keyID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New API key created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateAPIKeyResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
         };
     };
@@ -2494,6 +2818,108 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+        };
+    };
+    listWebhooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of webhooks. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookListResponse"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateWebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Webhook"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                webhookID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWebhookRequest"];
+            };
+        };
+        responses: {
+            /** @description Webhook updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Webhook"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                webhookID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Webhook deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
         };
     };
     listTenants: {
@@ -2701,6 +3127,74 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             500: components["responses"]["InternalError"];
+        };
+    };
+    listSecretsKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Key IDs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        key_ids?: string[];
+                        active_key?: string;
+                        encryption_enabled?: boolean;
+                    };
+                };
+            };
+            /** @description Missing or invalid internal token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reEncryptSecrets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Re-encryption complete */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        re_encrypted?: number;
+                        status?: string;
+                    };
+                };
+            };
+            /** @description Encryption not configured */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Re-encryption failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listDomains: {

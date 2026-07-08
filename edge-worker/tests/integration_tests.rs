@@ -90,11 +90,15 @@ fn test_config(
         consumer_name: format!("test-{}", worker_id),
         worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     }
 }
 
@@ -165,10 +169,14 @@ impl TestHarness {
             queue_group: "test-pinning-group".to_string(),
             consumer_name: "test-consumer".to_string(),
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+            worker_jwt_kid: None,
             worker_jwt_issuer: "edgecloud".to_string(),
             worker_tenant_id: "t_test".to_string(),
             handler_request_budget_ms: 1000,
             handler_max_request_body_bytes: 10 * 1024 * 1024,
+            task_stream_replicas: 1,
+            tls_cert_path: None,
+            tls_key_path: None,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -361,11 +369,15 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         queue_group: "test-heartbeat-group".to_string(),
         consumer_name: "test-heartbeat-consumer".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
         worker_sync_threshold_secs: 60,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -817,10 +829,14 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         queue_group: queue_group.to_string(),
         consumer_name: "consumer-a".to_string(),
         worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -842,10 +858,14 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         queue_group: queue_group.to_string(),
         consumer_name: "consumer-b".to_string(),
         worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1636,14 +1656,17 @@ async fn build_supervisor_only_with_cp(
         queue_group: "test-sync-group".to_string(),
         consumer_name: "test-sync-consumer".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
+        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: tenant_id.to_string(),
         handler_request_budget_ms: 1000,
         handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
     };
 
     let guard = build_supervisor_with(config).await;
-    // Discard the guard's container handle — `supervisor` is a clone
     // of the Arc inside the guard; the guard holds the container
     // alive for as long as it's in scope. Once this function returns
     // the caller owns the supervisor but NOT the guard; that means

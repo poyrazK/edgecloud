@@ -69,28 +69,33 @@ pub trait NatsClient: Send + Sync + 'static {
 /// Production NATS client wrapping async-nats with JetStream support.
 pub struct NatsClientImpl {
     client: async_nats::Client,
+    task_stream_replicas: usize,
 }
 
 impl NatsClientImpl {
     /// Connect to a NATS server.
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+    pub async fn connect(url: &str, task_stream_replicas: usize) -> anyhow::Result<Self> {
         let client = async_nats::connect(url).await?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            task_stream_replicas,
+        })
     }
 
     /// Idempotently create the tasks stream if it does not exist.
     ///
-    /// Matches the whitepaper §8.4 contract: workqueue retention, 24h max
+    /// Matches the whitepaper §8.4 contract: interest retention (allows
+    /// per-region consumers with different filter subjects), 24h max
     /// age, replication factor 3. Safe to call from both the worker and
     /// the control plane.
-    pub async fn ensure_task_stream(&self) -> anyhow::Result<()> {
+    pub async fn ensure_task_stream(&self, replicas: usize) -> anyhow::Result<()> {
         let js = jetstream::new(self.client.clone());
         js.get_or_create_stream(StreamConfig {
             name: TASK_STREAM.to_string(),
             subjects: vec![TASK_SUBJECT_WILDCARD.to_string()],
-            retention: RetentionPolicy::WorkQueue,
+            retention: RetentionPolicy::Interest,
             max_age: Duration::from_secs(24 * 60 * 60),
-            num_replicas: 3,
+            num_replicas: replicas,
             ..Default::default()
         })
         .await
@@ -110,7 +115,7 @@ impl NatsClient for NatsClientImpl {
     ) -> anyhow::Result<TaskMessageStream> {
         // Idempotent — works whether or not the control plane already
         // created the stream.
-        self.ensure_task_stream().await?;
+        self.ensure_task_stream(self.task_stream_replicas).await?;
         let js = jetstream::new(self.client.clone());
         let stream = js
             .get_stream(TASK_STREAM)
@@ -123,19 +128,15 @@ impl NatsClient for NatsClientImpl {
         // queue-group name — NATS load-balances messages across consumers
         // in the same group, preventing duplicate app starts across
         // workers in the same region (issue #86).
+        let deliver_subject = format!("_INBOX.task.{}", consumer_name);
         let config = PushConsumerConfig {
             name: Some(consumer_name.to_string()),
             durable_name: Some(consumer_name.to_string()),
+            deliver_subject,
             deliver_group: Some(queue_group.to_string()),
             ack_policy: jetstream::consumer::AckPolicy::Explicit,
             deliver_policy: jetstream::consumer::DeliverPolicy::All,
             filter_subject: format!("edgecloud.tasks.{}", region),
-            // Bound re-deliveries so a persistently-failing message can't
-            // dead-letter the whole consumer. After this many redeliveries
-            // the server stops sending the message and the worker is
-            // expected to `term()` it. Set high enough that transient
-            // failures (e.g., slow artifact download) have room to recover
-            // before the consumer stalls.
             max_deliver: 20,
             ..Default::default()
         };

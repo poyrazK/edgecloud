@@ -30,6 +30,8 @@ type DeploymentHandler struct {
 	// contract lets tests stub the activate path without the full service
 	// surface. Concrete *service.DeploymentService satisfies it.
 	activateSvc deploymentActivator
+	// promoteSvc is the narrow contract for the Promote handler.
+	promoteSvc deploymentPromoter
 }
 
 // deploymentRollbacker is the narrow contract the Rollback handler needs.
@@ -45,6 +47,13 @@ type deploymentActivator interface {
 	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
 }
 
+// deploymentPromoter is the narrow contract the Promote handler needs.
+// PromoteDeployment activates a deployment under a different app name
+// than it was originally deployed under (preview → production).
+type deploymentPromoter interface {
+	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
+}
+
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
@@ -56,6 +65,7 @@ func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc se
 		// activateSvc.
 		rollbackSvc: deploymentSvc,
 		activateSvc: deploymentSvc,
+		promoteSvc:  deploymentSvc,
 	}
 }
 
@@ -174,6 +184,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Deploy: failed to encode response: %v", err)
 	}
+	auditRecord(r, "deploy", "deployment", deployment.ID, "deployment "+deployment.ID+" created for app "+appName, "success")
 }
 
 // parseRegions turns the `?regions=` query value into a deduped slice.
@@ -375,6 +386,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
 			log.Printf("Activate: failed to encode response: %v", err)
 		}
+		auditRecord(r, "activate", "deployment", deploymentID, "deployment "+deploymentID+" activated for app "+appName, "success")
 		return
 	}
 
@@ -460,6 +472,7 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(map[string]string{"deployment_id": newID}); err != nil {
 		log.Printf("Rollback: failed to encode response: %v", err)
 	}
+	auditRecord(r, "rollback", "deployment", newID, "app "+appName+" rolled back to deployment "+newID, "success")
 }
 
 func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +489,38 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(deployment); err != nil {
 		log.Printf("GetActive: failed to encode response: %v", err)
 	}
+}
+
+// Promote handles POST /api/v1/apps/{appName}/promote/{deploymentID} —
+// activates a deployment under a different app name than it was originally
+// deployed under (preview → production workflow).
+func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	targetAppName := r.PathValue("appName")
+	deploymentID := r.PathValue("deploymentID")
+
+	if !validateAppName(w, targetAppName) {
+		return
+	}
+	if !validateDeploymentID(w, deploymentID) {
+		return
+	}
+
+	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID); err != nil {
+		if errors.Is(err, service.ErrDeploymentNotFound) {
+			httperror.NotFoundCtx(w, r, "deployment not found")
+			return
+		}
+		log.Printf("internal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"status": "promoted"}); err != nil {
+		log.Printf("Promote: failed to encode response: %v", err)
+	}
+	auditRecord(r, "promote", "deployment", deploymentID, "deployment "+deploymentID+" promoted to app "+targetAppName, "success")
 }
 
 // validateAppName writes a 400 with {"error": "invalid app name"} and

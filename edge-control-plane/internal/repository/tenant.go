@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -36,7 +37,7 @@ func (r *TenantRepository) Create(ctx context.Context, t *domain.Tenant) error {
 
 func (r *TenantRepository) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
 	var t domain.Tenant
-	query := `SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants WHERE id = $1`
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = $1`
 	err := r.db.GetContext(ctx, &t, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -46,7 +47,7 @@ func (r *TenantRepository) GetByID(ctx context.Context, id string) (*domain.Tena
 
 func (r *TenantRepository) List(ctx context.Context) ([]domain.Tenant, error) {
 	var tenants []domain.Tenant
-	query := `SELECT id, name, plan, allowlisted_destinations, created_at FROM tenants ORDER BY created_at DESC`
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &tenants, query)
 	return tenants, err
 }
@@ -60,4 +61,38 @@ func (r *TenantRepository) Update(ctx context.Context, t *domain.Tenant) error {
 func (r *TenantRepository) Delete(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM tenants WHERE id = $1`, id)
 	return err
+}
+
+// ListActive returns tenants that are not disabled (disabled_at IS NULL).
+// Used by ReconcileService to skip disabled tenants when fanning out
+// full-state sync messages (issue #155).
+func (r *TenantRepository) ListActive(ctx context.Context) ([]domain.Tenant, error) {
+	var tenants []domain.Tenant
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE disabled_at IS NULL ORDER BY created_at DESC`
+	err := r.db.SelectContext(ctx, &tenants, query)
+	return tenants, err
+}
+
+// SetDisabledAt marks a tenant as disabled at the given timestamp. Called
+// when a tenant exceeds their outbound bandwidth quota (issue #155).
+func (r *TenantRepository) SetDisabledAt(ctx context.Context, tenantID string, at time.Time) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE tenants SET disabled_at = $2 WHERE id = $1`, tenantID, at)
+	return err
+}
+
+// ClearDisabledAt removes the disabled_at marker. Called when the billing
+// period resets, a plan upgrades, or an operator manually re-enables the
+// tenant.
+func (r *TenantRepository) ClearDisabledAt(ctx context.Context, tenantID string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE tenants SET disabled_at = NULL WHERE id = $1`, tenantID)
+	return err
+}
+
+// ListDisabled returns tenants that are currently disabled (disabled_at
+// IS NOT NULL). Useful for admin views and billing-cycle reset sweeps.
+func (r *TenantRepository) ListDisabled(ctx context.Context) ([]domain.Tenant, error) {
+	var tenants []domain.Tenant
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE disabled_at IS NOT NULL ORDER BY disabled_at DESC`
+	err := r.db.SelectContext(ctx, &tenants, query)
+	return tenants, err
 }

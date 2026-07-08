@@ -13,7 +13,7 @@ type mockMetricsAgg struct {
 	tenantStr string
 }
 
-func (m *mockMetricsAgg) RenderAll() string        { return m.allStr }
+func (m *mockMetricsAgg) RenderAll() string             { return m.allStr }
 func (m *mockMetricsAgg) RenderTenant(id string) string { return m.tenantStr }
 
 func TestMetricsHandler_GetAllMetrics(t *testing.T) {

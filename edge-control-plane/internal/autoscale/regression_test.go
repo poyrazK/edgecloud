@@ -28,7 +28,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -38,23 +37,12 @@ import (
 	tcnats "github.com/testcontainers/testcontainers-go/modules/nats"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/testutil"
 )
 
-// shouldSkipRegression mirrors edge-worker/tests/integration_tests.rs:50.
-// Returns (reason, true) when the test should t.Skip — Docker unavailable,
-// CI without Docker, or explicit SKIP_INTEGRATION_TESTS=1.
-//
-// CI runs the test with `docker:dind` so /var/run/docker.sock is present
-// and the guard does not fire; this is purely for local-dev convenience.
-func shouldSkipRegression() (string, bool) {
-	if _, ok := os.LookupEnv("SKIP_INTEGRATION_TESTS"); ok {
-		return "SKIP_INTEGRATION_TESTS set", true
-	}
-	if _, err := os.Stat("/var/run/docker.sock"); err != nil {
-		return "/var/run/docker.sock not present (set SKIP_INTEGRATION_TESTS=1 to skip)", true
-	}
-	return "", false
-}
+// shouldSkipRegression was extracted to testutil.ShouldSkipIntegration.
+// Callers updated to pass "SKIP_INTEGRATION_TESTS" explicitly so future
+// tests can pick their own env var name if they need to.
 
 // newTestNATS boots a NATS testcontainer and returns a connected
 // *natsio.Conn. The container is terminated via t.Cleanup so each
@@ -310,7 +298,7 @@ func runSubscribeWithCleanup(t *testing.T, s *Service, nc *natsio.Conn, ctx cont
 //
 //	needed = 100 + 20 = 120  >  totalFreeSlots=0  →  scale_up (1 → 2)
 func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
-	if reason, ok := shouldSkipRegression(); ok {
+	if reason, ok := testutil.ShouldSkipIntegration("SKIP_INTEGRATION_TESTS"); ok {
 		t.Skipf("regression: %s", reason)
 	}
 
@@ -360,7 +348,7 @@ func TestRegression_ScaleUpFiresUnderSpike(t *testing.T) {
 // comfortably covers the 2.5s observation period so a CI runner
 // scheduling ticks slightly late still observes suppression.
 func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
-	if reason, ok := shouldSkipRegression(); ok {
+	if reason, ok := testutil.ShouldSkipIntegration("SKIP_INTEGRATION_TESTS"); ok {
 		t.Skipf("regression: %s", reason)
 	}
 
@@ -415,7 +403,7 @@ func TestRegression_CooldownSuppressesSecondScaleUp(t *testing.T) {
 // call. The autoscaler fans out per-region in evaluateAll
 // (service.go:175) — this test pins that wiring.
 func TestRegression_MultiRegionIndependent(t *testing.T) {
-	if reason, ok := shouldSkipRegression(); ok {
+	if reason, ok := testutil.ShouldSkipIntegration("SKIP_INTEGRATION_TESTS"); ok {
 		t.Skipf("regression: %s", reason)
 	}
 
@@ -457,7 +445,7 @@ func TestRegression_MultiRegionIndependent(t *testing.T) {
 // This is the only test that proves the full Deprovision pipeline
 // works (pickVictim → CloudProvider.Deprovision → event recorded).
 func TestRegression_ScaleDownFiresOnExcess(t *testing.T) {
-	if reason, ok := shouldSkipRegression(); ok {
+	if reason, ok := testutil.ShouldSkipIntegration("SKIP_INTEGRATION_TESTS"); ok {
 		t.Skipf("regression: %s", reason)
 	}
 
@@ -513,7 +501,7 @@ func TestRegression_ScaleDownFiresOnExcess(t *testing.T) {
 // subsequent tick within ScaleDownCooldownS must suppress the next
 // Deprovision and record a cooldown-noop event instead.
 func TestRegression_ScaleDownCooldownSuppressesSecond(t *testing.T) {
-	if reason, ok := shouldSkipRegression(); ok {
+	if reason, ok := testutil.ShouldSkipIntegration("SKIP_INTEGRATION_TESTS"); ok {
 		t.Skipf("regression: %s", reason)
 	}
 

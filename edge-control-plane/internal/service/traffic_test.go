@@ -203,19 +203,19 @@ func TestSetTraffic_ValidSingleSplit(t *testing.T) {
 	defer cleanup()
 
 	svc := &TrafficService{
-		db: db,
-		splitRepo:      &trafficSplitRepo{},
+		db:        db,
+		splitRepo: &trafficSplitRepo{},
 		deploymentRepo: &trafficDeployRepo{
 			getByIDFn: func(ctx context.Context, id string) (*domain.Deployment, error) {
 				return &domain.Deployment{ID: "d_1", TenantID: "t_1", AppName: "hello", Hash: "abc"}, nil
 			},
 		},
-		activeRepo:     &trafficActiveRepo{},
-		appEnvRepo:     &trafficAppEnvRepo{},
-		tenantRepo:     &trafficTenantRepo{},
-		quotaRepo:      &trafficQuotaRepo{},
-		publisher:      &trafficPublisher{publishFn: func(region string, msg *nats.TaskMessage) error { return nil }},
-		defaultRegion:  "fra",
+		activeRepo:    &trafficActiveRepo{},
+		appEnvRepo:    &trafficAppEnvRepo{},
+		tenantRepo:    &trafficTenantRepo{},
+		quotaRepo:     &trafficQuotaRepo{},
+		publisher:     &trafficPublisher{publishFn: func(region string, msg *nats.TaskMessage) error { return nil }},
+		defaultRegion: "fra",
 	}
 
 	mock.ExpectBegin()

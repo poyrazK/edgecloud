@@ -28,7 +28,14 @@ pub struct Config {
     pub nats_url: String,
     pub caddy_admin_url: String,
     pub region: String,
+    /// Path to the TLS certificate PEM file. Passed to Caddy's
+    /// `load_files` config. When Caddy runs in Docker, this must be
+    /// a container-accessible path (e.g. `/etc/caddy/tls/cert.pem`
+    /// matching a `-v` mount), not a host path like `/Users/...`.
+    /// Set via `TLS_CERT_FILE` (required).
     pub cert_file: String,
+    /// Path to the TLS key PEM file. Same Docker constraint as
+    /// `cert_file`. Set via `TLS_KEY_FILE` (required).
     pub key_file: String,
     pub listen_http: String,
     pub listen_https: String,
@@ -52,6 +59,10 @@ pub struct Config {
     pub service_token: String,
     /// How often to poll `/api/internal/domains` (default 30s).
     pub domain_poll_interval: Duration,
+    /// Listen address for Caddy's admin API (e.g. `localhost:2019` or
+    /// `0.0.0.0:2019` for Docker). Defaults to `localhost:2019` which
+    /// matches Caddy's own default. Override with `CADDY_ADMIN_LISTEN`.
+    pub caddy_admin_listen: String,
 }
 
 impl Config {
@@ -59,8 +70,12 @@ impl Config {
     ///
     /// Required env vars:
     /// - `INGRESS_REGION` (e.g. `fra`)
-    /// - `TLS_CERT_FILE` (path to the `*.edgecloud.dev` wildcard cert PEM)
-    /// - `TLS_KEY_FILE` (path to the matching key PEM)
+    /// - `TLS_CERT_FILE` — path to the `*.edgecloud.dev` wildcard cert PEM.
+    ///   When Caddy runs in Docker, this must be a path accessible from
+    ///   inside the container (e.g. `/etc/caddy/tls/cert.pem` when using
+    ///   `-v` mount), NOT a host-only path like `/Users/user/...`.
+    /// - `TLS_KEY_FILE` — path to the matching key PEM. Same Docker
+    ///   path constraint as `TLS_CERT_FILE`.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -116,6 +131,8 @@ impl Config {
             control_plane_url,
             service_token,
             domain_poll_interval,
+            caddy_admin_listen: std::env::var("CADDY_ADMIN_LISTEN")
+                .unwrap_or_else(|_| "localhost:2019".into()),
         })
     }
 }
@@ -230,5 +247,37 @@ mod tests {
         let name = "__TEST_DUR_DEFINITELY_UNSET_XYZ";
         unset_var(name);
         assert_eq!(parse_duration_env(name), None);
+    }
+
+    // ── Ingress hostname ──────────────────────────────────────────────
+
+    /// Must stay in sync with the Go control plane's
+    /// `TestIngressHost_Format`. Every `https://<tenant>-<app>.edgecloud.dev`
+    /// URL the control plane advertises to tenants depends on this format.
+    #[test]
+    fn ingress_host_returns_formatted_hostname() {
+        let host = ingress_host("t_acme", "api");
+        assert_eq!(host, "t_acme-api.edgecloud.dev");
+    }
+
+    /// Pin the constant against accidental re-branding. The Go control
+    /// plane has an identical guard in `TestIngressHostSuffix_Constant`.
+    /// If this constant ever changes, the wildcard TLS certificate and
+    /// the Go side must be updated in lock-step.
+    #[test]
+    fn ingress_host_suffix_is_edgecloud_dev() {
+        assert_eq!(INGRESS_HOST_SUFFIX, "edgecloud.dev");
+    }
+
+    /// Edge cases: empty tenant or app name must not produce a trailing
+    /// or leading `-` that could be confused with a subdomain boundary.
+    #[test]
+    fn ingress_host_handles_edge_cases() {
+        let host = ingress_host("", "");
+        // Empty tenant + app still produces a valid-ish hostname,
+        // just `-.edgecloud.dev` — which won't resolve, but it
+        // won't panic or produce anything injectable.
+        assert!(host.ends_with(".edgecloud.dev"));
+        assert!(host.contains('.'));
     }
 }

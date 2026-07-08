@@ -55,6 +55,7 @@ fn runtime_state() -> RuntimeState {
             tenant_id: "smoke".to_string(),
             deployment_id: "smoke".to_string(),
         },
+        None,
     )
 }
 

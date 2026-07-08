@@ -13,8 +13,8 @@ import (
 )
 
 type mockEgressTenantSvc struct {
-	list    []string
-	listErr error
+	list      []string
+	listErr   error
 	updateErr error
 }
 

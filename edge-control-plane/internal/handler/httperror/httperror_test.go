@@ -68,8 +68,8 @@ func TestCtxVariants_PopulateRequestID(t *testing.T) {
 	r = r.WithContext(ctx)
 
 	tests := []struct {
-		name   string
-		call   func(w http.ResponseWriter)
+		name string
+		call func(w http.ResponseWriter)
 	}{
 		{
 			"BadRequestCtx",
@@ -153,7 +153,7 @@ func TestInternalError_MessageIsSanitized(t *testing.T) {
 func TestBadGateway_MergesDetailKeys(t *testing.T) {
 	w := httptest.NewRecorder()
 	BadGateway(w, "upstream timeout", map[string]any{
-		"upstream": "https://backend",
+		"upstream":   "https://backend",
 		"timeout_ms": float64(5000),
 	})
 	var body map[string]interface{}

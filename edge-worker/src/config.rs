@@ -60,6 +60,10 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// Number of JetStream replicas for the `edgecloud-tasks` stream.
+    /// Must be 1 on non-clustered NATS (local dev); defaults to 3 for
+    /// production. Override with `TASK_STREAM_REPLICAS`.
+    pub task_stream_replicas: usize,
     /// HMAC secret the worker uses to sign outbound JWTs to the control
     /// plane's internal endpoints. Must match `JWT_SECRET` on the Go side.
     ///
@@ -69,12 +73,39 @@ pub struct Config {
     /// see follow-up issue D). NATS heartbeats and the deployment
     /// supervisor keep working regardless.
     pub worker_jwt_secret: String,
+    /// Optional `kid` header value for worker JWTs. Set to the matching
+    /// `active_kid` in the control plane's `jwt.keys` config. When set,
+    /// the JWT header includes a `kid` field so the CP can select the
+    /// correct verification key during rotation. The CP also falls back
+    /// to the legacy `jwt.secret` when `kid` is absent, so this is
+    /// optional. Override with `WORKER_JWT_KID`.
+    pub worker_jwt_kid: Option<String>,
     /// Expected `iss` claim. Must match `JWT_ISSUER` on the Go side.
     /// Defaults to `edgecloud`.
     pub worker_jwt_issuer: String,
-    /// The tenant this worker is authorized for. Loaded once at startup;
-    /// a worker is per-tenant in this design (whitepaper §9.3 calls for
-    /// tenant-agnostic workers — file a follow-up to revisit).
+    /// The tenant this worker is authorized for. Loaded once at startup
+    /// and embedded in the worker's JWT `tenant_id` claim. All outbound
+    /// calls to `/api/internal/*` (downloads, logs, sync, registration)
+    /// are scoped to this tenant — the control plane only returns
+    /// artifacts and data belonging to this tenant ID.
+    ///
+    /// The worker is **architecturally multi-tenant**: it can host apps
+    /// from different tenants simultaneously via per-tenant NATS task
+    /// messages. However, because the JWT is signed once at boot, every
+    /// HTTP call still carries the same `tenant_id` claim. In practice
+    /// this means:
+    ///
+    /// - A worker whose `WORKER_TENANT_ID=t_a` cannot download artifacts
+    ///   or forward logs for apps that belong to `t_b` (even if the NATS
+    ///   task message says `tenant_id=t_b`).
+    ///
+    /// - The `/sync` fallback endpoint returns this tenant's apps, not
+    ///   the per-NATS-message tenant.
+    ///
+    /// A future change should make the JWT per-request (or per-tenant)
+    /// so the worker can fully serve multiple tenants. Until then, this
+    /// env var is **required** and must match the tenant whose apps this
+    /// worker hosts for outbound HTTP calls.
     pub worker_tenant_id: String,
     /// Per-request CPU budget for FaaS (Handler) components, in ms.
     /// Default 1000ms (1s). The store's epoch deadline is set to
@@ -90,6 +121,15 @@ pub struct Config {
     /// RECOMMENDED in production — a misbehaving tenant can exhaust
     /// worker memory with one POST).
     pub handler_max_request_body_bytes: u64,
+    /// Optional path to a PEM-encoded TLS certificate for the FaaS
+    /// HandlerDispatch endpoint (issue #209). When set alongside
+    /// `tls_key_path`, the dispatch accepts TLS connections in
+    /// addition to plaintext. Both must be set for TLS to activate.
+    pub tls_cert_path: Option<String>,
+    /// Optional path to a PEM-encoded TLS private key for the FaaS
+    /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
+    /// and `tls_key_path` must be set for TLS to activate.
+    pub tls_key_path: Option<String>,
 }
 
 impl Config {
@@ -103,7 +143,9 @@ impl Config {
     ///   this worker for the public ingress. Required: silent defaults have
     ///   produced every past "URL works for me but not for users" incident.
     /// - `WORKER_JWT_SECRET` (HMAC secret shared with the control plane)
-    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`)
+    /// - `WORKER_TENANT_ID` (e.g., `t_tenant1`) — the tenant ID whose apps
+    ///   this worker hosts. Required: scopes all `/api/internal/*` calls
+    ///   (downloads, logs, sync) to this tenant. See struct field docs.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -119,6 +161,9 @@ impl Config {
     ///   worker log layer ships to the control plane via `LogForwarder`.
     ///   Independent of `RUST_LOG`, which still controls local stdout
     ///   verbosity via `EnvFilter`. See `forwarder_log_level`.
+    /// - `TASK_STREAM_REPLICAS` (default: `3`) — JetStream replica count
+    ///   for the `edgecloud-tasks` stream. Set to `1` for non-clustered
+    ///   NATS (local dev).
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -143,6 +188,7 @@ impl Config {
             );
         }
         Ok(Config {
+            task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
             queue_group: std::env::var("EDGE_QUEUE_GROUP")
                 .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
             consumer_name,
@@ -170,15 +216,21 @@ impl Config {
             epoch_tick_ms: parse_env_u64("EPOCH_TICK_MS", 10)?,
             epoch_deadline_ticks: parse_env_u64("EPOCH_DEADLINE_TICKS", 100)?,
             worker_jwt_secret: std::env::var("WORKER_JWT_SECRET").unwrap_or_default(),
+            worker_jwt_kid: std::env::var("WORKER_JWT_KID").ok(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
-            worker_tenant_id: std::env::var("WORKER_TENANT_ID")
-                .context("WORKER_TENANT_ID not set")?,
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID").context(
+                "WORKER_TENANT_ID not set — a tenant ID is required (e.g. t_abc123). \
+                     This is the ID of the tenant whose apps this worker hosts. \
+                     All outbound calls to /api/internal/* are scoped to this tenant.",
+            )?,
             handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
             handler_max_request_body_bytes: parse_env_u64(
                 "HANDLER_MAX_REQUEST_BODY_BYTES",
                 10 * 1024 * 1024,
             )?,
+            tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
+            tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
         })
     }
 
@@ -218,6 +270,15 @@ fn parse_env_u64(name: &str, default: u64) -> anyhow::Result<u64> {
         Err(_) => Ok(default),
         Ok(s) => s
             .parse::<u64>()
+            .with_context(|| format!("{} must be a non-negative integer (got {:?})", name, s)),
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(s) => s
+            .parse::<usize>()
             .with_context(|| format!("{} must be a non-negative integer (got {:?})", name, s)),
     }
 }

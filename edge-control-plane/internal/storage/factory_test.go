@@ -45,10 +45,10 @@ func TestNew_S3(t *testing.T) {
 
 func TestNew_Remote(t *testing.T) {
 	cfg := config.StorageConfig{
-		ArtifactBackend:             "remote",
-		PeerControlPlaneURL:         "https://peer.example.com",
+		ArtifactBackend:               "remote",
+		PeerControlPlaneURL:           "https://peer.example.com",
 		PeerControlPlaneInternalToken: "test-token",
-		ArtifactPath:                "/tmp/edgecloud-artifacts",
+		ArtifactPath:                  "/tmp/edgecloud-artifacts",
 	}
 	store, err := New(context.Background(), cfg)
 	if err != nil {

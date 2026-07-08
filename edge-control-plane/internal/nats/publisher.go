@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -199,34 +200,46 @@ func NewNATSPublisher(url string) (*NATSPublisher, error) {
 
 // EnsureStream idempotently creates the given JetStream stream. If the
 // stream already exists with the same shape (subjects, retention, MaxAge,
-// replicas), it's a no-op. If any of those four fields differ, an error
-// is returned so the operator can reconcile (issue #86 — workers and
-// the control plane must agree on stream shape for the queue-group
-// consumer to work).
+// replicas), it's a no-op.
+//
+// Retention and replica-count changes require delete+recreate — NATS does
+// not allow changing those on an existing stream. The reconcile loop (every
+// 5 minutes) re-publishes desired state, bounding the window of missed
+// messages after the delete.
 func (p *NATSPublisher) EnsureStream(cfg StreamConfig) error {
 	info, err := p.js.StreamInfo(cfg.Name)
-	if err == nil {
-		// Stream exists — verify config matches. Any mismatch surfaces
-		// loudly so a misconfigured cluster (e.g., RF=1 in dev, RF=3 in
-		// prod) can't silently degrade durability.
-		if !equalSubjects(info.Config.Subjects, cfg.Subjects) {
-			return fmt.Errorf("stream %s already exists with subjects=%v, want %v", cfg.Name, info.Config.Subjects, cfg.Subjects)
-		}
-		if info.Config.Retention != cfg.Retention {
-			return fmt.Errorf("stream %s already exists with retention=%v, want %v", cfg.Name, info.Config.Retention, cfg.Retention)
-		}
-		if info.Config.MaxAge != cfg.MaxAge {
-			return fmt.Errorf("stream %s already exists with MaxAge=%v, want %v", cfg.Name, info.Config.MaxAge, cfg.MaxAge)
-		}
-		if info.Config.Replicas != cfg.Replicas {
-			return fmt.Errorf("stream %s already exists with replicas=%d, want %d", cfg.Name, info.Config.Replicas, cfg.Replicas)
-		}
-		return nil
+	if errors.Is(err, nats.ErrStreamNotFound) {
+		return p.addStream(cfg)
 	}
-	if !errors.Is(err, nats.ErrStreamNotFound) {
+	if err != nil {
 		return fmt.Errorf("checking stream %s: %w", cfg.Name, err)
 	}
-	_, err = p.js.AddStream(&nats.StreamConfig{
+
+	// Stream exists — check if we need to delete+recreate for changes
+	// that NATS doesn't allow in-place (retention, replica count).
+	if info.Config.Retention != cfg.Retention || info.Config.Replicas != cfg.Replicas {
+		log.Printf(
+			"stream %s has retention=%v/replicas=%d, want retention=%v/replicas=%d — deleting and recreating",
+			cfg.Name, info.Config.Retention, info.Config.Replicas, cfg.Retention, cfg.Replicas,
+		)
+		if err := p.js.DeleteStream(cfg.Name); err != nil {
+			return fmt.Errorf("deleting stream %s for migration: %w", cfg.Name, err)
+		}
+		return p.addStream(cfg)
+	}
+
+	if !equalSubjects(info.Config.Subjects, cfg.Subjects) {
+		return fmt.Errorf("stream %s already exists with subjects=%v, want %v", cfg.Name, info.Config.Subjects, cfg.Subjects)
+	}
+	if info.Config.MaxAge != cfg.MaxAge {
+		return fmt.Errorf("stream %s already exists with MaxAge=%v, want %v", cfg.Name, info.Config.MaxAge, cfg.MaxAge)
+	}
+	return nil
+}
+
+// addStream is a small helper that creates a stream with the given config.
+func (p *NATSPublisher) addStream(cfg StreamConfig) error {
+	_, err := p.js.AddStream(&nats.StreamConfig{
 		Name:      cfg.Name,
 		Subjects:  cfg.Subjects,
 		Retention: cfg.Retention,

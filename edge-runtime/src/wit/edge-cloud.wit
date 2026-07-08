@@ -68,6 +68,39 @@ interface process {
   exit: func(code: u32);
 }
 
+/// WebSocket connection hosting as defined by RFC 6455.
+interface websocket {
+  /// WebSocket message type.
+  enum message-type {
+    text,
+    binary,
+    ping,
+    pong,
+    close,
+  }
+
+  /// Close reason code and message.
+  record close-info {
+    code: u16,
+    reason: string,
+  }
+
+  /// Listen for WebSocket connections on the given port.
+  listen: func(port: u16) -> result<u32, string>;
+
+  /// Accept an incoming WebSocket connection.
+  accept: func(listener: u32) -> result<u32, string>;
+
+  /// Send a WebSocket data frame.
+  send: func(conn: u32, data: list<u8>, kind: message-type) -> result;
+
+  /// Receive the next complete WebSocket message.
+  receive: func(conn: u32) -> result<tuple<list<u8>, message-type>, close-info>;
+
+  /// Close the WebSocket connection with the given code and reason.
+  close: func(conn: u32, info: close-info) -> result;
+}
+
 // Long-running world. Components implement _start and self-host any
 // TCP servers they need via wasi:sockets. They can also make outbound
 // HTTP calls via wasi:http/outgoing-handler.
@@ -98,6 +131,7 @@ world edge-runtime {
   import time;
   import scheduling;
   import process;
+  import websocket;
 }
 
 // FaaS world. Components implement wasi:http/incoming-handler and the
@@ -120,6 +154,7 @@ world edge-runtime-handler {
   import time;
   import scheduling;
   import process;
+  import websocket;
 
   // The handler export — this is what detect::detect_execution_model
   // routes through wasmtime_wasi_http::ProxyPre. The guest's `handle`

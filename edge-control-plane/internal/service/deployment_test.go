@@ -360,10 +360,10 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 // apps row forever, counting against the tenant's max_apps quota.
 //
 // sqlmock expectations in order:
-//   1. CreateIfNotExists: SELECT COUNT(*) FROM apps + INSERT INTO apps
-//   2. Deploy: SELECT quota + SELECT count
-//   3. Tx: Begin; SaveAndHash fails; Rollback
-//   4. POST-tx apps-row cleanup: DELETE FROM apps (NOT EXISTS guard)
+//  1. CreateIfNotExists: SELECT COUNT(*) FROM apps + INSERT INTO apps
+//  2. Deploy: SELECT quota + SELECT count
+//  3. Tx: Begin; SaveAndHash fails; Rollback
+//  4. POST-tx apps-row cleanup: DELETE FROM apps (NOT EXISTS guard)
 func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 	db, mock, cleanup := newDeploymentMockDB(t)
 	defer cleanup()

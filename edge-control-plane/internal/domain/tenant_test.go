@@ -11,11 +11,11 @@ import (
 func TestTenant_JSONRoundTrip(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	tnt := Tenant{
-		ID:                     "t_abc",
-		Name:                   "acme-corp",
-		Plan:                   "free",
+		ID:                      "t_abc",
+		Name:                    "acme-corp",
+		Plan:                    "free",
 		AllowlistedDestinations: pq.StringArray{"*.example.com", "api.internal"},
-		CreatedAt:              now,
+		CreatedAt:               now,
 	}
 	data, err := json.Marshal(tnt)
 	if err != nil {

@@ -341,9 +341,15 @@ pub fn render_routes(
     }
 
     let mut root = serde_json::Map::new();
+    // Preserve the admin binding across POST /load reloads. Without
+    // this, Caddy resets to its default `localhost:2019` (inside the
+    // container), breaking the next reload from the host.
+    root.insert(
+        "admin".to_string(),
+        json!({"listen": cfg.caddy_admin_listen}),
+    );
     let mut http_apps = serde_json::Map::new();
     http_apps.insert("servers".to_string(), Value::Object(servers));
-    http_apps.insert("automatic_https".to_string(), json!({"disable": true}));
     let mut http_block = serde_json::Map::new();
     http_block.insert("http".to_string(), Value::Object(http_apps));
     http_block.insert("tls".to_string(), Value::Object(tls));
@@ -415,6 +421,7 @@ mod tests {
             control_plane_url: String::new(),
             service_token: String::new(),
             domain_poll_interval: Duration::from_secs(30),
+            caddy_admin_listen: "localhost:2019".into(),
         }
     }
 
@@ -437,12 +444,28 @@ mod tests {
     }
 
     #[test]
-    fn automatic_https_is_disabled_so_wildcard_cert_wins() {
+    fn wildcard_cert_takes_precedence_over_auto_tls() {
         let cache = TrafficSplitCache::default();
         let cfg_json = render_routes(&[], &[], &test_cfg(), &cache);
+        // Caddy 2.11 removed the `app.http.automatic_https` field.
+        // The wildcard cert in `tls.certificates.load_files` takes
+        // precedence automatically — no need to disable auto-TLS.
+        assert!(
+            cfg_json["apps"]["http"]["automatic_https"].is_null(),
+            "render_routes must not emit the removed automatic_https field"
+        );
+    }
+
+    #[test]
+    fn admin_block_is_emitted_so_caddy_binding_persists_across_reloads() {
+        let cache = TrafficSplitCache::default();
+        let mut cfg = test_cfg();
+        cfg.caddy_admin_listen = "0.0.0.0:2019".into();
+        let cfg_json = render_routes(&[], &[], &cfg, &cache);
         assert_eq!(
-            cfg_json["apps"]["http"]["automatic_https"]["disable"],
-            serde_json::Value::Bool(true)
+            cfg_json["admin"]["listen"], "0.0.0.0:2019",
+            "render_routes must include admin.listen matching Config so \
+             POST /load does not reset Caddy's admin binding"
         );
     }
 

@@ -17,7 +17,7 @@ const (
 	//      wasm magic-number check — also surface as Failed, since
 	//      no runnable artifact was produced.
 	// Tenants should read the Errors[] array for the cause.
-	MigrationStatusFailed  = MigrationStatus("failed")
+	MigrationStatusFailed = MigrationStatus("failed")
 )
 
 // MigrateEnvelopeVersion is the wire-format version of the

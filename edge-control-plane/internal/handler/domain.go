@@ -92,6 +92,7 @@ func (h *DomainHandler) Add(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(d)
+	auditRecord(r, "create", "domain", req.FQDN, "domain "+req.FQDN+" added to app "+appName, "success")
 }
 
 // List handles GET /api/v1/apps/{appName}/domains — list all custom domains
@@ -173,4 +174,5 @@ func (h *DomainHandler) Remove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	auditRecord(r, "delete", "domain", fqdn, "domain "+fqdn+" removed from app "+appName, "success")
 }

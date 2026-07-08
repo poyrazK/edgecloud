@@ -1,0 +1,68 @@
+# Local development infrastructure for edgeCloud.
+#
+# Spins up Postgres 16 and NATS 2.10 (with JetStream) — the two services
+# the control plane and worker require. Versions match the CI test
+# containers exactly (see `.github/workflows/ci.yml` →
+# `go-test-integration.services.postgres` and the `nats:2.10-alpine`
+# image used by `internal/autoscale/regression_test.go`), so a
+# migration or code change that passes locally will pass in CI and
+# vice versa.
+#
+# Usage:
+#   docker compose up -d    # start Postgres + NATS in the background
+#   make infra-up          # same, via the Makefile wrapper
+#
+# The control plane binary (`edge-control-plane/cmd/api`) and the
+# worker (`edge-worker`) read their database/NATS settings from
+# `edge-control-plane/config.yaml` and env vars. The defaults in that
+# config match the host/port/user/password/db/url below, so neither
+# binary needs env-var overrides for the typical happy-path setup.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: edgecloud-postgres
+    environment:
+      POSTGRES_USER: edgecloud
+      POSTGRES_PASSWORD: edgecloud
+      POSTGRES_DB: edgecloud
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is built into the official postgres image. Same
+      # check the CI healthcheck uses (services: postgres in ci.yml).
+      test: ["CMD-SHELL", "pg_isready -U edgecloud -d edgecloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: edgecloud-nats
+    # -js enables JetStream. The control plane publishes NATS
+    # JetStream messages (edgecloud.tasks.<region>,
+    # edgecloud.heartbeats.<region>) — without -js those publishes
+    # would fail with "no stream configured". -m 8222 turns on the
+    # HTTP monitoring endpoint on :8222 so the healthcheck can hit
+    # /healthz.
+    command: ["nats-server", "-js", "-m", "8222"]
+    ports:
+      - "4222:4222"   # NATS client traffic
+      - "8222:8222"   # HTTP monitoring endpoint
+    healthcheck:
+      # wget is part of the nats:2.10-alpine image (Alpine base).
+      # Hit the monitoring endpoint's /healthz; non-200 = unhealthy.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  pgdata:
+    # Named volume so `docker compose down` (without -v) keeps the
+    # schema. `make infra-reset` does the down -v + re-apply dance.
+    name: edgecloud-pgdata

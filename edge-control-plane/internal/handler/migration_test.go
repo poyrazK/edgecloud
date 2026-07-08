@@ -568,7 +568,7 @@ func itoa(i int) string {
 func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
 	h := NewMigrationHandler(svc)
-// Build a valid multipart body that's over the cap, but stream
+	// Build a valid multipart body that's over the cap, but stream
 	// it through io.Pipe + zeroReader so we never allocate the full
 	// ~50 MiB up front. The multipart envelope (form fields + part
 	// headers + trailing boundary) writes eagerly into the pipe;

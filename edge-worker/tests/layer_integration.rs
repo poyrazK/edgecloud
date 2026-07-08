@@ -176,10 +176,11 @@ impl LayerHarness {
             )),
             env: HashMap::new(),
             max_request_body_bytes: 10 * 1024 * 1024,
+            metrics_acc: None,
         };
 
         let dispatch = Arc::new(
-            HandlerDispatch::new(instance_pre, port, 1_000, 1, config)
+            HandlerDispatch::new(instance_pre, port, 1_000, 1, config, None)
                 .context("HandlerDispatch::new")?,
         );
 
@@ -328,6 +329,7 @@ async fn l6_request_body_over_cap_returns_413() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 100,
+        metrics_acc: None,
     })
     .await;
 
@@ -374,7 +376,8 @@ async fn l6b_request_body_under_cap_reaches_guest() {
             "l6b-deployment".to_string(),
         )),
         env: HashMap::new(),
-        max_request_body_bytes: 10 * 1024 * 1024, // 10 MB — generous
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None, // 10 MB — generous
     })
     .await;
 
@@ -447,6 +450,7 @@ async fn l7_per_request_timeout_returns_500() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     };
 
     let dispatch = Arc::new(
@@ -456,6 +460,7 @@ async fn l7_per_request_timeout_returns_500() {
             /* request_budget_ms */ 100,
             1,
             config,
+            None,
         )
         .expect("HandlerDispatch::new"),
     );
@@ -521,7 +526,8 @@ async fn spawn_handler_with_config(config: HandlerConfig) -> (u16, broadcast::Se
     let port = ephemeral_port().expect("bind ephemeral port");
 
     let dispatch = Arc::new(
-        HandlerDispatch::new(instance_pre, port, 5_000, 10, config).expect("HandlerDispatch::new"),
+        HandlerDispatch::new(instance_pre, port, 5_000, 10, config, None)
+            .expect("HandlerDispatch::new"),
     );
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
@@ -633,6 +639,7 @@ async fn l11_guest_calls_process_get_env() {
         )),
         env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -677,6 +684,7 @@ async fn l12_guest_calls_time_now() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -725,6 +733,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -797,6 +806,7 @@ async fn l14_guest_calls_cache_round_trip() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -866,6 +876,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -922,6 +933,7 @@ async fn l16_guest_schedules_task() {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
 
@@ -968,6 +980,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         )),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     }
 }
 
@@ -1255,6 +1268,7 @@ async fn l27_process_get_all_env() {
         meter: Arc::new(RequestMeter::new("l27".to_string(), "l27".to_string())),
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
     })
     .await;
     let cl = make_client();
@@ -1305,6 +1319,78 @@ async fn l30_process_get_cwd() {
     assert!(
         std::path::Path::new(&cwd).is_absolute(),
         "cwd should be absolute: {cwd}"
+    );
+}
+
+// ── Outbound Metering (L45) ────────────────────────────────────────────
+
+/// L45: outbound byte metering is restored. Fire a GET that returns a
+/// known-size response body and assert that
+/// `meter.snapshot().outbound_bytes` reflects it (fixes issue #210).
+#[tokio::test(flavor = "multi_thread")]
+async fn l45_outbound_metering_counts_response_bytes() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let meter = Arc::new(RequestMeter::new(
+        "test-tenant".to_string(),
+        "l45-deployment".to_string(),
+    ));
+    let meter_for_config = meter.clone();
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l45".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l45-deployment".to_string(),
+        },
+        meter: meter_for_config,
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest::Client");
+
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // The handler fixture's "/" path returns JSON ~50-100 bytes.
+    let resp = client.get(&url).send().await.expect("GET /");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let first_body = resp.text().await.expect("body");
+    let first_len = first_body.len() as u64;
+
+    // After the first request, outbound bytes should at minimum
+    // cover the response body.
+    let snap = meter.snapshot();
+    assert!(
+        snap.outbound_bytes >= first_len,
+        "outbound_bytes ({}) should be >= response body size ({})",
+        snap.outbound_bytes,
+        first_len
+    );
+
+    // Fire 99 more and verify accumulation.
+    for _ in 0..99 {
+        let resp = client.get(&url).send().await.expect("GET /");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.text().await.expect("body");
+    }
+
+    let snap = meter.snapshot();
+    assert!(
+        snap.outbound_bytes >= 100 * first_len,
+        "after 100 requests, outbound_bytes ({}) should be >= {}",
+        snap.outbound_bytes,
+        100 * first_len
     );
 }
 
@@ -1695,4 +1781,60 @@ async fn l44_concurrent_time_now() {
         let ts: u64 = resp.text().await.unwrap().trim().parse().unwrap();
         assert!(ts > 1_700_000_000, "unreasonable timestamp: {ts}");
     }
+}
+
+// ── Streaming Response Bodies (L46) ─────────────────────────────────────
+
+/// L46: the guest calls ResponseOutparam::set early (headers-only)
+/// and continues writing body chunks. The host must start serving the
+/// response immediately — proving the streaming path works end-to-end
+/// for SSE, long-polling, and progressive chunked responses (issue #312).
+#[tokio::test(flavor = "multi_thread")]
+async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::allow_all()),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l46".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l46-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l46-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest::Client");
+
+    let url = format!("http://127.0.0.1:{port}/sse?count=3");
+    let resp = client.get(&url).send().await.expect("GET /sse?count=3");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap()),
+        Some("text/event-stream")
+    );
+
+    // Read the body — it should contain SSE-formatted data lines
+    // emitted by the guest after the headers were already sent.
+    let body = resp.text().await.expect("streaming body");
+    let event_count = body.lines().filter(|l| l.starts_with("data:")).count();
+    assert!(
+        event_count >= 3,
+        "SSE response should contain at least 3 data: lines, got {event_count}\nbody:\n{body}"
+    );
 }

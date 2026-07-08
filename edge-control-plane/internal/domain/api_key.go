@@ -48,3 +48,40 @@ const (
 func IsValidRole(r string) bool {
 	return r == RoleOwner || r == RoleDeveloper || r == RoleViewer
 }
+
+// UpdateAPIKeyRequest is sent when updating an existing API key.
+// nil pointer fields mean "don't change"; non-nil means "set to this value".
+type UpdateAPIKeyRequest struct {
+	Name *string `json:"name"` // nil = no change
+	Role *string `json:"role"` // nil = no change
+}
+
+// SafeAPIKeyResponse is the tenant-facing API key representation.
+// It deliberately omits KeyHash, LookupHash, and HashAlgorithm.
+type SafeAPIKeyResponse struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Role      string  `json:"role"`
+	CreatedAt string  `json:"created_at"`
+	LastUsed  *string `json:"last_used,omitempty"`
+	ExpiresAt *string `json:"expires_at,omitempty"`
+}
+
+// ToSafeResponse converts a domain.APIKey to a SafeAPIKeyResponse.
+func (k *APIKey) ToSafeResponse() SafeAPIKeyResponse {
+	r := SafeAPIKeyResponse{
+		ID:        k.ID,
+		Name:      k.Name,
+		Role:      k.Role,
+		CreatedAt: k.CreatedAt.Format("2006-01-02T15:04:05Z"),
+	}
+	if k.LastUsed != nil {
+		s := k.LastUsed.Format("2006-01-02T15:04:05Z")
+		r.LastUsed = &s
+	}
+	if k.ExpiresAt != nil {
+		s := k.ExpiresAt.Format("2006-01-02T15:04:05Z")
+		r.ExpiresAt = &s
+	}
+	return r
+}

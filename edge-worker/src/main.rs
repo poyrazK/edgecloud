@@ -46,20 +46,28 @@ async fn main() -> anyhow::Result<()> {
     // JWT carries the worker's tenant_id claim.
     let jwt_signer = WorkerJwtSigner::new(
         config.worker_jwt_secret.clone(),
+        config.worker_jwt_kid.clone(),
         config.worker_jwt_issuer.clone(),
         config.worker_id.clone(),
         config.region.clone(),
         config.worker_tenant_id.clone(),
     );
 
+    // Initialize disk spool for log durability — failed HTTP batches are
+    // persisted here and replayed on the next startup.
+    let spool = edge_spool::Spool::open(&std::path::PathBuf::from(".worker-spool"))
+        .await
+        .ok();
+
     // Initialize LogForwarder — receives tenant `emit_log` records from the
     // runtime AND worker-side `tracing` events via WorkerLogLayer. One per
     // worker; per-app AppLogContext travels with each guest record.
-    let log_forwarder = LogForwarder::new(
+    let log_forwarder = LogForwarder::new_with_spool(
         config.control_plane_url.clone(),
         config.worker_id.clone(),
         config.region.clone(),
         jwt_signer.clone(),
+        spool,
     );
 
     // Without a JWT secret the worker can still run — NATS heartbeats and
@@ -105,6 +113,57 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
+    // Validate region consistency with the control plane (issue #254).
+    // If the CP uses "global" and the worker uses "fra", the worker will
+    // subscribe to the wrong NATS subject and silently never receive
+    // task messages. Registering with the CP early surfaces the mismatch
+    // immediately with a clear error message.
+    {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let payload = serde_json::json!({
+            "worker_id": config.worker_id,
+            "region": config.region,
+        });
+        let resp = http
+            .post(format!("{}/api/internal/workers", config.control_plane_url))
+            .header("Authorization", format!("Bearer {}", jwt_signer.sign()))
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "worker registration failed (status {}): {}. \
+                 Ensure CONTROL_PLANE_REGION matches worker REGION.",
+                status,
+                body
+            );
+        }
+
+        let cp: serde_json::Value = resp.json().await?;
+        let cp_region = cp["cp_region"].as_str().unwrap_or("");
+        if !cp_region.is_empty() && cp_region != config.region {
+            anyhow::bail!(
+                "region mismatch: worker REGION={} but control plane has cp_region={}. \
+                 The worker will not receive task messages unless the regions match. \
+                 To fix: set CONTROL_PLANE_REGION={} on the control plane, \
+                 or set REGION={} on the worker.",
+                config.region,
+                cp_region,
+                config.region,
+                cp_region
+            );
+        }
+    }
+    tracing::info!(
+        worker_region = %config.region,
+        "region validated with control plane"
+    );
+
     // Create cache directory
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     tracing::info!(dir = %config.cache_dir.display(), "cache directory ready");
@@ -130,8 +189,9 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     // Connect to NATS
-    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url).await?)
-        as Arc<dyn crate::nats::NatsClient>;
+    let nats =
+        Arc::new(NatsClientImpl::connect(&config.nats_url, config.task_stream_replicas).await?)
+            as Arc<dyn crate::nats::NatsClient>;
     tracing::info!(url = %config.nats_url, "connected to NATS");
 
     // Create the shutdown broadcast channel for the heartbeat task.
@@ -189,6 +249,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tracing::info!("heartbeat task started");
+
+    // Replay any spooled log batches from a previous run before the
+    // regular flush loop starts, so failed batches from a prior crash
+    // are retried before new entries accumulate.
+    log_forwarder.replay_spool().await;
 
     // Spawn the log-forwarder flush loop. It listens on the same shutdown
     // broadcast as the heartbeat task; on shutdown it does one final flush

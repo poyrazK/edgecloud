@@ -48,12 +48,14 @@ use crate::edge_runtime_long::edge::cloud::{
 use crate::egress::EgressPolicy;
 use crate::interfaces::{cache, kv_store, observe, process, scheduling, time};
 use crate::metering::RequestMeter;
+use crate::store::HasStoreLimits;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasmtime::component::ResourceTable;
+use wasmtime::{ResourceLimiter, StoreLimits};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
@@ -117,6 +119,12 @@ pub struct RuntimeState {
     /// `process.exit`. Allows `execute_app` to distinguish a clean guest
     /// exit from a wasm trap.
     pub exit_code: Arc<AtomicU32>,
+
+    /// Memory limits embedded here so `create_store` can wire wasmtime's
+    /// resource-limiter callback with a proper lifetime-bounded closure
+    /// rather than a `Box::leak`-based `'static` reference. Set by
+    /// `create_store` before the `Store` is constructed; `None` until then.
+    store_limits: Option<StoreLimits>,
 }
 
 impl RuntimeState {
@@ -149,6 +157,7 @@ impl RuntimeState {
             egress: Arc::new(EgressPolicy::allow_all()),
             http_hooks: EgressHttpHooks::new(Arc::new(EgressPolicy::allow_all()), String::new()),
             exit_code,
+            store_limits: None,
         }
     }
 
@@ -175,6 +184,7 @@ impl RuntimeState {
         egress: Arc<EgressPolicy>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
+        metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
     ) -> Self {
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -184,11 +194,13 @@ impl RuntimeState {
 
         let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id);
 
-        let observer = observe::Observer::from_config(
-            observe::ObserveConfig::new()
-                .with_log_sink(log_sink)
-                .with_app_ctx(app_ctx),
-        );
+        let mut observe_cfg = observe::ObserveConfig::new()
+            .with_log_sink(log_sink)
+            .with_app_ctx(app_ctx);
+        if let Some(acc) = metrics_acc {
+            observe_cfg = observe_cfg.with_metrics_accumulator(acc);
+        }
+        let observer = observe::Observer::from_config(observe_cfg);
 
         Self {
             kv_store,
@@ -211,6 +223,7 @@ impl RuntimeState {
             // policy swap (returning a new Arc) only updates one place.
             http_hooks: EgressHttpHooks::new(egress, tenant_id),
             exit_code,
+            store_limits: None,
         }
     }
 
@@ -264,6 +277,7 @@ impl Clone for RuntimeState {
             egress: self.egress.clone(),
             http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
+            store_limits: None, // set fresh by create_store for each new Store
         }
     }
 }
@@ -327,20 +341,23 @@ impl WasiHttpHooks for EgressHttpHooks {
                 reason = %reason,
                 "egress denied"
             );
-            // Convert to `ErrorCode::InternalError` (the public
-            // `From<ErrorCode> for HttpError` impl is the only way to
-            // build a typed `HttpError` from outside the crate). The
-            // guest sees an InternalError-equivalent 5xx with the
-            // reason embedded in the diagnostics payload.
             let diagnostics = format!("egress denied: {reason}");
             return Err(HttpError::from(ErrorCode::InternalError(Some(diagnostics))));
         }
-        // Egress allowlist passed — defer to our custom DNS-rebinding-
+// Egress allowlist passed — defer to our custom DNS-rebinding-
         // aware send_request handler in `egress_transport`. It
         // pre-resolves via `tokio::net::lookup_host`, validates each
         // candidate IP against `egress.check_resolved_ip`, then connects
         // to the validated IP literal — so the kernel cannot re-resolve
         // and serve a poisoned record on the second query.
+        //
+        // Note: origin/main has an inline `lookup_host`-based check that
+        // calls `default_send_request` after the IP validation. The
+        // release/v0.2-egress-hardening branch's egress_transport module
+        // is the canonical v0.2 implementation — it does the same IP
+        // validation but uses `spawn_send_request_handler` to keep the
+        // resolution and connection on a single async task so the kernel
+        // cannot re-resolve mid-flight. Keeping that path here.
         Ok(crate::egress_transport::spawn_send_request_handler(
             request,
             config,
@@ -382,6 +399,18 @@ impl WasiHttpView for RuntimeState {
             table: &mut self.resource_table,
             hooks: &mut self.http_hooks,
         }
+    }
+}
+
+impl HasStoreLimits for RuntimeState {
+    fn set_store_limits(&mut self, limits: StoreLimits) {
+        self.store_limits = Some(limits);
+    }
+
+    fn store_limits_mut(&mut self) -> &mut dyn ResourceLimiter {
+        self.store_limits
+            .as_mut()
+            .expect("store_limits not set — create_store must call set_store_limits first")
     }
 }
 
@@ -437,6 +466,7 @@ mod send_request_tests {
                 tenant_id: "phase-c8-test".to_string(),
                 deployment_id: "phase-c8-test".to_string(),
             },
+            None,
         )
     }
 
@@ -947,3 +977,179 @@ impl_scheduling!(SchedulingHost);
 
 impl_process!(LongProcessHost);
 impl_process!(ProcessHost);
+
+#[cfg(test)]
+mod with_env_and_meter_tests {
+    use super::*;
+    use crate::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+
+    struct NoopSink;
+    impl LogSink for NoopSink {
+        fn push(&self, _r: LogRecord, _c: AppLogContext) {}
+    }
+
+    fn state_with_env(env: HashMap<String, String>, tenant_id: &str) -> RuntimeState {
+        RuntimeState::with_env_and_meter(
+            env,
+            None,
+            tenant_id.to_string(),
+            Arc::new(EgressPolicy::allow_all()),
+            Arc::new(NoopSink) as Arc<dyn LogSink>,
+            AppLogContext {
+                app_name: "test".to_string(),
+                tenant_id: tenant_id.to_string(),
+                deployment_id: "test".to_string(),
+            },
+            None,
+        )
+    }
+
+    // ── exit_requested ─────────────────────────────────────────────────
+
+    #[test]
+    fn exit_requested_returns_none_on_zero() {
+        let state = RuntimeState::new();
+        assert_eq!(state.exit_requested(), None);
+    }
+
+    #[test]
+    fn exit_requested_returns_code_after_exit() {
+        let state = RuntimeState::new();
+        state.process.exit(42);
+        assert_eq!(state.exit_requested(), Some(42));
+    }
+
+    // ── Env passthrough ────────────────────────────────────────────────
+    //
+    // `with_env_and_meter` stores the raw env in `Process` as-is. The
+    // worker is responsible for pre-filtering before calling this
+    // constructor. The defense-in-depth env blocklist is applied inside
+    // `build_wasi_ctx_for_tenant` to the wasi:cli path (which we cannot
+    // easily inspect from tests), not to the process::get-all-env path.
+
+    #[test]
+    fn env_passed_through_to_process() {
+        let mut env = HashMap::new();
+        env.insert("SAFE_VAR".into(), "safe".into());
+        env.insert("AWS_SECRET_KEY".into(), "leaked".into());
+        env.insert("DB_API_KEY".into(), "secret123".into());
+
+        let state = state_with_env(env.clone(), &format!("env-pass-{}", uuid::Uuid::new_v4()));
+        let all_env: HashMap<String, String> = state.process.get_all_env().into_iter().collect();
+
+        // All vars are passed through — runtime does NOT filter the Process.
+        assert_eq!(all_env.get("SAFE_VAR"), Some(&"safe".into()));
+        assert_eq!(all_env.get("AWS_SECRET_KEY"), Some(&"leaked".into()));
+        assert_eq!(all_env.get("DB_API_KEY"), Some(&"secret123".into()));
+    }
+
+    // ── Persistence env var wiring ────────────────────────────────────
+
+    #[tokio::test]
+    async fn persistence_env_vars_create_persistent_stores() {
+        let kv_dir = tempfile::TempDir::new().expect("kv temp dir");
+        let cache_dir = tempfile::TempDir::new().expect("cache temp dir");
+        let sched_dir = tempfile::TempDir::new().expect("sched temp dir");
+        let tenant_id = format!("persist-{}", uuid::Uuid::new_v4());
+
+        let kv_str = kv_dir.path().to_string_lossy().to_string();
+        let cache_str = cache_dir.path().to_string_lossy().to_string();
+        let sched_str = sched_dir.path().to_string_lossy().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_KV_STORE_PATH", Some(&kv_str), || {
+                temp_env::with_var("EDGE_CACHE_PATH", Some(&cache_str), || {
+                    temp_env::with_var("EDGE_SCHEDULING_PATH", Some(&sched_str), || {
+                        let state = state_with_env(HashMap::new(), &tenant_id);
+
+                        state.kv_store.set("k".into(), b"v".to_vec(), None).unwrap();
+                        assert_eq!(state.kv_store.get("k").unwrap(), Some(b"v".to_vec()));
+
+                        state.cache.set("ck".into(), b"cv".to_vec(), None).unwrap();
+                        assert_eq!(state.cache.get("ck").unwrap(), Some(b"cv".to_vec()));
+
+                        let sched_id = state
+                            .scheduling
+                            .schedule_once(60_000, b"sp".to_vec())
+                            .unwrap();
+                        state.scheduling.cancel(&sched_id).unwrap();
+                    });
+                });
+            });
+        })
+        .await;
+
+        result.expect("spawn_blocking panicked");
+    }
+
+    #[tokio::test]
+    async fn persistence_env_var_fallback_on_bad_path() {
+        let bad_dir = tempfile::TempDir::new().expect("temp dir");
+        let tenant_id = format!("fallback-{}", uuid::Uuid::new_v4());
+
+        // Make the directory read-only so with_persistence fails.
+        let mut perms = std::fs::metadata(bad_dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(bad_dir.path(), perms).expect("set read-only");
+
+        let bad_str = bad_dir.path().to_string_lossy().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            temp_env::with_var("EDGE_KV_STORE_PATH", Some(&bad_str), || {
+                // Should not panic — fallback to ephemeral store.
+                let state = state_with_env(HashMap::new(), &tenant_id);
+                state.kv_store.set("k".into(), b"v".to_vec(), None).unwrap();
+                assert_eq!(state.kv_store.get("k").unwrap(), Some(b"v".to_vec()));
+            });
+        })
+        .await;
+
+        result.expect("spawn_blocking panicked");
+    }
+
+    // ── Registry caching ───────────────────────────────────────────────
+
+    #[test]
+    fn same_tenant_reuses_registry_stores() {
+        let tenant_id = format!("reuse-{}", uuid::Uuid::new_v4());
+        let state1 = state_with_env(HashMap::new(), &tenant_id);
+        let state2 = state_with_env(HashMap::new(), &tenant_id);
+
+        // Both calls must return the same Arc allocations.
+        assert!(
+            Arc::ptr_eq(&state1.kv_store, &state2.kv_store),
+            "same tenant must reuse kv_store Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&state1.cache, &state2.cache),
+            "same tenant must reuse cache Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
+            "same tenant must reuse scheduling Arc"
+        );
+    }
+
+    #[test]
+    fn different_tenants_have_different_stores() {
+        let tenant_a = format!("diff-a-{}", uuid::Uuid::new_v4());
+        let tenant_b = format!("diff-b-{}", uuid::Uuid::new_v4());
+        let state1 = state_with_env(HashMap::new(), &tenant_a);
+        let state2 = state_with_env(HashMap::new(), &tenant_b);
+
+        assert!(
+            !Arc::ptr_eq(&state1.kv_store, &state2.kv_store),
+            "different tenants must have different kv_store Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state1.cache, &state2.cache),
+            "different tenants must have different cache Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
+            "different tenants must have different scheduling Arcs"
+        );
+    }
+}

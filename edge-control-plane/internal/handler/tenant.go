@@ -79,6 +79,10 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("Bootstrap tenant: failed to encode response: %v", err)
 	}
+	auditRecord(r, "bootstrap", "tenant", tenant.ID, "tenant "+tenant.ID+" created via self-signup", "success")
+	if DefaultTenantCreationLimiter != nil {
+		DefaultTenantCreationLimiter.Record(service.StripPort(r.RemoteAddr))
+	}
 }
 
 func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +116,7 @@ func (h *TenantHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(tenant); err != nil {
 		log.Printf("Create tenant: failed to encode response: %v", err)
 	}
+	auditRecord(r, "create", "tenant", tenant.ID, "tenant "+tenant.Name+" created by admin", "success")
 }
 
 func (h *TenantHandler) Get(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +245,7 @@ func (h *TenantHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(tenant); err != nil {
 		log.Printf("Update tenant: failed to encode response: %v", err)
 	}
+	auditRecord(r, "update", "tenant", tenantID, "tenant "+tenantID+" updated", "success")
 }
 
 func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
@@ -248,5 +254,6 @@ func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
+	auditRecord(r, "delete", "tenant", tenantID, "tenant "+tenantID+" deleted", "success")
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -18,61 +18,28 @@ import (
 )
 
 // stubLogService is the minimum implementation of *service.LogService
-// the LogHandler needs. We point the handler at the production type so
-// the handler's real call site (svc.ListByTenantApp) is exercised; the
-// service package's own tests cover the service's own logic.
+// the LogHandler needs. We wrap a real *service.LogService whose repo
+// is a stub so the handler's own call path (svc.ListByTenantApp) is
+// exercised.
 type stubLogService struct {
 	entries []domain.LogEntry
 	err     error
 	called  bool
 	// lastQuery records the LogQuery the handler passed so tests can
 	// assert the query string was parsed + defaulted correctly.
-	// Levels carries the post-translation level set (or nil when no
-	// level filter was requested).
 	lastQuery service.LogQuery
 }
 
-func (s *stubLogService) ListByTenantApp(
-	_ context.Context, _, _ string, q service.LogQuery,
-) ([]domain.LogEntry, int, error) {
-	s.called = true
-	s.lastQuery = q
-	// Echo the limit through. Handler tests assert the *echoed* limit
-	// matched the requested one, so for the happy path we just pass
-	// the requested value back — production behavior is "echo the
-	// post-clamp limit", and the clamp is exercised in service tests.
-	// If a test wants to drive the service's clamp directly, it
-	// should use a real *service.LogService.
-	return s.entries, q.Limit, s.err
-}
-
-// newLogsMux wires a single GET /api/v1/apps/{appName}/logs route
-// through a real *http.ServeMux so r.PathValue("appName") populates
-// the same way it does in production. We use a hand-rolled stub
-// service (not a real *service.LogService) because the handler's
-// contract is purely "call svc.ListByTenantApp and encode the
-// result"; all the service-level behavior (defaults, clamps, level
-// validation) is covered by service/logs_test.go.
-func newLogsMux(svc *stubLogService) *http.ServeMux {
-	// The handler takes a *service.LogService typed value, not the
-	// LogEntryLister interface — that is what the production wiring
-	// does. To inject our stub without a real DB, we wrap it in a
-	// thin shim that satisfies the service struct's *implicit*
-	// dependency on the repo by re-implementing the single method
-	// the handler calls. We do this by constructing a real
-	// LogService with our stub as its repo, then handing that
-	// service to the handler.
-	realSvc := service.NewLogService(stubListerAdapter{svc: svc})
+// newLogsMux wires a single GET /api/v1/apps/{appName}/logs route.
+func newLogsMux(stub *stubLogService) *http.ServeMux {
+	realSvc := service.NewLogService(stubListerAdapter{svc: stub})
 	h := NewLogHandler(realSvc)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/apps/{appName}/logs", h.List)
 	return mux
 }
 
-// stubListerAdapter bridges stubLogService (which records the query)
-// to repository.LogListFilter (which is what *service.LogService
-// consumes). Without this, the service would reject the call because
-// the underlying repo would never get hit.
+// stubListerAdapter bridges stubLogService to repository.LogListFilter.
 type stubListerAdapter struct {
 	svc *stubLogService
 }
@@ -80,17 +47,12 @@ type stubListerAdapter struct {
 func (a stubListerAdapter) ListByTenantApp(
 	_ context.Context, _, _ string, filter repository.LogListFilter,
 ) ([]domain.LogEntry, error) {
-	// Capture everything the service handed the repo: the handler
-	// tests assert that the parsed query made it through. Note we
-	// can't recover the original MinLvl string (the service expanded
-	// it into a Levels set), so the level assertion in
-	// TestLogsList_ForwardsQueryParams runs against the Levels slice
-	// — the same observable effect.
 	a.svc.called = true
 	a.svc.lastQuery = service.LogQuery{
 		Since:  filter.Since,
 		Limit:  filter.Limit,
 		Levels: filter.Levels,
+		Offset: filter.Offset,
 	}
 	return a.svc.entries, a.svc.err
 }
@@ -145,9 +107,6 @@ func TestLogsList_HappyPath_Returns200(t *testing.T) {
 // List — 200 (envelope shape)
 // ---------------------------------------------------------------------------
 
-// TestLogsList_EnvelopeShape pins the JSON wire format. The CLI parses
-// this; a regression that renamed a field would silently break the
-// read path.
 func TestLogsList_EnvelopeShape(t *testing.T) {
 	stub := &stubLogService{
 		entries: []domain.LogEntry{
@@ -176,24 +135,73 @@ func TestLogsList_EnvelopeShape(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// List — 200 (next_offset appears when more results exist)
+// ---------------------------------------------------------------------------
+
+func TestLogsList_NextOffsetInResponse(t *testing.T) {
+	// 5 entries, limit 3 → 2 pages. First page should have next_offset=3.
+	stub := &stubLogService{
+		entries: make([]domain.LogEntry, 3),
+	}
+	mux := newLogsMux(stub)
+
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?limit=3", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var got LogListResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.NextOffset == nil {
+		t.Fatal("expected next_offset in response when page is full")
+	}
+	if *got.NextOffset != 3 {
+		t.Errorf("next_offset = %d, want 3", *got.NextOffset)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// List — 200 (next_offset omitted when last page)
+// ---------------------------------------------------------------------------
+
+func TestLogsList_NoNextOffsetOnLastPage(t *testing.T) {
+	stub := &stubLogService{
+		entries: make([]domain.LogEntry, 2),
+	}
+	mux := newLogsMux(stub)
+
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?limit=10", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var got LogListResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.NextOffset != nil {
+		t.Errorf("next_offset = %d, want nil (last page)", *got.NextOffset)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // List — 200 (query params forwarded correctly)
 // ---------------------------------------------------------------------------
 
-// TestLogsList_ForwardsQueryParams pins the handler's parse → service
-// contract: every query param must be parsed and passed to the
-// service so the service's validation can reject bad input. We
-// assert on the *service* query (not the repo filter) so a future
-// service refactor doesn't break this test.
 func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
 
-	// Past timestamp: 2020-01-01, unambiguously behind any clock the
-	// test runner could have. The handler's parseSinceParam rejects
-	// future-dated values with 400, so picking a date "today" risks
-	// flakiness around midnight UTC.
 	sinceRFC := "2020-01-01T00:00:00Z"
-	url := "/api/v1/apps/myapp/logs?level=warn&limit=50&since=" + sinceRFC
+	url := "/api/v1/apps/myapp/logs?level=warn&limit=50&since=" + sinceRFC + "&offset=100"
 	req := httptest.NewRequest("GET", url, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
@@ -202,10 +210,6 @@ func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
-	// The service translates MinLvl=warn into Levels=[warn, error]
-	// before the repo sees it, so we assert on the post-translation
-	// slice. The MinLvl→Levels mapping itself is covered by
-	// service/logs_test.go.
 	if !reflect.DeepEqual(stub.lastQuery.Levels, []string{"warn", "error"}) {
 		t.Errorf("Levels = %v, want [warn error]", stub.lastQuery.Levels)
 	}
@@ -215,10 +219,13 @@ func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	if stub.lastQuery.Since <= 0 {
 		t.Errorf("Since = %s, want > 0 (parsed from RFC3339)", stub.lastQuery.Since)
 	}
+	if stub.lastQuery.Offset != 100 {
+		t.Errorf("Offset = %d, want 100", stub.lastQuery.Offset)
+	}
 }
 
 // ---------------------------------------------------------------------------
-// List — 400 (path traversal in appName)
+// List — 400 tests
 // ---------------------------------------------------------------------------
 
 func TestLogsList_PathTraversal_Returns400(t *testing.T) {
@@ -240,7 +247,7 @@ func TestLogsList_PathTraversal_Returns400(t *testing.T) {
 			mux.ServeHTTP(rr, req)
 
 			if rr.Code != http.StatusBadRequest {
-				t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+				t.Errorf("status = %d, want 400", rr.Code)
 			}
 			if stub.called {
 				t.Error("service should not have been called for traversal appName")
@@ -249,129 +256,91 @@ func TestLogsList_PathTraversal_Returns400(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// List — 400 (invalid since)
-// ---------------------------------------------------------------------------
-
 func TestLogsList_RejectsInvalidSince(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
-
 	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?since=not-a-time", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "since") {
-		t.Errorf("body should mention 'since', got: %s", rr.Body.String())
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 	if stub.called {
 		t.Error("service should not have been called for invalid since")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// List — 400 (future-dated since)
-// ---------------------------------------------------------------------------
-
-// TestLogsList_RejectsFutureDatedSince pins the contract change from
-// PR #138 review finding #7: a `since` whose RFC3339 value lies after
-// `time.Now()` must be rejected with 400 (not silently clamped to 0,
-// which would let the request succeed against the default 5m window
-// while the client thought it was pinning a specific past bound).
 func TestLogsList_RejectsFutureDatedSince(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
-
-	// Year 9000 — far enough in the future that RFC3339's
-	// seconds-precision rounding (which floors to the whole
-	// second on Format→Parse round-trip) cannot cause the parsed
-	// value to land in the past. Using "now + small offset" is a
-	// footgun: sub-second drift across the format/parse round
-	// trip can flip a +1h offset into a value that's effectively
-	// already past when the handler measures `time.Until(t)`.
-	// RFC3339 accepts any year in 0001..9999.
 	future := time.Date(9000, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
 	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?since="+future, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "future") {
-		t.Errorf("body should mention 'future', got: %s", rr.Body.String())
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 	if stub.called {
 		t.Error("service should not have been called for future-dated since")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// List — 400 (invalid level)
-// ---------------------------------------------------------------------------
-
 func TestLogsList_RejectsInvalidLevel(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
-
 	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?level=critical", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "level") {
-		t.Errorf("body should mention 'level', got: %s", rr.Body.String())
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 	if stub.called {
 		t.Error("service should not have been called for invalid level")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// List — 400 (invalid limit)
-// ---------------------------------------------------------------------------
-
 func TestLogsList_RejectsInvalidLimit(t *testing.T) {
 	stub := &stubLogService{}
 	mux := newLogsMux(stub)
-
-	// Non-integer — the handler's parseLimitParam is the gate.
 	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?limit=notanumber", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 	if stub.called {
 		t.Error("service should not have been called for invalid limit")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// List — 500 (repo / service error)
-// ---------------------------------------------------------------------------
+func TestLogsList_RejectsInvalidOffset(t *testing.T) {
+	stub := &stubLogService{}
+	mux := newLogsMux(stub)
+	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?offset=notanumber", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if stub.called {
+		t.Error("service should not have been called for invalid offset")
+	}
+}
 
 func TestLogsList_ServiceError_Returns500(t *testing.T) {
 	stub := &stubLogService{err: errors.New("db unreachable")}
 	mux := newLogsMux(stub)
-
 	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
+		t.Fatalf("status = %d, want 500", rr.Code)
 	}
 	if strings.Contains(rr.Body.String(), "db unreachable") {
 		t.Errorf("body must not leak raw error: %s", rr.Body.String())

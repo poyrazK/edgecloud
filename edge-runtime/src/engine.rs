@@ -41,3 +41,68 @@ pub fn create_engine() -> Result<wasmtime::Engine> {
     let engine = Engine::new(&config)?;
     Ok(engine)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::RuntimeState;
+    use crate::store::create_store;
+
+    #[test]
+    fn create_engine_succeeds() {
+        let engine = create_engine().expect("engine");
+        drop(engine);
+    }
+
+    #[test]
+    fn engine_is_cloneable() {
+        let engine = create_engine().expect("engine");
+        let _clone = engine.clone();
+    }
+
+    #[test]
+    fn engine_shares_across_stores() {
+        let engine = create_engine().expect("engine");
+        let state1 = RuntimeState::new();
+        let state2 = RuntimeState::new();
+        let store1 = create_store(&engine, 0, state1);
+        let store2 = create_store(&engine, 0, state2);
+        drop(store1);
+        drop(store2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        windows,
+        ignore = "wasmtime epoch signals trigger STATUS_STACK_BUFFER_OVERRUN on Windows"
+    )]
+    async fn epoch_interruption_wired() {
+        let engine = create_engine().expect("engine");
+        let state = RuntimeState::new();
+        let mut store = create_store(&engine, 0, state);
+
+        // store.set_epoch_deadline requires epoch_interruption(true) on the
+        // engine config — if the call succeeds, the config took effect.
+        store.set_epoch_deadline(1);
+    }
+
+    #[test]
+    fn component_model_enabled() {
+        let engine = create_engine().expect("engine");
+
+        let component_wat = r#"
+            (component
+              (core module
+                (func (export "run") (result i32)
+                  i32.const 42
+                )
+              )
+              (core instance (instantiate 0))
+            )
+        "#;
+
+        let bytes = wat::parse_str(component_wat).expect("valid component wat");
+        let _component = wasmtime::component::Component::new(&engine, bytes)
+            .expect("component model must be enabled on engine");
+    }
+}

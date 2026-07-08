@@ -200,6 +200,101 @@ components:
           format: date-time
           example: "2026-01-02T03:04:05Z"
 
+    UpdateAPIKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: New name. Omit to leave unchanged.
+          example: renamed-key
+        role:
+          type: string
+          description: "New role. Omit to leave unchanged. Valid roles: 'developer', 'owner', 'viewer'."
+          example: viewer
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, secret, events]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS callback URL.
+          example: https://hooks.example.com/deploy
+        secret:
+          type: string
+          description: HMAC signing secret (min 16 chars).
+          example: whsec_abc123def456
+        events:
+          type: array
+          items:
+            type: string
+            enum: [deploy, activate, rollback, auto_rollback]
+          description: Event types that trigger this webhook.
+          example: [deploy, activate]
+        description:
+          type: string
+          description: Optional description.
+          example: Production deploy notifications
+
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: string
+          example: wh_abc123
+        tenant_id:
+          type: string
+          example: t_abc123
+        url:
+          type: string
+          example: https://hooks.example.com/deploy
+        events:
+          type: array
+          items:
+            type: string
+          example: [deploy, activate]
+        description:
+          type: string
+          example: Production deploy notifications
+        enabled:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-07-03T18:00:00Z"
+
+    UpdateWebhookRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS callback URL. Omit to leave unchanged.
+        secret:
+          type: string
+          description: New HMAC signing secret. Omit to leave unchanged.
+        events:
+          type: array
+          items:
+            type: string
+          description: Replace event types. Omit to leave unchanged.
+        description:
+          type: string
+          description: Replace description. Omit to leave unchanged.
+        enabled:
+          type: boolean
+          description: Enable or disable. Omit to leave unchanged.
+
+    WebhookListResponse:
+      type: object
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+
     # -------------------------------------------------------------------------
     # Apps
     # -------------------------------------------------------------------------
@@ -210,6 +305,17 @@ components:
           type: string
           description: Optional human-readable description.
           example: Main web app
+
+    UpdateAppRequest:
+      type: object
+      properties:
+        description:
+          type: string
+          nullable: true
+          description: |
+            New description. Send `null` or omit to leave unchanged.
+            Send `""` to clear the description.
+          example: Updated description
 
     App:
       type: object
@@ -1284,6 +1390,42 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+    put:
+      operationId: updateApp
+      summary: Update mutable fields of an app
+      description: |
+        Updates the mutable fields (currently only `description`) of
+        an existing app. Nullable fields: omit the field or send `null`
+        to leave it unchanged; send `""` to clear it.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAppRequest'
+      responses:
+        '200':
+          description: App updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/App'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # -------------------------------------------------------------------------
   # Deployments
   # -------------------------------------------------------------------------
@@ -1431,6 +1573,46 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ActivateResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/apps/{appName}/promote/{deploymentID}:
+    post:
+      operationId: promoteDeployment
+      summary: Promote a preview deployment to production
+      description: |
+        Activates a deployment under a different app name than it was
+        originally deployed under. Used to promote a preview deployment
+        (deployed under a suffixed name like `myapp--preview-abc123`) to
+        the real app name. The deployment must belong to the same tenant.
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Target app name for promotion.
+        - name: deploymentID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The deployment ID to promote (from a preview deploy).
+      responses:
+        '200':
+          description: Deployment promoted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: promoted
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1960,6 +2142,38 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   /api/v1/keys/{keyID}:
+    put:
+      operationId: updateAPIKey
+      summary: Update an API key's name or role
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The API key ID to update.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAPIKeyRequest'
+      responses:
+        '200':
+          description: API key updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIKeyInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
     delete:
       operationId: deleteAPIKey
       summary: Revoke an API key
@@ -1975,6 +2189,31 @@ paths:
           description: API key revoked.
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/keys/{keyID}/rotate:
+    post:
+      operationId: rotateAPIKey
+      summary: Rotate an API key (generate new key, expire old one)
+      parameters:
+        - name: keyID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The API key ID to rotate.
+      responses:
+        '201':
+          description: New API key created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAPIKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2042,6 +2281,97 @@ paths:
                 type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
+  # Webhooks
+  # -------------------------------------------------------------------------
+  /api/v1/webhooks:
+    post:
+      operationId: createWebhook
+      summary: Create a new webhook subscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: Webhook created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listWebhooks
+      summary: List all webhooks for the authenticated tenant
+      responses:
+        '200':
+          description: List of webhooks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/webhooks/{webhookID}:
+    put:
+      operationId: updateWebhook
+      summary: Update a webhook subscription
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+      responses:
+        '200':
+          description: Webhook updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteWebhook
+      summary: Delete a webhook subscription
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Webhook deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
   # Admin: Tenants
@@ -2266,6 +2596,57 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Secrets key management (internal auth)
+  # -------------------------------------------------------------------------
+  /api/v1/admin/secrets/keys:
+    get:
+      operationId: listSecretsKeys
+      summary: List key IDs in the secrets keyring
+      security:
+        - InternalTokenAuth: []
+      responses:
+        '200':
+          description: Key IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key_ids:
+                    type: array
+                    items:
+                      type: string
+                  active_key:
+                    type: string
+                  encryption_enabled:
+                    type: boolean
+        '401':
+          description: Missing or invalid internal token
+
+  /api/v1/admin/secrets/re-encrypt:
+    post:
+      operationId: reEncryptSecrets
+      summary: Re-encrypt all env values with the active key
+      security:
+        - InternalTokenAuth: []
+      responses:
+        '200':
+          description: Re-encryption complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  re_encrypted:
+                    type: integer
+                  status:
+                    type: string
+        '400':
+          description: Encryption not configured
+        '500':
+          description: Re-encryption failed
 
   /api/v1/internal/traffic/{tenantID}/{appName}:
     get:

@@ -160,6 +160,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
     let jwt_signer = WorkerJwtSigner::new(
         config.worker_jwt_secret.clone(),
+        config.worker_jwt_kid.clone(),
         config.worker_jwt_issuer.clone(),
         config.worker_id.clone(),
         config.region.clone(),
@@ -175,7 +176,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
         config.port_cooldown_secs,
     )));
     let nats =
-        Arc::new(NatsClientImpl::connect(&config.nats_url).await?) as Arc<dyn NatsClientTrait>;
+        Arc::new(NatsClientImpl::connect(&config.nats_url, 1).await?) as Arc<dyn NatsClientTrait>;
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),

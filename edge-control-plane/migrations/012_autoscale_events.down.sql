@@ -1,3 +1,4 @@
+-- +migrate Down
 -- Reverse of 012_autoscale_events.up.sql. Drops the index first
 -- (Postgres drops the index automatically when the table is dropped,
 -- but being explicit matches the up migration's ordering).

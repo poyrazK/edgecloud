@@ -109,7 +109,10 @@ var (
 	// check is enough to reject obviously-non-wasm inputs before
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
-	ErrNoLastGood                  = fmt.Errorf("no previous deployment to roll back to")
+	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
+	// ErrDeploymentNotFound is returned by PromoteDeployment when the
+	// deployment doesn't exist or belongs to a different tenant.
+	ErrDeploymentNotFound = fmt.Errorf("deployment not found")
 	// ErrNoActiveDeployment is returned by RollbackDeployment when there
 	// is no active-deployment row for this app (user never activated any
 	// deployment). Distinct from ErrAppNotFound (which is for the app
@@ -204,6 +207,8 @@ type DeploymentService struct {
 	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService
+	envSvc         *EnvService     // injected for decryption at publish
+	webhookSvc     *WebhookService // injected for webhook events
 	// defaultRegion is this control plane's own region. Used as the
 	// fallback `regions` list for deployments that don't explicitly
 	// target any region — both in `Deploy` (when the HTTP request
@@ -250,6 +255,15 @@ func NewDeploymentService(
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
 func (s *DeploymentService) SetAppService(appSvc *AppService) {
 	s.appSvc = appSvc
+}
+
+// SetEnvService injects the EnvService used for decrypting env vars at publish.
+func (s *DeploymentService) SetEnvService(envSvc *EnvService) {
+	s.envSvc = envSvc
+}
+
+func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
+	s.webhookSvc = webhookSvc
 }
 
 // Deploy creates a new deployment and stores the artifact.
@@ -330,15 +344,15 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	}
 
 	deployment := &domain.Deployment{
-		ID:        "d_" + uuid.New().String(),
-		TenantID:  tenantID,
-		AppName:   appName,
-		Status:    domain.StatusDeployed,
+		ID:       "d_" + uuid.New().String(),
+		TenantID: tenantID,
+		AppName:  appName,
+		Status:   domain.StatusDeployed,
 		// Hash is populated after SaveAndHash returns the SHA-256
 		// of the streamed bytes. Streaming keeps the bytes from
 		// ever sitting in RAM as a single buffer.
-		Hash:    "",
-		Regions: domain.StringArrayFrom(effectiveRegions),
+		Hash:      "",
+		Regions:   domain.StringArrayFrom(effectiveRegions),
 		CreatedAt: time.Now(),
 		// Persist the tenant opt-in on the artifact row so audit
 		// endpoints (`edge deployments --app foo`) can show which
@@ -347,7 +361,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		AutoRollbackEnabled: autoRollback,
 	}
 
-// Wrap the row insert and the artifact save in a transaction
+	// Wrap the row insert and the artifact save in a transaction
 	// so a failed SaveAndHash rolls the deployment row back
 	// atomically (we don't end up with a row pointing at no
 	// artifact). The artifact store is filesystem, so the tx only
@@ -437,6 +451,13 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		return nil, err
 	}
 
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), deployment.TenantID, deployment.AppName, "deploy", map[string]string{
+			"deployment_id": deployment.ID,
+			"hash":          deployment.Hash,
+		})
+	}
+
 	return deployment, nil
 }
 
@@ -499,6 +520,29 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("deployment not found")
 	}
 
+	return s.activateDeployment(ctx, tenantID, appName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+}
+
+// PromoteDeployment activates a deployment under a different app name than
+// the one it was originally deployed under. This enables the preview →
+// production promotion workflow: a user deploys as `myapp--pr-42` (gets a
+// unique preview URL), then promotes the same artifact to `myapp`.
+func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error {
+	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
+	if err != nil || deployment == nil {
+		return ErrDeploymentNotFound
+	}
+	if deployment.TenantID != tenantID {
+		return ErrDeploymentNotFound
+	}
+	return s.activateDeployment(ctx, tenantID, targetAppName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+}
+
+// activateDeployment is the shared inner logic for ActivateDeployment
+// and PromoteDeployment. It sets the active deployment row and publishes
+// a task update, without checking the deployment's original app name.
+func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
+
 	// Atomically move the current active id into last_good_deployment_id
 	// and write the new id. Two readers can race on a non-tx read+write;
 	// use a tx with FOR UPDATE so concurrent activate/rollback serialize.
@@ -550,26 +594,39 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	}
 
 	// Publish task update
-	envs, err := s.appEnvRepo.List(ctx, tenantID, appName)
-	if err != nil {
-		return fmt.Errorf("listing env vars: %w", err)
-	}
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
+	var envMap map[string]string
+	var pubErr error
+	if s.envSvc != nil {
+		envMap, pubErr = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
+		if pubErr != nil {
+			return fmt.Errorf("preparing env vars for publish: %w", pubErr)
+		}
+	} else {
+		var envs []domain.AppEnv
+		envs, pubErr = s.appEnvRepo.List(ctx, tenantID, appName)
+		if pubErr != nil {
+			return fmt.Errorf("listing env vars: %w", pubErr)
+		}
+		envMap = make(map[string]string, len(envs))
+		for _, e := range envs {
+			envMap[e.EnvKey] = e.EnvValue
+		}
 	}
 
-	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting tenant: %w", err)
+	tenant, pubErr := s.tenantRepo.GetByID(ctx, tenantID)
+	if pubErr != nil {
+		return fmt.Errorf("getting tenant: %w", pubErr)
 	}
 	if tenant == nil {
 		return fmt.Errorf("tenant not found")
 	}
+	if tenant.IsDisabled() {
+		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
+	}
 
-	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("getting quota: %w", err)
+	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
+	if pubErr != nil {
+		return fmt.Errorf("getting quota: %w", pubErr)
 	}
 	maxMemoryMB := 256
 	if quota != nil && quota.MaxMemoryMB > 0 {
@@ -603,7 +660,15 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	return s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions)
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
+		return err
+	}
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
+			"deployment_id": deploymentID,
+		})
+	}
+	return nil
 }
 
 // publishSwap fans a TaskMessage out to every region in `regions`,
@@ -857,9 +922,19 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		return "", err
 	}
 
-	envMap := make(map[string]string)
-	for _, e := range envs {
-		envMap[e.EnvKey] = e.EnvValue
+	envMap := make(map[string]string, len(envs))
+	if s.envSvc != nil {
+		for _, e := range envs {
+			v, err := s.envSvc.Decrypt(e.EnvValue)
+			if err != nil {
+				return "", fmt.Errorf("rollback: decrypting env %s: %w", e.EnvKey, err)
+			}
+			envMap[e.EnvKey] = v
+		}
+	} else {
+		for _, e := range envs {
+			envMap[e.EnvKey] = e.EnvValue
+		}
 	}
 
 	msg := &nats.TaskMessage{
@@ -878,6 +953,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	}
 	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
 		return "", err
+	}
+
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "rollback", map[string]string{
+			"deployment_id": rolledBackID,
+		})
 	}
 
 	return rolledBackID, nil
@@ -928,7 +1009,17 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 		}
 		envMap := make(map[string]string, len(envs))
 		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
+			v := e.EnvValue
+			if s.envSvc != nil {
+				var decErr error
+				v, decErr = s.envSvc.Decrypt(e.EnvValue)
+				if decErr != nil {
+					log.Printf("republish: decrypting env %s/%s: %v", ad.AppName, e.EnvKey, decErr)
+					failedApps = append(failedApps, ad.AppName)
+					break
+				}
+			}
+			envMap[e.EnvKey] = v
 		}
 
 		msg := &nats.TaskMessage{

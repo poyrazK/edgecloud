@@ -7,6 +7,8 @@ use clap::Subcommand;
 use std::env;
 use std::io::{IsTerminal, Read};
 
+#[cfg(test)]
+use crate::api::APIKeySummary;
 use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
 use crate::output;
@@ -506,4 +508,243 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
 #[cfg(not(feature = "network"))]
 fn keys_revoke(_id: &str, _force: bool, _yes: bool) -> Result<()> {
     anyhow::bail!("auth keys requires network support; rebuild with --features network")
+}
+
+/// Determine the key acquisition path for `login`.
+/// Extracted for testability.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+enum KeyReadPath {
+    Provided(String),
+    Prompt,
+    Stdin,
+}
+
+#[cfg(test)]
+fn login_key_value(key: Option<&str>, no_echo: bool) -> KeyReadPath {
+    match key {
+        Some(k) => KeyReadPath::Provided(k.trim().to_string()),
+        None if no_echo => KeyReadPath::Prompt,
+        None => KeyReadPath::Stdin,
+    }
+}
+
+/// Check for signup key conflicts. Returns an error if --force is not
+/// set and there's a conflict that can't be safely resolved.
+#[cfg(test)]
+fn signup_conflict_check(force: bool, env_key_set: bool, saved_key_exists: bool) -> Result<bool> {
+    if !force && saved_key_exists {
+        if env_key_set {
+            anyhow::bail!("refusing to overwrite saved key while EDGE_API_KEY is set");
+        }
+        // Warn but proceed: return `true` to indicate a warning was issued.
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Guard against self-revoke without `--force`.
+#[cfg(test)]
+fn self_revoke_check(current_id: &str, target_id: &str, force: bool) -> Result<()> {
+    if !force && current_id == target_id {
+        anyhow::bail!("refusing to revoke the key currently used to authenticate this CLI session");
+    }
+    Ok(())
+}
+
+/// Check whether a confirmation prompt is needed before a destructive
+/// action. Requires `--yes` when not on a TTY.
+#[cfg(test)]
+fn confirmation_required(yes: bool, is_tty: bool) -> Result<()> {
+    if !yes && !is_tty {
+        anyhow::bail!(
+            "refusing to revoke without confirmation: pass --yes in non-interactive shells"
+        );
+    }
+    Ok(())
+}
+
+/// Render a key list table to a string. The `current_id` parameter marks
+/// one row with `* (current)`.
+#[cfg(test)]
+fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
+    if keys.is_empty() {
+        return "No API keys.".to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<38} {:<24} {:<12} {:<22} NOTE\n",
+        "ID", "NAME", "ROLE", "CREATED"
+    ));
+    out.push_str(&"-".repeat(102));
+    out.push('\n');
+    for k in keys {
+        let is_current = current_id == Some(k.id.as_str());
+        let note = if is_current { "(current)" } else { "" };
+        out.push_str(&format!(
+            "{:<38} {:<24} {:<12} {:<22} {}\n",
+            k.id, k.name, k.role, k.created_at, note
+        ));
+    }
+    out
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── login_key_value ────────────────────────────────────────────────
+
+    #[test]
+    fn key_flag_takes_precedence_over_no_echo() {
+        let path = login_key_value(Some("my-key"), true);
+        assert_eq!(path, KeyReadPath::Provided("my-key".into()));
+    }
+
+    #[test]
+    fn key_flag_trims_whitespace() {
+        let path = login_key_value(Some("  key-value  "), false);
+        assert_eq!(path, KeyReadPath::Provided("key-value".into()));
+    }
+
+    #[test]
+    fn no_echo_path_when_no_key() {
+        let path = login_key_value(None, true);
+        assert_eq!(path, KeyReadPath::Prompt);
+    }
+
+    #[test]
+    fn stdin_path_when_no_key_no_echo() {
+        let path = login_key_value(None, false);
+        assert_eq!(path, KeyReadPath::Stdin);
+    }
+
+    // ── signup_conflict_check ──────────────────────────────────────────
+
+    #[test]
+    fn no_conflict_when_no_saved_key() {
+        let result = signup_conflict_check(false, false, false).unwrap();
+        assert!(!result, "no warning expected");
+    }
+
+    #[test]
+    fn force_overrides_all_conflicts() {
+        let result = signup_conflict_check(true, true, true).unwrap();
+        assert!(!result, "force should suppress warnings");
+    }
+
+    #[test]
+    fn error_when_env_and_saved_key_without_force() {
+        let err = signup_conflict_check(false, true, true).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("EDGE_API_KEY"));
+    }
+
+    #[test]
+    fn warn_when_saved_key_no_env_without_force() {
+        let warned = signup_conflict_check(false, false, true).unwrap();
+        assert!(warned, "should signal a warning was issued");
+    }
+
+    // ── self_revoke_check ──────────────────────────────────────────────
+
+    #[test]
+    fn ok_when_not_self_revoke() {
+        self_revoke_check("a", "b", false).unwrap();
+    }
+
+    #[test]
+    fn ok_when_force_overrides_self_revoke() {
+        self_revoke_check("a", "a", true).unwrap();
+    }
+
+    #[test]
+    fn error_on_self_revoke_without_force() {
+        let err = self_revoke_check("a", "a", false).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("refusing to revoke"));
+    }
+
+    // ── confirmation_required ──────────────────────────────────────────
+
+    #[test]
+    fn yes_flag_skips_confirmation() {
+        confirmation_required(true, false).unwrap();
+    }
+
+    #[test]
+    fn tty_allows_confirmation_prompt() {
+        confirmation_required(false, true).unwrap();
+    }
+
+    #[test]
+    fn no_tty_no_yes_is_error() {
+        let err = confirmation_required(false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("--yes"));
+    }
+
+    // ── render_key_list ───────────────────────────────────────────────-
+
+    #[test]
+    fn shows_current_marker() {
+        let keys = vec![APIKeySummary {
+            id: "k_abc".into(),
+            name: "default".into(),
+            role: "owner".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let rendered = render_key_list(&keys, Some("k_abc"));
+        assert!(rendered.contains("(current)"));
+    }
+
+    #[test]
+    fn no_marker_when_current_id_none() {
+        let keys = vec![APIKeySummary {
+            id: "k_abc".into(),
+            name: "default".into(),
+            role: "owner".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let rendered = render_key_list(&keys, None);
+        assert!(!rendered.contains("(current)"));
+    }
+
+    #[test]
+    fn empty_list_returns_empty_message() {
+        let rendered = render_key_list(&[], None);
+        assert_eq!(rendered, "No API keys.");
+    }
+
+    #[test]
+    fn multiple_keys_one_marked() {
+        let keys = vec![
+            APIKeySummary {
+                id: "k_001".into(),
+                name: "first".into(),
+                role: "viewer".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            APIKeySummary {
+                id: "k_002".into(),
+                name: "second".into(),
+                role: "developer".into(),
+                created_at: "2026-06-01T00:00:00Z".into(),
+            },
+        ];
+        let rendered = render_key_list(&keys, Some("k_002"));
+        // First row (k_001) should not have (current).
+        let k_001_line = rendered.lines().find(|l| l.contains("k_001")).unwrap();
+        assert!(
+            !k_001_line.contains("(current)"),
+            "first row should not be marked"
+        );
+        // Second row (k_002) must have (current).
+        let k_002_line = rendered.lines().find(|l| l.contains("k_002")).unwrap();
+        assert!(
+            k_002_line.contains("(current)"),
+            "second row must be marked (current)"
+        );
+    }
 }

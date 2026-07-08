@@ -110,6 +110,7 @@ pub fn run(
     level: Option<&str>,
     follow: bool,
     limit: u32,
+    offset: Option<u32>,
 ) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(app, state.as_ref())?;
@@ -136,10 +137,11 @@ pub fn run(
     } else {
         let resp = client
             .logs()
-            .list(&app_name, Some(&since_rfc), level, Some(limit))?;
+            .list(&app_name, Some(&since_rfc), level, Some(limit), offset)?;
         for entry in &resp.items {
             print_entry(entry, is_tty);
         }
+        maybe_print_next_page_hint(resp.next_offset);
         Ok(())
     }
 }
@@ -152,6 +154,7 @@ pub fn run(
     _level: Option<&str>,
     _follow: bool,
     _limit: u32,
+    _offset: Option<u32>,
 ) -> Result<()> {
     anyhow::bail!("logs requires network support; rebuild with --features network")
 }
@@ -210,7 +213,7 @@ fn run_follow(
 
         let resp = client
             .logs()
-            .list(app_name, Some(&since), level, Some(limit))?;
+            .list(app_name, Some(&since), level, Some(limit), None)?;
         if resp.items.is_empty() {
             // No new rows. Sleep interruptibly so SIGINT exits
             // promptly (up to FOLLOW_POLL_GRANULARITY instead of
@@ -436,6 +439,16 @@ fn chrono_parse_rfc3339(s: &str) -> Result<i64, ()> {
 
     let secs_of_day = (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
     Ok(days * 86_400 + secs_of_day)
+}
+
+/// Print a hint pointing at `--offset` when the response includes a
+/// `next_offset` field, indicating more results exist beyond this page.
+fn maybe_print_next_page_hint(next_offset: Option<u32>) {
+    if let Some(no) = next_offset {
+        output::hint(&format!(
+            "More entries available — run with `--offset {no}` for the next page"
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
