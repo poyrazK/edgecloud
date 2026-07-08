@@ -165,6 +165,8 @@ pub fn spawn_rate_limit_fetcher(
                 .await
                 {
                     Ok(Some(entry)) => {
+                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "success")
+                            .increment(1);
                         debug!(
                             tenant = %tenant_id,
                             app = %app_name,
@@ -175,12 +177,15 @@ pub fn spawn_rate_limit_fetcher(
                         cache.write().await.update(tenant_id, app_name, entry);
                     }
                     Ok(None) => {
+                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "not_found").increment(1);
                         // No override — app uses global defaults.
                         // Remove any stale override so render_routes
                         // falls through to RouteEntry/Config defaults.
                         cache.write().await.inner.remove(&(tenant_id, app_name));
                     }
                     Err(e) => {
+                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "failure")
+                            .increment(1);
                         // Transient failure — keep cached value.
                         debug!(
                             tenant = %tenant_id,

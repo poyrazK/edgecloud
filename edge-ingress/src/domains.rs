@@ -107,6 +107,7 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
         ticker.tick().await;
         match fetch_and_apply(&http, &url, &cfg.service_token, &table).await {
             Ok((added, removed)) => {
+                metrics::counter!("ingress.domain_poll.total", "status" => "success").increment(1);
                 // Reset on any success — the previous auth failures
                 // (if any) were transient, the token is working now.
                 consecutive_auth_errors = 0;
@@ -137,6 +138,8 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
                 };
                 let is_auth = matches!(status, Some(401) | Some(403));
                 if is_auth {
+                    metrics::counter!("ingress.domain_poll.total", "status" => "auth_error")
+                        .increment(1);
                     consecutive_auth_errors += 1;
                     if consecutive_auth_errors >= MAX_CONSECUTIVE_AUTH_ERRORS {
                         error!(
@@ -153,6 +156,8 @@ pub async fn run(cfg: Config, table: Arc<RoutingTable>, render_notify: Arc<Notif
                         "domain poll auth error; will retry"
                     );
                 } else {
+                    metrics::counter!("ingress.domain_poll.total", "status" => "failure")
+                        .increment(1);
                     // Transient error — reset the auth-error counter
                     // so a single 503 doesn't burn the budget.
                     consecutive_auth_errors = 0;
@@ -409,6 +414,7 @@ mod tests {
             service_token: "ignored".into(),
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
+            metrics_listen: ":9091".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
@@ -595,6 +601,7 @@ mod tests {
             service_token: "stale-token".into(),
             domain_poll_interval: poll,
             caddy_admin_listen: "localhost:2019".into(),
+            metrics_listen: ":9091".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),

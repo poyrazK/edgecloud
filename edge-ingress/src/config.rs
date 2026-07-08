@@ -63,6 +63,9 @@ pub struct Config {
     /// `0.0.0.0:2019` for Docker). Defaults to `localhost:2019` which
     /// matches Caddy's own default. Override with `CADDY_ADMIN_LISTEN`.
     pub caddy_admin_listen: String,
+    /// Listen address for the Prometheus /metrics HTTP endpoint
+    /// (e.g. `:9091`). Set via `INGRESS_METRICS_LISTEN` (default `:9091`).
+    pub metrics_listen: String,
     /// Default per-app rate limit in requests per second. 0 = disabled.
     /// Override with `RATE_LIMIT_RPS_DEFAULT`.
     pub rate_limit_rps_default: u32,
@@ -142,6 +145,8 @@ impl Config {
             domain_poll_interval,
             caddy_admin_listen: std::env::var("CADDY_ADMIN_LISTEN")
                 .unwrap_or_else(|_| "localhost:2019".into()),
+            metrics_listen: std::env::var("INGRESS_METRICS_LISTEN")
+                .unwrap_or_else(|_| ":9091".into()),
             rate_limit_rps_default: std::env::var("RATE_LIMIT_RPS_DEFAULT")
                 .unwrap_or_else(|_| "0".into())
                 .parse()
@@ -330,6 +335,7 @@ mod tests {
             "INGRESS_SERVICE_TOKEN",
             "DOMAIN_POLL_INTERVAL",
             "CADDY_ADMIN_LISTEN",
+            "INGRESS_METRICS_LISTEN",
         ] {
             unset_var(v);
         }
@@ -378,6 +384,7 @@ mod tests {
         assert_eq!(cfg.admin_token, None);
         assert_eq!(cfg.internal_token, None);
         assert_eq!(cfg.caddy_admin_listen, "localhost:2019");
+        assert_eq!(cfg.metrics_listen, ":9091");
 
         // 6. HTTP_TO_HTTPS=false
         set_required_vars();
@@ -445,6 +452,13 @@ mod tests {
         set_var("CONTROL_PLANE_API_URL", "http://cp.internal:8080");
         let cfg = Config::from_env().expect("api url test");
         assert_eq!(cfg.control_plane_api_url, "http://cp.internal:8080");
+
+        // 15. INGRESS_METRICS_LISTEN override
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("INGRESS_METRICS_LISTEN", "0.0.0.0:9092");
+        let cfg = Config::from_env().expect("metrics listen test");
+        assert_eq!(cfg.metrics_listen, "0.0.0.0:9092");
 
         // Clean up
         unset_all_config_vars();

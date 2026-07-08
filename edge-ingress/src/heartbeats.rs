@@ -109,11 +109,16 @@ pub async fn run(
     while let Some(msg) = subscription.next().await {
         match serde_json::from_slice::<HeartbeatMessage>(&msg.payload) {
             Ok(hb) => {
+                metrics::counter!("ingress.heartbeats.received", "region" => cfg.region.clone())
+                    .increment(1);
+                metrics::counter!("ingress.heartbeats.apps_total").increment(hb.apps.len() as u64);
                 if apply_heartbeat(&table, &hb).await {
+                    metrics::counter!("ingress.routes.changed").increment(1);
                     render_notify.notify_one();
                 }
             }
             Err(e) => {
+                metrics::counter!("ingress.heartbeats.parse_failed").increment(1);
                 warn!(err = %e, "failed to parse heartbeat; ignoring");
             }
         }
@@ -138,6 +143,7 @@ pub async fn run(
 pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> bool {
     let worker_addr = hb.worker_addr.as_deref().unwrap_or("");
     if worker_addr.is_empty() {
+        metrics::counter!("ingress.heartbeats.no_addr").increment(1);
         warn!("heartbeat has no worker_addr; cannot route any apps from it");
         return false;
     }
@@ -236,6 +242,7 @@ fn spawn_pruner(table: Arc<RoutingTable>, notify: Arc<Notify>) {
             ticker.tick().await;
             let removed = table.remove_stale(STALE_AFTER).await;
             if !removed.is_empty() {
+                metrics::counter!("ingress.pruner.removed_total").increment(removed.len() as u64);
                 warn!(?removed, "pruned stale routes");
                 notify.notify_one();
             }
@@ -254,8 +261,33 @@ async fn push_now(
     let fqdns = table.fqdn_snapshot().await;
     let traffic_cache = traffic_cache.read().await;
     let rate_limit_cache = rate_limit_cache.read().await;
+
+    // Set gauges from current state.
+    metrics::gauge!("ingress.routes.active").set(snap.len() as f64);
+    metrics::gauge!("ingress.fqdns.active").set(fqdns.len() as f64);
+
+    // Time the Caddyfile-JSON rendering.
+    let render_start = std::time::Instant::now();
     let json = render_routes(&snap, &fqdns, cfg, &traffic_cache, &rate_limit_cache);
-    caddy.load_config(&json).await
+    let render_dur = render_start.elapsed();
+    metrics::histogram!("ingress.caddy.render_duration_seconds").record(render_dur.as_secs_f64());
+
+    // Time the Caddy POST /load.
+    let load_start = std::time::Instant::now();
+    let result = caddy.load_config(&json).await;
+    let load_dur = load_start.elapsed();
+    metrics::histogram!("ingress.caddy.reload_duration_seconds").record(load_dur.as_secs_f64());
+
+    match &result {
+        Ok(()) => {
+            metrics::counter!("ingress.caddy.reload_total", "status" => "success").increment(1);
+        }
+        Err(_) => {
+            metrics::counter!("ingress.caddy.reload_total", "status" => "failure").increment(1);
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -505,6 +537,7 @@ mod tests {
             service_token: String::new(),
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
+            metrics_listen: ":9091".into(),
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),

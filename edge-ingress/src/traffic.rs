@@ -421,10 +421,13 @@ pub fn spawn_fetcher(
                 .await;
                 match outcome {
                     FetchOutcome::Ok(weights) => {
+                        metrics::counter!("ingress.traffic_fetch.total", "status" => "success")
+                            .increment(1);
                         let mut cache = cache.write().await;
                         cache.update(tenant_id.clone(), app_name.clone(), weights);
                     }
                     FetchOutcome::Unauthorized => {
+                        metrics::counter!("ingress.traffic_fetch.total", "status" => "unauthorized").increment(1);
                         if !tick_unauthorized_logged {
                             // EDGE_INTERNAL_TOKEN is unset on the control
                             // plane, or doesn't match what this ingress
@@ -444,6 +447,8 @@ pub fn spawn_fetcher(
                         }
                     }
                     FetchOutcome::Transient(reason) => {
+                        metrics::counter!("ingress.traffic_fetch.total", "status" => "failure")
+                            .increment(1);
                         // Per-app warn is fine here — transient is
                         // expected on network blips and a per-app line
                         // helps correlate with operator reports.

@@ -12,8 +12,10 @@
 //! Skips automatically when Docker is unavailable (no `/var/run/docker.sock`)
 //! or in CI environments (`CI` env var or `SKIP_INTEGRATION_TESTS=1`).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -48,10 +50,28 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         service_token: String::new(),
         domain_poll_interval: Duration::from_secs(30),
         caddy_admin_listen: "localhost:2019".into(),
+        metrics_listen: ":9091".into(),
         rate_limit_rps_default: 0,
         rate_limit_burst_default: 0,
         rate_limit_fetch_interval: Duration::from_secs(60),
     }
+}
+
+/// Install the Prometheus recorder globally exactly once across all
+/// integration tests. Returns the handle so tests can call
+/// `handle.render()` to assert metric names and values.
+fn install_metrics_recorder() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+    static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        OnceLock::new();
+    METRICS_HANDLE.get_or_init(|| {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // Install globally so the `metrics::counter!()` and similar macros
+        // in the production code actually record data. Since the OnceLock
+        // guards this, set_global_recorder is only called once.
+        let _ = metrics::set_global_recorder(recorder);
+        handle
+    })
 }
 
 /// Heartbeat published to NATS must reach the wiremock (Caddy admin stub)
@@ -152,6 +172,117 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     );
 
     // Stop the pipeline (it'll error out on the next drop — that's fine).
+    pipeline.abort();
+}
+
+/// After a full heartbeat pipeline run, the Prometheus handle must contain
+/// the expected metric names and values. This proves the instrumentation
+/// macros fire correctly through the real code paths.
+#[tokio::test]
+async fn metrics_are_recorded_through_heartbeat_pipeline() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let (_nats, nats_url) = start_nats().await;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/load"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
+
+    let cfg = test_config(nats_url.clone(), mock_server.uri());
+    let table = std::sync::Arc::new(RoutingTable::new());
+    let caddy = std::sync::Arc::new(
+        CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
+    );
+
+    let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let pipeline = tokio::spawn({
+        let run_cfg = cfg.clone();
+        let run_table = table.clone();
+        let run_caddy = caddy.clone();
+        let n = pipeline_notify.clone();
+        async move { heartbeats::run(run_cfg, run_table, run_caddy, n).await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish a heartbeat the pipeline can process.
+    let client = async_nats::connect(&nats_url)
+        .await
+        .expect("publish-side NATS connect");
+    let subject = format!("edgecloud.heartbeats.{}", cfg.region);
+    let payload = serde_json::json!({
+        "type": "heartbeat",
+        "timestamp": "2026-06-17T12:00:00Z",
+        "worker_id": "w_test",
+        "region": cfg.region,
+        "worker_addr": "203.0.113.10",
+        "apps": {
+            "myapp": {
+                "deployment_id": "d_test",
+                "status": "running",
+                "exit_code": null,
+                "request_count": 0,
+                "tenant_id": "t_acme",
+                "port": 8081u16,
+            }
+        }
+    })
+    .to_string();
+    client
+        .publish(subject, payload.into())
+        .await
+        .expect("publish heartbeat");
+    client.flush().await.expect("flush");
+
+    // Wait for the pipeline to process the heartbeat and trigger a reload.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Read recorded metrics from the handle.
+    let handle = install_metrics_recorder();
+    let output = handle.render();
+
+    // The boot push and heartbeat push should have produced reload attempts.
+    assert!(
+        output.contains("ingress_caddy_reload_total"),
+        "expected reload_total metric in render output:\n{output}"
+    );
+    assert!(
+        output.contains("ingress_caddy_reload_total{status=\"success\"}"),
+        "expected a success counter in render output:\n{output}"
+    );
+    // routes.active should be 1 (the one app).
+    assert!(
+        output.contains("ingress_routes_active 1"),
+        "expected routes_active = 1:\n{output}"
+    );
+    // fqdns.active should be 0 (no domain poller running).
+    assert!(
+        output.contains("ingress_fqdns_active 0"),
+        "expected fqdns_active = 0:\n{output}"
+    );
+    // heartbeats counter should have incremented (region tag).
+    assert!(
+        output.contains("ingress_heartbeats_received{region=\"test-region\"} 1"),
+        "expected one heartbeat received:\n{output}"
+    );
+
+    // Histogram buckets should exist for render and reload durations.
+    assert!(
+        output.contains("ingress_caddy_render_duration_seconds"),
+        "expected render duration histogram presence:\n{output}"
+    );
+    assert!(
+        output.contains("ingress_caddy_reload_duration_seconds"),
+        "expected reload duration histogram presence:\n{output}"
+    );
+
     pipeline.abort();
 }
 
