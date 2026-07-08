@@ -208,3 +208,71 @@ func TestEnvService_ListEnv_PropagatesError(t *testing.T) {
 		t.Errorf("error = %v, want %v", err, want)
 	}
 }
+
+func TestEnvService_DeleteEnv_HappyPath(t *testing.T) {
+	var called bool
+	repo := &mockEnvRepo{
+		deleteFn: func(ctx context.Context, tenantID, appName, key string) error {
+			called = true
+			return nil
+		},
+	}
+	svc := newEnvSvc(repo)
+	if err := svc.DeleteEnv(context.Background(), "t_1", "hello", "K"); err != nil {
+		t.Fatalf("DeleteEnv: %v", err)
+	}
+	if !called {
+		t.Error("repo.Delete was not called")
+	}
+}
+
+func TestEnvService_DeleteEnv_RepoError(t *testing.T) {
+	want := errors.New("delete failed")
+	repo := &mockEnvRepo{
+		deleteFn: func(ctx context.Context, tenantID, appName, key string) error {
+			return want
+		},
+	}
+	svc := newEnvSvc(repo)
+	if err := svc.DeleteEnv(context.Background(), "t_1", "hello", "K"); !errors.Is(err, want) {
+		t.Errorf("error = %v, want %v", err, want)
+	}
+}
+
+func TestEnvService_Decrypt_HappyPath(t *testing.T) {
+	sec, _ := NewSecretEncryptor(testMasterKey)
+	encrypted, _ := sec.Encrypt("secret-value")
+	svc := newEnvSvc(&mockEnvRepo{})
+	svc.SetSecretEncryptor(sec)
+	v, err := svc.Decrypt(encrypted)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if v != "secret-value" {
+		t.Errorf("Decrypt = %q, want 'secret-value'", v)
+	}
+}
+
+func TestEnvService_Decrypt_ReturnsAsIsForUnknownFormat(t *testing.T) {
+	sec, _ := NewSecretEncryptor(testMasterKey)
+	svc := newEnvSvc(&mockEnvRepo{})
+	svc.SetSecretEncryptor(sec)
+	v, err := svc.Decrypt("not-encrypted")
+	if err != nil {
+		t.Fatalf("Decrypt should not error on unknown format: %v", err)
+	}
+	if v != "not-encrypted" {
+		t.Errorf("Decrypt = %q, want 'not-encrypted'", v)
+	}
+}
+
+func TestEnvService_Decrypt_NilEncryptor(t *testing.T) {
+	svc := newEnvSvc(&mockEnvRepo{})
+	v, err := svc.Decrypt("plaintext")
+	if err != nil {
+		t.Fatalf("Decrypt with nil encryptor: %v", err)
+	}
+	if v != "plaintext" {
+		t.Errorf("Decrypt = %q, want 'plaintext'", v)
+	}
+}
