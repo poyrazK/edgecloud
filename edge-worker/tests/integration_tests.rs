@@ -951,8 +951,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         hostname_pinning_enabled: false,
         standby_pool_size: 10,
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -987,8 +987,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         hostname_pinning_enabled: false,
         standby_pool_size: 10,
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
