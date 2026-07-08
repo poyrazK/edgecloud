@@ -240,12 +240,12 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 
 func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	var hb struct {
-		Type           string          `json:"type"`
-		Timestamp      time.Time       `json:"timestamp"`
-		WorkerID       string          `json:"worker_id"`
-		Region         string          `json:"region"`
-		WorkerAddr     string          `json:"worker_addr"`
-		Apps           json.RawMessage `json:"apps"`
+		Type       string          `json:"type"`
+		Timestamp  time.Time       `json:"timestamp"`
+		WorkerID   string          `json:"worker_id"`
+		Region     string          `json:"region"`
+		WorkerAddr string          `json:"worker_addr"`
+		Apps       json.RawMessage `json:"apps"`
 		// TenantID is sent by the worker so the control plane can
 		// scope stability evaluation to the right row. Heartbeats
 		// from the same worker may carry different tenants (the
