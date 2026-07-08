@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::{ingress_host, Config};
+use crate::ratelimit::RateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry};
 use crate::traffic::TrafficSplitCache;
 
@@ -170,6 +171,7 @@ pub fn render_routes(
     fqdns: &[FqdnBinding],
     cfg: &Config,
     traffic_cache: &TrafficSplitCache,
+    rate_limit_cache: &RateLimitCache,
 ) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
@@ -222,18 +224,64 @@ pub fn render_routes(
                     .collect::<Vec<_>>())
             };
 
+            // Resolve effective rate limit for this route.
+            // Priority: per-app cache entry > RouteEntry field > Config default.
+            let first = group_sorted[0];
+            let cached = rate_limit_cache.get(tenant_id, app_name);
+            let rps = cached
+                .map(|e| e.rps)
+                .or(first.rate_limit_rps)
+                .or_else(|| {
+                    let d = cfg.rate_limit_rps_default;
+                    if d > 0 {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let burst = cached
+                .map(|e| e.burst)
+                .or(first.rate_limit_burst)
+                .or_else(|| {
+                    let d = cfg.rate_limit_burst_default;
+                    if d > 0 {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+
+            let mut handle_chain = Vec::new();
+
+            // Inject rate_limit handler when rps > 0.
+            if rps > 0 {
+                let burst = if burst > 0 { burst } else { rps };
+                handle_chain.push(json!({
+                    "handler": "rate_limit",
+                    "rates": {
+                        "rps": rps,
+                        "burst": burst,
+                    },
+                    "key": "{http.request.host}",
+                }));
+            }
+
+            handle_chain.push(json!({
+                "handler": "reverse_proxy",
+                "upstreams": upstreams,
+                "health_checks": {
+                    "active": {"uri": "/", "expect_status": 2}
+                }
+            }));
+
             json!({
                 "match": [{"host": [host]}],
                 "handle": [{
                     "handler": "subroute",
                     "routes": [{
-                        "handle": [{
-                            "handler": "reverse_proxy",
-                            "upstreams": upstreams,
-                            "health_checks": {
-                                "active": {"uri": "/", "expect_status": 2}
-                            }
-                        }]
+                        "handle": handle_chain,
                     }]
                 }],
                 "terminal": true
@@ -254,6 +302,22 @@ pub fn render_routes(
         })
         .collect();
 
+    // Build a (tenant, app) → rate limit lookup for FQDN routes.
+    let rate_limit_index: HashMap<(String, String), (u32, u32)> = entries
+        .iter()
+        .map(|e| {
+            let rps = e
+                .rate_limit_rps
+                .or(Some(cfg.rate_limit_rps_default))
+                .unwrap_or(0);
+            let burst = e
+                .rate_limit_burst
+                .or(Some(cfg.rate_limit_burst_default))
+                .unwrap_or(0);
+            ((e.tenant_id.clone(), e.app_name.clone()), (rps, burst))
+        })
+        .collect();
+
     // FQDN routes: sort by FQDN for deterministic output.
     let mut sorted_fqdns: Vec<&FqdnBinding> = fqdns.iter().collect();
     sorted_fqdns.sort_by(|a, b| a.fqdn.cmp(&b.fqdn));
@@ -267,24 +331,71 @@ pub fn render_routes(
         else {
             continue;
         };
+
+        // Resolve rate limit for this FQDN route.
+        // Priority: per-app cache entry > RouteEntry field > Config default.
+        let cached = rate_limit_cache.get(&b.tenant_id, &b.app_name);
+        let (fqdn_rps, fqdn_burst) = {
+            let entry = rate_limit_index.get(&(b.tenant_id.clone(), b.app_name.clone()));
+            let from_entry = entry.copied().unwrap_or((0, 0));
+            let rps = cached
+                .map(|e| e.rps)
+                .or(if from_entry.0 > 0 {
+                    Some(from_entry.0)
+                } else {
+                    None
+                })
+                .or_else(|| {
+                    let d = cfg.rate_limit_rps_default;
+                    if d > 0 {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let burst = cached
+                .map(|e| e.burst)
+                .or(if from_entry.1 > 0 {
+                    Some(from_entry.1)
+                } else {
+                    None
+                })
+                .or_else(|| {
+                    let d = cfg.rate_limit_burst_default;
+                    if d > 0 {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            (rps, burst)
+        };
+
+        let mut fqdn_handle_chain = Vec::new();
+        if fqdn_rps > 0 {
+            let burst = if fqdn_burst > 0 { fqdn_burst } else { fqdn_rps };
+            fqdn_handle_chain.push(json!({
+                "handler": "rate_limit",
+                "rates": { "rps": fqdn_rps, "burst": burst },
+                "key": "{http.request.host}",
+            }));
+        }
+        fqdn_handle_chain.push(json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
+            "health_checks": {
+                "active": {"uri": "/", "expect_status": 2}
+            }
+        }));
+
         routes.push(json!({
             "match": [{"host": [b.fqdn]}],
             "handle": [{
                 "handler": "subroute",
                 "routes": [{
-                    "handle": [{
-                        "handler": "reverse_proxy",
-                        "upstreams": [{"dial": format!("{}:{}", worker_addr, port)}],
-                        // Same liveness probe as the synthetic-host
-                        // route above: without it, Caddy only marks
-                        // the upstream unhealthy when an active
-                        // connection fails, so custom-domain traffic
-                        // gets routed to dead workers until the next
-                        // failure. See PR #133 review finding #3.
-                        "health_checks": {
-                            "active": {"uri": "/", "expect_status": 2}
-                        }
-                    }]
+                    "handle": fqdn_handle_chain,
                 }]
             }],
             "terminal": true,
@@ -360,9 +471,14 @@ pub fn render_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ratelimit::RateLimitCache;
     use crate::routing::{FqdnBinding, RouteEntry};
     use crate::traffic::TrafficSplitCache;
     use std::time::{Duration, Instant};
+
+    fn test_rate_limit_cache() -> RateLimitCache {
+        RateLimitCache::default()
+    }
 
     fn entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
         RouteEntry {
@@ -372,6 +488,8 @@ mod tests {
             weight: 100,
             worker_addr: addr.to_string(),
             port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
             last_seen: Instant::now(),
         }
     }
@@ -391,6 +509,8 @@ mod tests {
             weight,
             worker_addr: addr.to_string(),
             port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
             last_seen: Instant::now(),
         }
     }
@@ -422,6 +542,9 @@ mod tests {
             service_token: String::new(),
             domain_poll_interval: Duration::from_secs(30),
             caddy_admin_listen: "localhost:2019".into(),
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
         }
     }
 
@@ -429,7 +552,7 @@ mod tests {
     fn render_empty_table_still_emits_servers_and_tls() {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache);
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
         assert!(servers.contains_key(SERVER_NAME_HTTP));
@@ -446,7 +569,8 @@ mod tests {
     #[test]
     fn wildcard_cert_takes_precedence_over_auto_tls() {
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache);
+        let rl_cache = test_rate_limit_cache();
+        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache);
         // Caddy 2.11 removed the `app.http.automatic_https` field.
         // The wildcard cert in `tls.certificates.load_files` takes
         // precedence automatically — no need to disable auto-TLS.
@@ -461,7 +585,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let mut cfg = test_cfg();
         cfg.caddy_admin_listen = "0.0.0.0:2019".into();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache);
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
         assert_eq!(
             cfg_json["admin"]["listen"], "0.0.0.0:2019",
             "render_routes must include admin.listen matching Config so \
@@ -478,7 +602,7 @@ mod tests {
             entry("t_acme", "web", "1.2.3.4", 8082),
             entry("t_globex", "api", "5.6.7.8", 9000),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache);
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -521,7 +645,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 95),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 5),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache);
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -556,7 +680,7 @@ mod tests {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
         let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache);
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         assert_eq!(upstreams.as_array().unwrap().len(), 1);
@@ -574,7 +698,7 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.http_to_https = false;
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache);
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
@@ -590,7 +714,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 0),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache);
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -626,7 +750,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache);
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -654,7 +778,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache);
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -688,7 +812,7 @@ mod tests {
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         // FQDN binding is for t_other/web but the entries only have t_acme/api.
         let bindings = vec![fqdn("t_other", "web", "web.example.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache);
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -702,7 +826,8 @@ mod tests {
     #[test]
     fn default_only_mode_omits_on_demand_ask_url() {
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache);
+        let rl_cache = test_rate_limit_cache();
+        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache);
         assert!(
             cfg_json["apps"]["tls"].get("automation").is_none(),
             "no automation block when control_plane_url is empty"
@@ -716,7 +841,7 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.control_plane_url = "http://control-plane:8080".into();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache);
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
         assert_eq!(
             cfg_json["apps"]["tls"]["automation"]["on_demand"]["ask"],
             "http://control-plane:8080/api/internal/tls-allowed"
@@ -735,7 +860,7 @@ mod tests {
             fqdn("t_acme", "api", "alpha.example.com"),
             fqdn("t_acme", "api", "mike.example.com"),
         ];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache);
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -764,7 +889,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache);
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();

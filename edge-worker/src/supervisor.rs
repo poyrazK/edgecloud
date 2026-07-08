@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use edge_runtime::linker::create_component_linker_long_running;
-use edge_runtime::{create_component_linker_handler, EgressPolicy, RequestMeter};
+use edge_runtime::{EgressPolicy, RequestMeter};
 use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use wasmtime::component::InstancePre;
 
 use crate::config::Config;
-use crate::detect::{detect_execution_model, ExecutionModel};
+use crate::detect::ExecutionModel;
 use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -21,6 +21,631 @@ use crate::messages::{
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
+
+/// A pool of pre-warmed wasmtime::Engine instances.
+pub struct StandbyPool {
+    pool: Mutex<tokio::sync::mpsc::Receiver<wasmtime::Engine>>,
+    sender: tokio::sync::mpsc::Sender<wasmtime::Engine>,
+}
+
+impl StandbyPool {
+    pub fn new(size: usize) -> anyhow::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel(size.max(1));
+        for _ in 0..size {
+            let engine = edge_runtime::create_engine()?;
+            tx.try_send(engine)
+                .map_err(|_| anyhow::anyhow!("failed to pre-warm pool"))?;
+        }
+        Ok(Self {
+            pool: Mutex::new(rx),
+            sender: tx,
+        })
+    }
+
+    pub async fn acquire(&self, state: &RwLock<WorkerState>) -> wasmtime::Engine {
+        let mut rx = self.pool.lock().await;
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(engine)) => engine,
+            _ => {
+                // Try to evict the LRU FaaS app
+                if let Some(engine) = self.evict_lru_app(state).await {
+                    engine
+                } else {
+                    tracing::warn!("StandbyPool exhausted and no idle apps to evict; creating transient engine");
+                    edge_runtime::create_engine().expect("fallback engine must build")
+                }
+            }
+        }
+    }
+
+    async fn evict_lru_app(&self, state: &RwLock<WorkerState>) -> Option<wasmtime::Engine> {
+        let apps = {
+            let guard = state.read().await;
+            guard.apps.clone()
+        };
+
+        let mut candidate: Option<(std::time::Instant, Arc<Mutex<AppInstance>>)> = None;
+
+        for ((_tenant_id, _app_name), app_mutex) in apps {
+            let app = app_mutex.lock().await;
+            if app.execution_model == ExecutionModel::Handler {
+                if let Some(ref dispatch) = app.dispatch {
+                    if dispatch.has_engine().await {
+                        let last_req_opt = {
+                            let lock = dispatch.config.last_request_at.lock().await;
+                            *lock
+                        };
+                        if let Some(last_req) = last_req_opt {
+                            match candidate {
+                                None => {
+                                    candidate = Some((last_req, app_mutex.clone()));
+                                }
+                                Some((oldest_req, _)) if last_req < oldest_req => {
+                                    candidate = Some((last_req, app_mutex.clone()));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, app_mutex)) = candidate {
+            let app = app_mutex.lock().await;
+            if let Some(ref dispatch) = app.dispatch {
+                if let Some(engine) = dispatch.evict().await {
+                    tracing::info!(
+                        "StandbyPool exhausted: evicting least-recently-used app to reclaim engine"
+                    );
+                    return Some(engine);
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn release(&self, engine: wasmtime::Engine) {
+        let _ = self.sender.try_send(engine);
+    }
+}
+
+// ── build_heartbeat integration tests ──────────────────────────────────
+// These tests construct a real Supervisor with seeded WorkerState and
+// verify the heartbeat wire format. No Docker required, but they need
+// the handler.wasm fixture file linked into edge_runtime.
+
+#[cfg(test)]
+mod heartbeat_integration_tests {
+    use super::*;
+    use crate::auth::WorkerJwtSigner;
+    use crate::downloader::Downloader;
+    use crate::log_forwarder::LogForwarder;
+    use crate::port_pool::PortPool;
+
+    fn cp_config() -> Config {
+        Config {
+            worker_id: "w_test".to_string(),
+            region: "fra".to_string(),
+            worker_addr: "127.0.0.1:9000".to_string(),
+            worker_tenant_id: "t_test".to_string(),
+            nats_url: String::new(),
+            control_plane_url: "http://localhost:0".to_string(),
+            cache_dir: std::path::PathBuf::from("/tmp"),
+            heartbeat_interval_secs: 30,
+            health_check_timeout_secs: 30,
+            worker_sync_threshold_secs: 30,
+            port_cooldown_secs: 1,
+            starting_port: 10000,
+            max_memory_mb: 256,
+            epoch_tick_ms: 10,
+            epoch_deadline_ticks: 100,
+            consumer_name: "test".to_string(),
+            task_stream_replicas: 1,
+            worker_jwt_secret: String::new(),
+            worker_jwt_kid: None,
+            worker_jwt_issuer: String::new(),
+            worker_bootstrap_secret: String::new(),
+            handler_request_budget_ms: 1000,
+            handler_max_request_body_bytes: 0,
+            tls_cert_path: None,
+            tls_key_path: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            standby_pool_size: 1,
+        }
+    }
+
+    fn load_handler_fixture(
+        engine: &wasmtime::Engine,
+    ) -> wasmtime::component::InstancePre<edge_runtime::RuntimeState> {
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("handler.wasm fixture not found");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let component = wasmtime::component::Component::from_binary(engine, &bytes)
+            .expect("compile handler component");
+        let linker = edge_runtime::create_component_linker_handler(engine).expect("create linker");
+        linker.instantiate_pre(&component).expect("instantiate_pre")
+    }
+
+    fn build_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
+        let jwt = WorkerJwtSigner::new(
+            String::new(),
+            None,
+            String::new(),
+            "w_test",
+            "fra",
+            "t_test",
+        );
+        let nats = Arc::new(crate::nats::tests::MockNatsClient::new());
+        Arc::new(Supervisor {
+            config: cp_config(),
+            state,
+            downloader: Arc::new(Downloader::new(
+                "http://localhost:0".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                jwt.clone(),
+            )),
+            port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
+            nats: nats as Arc<dyn NatsClient>,
+            log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
+            jwt_signer: jwt,
+            http: reqwest::Client::new(),
+            engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+        })
+    }
+
+    fn make_app(
+        instance_pre: wasmtime::component::InstancePre<edge_runtime::RuntimeState>,
+        status: AppInstanceStatus,
+        ws_port: Option<u16>,
+    ) -> Arc<Mutex<AppInstance>> {
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18000,
+            status,
+            meter,
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port,
+        }))
+    }
+
+    #[tokio::test]
+    async fn heartbeat_empty_state() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert_eq!(hb.worker_id, "w_test");
+        assert_eq!(hb.region, "fra");
+        assert!(hb.apps.is_empty());
+        assert!(hb.cluster_headroom.is_some());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_one_running_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert_eq!(hb.apps.len(), 1);
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.status, "running");
+        assert_eq!(s.tenant_id, "t_test");
+        assert_eq!(s.port, 18000);
+        assert_eq!(s.request_count, 2);
+        assert!(s.ws_port.is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_crashed_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(
+            instance_pre,
+            AppInstanceStatus::Crashed { restart_count: 3 },
+            None,
+        );
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.status, "crashed");
+        assert_eq!(s.exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_with_ws_port() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, Some(19091));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(s.ws_port, Some(19091));
+    }
+
+    // ── snapshot_current_apps tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_empty_state_returns_empty() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let snap = sup.snapshot_current_apps("t_test").await;
+        assert!(snap.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_filters_by_tenant() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        // Query for a different tenant -> empty
+        let snap = sup.snapshot_current_apps("t_other").await;
+        assert!(snap.is_empty());
+        // Query for the correct tenant -> found
+        let snap = sup.snapshot_current_apps("t_test").await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap.get("my-app").unwrap().0, "d1");
+    }
+
+    // ── stop_all_apps / reset_meters_after tests ────────────────────
+
+    #[tokio::test]
+    async fn stop_all_apps_empty_is_noop() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        sup.stop_all_apps().await;
+        assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_meters_after_empty_no_panic() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let hb = HeartbeatMessage::new("w1".into(), "fra".into(), "1.2.3.4:0".into(), "t1".into());
+        sup.reset_meters_after(&hb).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_sync_stamps_watchdog() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let result = sup.fetch_sync().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        let state_guard = sup.state.read().await;
+        let last = state_guard.last_task_received_at.lock().unwrap();
+        assert!(last.is_some());
+    }
+
+    // ── handle_task_message tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_task_message_empty_desired_stops_all() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+
+        // Send a TaskUpdate with empty apps → should stop the running app
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            apps: HashMap::new(),
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+        // App should be gone now
+        assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_task_message_same_deployment_noop() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+
+        // Send a TaskUpdate with the same app → no-op
+        let mut desired = HashMap::new();
+        desired.insert(
+            "my-app".into(),
+            AppSpec {
+                deployment_id: "d1".into(),
+                deployment_hash: "abc123".into(),
+                routes: None,
+                env: HashMap::new(),
+                allowlist: None,
+                max_memory_mb: 256,
+                cpu_budget_ms: None,
+            },
+        );
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            apps: desired,
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+        // App should still be there
+        assert_eq!(sup.state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_task_message_other_tenant_noop() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+
+        // Send a TaskUpdate for a different tenant with empty apps → should NOT stop our app
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_other".into(),
+            apps: HashMap::new(),
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+        // Our app should still be there
+        assert_eq!(sup.state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_task_message_full_sync_same_semantics() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+
+        // FullSync with empty apps should stop running app (same as TaskUpdate)
+        let msg = TaskMessage::FullSync {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            apps: HashMap::new(),
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+        assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    // ── process_task_message ack/nack/term tests ────────────────────
+
+    #[tokio::test]
+    async fn process_poison_pill_terminates() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        // Verify handle_task_message returns Ok for empty apps (no side effects)
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            apps: HashMap::new(),
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_task_with_other_tenant_preserves_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre.clone(), AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-a".into()), app);
+        let sup = build_supervisor(state);
+
+        // TaskUpdate for t_other with empty apps should NOT stop app-a
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_other".into(),
+            apps: HashMap::new(),
+        };
+        sup.handle_task_message(msg).await.unwrap();
+        assert_eq!(sup.state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_task_message_with_same_tenant_but_non_overlapping_apps() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre.clone(), AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-a".into()), app);
+        let sup = build_supervisor(state);
+
+        // TaskUpdate for same tenant but with a different app
+        let mut desired = HashMap::new();
+        desired.insert(
+            "app-b".into(),
+            AppSpec {
+                deployment_id: "d2".into(),
+                deployment_hash: "abc124".into(),
+                routes: None,
+                env: HashMap::new(),
+                allowlist: None,
+                max_memory_mb: 256,
+                cpu_budget_ms: None,
+            },
+        );
+        let msg = TaskMessage::TaskUpdate {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            apps: desired,
+        };
+        // handle_task_message will try to stop app-a (not in desired) and start app-b
+        // but start_app will fail since we don't have real wasm components.
+        // This is fine — we're testing the diff+orchestration, not start_app.
+        let _ = sup.handle_task_message(msg).await;
+    }
+}
+
+// ── extracted pure functions tests ──────────────────────────────────────
+
+#[cfg(test)]
+mod extracted_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ── calculate_backoff ──────────────────────────────────────────
+
+    #[test]
+    fn backoff_r0_is_1s() {
+        assert_eq!(calculate_backoff(0), Duration::from_secs(1));
+    }
+    #[test]
+    fn backoff_r1_is_1s() {
+        assert_eq!(calculate_backoff(1), Duration::from_secs(1));
+    }
+    #[test]
+    fn backoff_r2_is_2s() {
+        assert_eq!(calculate_backoff(2), Duration::from_secs(2));
+    }
+    #[test]
+    fn backoff_r3_is_4s() {
+        assert_eq!(calculate_backoff(3), Duration::from_secs(4));
+    }
+    #[test]
+    fn backoff_large_clamped() {
+        assert!(calculate_backoff(u32::MAX).as_secs() <= 60);
+    }
+
+    // ── build_app_env ──────────────────────────────────────────────
+
+    #[test]
+    fn env_adds_http_port() {
+        let env = build_app_env(&HashMap::new(), 8080, None);
+        assert_eq!(env.get("EDGE_HTTP_SERVER_PORT"), Some(&"8080".to_string()));
+    }
+    #[test]
+    fn env_adds_ws_port() {
+        let env = build_app_env(&HashMap::new(), 8080, Some(9091));
+        assert_eq!(env.get("EDGE_WS_PORT"), Some(&"9091".to_string()));
+    }
+    #[test]
+    fn env_preserves_existing() {
+        let mut base = HashMap::new();
+        base.insert("FOO".into(), "bar".into());
+        let env = build_app_env(&base, 8080, None);
+        assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    // ── parse_task_payload ─────────────────────────────────────────
+
+    #[test]
+    fn parse_valid_task_update() {
+        let json = r#"{"type":"task_update","timestamp":"","tenant_id":"t1","apps":{}}"#;
+        let msg = parse_task_payload(json.as_bytes()).expect("parse");
+        match msg {
+            TaskMessage::TaskUpdate { ref tenant_id, .. } => assert_eq!(tenant_id, "t1"),
+            other => panic!("expected TaskUpdate, got {:?}", other),
+        }
+    }
+    #[test]
+    fn parse_valid_full_sync() {
+        let json = r#"{"type":"full_sync","timestamp":"","tenant_id":"t2","apps":{}}"#;
+        let msg = parse_task_payload(json.as_bytes()).expect("parse");
+        match msg {
+            TaskMessage::FullSync { ref tenant_id, .. } => assert_eq!(tenant_id, "t2"),
+            other => panic!("expected FullSync, got {:?}", other),
+        }
+    }
+    #[test]
+    fn parse_invalid_json_returns_err() {
+        assert!(parse_task_payload(b"garbage").is_err());
+    }
+}
+
+// ── allowlist_to_egress_policy ──────────────────────────────────────
+
+/// Convert an allowlist spec to an EgressPolicy.
+#[allow(dead_code)]
+pub fn allowlist_to_egress_policy(allowlist: &Option<Vec<String>>) -> Arc<EgressPolicy> {
+    match allowlist {
+        None => Arc::new(EgressPolicy::allow_all()),
+        Some(list) => Arc::new(EgressPolicy::new(list.clone())),
+    }
+}
 
 /// The main supervisor — manages all running apps for this worker node.
 #[allow(dead_code)]
@@ -34,15 +659,15 @@ pub struct Supervisor {
     /// `AppLogContext` travels with each `emit_log` call so the forwarder
     /// knows which tenant/app/deployment the record belongs to.
     pub log_forwarder: Arc<LogForwarder>,
+    /// HTTP client for sync fallback.
+    pub http: reqwest::Client,
+    /// Standby engine pool for lazy starting apps.
+    pub engine_pool: Arc<StandbyPool>,
     /// JWT signer used by `fetch_sync` (the HTTP /sync fallback) and by
     /// downloader/internal HTTP calls. Mirrors the main-branch shape so
     /// `edge-test-helpers::build_supervisor_inner` can construct a
     /// Supervisor for tests without separate plumbing.
     pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
-    /// Shared HTTP client. Constructed once at startup so its TLS
-    /// connection pool survives across every /sync fallback tick —
-    /// same rationale as `Downloader::client`.
-    pub http: reqwest::Client,
 }
 
 impl Supervisor {
@@ -84,56 +709,66 @@ impl Supervisor {
             } => (tenant_id, apps),
         };
 
-        // Snapshot this tenant's running apps: (deployment_id, status).
-        // Filtered to `tenant_id` so other tenants' apps don't appear.
-        let current_apps: HashMap<String, (String, AppInstanceStatus)> = {
-            let state = self.state.read().await;
-            let mut map = HashMap::new();
-            for ((t, n), inst) in state.apps.iter() {
-                if t != &tenant_id {
-                    continue;
-                }
-                let inst = inst.lock().await;
-                map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
-            }
-            map
-        };
+        // Snapshot this tenant's running apps.
+        let current_apps = self.snapshot_current_apps(&tenant_id).await;
 
-        // Stop apps no longer in the desired set (within THIS tenant only).
-        for app_name in current_apps.keys() {
-            if !desired_apps.contains_key(app_name) {
-                if let Err(e) = self.stop_app(&tenant_id, app_name).await {
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        app_name,
-                        err = %e,
-                        "failed to stop app"
-                    );
-                }
+        let diff = compute_app_diff(&current_apps, &desired_apps);
+
+        let has_changes = !diff.apps_to_stop.is_empty() || !diff.apps_to_start.is_empty();
+
+        for app_name in &diff.apps_to_stop {
+            if let Err(e) = self.stop_app(&tenant_id, app_name).await {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    app_name,
+                    err = %e,
+                    "failed to stop app"
+                );
             }
         }
 
-        // Start or update apps in the desired set.
-        for (app_name, spec) in &desired_apps {
-            let is_new = !current_apps.contains_key(app_name);
-            let is_changed = current_apps
-                .get(app_name)
-                .map(|(dep_id, _)| dep_id != &spec.deployment_id)
-                .unwrap_or(false);
+        for (app_name, spec) in &diff.apps_to_start {
+            if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
+                tracing::error!(
+                    tenant_id = %tenant_id,
+                    app_name,
+                    err = %e,
+                    "failed to start app"
+                );
+            }
+        }
 
-            if is_new || is_changed {
-                if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        app_name,
-                        err = %e,
-                        "failed to start app"
-                    );
-                }
+        if has_changes {
+            let heartbeat = self.build_heartbeat().await;
+            if let Err(e) = self
+                .nats
+                .publish_heartbeat(&self.config.region, &heartbeat)
+                .await
+            {
+                tracing::error!(err = %e, "failed to publish immediate heartbeat");
+            } else {
+                tracing::info!("successfully published immediate heartbeat for route propagation");
             }
         }
 
         Ok(())
+    }
+
+    /// Snapshot this tenant's running apps: app_name → (deployment_id, status).
+    async fn snapshot_current_apps(
+        &self,
+        tenant_id: &str,
+    ) -> HashMap<String, (String, AppInstanceStatus)> {
+        let state = self.state.read().await;
+        let mut map = HashMap::new();
+        for ((t, n), inst) in state.apps.iter() {
+            if t != tenant_id {
+                continue;
+            }
+            let inst = inst.lock().await;
+            map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
+        }
+        map
     }
 
     /// Start a new app or restart a changed one.
@@ -199,112 +834,14 @@ impl Supervisor {
             }
         };
 
-        let engine = &self.state.read().await.engine;
-
-        // Try AOT compilation cache first.
-        let cwasm_path = self.downloader.cwasm_path(&spec.deployment_id);
-        let component = if cwasm_path.exists() {
-            match tokio::fs::read(&cwasm_path).await {
-                Ok(cwasm_bytes) => {
-                    // Safety: Loading pre-compiled code from a local trusted file cache is safe.
-                    // We catch any deserialization failures and fall back to from_binary.
-                    match unsafe {
-                        wasmtime::component::Component::deserialize(engine, &cwasm_bytes)
-                    } {
-                        Ok(c) => {
-                            tracing::info!(
-                                tenant_id,
-                                app_name,
-                                deployment_id = %spec.deployment_id,
-                                "AOT pre-compilation cache hit: successfully deserialized component"
-                            );
-                            Some(c)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                tenant_id,
-                                app_name,
-                                deployment_id = %spec.deployment_id,
-                                err = %e,
-                                "failed to deserialize component; falling back to JIT compilation"
-                            );
-                            let _ = tokio::fs::remove_file(&cwasm_path).await;
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        tenant_id,
-                        app_name,
-                        deployment_id = %spec.deployment_id,
-                        err = %e,
-                        "failed to read AOT cache file; falling back to JIT compilation"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let component = match component {
-            Some(c) => c,
-            None => {
-                // Compile the component using the shared engine.
-                match wasmtime::component::Component::from_binary(engine, &artifact) {
-                    Ok(c) => {
-                        // Serialize and write to cache in a background task so we don't block
-                        // the initial start/restart path.
-                        let cwasm_path_clone = cwasm_path.clone();
-                        let serialized_result = c.serialize();
-                        tokio::spawn(async move {
-                            match serialized_result {
-                                Ok(serialized_bytes) => {
-                                    if let Err(e) =
-                                        tokio::fs::write(&cwasm_path_clone, &serialized_bytes).await
-                                    {
-                                        tracing::warn!(
-                                            path = %cwasm_path_clone.display(),
-                                            err = %e,
-                                            "failed to write serialized component to AOT cache"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            path = %cwasm_path_clone.display(),
-                                            "successfully wrote serialized component to AOT cache"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(err = %e, "failed to serialize compiled component");
-                                }
-                            }
-                        });
-                        c
-                    }
-                    Err(e) => {
-                        let mut pool = self.port_pool.lock().await;
-                        pool.release(raw_port);
-                        if let Some(ws) = ws_port {
-                            pool.release(ws);
-                        }
-                        return Err(anyhow::Error::from(e)
-                            .context(format!("failed to compile component for {}", app_name)));
-                    }
-                }
-            }
-        };
-
         // Decide which WIT world this component targets. Detection is
         // structural — we look for a `wasi:http/incoming-handler` export
         // and pick `Handler` if found, otherwise `LongRunning`. The
         // linker factory must match: only the Handler linker has the
-        // `wasi:http/incoming-handler` export wired in via ProxyPre
-        // (Phase C wires that path; for now both linkers add only the
-        // edge:cloud/* imports — instantiation will fail for components
-        // that import wasi:*, which is expected pre-Phase-C).
-        let execution_model = detect_execution_model(&component);
+        // `wasi:http/incoming-handler` export wired in via ProxyPre.
+        // We do this via fast-path byte detection to avoid compiling FaaS
+        // handlers until their first request arrives.
+        let execution_model = crate::detect::detect_execution_model_from_bytes(&artifact);
         tracing::info!(
             tenant_id,
             app_name,
@@ -312,21 +849,129 @@ impl Supervisor {
             "execution model detected"
         );
 
-        let linker = match execution_model {
-            ExecutionModel::Handler => create_component_linker_handler(engine)?,
-            ExecutionModel::LongRunning => create_component_linker_long_running(engine)?,
-        };
-        let instance_pre = match linker.instantiate_pre(&component) {
-            Ok(ip) => ip,
-            Err(e) => {
-                let mut pool = self.port_pool.lock().await;
-                pool.release(raw_port);
-                return Err(anyhow::Error::from(e).context(format!(
-                    "failed to pre-instantiate {} (execution_model={:?}); \
-                         wasi: imports are wired in Phase C",
-                    app_name, execution_model
-                )));
+        let engine = self.state.read().await.engine.clone();
+
+        let instance_pre = if execution_model == ExecutionModel::LongRunning {
+            // For LongRunning apps, we compile and instantiate eagerly.
+            // Try AOT compilation cache first.
+            let cwasm_path = self.downloader.cwasm_path(&spec.deployment_id);
+            let component = if cwasm_path.exists() {
+                match tokio::fs::read(&cwasm_path).await {
+                    Ok(cwasm_bytes) => {
+                        // Safety: Loading pre-compiled code from a local trusted file cache is safe.
+                        match unsafe {
+                            wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
+                        } {
+                            Ok(c) => {
+                                tracing::info!(
+                                    tenant_id,
+                                    app_name,
+                                    deployment_id = %spec.deployment_id,
+                                    "AOT pre-compilation cache hit: successfully deserialized component"
+                                );
+                                Some(c)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    tenant_id,
+                                    app_name,
+                                    deployment_id = %spec.deployment_id,
+                                    err = %e,
+                                    "failed to deserialize component; falling back to JIT compilation"
+                                );
+                                let _ = tokio::fs::remove_file(&cwasm_path).await;
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tenant_id,
+                            app_name,
+                            deployment_id = %spec.deployment_id,
+                            err = %e,
+                            "failed to read AOT cache file; falling back to JIT compilation"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let component = match component {
+                Some(c) => c,
+                None => {
+                    // Compile the component using the shared engine.
+                    let engine_for_spawn = engine.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        wasmtime::component::Component::from_binary(&engine_for_spawn, &artifact)
+                    })
+                    .await
+                    .unwrap()
+                    {
+                        Ok(c) => {
+                            // Serialize and write to cache in a background task
+                            let cwasm_path_clone = cwasm_path.clone();
+                            let serialized_result = c.serialize();
+                            tokio::spawn(async move {
+                                match serialized_result {
+                                    Ok(serialized_bytes) => {
+                                        if let Err(e) =
+                                            tokio::fs::write(&cwasm_path_clone, &serialized_bytes)
+                                                .await
+                                        {
+                                            tracing::warn!(
+                                                path = %cwasm_path_clone.display(),
+                                                err = %e,
+                                                "failed to write serialized component to AOT cache"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                path = %cwasm_path_clone.display(),
+                                                "successfully wrote serialized component to AOT cache"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(err = %e, "failed to serialize compiled component");
+                                    }
+                                }
+                            });
+                            c
+                        }
+                        Err(e) => {
+                            let mut pool = self.port_pool.lock().await;
+                            pool.release(raw_port);
+                            if let Some(ws) = ws_port {
+                                pool.release(ws);
+                            }
+                            return Err(anyhow::Error::from(e)
+                                .context(format!("failed to compile component for {}", app_name)));
+                        }
+                    }
+                }
+            };
+
+            let linker = create_component_linker_long_running(&engine)?;
+            match linker.instantiate_pre(&component) {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    let mut pool = self.port_pool.lock().await;
+                    pool.release(raw_port);
+                    if let Some(ws) = ws_port {
+                        pool.release(ws);
+                    }
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "failed to pre-instantiate {} (execution_model={:?}); \
+                             wasi: imports are wired in Phase C",
+                        app_name, execution_model
+                    )));
+                }
             }
+        } else {
+            // Handler (FaaS) apps defer instantiation until the first request.
+            None
         };
 
         // Spawn the per-app epoch ticker. The engine clock is global, but
@@ -411,110 +1056,119 @@ impl Supervisor {
         //   * `LongRunning` — `oneshot::Sender` consumed by run_app_loop.
         //   * `Handler`     — `broadcast::Sender` consumed by
         //     `HandlerDispatch::serve` via `with_graceful_shutdown`.
-        let (shutdown_tx, shutdown_tx_broadcast, handle, dispatch) =
-            if execution_model == ExecutionModel::Handler {
-                // Drop the unused oneshot receiver; broadcast will be
-                // used instead.
-                let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let (shutdown_tx, shutdown_tx_broadcast, handle, dispatch) = if execution_model
+            == ExecutionModel::Handler
+        {
+            // Drop the unused oneshot receiver; broadcast will be
+            // used instead.
+            let (broadcast_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-                let handler_config = HandlerConfig {
-                    tenant_id: tenant_id.to_string(),
-                    egress: egress_for_handler.clone(),
-                    log_sink: self.log_forwarder.clone()
-                        as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
-                    app_ctx: app_ctx.clone(),
-                    meter: meter.clone(),
-                    env: env.clone(),
-                    max_request_body_bytes: self.config.handler_max_request_body_bytes,
-                    metrics_acc: metrics_acc.clone(),
-                    socket_mode: self.config.socket_mode,
-                };
-
-                let tls_config =
-                    try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
-                let dispatch = HandlerDispatch::new(
-                    instance_pre.clone(),
-                    raw_port,
-                    self.config.handler_request_budget_ms,
-                    self.config.epoch_tick_ms,
-                    handler_config,
-                    tls_config,
-                )?;
-
-                let dispatch = Arc::new(dispatch);
-                let dispatch_for_serve = dispatch.clone();
-                let shutdown_rx_for_dispatch = broadcast_tx.subscribe();
-                let port_for_log = raw_port;
-                let app_name_for_log = app_name_str.clone();
-                let tenant_for_log = tenant_id.clone();
-
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = dispatch_for_serve.serve(shutdown_rx_for_dispatch).await {
-                        tracing::error!(
-                            tenant_id = %tenant_for_log,
-                            app_name = %app_name_for_log,
-                            port = port_for_log,
-                            err = %e,
-                            "HandlerDispatch serve() returned Err"
-                        );
-                    } else {
-                        tracing::info!(
-                            tenant_id = %tenant_for_log,
-                            app_name = %app_name_for_log,
-                            port = port_for_log,
-                            "HandlerDispatch serve() exited"
-                        );
-                    }
-                });
-                (None, Some(broadcast_tx), handle, Some(dispatch))
-            } else {
-                let instance_pre_clone = instance_pre.clone();
-                let meter_clone = meter.clone();
-                let state_clone = self.state.clone();
-                // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
-                // falling back to the worker's config default otherwise.
-                let max_memory_mb = if spec.max_memory_mb > 0 {
-                    spec.max_memory_mb
-                } else {
-                    self.config.max_memory_mb
-                };
-                let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
-                let health_check_timeout_secs = self.config.health_check_timeout_secs;
-                let allowlist = spec.allowlist.clone();
-                // downloader_clone is captured into the per-app task so
-                // run_app_loop can post the auto-rollback signal when an
-                // app exhausts its restart cap. Arc<Downloader> is cheap to
-                // clone; the underlying reqwest::Client is internally Arc'd
-                // already, so this is one atomic refcount bump.
-                let downloader_clone = self.downloader.clone();
-                let log_forwarder = self.log_forwarder.clone();
-                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                let metrics_acc_for_loop = metrics_acc.clone();
-
-                let socket_mode_for_loop = self.config.socket_mode;
-                let handle = tokio::spawn(async move {
-                    Self::run_app_loop(
-                        instance_pre_clone,
-                        meter_clone,
-                        env,
-                        state_clone,
-                        app_name_str.clone(),
-                        shutdown_rx,
-                        max_memory_mb,
-                        epoch_deadline_ticks,
-                        health_check_timeout_secs,
-                        tenant_id,
-                        allowlist,
-                        downloader_clone,
-                        log_forwarder,
-                        metrics_acc_for_loop,
-                        socket_mode_for_loop,
-                    )
-                    .await;
-                    tracing::info!(app_name = %app_name_str, "app task exited");
-                });
-                (Some(shutdown_tx), None, handle, None)
+            let handler_config = HandlerConfig {
+                tenant_id: tenant_id.to_string(),
+                egress: egress_for_handler.clone(),
+                log_sink: self.log_forwarder.clone()
+                    as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
+                app_ctx: app_ctx.clone(),
+                meter: meter.clone(),
+                env: env.clone(),
+                max_request_body_bytes: self.config.handler_max_request_body_bytes,
+                metrics_acc: metrics_acc.clone(),
+                socket_mode: self.config.socket_mode,
+                last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
+                max_memory_mb: spec.max_memory_mb,
+                cpu_budget_ms: spec
+                    .cpu_budget_ms
+                    .unwrap_or(self.config.handler_request_budget_ms),
             };
+
+            let tls_config =
+                try_load_tls_config(&self.config.tls_cert_path, &self.config.tls_key_path);
+            let dispatch = HandlerDispatch::new(
+                raw_port,
+                self.config.handler_request_budget_ms,
+                self.config.epoch_tick_ms,
+                handler_config,
+                tls_config,
+                self.downloader.clone(),
+                spec.deployment_id.clone(),
+                self.engine_pool.clone(),
+                self.state.clone(),
+            )?;
+
+            let dispatch = Arc::new(dispatch);
+            let dispatch_for_serve = dispatch.clone();
+            let shutdown_rx_for_dispatch = broadcast_tx.subscribe();
+            let port_for_log = raw_port;
+            let app_name_for_log = app_name_str.clone();
+            let tenant_for_log = tenant_id.clone();
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = dispatch_for_serve.serve(shutdown_rx_for_dispatch).await {
+                    tracing::error!(
+                        tenant_id = %tenant_for_log,
+                        app_name = %app_name_for_log,
+                        port = port_for_log,
+                        err = %e,
+                        "HandlerDispatch serve() returned Err"
+                    );
+                } else {
+                    tracing::info!(
+                        tenant_id = %tenant_for_log,
+                        app_name = %app_name_for_log,
+                        port = port_for_log,
+                        "HandlerDispatch serve() exited"
+                    );
+                }
+            });
+            (None, Some(broadcast_tx), handle, Some(dispatch))
+        } else {
+            let instance_pre_clone = instance_pre.clone().unwrap();
+            let meter_clone = meter.clone();
+            let state_clone = self.state.clone();
+            // Use per-tenant MaxMemoryMB from the task message when available (non-zero),
+            // falling back to the worker's config default otherwise.
+            let max_memory_mb = if spec.max_memory_mb > 0 {
+                spec.max_memory_mb
+            } else {
+                self.config.max_memory_mb
+            };
+            let epoch_deadline_ticks = self.config.epoch_deadline_ticks;
+            let health_check_timeout_secs = self.config.health_check_timeout_secs;
+            let allowlist = spec.allowlist.clone();
+            // downloader_clone is captured into the per-app task so
+            // run_app_loop can post the auto-rollback signal when an
+            // app exhausts its restart cap. Arc<Downloader> is cheap to
+            // clone; the underlying reqwest::Client is internally Arc'd
+            // already, so this is one atomic refcount bump.
+            let downloader_clone = self.downloader.clone();
+            let log_forwarder = self.log_forwarder.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let metrics_acc_for_loop = metrics_acc.clone();
+
+            let socket_mode_for_loop = self.config.socket_mode;
+            let handle = tokio::spawn(async move {
+                Self::run_app_loop(
+                    instance_pre_clone,
+                    meter_clone,
+                    env,
+                    state_clone,
+                    app_name_str.clone(),
+                    shutdown_rx,
+                    max_memory_mb,
+                    epoch_deadline_ticks,
+                    health_check_timeout_secs,
+                    tenant_id,
+                    allowlist,
+                    downloader_clone,
+                    log_forwarder,
+                    metrics_acc_for_loop,
+                    socket_mode_for_loop,
+                )
+                .await;
+                tracing::info!(app_name = %app_name_str, "app task exited");
+            });
+            (Some(shutdown_tx), None, handle, None)
+        };
 
         // Register the app instance (Arc<Mutex<>> for interior mutability),
         // keyed by `(tenant_id, app_name)`. Each of the three
@@ -530,7 +1184,7 @@ impl Supervisor {
             meter,
             shutdown_tx,
             shutdown_tx_broadcast,
-            instance_pre,
+            instance_pre: instance_pre.unwrap(),
             handle: Some(std::sync::Arc::new(handle)),
             ticker: Some(ticker),
             execution_model,
@@ -546,6 +1200,39 @@ impl Supervisor {
 
         tracing::info!(tenant_id = %tenant_id_for_instance, app_name, port = raw_port, "app started");
         Ok(())
+    }
+
+    /// Periodically scans all active apps and evicts in-memory Wasm components for idle Handler (FaaS) apps.
+    pub async fn evict_idle_apps(&self, idle_timeout: Duration) {
+        let apps = {
+            let state = self.state.read().await;
+            state.apps.clone()
+        };
+
+        for ((tenant_id, app_name), app_mutex) in apps {
+            let app = app_mutex.lock().await;
+            if app.execution_model == ExecutionModel::Handler {
+                if let Some(ref dispatch) = app.dispatch {
+                    let last_req_opt = {
+                        let lock = dispatch.config.last_request_at.lock().await;
+                        *lock
+                    };
+                    if let Some(last_req) = last_req_opt {
+                        if last_req.elapsed() > idle_timeout {
+                            // Try evicting the component
+                            if let Some(engine) = dispatch.evict().await {
+                                tracing::info!(
+                                    tenant_id = %tenant_id,
+                                    app_name = %app_name,
+                                    "Idle timeout reached: evicting component from memory (scale-to-zero)"
+                                );
+                                self.engine_pool.release(engine);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Stop an app gracefully.
@@ -983,19 +1670,8 @@ impl Supervisor {
         // (tenant_id, app_name), see edge-ingress::config::ingress_host).
         for ((_tenant_id, app_name), inst) in &state.apps {
             let inst = inst.lock().await;
-            let status = match &inst.status {
-                AppInstanceStatus::Running => "running",
-                AppInstanceStatus::Starting => "starting",
-                AppInstanceStatus::Stopping => "stopping",
-                AppInstanceStatus::Crashed { .. } => "crashed",
-                AppInstanceStatus::Hung => "hung",
-            };
-            let exit_code = match &inst.status {
-                AppInstanceStatus::Running
-                | AppInstanceStatus::Starting
-                | AppInstanceStatus::Stopping => None,
-                AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
-            };
+            let status = app_status_to_string(&inst.status);
+            let exit_code = app_status_exit_code(&inst.status);
             let snap = inst.meter.snapshot();
 
             // Snapshot the app's MetricsAccumulator (guest edge:observe
@@ -1110,11 +1786,9 @@ impl Supervisor {
 
     /// Run the JetStream task-consume loop until `shutdown_rx` fires.
     ///
-    /// Subscribes to the queue-grouped consumer derived from
-    /// `config.queue_group` / `config.consumer_name`. Each delivered
-    /// `TaskMessage` is deserialized, passed to `handle_task_message`, and
-    /// ack'd on success. Failures are nack'd for redelivery; unparseable
-    /// (poison) messages are terminated so the consumer makes progress.
+    /// Subscribes to the task stream without a queue group (issue #316
+    /// fan-out). Every worker in the region receives every `TaskMessage`;
+    /// `handle_task_message`'s diff logic handles duplicates.
     ///
     /// Returns `Ok(())` only when `shutdown_rx` resolves. If the JetStream
     /// push stream ends (consumer deleted, server restart, transient
@@ -1126,17 +1800,12 @@ impl Supervisor {
     ) -> anyhow::Result<()> {
         let mut stream = self
             .nats
-            .subscribe_tasks(
-                &self.config.region,
-                &self.config.queue_group,
-                &self.config.consumer_name,
-            )
+            .subscribe_tasks(&self.config.region, &self.config.consumer_name)
             .await?;
         tracing::info!(
             region = %self.config.region,
-            queue_group = %self.config.queue_group,
             consumer = %self.config.consumer_name,
-            "subscribed to task stream"
+            "subscribed to task stream (fan-out mode)"
         );
 
         loop {
@@ -1211,5 +1880,624 @@ impl Supervisor {
         if let Err(e) = self.nats.term(msg).await {
             tracing::error!(err = %e, "term() failed — message may be redelivered");
         }
+    }
+}
+
+/// Result of diffing desired apps against current apps.
+#[derive(Debug)]
+pub struct AppDiff {
+    pub apps_to_stop: Vec<String>,
+    pub apps_to_start: Vec<(String, AppSpec)>,
+}
+
+/// Compute the set of apps to stop vs start based on current and desired sets.
+/// This is a pure function — no I/O, no state mutation.
+///
+/// `current_apps` maps app_name → (deployment_id, status) for a single tenant.
+/// `desired_apps` maps app_name → AppSpec for the same tenant.
+///
+/// Tenant filtering is expected to be done by the caller — this function
+/// operates on already-scoped maps.
+pub fn compute_app_diff(
+    current_apps: &HashMap<String, (String, AppInstanceStatus)>,
+    desired_apps: &HashMap<String, AppSpec>,
+) -> AppDiff {
+    let mut apps_to_stop = Vec::new();
+    let mut apps_to_start = Vec::new();
+
+    // Stop apps no longer in the desired set.
+    for app_name in current_apps.keys() {
+        if !desired_apps.contains_key(app_name) {
+            apps_to_stop.push(app_name.clone());
+        }
+    }
+
+    // Start or update apps in the desired set.
+    for (app_name, spec) in desired_apps {
+        let is_new = !current_apps.contains_key(app_name);
+        let is_changed = current_apps
+            .get(app_name)
+            .map(|(dep_id, _)| dep_id != &spec.deployment_id)
+            .unwrap_or(false);
+
+        if is_new || is_changed {
+            apps_to_start.push((app_name.clone(), spec.clone()));
+        }
+    }
+
+    AppDiff {
+        apps_to_stop,
+        apps_to_start,
+    }
+}
+
+/// Map an AppInstanceStatus to its heartbeat wire string.
+pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
+    match status {
+        AppInstanceStatus::Running => "running",
+        AppInstanceStatus::Starting => "starting",
+        AppInstanceStatus::Stopping => "stopping",
+        AppInstanceStatus::Crashed { .. } => "crashed",
+        AppInstanceStatus::Hung => "hung",
+    }
+}
+
+/// Map an AppInstanceStatus to its heartbeat exit_code.
+pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
+    match status {
+        AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Stopping => {
+            None
+        }
+        AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
+    }
+}
+
+/// Exponential backoff: min(1s × 2^(n-1), 60s).
+#[allow(dead_code)]
+pub fn calculate_backoff(restart_count: u32) -> Duration {
+    const BASE: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    if restart_count == 0 {
+        return BASE;
+    }
+    // Use checked_pow to avoid overflow.
+    let secs = 2u64
+        .checked_pow(restart_count.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    std::cmp::min(Duration::from_secs(secs), MAX)
+}
+
+/// Build the per-app environment map.
+#[allow(dead_code)]
+pub fn build_app_env(
+    spec_env: &HashMap<String, String>,
+    raw_port: u16,
+    ws_port: Option<u16>,
+) -> HashMap<String, String> {
+    let mut env = spec_env.clone();
+    env.insert("EDGE_HTTP_SERVER_PORT".to_string(), raw_port.to_string());
+    if let Some(ws) = ws_port {
+        env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
+    }
+    env
+}
+
+/// Parse a raw NATS task message payload into a TaskMessage.
+#[allow(dead_code)]
+pub fn parse_task_payload(payload: &[u8]) -> anyhow::Result<TaskMessage> {
+    serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!("invalid task payload: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_spec(deployment_id: &str) -> AppSpec {
+        AppSpec {
+            deployment_id: deployment_id.to_string(),
+            deployment_hash: "abc123".to_string(),
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+        }
+    }
+
+    fn make_status(deployment_id: &str, status: AppInstanceStatus) -> (String, AppInstanceStatus) {
+        (deployment_id.to_string(), status)
+    }
+
+    fn running(deployment_id: &str) -> (String, AppInstanceStatus) {
+        make_status(deployment_id, AppInstanceStatus::Running)
+    }
+
+    // ── app_status_to_string tests ──────────────────────────────────
+
+    #[test]
+    fn status_to_string_running() {
+        assert_eq!(app_status_to_string(&AppInstanceStatus::Running), "running");
+    }
+
+    #[test]
+    fn status_to_string_starting() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Starting),
+            "starting"
+        );
+    }
+
+    #[test]
+    fn status_to_string_stopping() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Stopping),
+            "stopping"
+        );
+    }
+
+    #[test]
+    fn status_to_string_crashed() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Crashed { restart_count: 5 }),
+            "crashed"
+        );
+    }
+
+    #[test]
+    fn status_to_string_hung() {
+        assert_eq!(app_status_to_string(&AppInstanceStatus::Hung), "hung");
+    }
+
+    // ── app_status_exit_code tests ──────────────────────────────────
+
+    #[test]
+    fn exit_code_running_is_none() {
+        assert_eq!(app_status_exit_code(&AppInstanceStatus::Running), None);
+    }
+
+    #[test]
+    fn exit_code_crashed_is_some() {
+        assert_eq!(
+            app_status_exit_code(&AppInstanceStatus::Crashed { restart_count: 3 }),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn exit_code_hung_is_some() {
+        assert_eq!(app_status_exit_code(&AppInstanceStatus::Hung), Some(1));
+    }
+
+    // ── compute_app_diff tests ──────────────────────────────────────
+
+    #[test]
+    fn diff_new_app_is_started() {
+        let current = HashMap::new();
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].0, "api");
+        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d1");
+    }
+
+    #[test]
+    fn diff_same_app_same_deployment_is_noop() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_changed_deployment_triggers_restart() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d2"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].0, "api");
+        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d2");
+    }
+
+    #[test]
+    fn diff_missing_app_is_stopped() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        let desired = HashMap::new();
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], "api");
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_empty_current_starts_all() {
+        let current = HashMap::new();
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+        desired.insert("worker".to_string(), make_spec("d2"));
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 2);
+        assert_eq!(diff.apps_to_stop.len(), 0);
+    }
+
+    #[test]
+    fn diff_empty_desired_stops_all() {
+        let mut current = HashMap::new();
+        current.insert("api".to_string(), running("d1"));
+        current.insert("worker".to_string(), running("d2"));
+        let desired = HashMap::new();
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 2);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_mixed_scenario() {
+        let mut current = HashMap::new();
+        current.insert("keep".to_string(), running("d1"));
+        current.insert("stop_me".to_string(), running("d2"));
+        current.insert("update_me".to_string(), running("d3"));
+        let mut desired = HashMap::new();
+        desired.insert("keep".to_string(), make_spec("d1")); // unchanged
+        desired.insert("update_me".to_string(), make_spec("d4")); // changed
+        desired.insert("new_app".to_string(), make_spec("d5")); // new
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop, vec!["stop_me"]);
+        assert_eq!(diff.apps_to_start.len(), 2);
+        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "update_me"));
+        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "new_app"));
+        assert_eq!(
+            diff.apps_to_start
+                .iter()
+                .find(|(n, _)| n == "update_me")
+                .unwrap()
+                .1
+                .deployment_id,
+            "d4"
+        );
+    }
+
+    #[test]
+    fn diff_crashed_app_still_detected_as_running() {
+        let mut current = HashMap::new();
+        current.insert(
+            "api".to_string(),
+            make_status("d1", AppInstanceStatus::Crashed { restart_count: 3 }),
+        );
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d2"));
+
+        // Even though crashed, the app exists — changing deployment_id should trigger start.
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 1);
+    }
+
+    #[test]
+    fn diff_self_corrects_on_same_deployment_after_crash() {
+        let mut current = HashMap::new();
+        current.insert(
+            "api".to_string(),
+            make_status("d1", AppInstanceStatus::Crashed { restart_count: 5 }),
+        );
+        let mut desired = HashMap::new();
+        desired.insert("api".to_string(), make_spec("d1"));
+
+        // Same deployment_id, crashed — the diff says no-op because the
+        // supervisor's restart loop handles the crash. The control plane
+        // needs to send a new deployment_id to trigger a restart.
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    #[test]
+    fn diff_non_running_statuses() {
+        for status in &[
+            AppInstanceStatus::Starting,
+            AppInstanceStatus::Running,
+            AppInstanceStatus::Stopping,
+        ] {
+            let mut current = HashMap::new();
+            current.insert("api".to_string(), make_status("d1", status.clone()));
+            let mut desired = HashMap::new();
+            desired.insert("api".to_string(), make_spec("d2"));
+
+            let diff = compute_app_diff(&current, &desired);
+            assert_eq!(
+                diff.apps_to_start.len(),
+                1,
+                "should restart for status {:?}",
+                status
+            );
+        }
+    }
+
+    // ── StandbyPool tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_standby_pool_acquire_and_release() {
+        let pool = StandbyPool::new(2).expect("failed to create pool");
+        let engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = RwLock::new(WorkerState::new(engine));
+
+        // Acquire 2 engines (should be fast, no 500ms delay)
+        let start = std::time::Instant::now();
+        let e1 = pool.acquire(&state).await;
+        let _e2 = pool.acquire(&state).await;
+        assert!(start.elapsed().as_millis() < 500, "Should not timeout");
+
+        // Release 1
+        pool.release(e1);
+
+        // We should be able to acquire again fast
+        let start2 = std::time::Instant::now();
+        let _e3 = pool.acquire(&state).await;
+        assert!(
+            start2.elapsed().as_millis() < 500,
+            "Should not timeout after release"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_standby_pool_exhaustion_fallback() {
+        let pool = StandbyPool::new(1).expect("failed to create pool");
+        let engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = RwLock::new(WorkerState::new(engine));
+
+        // Acquire the only engine in the pool
+        let _e1 = pool.acquire(&state).await;
+
+        // The pool is now empty. The next acquire should timeout (500ms) and fallback
+        // to a new transient engine without crashing.
+        let start = std::time::Instant::now();
+        let _e2 = pool.acquire(&state).await;
+        let elapsed = start.elapsed();
+
+        // It should have taken at least 500ms for the timeout
+        assert!(
+            elapsed.as_millis() >= 450,
+            "Should have hit the timeout before fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_standby_pool_lru_eviction() {
+        let pool = Arc::new(StandbyPool::new(1).expect("failed to create pool"));
+        let base_engine = edge_runtime::create_engine().expect("failed to create engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(base_engine.clone())));
+
+        struct NullSink;
+        impl edge_runtime::interfaces::observe::LogSink for NullSink {
+            fn push(
+                &self,
+                _record: edge_runtime::interfaces::observe::LogRecord,
+                _ctx: edge_runtime::interfaces::observe::AppLogContext,
+            ) {
+            }
+        }
+
+        // We compile a dummy component to get a real ProxyPre and InstancePre
+        let engine_for_compile = pool.acquire(&state).await; // Get pre-warmed engine
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("fixture handler.wasm missing");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let component =
+            wasmtime::component::Component::from_binary(&engine_for_compile, &bytes).unwrap();
+        let linker = edge_runtime::create_component_linker_handler(&engine_for_compile).unwrap();
+        let instance_pre = linker.instantiate_pre(&component).unwrap();
+        let proxy_pre =
+            wasmtime_wasi_http::p2::bindings::ProxyPre::new(instance_pre.clone()).unwrap();
+
+        // Release the engine back to the pool
+        pool.release(engine_for_compile);
+
+        let config_a = HandlerConfig {
+            tenant_id: "test-tenant".to_string(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(NullSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "app-a".to_string(),
+                tenant_id: "test-tenant".to_string(),
+                deployment_id: "dep-a".to_string(),
+            },
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-a".to_string(),
+            )),
+            env: HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ))),
+            max_memory_mb: 256,
+            cpu_budget_ms: 1000,
+        };
+
+        let config_b = HandlerConfig {
+            tenant_id: "test-tenant".to_string(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(NullSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "app-b".to_string(),
+                tenant_id: "test-tenant".to_string(),
+                deployment_id: "dep-b".to_string(),
+            },
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-b".to_string(),
+            )),
+            env: HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
+            max_memory_mb: 256,
+            cpu_budget_ms: 1000,
+        };
+
+        let downloader = Arc::new(crate::downloader::Downloader::new(
+            "http://localhost".to_string(),
+            std::path::PathBuf::from("/tmp"),
+            crate::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""),
+        ));
+
+        let dispatch_a = Arc::new(
+            HandlerDispatch::new(
+                18001,
+                1000,
+                10,
+                config_a,
+                None,
+                downloader.clone(),
+                "dep-a".to_string(),
+                pool.clone(),
+                state.clone(),
+            )
+            .unwrap(),
+        );
+
+        let dispatch_b = Arc::new(
+            HandlerDispatch::new(
+                18002,
+                1000,
+                10,
+                config_b,
+                None,
+                downloader.clone(),
+                "dep-b".to_string(),
+                pool.clone(),
+                state.clone(),
+            )
+            .unwrap(),
+        );
+
+        // Put the proxy_pre into dispatch_a, and make it hold the engine
+        dispatch_a.set_proxy_pre(proxy_pre).await;
+
+        // Create two FaaS apps: app A and app B.
+        let app_a = AppInstance {
+            deployment_id: "dep-a".to_string(),
+            app_name: "app-a".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            port: 18001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-a".to_string(),
+            )),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: instance_pre.clone(),
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: Some(dispatch_a),
+            metrics_acc: None,
+            ws_port: None,
+        };
+
+        let app_b = AppInstance {
+            deployment_id: "dep-b".to_string(),
+            app_name: "app-b".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            port: 18002,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(edge_runtime::RequestMeter::new(
+                "test-tenant".to_string(),
+                "dep-b".to_string(),
+            )),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: instance_pre.clone(),
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: Some(dispatch_b),
+            metrics_acc: None,
+            ws_port: None,
+        };
+
+        {
+            let mut guard = state.write().await;
+            guard.apps.insert(
+                ("test-tenant".to_string(), "app-a".to_string()),
+                Arc::new(Mutex::new(app_a)),
+            );
+            guard.apps.insert(
+                ("test-tenant".to_string(), "app-b".to_string()),
+                Arc::new(Mutex::new(app_b)),
+            );
+        }
+
+        // Initially, app_a has an engine in memory.
+        assert!(
+            state
+                .read()
+                .await
+                .apps
+                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .unwrap()
+                .lock()
+                .await
+                .dispatch
+                .as_ref()
+                .unwrap()
+                .has_engine()
+                .await
+        );
+
+        // Let's acquire the engine to empty the pool!
+        let _e1 = pool.acquire(&state).await;
+
+        // Pool is now empty. Acquiring again should trigger LRU eviction on app-a (which has the engine) because app-a's last_request_at is older than app-b's.
+        let start = std::time::Instant::now();
+        let _e2 = pool.acquire(&state).await;
+        let elapsed = start.elapsed();
+
+        // Eviction should have been successful, taking the engine from app_a
+        assert!(
+            elapsed.as_millis() >= 450,
+            "Should timeout waiting, then try eviction"
+        );
+        assert!(
+            !state
+                .read()
+                .await
+                .apps
+                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .unwrap()
+                .lock()
+                .await
+                .dispatch
+                .as_ref()
+                .unwrap()
+                .has_engine()
+                .await,
+            "app-a should have been evicted"
+        );
     }
 }

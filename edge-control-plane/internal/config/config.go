@@ -19,6 +19,12 @@ type Config struct {
 	JWT       JWTConfig       `yaml:"jwt"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Migration MigrationConfig `yaml:"migration"`
+	// Signing configures the Ed25519 artifact-signing key (issue #307).
+	// The CP signs every new deployment's artifact at upload time;
+	// workers verify the signature before instantiation. The private
+	// key never leaves the CP. The public key is propagated to workers
+	// out-of-band (today: EDGE_SIGNING_PUBKEY env var on each worker).
+	Signing SigningConfig `yaml:"signing"`
 	// Autoscale configures the cluster autoscaler (issue #85).
 	// Disabled by default — operators flip `enabled: true` once the
 	// fleet has multiple workers and the cloud-provider integration
@@ -33,6 +39,17 @@ type Config struct {
 	// its own region. See `service.ActivateDeployment` for the
 	// fallback path. (Issue #82, v1.)
 	Region string `yaml:"region"`
+	// BootstrapSecret is a shared HMAC secret used by workers to
+	// authenticate at bootstrap when WORKER_JWT_SECRET is not yet
+	// provisioned. The handshake:
+	//   1. Worker POSTs to /api/internal/bootstrap with a payload
+	//      signed by this secret (HMAC-SHA256).
+	//   2. CP returns a short-lived (5min) bootstrap JWT.
+	//   3. Worker exchanges that JWT for the real JWT_SECRET at
+	//      GET /api/internal/worker-secret.
+	// Must be at least 32 bytes, like JWT_SECRET. Set via
+	// BOOTSTRAP_SECRET env var or bootstrap.secret in config.
+	BootstrapSecret string `yaml:"bootstrap_secret"`
 	// InternalToken is a shared secret presented by trusted
 	// service-to-service callers (today: the edge-ingress, which
 	// fetches traffic splits to apply Caddy weights). When set, the
@@ -303,6 +320,9 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("EDGE_INTERNAL_TOKEN"); v != "" {
 		cfg.InternalToken = v
 	}
+	if v := os.Getenv("BOOTSTRAP_SECRET"); v != "" {
+		cfg.BootstrapSecret = v
+	}
 	if v := os.Getenv("EDGE_SECRETS_MASTER_KEY"); v != "" {
 		cfg.SecretsMasterKey = v
 	}
@@ -438,6 +458,15 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("RUSTC_PATH"); v != "" {
 		cfg.Migration.RustcPath = v
 	}
+	if v := os.Getenv("EDGE_SIGNING_KEY_PATH"); v != "" {
+		cfg.Signing.KeyPath = v
+	}
+	if v := os.Getenv("EDGE_SIGNING_KEY"); v != "" {
+		cfg.Signing.Key = v
+	}
+	if v := os.Getenv("EDGE_SIGNING_KEY_ID"); v != "" {
+		cfg.Signing.KeyID = v
+	}
 
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
@@ -484,6 +513,15 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Validate bootstrap secret if configured. Same strength requirements
+	// as JWT_SECRET — must be ≥32 bytes, not a known placeholder.
+	// Optional: when empty, workers must use the direct JWT secret.
+	if cfg.BootstrapSecret != "" {
+		if err := validateBootstrapSecret(cfg.BootstrapSecret); err != nil {
+			return nil, err
+		}
+	}
+
 	// Validate secrets config: must not mix old and new formats.
 	if err := validateSecretsConfig(cfg.SecretsMasterKey, cfg.Secrets); err != nil {
 		return nil, err
@@ -497,7 +535,29 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Validate the signing key (issue #307). At least one of KeyPath /
+	// Key must be set; a CP without a signing key cannot issue
+	// signatures on new artifacts, and Deploy should fail rather than
+	// silently produce unsigned rows.
+	if err := validateSigningConfig(&cfg.Signing); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validateSigningConfig enforces that an Ed25519 signing key is
+// configured. The format / content of the key itself is validated
+// at load time by `signing.LoadFromFile` / `signing.LoadFromEnv` —
+// this validator only checks "is the operator pointing at SOMETHING".
+// A missing KeyID is allowed (with a warning logged by the caller)
+// so dev environments can boot without ceremony, but a missing key
+// entirely is a hard failure.
+func validateSigningConfig(s *SigningConfig) error {
+	if s.KeyPath == "" && s.Key == "" {
+		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH) or signing.key (EDGE_SIGNING_KEY) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
+	}
+	return nil
 }
 
 // insecureJWTSecretValues is the set of well-known placeholder JWT secrets
@@ -558,6 +618,18 @@ func validateJWTSecret(secret string, activeKID string, keys map[string]string) 
 
 // validateSecretsConfig enforces that the old and new secrets config
 // formats are not mixed.
+// validateBootstrapSecret enforces that the bootstrap secret, when set,
+// meets the same strength requirements as JWT_SECRET.
+func validateBootstrapSecret(secret string) error {
+	if _, ok := insecureJWTSecretValues[secret]; ok {
+		return fmt.Errorf("bootstrap.secret %q is a known placeholder; set BOOTSTRAP_SECRET to a unique value", secret)
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("bootstrap.secret must be at least 32 bytes (got %d)", len(secret))
+	}
+	return nil
+}
+
 func validateSecretsConfig(masterKey string, secrets SecretsConfig) error {
 	if masterKey != "" && secrets.ActiveKeyID != "" {
 		return fmt.Errorf("cannot set both secrets_master_key and secrets.active_key_id; use secrets.keys exclusively")
@@ -704,10 +776,35 @@ func isValidRegionIdentifier(s string) bool {
 type MigrationConfig struct {
 	EdgeMigratePath string `yaml:"edge_migrate_path" env:"EDGE_MIGRATE_PATH" envDefault:"edge-migrate"`
 	WasiSdkPath     string `yaml:"wasi_sdk_path"     env:"WASI_SDK_PATH"     envDefault:"/usr/local/wasi-sdk/bin"`
-	// RustcPath is the absolute path to a rustc binary capable of
-	// targeting wasm32-wasip2 (i.e. `rustup target add wasm32-wasip2`
-	// has been run on the host). Used by the migration service when
-	// language == "rust" to compile the transformed source into a
-	// wasm component. Falls back to "rustc" (PATH lookup) if unset.
-	RustcPath string `yaml:"rustc_path" env:"RUSTC_PATH" envDefault:"rustc"`
+	RustcPath       string `yaml:"rustc_path"        env:"RUSTC_PATH"        envDefault:"rustc"`
+	// Wasm2CwasmPath is the path to the wasm2cwasm binary used to
+	// pre-compile .wasm artifacts to .cwasm during activation. When
+	// empty, the pre-compilation step is skipped and workers JIT-compile
+	// lazily on first load. Set via EDGE_WASM2CWASM_PATH env var.
+	Wasm2CwasmPath string `yaml:"wasm2cwasm_path" env:"EDGE_WASM2CWASM_PATH"`
+}
+
+// SigningConfig configures the Ed25519 signing key used to sign
+// deployment artifacts (issue #307). The CP signs every new
+// deployment's artifact at upload time; workers verify the
+// signature before instantiation. The private key never leaves the
+// CP. The public key is propagated to workers out-of-band (today:
+// the EDGE_SIGNING_PUBKEY env var on each worker). At least one of
+// KeyPath / Key must be set or the CP fails to start.
+type SigningConfig struct {
+	// KeyPath is the path to a file containing the Ed25519 private
+	// key. Two formats are accepted (selected by file size): 32 raw
+	// bytes (seed form, expanded via ed25519.NewKeyFromSeed) or 64
+	// raw bytes (the full private key per RFC 8032 §5.1.2). Hex
+	// variants (64 or 128 hex chars) of either are also accepted.
+	KeyPath string `yaml:"key_path"`
+	// Key is the inline Ed25519 private key, used when KeyPath is
+	// unset (typical in container deployments where the key is
+	// injected via a sealed secret). Same format rules as KeyPath.
+	Key string `yaml:"key"`
+	// KeyID is a logical identifier (operator-chosen, e.g. "k1")
+	// stamped onto each `deployments` row at sign time. Required
+	// for clean rotation semantics; missing is allowed but emits a
+	// startup warning so operators see the footgun in their logs.
+	KeyID string `yaml:"key_id"`
 }

@@ -38,6 +38,10 @@ type ArtifactStore interface {
 	// a 100 MiB artifact in RAM.
 	SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error)
 	OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error)
+	// SaveFormat writes an artifact in the given format (e.g. "cwasm")
+	// alongside the default .wasm file. Used by the pre-compilation step
+	// to store AOT-compiled components on the control plane.
+	SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error
 }
 
 // FSArtifactStore is the filesystem-backed implementation of
@@ -289,4 +293,57 @@ func (s *FSArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, dep
 		return nil, err
 	}
 	return newLimitReadCloser(f, MaxArtifactSize), nil
+}
+
+// SaveFormat writes a pre-compiled artifact (e.g. .cwasm) to the store
+// alongside the default .wasm file. Uses the same atomic temp-rename
+// pattern as Save. ctx is ignored — `os.*` does not take a context.
+func (s *FSArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	ext := "." + format
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return err
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return err
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return err
+	}
+
+	path := filepath.Join(s.basePath, tenantID, appName, deploymentID+ext)
+	clean := filepath.Clean(path)
+	if !strings.HasPrefix(clean, filepath.Clean(s.basePath)) {
+		return fmt.Errorf("path traversal detected")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("creating artifact dir: %w", err)
+	}
+
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	cleanup := func() { _ = os.Remove(tmp) }
+
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("writing artifact: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return fmt.Errorf("syncing artifact: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("closing artifact: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		cleanup()
+		return fmt.Errorf("renaming artifact: %w", err)
+	}
+	return nil
 }

@@ -19,6 +19,34 @@ pub struct Project {
     #[allow(dead_code)]
     pub version: String,
     pub target: String,
+    /// Source language this project builds with. `None` (and absent
+    /// from legacy `edge.toml` files) resolves to `"rust"` via
+    /// [`Project::language_or_default`].
+    ///
+    /// `#[serde(default)]` preserves backward compatibility — tomls
+    /// without a `language` key keep parsing as Rust projects. Allowed
+    /// values at use sites (build / deploy): `"rust"`, `"js"`. Other
+    /// values surface as a friendly error at the build step, not at
+    /// parse time, so read-only commands (`status`, `apps get`,
+    /// `rollback`) keep working on tomls with stale language fields.
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+impl Project {
+    /// Resolve the project's source language, defaulting to `"rust"`
+    /// for projects whose `edge.toml` was written before the language
+    /// field existed. Always returns a non-empty string — even if the
+    /// toml explicitly sets `language = ""` (a valid TOML value), we
+    /// treat that as "absent" and fall back to the default, because
+    /// `path_for` would otherwise match its `_` arm and silently
+    /// route the deploy to a stale rust artifact.
+    pub fn language_or_default(&self) -> &str {
+        match self.language.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => "rust",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,5 +140,65 @@ target = "wasm32-wasip2"
         // verbatim. CI runs in a clean env so this assertion is true in
         // CI; a developer with EDGE_API_URL set will see a different
         // (still-valid) value here.
+    }
+
+    // ── language field (issue #317) ───────────────────────────────────
+
+    #[test]
+    fn parse_accepts_language_field() {
+        // Forward-compat: a toml with `language = "js"` parses and the
+        // value is exposed on Project::language for callers to act on.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = "js"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.language.as_deref(), Some("js"));
+        assert_eq!(toml.project.language_or_default(), "js");
+    }
+
+    #[test]
+    fn parse_accepts_missing_language_field_for_backcompat() {
+        // Backward-compat: existing tomls written before the field
+        // existed parse unchanged, and language_or_default() returns
+        // "rust" so the existing Rust build path is selected.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.language, None);
+        assert_eq!(toml.project.language_or_default(), "rust");
+    }
+
+    #[test]
+    fn language_or_default_treats_empty_string_as_missing() {
+        // `language = ""` is a valid TOML value and parses as
+        // Some(""). The unwrap_or("rust") fallback alone would return
+        // "" (because Some("") is_some), which then matches the `_`
+        // arm in `path_for` and silently deploys a stale rust
+        // artifact. Treat empty-string as absent so the default
+        // wins.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = ""
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.language.as_deref(), Some(""));
+        assert_eq!(toml.project.language_or_default(), "rust");
     }
 }

@@ -94,6 +94,8 @@ pub struct AppSpec {
     #[serde(default, deserialize_with = "deserialize_allowlist")]
     pub allowlist: Option<Vec<String>>,
     pub max_memory_mb: u64,
+    #[serde(default)]
+    pub cpu_budget_ms: Option<u64>,
 }
 
 /// ClusterHeadroom carries capacity info for the autoscaler (issue #85).
@@ -511,7 +513,8 @@ mod tests {
                     "deployment_hash": "abc",
                     "env": {"KEY": "value"},
                     "max_memory_mb": 256,
-                    "allowlist": ["api.stripe.com"]
+                    "allowlist": ["api.stripe.com"],
+                    "cpu_budget_ms": 500
                 },
                 "other": {
                     "deployment_id": "d_2",
@@ -539,8 +542,10 @@ mod tests {
             apps["myapp"].allowlist,
             Some(vec!["api.stripe.com".to_string()])
         );
+        assert_eq!(apps["myapp"].cpu_budget_ms, Some(500));
         assert_eq!(apps["other"].deployment_hash, "def");
         assert_eq!(apps["other"].max_memory_mb, 128);
+        assert_eq!(apps["other"].cpu_budget_ms, None);
     }
 
     /// Unknown `type` values must fail to deserialize rather than silently

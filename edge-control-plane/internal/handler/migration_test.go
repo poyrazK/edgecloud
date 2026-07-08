@@ -17,6 +17,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 )
 
 // mockDeploymentRepo implements service.DeploymentRepoInterface for testing.
@@ -37,6 +38,15 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 		return m.createErr
 	}
 	m.deployments = append(m.deployments, d)
+	return nil
+}
+
+// UpdateHashAndSignature is the post-#307 in-place update. The
+// handler tests don't exercise the signed Deploy path (they target
+// MigrateTree, which uses Create-then-UpdateHashAndSignature), but
+// the interface requires it. No-op here — the post-#307 fields
+// aren't asserted on by these tests.
+func (m *mockDeploymentRepo) UpdateHashAndSignature(ctx context.Context, d *domain.Deployment) error {
 	return nil
 }
 
@@ -79,6 +89,10 @@ func (m *mockArtifactStore) Open(ctx context.Context, tenantID, appName, deploym
 
 func (m *mockArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
 	return nil, nil
+}
+
+func (m *mockArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return nil
 }
 
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
@@ -132,7 +146,7 @@ func TestMigrationHandler_Migrate_Success(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	source := `#include <stdio.h>
@@ -161,7 +175,7 @@ int main() { return 0; }`
 func TestMigrationHandler_Migrate_MissingFile(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	// Build multipart without a "file" field
@@ -201,7 +215,7 @@ func TestMigrationHandler_Migrate_AcceptsRustLanguage(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	source := `fn main() {}`
@@ -222,7 +236,7 @@ func TestMigrationHandler_Migrate_AcceptsRustLanguage(t *testing.T) {
 func TestMigrationHandler_Migrate_RejectsUnknownLanguage(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	body := &bytes.Buffer{}
@@ -256,7 +270,7 @@ func TestMigrationHandler_Migrate_RejectsUnknownLanguage(t *testing.T) {
 func TestMigrationHandler_Migrate_NoMultipart(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	req := httptest.NewRequest("POST", "/api/migrate", strings.NewReader("not multipart"))
@@ -274,7 +288,7 @@ func TestMigrationHandler_Migrate_NoMultipart(t *testing.T) {
 func TestMigrationHandler_Migrate_MissingTenantID(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	source := `#include <stdio.h>
@@ -296,7 +310,7 @@ int main() { return 0; }`
 func TestMigrationHandler_Migrate_PathTraversalFilename(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
-	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	source := `#include <stdio.h>
@@ -366,7 +380,7 @@ func withTenantID(req *http.Request, tenantID string) *http.Request {
 }
 
 func TestMigrateTree_RejectsMissingTenantID(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`, map[string]string{"main.c": "int main(){}"})
 	rr := httptest.NewRecorder()
@@ -377,7 +391,7 @@ func TestMigrateTree_RejectsMissingTenantID(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsBadAppName(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	for _, bad := range []string{"../traversal", "Bad-Name", "a/b", ""} {
 		req := makeTreeReq(t, bad, "c", `{"files":["main.c"]}`, map[string]string{"main.c": "x"})
@@ -391,7 +405,7 @@ func TestMigrateTree_RejectsBadAppName(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsMissingAppName(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// Make a request without an app_name field.
 	body := &bytes.Buffer{}
@@ -422,7 +436,7 @@ func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
 	// `edge-migrate` (it doesn't, since the test path doesn't need
 	// edge-migrate to run — the gate rejection happens before any
 	// service work).
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "rust", `{"files":["main.rs"]}`, map[string]string{"main.rs": "fn main(){}"})
 	req = withTenantID(req, "t_1")
@@ -434,7 +448,7 @@ func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "python", `{"files":["main.py"]}`, map[string]string{"main.py": "x"})
 	req = withTenantID(req, "t_1")
@@ -454,7 +468,7 @@ func TestMigrateTree_AcceptsRsInZipVariant(t *testing.T) {
 	// POST it, and assert the response is not 400 (the gate is open;
 	// the service is stubbed and will 500 if it tries to run the
 	// toolchain, which is acceptable for this assertion).
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	var zipBuf bytes.Buffer
@@ -497,7 +511,7 @@ func TestMigrateTree_AcceptsRsInZipVariant(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsManifestMismatch(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// Manifest declares 2 files, but only 1 file part.
 	req := makeTreeReq(t, "hello", "c",
@@ -512,7 +526,7 @@ func TestMigrateTree_RejectsManifestMismatch(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// Manifest references a path with `..`.
 	req := makeTreeReq(t, "hello", "c",
@@ -527,7 +541,7 @@ func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsTooManyFiles(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// Build a manifest with maxTreeFiles+1 entries. We don't actually
 	// upload that many file parts — the mismatch is caught first, so
@@ -570,7 +584,7 @@ func itoa(i int) string {
 }
 
 func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// Build a valid multipart body that's over the cap, but stream
 	// it through io.Pipe + zeroReader so we never allocate the full
@@ -604,7 +618,7 @@ func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsMissingTree(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// No `tree` field, no `file` parts.
 	req := makeTreeReq(t, "hello", "c", "", nil)
@@ -617,7 +631,7 @@ func TestMigrateTree_RejectsMissingTree(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsInvalidManifestJSON(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "c", "not json", map[string]string{"main.c": "x"})
 	req = withTenantID(req, "t_1")
@@ -642,7 +656,7 @@ func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
 	svc := service.NewMigrationService(
 		&mockDeploymentRepo{}, &mockArtifactStore{},
 		"/this/binary/does/not/exist", "/wasi-sdk", "rustc",
-	)
+		signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`,
 		map[string]string{"main.c": "int main(){return 0;}\n"})
@@ -677,7 +691,7 @@ func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
 // `treeUploadExts` since M2; this brings the multipart variant
 // in line.
 func TestMigrateTree_RejectsUnknownExtensionMultipartPart(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	// .txt is not a recognized source extension — the handler
 	// must reject it before reaching the service.
@@ -700,7 +714,7 @@ func TestMigrateTree_RejectsUnknownExtensionMultipartPart(t *testing.T) {
 // part is present (e.g. the part is `foo.txt` and the manifest
 // also says `foo.txt`).
 func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	req := makeTreeReq(t, "hello", "rust", `{"files":["main.py"]}`,
 		map[string]string{"main.py": "print('hi')"})
@@ -722,7 +736,7 @@ func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
 // who uploads one huge part to consume the whole body budget
 // before the per-file manifest mismatch check runs.
 func TestMigrateTree_RejectsOversizedPart(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	// Build a multipart request with a single file part of 6 MiB.
@@ -761,7 +775,7 @@ func TestMigrateTree_RejectsOversizedPart(t *testing.T) {
 // rejected even when the total decompressed size is under the
 // 50 MiB cap. Same threat model as the multipart per-part cap.
 func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	// Build a zip with a single 6 MiB entry.
@@ -813,7 +827,7 @@ func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
 // a regression there would silently let attackers overwrite files
 // outside the temp dir.
 func TestMigrateTree_ZipSlip(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 
 	// Build a zip containing a path-traversal entry. The zip
@@ -874,7 +888,7 @@ func TestMigrateTree_ZipSlip(t *testing.T) {
 // allocated eagerly — see TestMigrateTree_RejectsOversizedBody for
 // the streaming pattern's rationale.
 func TestMigrate_RejectsOversizedBody(t *testing.T) {
-	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc")
+	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", signing.TestKey(t))
 	h := NewMigrationHandler(svc)
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)

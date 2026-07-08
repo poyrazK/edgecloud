@@ -4,19 +4,6 @@ use anyhow::Context;
 use edge_runtime::socket_egress::SocketEgressPolicy;
 use std::path::PathBuf;
 
-// `max_memory_mb`, `epoch_tick_ms`, and `epoch_deadline_ticks` are read from
-// env vars and consumed by the supervisor (PR #64 follow-up). They plumb
-// per-app wasmtime limits: StoreLimits for memory, and an epoch ticker +
-// deadline for CPU budgets. The previous PR deferred the wiring; this PR
-// closes the loop and removes the dead_code allow.
-//
-// `queue_group` and `consumer_name` (PR #96) drive the JetStream push
-// consumer: every worker in a region joins `queue_group` so a TaskMessage
-// is delivered to exactly one worker, and `consumer_name` is the durable
-// cursor identity (derived from `worker_id` by default).
-
-use crate::nats::DEFAULT_QUEUE_GROUP;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub worker_id: String,
@@ -52,11 +39,6 @@ pub struct Config {
     /// With the default tick of 10 ms and deadline of 100, each call has a
     /// ~1 s CPU budget. Tune via `EPOCH_DEADLINE_TICKS`.
     pub epoch_deadline_ticks: u64,
-    /// NATS queue group this worker subscribes to. All workers in a region
-    /// join the same group so that NATS delivers each `TaskMessage` to
-    /// exactly one worker — preventing duplicate app starts across workers.
-    /// Override with `EDGE_QUEUE_GROUP`.
-    pub queue_group: String,
     /// Durable JetStream consumer name. Derived from `worker_id` by default
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
@@ -131,6 +113,15 @@ pub struct Config {
     /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
     /// and `tls_key_path` must be set for TLS to activate.
     pub tls_key_path: Option<String>,
+    /// Optional bootstrap secret for the bootstrap handshake (issue #104).
+    /// When WORKER_JWT_SECRET is empty AND WORKER_BOOTSTRAP_SECRET is set,
+    /// the worker performs the bootstrap handshake on startup:
+    ///   1. POST to /api/internal/bootstrap with HMAC-SHA256 signature
+    ///   2. Receive short-lived (5min) bootstrap JWT
+    ///   3. Exchange bootstrap JWT for the real JWT_SECRET at
+    ///      GET /api/internal/worker-secret
+    pub worker_bootstrap_secret: String,
+
     /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
     /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
     /// (`block-all` (default, closes wasi:sockets connect-side),
@@ -144,6 +135,9 @@ pub struct Config {
     /// flagged as a perf regression). Mirrors the
     /// `handler_max_request_body_bytes` pattern above.
     pub socket_mode: SocketEgressPolicy,
+    /// Configured size of the warm standby pool of Wasmtime engines.
+    /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
+    pub standby_pool_size: usize,
 }
 
 impl Config {
@@ -205,8 +199,6 @@ impl Config {
         }
         Ok(Config {
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
-            queue_group: std::env::var("EDGE_QUEUE_GROUP")
-                .unwrap_or_else(|_| DEFAULT_QUEUE_GROUP.to_string()),
             consumer_name,
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
@@ -235,11 +227,7 @@ impl Config {
             worker_jwt_kid: std::env::var("WORKER_JWT_KID").ok(),
             worker_jwt_issuer: std::env::var("WORKER_JWT_ISSUER")
                 .unwrap_or_else(|_| "edgecloud".into()),
-            worker_tenant_id: std::env::var("WORKER_TENANT_ID").context(
-                "WORKER_TENANT_ID not set — a tenant ID is required (e.g. t_abc123). \
-                     This is the ID of the tenant whose apps this worker hosts. \
-                     All outbound calls to /api/internal/* are scoped to this tenant.",
-            )?,
+            worker_tenant_id: std::env::var("WORKER_TENANT_ID").unwrap_or_else(|_| "*".into()),
             handler_request_budget_ms: parse_env_u64("HANDLER_REQUEST_BUDGET_MS", 1000)?,
             handler_max_request_body_bytes: parse_env_u64(
                 "HANDLER_MAX_REQUEST_BODY_BYTES",
@@ -247,7 +235,9 @@ impl Config {
             )?,
             tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
+            worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
+            standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
         })
     }
 

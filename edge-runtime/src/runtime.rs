@@ -38,6 +38,9 @@ use crate::edge_runtime_handler::edge::cloud::{
     process::Host as ProcessHost,
     scheduling::Host as SchedulingHost,
     time::Host as TimeHost,
+    websocket::{
+        CloseInfo as HandlerCloseInfo, Host as WebsocketHost, MessageType as HandlerMessageType,
+    },
 };
 use crate::edge_runtime_long::edge::cloud::{
     cache::Host as LongCacheHost,
@@ -48,9 +51,12 @@ use crate::edge_runtime_long::edge::cloud::{
     process::Host as LongProcessHost,
     scheduling::Host as LongSchedulingHost,
     time::Host as LongTimeHost,
+    websocket::{
+        CloseInfo as LongCloseInfo, Host as LongWebsocketHost, MessageType as LongMessageType,
+    },
 };
 use crate::egress::EgressPolicy;
-use crate::interfaces::{cache, kv_store, observe, process, scheduling, time};
+use crate::interfaces::{cache, kv_store, observe, process, scheduling, time, websocket};
 use crate::metering::RequestMeter;
 use crate::socket_egress::{make_socket_addr_check, SocketEgressPolicy};
 use crate::store::HasStoreLimits;
@@ -90,6 +96,9 @@ pub struct RuntimeState {
     pub time: Arc<time::Clock>,
     pub scheduling: Arc<scheduling::Scheduler>,
     pub process: Arc<process::Process>,
+
+    /// Per-app WebSocket state.
+    pub websocket: Arc<websocket::WebSocket>,
 
     /// wasi: state — required by `WasiView`. The `WasiCtx` is rebuilt
     /// per `Clone` from `wasi_env_for_clone` because `WasiCtx` does not
@@ -178,6 +187,7 @@ impl RuntimeState {
             time: Arc::new(time::Clock::new()),
             scheduling: Arc::new(scheduling::Scheduler::new()),
             process: Arc::new(process),
+            websocket: Arc::new(websocket::WebSocket::new()),
             wasi_ctx,
             wasi_http_ctx: WasiHttpCtx::new(),
             resource_table: ResourceTable::new(),
@@ -247,6 +257,7 @@ impl RuntimeState {
                 env.clone(),
                 exit_code.clone(),
             )),
+            websocket: Arc::new(websocket::WebSocket::new()),
             wasi_ctx,
             wasi_http_ctx: WasiHttpCtx::new(),
             resource_table: ResourceTable::new(),
@@ -316,6 +327,7 @@ impl Clone for RuntimeState {
             observe: self.observe.clone(),
             time: self.time.clone(),
             process: self.process.clone(),
+            websocket: self.websocket.clone(),
             wasi_ctx: build_wasi_ctx_for_tenant(
                 &self.wasi_env_for_clone,
                 &self.tenant_id,
@@ -1044,6 +1056,104 @@ macro_rules! impl_process {
             }
         }
     };
+}
+
+impl LongWebsocketHost for RuntimeState {
+    fn listen(&mut self, port: u16) -> Result<u32, String> {
+        self.websocket.listen(port)
+    }
+    fn accept(&mut self, listener: u32) -> Result<u32, String> {
+        self.websocket.accept(listener)
+    }
+    fn send(
+        &mut self,
+        conn: u32,
+        data: Vec<u8>,
+        kind: LongMessageType,
+    ) -> std::result::Result<(), ()> {
+        let msg = match kind {
+            LongMessageType::Text => crate::interfaces::websocket::MessageType::Text,
+            LongMessageType::Binary => crate::interfaces::websocket::MessageType::Binary,
+            LongMessageType::Ping => crate::interfaces::websocket::MessageType::Ping,
+            LongMessageType::Pong => crate::interfaces::websocket::MessageType::Pong,
+            LongMessageType::Close => crate::interfaces::websocket::MessageType::Close,
+        };
+        self.websocket.send(conn, &data, msg).map_err(|_| ())
+    }
+    fn receive(
+        &mut self,
+        conn: u32,
+    ) -> std::result::Result<(Vec<u8>, LongMessageType), LongCloseInfo> {
+        match self.websocket.receive(conn) {
+            Ok((data, msg_type)) => {
+                let kind = match msg_type {
+                    crate::interfaces::websocket::MessageType::Text => LongMessageType::Text,
+                    crate::interfaces::websocket::MessageType::Binary => LongMessageType::Binary,
+                    crate::interfaces::websocket::MessageType::Ping => LongMessageType::Ping,
+                    crate::interfaces::websocket::MessageType::Pong => LongMessageType::Pong,
+                    crate::interfaces::websocket::MessageType::Close => LongMessageType::Close,
+                };
+                Ok((data, kind))
+            }
+            Err(ci) => Err(LongCloseInfo {
+                code: ci.code,
+                reason: ci.reason,
+            }),
+        }
+    }
+    fn close(&mut self, conn: u32, info: LongCloseInfo) -> std::result::Result<(), ()> {
+        let ci = crate::interfaces::websocket::CloseInfo::new(info.code, info.reason);
+        self.websocket.close(conn, ci).map_err(|_| ())
+    }
+}
+
+impl WebsocketHost for RuntimeState {
+    fn listen(&mut self, port: u16) -> Result<u32, String> {
+        self.websocket.listen(port)
+    }
+    fn accept(&mut self, listener: u32) -> Result<u32, String> {
+        self.websocket.accept(listener)
+    }
+    fn send(
+        &mut self,
+        conn: u32,
+        data: Vec<u8>,
+        kind: HandlerMessageType,
+    ) -> std::result::Result<(), ()> {
+        let msg = match kind {
+            HandlerMessageType::Text => crate::interfaces::websocket::MessageType::Text,
+            HandlerMessageType::Binary => crate::interfaces::websocket::MessageType::Binary,
+            HandlerMessageType::Ping => crate::interfaces::websocket::MessageType::Ping,
+            HandlerMessageType::Pong => crate::interfaces::websocket::MessageType::Pong,
+            HandlerMessageType::Close => crate::interfaces::websocket::MessageType::Close,
+        };
+        self.websocket.send(conn, &data, msg).map_err(|_| ())
+    }
+    fn receive(
+        &mut self,
+        conn: u32,
+    ) -> std::result::Result<(Vec<u8>, HandlerMessageType), HandlerCloseInfo> {
+        match self.websocket.receive(conn) {
+            Ok((data, msg_type)) => {
+                let kind = match msg_type {
+                    crate::interfaces::websocket::MessageType::Text => HandlerMessageType::Text,
+                    crate::interfaces::websocket::MessageType::Binary => HandlerMessageType::Binary,
+                    crate::interfaces::websocket::MessageType::Ping => HandlerMessageType::Ping,
+                    crate::interfaces::websocket::MessageType::Pong => HandlerMessageType::Pong,
+                    crate::interfaces::websocket::MessageType::Close => HandlerMessageType::Close,
+                };
+                Ok((data, kind))
+            }
+            Err(ci) => Err(HandlerCloseInfo {
+                code: ci.code,
+                reason: ci.reason,
+            }),
+        }
+    }
+    fn close(&mut self, conn: u32, info: HandlerCloseInfo) -> std::result::Result<(), ()> {
+        let ci = crate::interfaces::websocket::CloseInfo::new(info.code, info.reason);
+        self.websocket.close(conn, ci).map_err(|_| ())
+    }
 }
 
 // Generate the per-world impls. Each macro invocation emits TWO impl

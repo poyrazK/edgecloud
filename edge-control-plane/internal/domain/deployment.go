@@ -13,6 +13,20 @@ type Deployment struct {
 	AppName  string `db:"app_name"`
 	Status   string `db:"status"`
 	Hash     string `db:"hash"` // SHA-256 of Wasm payload
+	// Signature is the base64url(no-pad) Ed25519 signature over
+	// `sha256(artifact_bytes) || deployment_id` (issue #307). Empty
+	// for rows created before the signing code shipped; the worker
+	// treats empty as "unsigned legacy artifact" and the rollout
+	// flag EDGE_REQUIRE_SIGNATURE gates whether such rows are
+	// accepted. Stamped at Deploy / Migrate / MigrateTree time by
+	// `signing.Signer.Sign`.
+	Signature string `db:"signature"`
+	// SigningKeyID is the logical key id used to sign this row
+	// (env EDGE_SIGNING_KEY_ID on the CP). Future rotation work
+	// will check `signing_key_id = <current key id>` to refuse
+	// artifacts signed with a retired key without a DB lookup per
+	// request. Empty for legacy rows.
+	SigningKeyID string `db:"signing_key_id"`
 	// Regions is the list of regions this deployment is replicated to.
 	// The activate path loops over this list and publishes one
 	// `TaskMessage` per region to `edgecloud.tasks.<region>`. An empty
@@ -41,6 +55,10 @@ type Deployment struct {
 	// are not affected). Stored on the deployments row too so operators
 	// can audit "which deployments opted in" via the list endpoint.
 	AutoRollbackEnabled bool `db:"auto_rollback_enabled" json:"auto_rollback_enabled"`
+	// DesiredReplicas is the number of workers that should run this
+	// deployment in each region (issue #316). 0 means "no threshold"
+	// — the reconcile loop won't warn about under-replication.
+	DesiredReplicas int `db:"desired_replicas" json:"desired_replicas"`
 }
 
 // Deployment status constants.
@@ -153,6 +171,10 @@ type ActiveDeployment struct {
 	// NATS stream UI surfaces message ids, but the CP-side table
 	// needs a copy for the join to be useful.
 	LastPublishAttemptID *string `db:"last_publish_attempt_id"`
+	// DesiredReplicas is the number of workers that should run this
+	// deployment in each region (issue #316). 0 means "no threshold".
+	// Copied from the deployments row at activate time.
+	DesiredReplicas int `db:"desired_replicas"`
 }
 
 // AppEnv stores environment variables for an app.

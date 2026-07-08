@@ -119,6 +119,38 @@ func (s *S3ArtifactStore) Save(ctx context.Context, tenantID, appName, deploymen
 	return nil
 }
 
+// SaveFormat writes a pre-compiled artifact (e.g. .cwasm) to S3 alongside the .wasm.
+func (s *S3ArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return err
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return err
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return err
+	}
+	key := s.keyPrefix + tenantID + "/" + appName + "/" + deploymentID + "." + format
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.objectURL(key), r)
+	if err != nil {
+		return fmt.Errorf("S3ArtifactStore.SaveFormat: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	signRequest(req, s.accessKey, s.secretKey, s.region, nil, "UNSIGNED-PAYLOAD")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("S3ArtifactStore.SaveFormat: PUT %s: %w", key, err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("S3ArtifactStore.SaveFormat: draining body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("S3ArtifactStore.SaveFormat: PUT %s: status %d", key, resp.StatusCode)
+	}
+	return nil
+}
+
 // Open GETs the artifact bytes from S3. Returns os.ErrNotExist on a 404
 // so the existing `httperror.NotFoundCtx` path in the worker download
 // handler surfaces a clean 404 without having to special-case
@@ -224,7 +256,7 @@ func (s *S3ArtifactStore) SaveAndHash(ctx context.Context, tenantID, appName, de
 	if err != nil {
 		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: %w", key, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("S3ArtifactStore.SaveAndHash: PUT %s: status %d", key, resp.StatusCode)
 	}

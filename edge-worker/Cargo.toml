@@ -30,6 +30,8 @@ wasmtime = { version = "=45.0.3", features = ["component-model", "async", "anyho
 # `src/dispatch.rs`. Pairs with `wasmtime-wasi-http` in edge-runtime.
 wasmtime-wasi-http = "=45.0.3"
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
 
@@ -53,6 +55,7 @@ hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2.2"
 tokio-rustls = "0.26"
+wasmparser = "0.252.0"
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }

@@ -13,6 +13,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
 )
@@ -69,10 +70,11 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -112,10 +114,11 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -127,6 +130,29 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 	if dep.Hash == "" {
 		t.Error("deployment.Hash = \"\", want populated (SaveAndHash should set it)")
+	}
+
+	// Issue #307: the happy path must stamp a base64url Ed25519
+	// signature onto the deployment row plus the signing key id.
+	// Without these, a worker running with EDGE_REQUIRE_SIGNATURE=true
+	// would reject the artifact at instantiation time — a silent
+	// regression from the previous behavior.
+	signer := signing.TestKey(t)
+	if dep.Signature == "" {
+		t.Error("deployment.Signature = \"\", want populated (Signer.Sign should set it)")
+	}
+	if dep.SigningKeyID != signer.KeyID() {
+		t.Errorf("deployment.SigningKeyID = %q, want %q", dep.SigningKeyID, signer.KeyID())
+	}
+	// And the signature must verify against the same keypair —
+	// round-trip check that catches any future drift in the signed
+	// message layout (the canonical closure of issue #307).
+	ok, vErr := signer.Verify(dep.Hash, dep.ID, dep.Signature)
+	if vErr != nil {
+		t.Fatalf("Verify: %v", vErr)
+	}
+	if !ok {
+		t.Error("signature produced by Deploy did not verify against the test key")
 	}
 }
 
@@ -164,12 +190,14 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		// defaultRegion unset — defensive "global" default in the
 		// constructor doesn't matter for this test (validation
 		// fires before the default-region fallback is consulted).
+		signer: signing.TestKey(t),
 	}
 
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "US-EAST"}, // second is invalid
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid region, got nil")
@@ -194,12 +222,14 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "BAD-1", "BAD-2", "eu-west"},
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -225,6 +255,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	// Build 17 valid regions (a..q) — the cap is 16.
@@ -237,6 +268,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		regions,
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for over-cap regions, got nil")
@@ -278,6 +310,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		signer:         signing.TestKey(t),
 	}
 
 	regions := make([]string, 0, 16)
@@ -289,6 +322,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		regions,
 		false,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("Deploy at cap: %v", err)
@@ -339,10 +373,11 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 		deploymentRepo: repository.NewDeploymentRepository(db),
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(badDir),
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
@@ -410,10 +445,11 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(badDir),
 		appSvc:         appSvc,
+		signer:         signing.TestKey(t),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}

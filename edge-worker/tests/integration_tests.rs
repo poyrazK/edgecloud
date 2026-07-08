@@ -86,7 +86,6 @@ fn test_config(
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
-        queue_group: "test-group".to_string(),
         consumer_name: format!("test-{}", worker_id),
         worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
@@ -99,7 +98,9 @@ fn test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     }
 }
 
@@ -167,10 +168,9 @@ impl TestHarness {
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
-            queue_group: "test-pinning-group".to_string(),
             consumer_name: "test-consumer".to_string(),
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
-            worker_jwt_kid: None,
+            worker_jwt_kid: Some("test-kid".to_string()),
             worker_jwt_issuer: "edgecloud".to_string(),
             worker_tenant_id: "t_test".to_string(),
             handler_request_budget_ms: 1000,
@@ -178,7 +178,9 @@ impl TestHarness {
             task_stream_replicas: 1,
             tls_cert_path: None,
             tls_key_path: None,
+            worker_bootstrap_secret: String::new(),
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            standby_pool_size: 10,
         };
 
         let sup_guard = build_supervisor_with(config).await;
@@ -278,6 +280,7 @@ async fn test_app_lifecycle() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
 
@@ -368,7 +371,6 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
-        queue_group: "test-heartbeat-group".to_string(),
         consumer_name: "test-heartbeat-consumer".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
@@ -380,7 +382,9 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config).await?;
 
@@ -430,6 +434,7 @@ async fn test_stop_all_apps() {
             env: HashMap::new(),
             allowlist: None,
             max_memory_mb: 256,
+            cpu_budget_ms: None,
             routes: None,
         };
         let msg = TaskMessage::TaskUpdate {
@@ -491,6 +496,7 @@ async fn test_artifact_hash_match_starts_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -543,6 +549,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let bad_msg = TaskMessage::TaskUpdate {
@@ -575,6 +582,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let good_msg = TaskMessage::TaskUpdate {
@@ -637,6 +645,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -703,6 +712,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -754,6 +764,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -787,165 +798,13 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     );
 }
 
-/// Issue #86 regression test: two workers in the same region joined to the
-/// same queue group must NOT both start the same app when a single
-/// `TaskMessage` is published. NATS queue-group delivery guarantees
-/// exactly-one delivery across consumers in the group.
-#[tokio::test]
-async fn test_queue_group_pinning() {
-    if should_skip_integration_tests() {
-        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
-        return;
-    }
+// Issue #316: fan-out mode removed queue-group pinning. Every worker
+// receives every TaskMessage and the supervisor's diff logic handles
+// duplicates. This test was removed because the behavior it verified
+// (exactly-once delivery via queue group) is no longer desired — each
+// worker independently reconciles against its running state.
 
-    timeout(Duration::from_secs(120), test_queue_group_pinning_inner())
-        .await
-        .expect("test_queue_group_pinning timed out")
-        .expect("test_queue_group_pinning failed");
-}
-
-async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
-    // Single NATS container, shared by both workers and the publisher.
-    let (nats_container, nats_url) = start_nats().await;
-
-    let region = "test-region";
-    let queue_group = "test-pinning-group";
-
-    // Two workers — same region, same queue group, distinct consumer names.
-    // The pinning test doesn't touch the downloader, so a shared /tmp cache
-    // is fine — give each worker its own subdir to avoid cross-worker clobber.
-    let config_a = Config {
-        worker_id: "w_pinning_a".to_string(),
-        region: region.to_string(),
-        worker_addr: "test-host:0".to_string(),
-        nats_url: String::new(), // overwritten by build_supervisor_from_url
-        control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-a"),
-        heartbeat_interval_secs: 30,
-        worker_sync_threshold_secs: 60,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: queue_group.to_string(),
-        consumer_name: "consumer-a".to_string(),
-        worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_kid: None,
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-        handler_request_budget_ms: 1000,
-        handler_max_request_body_bytes: 10 * 1024 * 1024,
-        task_stream_replicas: 1,
-        tls_cert_path: None,
-        tls_key_path: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
-    };
-    let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
-
-    let config_b = Config {
-        worker_id: "w_pinning_b".to_string(),
-        region: region.to_string(),
-        worker_addr: "test-host:0".to_string(),
-        nats_url: String::new(),
-        control_plane_url: "http://localhost:9999".to_string(),
-        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-b"),
-        heartbeat_interval_secs: 30,
-        worker_sync_threshold_secs: 60,
-        health_check_timeout_secs: 60,
-        port_cooldown_secs: 60,
-        starting_port: 18_000,
-        max_memory_mb: 256,
-        epoch_tick_ms: 10,
-        epoch_deadline_ticks: 100,
-        queue_group: queue_group.to_string(),
-        consumer_name: "consumer-b".to_string(),
-        worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_kid: None,
-        worker_jwt_issuer: "edgecloud".to_string(),
-        worker_tenant_id: "t_test".to_string(),
-        handler_request_budget_ms: 1000,
-        handler_max_request_body_bytes: 10 * 1024 * 1024,
-        task_stream_replicas: 1,
-        tls_cert_path: None,
-        tls_key_path: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
-    };
-    let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
-
-    // Each supervisor gets its own shutdown channel — the test triggers
-    // shutdown at the end and waits for both loops to exit.
-    let (shutdown_tx_a, _) = tokio::sync::broadcast::channel::<()>(1);
-    let (shutdown_tx_b, _) = tokio::sync::broadcast::channel::<()>(1);
-
-    let sup_a_clone = sup_a.clone();
-    let shutdown_rx_a = shutdown_tx_a.subscribe();
-    let handle_a = tokio::spawn(async move {
-        let _ = sup_a_clone.run_consume_loop(shutdown_rx_a).await;
-    });
-
-    let sup_b_clone = sup_b.clone();
-    let shutdown_rx_b = shutdown_tx_b.subscribe();
-    let handle_b = tokio::spawn(async move {
-        let _ = sup_b_clone.run_consume_loop(shutdown_rx_b).await;
-    });
-
-    // Give both consume loops a moment to subscribe before publishing.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Publish a single TaskMessage via plain NATS — JetStream's stream
-    // (subjects = `edgecloud.tasks.>`) captures it.
-    let publisher = async_nats::connect(&nats_url).await?;
-    let payload = serde_json::json!({
-        "type": "task_update",
-        "timestamp": "2026-06-15T00:00:00Z",
-        "tenant_id": "t_test",
-        "apps": {
-            "pinned-app": {
-                "deployment_id": "d_pinned_001",
-                "deployment_hash": "abc123",
-                "env": {},
-                "allowlist": []
-            }
-        }
-    });
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    publisher
-        .publish(format!("edgecloud.tasks.{}", region), payload_bytes.into())
-        .await?;
-
-    // Wait for the message to be processed by exactly one worker.
-    let started =
-        wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "t_test", "pinned-app", 15)
-            .await;
-    assert!(
-        started.is_some(),
-        "exactly one worker should have started pinned-app"
-    );
-
-    // Give the OTHER worker a chance to also start the app (it shouldn't).
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let apps_a = sup_a.state.read().await.apps.len();
-    let apps_b = sup_b.state.read().await.apps.len();
-    let total = apps_a + apps_b;
-    assert_eq!(
-        total, 1,
-        "exactly one worker should host pinned-app (a={}, b={})",
-        apps_a, apps_b
-    );
-
-    // Signal shutdown and wait for consume loops to exit cleanly.
-    let _ = shutdown_tx_a.send(());
-    let _ = shutdown_tx_b.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle_a).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle_b).await;
-
-    drop(nats_container);
-    Ok(())
-}
-
+#[allow(dead_code)]
 /// Wait until `app_name` is `Running` in any of `supervisors`. Returns
 /// which supervisor saw it (Some(index)) or None if none did within the
 /// timeout.
@@ -1055,6 +914,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1236,6 +1096,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
         env: HashMap::new(),
         allowlist: Some(vec![]),
         max_memory_mb: 0,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1577,6 +1438,7 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
     };
     let mut apps = HashMap::new();
     apps.insert("myapp".to_string(), bad_app);
@@ -1630,7 +1492,7 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure() {
 // This is now a thin shim over `edge_test_helpers::build_supervisor_with`
 // that lets each test specify only the bits that vary (worker_id,
 // region, tenant_id, control_plane_url). It's still useful because
-// the rest of the Config (starting_port, queue_group, …) is identical
+// the rest of the Config (starting_port, consumer_name, …) is identical
 // across all 5 call sites — keeping the wiring logic next to the
 // tests lets the test author see what knobs can be customised
 // without having to jump into the helper crate.
@@ -1658,7 +1520,6 @@ async fn build_supervisor_only_with_cp(
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
-        queue_group: "test-sync-group".to_string(),
         consumer_name: "test-sync-consumer".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
@@ -1669,7 +1530,9 @@ async fn build_supervisor_only_with_cp(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        standby_pool_size: 10,
     };
 
     let guard = build_supervisor_with(config).await;
@@ -1683,4 +1546,97 @@ async fn build_supervisor_only_with_cp(
     // semantics, we intentionally forget the NATS container here.
     std::mem::forget(guard._nats_container);
     Ok(guard.supervisor)
+}
+
+#[tokio::test]
+async fn test_supervisor_lazy_starting_and_eviction() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_deploy_001"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // Step 1: send TaskMessage to start an app
+    let spec = AppSpec {
+        deployment_id: "d_deploy_001".to_string(),
+        deployment_hash: test_component_hash(),
+        env: HashMap::new(),
+        allowlist: None,
+        max_memory_mb: 256,
+        cpu_budget_ms: None,
+        routes: None,
+    };
+
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-06-15T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("test-app".to_string(), spec)]),
+    };
+
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check state. Since it's lazy, there shouldn't be an engine yet.
+    let dispatch = {
+        let state = harness.supervisor.state.read().await;
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
+        let inst_locked = inst.lock().await;
+        assert_eq!(
+            inst_locked.execution_model,
+            edge_worker::detect::ExecutionModel::Handler
+        );
+        inst_locked.dispatch.clone().unwrap()
+    };
+
+    assert!(
+        dispatch.evict().await.is_none(),
+        "Engine should be None because it is lazily started"
+    );
+
+    // Simulate request by hitting the port
+    let port = {
+        let state = harness.supervisor.state.read().await;
+        let inst = state
+            .apps
+            .get(&("t_test".to_string(), "test-app".to_string()))
+            .unwrap();
+        let p = inst.lock().await.port;
+        p
+    };
+
+    let client = reqwest::Client::new();
+    let _ = client
+        .get(format!("http://127.0.0.1:{}", port))
+        .send()
+        .await;
+
+    // Give it a moment to process
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Check state. Engine should exist now.
+    let engine = dispatch.evict().await;
+    assert!(
+        engine.is_some(),
+        "Engine should be Some because it was started"
+    );
+
+    // Free it
+    if let Some(e) = engine {
+        harness.supervisor.engine_pool.release(e);
+    }
 }

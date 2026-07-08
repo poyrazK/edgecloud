@@ -1,16 +1,22 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -57,7 +63,7 @@ func newInternalHandler(svc handler.InternalDomainServiceInterface) *handler.Int
 	// We rely on the InternalHandler struct's `domainSvc` being the
 	// first thing the custom-domain routes read; the deployment
 	// service is only read by Download, which is not in this test set.
-	return handler.NewInternalHandler(nil, nil, svc, nil, nil, nil, "")
+	return handler.NewInternalHandler(nil, nil, svc, nil, nil, nil, "", "", "")
 }
 
 // TestInternal_ListDomains_HappyPath pins the array-shape contract that
@@ -257,5 +263,209 @@ func TestInternal_UpdateDomainStatus_InternalError_Returns500(t *testing.T) {
 	h.UpdateDomainStatus(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", rec.Code)
+	}
+}
+
+// ── Bootstrap handshake tests (issue #104) ───────────────────────────────
+
+// testBootstrapSecret is a shared bootstrap secret for tests.
+const testBootstrapSecret = "test-bootstrap-secret-that-is-long-enough-32!"
+
+// signBootstrapPayload computes the HMAC-SHA256 signature for a bootstrap
+// request, matching the CP-side verification in internal.go's Bootstrap handler.
+func signBootstrapPayload(workerID, region, tenantID, timestamp, nonce, secret string) string {
+	payload := workerID + ":" + region + ":" + tenantID + ":" + timestamp + ":" + nonce
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// withBootstrapCtx attaches the same context values BootstrapAuth middleware
+// would after validating a bootstrap JWT: worker_id and tenant_id.
+func withBootstrapCtx(workerID, tenantID, region string) func(*http.Request) *http.Request {
+	return func(r *http.Request) *http.Request {
+		ctx := context.WithValue(r.Context(), middleware.WorkerIDKey, workerID)
+		ctx = context.WithValue(ctx, middleware.WorkerTenantIDKey, tenantID)
+		ctx = context.WithValue(ctx, middleware.WorkerRegionKey, region)
+		return r.WithContext(ctx)
+	}
+}
+
+// TestInternal_Bootstrap_NotConfigured returns 501 when bootstrap secret is empty.
+func TestInternal_Bootstrap_NotConfigured(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "")
+	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","nonce":"abc","signature":"def"}`
+	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Bootstrap(rec, req)
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", rec.Code)
+	}
+}
+
+// TestInternal_Bootstrap_MissingFields returns 400.
+func TestInternal_Bootstrap_MissingFields(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty body", `{}`},
+		{"missing worker_id", `{"region":"fra","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","nonce":"abc","signature":"def"}`},
+		{"missing region", `{"worker_id":"w_test","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","nonce":"abc","signature":"def"}`},
+		{"missing tenant_id", `{"worker_id":"w_test","region":"fra","timestamp":"2026-07-06T12:00:00Z","nonce":"abc","signature":"def"}`},
+		{"missing timestamp", `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","nonce":"abc","signature":"def"}`},
+		{"missing nonce", `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","signature":"def"}`},
+		{"missing signature", `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","nonce":"abc"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(tt.body))
+			rec := httptest.NewRecorder()
+			h.Bootstrap(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+// TestInternal_Bootstrap_InvalidTimestampFormat returns 400 when timestamp
+// is not valid RFC3339.
+func TestInternal_Bootstrap_InvalidTimestampFormat(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"not-a-timestamp","nonce":"abc","signature":"def"}`
+	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Bootstrap(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestInternal_Bootstrap_StaleTimestamp returns 400 when timestamp is >5min old.
+func TestInternal_Bootstrap_StaleTimestamp(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	oldTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
+	sig := signBootstrapPayload("w_test", "fra", "t_test", oldTime, "abc", testBootstrapSecret)
+	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"` + oldTime + `","nonce":"abc","signature":"` + sig + `"}`
+	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Bootstrap(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestInternal_Bootstrap_InvalidSignature returns 401.
+func TestInternal_Bootstrap_InvalidSignature(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	now := time.Now().Format(time.RFC3339)
+	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"` + now + `","nonce":"abc","signature":"wrong-signature"}`
+	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Bootstrap(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+// TestInternal_Bootstrap_Success returns 200 with a JWT token.
+func TestInternal_Bootstrap_Success(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "real-jwt-secret")
+	now := time.Now().Format(time.RFC3339)
+	sig := signBootstrapPayload("w_test_abc", "fra", "t_test", now, "unique-nonce", testBootstrapSecret)
+	bodyMap := map[string]string{
+		"worker_id": "w_test_abc",
+		"region":    "fra",
+		"tenant_id": "t_test",
+		"timestamp": now,
+		"nonce":     "unique-nonce",
+		"signature": sig,
+	}
+	bodyBytes, _ := json.Marshal(bodyMap)
+	req := httptest.NewRequest("POST", "/api/internal/bootstrap", bytes.NewReader(bodyBytes))
+	rec := httptest.NewRecorder()
+	h.Bootstrap(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	token, ok := resp["token"]
+	if !ok || token == "" {
+		t.Fatal("response missing 'token' field")
+	}
+	// Verify the token is a valid bootstrap JWT signed with the bootstrap secret.
+	claims, err := middleware.VerifyBootstrapJWT(token, middleware.BootstrapJWTConfig{
+		BootstrapSecret: testBootstrapSecret,
+		Issuer:          "edgecloud-bootstrap",
+	})
+	if err != nil {
+		t.Fatalf("verify bootstrap JWT: %v", err)
+	}
+	if claims.WorkerID != "w_test_abc" {
+		t.Errorf("WorkerID = %q, want w_test_abc", claims.WorkerID)
+	}
+	if claims.TenantID != "t_test" {
+		t.Errorf("TenantID = %q, want t_test", claims.TenantID)
+	}
+	if claims.Region != "fra" {
+		t.Errorf("Region = %q, want fra", claims.Region)
+	}
+}
+
+// TestInternal_WorkerSecret_NotConfigured returns 501 when bootstrap is not set.
+func TestInternal_WorkerSecret_NotConfigured(t *testing.T) {
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "")
+	req := httptest.NewRequest("GET", "/api/internal/worker-secret", nil)
+	rec := httptest.NewRecorder()
+	h.WorkerSecret(rec, req)
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", rec.Code)
+	}
+}
+
+// TestInternal_WorkerSecret_Success returns 200 with the JWT secret.
+func TestInternal_WorkerSecret_Success(t *testing.T) {
+	jwtSecret := "the-real-jwt-secret-that-is-at-least-32-b"
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, jwtSecret)
+
+	// Issue a bootstrap JWT the same way the Bootstrap handler would.
+	cfg := middleware.BootstrapJWTConfig{
+		BootstrapSecret: testBootstrapSecret,
+		Issuer:          "edgecloud-bootstrap",
+	}
+	token, err := middleware.IssueBootstrapJWT(cfg, "w_test_abc", "t_test", "fra")
+	if err != nil {
+		t.Fatalf("issue bootstrap JWT: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/internal/worker-secret", nil)
+	req = withBootstrapCtx("w_test_abc", "t_test", "fra")(req)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.WorkerSecret(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	gotSecret, ok := resp["secret"]
+	if !ok || gotSecret == "" {
+		t.Fatal("response missing 'secret' field")
+	}
+	if gotSecret != jwtSecret {
+		t.Errorf("secret = %q, want %q", gotSecret, jwtSecret)
+	}
+	// Cache-Control header must be set to no-store.
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
 	}
 }

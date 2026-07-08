@@ -105,6 +105,7 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	_, err := r.db.ExecContext(ctx, query,
 		ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled,
 		regionsPublished, regionsFailed, regionsCached, regionsCacheFailed, ad.LastPublishAt, ad.LastPublishAttemptID,
+		ad.DesiredReplicas,
 	)
 	return err
 }
@@ -310,8 +311,9 @@ func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID 
 // did).
 type JoinedActiveDeployment struct {
 	domain.ActiveDeployment
-	Hash    sql.NullString `db:"hash"`
-	Regions pq.StringArray `db:"regions"`
+	Hash      sql.NullString `db:"hash"`
+	Signature sql.NullString `db:"signature"`
+	Regions   pq.StringArray `db:"regions"`
 }
 
 // ListByTenantWithDeployment returns one row per active deployment
@@ -336,8 +338,9 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 	query := `
 		SELECT ad.tenant_id, ad.app_name, ad.deployment_id, ad.last_good_deployment_id,
 		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
-		       ad.regions_failed, ad.regions_cached, ad.last_publish_at, ad.last_publish_attempt_id,
-		       d.hash, d.regions
+		       ad.regions_failed, ad.regions_cached, ad.regions_cache_failed,
+		       ad.last_publish_at, ad.last_publish_attempt_id,
+		       d.hash, d.signature, d.regions
 		FROM active_deployments ad
 		LEFT JOIN deployments d ON d.id = ad.deployment_id
 		WHERE ad.tenant_id = $1

@@ -135,6 +135,10 @@ func (s *WorkerService) Register(ctx context.Context, tenantID string, req *doma
 		return ErrRegionMismatch
 	}
 
+	if tenantID == "*" || tenantID == "" {
+		tenantID = "t_system"
+	}
+
 	// 3. Atomic upsert — handles both new registrations and re-registrations.
 	// Uses ON CONFLICT DO NOTHING so concurrent inserts for the same worker_id
 	// are safely deduplicated; the RETURNING clause tells us if a row was inserted.

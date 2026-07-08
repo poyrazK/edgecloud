@@ -36,7 +36,6 @@ use edge_worker::supervisor::Supervisor;
 
 use edge_ingress::heartbeats::apply_heartbeat;
 use edge_ingress::routing::RoutingTable;
-use edge_runtime::socket_egress::SocketEgressPolicy;
 
 /// Construct a `Config` matching the worker's runtime expectations, for
 /// the heartbeat wire test (which never starts apps; the only fields it
@@ -47,6 +46,7 @@ fn wire_test_config(
     worker_addr: &str,
 ) -> edge_worker::config::Config {
     edge_worker::config::Config {
+        worker_jwt_kid: None,
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: worker_addr.to_string(),
@@ -61,10 +61,8 @@ fn wire_test_config(
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
-        queue_group: "ingress-wire-group".to_string(),
         consumer_name: format!("ingress-wire-{worker_id}"),
         worker_jwt_secret: "test-secret".to_string(),
-        worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),
         handler_request_budget_ms: 1000,
@@ -72,7 +70,9 @@ fn wire_test_config(
         task_stream_replicas: 1,
         tls_cert_path: None,
         tls_key_path: None,
-        socket_mode: SocketEgressPolicy::default(),
+        worker_bootstrap_secret: String::new(),
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+        standby_pool_size: 10,
     }
 }
 

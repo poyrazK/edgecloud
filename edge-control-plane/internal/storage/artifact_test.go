@@ -28,7 +28,7 @@ func TestFSArtifactStore_SaveOpenRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	got, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
@@ -369,7 +369,7 @@ func TestFSArtifactStore_OpenFormat(t *testing.T) {
 		t.Fatalf("OpenFormat empty: %v", err)
 	}
 	got, _ := io.ReadAll(rc)
-	rc.Close()
+	_ = rc.Close()
 	if !bytes.Equal(got, payload) {
 		t.Errorf("expected %x, got %x", payload, got)
 	}
@@ -380,7 +380,7 @@ func TestFSArtifactStore_OpenFormat(t *testing.T) {
 		t.Fatalf("OpenFormat wasm: %v", err)
 	}
 	got, _ = io.ReadAll(rc)
-	rc.Close()
+	_ = rc.Close()
 	if !bytes.Equal(got, payload) {
 		t.Errorf("expected %x, got %x", payload, got)
 	}
@@ -403,7 +403,7 @@ func TestFSArtifactStore_OpenFormat(t *testing.T) {
 		t.Fatalf("OpenFormat cwasm: %v", err)
 	}
 	got, _ = io.ReadAll(rc)
-	rc.Close()
+	_ = rc.Close()
 	if !bytes.Equal(got, cwasmPayload) {
 		t.Errorf("expected %s, got %s", cwasmPayload, got)
 	}

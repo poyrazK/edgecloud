@@ -2,8 +2,12 @@ package handler
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -59,19 +63,21 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // a sync — the periodic timer in cmd/api/main.go will catch up
 // within RECONCILE_INTERVAL. Set via NewInternalHandler. Tests pass
 // nil so they don't have to wire a publisher.
+//
+// `bootstrapSecret` is the HMAC secret for the bootstrap handshake
+// (issue #104). When empty, the bootstrap endpoint returns 501
+// (not configured). Set via `BOOTSTRAP_SECRET` env var.
 type InternalHandler struct {
-	deploymentSvc autoRollbacker
-	workerSvc     workerRegisterer
-	domainSvc     InternalDomainServiceInterface
-	logEntryRepo  logEntryRepo
-	reconcileSvc  syncRequester
-	// syncBuilder is the read-only side of the ReconcileService — it
-	// computes the per-region AppConfig map without publishing, so the
-	// HTTP /sync fallback endpoint (issue #53) can return the exact
-	// payload the periodic loop would publish. Tests inject a stub.
-	// nil-safe: when nil, the Sync endpoint returns 501.
-	syncBuilder syncPayloadBuilder
-	cpRegion    string
+	deploymentSvc  autoRollbacker
+	workerSvc      workerRegisterer
+	domainSvc      InternalDomainServiceInterface
+	logEntryRepo   logEntryRepo
+	reconcileSvc   syncRequester
+	syncBuilder    syncPayloadBuilder
+	cpRegion       string
+	bootstrapSecret string
+	// jwtSecret is the JWT_SECRET the bootstrap handshake delivers to workers.
+	jwtSecret string
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -131,6 +137,8 @@ func NewInternalHandler(
 	reconcileSvc syncRequester,
 	syncBuilder syncPayloadBuilder,
 	cpRegion string,
+	bootstrapSecret string,
+	jwtSecret string,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc: deploymentSvc,
@@ -140,6 +148,8 @@ func NewInternalHandler(
 		reconcileSvc:  reconcileSvc,
 		syncBuilder:   syncBuilder,
 		cpRegion:      cpRegion,
+		bootstrapSecret: bootstrapSecret,
+		jwtSecret:       jwtSecret,
 	}
 }
 
@@ -149,7 +159,11 @@ func (h *InternalHandler) Download(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetWorkerTenantID(r.Context())
 	deploymentID := r.PathValue("deploymentID")
 
-	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), tenantID, deploymentID)
+	lookupTenant := tenantID
+	if middleware.IsSharedWorker(r.Context()) {
+		lookupTenant = "*"
+	}
+	deployment, err := h.deploymentSvc.GetDeployment(r.Context(), lookupTenant, deploymentID)
 	if err != nil || deployment == nil {
 		httperror.NotFoundCtx(w, r, "not found")
 		return
@@ -319,6 +333,12 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	if appName != req.AppName {
 		httperror.BadRequestCtx(w, r, "app_name in URL and body must match")
+		return
+	}
+
+	jwtTenant := middleware.GetWorkerTenantID(r.Context())
+	if jwtTenant != "" && jwtTenant != "*" && jwtTenant != req.TenantID {
+		httperror.ForbiddenCtx(w, r, "tenant mismatch")
 		return
 	}
 
@@ -550,4 +570,124 @@ func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// WorkerBootstrapRequest is the JSON body for the bootstrap handshake.
+type WorkerBootstrapRequest struct {
+	WorkerID  string `json:"worker_id"`
+	Region    string `json:"region"`
+	TenantID  string `json:"tenant_id"`
+	Timestamp string `json:"timestamp"`  // RFC3339, for replay protection
+	Nonce     string `json:"nonce"`      // random value for replay protection
+	Signature string `json:"signature"`  // HMAC-SHA256 of worker_id+":"+region+":"+tenant_id+":"+timestamp+":"+nonce
+}
+
+// Bootstrap handles POST /api/internal/bootstrap — the first phase of
+// the bootstrap handshake (issue #104). The worker sends a request
+// signed with the shared BOOTSTRAP_SECRET and receives a short-lived
+// JWT (5 minutes) that it can use to fetch the real JWT_SECRET.
+//
+// Returns 501 when BOOTSTRAP_SECRET is not configured on the CP.
+// Returns 401 on invalid signature.
+// Returns 400 on malformed request.
+// Returns 200 with {"token": "<bootstrap_jwt>"} on success.
+func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
+	if h.bootstrapSecret == "" {
+		http.Error(w, `{"error": "bootstrap not configured"}`, http.StatusNotImplemented)
+		return
+	}
+
+	var req WorkerBootstrapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+	if req.WorkerID == "" || req.Region == "" || req.TenantID == "" {
+		httperror.BadRequestCtx(w, r, "worker_id, region, and tenant_id are required")
+		return
+	}
+	if req.Timestamp == "" || req.Nonce == "" || req.Signature == "" {
+		httperror.BadRequestCtx(w, r, "timestamp, nonce, and signature are required")
+		return
+	}
+
+	// Verify timestamp is within 5 minutes (replay protection).
+	ts, err := time.Parse(time.RFC3339, req.Timestamp)
+	if err != nil {
+		httperror.BadRequestCtx(w, r, "invalid timestamp format (use RFC3339)")
+		return
+	}
+	if time.Since(ts) > 5*time.Minute || time.Since(ts) < -1*time.Minute {
+		httperror.BadRequestCtx(w, r, "timestamp is too old or in the future")
+		return
+	}
+
+	// Verify HMAC-SHA256 signature.
+	payload := fmt.Sprintf("%s:%s:%s:%s:%s",
+		req.WorkerID, req.Region, req.TenantID, req.Timestamp, req.Nonce)
+	mac := hmac.New(sha256.New, []byte(h.bootstrapSecret))
+	mac.Write([]byte(payload))
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(req.Signature), []byte(expectedSig)) {
+		log.Printf("bootstrap: invalid signature for worker %s (tenant=%s, region=%s)",
+			req.WorkerID, req.TenantID, req.Region)
+		httperror.UnauthorizedCtx(w, r, "invalid signature")
+		return
+	}
+
+	// Issue short-lived bootstrap JWT.
+	cfg := middleware.BootstrapJWTConfig{
+		BootstrapSecret: h.bootstrapSecret,
+		Issuer:          "edgecloud-bootstrap",
+	}
+	token, err := middleware.IssueBootstrapJWT(cfg, req.WorkerID, req.TenantID, req.Region)
+	if err != nil {
+		log.Printf("bootstrap: failed to issue JWT for worker %s: %v", req.WorkerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	// Audit log the bootstrap.
+	auditRecord(r, "bootstrap", "worker", req.WorkerID,
+		fmt.Sprintf("worker %s (tenant=%s, region=%s) bootstrap", req.WorkerID, req.TenantID, req.Region),
+		"success")
+
+	log.Printf("bootstrap: worker %s (tenant=%s, region=%s) authenticated via bootstrap secret",
+		req.WorkerID, req.TenantID, req.Region)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"token": token,
+	})
+}
+
+// WorkerSecret handles GET /api/internal/worker-secret — the second
+// phase of the bootstrap handshake (issue #104). The worker presents
+// its short-lived bootstrap JWT (obtained from POST /api/internal/bootstrap)
+// and receives the real JWT_SECRET in return.
+//
+// Protected by the BootstrapAuth middleware (separate from WorkerAuth).
+// Returns 200 with {"secret": "<jwt_secret>"} on success.
+func (h *InternalHandler) WorkerSecret(w http.ResponseWriter, r *http.Request) {
+	if h.bootstrapSecret == "" || h.jwtSecret == "" {
+		http.Error(w, `{"error": "bootstrap not configured"}`, http.StatusNotImplemented)
+		return
+	}
+
+	workerID := middleware.GetWorkerID(r.Context())
+	tenantID := middleware.GetWorkerTenantID(r.Context())
+
+	// Audit log the secret fetch.
+	auditRecord(r, "secret_fetch", "worker", workerID,
+		fmt.Sprintf("worker %s (tenant=%s) fetched JWT secret", workerID, tenantID),
+		"success")
+
+	log.Printf("worker-secret: worker %s (tenant=%s) fetched JWT secret", workerID, tenantID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"secret": h.jwtSecret,
+	})
 }

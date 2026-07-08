@@ -7,6 +7,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // WorkerRepository handles worker data access.
@@ -113,6 +114,38 @@ func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, a
 	return targets, nil
 }
 
+// CountRunningWorkers returns the number of distinct workers running
+// each of the given apps for a tenant. Apps with zero running workers
+// are absent from the result map. The key is the bare app_name (the
+// split_part strips canary suffixes like `myapp:d_xxx`). Used by the
+// reconcile loop for under-replication monitoring (issue #316).
+func (r *WorkerRepository) CountRunningWorkers(ctx context.Context, tenantID string, appNames []string) (map[string]int, error) {
+	if len(appNames) == 0 {
+		return map[string]int{}, nil
+	}
+	const query = `
+		SELECT split_part(apps.key, ':', 1) AS app_name, COUNT(DISTINCT worker_id) AS running_count
+		FROM workers
+		JOIN worker_status ON worker_status.worker_id = workers.id
+		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
+		WHERE apps.value->>'tenant_id' = $1
+		  AND apps.value->>'status' = 'running'
+		  AND split_part(apps.key, ':', 1) = ANY($2)
+		GROUP BY split_part(apps.key, ':', 1)`
+	var rows []struct {
+		AppName      string `db:"app_name"`
+		RunningCount int    `db:"running_count"`
+	}
+	if err := r.db.SelectContext(ctx, &rows, query, tenantID, pq.Array(appNames)); err != nil {
+		return nil, err
+	}
+	out := make(map[string]int, len(rows))
+	for _, row := range rows {
+		out[row.AppName] = row.RunningCount
+	}
+	return out, nil
+}
+
 // GetAppStatus returns the worker-reported status for one of the
 // tenant's apps, or `nil, nil` when no worker has reported on this
 // (tenant, app) pair yet. Powers GET /api/v1/apps/{appName}/status.
@@ -135,6 +168,7 @@ func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName s
 		SELECT
 			apps.key                                    AS app_name,
 			apps.value->>'status'                       AS status,
+			apps.value->>'deployment_id'                AS deployment_id,
 			worker_status.last_report                   AS last_heartbeat,
 			workers.region                              AS region,
 			workers.id                                  AS worker_id,
@@ -142,7 +176,7 @@ func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName s
 		FROM workers
 		JOIN worker_status ON worker_status.worker_id = workers.id
 		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
-		WHERE apps.key = $1
+		WHERE split_part(apps.key, ':', 1) = $1
 		  AND apps.value->>'tenant_id' = $2
 		ORDER BY worker_status.last_report DESC
 		LIMIT 1`
@@ -238,7 +272,7 @@ func (r *WorkerRepository) GetLatestStatuses(ctx context.Context, workerIDs []st
 	// sqlx + the pgx driver accept []string as a Postgres text[] array,
 	// which binds to ANY($1) directly.
 	query := `SELECT DISTINCT ON (worker_id) worker_id, apps, last_report FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`
-	if err := r.db.SelectContext(ctx, &rows, query, workerIDs); err != nil {
+	if err := r.db.SelectContext(ctx, &rows, query, pq.Array(workerIDs)); err != nil {
 		return nil, err
 	}
 	for _, ws := range rows {

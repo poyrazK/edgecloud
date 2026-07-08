@@ -8,8 +8,47 @@ mod output;
 mod state;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::time::SystemTime;
+
+/// Source language for the `edge build` and `edge init` commands
+/// (issue #317 — Multi-language runtime support). Each variant maps
+/// to a dedicated build pipeline; the lowercase clap value (`rust`,
+/// `js`) is what the user types on the command line and what gets
+/// written into `[project] language = "..."` in `edge.toml`.
+///
+/// Single source of truth: the `#[value(name = "...")]` attribute is
+/// the canonical wire form. `Display::fmt` and `as_str()` both
+/// delegate to it, so adding a new variant is a one-line change at
+/// this enum (no edits to `init.rs`, `build.rs`, or `deploy.rs`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LangArg {
+    #[value(name = "rust")]
+    Rust,
+    #[value(name = "js")]
+    Js,
+}
+
+impl std::fmt::Display for LangArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl LangArg {
+    /// Lowercase string form used both as the clap value and as the
+    /// `edge.toml` `language` field. Kept here so `commands::build::path_for`
+    /// and friends can match on a `&str` rather than re-implementing
+    /// the per-variant rendering.
+    pub fn as_str(&self) -> &'static str {
+        // Sourced from the `#[value(name = "...")]` attribute above so
+        // adding a variant here can't drift from the clap wire form.
+        match self {
+            LangArg::Rust => "rust",
+            LangArg::Js => "js",
+        }
+    }
+}
 
 /// Generate a short unique suffix for preview deployments.
 fn short_hash() -> String {
@@ -89,10 +128,23 @@ enum Command {
         /// `~/.config/edgecloud/config.toml`, then the default.
         #[arg(long)]
         api: Option<String>,
+        /// Source language for the starter template. `rust` scaffolds
+        /// `Cargo.toml` + `src/main.rs`; `js` scaffolds `index.js`
+        /// (a wasi:http-only handler, built by Javy). The choice is
+        /// written into `[project] language = "..."` in `edge.toml`.
+        #[arg(long, value_enum, default_value_t = LangArg::Rust)]
+        lang: LangArg,
     },
 
     /// Compile the project to WebAssembly.
-    Build,
+    Build {
+        /// Source language to build. When omitted, reads `[project] language`
+        /// from `edge.toml` (falling back to `rust`). If both `--lang` and
+        /// the toml are set, they must agree — mismatches are rejected with
+        /// a clear error so you never accidentally build the wrong artifact.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
+    },
 
     /// Upload the artifact to the edgeCloud control plane, or activate a stored one.
     ///
@@ -102,6 +154,16 @@ enum Command {
         /// App name. Upload mode: overrides edge.toml. Activate mode (with --id): primary source; falls back to .edge/state.json.
         #[arg(default_value = "")]
         app: String,
+
+        /// Source language for the artifact path lookup. By default
+        /// we read `[project] language` from `edge.toml`. Pass this
+        /// flag to override (e.g. when you built with
+        /// `edge build --lang=js` but your toml still says `rust`).
+        /// `--lang` and the toml must agree; mismatches are rejected
+        /// with a clear error so a stale rust deploy path can never
+        /// be served for a Javy artifact.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
 
         /// Activate a previously-stored deployment by ID (e.g. from `edge migrate`).
         #[arg(long, value_name = "deployment_id")]
@@ -135,6 +197,13 @@ enum Command {
         /// property, not a session toggle).
         #[arg(long)]
         auto_rollback: bool,
+
+        /// Desired number of workers to run this deployment in each
+        /// region (issue #316). 0 means no threshold. Every worker
+        /// already receives every TaskMessage (fan-out) — this is a
+        /// monitoring threshold, not a scheduling constraint.
+        #[arg(long, default_value_t = 0)]
+        replicas: usize,
 
         /// Deploy as a preview with a unique staging URL.
         /// The app is deployed under a suffixed name (e.g. `myapp--preview-abc123`)
@@ -223,7 +292,13 @@ enum Command {
     },
 
     /// Local development server with hot-reload.
-    Dev,
+    Dev {
+        /// Source language to build. When omitted, reads `[project] language`
+        /// from `edge.toml` (falling back to `rust`). Must match the toml
+        /// when both are set — mismatches are rejected with a clear error.
+        #[arg(long, value_enum)]
+        lang: Option<LangArg>,
+    },
 
     /// Open the deployed URL in a browser.
     Open {
@@ -356,16 +431,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { name, api } => commands::init::run(&name, api.as_deref()),
-        Command::Build => commands::build::run(&cli.path),
+        Command::Init { name, api, lang } => commands::init::run(&name, api.as_deref(), lang),
+        Command::Build { lang } => commands::build::run(&cli.path, lang),
         Command::Deploy {
             app,
             id,
             regions,
             auto_rollback,
+            replicas,
             file,
             preview,
             promote,
+            lang,
         } => {
             if let Some(dep_id) = promote {
                 return commands::deploy::run_promote(&cli.path, &app, &dep_id);
@@ -381,7 +458,9 @@ fn main() -> Result<()> {
                 id.as_deref(),
                 &regions,
                 auto_rollback,
+                replicas,
                 file.as_deref(),
+                lang,
             )
         }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
@@ -404,7 +483,7 @@ fn main() -> Result<()> {
         },
         Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
-        Command::Dev => commands::dev::run(&cli.path),
+        Command::Dev { lang } => commands::dev::run(&cli.path, lang),
         Command::Open { force } => commands::open::run(&cli.path, force),
         Command::Deployments => commands::deployments::run(&cli.path),
         Command::Quota => commands::quota::run(&cli.path),

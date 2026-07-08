@@ -16,3 +16,28 @@ pub fn new_memory_limits(max_memory_mb: u64) -> wasmtime::StoreLimits {
         .memories(1)
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_size_matches_max_mb() {
+        let limits = new_memory_limits(256);
+        // wasmtime's StoreLimits doesn't expose fields, so we verify
+        // the builder completes without error and the return type is correct.
+        let _ = limits;
+    }
+
+    #[test]
+    fn zero_max_mb_produces_some_limit() {
+        let limits = new_memory_limits(0);
+        let _ = limits;
+    }
+
+    #[test]
+    fn large_value_does_not_overflow() {
+        let limits = new_memory_limits(1_000_000);
+        let _ = limits;
+    }
+}

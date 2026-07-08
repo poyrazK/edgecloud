@@ -80,6 +80,10 @@ func (m *mockDeploymentGCArtifactStore) SaveAndHash(ctx context.Context, tenantI
 	return nil, nil
 }
 
+func (m *mockDeploymentGCArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return nil
+}
+
 func (m *mockDeploymentGCArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

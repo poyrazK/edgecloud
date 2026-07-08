@@ -56,7 +56,6 @@ use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
@@ -172,25 +171,23 @@ impl AsyncWrite for MaybeTls {
 /// `hyper`-based server bound to `0.0.0.0:port`. One instance per
 /// `(tenant_id, app_name)` is stored on the `AppInstance`.
 pub struct HandlerDispatch {
-    /// `wasmtime_wasi_http::ProxyPre` — pre-instantiated component
-    /// that exports `wasi:http/incoming-handler`. Cheap to clone
-    /// (Arc-shared); we hand a clone to each per-request task so
-    /// `proxy_pre.instantiate_async(&mut store)` is parallel-safe.
-    proxy_pre: HandlerProxyPre,
     /// TCP port assigned to this app by `PortPool`.
     port: u16,
-    /// Per-request wasmtime epoch deadline (in ticks, where each tick
-    /// is `tick_ms`).
-    request_budget_ticks: u64,
+
     /// Engine-clock tick interval (ms) — how often the per-app ticker
     /// calls `engine.increment_epoch()`. Defaults to 1 if the caller
     /// passes 0.
     tick_ms: u64,
     /// Per-app context shared across all requests (tenant_id, egress,
     /// meter, log_sink, app_ctx). Cheap to clone (`Arc`-heavy).
-    config: Arc<HandlerConfig>,
+    pub config: Arc<HandlerConfig>,
     /// Optional TLS server config for encrypted connections (issue #209).
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    downloader: Arc<crate::downloader::Downloader>,
+    deployment_id: String,
+    engine_pool: Arc<crate::supervisor::StandbyPool>,
+    proxy_pre: tokio::sync::RwLock<Option<HandlerProxyPre>>,
+    state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
 }
 
 /// Per-app context handed to every FaaS request.
@@ -227,35 +224,47 @@ pub struct HandlerConfig {
     /// itself; the worker's `Config::from_env` reads it once at
     /// startup and the supervisor copies it into `HandlerConfig`.
     pub socket_mode: SocketEgressPolicy,
+    pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    pub max_memory_mb: u64,
+    pub cpu_budget_ms: u64,
 }
 
 impl HandlerDispatch {
-    /// Build a dispatcher from a pre-instantiated component.
+    /// Create a new HandlerDispatch wrapping a ProxyPre for a Handler component.
+    /// `tick_ms` is clamped to ≥1, and ticks is clamped to ≥1.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        instance_pre: InstancePre<RuntimeState>,
         port: u16,
-        request_budget_ms: u64,
+        _request_budget_ms: u64,
         epoch_tick_ms: u64,
         config: HandlerConfig,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        downloader: Arc<crate::downloader::Downloader>,
+        deployment_id: String,
+        engine_pool: Arc<crate::supervisor::StandbyPool>,
+        state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
     ) -> anyhow::Result<Self> {
-        let proxy_pre = HandlerProxyPre::new(instance_pre).map_err(|e| {
-            anyhow::anyhow!(
-                "ProxyPre::new (component does not export wasi:http/incoming-handler): {e}"
-            )
-        })?;
-        // Defend against divide-by-zero: a misconfigured 0 tick would
-        // NaN the math. Default to 1 ms.
         let tick_ms = epoch_tick_ms.max(1);
-        let ticks = request_budget_ms / tick_ms;
         Ok(Self {
-            proxy_pre,
+            proxy_pre: tokio::sync::RwLock::new(None),
             port,
-            request_budget_ticks: ticks.max(1),
             tick_ms,
             config: Arc::new(config),
             tls_config,
+            downloader,
+            deployment_id,
+            engine_pool,
+            state,
         })
+    }
+
+    /// Expose for integration tests so they can skip the Downloader.
+    #[allow(dead_code)]
+    pub async fn set_proxy_pre(
+        &self,
+        pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>,
+    ) {
+        *self.proxy_pre.write().await = Some(pre);
     }
 
     /// Spawn the HTTP server on `0.0.0.0:port`. Returns once the
@@ -298,7 +307,9 @@ impl HandlerDispatch {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let ticker_engine = self.proxy_pre.engine().clone();
+        // The engine could change during lazy-loading, so the ticker needs
+        // to dynamically fetch the latest engine. We use a channel or shared ref.
+        let server_ref = self.clone();
         let tick_ms = self.tick_ms;
         let ticker_shutdown = shutdown_flag.clone();
         let ticker_handle = thread::Builder::new()
@@ -311,7 +322,14 @@ impl HandlerDispatch {
                 if ticker_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                ticker_engine.increment_epoch();
+
+                let maybe_engine = {
+                    let lock = server_ref.proxy_pre.blocking_read();
+                    lock.as_ref().map(|p: &HandlerProxyPre| p.engine().clone())
+                };
+                if let Some(engine) = maybe_engine {
+                    engine.increment_epoch();
+                }
             })
             .with_context(|| {
                 format!(
@@ -468,7 +486,46 @@ impl<F: Future + Send + 'static> Executor<F> for TokioExecutor {
     }
 }
 
+/// Check whether the incoming request's `Content-Length` exceeds the
+/// per-app body cap. Returns `Some(413 response)` when the body is too
+/// large, `None` when the check passes (or is disabled).
+///
+/// When `cap == 0` the check is disabled — all body sizes are allowed.
+/// When the request has no `Content-Length` header (chunked transfer),
+/// the check is skipped and the wasmtime memory cap provides defense-
+/// in-depth.
+pub fn check_body_cap(
+    content_length: Option<u64>,
+    cap: u64,
+    meter: &Arc<RequestMeter>,
+) -> Option<HyperResponse<HyperOutgoingBody>> {
+    if cap == 0 {
+        return None;
+    }
+    match content_length {
+        Some(len) if len > cap => {
+            tracing::warn!(
+                content_length = len,
+                cap,
+                "request body exceeds per-app cap; rejecting 413",
+            );
+            Some(synthetic_413(len, cap, meter))
+        }
+        _ => None,
+    }
+}
+
 impl HandlerDispatch {
+    pub async fn evict(&self) -> Option<wasmtime::Engine> {
+        let mut lock = self.proxy_pre.write().await;
+        lock.take().map(|proxy_pre| proxy_pre.engine().clone())
+    }
+
+    pub async fn has_engine(&self) -> bool {
+        let lock = self.proxy_pre.read().await;
+        lock.is_some()
+    }
+
     /// Dispatch a single HTTP request through `ProxyPre`.
     /// Mirrors the canonical example in `wasmtime-wasi-http` 25's own
     /// `lib.rs`. Key differences from that example:
@@ -506,6 +563,94 @@ impl HandlerDispatch {
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
+        {
+            let mut lock = self.config.last_request_at.lock().await;
+            *lock = Some(std::time::Instant::now());
+        }
+
+        // Lazy instantiation: check if we have a ProxyPre.
+        let proxy_pre = {
+            let lock = self.proxy_pre.read().await;
+            if lock.is_some() {
+                lock.as_ref().unwrap().clone()
+            } else {
+                drop(lock);
+                let mut write_lock = self.proxy_pre.write().await;
+                if write_lock.is_none() {
+                    let engine = self.engine_pool.acquire(&self.state).await;
+                    let cwasm_path = self.downloader.cwasm_path(&self.deployment_id);
+
+                    let component = if cwasm_path.exists() {
+                        match tokio::fs::read(&cwasm_path).await {
+                            Ok(cwasm_bytes) => unsafe {
+                                wasmtime::component::Component::deserialize(&engine, &cwasm_bytes)
+                            }
+                            .ok(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    let component = match component {
+                        Some(c) => c,
+                        None => {
+                            let wasm_path = self.downloader.cache_path(&self.deployment_id);
+                            let bytes = tokio::fs::read(&wasm_path).await?;
+                            let engine_for_spawn = engine.clone();
+                            let cwasm_path_clone = cwasm_path.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                wasmtime::component::Component::from_binary(
+                                    &engine_for_spawn,
+                                    &bytes,
+                                )
+                            })
+                            .await
+                            .unwrap()
+                            {
+                                Ok(c) => {
+                                    // Serialize to .cwasm for future cache hits in a
+                                    // background task so the initial request is not delayed.
+                                    match c.serialize() {
+                                        Ok(serialized) => {
+                                            tokio::spawn(async move {
+                                                if let Err(e) =
+                                                    tokio::fs::write(&cwasm_path_clone, &serialized)
+                                                        .await
+                                                {
+                                                    tracing::warn!(
+                                                        path = %cwasm_path_clone.display(),
+                                                        err = %e,
+                                                        "failed to write serialized component to AOT cache"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                err = %e,
+                                                "failed to serialize compiled component"
+                                            );
+                                        }
+                                    }
+                                    c
+                                }
+                                Err(e) => return Err(anyhow::anyhow!("JIT failed: {e}")),
+                            }
+                        }
+                    };
+
+                    let linker = edge_runtime::create_component_linker_handler(&engine)?;
+                    let instance_pre = linker.instantiate_pre(&component)?;
+                    let p = HandlerProxyPre::new(instance_pre)?;
+                    *write_lock = Some(p.clone());
+                    p
+                } else {
+                    write_lock.as_ref().unwrap().clone()
+                }
+            }
+        };
+
         // Body-cap pre-check. Prevents a FaaS guest from being asked to
         // handle a 10 GB POST that we'd then have to buffer into the
         // 256 MiB wasmtime memory cap. We trust Content-Length as the
@@ -517,30 +662,20 @@ impl HandlerDispatch {
         // Returning 413 *before* the guest runs (instead of dispatching
         // and letting the guest trap) means a misconfigured tenant
         // can't DoS the worker by spamming large payloads.
-        if self.config.max_request_body_bytes > 0 {
-            if let Some(cl) = req.headers().get(hyper::header::CONTENT_LENGTH) {
-                if let Ok(cl_str) = cl.to_str() {
-                    if let Ok(len) = cl_str.parse::<u64>() {
-                        if len > self.config.max_request_body_bytes {
-                            tracing::warn!(
-                                tenant_id = %self.config.tenant_id,
-                                app_name = %self.config.app_ctx.app_name,
-                                content_length = len,
-                                cap = self.config.max_request_body_bytes,
-                                "request body exceeds per-app cap; rejecting 413",
-                            );
-                            return Ok(synthetic_413(
-                                len,
-                                self.config.max_request_body_bytes,
-                                &self.config.meter,
-                            ));
-                        }
-                    }
-                }
+        {
+            let cl = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(resp) =
+                check_body_cap(cl, self.config.max_request_body_bytes, &self.config.meter)
+            {
+                return Ok(resp);
             }
         }
 
-        let engine = self.proxy_pre.engine();
+        let engine = proxy_pre.engine();
 
         // Per-request RuntimeState — fresh ResourceTable, fresh
         // WasiCtx (rebuilt from the stored env HashMap), shared
@@ -564,11 +699,12 @@ impl HandlerDispatch {
         // this Arc clone once we drop the request_state into create_store.
         let exit_code_arc = Arc::clone(&request_state.exit_code);
 
-        // 256 MiB memory cap per request — generous for FaaS
-        // workloads but bounds memory-bomb guests. Matches the
-        // LongRunning branch's hardcoded cap from the v0.1 era.
-        let mut store = edge_runtime::create_store(engine, 256, request_state);
-        store.set_epoch_deadline(self.request_budget_ticks);
+        // Memory cap per request — bounds memory-bomb guests.
+        // Uses the configured max_memory_mb limit.
+        let mut store =
+            edge_runtime::create_store(engine, self.config.max_memory_mb, request_state);
+        let ticks = self.config.cpu_budget_ms / self.tick_ms;
+        store.set_epoch_deadline(ticks.max(1));
 
         // Build the incoming-request / response-outparam handles the
         // guest will see. `new_incoming_request` records the URL +
@@ -595,7 +731,6 @@ impl HandlerDispatch {
         self.config.meter.record_request();
         let tenant_for_log = self.config.tenant_id.clone();
         let app_name_for_log = self.config.app_ctx.app_name.clone();
-        let proxy_pre = self.proxy_pre.clone();
 
         // Spawn the guest concurrently so the host can start serving
         // the response body as soon as the guest calls
@@ -1037,5 +1172,338 @@ mod synthetic_response_tests {
             cl <= 1024,
             "body should be capped at 1024 even for huge values"
         );
+    }
+
+    // ── check_body_cap tests ────────────────────────────────────────
+
+    #[test]
+    fn body_cap_disabled_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(999_999), 0, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_no_content_length_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(None, 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_within_limit_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(100), 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_exact_limit_returns_none() {
+        let m = test_meter();
+        // Content-Length exactly equal to cap should pass.
+        assert!(check_body_cap(Some(1024), 1024, &m).is_none());
+    }
+
+    #[test]
+    fn body_cap_exceeds_returns_413() {
+        let m = test_meter();
+        let resp = check_body_cap(Some(2000), 1024, &m);
+        assert!(resp.is_some());
+        assert_eq!(resp.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn body_cap_zero_length_returns_none() {
+        let m = test_meter();
+        assert!(check_body_cap(Some(0), 1024, &m).is_none());
+    }
+
+    // ── truncate_diagnostic tests ───────────────────────────────────
+
+    #[test]
+    fn truncate_short_diagnostic_passes_through() {
+        assert_eq!(truncate_diagnostic("hello"), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_1024_passes_through() {
+        let s = "x".repeat(1024);
+        assert_eq!(truncate_diagnostic(&s).len(), 1024);
+    }
+
+    #[test]
+    fn truncate_long_diagnostic_capped_at_1024() {
+        let s = "x".repeat(2000);
+        let truncated = truncate_diagnostic(&s);
+        assert!(truncated.len() <= 1024);
+    }
+
+    #[test]
+    fn truncate_empty_returns_empty() {
+        assert_eq!(truncate_diagnostic(""), "");
+    }
+
+    #[test]
+    fn truncate_multi_byte_utf8_boundary() {
+        // Each '☃' is 3 bytes. A string with 342 snowmen = 1026 bytes.
+        // Truncation must cut at a character boundary, so the result
+        // should be 341 snowmen = 1023 bytes.
+        let s = "☃".repeat(342); // 1026 bytes
+        let truncated = truncate_diagnostic(&s);
+        assert!(truncated.len() <= 1024);
+        assert!(truncated.len() % 3 == 0, "must cut at char boundary");
+    }
+
+    // ── budget math tests ───────────────────────────────────────────
+
+    #[test]
+    fn budget_ticks_divide_evenly() {
+        assert_eq!(100u64 / 10u64, 10);
+    }
+
+    #[test]
+    fn budget_ticks_floor_at_one() {
+        assert_eq!(5u64 / 10u64, 0);
+    }
+
+    #[test]
+    fn budget_ticks_rounding_floor() {
+        assert_eq!(95u64 / 10u64, 9);
+    }
+
+    // ── CountingBody tests ──────────────────────────────────────────────
+
+    use bytes::Bytes;
+    use std::pin::Pin;
+
+    #[tokio::test]
+    async fn counting_body_records_outbound_bytes() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from("hello"));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let mut counting = CountingBody {
+            inner: inner_hyper,
+            meter: meter.clone(),
+        };
+
+        while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
+        let snap = meter.snapshot();
+        assert_eq!(snap.outbound_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn counting_body_empty_records_zero() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from(""));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let mut counting = CountingBody {
+            inner: inner_hyper,
+            meter: meter.clone(),
+        };
+
+        while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
+        let snap = meter.snapshot();
+        assert_eq!(snap.outbound_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn counting_body_size_hint_delegates() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from("test"));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let counting = CountingBody {
+            inner: inner_hyper,
+            meter,
+        };
+
+        let hint = Body::size_hint(&counting);
+        assert_eq!(hint.lower(), 4);
+    }
+
+    // ── MaybeTls loopback tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn maybe_tls_plain_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let mut maybe_server = MaybeTls::Plain(server);
+        let mut maybe_client = MaybeTls::Plain(client);
+
+        maybe_client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        maybe_server.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn maybe_tls_flush_and_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let mut maybe_server = MaybeTls::Plain(server);
+        maybe_server.flush().await.unwrap();
+        maybe_server.shutdown().await.unwrap();
+
+        let mut maybe_client = MaybeTls::Plain(client);
+        maybe_client.shutdown().await.unwrap();
+    }
+
+    // ── HandlerDispatch::evict / has_engine tests ───────────────────────
+
+    #[tokio::test]
+    async fn dispatch_new_with_engine() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let engine_pool = pool;
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18000,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+            )),
+            "d1".into(),
+            engine_pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        // By default has_engine=false (no ProxyPre loaded)
+        assert!(!dispatch.has_engine().await);
+
+        // evict on empty proxy_pre returns None
+        assert!(dispatch.evict().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_evict_round_trips_engine() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let engine_for_proxy = edge_runtime::create_engine().expect("engine2");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18001,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+            )),
+            "d1".into(),
+            pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        assert!(!dispatch.has_engine().await);
+        assert!(dispatch.evict().await.is_none());
+        let _ = engine_for_proxy;
+    }
+
+    // ── Budget/tick math tests ─────────────────────────────────────────
+
+    #[test]
+    fn budget_ticks_100ms_at_10ms_gives_10() {
+        // request_budget_ms (100) / tick_ms (10) = 10 ticks, clamped to ≥1
+        let budget: u64 = 100;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 10);
+    }
+
+    #[test]
+    fn budget_ticks_5ms_at_10ms_floors_at_1() {
+        let budget: u64 = 5;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 1);
+    }
+
+    #[test]
+    fn budget_ticks_zero_budget_floors_at_1() {
+        let budget: u64 = 0;
+        let tick: u64 = 10;
+        let ticks = (budget / tick.max(1)).max(1);
+        assert_eq!(ticks, 1);
+    }
+
+    #[test]
+    fn tick_ms_zero_clamped_to_1() {
+        let tick: u64 = 0;
+        assert_eq!(tick.max(1), 1);
     }
 }

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 )
 
 // mockDeploymentRepo implements DeploymentRepoInterface for testing.
@@ -25,6 +26,10 @@ type mockDeploymentRepo struct {
 	deleteCalls []string
 	// deleteErr returns this error from DeleteByID if non-nil.
 	deleteErr error
+	// updateCalls records each (id, hash, signature) triple from
+	// UpdateHashAndSignature. Used by the post-#307 sign tests to
+	// assert the signed fields were persisted.
+	updateCalls []domain.Deployment
 }
 
 func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) error {
@@ -33,6 +38,28 @@ func (m *mockDeploymentRepo) Create(ctx context.Context, d *domain.Deployment) e
 	}
 	m.deployments = append(m.deployments, d)
 	return nil
+}
+
+// UpdateHashAndSignature is the post-#307 in-place update. The mock
+// looks up the row by id and overwrites the hash + signature fields
+// in-place, mirroring what the production `DeploymentRepository` SQL
+// does. If the row was never created (a regression in the
+// service's flow), the call is recorded but a no-op — the test
+// failure is the comment, not a panic.
+func (m *mockDeploymentRepo) UpdateHashAndSignature(ctx context.Context, d *domain.Deployment) error {
+	m.updateCalls = append(m.updateCalls, *d)
+	for _, existing := range m.deployments {
+		if existing.ID == d.ID {
+			existing.Hash = d.Hash
+			existing.Signature = d.Signature
+			existing.SigningKeyID = d.SigningKeyID
+			return nil
+		}
+	}
+	// Row not found: this is the documented "compensating delete
+	// raced ahead" no-op, but a test that exercises this path should
+	// be flagged — return an error so the test fails loudly.
+	return fmt.Errorf("mockDeploymentRepo: UpdateHashAndSignature called for unknown id %q", d.ID)
 }
 
 func (m *mockDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
@@ -130,6 +157,19 @@ func (m *mockArtifactStore) OpenFormat(ctx context.Context, tenantID, appName, d
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+func (m *mockArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	key := tenantID + "/" + appName + "/" + deploymentID + "." + format
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if m.artifacts == nil {
+		m.artifacts = make(map[string][]byte)
+	}
+	m.artifacts[key] = data
+	return nil
+}
+
 func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	key := tenantID + "/" + appName + "/" + deploymentID
 	m.deleteCalls = append(m.deleteCalls, key)
@@ -141,8 +181,12 @@ func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deplo
 }
 
 // migrationSvcForTest builds a MigrationService with mock dependencies.
-func migrationSvcForTest(repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
-	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+// The signer is the deterministic zero-seed fixture from the signing
+// package — see internal/signing/signer_test.go for the shape. The
+// caller doesn't need to know the details; this helper exists so
+// individual tests don't repeat the boilerplate.
+func migrationSvcForTest(t *testing.T, repo *mockDeploymentRepo, store *mockArtifactStore) *MigrationService {
+	return NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 }
 
 func skipIfNoEdgeMigrate(t *testing.T) {
@@ -212,7 +256,7 @@ func TestMigrationService_Migrate_Success(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if err != nil {
@@ -248,7 +292,7 @@ func TestMigrationService_Migrate_AppNameStripsC(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "my_app.c", "c", emptySource)
 	if err != nil {
@@ -265,7 +309,7 @@ func TestMigrationService_Migrate_EmptySource(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", emptySource)
 	if err != nil {
@@ -284,7 +328,7 @@ func TestMigrationService_Migrate_EdgeMigrateFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := NewMigrationService(repo, store, "edge-migrate-that-does-not-exist", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", posixHTTPSource)
 	if !errors.Is(err, ErrEdgeMigrateFailed) {
@@ -310,7 +354,7 @@ func TestMigrationService_Migrate_ClangFails(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	// Source that edge-migrate will accept but clang will reject (syntax error)
 	badSource := `int main() { invalid syntax here }`
@@ -341,7 +385,7 @@ func TestMigrationService_Migrate_DBError(t *testing.T) {
 
 	repo := &mockDeploymentRepo{createErr: os.ErrPermission}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	_, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c", emptySource)
 	if err == nil {
@@ -355,7 +399,7 @@ func TestMigrationService_Migrate_AppNameNoExtension(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello", "c", emptySource)
 	if err != nil {
@@ -374,7 +418,7 @@ func TestMigrationService_Migrate_PathTraversalFilename(t *testing.T) {
 	// grounds that the handler already rejects.
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	_, err := svc.Migrate(context.Background(), "tenant-1", "../etc.c", "c", emptySource)
 	if err == nil {
@@ -391,7 +435,7 @@ func TestMigrationService_Migrate_PathTraversalFilename(t *testing.T) {
 func TestMigrationService_Migrate_EmptyFilename(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	_, err := svc.Migrate(context.Background(), "tenant-1", "", "c", emptySource)
 	if err == nil {
@@ -408,7 +452,7 @@ func TestMigrationService_Migrate_PopulatesPatternsDetected(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	// posixHTTPSource has socket + bind + listen + accept — all transformable
 	// (Accept is "best-effort"; the rest are "auto-transformable").
@@ -679,7 +723,7 @@ func TestAggregateTreeStatus(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsInvalidAppName(t *testing.T) {
-	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 	_, err := svc.MigrateTree(context.Background(), "t_1", "../bad", "c", []domain.FileEntry{
 		{Path: "main.c", Source: "int main(){return 0;}\n"},
 	})
@@ -689,7 +733,7 @@ func TestMigrateTree_RejectsInvalidAppName(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsEmptyTree(t *testing.T) {
-	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", nil)
 	if err == nil {
 		t.Fatal("expected error for empty tree")
@@ -701,7 +745,7 @@ func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
 	// Anything else (e.g. "python", "go") is still rejected at the
 	// service layer as a defense-in-depth check, even though the
 	// handler rejects it earlier.
-	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "python", []domain.FileEntry{
 		{Path: "main.py", Source: "print('hi')\n"},
 	})
@@ -714,7 +758,7 @@ func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
 	// M3 also added Rust. The service shouldn't reject "rust" at the
 	// language gate — it'll only fail later (in the per-file
 	// subprocess), so this test only confirms the gate is open.
-	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "rust", nil)
 	// Empty entries still errors, but the error must be about empty
 	// tree, not about the language.
@@ -727,7 +771,7 @@ func TestMigrateTree_AcceptsRustLanguage(t *testing.T) {
 }
 
 func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
-	svc := migrationSvcForTest(&mockDeploymentRepo{}, newMockArtifactStore())
+	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 	_, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
 		{Path: "../etc/passwd", Source: "x"},
 	})
@@ -745,7 +789,7 @@ func TestMigrateTree_PerFileTransformFailure_ReturnsErrMigrateTreeFailed(t *test
 	// structured TreeMigrationReport for the caller to inspect.
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc")
+	svc := NewMigrationService(repo, store, "/this/binary/does/not/exist", "/wasi-sdk", "rustc", signing.TestKey(t))
 	report, err := svc.MigrateTree(context.Background(), "t_1", "hello", "c", []domain.FileEntry{
 		{Path: "main.c", Source: "int main(){return 0;}\n"},
 	})
@@ -779,7 +823,7 @@ func TestMigrateTree_ToolchainFailure_ReturnsErrMigrateTreeFailed(t *testing.T) 
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	// Source that edge-migrate will accept but clang will reject
 	// (syntax error — clang --target=wasm32-wasip2 will fail to compile).
@@ -844,7 +888,7 @@ func TestMigrateTree_AnalyzeJsonFallback_PopulatesManualReview(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc")
+	svc := NewMigrationService(repo, store, shimPath, "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 
 	// Source: a fork() call. The transformer will leave it in place
 	// (no WASI equivalent exists), so the transformed source still
@@ -1006,7 +1050,7 @@ fn main() {
 func TestMigrationService_StoresRustcPath(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc")
+	svc := NewMigrationService(repo, store, "edge-migrate", "/wasi-sdk", "/opt/rust/bin/rustc", signing.TestKey(t))
 	if svc.rustcPath != "/opt/rust/bin/rustc" {
 		t.Errorf("expected rustcPath=%q, got %q", "/opt/rust/bin/rustc", svc.rustcPath)
 	}
@@ -1049,7 +1093,7 @@ func TestMigrationService_Migrate_RustSuccess(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
@@ -1095,7 +1139,7 @@ func TestMigrationService_Migrate_RustAppNameStripsRs(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "my_app.rs", "rust", rustHTTPSource)
 	if err != nil {
@@ -1116,7 +1160,7 @@ func TestMigrationService_Migrate_RustProcessExitNotTransformable(t *testing.T) 
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	const src = `fn main() {
     std::process::exit(0);
@@ -1157,7 +1201,7 @@ func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
 	// Point edge-migrate at a non-existent binary so the subprocess
 	// fails. The Rust compile path must surface this as a failure,
 	// not silently produce a wasm.
-	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc")
+	svc := NewMigrationService(repo, store, "/nonexistent/edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", signing.TestKey(t))
 
 	report, err := svc.Migrate(context.Background(), "tenant-1", "hello.rs", "rust", rustHTTPSource)
 	if err != nil {
@@ -1183,7 +1227,7 @@ func TestMigrateTree_RustCompilesAllFilesTogether(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	entries := []domain.FileEntry{
 		{Path: "src/main.rs", Source: `fn main() {
@@ -1267,7 +1311,7 @@ func TestMigrate_ArtifactSaveFailure_RollsBackDeployment(t *testing.T) {
 
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{saveErr: errors.New("disk full (test)")}
-	svc := migrationSvcForTest(repo, store)
+	svc := migrationSvcForTest(t, repo, store)
 
 	_, err := svc.Migrate(context.Background(), "tenant-1", "hello.c", "c",
 		"int main(){return 0;}\n")

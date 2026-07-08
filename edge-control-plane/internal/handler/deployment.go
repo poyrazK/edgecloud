@@ -14,6 +14,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
 
 // DeploymentHandler handles deployment HTTP requests.
@@ -21,17 +22,14 @@ type DeploymentHandler struct {
 	deploymentSvc *service.DeploymentService
 	workerSvc     service.AppTargetLookup
 	trafficSvc    *service.TrafficService
-	// rollbackSvc is a narrow contract for the rollback handler so the
-	// test can stub it without standing up the full *service.DeploymentService
-	// (DB + NATS + publisher + artifact store). The concrete
-	// *service.DeploymentService satisfies it.
-	rollbackSvc deploymentRollbacker
-	// activateSvc mirrors rollbackSvc for the Activate handler — narrow
-	// contract lets tests stub the activate path without the full service
-	// surface. Concrete *service.DeploymentService satisfies it.
-	activateSvc deploymentActivator
-	// promoteSvc is the narrow contract for the Promote handler.
-	promoteSvc deploymentPromoter
+	rollbackSvc   deploymentRollbacker
+	activateSvc   deploymentActivator
+	promoteSvc    deploymentPromoter
+	// artifactStore is used by the precompile step to read .wasm and write .cwasm.
+	artifactStore storage.ArtifactStore
+	// wasm2cwasmPath is the path to the wasm2cwasm binary for AOT pre-compilation.
+	// Empty = skip pre-compilation.
+	wasm2cwasmPath string
 }
 
 // deploymentRollbacker is the narrow contract the Rollback handler needs.
@@ -54,18 +52,16 @@ type deploymentPromoter interface {
 	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
 }
 
-func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService) *DeploymentHandler {
+func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService, artifactStore storage.ArtifactStore, wasm2cwasmPath string) *DeploymentHandler {
 	return &DeploymentHandler{
 		deploymentSvc: deploymentSvc,
 		workerSvc:     workerSvc,
 		trafficSvc:    trafficSvc,
-		// Concrete *service.DeploymentService satisfies the narrow interfaces.
-		// nil is also fine for tests that only exercise the workerSvc path
-		// (e.g. AppIngress) — those methods never touch rollbackSvc /
-		// activateSvc.
-		rollbackSvc: deploymentSvc,
-		activateSvc: deploymentSvc,
-		promoteSvc:  deploymentSvc,
+		rollbackSvc:   deploymentSvc,
+		activateSvc:   deploymentSvc,
+		promoteSvc:    deploymentSvc,
+		artifactStore: artifactStore,
+		wasm2cwasmPath: wasm2cwasmPath,
 	}
 }
 
@@ -78,6 +74,7 @@ type deployResponse struct {
 	URL                 string   `json:"url"`
 	Regions             []string `json:"regions"`
 	AutoRollbackEnabled bool     `json:"auto_rollback_enabled"`
+	DesiredReplicas     int      `json:"desired_replicas"`
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +110,14 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse `?replicas=N` (issue #316). Defaults to 0 (no threshold).
+	// Must be a non-negative integer.
+	desiredReplicas, rerr := parseIntQuery(r.URL.Query().Get("replicas"), 0)
+	if rerr != nil {
+		http.Error(w, `{"error": "`+rerr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Cap the body at MaxArtifactSize. http.MaxBytesReader returns a
 	// typed *http.MaxBytesError when the cap is exceeded, which we
 	// map to 413 below. The body is now streamed directly to the
@@ -134,7 +139,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, service.MaxArtifactSize)
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, r.Body, regions, autoRollback, desiredReplicas)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -241,6 +246,23 @@ func parseBoolQuery(raw string, defaultVal bool) (bool, error) {
 		return defaultVal, nil
 	}
 	return strconv.ParseBool(raw)
+}
+
+// parseIntQuery parses a query-string integer with a default when the
+// parameter is absent. Returns an error for unparseable values so the
+// caller can return 400. Negative values are rejected.
+func parseIntQuery(raw string, defaultVal int) (int, error) {
+	if raw == "" {
+		return defaultVal, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer %q", raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("negative value not allowed: %d", n)
+	}
+	return n, nil
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +427,14 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 			httperror.InternalErrorCtx(w, r)
 			return
 		}
+
+		// Fire-and-forget precompilation in the background so the
+		// activation response is not blocked by compilation time.
+		if h.wasm2cwasmPath != "" && h.artifactStore != nil {
+			ctx := context.WithoutCancel(r.Context())
+			go service.PrecompileCwasm(ctx, h.artifactStore, h.wasm2cwasmPath, tenantID, appName, deploymentID)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]string{"status": "activated"}); err != nil {
 			log.Printf("Activate: failed to encode response: %v", err)

@@ -108,6 +108,7 @@ type AppTarget struct {
 type AppWorkerStatus struct {
 	AppName       string     `db:"app_name"       json:"app_name"`
 	Status        string     `db:"status"          json:"status"`
+	DeploymentID  string     `db:"deployment_id"   json:"deployment_id"`
 	LastHeartbeat *time.Time `db:"last_heartbeat"  json:"last_heartbeat"`
 	Region        string     `db:"region"          json:"region"`
 	WorkerID      string     `db:"worker_id"       json:"worker_id"`

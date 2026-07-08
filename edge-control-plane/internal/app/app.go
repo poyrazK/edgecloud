@@ -7,6 +7,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
 )
@@ -77,6 +79,19 @@ func New(
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
+	// Load the Ed25519 signing key (issue #307). The config validator
+	// already enforced that at least one of KeyPath / Key is set;
+	// here we resolve the actual signer and surface any load-time
+	// errors (malformed key, missing file) as a fatal startup
+	// condition rather than a runtime failure on the first Deploy.
+	signer, err := loadSigner(&cfg.Signing)
+	if err != nil {
+		log.Fatalf("loading signing key: %v", err)
+	}
+	if cfg.Signing.KeyID == "" {
+		log.Printf("WARNING: EDGE_SIGNING_KEY_ID is empty; rotation semantics will be ambiguous. Set a logical key id (e.g. \"k1\") before shipping rotation code.")
+	}
+
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(
@@ -84,7 +99,7 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region,
+		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, signer,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
@@ -97,6 +112,7 @@ func New(
 	migrationSvc := service.NewMigrationService(
 		deploymentRepo, artifactStore,
 		cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath,
+		signer,
 	)
 	trafficSvc := service.NewTrafficService(
 		db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo,
@@ -106,7 +122,7 @@ func New(
 	// pulls deployment hash + regions via ListByTenantWithDeployment
 	// in a single round trip (N+1 elimination).
 	reconcileSvc := service.NewReconcileService(
-		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, publisher, cfg.Region,
+		tenantRepo, activeDeploymentRepo, appEnvRepo, quotaRepo, workerRepo, publisher, cfg.Region,
 	)
 
 	// Wire secrets encryption (if configured). Supports both legacy
@@ -167,18 +183,18 @@ func New(
 
 	tenantHandler := handler.NewTenantHandler(tenantSvc)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
-	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc)
+	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc, artifactStore, cfg.Migration.Wasm2CwasmPath)
 	envHandler := handler.NewEnvHandler(envSvc)
 	// PR #195 / commit 2d61f94 (fold SetSyncBuilder into NewInternalHandler)
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region)
+	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
-	trafficHandler := handler.NewTrafficHandler(trafficSvc)
+	trafficHandler := handler.NewTrafficHandler(trafficSvc, appRepo)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
 	workerStatusHandler := handler.NewWorkerStatusHandler(workerSvc)
@@ -397,6 +413,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetTrafficInternal)).ServeHTTP(w, r)
 	})
 
+	// Per-app rate limit overrides for the ingress ratelimit fetcher (issue #305).
+	mux.HandleFunc("GET /api/v1/internal/rate-limits/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetRateLimitsInternal)).ServeHTTP(w, r)
+	})
+
 	// Secrets admin endpoints (X-Internal-Token auth).
 	secretsHandler := handler.NewSecretsAdminHandler(secretsEnc, envSvc)
 	mux.HandleFunc("GET /api/v1/admin/secrets/keys", func(w http.ResponseWriter, r *http.Request) {
@@ -431,6 +452,29 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ActiveKID: cfg.JWT.ActiveKID,
 		Keys:      cfg.JWT.Keys,
 	}
+
+	// Bootstrap endpoint (issue #104): no auth middleware — uses HMAC
+	// signature verification directly in the handler. Rate-limited to
+	// 5 req/min per IP.
+	if cfg.BootstrapSecret != "" {
+		mux.Handle("POST /api/internal/bootstrap",
+			bootstrapLimiter.Middleware(middleware.ClientIP)(
+				http.HandlerFunc(internalHandler.Bootstrap),
+			),
+		)
+
+		// Worker-secret: protected by BootstrapAuth (separate key from WorkerAuth).
+		bootstrapJWTConfig := middleware.BootstrapJWTConfig{
+			BootstrapSecret: cfg.BootstrapSecret,
+			Issuer:          "edgecloud-bootstrap",
+		}
+		mux.Handle("GET /api/internal/worker-secret",
+			middleware.BootstrapAuth(bootstrapJWTConfig)(
+				http.HandlerFunc(internalHandler.WorkerSecret),
+			),
+		)
+	}
+
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT OR an X-Internal-Token header.
 	downloadMux := http.NewServeMux()
@@ -528,4 +572,23 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// loadSigner constructs a *signing.Signer from the validated config.
+// Precedence matches `signing.LoadFromEnv`: file path (KeyPath)
+// wins over inline (Key). The config validator has already rejected
+// the case where both are empty, so exactly one path here is taken —
+// but this function is also reachable from tests that bypass Load
+// (the bundled-config regression guard bypasses Load and asserts the
+// error is logged in a stable way). The empty-guard here returns the
+// same sentinel error the validator would emit, so callers see one
+// consistent message regardless of which layer caught it.
+func loadSigner(cfg *config.SigningConfig) (*signing.Signer, error) {
+	if cfg.KeyPath == "" && cfg.Key == "" {
+		return nil, fmt.Errorf("%w: EDGE_SIGNING_KEY_PATH (or EDGE_SIGNING_KEY) is required (issue #307)", signing.ErrInvalidKey)
+	}
+	if cfg.KeyPath != "" {
+		return signing.LoadFromFile(cfg.KeyPath, cfg.KeyID)
+	}
+	return signing.LoadFromRaw([]byte(cfg.Key), cfg.KeyID)
 }

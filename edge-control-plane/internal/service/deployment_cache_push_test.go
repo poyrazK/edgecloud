@@ -218,6 +218,11 @@ func (f fakeArtifactStore) OpenFormat(ctx context.Context, _, _, _, _ string) (i
 	return f.Open(ctx, "", "", "")
 }
 
+// SaveFormat is a no-op.
+func (f fakeArtifactStore) SaveFormat(_ context.Context, _, _, _, _ string, _ io.Reader) error {
+	return nil
+}
+
 // Delete is a no-op (the pusher doesn't delete).
 func (f fakeArtifactStore) Delete(_ context.Context, _, _, _ string) error {
 	return nil

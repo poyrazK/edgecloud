@@ -11,6 +11,47 @@ import (
 // validSecret is a 32-byte secret we use in tests that need a non-placeholder value.
 const validSecret = "this-is-a-32-byte-test-secret-x!"
 
+// testSigningKeyPath is the absolute path to a fixture signing key
+// file (issue #307). Every test that calls Load must set
+// EDGE_SIGNING_KEY_PATH to this path so the new `signing` validator
+// doesn't reject the config; the validator requires a key, but the
+// test's only goal is exercising a different config field. The key
+// contents themselves are never decoded by these tests — they just
+// need the path to point at a parseable file.
+//
+// The fixture file is generated on first run by [ensureTestSigningKey]
+// and is .gitignored (testdata/*.key) so every checkout gets a
+// fresh random key. The key is meant to exercise the file-loading
+// path; cryptographic content doesn't matter. Compute the absolute
+// path once so tests work regardless of which directory `go test`
+// runs from.
+var testSigningKeyPath = func() string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		panic("runtime.Caller failed in config_test.go")
+	}
+	return filepath.Join(filepath.Dir(file), "testdata", "test_signing.key")
+}()
+
+// ensureTestSigningKey writes a deterministic 32-byte key to
+// testdata/test_signing.key if the file is missing. Deterministic
+// (all-zeros) because the test fixture only validates the file
+// *loading* path — there is no cryptographic material in play; the
+// signing tests use `signing.TestKey(t)` (also all-zero seed) for
+// their own assertions.
+func ensureTestSigningKey(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat(testSigningKeyPath); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(testSigningKeyPath), 0o700); err != nil {
+		t.Fatalf("create testdata dir: %v", err)
+	}
+	if err := os.WriteFile(testSigningKeyPath, make([]byte, 32), 0o600); err != nil {
+		t.Fatalf("write fixture signing key: %v", err)
+	}
+}
+
 // minimalConfigYAML is a small but valid config.yaml fixture. Tests override
 // the jwt.secret as needed.
 const minimalConfigYAML = `
@@ -20,8 +61,20 @@ jwt:
   issuer: edgecloud
 `
 
+// withSigningKey sets EDGE_SIGNING_KEY_PATH for the lifetime of a
+// test. The config Load() validator requires a signing key (issue
+// #307); every test that calls Load must call this so the validator
+// passes and the test reaches the field it actually cares about.
+// Done via t.Setenv so the env is restored when the test ends.
+func withSigningKey(t *testing.T) {
+	t.Helper()
+	ensureTestSigningKey(t)
+	t.Setenv("EDGE_SIGNING_KEY_PATH", testSigningKeyPath)
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
+	withSigningKey(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
