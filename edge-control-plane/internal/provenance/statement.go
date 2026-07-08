@@ -35,7 +35,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"time"
 )
 
@@ -407,31 +406,9 @@ func validHex64(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if c < '0' || c > '9' && c < 'a' || c > 'f' {
 			return false
 		}
 	}
 	return true
-}
-
-// sortTools is a tiny helper to make the buildTools array
-// deterministic across Go's map iteration order. Optional —
-// callers that build Tools directly can skip this if their input
-// is already ordered. Currently unused at runtime; kept as
-// documentation of the deterministic-order rule.
-func sortTools(in []ToolEntry) []ToolEntry {
-	out := make([]ToolEntry, len(in))
-	copy(out, in)
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-// sortMaterials sorts a materials slice by URI for deterministic
-// canonical output. Same "kept for documentation" rationale as
-// sortTools — callers that pass an already-sorted slice can skip.
-func sortMaterials(in []Material) []Material {
-	out := make([]Material, len(in))
-	copy(out, in)
-	sort.Slice(out, func(i, j int) bool { return out[i].URI < out[j].URI })
-	return out
 }

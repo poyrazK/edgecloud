@@ -436,7 +436,7 @@ func oversizedMultipartBody(t *testing.T, wantContentLength int64) (*io.PipeRead
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
-		defer pw.Close()
+		defer func() { _ = pw.Close() }()
 		if err := mw.WriteField("build_metadata", "{}"); err != nil {
 			return
 		}

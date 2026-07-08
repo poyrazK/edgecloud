@@ -166,7 +166,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"`+mperr.Error()+`"}`, http.StatusBadRequest)
 		return
 	}
-	defer filePart.Close()
+	defer func() { _ = filePart.Close() }()
 
 	// Decode the optional `build_metadata` form field into a
 	// CLISideMetadata struct. A missing or malformed value is
