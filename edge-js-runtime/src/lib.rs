@@ -2,10 +2,18 @@
 
 mod edge_modules;
 
-// Generate bindings matching the handler world
+// Generate bindings matching the handler world.
+//
+// The `path` argument points at the canonical WIT under the `edge-runtime`
+// crate, not at the (now-removed) repo-root `wit/` copy. There is only one
+// canonical `edge-cloud.wit` in this repo, sourced from
+// `edge-runtime/src/wit/edge-cloud.wit` — keeping both crates bound to the
+// same canonical file prevents the two copies from drifting the way they
+// did before issue #422. The `wasi:cli/command@0.2.1` include + seven
+// `edge:cloud/*` imports are declared in that file.
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
-    path: "../wit",
+    path: "../edge-runtime/src/wit",
     generate_all,
 });
 
