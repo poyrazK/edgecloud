@@ -895,7 +895,6 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     );
 }
 
-
 #[allow(dead_code)]
 /// Wait until `app_name` is `Running` in any of `supervisors`. Returns
 /// which supervisor saw it (Some(index)) or None if none did within the
@@ -1639,7 +1638,7 @@ async fn build_supervisor_only_with_cp(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
-standby_pool_size: 10,
+        standby_pool_size: 10,
         // Issue #307 PR2: signature config off for fetch_sync tests —
         // the signing path is exercised by the dedicated signature
         // tests; the fetch_sync tests focus on the /sync fallback.
@@ -1725,6 +1724,7 @@ async fn test_artifact_signature_match_starts_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1783,6 +1783,7 @@ async fn test_artifact_signature_mismatch_rejects_app() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -1838,6 +1839,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg1 = TaskMessage::TaskUpdate {
@@ -1874,6 +1876,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg2 = TaskMessage::TaskUpdate {
@@ -1938,6 +1941,7 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {
@@ -2002,6 +2006,7 @@ async fn test_artifact_missing_signature_rejects_when_required() {
         env: HashMap::new(),
         allowlist: None,
         max_memory_mb: 256,
+        cpu_budget_ms: None,
         routes: None,
     };
     let msg = TaskMessage::TaskUpdate {

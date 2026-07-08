@@ -153,6 +153,12 @@ mod heartbeat_integration_tests {
             tls_key_path: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             standby_pool_size: 1,
+            // Issue #307 PR2: these tests predate the signature
+            // verification feature; they don't exercise signing, so
+            // use the unsigned-friendly defaults.
+            require_signature: false,
+            signing_pubkey: None,
+            signing_pubkey_path: None,
         }
     }
 
@@ -192,6 +198,7 @@ mod heartbeat_integration_tests {
                 "http://localhost:0".to_string(),
                 std::path::PathBuf::from("/tmp"),
                 jwt.clone(),
+                None,
             )),
             port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
             nats: nats as Arc<dyn NatsClient>,
@@ -414,6 +421,7 @@ mod heartbeat_integration_tests {
             AppSpec {
                 deployment_id: "d1".into(),
                 deployment_hash: "abc123".into(),
+                deployment_signature: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -541,6 +549,7 @@ mod heartbeat_integration_tests {
             AppSpec {
                 deployment_id: "d2".into(),
                 deployment_hash: "abc124".into(),
+                deployment_signature: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -2410,6 +2419,7 @@ mod tests {
             "http://localhost".to_string(),
             std::path::PathBuf::from("/tmp"),
             crate::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""),
+            None,
         ));
 
         let dispatch_a = Arc::new(
