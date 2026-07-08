@@ -19,10 +19,7 @@ open = "5.0"
 notify = "6.1"
 regex = "1.10"
 walkdir = "2.5"
-# Used by `edge build --lang=js` (issue #317) to locate the `javy`
-# binary on PATH. Same crate + version as `edge-migrate-lib`'s
-# preprocessor (see edge-migrate/edge-migrate-lib/Cargo.toml:24).
-which = "6"
+
 dirs = "5.0"
 # Used by `edge logs --follow` to install a SIGINT handler so the
 # polling loop exits cleanly on Ctrl-C. Pulled in unconditionally
