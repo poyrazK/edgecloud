@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/jmoiron/sqlx"
 )
+
+var errTestDecryptFail = errors.New("decrypt failed")
 
 func TestValidateSum_Empty(t *testing.T) {
 	err := ValidateSum(nil)
@@ -308,5 +311,67 @@ func TestClearTraffic_NoActiveDeployment_Noop(t *testing.T) {
 	err := svc.ClearTraffic(context.Background(), "t_1", "hello")
 	if err != nil {
 		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+type mockTrafficEnvDecrypter struct {
+	decryptFn func(value string) (string, error)
+}
+
+func (m *mockTrafficEnvDecrypter) Decrypt(value string) (string, error) {
+	if m.decryptFn != nil {
+		return m.decryptFn(value)
+	}
+	return value, nil
+}
+
+func TestBuildEnvMap_WithDecrypter(t *testing.T) {
+	envs := []domain.AppEnv{
+		{EnvKey: "KEY_A", EnvValue: "encrypted_a"},
+		{EnvKey: "KEY_B", EnvValue: "encrypted_b"},
+	}
+	dec := &mockTrafficEnvDecrypter{
+		decryptFn: func(v string) (string, error) {
+			return "decrypted_" + v[len(v)-1:], nil
+		},
+	}
+	m := buildEnvMap(envs, dec)
+	if m["KEY_A"] != "decrypted_a" {
+		t.Errorf("KEY_A = %q, want decrypted_a", m["KEY_A"])
+	}
+	if m["KEY_B"] != "decrypted_b" {
+		t.Errorf("KEY_B = %q, want decrypted_b", m["KEY_B"])
+	}
+}
+
+func TestBuildEnvMap_DecrypterErrorFallsBackToPlaintext(t *testing.T) {
+	envs := []domain.AppEnv{
+		{EnvKey: "K", EnvValue: "plaintext"},
+	}
+	dec := &mockTrafficEnvDecrypter{
+		decryptFn: func(v string) (string, error) {
+			return "", errTestDecryptFail
+		},
+	}
+	m := buildEnvMap(envs, dec)
+	if m["K"] != "plaintext" {
+		t.Errorf("K = %q, want plaintext (fallback)", m["K"])
+	}
+}
+
+func TestBuildEnvMap_NoDecrypter(t *testing.T) {
+	envs := []domain.AppEnv{
+		{EnvKey: "K", EnvValue: "raw"},
+	}
+	m := buildEnvMap(envs, nil)
+	if m["K"] != "raw" {
+		t.Errorf("K = %q, want raw", m["K"])
+	}
+}
+
+func TestBuildEnvMap_EmptyEnvs(t *testing.T) {
+	m := buildEnvMap(nil, nil)
+	if len(m) != 0 {
+		t.Errorf("len = %d, want 0", len(m))
 	}
 }

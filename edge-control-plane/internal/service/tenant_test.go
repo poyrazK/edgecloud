@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -577,5 +578,119 @@ func TestValidateEgressAllowlist_AcceptsValidFQDN(t *testing.T) {
 	err := validateEgressAllowlist([]string{"api.example.com"})
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestEgressValidationError_ImplementsError(t *testing.T) {
+	err := egressValidationErr("test error")
+	if err.Error() != "test error" {
+		t.Errorf("Error() = %q, want 'test error'", err.Error())
+	}
+	var eErr *EgressValidationError
+	if !errors.As(err, &eErr) {
+		t.Error("egressValidationErr should produce *EgressValidationError")
+	}
+}
+
+func TestNewTenantService(t *testing.T) {
+	svc := NewTenantService(nil, nil, nil, nil)
+	if svc == nil {
+		t.Fatal("NewTenantService returned nil")
+	}
+}
+
+func TestTenantService_BootstrapTenant_HappyPath(t *testing.T) {
+	db, mock, cleanup := newTenantMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO tenants`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO quotas`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`INSERT INTO api_keys`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	svc := &TenantService{
+		db:         db,
+		tenantRepo: repository.NewTenantRepository(db),
+		quotaRepo:  repository.NewQuotaRepository(db),
+		apiKeyRepo: repository.NewAPIKeyRepository(db),
+	}
+	tenant, raw, err := svc.BootstrapTenant(context.Background(), "acme", "free", "default")
+	if err != nil {
+		t.Fatalf("BootstrapTenant: %v", err)
+	}
+	if tenant.Name != "acme" || raw == "" {
+		t.Errorf("unexpected tenant=%+v raw=%q", tenant, raw)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestTenantService_BootstrapTenant_UnknownPlan(t *testing.T) {
+	db, mock, cleanup := newTenantMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO tenants`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectRollback()
+
+	svc := &TenantService{
+		db:         db,
+		tenantRepo: repository.NewTenantRepository(db),
+		quotaRepo:  repository.NewQuotaRepository(db),
+		apiKeyRepo: repository.NewAPIKeyRepository(db),
+	}
+	_, _, err := svc.BootstrapTenant(context.Background(), "acme", "platinum", "default")
+	if err == nil {
+		t.Fatal("expected error for unknown plan")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestTenantService_UpdateTenantPlan_HappyPath(t *testing.T) {
+	db, mock, cleanup := newTenantMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants`).
+		WithArgs("t_1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
+			AddRow("t_1", "acme", "free", "{}", time.Now()))
+	mock.ExpectExec(`UPDATE tenants SET`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT tenant_id, max_deployments`).
+		WithArgs("t_1").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "quota_period_start"}).
+			AddRow("t_1", 50, 20, 10, 512, 10000, 5000000, 0, 0, time.Now()))
+	mock.ExpectExec(`UPDATE quotas SET`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	svc := &TenantService{
+		db:         db,
+		tenantRepo: repository.NewTenantRepository(db),
+		quotaRepo:  repository.NewQuotaRepository(db),
+	}
+	err := svc.UpdateTenantPlan(context.Background(), "t_1", "pro", true)
+	if err != nil {
+		t.Fatalf("UpdateTenantPlan: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestTenantService_UpdateTenantPlan_UnknownPlan(t *testing.T) {
+	svc := tenantSvcForTest(&mockTenantSvcRepo{}, &mockQuotaSvcRepo{}, &mockAPIKeySvcRepo{})
+	err := svc.UpdateTenantPlan(context.Background(), "t_1", "platinum", false)
+	if err == nil {
+		t.Fatal("expected error for unknown plan")
 	}
 }
