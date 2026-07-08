@@ -22,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service/wit"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
@@ -110,9 +111,21 @@ func New(
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 	)
 	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
+	// Materialize the canonical WIT tree at startup. The MigrationService
+	// passes this absolute path as the `path:` argument to
+	// wit_bindgen::generate!() in the synthetic Cargo project used by the
+	// `edge-migrate --language rust` path (issue #415). The tree is embedded
+	// into the binary at compile time (internal/service/wit/embed.go) and
+	// sync'd against the top-level wit/ directory by the wit-drift-check CI
+	// job.
+	witDir, witErr := wit.Materialize()
+	if witErr != nil {
+		log.Fatalf("materializing embedded WIT tree: %v", witErr)
+	}
 	migrationSvc := service.NewMigrationService(
 		deploymentRepo, artifactStore,
 		cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath,
+		cfg.Migration.WasmToolsPath, cfg.Migration.CargoPath, witDir,
 		keyring,
 	)
 	trafficSvc := service.NewTrafficService(
