@@ -126,7 +126,11 @@ pub struct Config {
     /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
     /// (`block-all` (default, closes wasi:sockets connect-side),
     /// `allowlist` (consult `EgressPolicy::check_address`),
-    /// `allow-all` (operator opt-in)).
+    /// `allow-all` (operator opt-in),
+    /// `hostname-pinned` (consult `EgressPolicy::hostname_pinned_match`
+    /// against the per-`Network` `HostnamePinning` cache — **dormant
+    /// today**; equals `block-all` until the upstream wasmtime-wasi
+    /// patch in `docs/upstream-wasmtime-resolve-check.patch` merges)).
     ///
     /// Posted into every `HandlerConfig` constructed by the supervisor,
     /// which threads it into `RuntimeState::with_env_and_meter` as a
@@ -135,6 +139,21 @@ pub struct Config {
     /// flagged as a perf regression). Mirrors the
     /// `handler_max_request_body_bytes` pattern above.
     pub socket_mode: SocketEgressPolicy,
+
+    /// Per-deployment `HostnamePinned` mode toggle (issue #309
+    /// follow-up). Read **once** at worker startup from
+    /// `EDGE_EGRESS_HOSTNAME_PINNING` (parsed 1/0, true/false, yes/no,
+    /// on/off, case-insensitive — default `false`).
+    ///
+    /// When `true`, the per-request `RuntimeState` swap uses
+    /// `SocketEgressPolicy::HostnamePinned` instead of the worker-wide
+    /// `Config::socket_mode`. Today this is dormant (the upstream
+    /// resolve hook has not merged, so the `HostnamePinning` cache
+    /// stays empty and `HostnamePinned` denies every connect-side
+    /// call — observable parity with `BlockAll`). Once the patch
+    /// merges, set this to `true` on the worker and the admit paths
+    /// light up.
+    pub hostname_pinning_enabled: bool,
     /// Configured size of the warm standby pool of Wasmtime engines.
     /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
     pub standby_pool_size: usize,
@@ -267,6 +286,7 @@ impl Config {
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
+            hostname_pinning_enabled: parse_env_bool("EDGE_EGRESS_HOSTNAME_PINNING", false)?,
             standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
             // Issue #307 PR2: signature verification config. The default
             // for `require_signature` is `true` (secure-by-default) — a
@@ -379,6 +399,7 @@ fn parse_env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -471,6 +492,54 @@ mod tests {
         let err = parse_env_u64("EDGE_TEST_VAR", 42).unwrap_err();
         // u64 can't represent -1, so we expect a parse error.
         assert!(format!("{:#}", err).contains("EDGE_TEST_VAR"));
+    }
+
+    #[test]
+    fn parse_env_bool_returns_default_when_unset() {
+        let _g = EnvGuard::unset("EDGE_TEST_VAR");
+        assert!(parse_env_bool("EDGE_TEST_VAR", true).unwrap());
+        assert!(!parse_env_bool("EDGE_TEST_VAR", false).unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_truthy_tokens() {
+        for tok in ["1", "true", "TRUE", "yes", "YES", "on", "On"] {
+            let _g = EnvGuard::set("EDGE_TEST_VAR", tok);
+            assert!(
+                parse_env_bool("EDGE_TEST_VAR", false).unwrap(),
+                "expected true for token {:?}",
+                tok
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_falsy_tokens() {
+        for tok in ["0", "false", "FALSE", "no", "NO", "off", "Off"] {
+            let _g = EnvGuard::set("EDGE_TEST_VAR", tok);
+            assert!(
+                !parse_env_bool("EDGE_TEST_VAR", true).unwrap(),
+                "expected false for token {:?}",
+                tok
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_errors_on_unknown_value() {
+        let _g = EnvGuard::set("EDGE_TEST_VAR", "maybe");
+        let err = parse_env_bool("EDGE_TEST_VAR", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("EDGE_TEST_VAR"),
+            "error should name the var: {}",
+            msg
+        );
+        assert!(
+            msg.contains("maybe"),
+            "error should include the bad value: {}",
+            msg
+        );
     }
 
     /// `Config::from_env` requires WORKER_ID, REGION, and CONTROL_PLANE_URL

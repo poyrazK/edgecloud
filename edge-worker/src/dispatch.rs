@@ -228,6 +228,24 @@ pub struct HandlerConfig {
     /// itself; the worker's `Config::from_env` reads it once at
     /// startup and the supervisor copies it into `HandlerConfig`.
     pub socket_mode: SocketEgressPolicy,
+    /// Per-deployment `HostnamePinned` mode toggle (issue #309
+    /// follow-up). When `true`, the per-request `RuntimeState` swap in
+    /// `dispatch` uses `SocketEgressPolicy::HostnamePinned` regardless
+    /// of `socket_mode`. Until the upstream wasmtime-wasi patch
+    /// (`docs/upstream-wasmtime-resolve-check.patch`) merges, the
+    /// `HostnamePinning` cache stays empty and `HostnamePinned` denies
+    /// every connect-side call — observable parity with `BlockAll`.
+    pub hostname_pinning_enabled: bool,
+    /// Shared per-app `HostnamePinning` cache. The supervisor
+    /// constructs one `Arc<HostnamePinning>` per app instance and
+    /// passes it through every FaaS dispatch. Once the upstream
+    /// wasmtime-wasi resolve hook merges (see
+    /// `docs/upstream-wasmtime-resolve-check.patch`), the runtime
+    /// writes into this cache during `resolve_addresses`; in-flight
+    /// dispatch clones share the same Arc so any cache entry added
+    /// while a request is being handled is visible to subsequent
+    /// connect-side checks on the same app instance.
+    pub hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
     pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     pub max_memory_mb: u64,
     pub cpu_budget_ms: u64,
@@ -712,6 +730,24 @@ impl HandlerDispatch {
         // Per-request RuntimeState — fresh ResourceTable, fresh
         // WasiCtx (rebuilt from the stored env HashMap), shared
         // EgressPolicy + LogSink + meter (Arc-clones).
+        //
+        // Socket-egress dispatch: when `hostname_pinning_enabled` is
+        // true the per-request `RuntimeState` uses
+        // `SocketEgressPolicy::HostnamePinned` and the app-wide
+        // shared cache; otherwise the worker-wide `socket_mode` is
+        // used and the per-request `HostnamePinning` stays empty
+        // (dormant — see config.rs `socket_mode` doc).
+        let (socket_mode, hostname_pinning) = if self.config.hostname_pinning_enabled {
+            (
+                edge_runtime::socket_egress::SocketEgressPolicy::HostnamePinned,
+                self.config.hostname_pinning.clone(),
+            )
+        } else {
+            (
+                self.config.socket_mode,
+                Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            )
+        };
         let request_state = RuntimeState::with_env_and_meter(
             self.config.env.clone(),
             Some(self.config.meter.clone()),
@@ -720,12 +756,8 @@ impl HandlerDispatch {
             self.config.log_sink.clone(),
             self.config.app_ctx.clone(),
             self.config.metrics_acc.clone(),
-            self.config.socket_mode,
-            // Dormant today (the upstream resolve hook in
-            // docs/upstream-wasmtime-resolve-check.patch hasn't merged).
-            // Per-RuntimeState Clone (one per dispatch) shares this Arc,
-            // so a future mid-flight cache write reaches every clone.
-            Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            socket_mode,
+            hostname_pinning,
         );
 
         // Clone the shared exit-code flag BEFORE moving `request_state`
@@ -1418,6 +1450,8 @@ mod synthetic_response_tests {
             max_request_body_bytes: 0,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
@@ -1478,6 +1512,8 @@ mod synthetic_response_tests {
             max_request_body_bytes: 0,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,

@@ -73,6 +73,7 @@ fn wire_test_config(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
         standby_pool_size: 10,
         // Issue #307 PR2: signature config off — ingress wire
         // test focuses on the heartbeat → routing table path.

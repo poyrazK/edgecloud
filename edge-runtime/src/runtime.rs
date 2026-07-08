@@ -250,7 +250,8 @@ impl RuntimeState {
         let cache_store = get_or_create_cache(&tenant_id);
         let scheduling = get_or_create_scheduler(&tenant_id);
 
-        let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode, &hostname_pinning);
+        let wasi_ctx =
+            build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode, &hostname_pinning);
 
         let mut observe_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)

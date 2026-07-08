@@ -152,6 +152,7 @@ mod heartbeat_integration_tests {
             tls_cert_path: None,
             tls_key_path: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
             standby_pool_size: 1,
             // Issue #307 PR2: these tests predate the signature
             // verification feature; they don't exercise signing, so
@@ -1087,6 +1088,16 @@ impl Supervisor {
             Arc::new(edge_runtime::interfaces::observe::MetricsAccumulator::new()),
         );
 
+        // Per-app HostnamePinning cache. Constructed once per app
+        // instance and shared into every FaaS dispatch via
+        // HandlerConfig. Today this is dormant (the upstream
+        // resolve hook hasn't merged), but the Arc layout is
+        // forward-compatible: once the runtime starts populating
+        // the cache during resolve_addresses, every in-flight
+        // dispatch on the same app sees the entries.
+        let hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning> =
+            Arc::new(edge_runtime::socket_egress::HostnamePinning::new());
+
         // Own tenant_id before the spawn — `start_app` borrows it as &str,
         // but the tokio::spawn future must be 'static, so we move an owned
         // String into the closure. The original is moved into the closure;
@@ -1129,6 +1140,8 @@ impl Supervisor {
                 max_request_body_bytes: self.config.handler_max_request_body_bytes,
                 metrics_acc: metrics_acc.clone(),
                 socket_mode: self.config.socket_mode,
+                hostname_pinning_enabled: self.config.hostname_pinning_enabled,
+                hostname_pinning: hostname_pinning.clone(),
                 last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
                 max_memory_mb: spec.max_memory_mb,
                 cpu_budget_ms: spec
@@ -2426,6 +2439,8 @@ mod tests {
             max_request_body_bytes: 0,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ))),
@@ -2450,6 +2465,8 @@ mod tests {
             max_request_body_bytes: 0,
             metrics_acc: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
             max_memory_mb: 256,
             cpu_budget_ms: 1000,
