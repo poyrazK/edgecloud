@@ -134,6 +134,17 @@ pub struct RuntimeState {
     /// `HandlerConfig` → `RuntimeState::with_env_and_meter`.
     pub socket_mode: SocketEgressPolicy,
 
+    /// Per-`Network` resolution cache backing the dormant
+    /// `SocketEgressPolicy::HostnamePinned` mode. Each entry records
+    /// `(hostname → set of resolved IPs)` as observed by the host impl
+    /// for `wasi:sockets/ip-name-lookup::resolve-addresses`. The cache
+    /// is dormant until the upstream wasmtime-wasi PR (see
+    /// `docs/upstream-wasmtime-resolve-check.patch`) merges. Today
+    /// tests populate it manually via `HostnamePinning::record`.
+    /// `Arc` so every `RuntimeState::clone` (one per dispatch) shares
+    /// the same backing store.
+    pub hostname_pinning: Arc<crate::socket_egress::HostnamePinning>,
+
     /// wasmtime 45 moved `send_request` off the `WasiHttpView` trait and
     /// onto a new `WasiHttpHooks` trait, referenced by
     /// `WasiHttpCtxView::hooks`. We store the concrete `EgressHttpHooks`
@@ -176,6 +187,12 @@ impl RuntimeState {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<Vec<_>>(),
             )
+            // Enable `wasi:sockets/ip-name-lookup` so the fixture's
+            // `/sockets/dns-resolve-and-connect` path can exercise
+            // `resolve_addresses`. The resolve hook is dormant (see
+            // `HostnamePinning` field docs) — the connect side stays
+            // gated by `socket_addr_check`.
+            .allow_ip_name_lookup(true)
             .build();
         let egress = Arc::new(EgressPolicy::allow_all());
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -195,6 +212,7 @@ impl RuntimeState {
             tenant_id: String::new(),
             egress: egress.clone(),
             socket_mode: SocketEgressPolicy::default(),
+            hostname_pinning: Arc::new(crate::socket_egress::HostnamePinning::new()),
             http_hooks: EgressHttpHooks::new(egress, String::new()),
             exit_code,
             store_limits: None,
@@ -230,6 +248,7 @@ impl RuntimeState {
         app_ctx: observe::AppLogContext,
         metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
         socket_mode: SocketEgressPolicy,
+        hostname_pinning: Arc<crate::socket_egress::HostnamePinning>,
     ) -> Self {
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -237,7 +256,8 @@ impl RuntimeState {
         let cache_store = get_or_create_cache(&tenant_id);
         let scheduling = get_or_create_scheduler(&tenant_id);
 
-        let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode);
+        let wasi_ctx =
+            build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode, &hostname_pinning);
 
         let mut observe_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -265,6 +285,7 @@ impl RuntimeState {
             tenant_id: tenant_id.clone(),
             egress: egress.clone(),
             socket_mode,
+            hostname_pinning,
             // The hooks box shares the same Arc-shared EgressPolicy and
             // tenant id as the top-level fields, so a future mid-flight
             // policy swap (returning a new Arc) only updates one place.
@@ -333,6 +354,12 @@ impl Clone for RuntimeState {
                 &self.tenant_id,
                 &self.egress,
                 self.socket_mode,
+                // `hostname_pinning: Arc<HostnamePinning>` is `Arc::clone`d
+                // below; every per-`Store` clone of `RuntimeState` shares
+                // the same backing store so observations made by the
+                // upstream-resolve hook on one dispatch are visible to
+                // the next. Cache writes are short-held.
+                &self.hostname_pinning,
             ),
             // WasiHttpCtx is zero-sized in wasmtime 25 (`PhantomData`)
             // so this is a no-op clone. The per-Store resources still
@@ -344,6 +371,10 @@ impl Clone for RuntimeState {
             tenant_id: self.tenant_id.clone(),
             egress: self.egress.clone(),
             socket_mode: self.socket_mode,
+            // Arc::clone so every RuntimeState::clone shares the same
+            // underlying HostnamePinning. Populated manually today
+            // (tests) and via the upstream resolve hook tomorrow.
+            hostname_pinning: self.hostname_pinning.clone(),
             http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
             exit_code: Arc::new(AtomicU32::new(0)),
             store_limits: None, // set fresh by create_store for each new Store
@@ -545,6 +576,7 @@ mod send_request_tests {
             },
             None,
             crate::socket_egress::SocketEgressPolicy::default(),
+            Arc::new(crate::socket_egress::HostnamePinning::new()),
         )
     }
 
@@ -807,11 +839,21 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 /// `AllowList` consults `EgressPolicy::check_address` (hard-deny +
 /// allowlist); mode = `AllowAll` is equivalent to
 /// `WasiCtxBuilder::inherit_network(true)` and is **off by default**.
+///
+/// `hostname_pinning` is an `Arc<HostnamePinning>` reserved for the
+/// dormant `SocketEgressPolicy::HostnamePinned` mode (see commit 3).
+/// Commit 2 only threads the cache through (this signature change);
+/// commit 3 makes the connect-side closure actually consult it via
+/// `EgressPolicy::hostname_pinned_match`. Until the upstream
+/// wasmtime-wasi patch in `docs/upstream-wasmtime-resolve-check.patch`
+/// merges, the cache stays empty — so even with `HostnamePinned` mode
+/// wired the closure denies every connect-side call. Dormant.
 fn build_wasi_ctx_for_tenant(
     env: &Arc<HashMap<String, String>>,
     tenant_id: &str,
     egress: &Arc<EgressPolicy>,
     mode: SocketEgressPolicy,
+    hostname_pinning: &Arc<crate::socket_egress::HostnamePinning>,
 ) -> WasiCtx {
     // Apply the env blocklist BEFORE handing the env to `WasiCtx`. The
     // host exposes the env to the guest via two paths:
@@ -830,6 +872,14 @@ fn build_wasi_ctx_for_tenant(
         process::filter_env_vars(env.iter().map(|(k, v)| (k.clone(), v.clone()))).collect();
     let mut builder = WasiCtxBuilder::new();
     builder.envs(&env_strings);
+
+    // Enable `wasi:sockets/ip-name-lookup` so guests can call
+    // `resolve_addresses`. Required for the L51 / L52 fixture path
+    // `/sockets/dns-resolve-and-connect` (issue #309 follow-up).
+    // The resolve hook stays dormant (see
+    // `docs/upstream-wasmtime-resolve-check.patch`) — the connect
+    // side is gated by `socket_addr_check` regardless.
+    builder.allow_ip_name_lookup(true);
 
     if let Some(base) = resolve_edge_fs_path() {
         let tenant_dir = base.join(tenant_id);
@@ -872,6 +922,7 @@ fn build_wasi_ctx_for_tenant(
         egress.clone(),
         mode,
         tenant_id.to_string(),
+        hostname_pinning.clone(),
     ));
 
     builder.build()
@@ -1204,6 +1255,7 @@ mod with_env_and_meter_tests {
             },
             None,
             crate::socket_egress::SocketEgressPolicy::default(),
+            Arc::new(crate::socket_egress::HostnamePinning::new()),
         )
     }
 

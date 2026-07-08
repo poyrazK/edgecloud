@@ -43,6 +43,14 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// NATS JetStream queue group for fan-out delivery within a region
+    /// (issue #86). Workers in the same region joined to the same
+    /// `queue_group` share a single delivery of each `TaskMessage`, so
+    /// exactly one worker per group starts the app.
+    /// Override with `EDGE_QUEUE_GROUP`. Empty string disables queue-group
+    /// pinning (each consumer receives a copy — the historical fan-out
+    /// behavior).
+    pub queue_group: String,
     /// Number of JetStream replicas for the `edgecloud-tasks` stream.
     /// Must be 1 on non-clustered NATS (local dev); defaults to 3 for
     /// production. Override with `TASK_STREAM_REPLICAS`.
@@ -126,7 +134,11 @@ pub struct Config {
     /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
     /// (`block-all` (default, closes wasi:sockets connect-side),
     /// `allowlist` (consult `EgressPolicy::check_address`),
-    /// `allow-all` (operator opt-in)).
+    /// `allow-all` (operator opt-in),
+    /// `hostname-pinned` (consult `EgressPolicy::hostname_pinned_match`
+    /// against the per-`Network` `HostnamePinning` cache — **dormant
+    /// today**; equals `block-all` until the upstream wasmtime-wasi
+    /// patch in `docs/upstream-wasmtime-resolve-check.patch` merges)).
     ///
     /// Posted into every `HandlerConfig` constructed by the supervisor,
     /// which threads it into `RuntimeState::with_env_and_meter` as a
@@ -135,6 +147,21 @@ pub struct Config {
     /// flagged as a perf regression). Mirrors the
     /// `handler_max_request_body_bytes` pattern above.
     pub socket_mode: SocketEgressPolicy,
+
+    /// Per-deployment `HostnamePinned` mode toggle (issue #309
+    /// follow-up). Read **once** at worker startup from
+    /// `EDGE_EGRESS_HOSTNAME_PINNING` (parsed 1/0, true/false, yes/no,
+    /// on/off, case-insensitive — default `false`).
+    ///
+    /// When `true`, the per-request `RuntimeState` swap uses
+    /// `SocketEgressPolicy::HostnamePinned` instead of the worker-wide
+    /// `Config::socket_mode`. Today this is dormant (the upstream
+    /// resolve hook has not merged, so the `HostnamePinning` cache
+    /// stays empty and `HostnamePinned` denies every connect-side
+    /// call — observable parity with `BlockAll`). Once the patch
+    /// merges, set this to `true` on the worker and the admit paths
+    /// light up.
+    pub hostname_pinning_enabled: bool,
     /// Configured size of the warm standby pool of Wasmtime engines.
     /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
     pub standby_pool_size: usize,
@@ -235,6 +262,7 @@ impl Config {
         let cfg = Config {
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
             consumer_name,
+            queue_group: std::env::var("EDGE_QUEUE_GROUP").unwrap_or_default(),
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             worker_addr: std::env::var("EDGE_WORKER_ADDR").context("EDGE_WORKER_ADDR not set")?,
@@ -272,6 +300,7 @@ impl Config {
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
+            hostname_pinning_enabled: parse_env_bool("EDGE_EGRESS_HOSTNAME_PINNING", false)?,
             standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
             // Issue #307 PR2 + PR1 follow-up: signature verification
             // config. The default for `require_signature` is `true`
@@ -475,6 +504,54 @@ mod tests {
         let err = parse_env_u64("EDGE_TEST_VAR", 42).unwrap_err();
         // u64 can't represent -1, so we expect a parse error.
         assert!(format!("{:#}", err).contains("EDGE_TEST_VAR"));
+    }
+
+    #[test]
+    fn parse_env_bool_returns_default_when_unset() {
+        let _g = EnvGuard::unset("EDGE_TEST_VAR");
+        assert!(parse_env_bool("EDGE_TEST_VAR", true).unwrap());
+        assert!(!parse_env_bool("EDGE_TEST_VAR", false).unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_truthy_tokens() {
+        for tok in ["1", "true", "TRUE", "yes", "YES", "on", "On"] {
+            let _g = EnvGuard::set("EDGE_TEST_VAR", tok);
+            assert!(
+                parse_env_bool("EDGE_TEST_VAR", false).unwrap(),
+                "expected true for token {:?}",
+                tok
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_falsy_tokens() {
+        for tok in ["0", "false", "FALSE", "no", "NO", "off", "Off"] {
+            let _g = EnvGuard::set("EDGE_TEST_VAR", tok);
+            assert!(
+                !parse_env_bool("EDGE_TEST_VAR", true).unwrap(),
+                "expected false for token {:?}",
+                tok
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_errors_on_unknown_value() {
+        let _g = EnvGuard::set("EDGE_TEST_VAR", "maybe");
+        let err = parse_env_bool("EDGE_TEST_VAR", false).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("EDGE_TEST_VAR"),
+            "error should name the var: {}",
+            msg
+        );
+        assert!(
+            msg.contains("maybe"),
+            "error should include the bad value: {}",
+            msg
+        );
     }
 
     /// `Config::from_env` requires WORKER_ID, REGION, and CONTROL_PLANE_URL

@@ -91,6 +91,7 @@ fn test_config(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: format!("test-{}", worker_id),
+        queue_group: String::new(),
         worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
@@ -104,6 +105,7 @@ fn test_config(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
         standby_pool_size: 10,
         // Issue #307 PR2: signature config. Default `require_signature=false`
         // for tests that don't exercise signing (the existing tests
@@ -191,6 +193,7 @@ impl TestHarness {
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
             consumer_name: "test-consumer".to_string(),
+            queue_group: String::new(),
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
             worker_jwt_kid: Some("test-kid".to_string()),
             worker_jwt_issuer: "edgecloud".to_string(),
@@ -202,6 +205,7 @@ impl TestHarness {
             tls_key_path: None,
             worker_bootstrap_secret: String::new(),
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            hostname_pinning_enabled: false,
             standby_pool_size: 10,
             // Issue #307 PR2: signature config — defaults match the
             // test_config helper (off for non-signing tests).
@@ -418,6 +422,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: "test-heartbeat-consumer".to_string(),
+        queue_group: String::new(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
@@ -430,6 +435,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
         standby_pool_size: 10,
         // Issue #307 PR2: signature config off for this test (it's a
         // queue-group pinning regression, not a signing test).
@@ -887,7 +893,177 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     );
 }
 
-#[allow(dead_code)]
+/// Issue #86 regression test: two workers in the same region joined to the
+/// same queue group must NOT both start the same app when a single
+/// `TaskMessage` is published. NATS queue-group delivery guarantees
+/// exactly-one delivery across consumers in the group.
+#[tokio::test]
+async fn test_queue_group_pinning() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    timeout(Duration::from_secs(120), test_queue_group_pinning_inner())
+        .await
+        .expect("test_queue_group_pinning timed out")
+        .expect("test_queue_group_pinning failed");
+}
+
+async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
+    // Single NATS container, shared by both workers and the publisher.
+    let (nats_container, nats_url) = start_nats().await;
+
+    let region = "test-region";
+    let queue_group = "test-pinning-group";
+
+    // Two workers — same region, same queue group, distinct consumer names.
+    // The pinning test doesn't touch the downloader, so a shared /tmp cache
+    // is fine — give each worker its own subdir to avoid cross-worker clobber.
+    let config_a = Config {
+        worker_id: "w_pinning_a".to_string(),
+        region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
+        nats_url: String::new(), // overwritten by build_supervisor_from_url
+        control_plane_url: "http://localhost:9999".to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-a"),
+        heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: queue_group.to_string(),
+        consumer_name: "consumer-a".to_string(),
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_kid: None,
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
+        standby_pool_size: 10,
+        require_signature: false,
+        signing_pubkey: None,
+        signing_pubkey_path: None,
+    };
+    let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
+
+    let config_b = Config {
+        worker_id: "w_pinning_b".to_string(),
+        region: region.to_string(),
+        worker_addr: "test-host:0".to_string(),
+        nats_url: String::new(),
+        control_plane_url: "http://localhost:9999".to_string(),
+        cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-b"),
+        heartbeat_interval_secs: 30,
+        worker_sync_threshold_secs: 60,
+        health_check_timeout_secs: 60,
+        port_cooldown_secs: 60,
+        starting_port: 18_000,
+        max_memory_mb: 256,
+        epoch_tick_ms: 10,
+        epoch_deadline_ticks: 100,
+        queue_group: queue_group.to_string(),
+        consumer_name: "consumer-b".to_string(),
+        worker_jwt_secret: "test-secret".to_string(),
+        worker_jwt_kid: None,
+        worker_jwt_issuer: "edgecloud".to_string(),
+        worker_tenant_id: "t_test".to_string(),
+        handler_request_budget_ms: 1000,
+        handler_max_request_body_bytes: 10 * 1024 * 1024,
+        task_stream_replicas: 1,
+        tls_cert_path: None,
+        tls_key_path: None,
+        worker_bootstrap_secret: String::new(),
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
+        standby_pool_size: 10,
+        require_signature: false,
+        signing_pubkey: None,
+        signing_pubkey_path: None,
+    };
+    let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
+
+    // Each supervisor gets its own shutdown channel — the test triggers
+    // shutdown at the end and waits for both loops to exit.
+    let (shutdown_tx_a, _) = tokio::sync::broadcast::channel::<()>(1);
+    let (shutdown_tx_b, _) = tokio::sync::broadcast::channel::<()>(1);
+
+    let sup_a_clone = sup_a.clone();
+    let shutdown_rx_a = shutdown_tx_a.subscribe();
+    let handle_a = tokio::spawn(async move {
+        let _ = sup_a_clone.run_consume_loop(shutdown_rx_a).await;
+    });
+
+    let sup_b_clone = sup_b.clone();
+    let shutdown_rx_b = shutdown_tx_b.subscribe();
+    let handle_b = tokio::spawn(async move {
+        let _ = sup_b_clone.run_consume_loop(shutdown_rx_b).await;
+    });
+
+    // Give both consume loops a moment to subscribe before publishing.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Publish a single TaskMessage via plain NATS — JetStream's stream
+    // (subjects = `edgecloud.tasks.>`) captures it.
+    let publisher = async_nats::connect(&nats_url).await?;
+    let payload = serde_json::json!({
+        "type": "task_update",
+        "timestamp": "2026-06-15T00:00:00Z",
+        "tenant_id": "t_test",
+        "apps": {
+            "pinned-app": {
+                "deployment_id": "d_pinned_001",
+                "deployment_hash": "abc123",
+                "env": {},
+                "allowlist": []
+            }
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    publisher
+        .publish(format!("edgecloud.tasks.{}", region), payload_bytes.into())
+        .await?;
+
+    // Wait for the message to be processed by exactly one worker.
+    let started =
+        wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "t_test", "pinned-app", 15)
+            .await;
+    assert!(
+        started.is_some(),
+        "exactly one worker should have started pinned-app"
+    );
+
+    // Give the OTHER worker a chance to also start the app (it shouldn't).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let apps_a = sup_a.state.read().await.apps.len();
+    let apps_b = sup_b.state.read().await.apps.len();
+    let total = apps_a + apps_b;
+    assert_eq!(
+        total, 1,
+        "exactly one worker should host pinned-app (a={}, b={})",
+        apps_a, apps_b
+    );
+
+    // Signal shutdown and wait for consume loops to exit cleanly.
+    let _ = shutdown_tx_a.send(());
+    let _ = shutdown_tx_b.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_a).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_b).await;
+
+    drop(nats_container);
+    Ok(())
+}
+
 /// Wait until `app_name` is `Running` in any of `supervisors`. Returns
 /// which supervisor saw it (Some(index)) or None if none did within the
 /// timeout.
@@ -1618,6 +1794,7 @@ async fn build_supervisor_only_with_cp(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: "test-sync-consumer".to_string(),
+        queue_group: String::new(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
@@ -1629,6 +1806,7 @@ async fn build_supervisor_only_with_cp(
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        hostname_pinning_enabled: false,
         standby_pool_size: 10,
         // Issue #307 PR2: signature config off for fetch_sync tests —
         // the signing path is exercised by the dedicated signature

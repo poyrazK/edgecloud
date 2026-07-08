@@ -1,0 +1,156 @@
+From: edgecloud maintainers <maintainers@edgecloud.local>
+Subject: [PATCH] wasmtime-wasi: add resolve-side SocketAddrCheck closure
+Date: Wed, 8 Jul 2026 12:00:00 +0000
+
+Mirrors the existing connect-side `WasiCtxBuilder::socket_addr_check`
+closure at wasmtime-wasi 45.0.3/src/sockets/mod.rs:125-163 with a
+resolve-side variant that fires from
+`wasi:sockets/ip_name_lookup::resolve_addresses`. This is the upstream
+piece that wakes the dormant `SocketEgressPolicy::HostnamePinned` mode
+in `edge-runtime/src/socket_egress.rs`.
+
+What changes:
+
+  - Adds `WasiSocketsCtx::resolve_addr_check: Option<ResolveAddressCheck>`
+    and `resolved_host_cache: Arc<Mutex<HashMap<String, HashSet<IpAddr>>>>`
+    fields (parallel to the existing `socket_addr_check`).
+  - Adds `WasiCtxBuilder::resolve_addr_check(...)` setter at
+    wasmtime-wasi-45.0.3/src/ctx.rs (mirrors `socket_addr_check`).
+  - Adds `ResolveAddressCheck` struct at
+    wasmtime-wasi-45.0.3/src/sockets/mod.rs that owns the closure and
+    exposes `async fn check(&self, name: &str, addrs: &[IpAddress]) -> bool`.
+  - Wires the closure into the host impl at
+    wasmtime-wasi-45.0.3/src/p2/ip_name_lookup.rs::resolve_addresses:
+    `spawn_blocking` wraps the upstream `blocking_resolve`, populates
+    the per-`Store` cache under the closure's lock, then fires the
+    operator hook. Returning `false` short-circuits to
+    `Err(PermanentResolverFailure)`.
+  - Documents (without coding here) that the connect-side
+    `SocketAddrCheck` consults the same cache so the connect direction
+    can admit addresses observed during resolve. The cache is per-`Store`
+    so per-tenant / per-`RuntimeState` isolation is preserved.
+
+The shape is intentionally identical to the existing `SocketAddrCheck`
+so the runtime can keep one closure for both directions and one cache
+both directions share.
+
+Filed on the wasmtime-wasi upstream; PR URL TBD (see edgecloud
+issue #309 for tracking).
+
+---
+
+diff --git a/src/ctx.rs b/src/ctx.rs
+index abc..def 100644
+--- a/src/ctx.rs
++++ b/src/ctx.rs
+@@ -397,6 +397,32 @@ impl WasiCtxBuilder {
+     pub fn socket_addr_check(
+         &mut self,
+         check: impl Fn(SocketAddr, SocketAddrUse) -> SocketAddrCheckFuture + Send + Sync + 'static,
++    ) -> &mut Self {
++        // ... existing setter body unchanged ...
++    }
++
++    /// Install a closure invoked from the host impl
++    /// `wasi:sockets/ip_name_lookup::resolve_addresses`. Returning `false`
++    /// short-circuits the resolve to `Err(PermanentResolverFailure)`. The
++    /// closure also populates a per-`Store` cache keyed by hostname so
++    /// the connect-side `SocketAddrCheck` can consult the same data.
++    pub fn resolve_addr_check(
++        &mut self,
++        check: impl Fn(&str, &[IpAddress]) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++            + Send
++            + Sync
++            + 'static,
++    ) -> &mut Self {
++        self.sockets.resolve_addr_check = Some(ResolveAddressCheck::new(check));
++        self
+     }
+
+diff --git a/src/sockets/mod.rs b/src/sockets/mod.rs
+index abc..def 100644
+--- a/src/sockets/mod.rs
++++ b/src/sockets/mod.rs
+@@ -70,6 +70,8 @@ pub struct WasiSocketsCtx {
+     pub(crate) socket_addr_check: SocketAddrCheck,
++    pub(crate) resolve_addr_check: Option<ResolveAddressCheck>,
++    pub(crate) resolved_host_cache: Arc<Mutex<HashMap<String, HashSet<IpAddr>>>>,
+ }
+@@ -94,6 +96,8 @@ impl WasiSocketsCtx {
+             socket_addr_check: SocketAddrCheck::default(),
++            resolve_addr_check: None,
++            resolved_host_cache: Arc::new(Mutex::new(HashMap::new())),
+         }
+     }
+ }
+
+@@ -125,6 +129,40 @@ pub(crate) struct SocketAddrCheck(Arc<...>);
+
++/// Mirror of `SocketAddrCheck` for the resolve-side hook. Closure
++/// signature: `Fn(&str, &[IpAddress]) -> Future<Output = bool>`. The
++/// closure is fired AFTER upstream DNS resolution, BEFORE the
++/// `ResolveAddressStream` is constructed. Returning `false` short-
++/// circuits the call to `Err(PermanentResolverFailure)`.
++#[derive(Clone)]
++pub(crate) struct ResolveAddressCheck(
++    Arc<
++        dyn Fn(&str, &[IpAddress]) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++            + Send
++            + Sync,
++    >,
++);
++
++impl ResolveAddressCheck {
++    pub(crate) fn new(
++        f: impl Fn(&str, &[IpAddress]) -> Pin<Box<dyn Future<Output = bool> + Send + Sync>>
++        + Send
++        + Sync
++        + 'static,
++    ) -> Self {
++        Self(Arc::new(f))
++    }
++
++    pub(crate) async fn check(&self, name: &str, addrs: &[IpAddress]) -> bool {
++        (self.0)(name, addrs).await
++    }
++}
+
+diff --git a/src/p2/ip_name_lookup.rs b/src/p2/ip_name_lookup.rs
+index abc..def 100644
+--- a/src/p2/ip_name_lookup.rs
++++ b/src/p2/ip_name_lookup.rs
+@@ -22,11 +23,32 @@ impl Host for WasiSocketsCtxView<'_> {
+     fn resolve_addresses(
+         &mut self,
+         network: Resource<Network>,
+         name: String,
+     ) -> Result<Resource<ResolveAddressStream>, SocketError> {
+         let network = self.table.get(&network)?;
+
+         let host = parse_host(&name)?;
+
+         if !network.allow_ip_name_lookup {
+             return Err(ErrorCode::PermanentResolverFailure.into());
+         }
+
+-        let task = spawn_blocking(move || blocking_resolve(&host));
++        let resolve_check = self.ctx.resolve_addr_check.clone();
++        let cache = self.ctx.resolved_host_cache.clone();
++        let name_for_closure = name.clone();
++        let task = spawn_blocking(move || {
++            let resolved = blocking_resolve(&host)?;
++            if let Ok(ip_set) = resolved.as_slice().to_canonical_ips() {
++                cache.lock().unwrap().insert(name_for_closure.clone(), ip_set);
++            }
++            if let Some(check) = resolve_check.as_ref() {
++                let allowed = pollster::block_on(check.check(&name_for_closure, &resolved));
++                if !allowed {
++                    return Err(ErrorCode::PermanentResolverFailure.into());
++                }
++            }
++            Ok(resolved)
++        });
+         let resource = self.table.push(ResolveAddressStream::Waiting(task))?;
+         Ok(resource)
+     }
+ }

@@ -126,6 +126,50 @@ impl EgressPolicy {
         Ok(())
     }
 
+    /// Allowlist gate for the `SocketEgressPolicy::HostnamePinned` mode
+    /// (issue #309 follow-up). Returns `true` iff `addr.ip()` appears
+    /// in `cache[hostname]` for some `hostname` that is also in the
+    /// tenant's per-app allowlist. The cache is keyed by hostname (the
+    /// string the guest passed to `wasi:sockets/ip-name-lookup::
+    /// resolve_addresses`); the connect-side closure receives only the
+    /// resolved IP, so the lookup iterates the allowlist members and
+    /// asks "for each allowlisted hostname, is this IP one I observed
+    /// during its resolve?" — first hit wins.
+    ///
+    /// **Caller must have already** consulted
+    /// [`EgressPolicy::check_resolved_ip`] — the hard-deny layer still
+    /// applies. This function only answers the allowlist half of the
+    /// question.
+    ///
+    /// Dormant today: the cache stays empty until the upstream
+    /// wasmtime-wasi PR in `docs/upstream-wasmtime-resolve-check.patch`
+    /// merges. With an empty cache the function always returns `false`.
+    pub fn hostname_pinned_match(
+        &self,
+        addr: SocketAddr,
+        cache: &std::collections::HashMap<String, std::collections::HashSet<IpAddr>>,
+    ) -> bool {
+        if self.allowlist.is_empty() {
+            return false;
+        }
+        // The "*" wildcard bypasses per-hostname matching — any cache IP
+        // is admitted. Mirrors `check`'s `*` semantics.
+        if self.allowlist.iter().any(|e| e == "*") {
+            return cache.values().any(|set| set.contains(&addr.ip()));
+        }
+        // Cache lookup by allowlist member — each allowlist entry is
+        // consulted as a hostname key against the cache. First hit
+        // wins; no hit → deny.
+        for entry in &self.allowlist {
+            if let Some(set) = cache.get(entry) {
+                if set.contains(&addr.ip()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Check whether an outbound request to `url` is permitted.
     ///
     /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
@@ -258,6 +302,8 @@ pub(crate) fn is_blocked_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::EgressPolicy;
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, SocketAddr};
 
     // ── hard-deny: IPs ────────────────────────────────────────────────────
 
@@ -706,5 +752,78 @@ mod tests {
         assert!(policy
             .check_address("127.0.0.1:80".parse().unwrap())
             .is_err());
+    }
+
+    // ── hostname_pinned_match ─────────────────────────────────────────────
+    //
+    // Pin the lookup behavior used by
+    // `SocketEgressPolicy::HostnamePinned`. Today the cache stays empty
+    // (the upstream resolve hook in
+    // `docs/upstream-wasmtime-resolve-check.patch` hasn't merged), so
+    // these tests assert the function shape by populating the cache
+    // directly. Once the hook ships, the integration path passes a
+    // populated cache to the runtime closure and these tests continue
+    // to pin the lookup semantics.
+
+    fn make_cache(v: Vec<(&str, IpAddr)>) -> HashMap<String, HashSet<IpAddr>> {
+        let mut m: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        for (host, ip) in v {
+            m.entry(host.to_string()).or_default().insert(ip);
+        }
+        m
+    }
+
+    #[test]
+    fn hostname_pinned_match_empty_allowlist_denies() {
+        // Default-deny parity with `check_address`.
+        let policy = EgressPolicy::new(vec![]);
+        let cache = make_cache(vec![("api.example.com", "8.8.8.8".parse().unwrap())]);
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(!policy.hostname_pinned_match(addr, &cache));
+    }
+
+    #[test]
+    fn hostname_pinned_match_empty_cache_denies() {
+        // Dormant-state contract: cache empty → deny every addr.
+        let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        let cache: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(!policy.hostname_pinned_match(addr, &cache));
+    }
+
+    #[test]
+    fn hostname_pinned_match_allowlist_match_permits() {
+        // IP is under an allowlisted hostname in the cache → admit.
+        let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        let cache = make_cache(vec![(
+            "api.example.com",
+            "8.8.8.8".parse::<IpAddr>().unwrap(),
+        )]);
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(policy.hostname_pinned_match(addr, &cache));
+    }
+
+    #[test]
+    fn hostname_pinned_match_unobserved_ip_denies() {
+        // IP is in the cache but under a non-allowlisted hostname → deny.
+        let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        let cache = make_cache(vec![("evil.com", "8.8.8.8".parse::<IpAddr>().unwrap())]);
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(!policy.hostname_pinned_match(addr, &cache));
+    }
+
+    #[test]
+    fn hostname_pinned_match_star_sentinel_admits_any() {
+        // "*" wildcard in the allowlist bypasses per-hostname matching
+        // — any cache IP is admitted.
+        //
+        // Use `EgressPolicy::allow_all()` (which stores `["*"]`
+        // directly) rather than `EgressPolicy::new(vec!["*"])`: the
+        // latter strips `"*"` defensively (see `EgressPolicy::new`
+        // doc comment). Test the operator-visible path.
+        let policy = EgressPolicy::allow_all();
+        let cache = make_cache(vec![("any", "8.8.8.8".parse::<IpAddr>().unwrap())]);
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(policy.hostname_pinned_match(addr, &cache));
     }
 }
