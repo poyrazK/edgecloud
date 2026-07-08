@@ -95,7 +95,17 @@ type FileEntry struct {
 // edge-migrate/edge-migrate-lib/src/report.rs). JSON tags must match
 // the Rust serialization exactly.
 type FileReport struct {
-	Path             string            `json:"path"`
+	// Path is the forward-slash path of the source file relative
+	// to the walk root.
+	Path string `json:"path"`
+	// SHA256 is the lowercase hex SHA-256 of the **original**
+	// source bytes (pre-transform). Empty when the file's source
+	// was not loaded into memory before the error (parse failure
+	// before read completes) or when the producer version is
+	// pre-PR2.7 (issue #307 PR2.7). Downstream SLSA L1
+	// attestation uses this as a `materials[].digest.sha256`
+	// entry.
+	SHA256           string            `json:"sha256,omitempty"`
 	Status           MigrationStatus   `json:"status"`
 	PatternsDetected []PatternInfo     `json:"patterns_detected"`
 	Transformations  []PatternInfo     `json:"transformations"`
