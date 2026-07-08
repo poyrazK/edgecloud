@@ -113,8 +113,12 @@ async fn main() -> ExitCode {
         tracing::info!("CONTROL_PLANE_URL unset; running in default-only mode (no custom domains)");
     }
 
-    // The heartbeat subscription can drop on NATS reconnect; mirror the
-    // worker's pattern of re-subscribing with backoff.
+    // Reconnect loop with exponential backoff. On success we reset to
+    // the initial delay; on failure we double up to the cap.
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let mut backoff = INITIAL_BACKOFF;
+
     loop {
         match heartbeats::run(
             cfg.clone(),
@@ -125,14 +129,18 @@ async fn main() -> ExitCode {
         .await
         {
             Ok(()) => {
-                tracing::warn!("heartbeats::run returned cleanly; re-running in 1s");
+                tracing::warn!("heartbeats::run returned cleanly; re-running");
+                backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
                 metrics::counter!("ingress.nats.reconnects_total").increment(1);
-                tracing::error!(err = %e, "heartbeats::run failed; re-running in 5s");
-                sleep(Duration::from_secs(5)).await;
+                tracing::error!(err = %e, delay_ms = backoff.as_millis(), "heartbeats::run failed; re-running after backoff");
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
-        sleep(Duration::from_secs(1)).await;
+        // Brief pause even on success to avoid busy-looping if NATS
+        // accepts the connection but drops the subscription immediately.
+        sleep(Duration::from_millis(100)).await;
     }
 }
