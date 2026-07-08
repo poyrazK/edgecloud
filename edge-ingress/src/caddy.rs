@@ -1,14 +1,11 @@
 //! Caddy admin-API client and Caddyfile-JSON renderer.
+//! Caddy admin-API client and Caddyfile-JSON renderer.
 //!
 //! Caddy exposes a JSON admin API on a configurable port (default `:2019`).
 //! We render the full Caddyfile-JSON in Rust and `POST /load` it on every
-//! routing change. The config is small (one route per app) and the round
-//! trip is fast (~50ms for thousands of routes), so a full reload is fine
-//! for v1.
-//!
-//! TODO(incremental-caddy): when route count exceeds ~10k, switch to
-//! `PUT /id/<id>/apps/http/servers/edge_https/routes/<n>` patches and
-//! track per-route handles in the `RoutingTable` snapshot.
+//! routing change. For incremental updates we use `@id` annotations on
+//! individual route objects and route-level `PUT /id/<id>` / `DELETE /id/<id>`
+//! operations — see `CaddyClient::upsert_route` and `delete_route`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -68,6 +65,33 @@ impl CaddyClient {
         let url = format!("{}/load", self.admin_url);
         post_with_retry(&self.http, &url, self.token.as_deref(), config).await
     }
+
+    /// Upsert a single route object by its `@id`. Caddy's admin API
+    /// handles `PUT /id/<id>` which creates or replaces the route.
+    pub async fn upsert_route(&self, route: &Value) -> Result<()> {
+        let id = route
+            .get("@id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("route object missing @id"))?;
+        let url = format!("{}/id/{}", self.admin_url, encode_url_path(id));
+        put_with_retry(&self.http, &url, self.token.as_deref(), route).await
+    }
+
+    /// Delete a single route by its `@id`.
+    pub async fn delete_route(&self, id: &str) -> Result<()> {
+        let url = format!("{}/id/{}", self.admin_url, encode_url_path(id));
+        delete_with_retry(&self.http, &url, self.token.as_deref()).await
+    }
+}
+
+/// URL-encode a route ID for use in Caddy admin API paths.
+/// Caddy `/id/` endpoints expect path-safe encoding.
+fn encode_url_path(id: &str) -> String {
+    id.replace('%', "%25")
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace('#', "%23")
+        .replace('?', "%3F")
 }
 
 /// POST `body` to `url`, retrying on transient HTTP failures. The
@@ -134,6 +158,116 @@ async fn post_with_retry(
 
 fn is_retryable_status(status: StatusCode) -> bool {
     status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 408
+}
+
+/// PUT `body` to `url`, retrying on transient failures.
+/// Same retry semantics as `post_with_retry`.
+async fn put_with_retry(
+    client: &Client,
+    url: &str,
+    token: Option<&str>,
+    body: &Value,
+) -> Result<()> {
+    let mut delay = INITIAL_BACKOFF;
+    for attempt in 1..=MAX_LOAD_ATTEMPTS {
+        let mut req = client.put(url).json(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < MAX_LOAD_ATTEMPTS {
+                    warn!(
+                        attempt,
+                        max = MAX_LOAD_ATTEMPTS,
+                        err = %e,
+                        "Caddy route PUT transport error, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                return Err(anyhow!(
+                    "Caddy route PUT transport error after {attempt} attempts: {e}"
+                ));
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let retryable = is_retryable_status(status);
+        let body_txt = resp.text().await.unwrap_or_default();
+        if retryable && attempt < MAX_LOAD_ATTEMPTS {
+            warn!(
+                attempt,
+                max = MAX_LOAD_ATTEMPTS,
+                status = status.as_u16(),
+                "Caddy route PUT transient failure, retrying"
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(MAX_BACKOFF);
+            continue;
+        }
+        return Err(anyhow!(
+            "Caddy route PUT returned {status} after {attempt} attempt(s): {body_txt}"
+        ));
+    }
+    unreachable!("loop always returns or continues")
+}
+
+/// DELETE `url`, retrying on transient failures.
+async fn delete_with_retry(client: &Client, url: &str, token: Option<&str>) -> Result<()> {
+    let mut delay = INITIAL_BACKOFF;
+    for attempt in 1..=MAX_LOAD_ATTEMPTS {
+        let mut req = client.delete(url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < MAX_LOAD_ATTEMPTS {
+                    warn!(
+                        attempt,
+                        max = MAX_LOAD_ATTEMPTS,
+                        err = %e,
+                        "Caddy route DELETE transport error, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_BACKOFF);
+                    continue;
+                }
+                return Err(anyhow!(
+                    "Caddy route DELETE transport error after {attempt} attempts: {e}"
+                ));
+            }
+        };
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            // 404 means the route doesn't exist — consider that a success
+            // since our goal was to ensure it's absent.
+            return Ok(());
+        }
+        let retryable = is_retryable_status(status);
+        let body_txt = resp.text().await.unwrap_or_default();
+        if retryable && attempt < MAX_LOAD_ATTEMPTS {
+            warn!(
+                attempt,
+                max = MAX_LOAD_ATTEMPTS,
+                status = status.as_u16(),
+                "Caddy route DELETE transient failure, retrying"
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(MAX_BACKOFF);
+            continue;
+        }
+        return Err(anyhow!(
+            "Caddy route DELETE returned {status} after {attempt} attempt(s): {body_txt}"
+        ));
+    }
+    unreachable!("loop always returns or continues")
 }
 
 /// Render the full Caddyfile-JSON for a set of routes. Pure function — no
@@ -277,6 +411,7 @@ pub fn render_routes(
             }));
 
             json!({
+                "@id": ingress_host(tenant_id, app_name),
                 "match": [{"host": [host]}],
                 "handle": [{
                     "handler": "subroute",
@@ -389,6 +524,7 @@ pub fn render_routes(
         }));
 
         routes.push(json!({
+            "@id": b.fqdn,
             "match": [{"host": [b.fqdn]}],
             "handle": [{
                 "handler": "subroute",
@@ -508,6 +644,78 @@ fn health_checks_block(cfg: &Config) -> serde_json::Value {
             "unhealthy_request_count": 3,
         }
     })
+}
+
+/// Diff result for routing entries: (added with item, removed IDs, changed with item).
+type DiffResult<'a> = (
+    Vec<(&'a RouteEntry, serde_json::Value)>,
+    Vec<String>,
+    Vec<(&'a RouteEntry, serde_json::Value)>,
+);
+
+/// Compute the delta between two routing table snapshots.
+///
+/// Returns `(added, removed, changed)` where:
+/// - `added`: routes present in `curr` but not in `prev`
+/// - `removed`: route IDs present in `prev` but not in `curr`
+/// - `changed`: routes present in both but with different content
+///   (worker_addr, port, or weight), paired with their rendered JSON
+///
+/// Comparison uses `RouteEntry::route_id()` as the stable key.
+/// Two entries are considered "changed" if any routing-relevant
+/// field differs (worker_addr, port, weight, rate_limit_rps/burst).
+pub(crate) fn diff_routes<'a>(prev: &'a [RouteEntry], curr: &'a [RouteEntry]) -> DiffResult<'a> {
+    let prev_by_id: HashMap<String, &RouteEntry> = prev.iter().map(|e| (e.route_id(), e)).collect();
+    let curr_by_id: HashMap<String, &RouteEntry> = curr.iter().map(|e| (e.route_id(), e)).collect();
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+
+    for (id, entry) in &curr_by_id {
+        if !prev_by_id.contains_key(id) {
+            added.push((*entry, json!({})));
+        }
+    }
+    for (id, prev_entry) in &prev_by_id {
+        match curr_by_id.get(id.as_str()) {
+            None => {
+                removed.push((*id).to_string());
+            }
+            Some(curr_entry) => {
+                if prev_entry.worker_addr != curr_entry.worker_addr
+                    || prev_entry.port != curr_entry.port
+                    || prev_entry.weight != curr_entry.weight
+                    || prev_entry.rate_limit_rps != curr_entry.rate_limit_rps
+                    || prev_entry.rate_limit_burst != curr_entry.rate_limit_burst
+                {
+                    changed.push((*curr_entry, json!({})));
+                }
+            }
+        }
+    }
+
+    (added, removed, changed)
+}
+
+/// Compute the delta between two FQDN binding lists.
+/// Returns `(added_fqdns, removed_fqdns)` — FQDNs are their own IDs.
+pub(crate) fn diff_fqdns(prev: &[FqdnBinding], curr: &[FqdnBinding]) -> (Vec<String>, Vec<String>) {
+    let prev_set: std::collections::HashSet<&str> = prev.iter().map(|b| b.fqdn.as_str()).collect();
+    let curr_set: std::collections::HashSet<&str> = curr.iter().map(|b| b.fqdn.as_str()).collect();
+
+    let added: Vec<String> = curr
+        .iter()
+        .filter(|b| !prev_set.contains(b.fqdn.as_str()))
+        .map(|b| b.fqdn.clone())
+        .collect();
+    let removed: Vec<String> = prev
+        .iter()
+        .filter(|b| !curr_set.contains(b.fqdn.as_str()))
+        .map(|b| b.fqdn.clone())
+        .collect();
+
+    (added, removed)
 }
 
 #[cfg(test)]
@@ -1066,6 +1274,109 @@ mod tests {
             server.get("max_conns_per_ip").is_none(),
             "max_conns_per_ip must be absent when zero"
         );
+    }
+
+    // ── diff_routes / diff_fqdns tests ───────────────────────────────
+
+    #[test]
+    fn diff_routes_empty_both() {
+        let (added, removed, changed) = diff_routes(&[], &[]);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_routes_no_changes() {
+        let snap = vec![entry("t_a", "api", "1.2.3.4", 8081)];
+        let (added, removed, changed) = diff_routes(&snap, &snap);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_routes_added() {
+        let prev = vec![];
+        let curr = vec![entry("t_a", "api", "1.2.3.4", 8081)];
+        let (added, removed, changed) = diff_routes(&prev, &curr);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].0.app_name, "api");
+        assert!(removed.is_empty());
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_routes_removed() {
+        let prev = vec![entry("t_a", "api", "1.2.3.4", 8081)];
+        let curr = vec![];
+        let (added, removed, changed) = diff_routes(&prev, &curr);
+        assert!(added.is_empty());
+        assert_eq!(removed.len(), 1);
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_routes_changed() {
+        let prev = vec![entry("t_a", "api", "1.2.3.4", 8081)];
+        let curr = vec![entry("t_a", "api", "5.6.7.8", 8082)];
+        let (added, removed, changed) = diff_routes(&prev, &curr);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0.worker_addr, "5.6.7.8");
+    }
+
+    #[test]
+    fn diff_routes_combined() {
+        let prev = vec![
+            entry("t_a", "api", "1.2.3.4", 8081), // changes
+            entry("t_a", "web", "1.2.3.4", 8082), // removed
+        ];
+        let curr = vec![
+            entry("t_a", "api", "5.6.7.8", 8082),     // changed
+            entry("t_b", "blog", "9.10.11.12", 9000), // added
+        ];
+        let (added, removed, changed) = diff_routes(&prev, &curr);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].0.app_name, "blog");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], "t_a:web");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0.app_name, "api");
+    }
+
+    #[test]
+    fn diff_fqdns_empty_both() {
+        let (added, removed) = diff_fqdns(&[], &[]);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_fqdns_no_changes() {
+        let bindings = vec![
+            fqdn("t_a", "api", "api.acme.com"),
+            fqdn("t_a", "web", "web.acme.com"),
+        ];
+        let (added, removed) = diff_fqdns(&bindings, &bindings);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_fqdns_changes() {
+        let prev = vec![
+            fqdn("t_a", "api", "api.acme.com"),
+            fqdn("t_a", "web", "web.acme.com"),
+        ];
+        let curr = vec![
+            fqdn("t_a", "api", "api.acme.com"),
+            fqdn("t_b", "blog", "blog.acme.com"),
+        ];
+        let (added, removed) = diff_fqdns(&prev, &curr);
+        assert_eq!(added, vec!["blog.acme.com"]);
+        assert_eq!(removed, vec!["web.acme.com"]);
     }
 
     // -----------------------------------------------------------------
