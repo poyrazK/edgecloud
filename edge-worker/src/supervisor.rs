@@ -589,7 +589,7 @@ mod heartbeat_integration_tests {
     #[tokio::test]
     async fn stop_app_long_running_removes_app() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let instance_pre = load_handler_fixture(&engine);
+        let instance_pre = Some(load_handler_fixture(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let (oneshot_tx, _) = tokio::sync::oneshot::channel::<()>();
         let app = Arc::new(Mutex::new(AppInstance {
@@ -623,7 +623,7 @@ mod heartbeat_integration_tests {
     #[tokio::test]
     async fn stop_app_handler_with_broadcast_sends_signal() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let instance_pre = load_handler_fixture(&engine);
+        let instance_pre = Some(load_handler_fixture(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let (tx, _rx) = tokio::sync::broadcast::channel::<()>(1);
         let app = Arc::new(Mutex::new(AppInstance {
@@ -660,7 +660,7 @@ mod heartbeat_integration_tests {
     async fn heartbeat_with_observer_metrics() {
         use edge_runtime::interfaces::observe::MetricsAccumulator;
         let engine = edge_runtime::create_engine().expect("engine");
-        let instance_pre = load_handler_fixture(&engine);
+        let instance_pre = Some(load_handler_fixture(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
 
         // MetricsAccumulator starts empty — this still exercises the
@@ -2883,7 +2883,7 @@ mod tests {
     #[tokio::test]
     async fn evict_idle_skips_long_running() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let pre = fixture_pre(&engine);
+        let pre = Some(fixture_pre(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let app = Arc::new(Mutex::new(AppInstance {
             deployment_id: "d1".into(),
@@ -2915,7 +2915,7 @@ mod tests {
     #[tokio::test]
     async fn evict_idle_skips_no_dispatch() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let pre = fixture_pre(&engine);
+        let pre = Some(fixture_pre(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let app = Arc::new(Mutex::new(AppInstance {
             deployment_id: "d1".into(),
@@ -2947,7 +2947,7 @@ mod tests {
     #[tokio::test]
     async fn evict_idle_skips_no_last_request() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let pre = fixture_pre(&engine);
+        let pre = Some(fixture_pre(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let cfg = HandlerConfig {
             tenant_id: "t_test".into(),
@@ -3027,7 +3027,7 @@ mod tests {
     #[tokio::test]
     async fn reset_meters_after_subtracts_delta() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let pre = fixture_pre(&engine);
+        let pre = Some(fixture_pre(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
         meter.record_request();
@@ -3066,7 +3066,7 @@ mod tests {
     #[tokio::test]
     async fn reset_meters_after_deployment_mismatch_skips() {
         let engine = edge_runtime::create_engine().expect("engine");
-        let pre = fixture_pre(&engine);
+        let pre = Some(fixture_pre(&engine));
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
         meter.record_request();
