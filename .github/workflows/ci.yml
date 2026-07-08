@@ -368,7 +368,12 @@ jobs:
 
       - name: Diff canonical vs vendored WIT
         run: |
-          if ! diff -r wit edge-control-plane/internal/service/wit > wit-drift.txt; then
+          # Exclude embed.go — it's the Go embed shim, not part of
+          # the canonical WIT tree (which lives at the top-level
+          # wit/ directory). Without --exclude, the drift check
+          # would always fail because the vendored copy has one
+          # extra file.
+          if ! diff -r --exclude embed.go wit edge-control-plane/internal/service/wit > wit-drift.txt; then
             echo "::error::wit-drift-check failed: the vendored copy under edge-control-plane/internal/service/wit is out of sync with the canonical source under wit/. Re-sync via 'cp -R wit/. edge-control-plane/internal/service/wit/' and commit the result. Full diff:"
             cat wit-drift.txt
             exit 1

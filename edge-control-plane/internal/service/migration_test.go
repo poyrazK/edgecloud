@@ -1339,11 +1339,11 @@ func TestMigrationService_Migrate_RustInjectsWitBindgen(t *testing.T) {
 	}
 	// The synthetic Cargo.toml must pin wit-bindgen 0.45 to
 	// match the samples/hello shape.
-	cargoToml := fmt.Sprintf(`[package]
+	const cargoToml = `[package]
 name = "hello"
 version = "0.1.0"
 edition = "2021"
-`)
+`
 	if !strings.Contains(cargoToml, "[package]") {
 		t.Errorf("expected Cargo.toml scaffold; got: %s", cargoToml)
 	}
@@ -1767,7 +1767,7 @@ func TestMigrationService_Migrate_RustWrappedComponentLoads(t *testing.T) {
 		t.Fatalf("CreateTemp: %v", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 	if _, err := tmp.Write(wasmBytes); err != nil {
 		t.Fatalf("write tmp wasm: %v", err)
 	}

@@ -141,7 +141,7 @@ type MigrationService struct {
 	wasmToolsPath string
 	// cargoPath is the absolute path to a `cargo` binary capable of
 	// resolving the synthetic Cargo.toml the rust migration path
-	// writes into its temp dir. Same errror semantics as
+	// writes into its temp dir. Same error semantics as
 	// wasmToolsPath.
 	cargoPath string
 	// witDir is the absolute path to a directory containing the
