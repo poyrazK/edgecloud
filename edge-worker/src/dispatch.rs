@@ -721,6 +721,11 @@ impl HandlerDispatch {
             self.config.app_ctx.clone(),
             self.config.metrics_acc.clone(),
             self.config.socket_mode,
+            // Dormant today (the upstream resolve hook in
+            // docs/upstream-wasmtime-resolve-check.patch hasn't merged).
+            // Per-RuntimeState Clone (one per dispatch) shares this Arc,
+            // so a future mid-flight cache write reaches every clone.
+            Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         );
 
         // Clone the shared exit-code flag BEFORE moving `request_state`

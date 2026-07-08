@@ -1689,6 +1689,11 @@ impl Supervisor {
             app_ctx,
             metrics_acc,
             socket_mode,
+            // Dormant today (the upstream resolve hook in
+            // docs/upstream-wasmtime-resolve-check.patch hasn't merged).
+            // Per-RuntimeState clones share this Arc so future
+            // mid-flight cache writes reach every clone.
+            Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         );
 
         // Create a store with per-invocation state. The memory cap is plumbed

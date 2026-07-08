@@ -32,11 +32,12 @@
 //! the effective deny-all behavior of wasmtime's `SocketAddrCheck::default()`.
 //! See [`SocketEgressPolicy::from_env`] for the parsing rules.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wasmtime_wasi::sockets::SocketAddrUse;
 
@@ -159,6 +160,61 @@ impl std::fmt::Display for SocketEgressPolicy {
 /// 45.0.3 (verified at `wasmtime-wasi-45.0.3/src/ctx.rs:397-406`).
 type SocketAddrCheckFuture = Pin<Box<dyn Future<Output = bool> + Send + Sync>>;
 
+// ── Per-tenant hostname-pinning cache (issue #309 follow-up) ─────────────
+//
+// Backs the dormant `SocketEgressPolicy::HostnamePinned` mode. Each
+// entry records `(hostname → set of resolved IPs)` as observed by the
+// host impl `wasi:sockets/ip-name-lookup::resolve-addresses`.
+//
+// Today the cache is populated manually by tests only (the upstream
+// resolve-side closure hook documented in
+// `docs/upstream-wasmtime-resolve-check.patch` hasn't been merged yet).
+// When the upstream PR lands, the runtime's
+// `WasiSocketsCtxView::resolve_addresses` impl calls
+// `HostnamePinning::record` before the upstream resolver runs, and the
+// connect-side closure consults `HostnamePinning::contains`.
+//
+// `Arc<Mutex<...>>` so a fresh `RuntimeState` (per-request in the
+// dispatch path) shares one cache for the lifetime of the dispatch
+// instance. The `Mutex` is short-held (a single hashmap insert or
+// lookup) and the cache is read-mostly; contention is negligible.
+
+/// Per-`Network` resolution cache backing `SocketEgressPolicy::HostnamePinned`.
+#[derive(Debug, Default)]
+pub struct HostnamePinning {
+    by_hostname: Mutex<HashMap<String, HashSet<IpAddr>>>,
+}
+
+impl HostnamePinning {
+    /// Construct an empty cache. `Default::default()` is the same.
+    pub fn new() -> Self {
+        Self {
+            by_hostname: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record `hostname → {ips}` as observed by the resolve-side hook.
+    /// Replaces any prior entry for `hostname`. The `Mutex` is held
+    /// briefly — single insert.
+    pub fn record(&self, hostname: &str, ips: impl IntoIterator<Item = IpAddr>) {
+        let mut guard = self
+            .by_hostname
+            .lock()
+            .expect("HostnamePinning mutex poisoned");
+        let set: HashSet<IpAddr> = ips.into_iter().collect();
+        guard.insert(hostname.to_string(), set);
+    }
+
+    /// Snapshot the full cache (used by the connect-side closure and
+    /// by tests). Cheap clone of a `HashMap<String, HashSet<IpAddr>>`.
+    pub fn snapshot(&self) -> HashMap<String, HashSet<IpAddr>> {
+        self.by_hostname
+            .lock()
+            .expect("HostnamePinning mutex poisoned")
+            .clone()
+    }
+}
+
 /// Build the closure consumed by `WasiCtxBuilder::socket_addr_check`.
 ///
 /// The returned closure is `Send + Sync + 'static` so `WasiCtxBuilder`
@@ -172,11 +228,22 @@ type SocketAddrCheckFuture = Pin<Box<dyn Future<Output = bool> + Send + Sync>>;
 ///   with `tracing::warn!` in the same shape as
 ///   `EgressHttpHooks::send_request` (see `runtime.rs:339-343`); allows
 ///   are silent.
+///
+/// `hostname_pinning` is reserved for the dormant
+/// `SocketEgressPolicy::HostnamePinned` mode (commit 3 wires the
+/// consult path; commit 2 only plumbs the Arc through). The closure
+/// captures it so a future body change doesn't re-touch every call
+/// site, but does not read it yet. The cache stays empty until the
+/// upstream wasmtime-wasi patch in
+/// `docs/upstream-wasmtime-resolve-check.patch` merges.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn make_socket_addr_check(
     egress: Arc<EgressPolicy>,
     mode: SocketEgressPolicy,
     tenant_id: String,
+    hostname_pinning: Arc<HostnamePinning>,
 ) -> impl Fn(SocketAddr, SocketAddrUse) -> SocketAddrCheckFuture + Send + Sync + 'static {
+    let _hostname_pinning = hostname_pinning;
     move |addr: SocketAddr, use_: SocketAddrUse| -> SocketAddrCheckFuture {
         match (mode, use_) {
             // `BlockAll` — close every bind/connect/send path.
@@ -236,13 +303,21 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80)
     }
 
+    /// Empty per-`Network` resolution cache. Today (dormant) every
+    /// `make_socket_addr_check` test passes this; once the upstream
+    /// resolve-side closure hook ships, tests that want to exercise
+    /// `HostnamePinned` admit paths will populate it.
+    fn empty_cache() -> Arc<HostnamePinning> {
+        Arc::new(HostnamePinning::new())
+    }
+
     // ── mode dispatch: BlockAll ──────────────────────────────────────────
 
     #[tokio::test]
     async fn block_all_denies_all_use_variants() {
         let egress = Arc::new(EgressPolicy::allow_all());
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string(), empty_cache());
         for use_ in [
             SocketAddrUse::TcpBind,
             SocketAddrUse::TcpConnect,
@@ -261,7 +336,7 @@ mod tests {
     async fn allow_all_permits_all_use_variants() {
         let egress = Arc::new(EgressPolicy::allow_all());
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string(), empty_cache());
         for use_ in [
             SocketAddrUse::TcpBind,
             SocketAddrUse::TcpConnect,
@@ -280,7 +355,7 @@ mod tests {
         // Document this explicitly so reviewers don't mistake the design.
         let egress = Arc::new(EgressPolicy::allow_all());
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string(), empty_cache());
         let result = check(loopback_v4_addr(80), SocketAddrUse::TcpConnect).await;
         assert!(
             result,
@@ -294,7 +369,7 @@ mod tests {
     async fn allowlist_empty_allowlist_denies_connect_side() {
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string(), empty_cache());
         // Connect-side on a public IP: empty allowlist ⇒ deny.
         assert!(!check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(!check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
@@ -307,7 +382,7 @@ mod tests {
         // raw-socket egress to non-hard-denied IPs.
         let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string(), empty_cache());
         assert!(check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
         assert!(check(public_v4_addr(80), SocketAddrUse::UdpOutgoingDatagram).await);
@@ -319,7 +394,7 @@ mod tests {
         // allowlist. Same posture as the HTTP layer.
         let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string(), empty_cache());
         assert!(!check(loopback_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(!check(metadata_addr(), SocketAddrUse::TcpConnect).await);
     }
@@ -329,7 +404,7 @@ mod tests {
         // User decision: bind is local-only, allow always.
         let egress = Arc::new(EgressPolicy::new(vec![]));
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string(), empty_cache());
         assert!(check(loopback_v4_addr(0), SocketAddrUse::TcpBind).await);
         assert!(check(loopback_v4_addr(0), SocketAddrUse::UdpBind).await);
     }
@@ -339,7 +414,7 @@ mod tests {
         // Sanity: when mode is BlockAll, even binds are denied.
         let egress = Arc::new(EgressPolicy::allow_all());
         let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string());
+            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string(), empty_cache());
         assert!(!check(public_v4_addr(0), SocketAddrUse::TcpBind).await);
         assert!(!check(public_v4_addr(0), SocketAddrUse::UdpBind).await);
     }
