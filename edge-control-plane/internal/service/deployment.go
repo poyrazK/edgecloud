@@ -222,14 +222,65 @@ func (e *PublishError) Unwrap() error {
 	return e.Err
 }
 
+// Package-level interfaces for testability. The concrete
+// *repository.* types satisfy these interfaces structurally.
+
+// deploymentRepoInterface is the subset of *repository.DeploymentRepository
+// methods used by DeploymentService.
+type deploymentRepoInterface interface {
+	WithTx(tx *sqlx.Tx) *repository.DeploymentRepository
+	GetByID(ctx context.Context, id string) (*domain.Deployment, error)
+	ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
+	CountByApp(ctx context.Context, tenantID, appName string) (int, error)
+	ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error)
+	Create(ctx context.Context, deployment *domain.Deployment) error
+	DeleteByID(ctx context.Context, id string) error
+}
+
+// deployActiveRepoInterface is the subset of *repository.ActiveDeploymentRepository
+// methods used by DeploymentService (distinct from worker.go's
+// activeRepoInterface which targets the stability-window evaluator).
+type deployActiveRepoInterface interface {
+	WithTx(tx *sqlx.Tx) *repository.ActiveDeploymentRepository
+	Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+	Set(ctx context.Context, ad *domain.ActiveDeployment) error
+	ClearStableSince(ctx context.Context, tenantID, appName string) error
+	ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
+	AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error
+	AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error
+	AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error
+}
+
+// tenantRepoForDeploymentSvc is the subset of *repository.TenantRepository
+// methods used by DeploymentService.
+type tenantRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.TenantRepository
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
+// quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
+// methods used by DeploymentService.
+type quotaRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
+	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+}
+
+// appEnvRepoForDeploymentSvc is the subset of *repository.AppEnvRepository
+// methods used by DeploymentService.
+type appEnvRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.AppEnvRepository
+	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
-	deploymentRepo *repository.DeploymentRepository
-	activeRepo     *repository.ActiveDeploymentRepository
-	appEnvRepo     *repository.AppEnvRepository
-	quotaRepo      *repository.QuotaRepository
-	tenantRepo     *repository.TenantRepository
+	deploymentRepo deploymentRepoInterface
+	activeRepo     deployActiveRepoInterface
+	appEnvRepo     appEnvRepoForDeploymentSvc
+	quotaRepo      quotaRepoForDeploymentSvc
+	tenantRepo     tenantRepoForDeploymentSvc
 	artifactStore  storage.ArtifactStore
 	publisher      nats.Publisher
 	appSvc         *AppService

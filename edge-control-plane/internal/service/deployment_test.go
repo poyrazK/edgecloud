@@ -19,6 +19,64 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
+// Mock types for testing non-tx deployment methods.
+
+type mockDeployDeploymentRepo struct {
+	getByIDFn            func(ctx context.Context, id string) (*domain.Deployment, error)
+	listByAppFn          func(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
+	countByAppFn         func(ctx context.Context, tenantID, appName string) (int, error)
+	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error)
+	createFn             func(ctx context.Context, deployment *domain.Deployment) error
+	deleteByIDFn         func(ctx context.Context, id string) error
+}
+
+func (m *mockDeployDeploymentRepo) WithTx(tx *sqlx.Tx) *repository.DeploymentRepository { return nil }
+func (m *mockDeployDeploymentRepo) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
+	if m.getByIDFn != nil { return m.getByIDFn(ctx, id) }
+	return nil, nil
+}
+func (m *mockDeployDeploymentRepo) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
+	if m.listByAppFn != nil { return m.listByAppFn(ctx, tenantID, appName) }
+	return nil, nil
+}
+func (m *mockDeployDeploymentRepo) CountByApp(ctx context.Context, tenantID, appName string) (int, error) {
+	if m.countByAppFn != nil { return m.countByAppFn(ctx, tenantID, appName) }
+	return 0, nil
+}
+func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+	if m.listByAppPaginatedFn != nil { return m.listByAppPaginatedFn(ctx, tenantID, appName, limit, offset) }
+	return nil, nil
+}
+func (m *mockDeployDeploymentRepo) Create(ctx context.Context, deployment *domain.Deployment) error {
+	if m.createFn != nil { return m.createFn(ctx, deployment) }
+	return nil
+}
+func (m *mockDeployDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
+	if m.deleteByIDFn != nil { return m.deleteByIDFn(ctx, id) }
+	return nil
+}
+
+type mockDeployActiveRepo struct {
+	getFn          func(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
+	listByTenantFn func(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
+}
+
+func (m *mockDeployActiveRepo) WithTx(tx *sqlx.Tx) *repository.ActiveDeploymentRepository { return nil }
+func (m *mockDeployActiveRepo) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
+	if m.getFn != nil { return m.getFn(ctx, tenantID, appName) }
+	return nil, nil
+}
+func (m *mockDeployActiveRepo) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) { return nil, nil }
+func (m *mockDeployActiveRepo) Set(ctx context.Context, ad *domain.ActiveDeployment) error { return nil }
+func (m *mockDeployActiveRepo) ClearStableSince(ctx context.Context, tenantID, appName string) error { return nil }
+func (m *mockDeployActiveRepo) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
+	if m.listByTenantFn != nil { return m.listByTenantFn(ctx, tenantID) }
+	return nil, nil
+}
+func (m *mockDeployActiveRepo) AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
+func (m *mockDeployActiveRepo) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
+func (m *mockDeployActiveRepo) AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error { return nil }
+
 // newDeploymentMockDB wires a sqlmock-backed *sqlx.DB for deployment tests.
 func newDeploymentMockDB(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
 	t.Helper()
@@ -518,5 +576,236 @@ func TestDeploy_PersistsSignedAttestation(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+func TestGetDeployment_FoundAndTenantMatches(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_test"}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	d, err := svc.GetDeployment(context.Background(), "t_test", "d_1")
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if d == nil || d.ID != "d_1" {
+		t.Errorf("unexpected deployment: %+v", d)
+	}
+}
+
+func TestGetDeployment_TenantMismatch(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_other"}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	d, err := svc.GetDeployment(context.Background(), "t_test", "d_1")
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if d != nil {
+		t.Errorf("expected nil for tenant mismatch, got %+v", d)
+	}
+}
+
+func TestGetDeployment_NotFound(t *testing.T) {
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{}}
+	d, err := svc.GetDeployment(context.Background(), "t_test", "d_missing")
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if d != nil {
+		t.Errorf("expected nil, got %+v", d)
+	}
+}
+
+func TestListDeployments_ReturnsRows(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		listByAppFn: func(_ context.Context, tenantID, appName string) ([]domain.Deployment, error) {
+			return []domain.Deployment{
+				{ID: "d_1", TenantID: tenantID, AppName: appName},
+				{ID: "d_2", TenantID: tenantID, AppName: appName},
+			}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	list, err := svc.ListDeployments(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("ListDeployments: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("got %d, want 2", len(list))
+	}
+}
+
+func TestListDeploymentsPaginated_AppliesDefaults(t *testing.T) {
+	var capturedLimit, capturedOffset int
+	repo := &mockDeployDeploymentRepo{
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, limit, offset int) ([]domain.Deployment, error) {
+			capturedLimit, capturedOffset = limit, offset
+			return nil, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 0, -1)
+	if capturedLimit != 20 {
+		t.Errorf("limit = %d, want 20", capturedLimit)
+	}
+	if capturedOffset != 0 {
+		t.Errorf("offset = %d, want 0", capturedOffset)
+	}
+}
+
+func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
+	var capturedLimit int
+	repo := &mockDeployDeploymentRepo{
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, limit, offset int) ([]domain.Deployment, error) {
+			capturedLimit = limit
+			return nil, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 200, 0)
+	if capturedLimit != 100 {
+		t.Errorf("limit = %d, want 100", capturedLimit)
+	}
+}
+
+func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			return 42, nil
+		},
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _, _ int) ([]domain.Deployment, error) {
+			return []domain.Deployment{{ID: "d_1"}}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	list, total, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, 0)
+	if err != nil {
+		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
+	}
+	if total != 42 {
+		t.Errorf("total = %d, want 42", total)
+	}
+	if len(list) != 1 {
+		t.Errorf("len(list) = %d, want 1", len(list))
+	}
+}
+
+func TestGetActiveDeployment_Found(t *testing.T) {
+	deploymentRepo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_test"}, nil
+		},
+	}
+	activeRepo := &mockDeployActiveRepo{
+		getFn: func(_ context.Context, _, _ string) (*domain.ActiveDeployment, error) {
+			return &domain.ActiveDeployment{DeploymentID: "d_1"}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: deploymentRepo, activeRepo: activeRepo}
+	d, err := svc.GetActiveDeployment(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("GetActiveDeployment: %v", err)
+	}
+	if d == nil || d.ID != "d_1" {
+		t.Errorf("unexpected deployment: %+v", d)
+	}
+}
+
+func TestGetActiveDeployment_NoActiveRow(t *testing.T) {
+	svc := &DeploymentService{activeRepo: &mockDeployActiveRepo{}}
+	d, err := svc.GetActiveDeployment(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("GetActiveDeployment: %v", err)
+	}
+	if d != nil {
+		t.Errorf("expected nil, got %+v", d)
+	}
+}
+
+func TestGetArtifact_FoundAndTenantMatches(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_test", AppName: "myapp"}, nil
+		},
+	}
+	// Use a real filesystem store for the artifact read.
+	tmpDir := t.TempDir()
+	store := storage.NewFSArtifactStore(tmpDir)
+	path, _ := store.Path("t_test", "myapp", "d_1")
+	if err := os.MkdirAll(path[:len(path)-len("/d_1.wasm")], 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("wasm bytes"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	svc := &DeploymentService{deploymentRepo: repo, artifactStore: store}
+	rc, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_1", "wasm")
+	if err != nil {
+		t.Fatalf("GetArtifact: %v", err)
+	}
+	defer rc.Close()
+}
+
+func TestGetArtifact_NotFound(t *testing.T) {
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{}}
+	_, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_missing", "wasm")
+	if err == nil {
+		t.Fatal("expected error for missing deployment")
+	}
+}
+
+func TestGetArtifact_TenantMismatch(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_other", AppName: "myapp"}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	_, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_1", "wasm")
+	if err == nil {
+		t.Fatal("expected error for tenant mismatch")
+	}
+}
+
+func TestIsValidAppName(t *testing.T) {
+	if !IsValidAppName("myapp") {
+		t.Error("expected valid")
+	}
+	if !IsValidAppName("a") {
+		t.Error("expected valid for single char")
+	}
+	if IsValidAppName("") {
+		t.Error("expected invalid for empty")
+	}
+	if IsValidAppName("../evil") {
+		t.Error("expected invalid for path traversal")
+	}
+	if IsValidAppName("a/b") {
+		t.Error("expected invalid for slash")
+	}
+}
+
+func TestIsValidRegion(t *testing.T) {
+	if !IsValidRegion("us-east-1") {
+		t.Error("expected valid")
+	}
+	if IsValidRegion("") {
+		t.Error("expected invalid for empty")
+	}
+	if IsValidRegion("UPPER") {
+		t.Error("expected invalid for uppercase")
+	}
+	if IsValidRegion("has space") {
+		t.Error("expected invalid for space")
+	}
+	if IsValidRegion("has.dot") {
+		t.Error("expected invalid for dot")
 	}
 }
