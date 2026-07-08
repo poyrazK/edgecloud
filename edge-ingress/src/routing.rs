@@ -54,6 +54,17 @@ pub struct RouteEntry {
     pub last_seen: Instant,
 }
 
+impl RouteEntry {
+    /// Stable Caddy route ID usable in `/id/...` admin API paths.
+    /// Uses `:` separator so the entire ID is a single URL path segment.
+    pub fn route_id(&self) -> String {
+        match &self.deployment_id {
+            Some(did) => format!("{}:{}:{}", self.tenant_id, self.app_name, did),
+            None => format!("{}:{}", self.tenant_id, self.app_name),
+        }
+    }
+}
+
 /// Binding from a custom FQDN to a (tenant, app) tuple. Carries NO
 /// upstream info — the renderer looks that up from `by_app` at render
 /// time. This decouples heartbeat-driven upstream churn from the slower
@@ -63,6 +74,13 @@ pub struct FqdnBinding {
     pub tenant_id: String,
     pub app_name: String,
     pub fqdn: String,
+}
+
+impl FqdnBinding {
+    /// Stable Caddy route ID. The FQDN string is globally unique.
+    pub fn route_id(&self) -> String {
+        self.fqdn.clone()
+    }
 }
 
 /// Domain row shape matching the Go control plane's `domain.Domain`.

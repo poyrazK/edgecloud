@@ -20,7 +20,7 @@ use crate::caddy::{render_routes, CaddyClient};
 use crate::config::Config;
 use crate::messages::HeartbeatMessage;
 use crate::ratelimit::SharedRateLimitCache;
-use crate::routing::{RouteEntry, RoutingTable};
+use crate::routing::{FqdnBinding, RouteEntry, RoutingTable};
 use crate::traffic::{spawn_fetcher, SharedCache};
 use reqwest::Client;
 
@@ -87,12 +87,14 @@ pub async fn run(
     // Push the initial empty config so Caddy's admin API has a known state
     // before the first heartbeat lands. (Otherwise Caddy might still be
     // serving its default config, e.g. `:2019` admin only.)
+    let mut boot_previous: Option<PreviousState> = None;
     if let Err(e) = push_now(
         &cfg,
         &table,
         &caddy,
         &traffic_cache_for_push,
         &rate_limit_cache_for_push,
+        &mut boot_previous,
     )
     .await
     {
@@ -216,6 +218,13 @@ pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> boo
     changed
 }
 
+/// Snapshot of the routing table and FQDN bindings from the last
+/// successful Caddy config push. Used to compute incremental diffs.
+struct PreviousState {
+    route_entries: Vec<RouteEntry>,
+    fqdn_bindings: Vec<FqdnBinding>,
+}
+
 fn spawn_renderer(
     cfg: Config,
     table: Arc<RoutingTable>,
@@ -225,18 +234,24 @@ fn spawn_renderer(
     notify: Arc<Notify>,
 ) {
     tokio::spawn(async move {
+        let mut previous: Option<PreviousState> = None;
         loop {
             notify.notified().await;
             // Coalesce bursty notifications: sleep the debounce, then push.
-            // If more heartbeats arrive during the debounce, `Notify` will
-            // hold a permit and the next `notified().await` returns
-            // immediately, so we push again — with one extra reload per
-            // burst. That's acceptable for v1; if it becomes a problem,
-            // switch to a trailing-edge debounce using a watch channel.
             sleep(Duration::from_millis(cfg.refresh_debounce_ms)).await;
-            if let Err(e) = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache).await
+            if let Err(e) = push_now(
+                &cfg,
+                &table,
+                &caddy,
+                &traffic_cache,
+                &rate_limit_cache,
+                &mut previous,
+            )
+            .await
             {
                 error!(err = %e, "Caddy reload failed");
+                // On error reset previous state so the next push is a full reload.
+                previous = None;
             } else {
                 debug!("Caddy config reloaded");
             }
@@ -267,38 +282,244 @@ async fn push_now(
     caddy: &CaddyClient,
     traffic_cache: &SharedCache,
     rate_limit_cache: &SharedRateLimitCache,
+    previous: &mut Option<PreviousState>,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
     let fqdns = table.fqdn_snapshot().await;
-    let traffic_cache = traffic_cache.read().await;
-    let rate_limit_cache = rate_limit_cache.read().await;
+    let traffic_cache_guard = traffic_cache.read().await;
+    let rate_limit_cache_guard = rate_limit_cache.read().await;
 
     // Set gauges from current state.
     metrics::gauge!("ingress.routes.active").set(snap.len() as f64);
     metrics::gauge!("ingress.fqdns.active").set(fqdns.len() as f64);
 
-    // Time the Caddyfile-JSON rendering.
-    let render_start = std::time::Instant::now();
-    let json = render_routes(&snap, &fqdns, cfg, &traffic_cache, &rate_limit_cache);
-    let render_dur = render_start.elapsed();
-    metrics::histogram!("ingress.caddy.render_duration_seconds").record(render_dur.as_secs_f64());
+    match previous.take() {
+        None => {
+            // Boot push — full config POST /load.
+            let render_start = std::time::Instant::now();
+            let json = render_routes(
+                &snap,
+                &fqdns,
+                cfg,
+                &traffic_cache_guard,
+                &rate_limit_cache_guard,
+            );
+            let render_dur = render_start.elapsed();
+            metrics::histogram!("ingress.caddy.render_duration_seconds")
+                .record(render_dur.as_secs_f64());
 
-    // Time the Caddy POST /load.
-    let load_start = std::time::Instant::now();
-    let result = caddy.load_config(&json).await;
-    let load_dur = load_start.elapsed();
-    metrics::histogram!("ingress.caddy.reload_duration_seconds").record(load_dur.as_secs_f64());
+            let load_start = std::time::Instant::now();
+            let result = caddy.load_config(&json).await;
+            let load_dur = load_start.elapsed();
+            metrics::histogram!("ingress.caddy.reload_duration_seconds")
+                .record(load_dur.as_secs_f64());
 
-    match &result {
-        Ok(()) => {
-            metrics::counter!("ingress.caddy.reload_total", "status" => "success").increment(1);
+            match &result {
+                Ok(()) => {
+                    metrics::counter!("ingress.caddy.reload_total", "status" => "success")
+                        .increment(1);
+                    *previous = Some(PreviousState {
+                        route_entries: snap,
+                        fqdn_bindings: fqdns,
+                    });
+                }
+                Err(_) => {
+                    metrics::counter!("ingress.caddy.reload_total", "status" => "failure")
+                        .increment(1);
+                }
+            }
+            result
         }
-        Err(_) => {
-            metrics::counter!("ingress.caddy.reload_total", "status" => "failure").increment(1);
+        Some(prev) => {
+            // Incremental — compute diffs and apply per-route patches.
+            let (added, removed_ids, changed) =
+                crate::caddy::diff_routes(&prev.route_entries, &snap);
+            let (fqdn_added, fqdn_removed) = crate::caddy::diff_fqdns(&prev.fqdn_bindings, &fqdns);
+            let total_changes = added.len()
+                + removed_ids.len()
+                + changed.len()
+                + fqdn_added.len()
+                + fqdn_removed.len();
+            let total = snap.len().max(prev.route_entries.len()).max(1);
+
+            // Heuristic: if >20% of routes changed, fall back to full reload.
+            if total_changes * 5 > total {
+                let render_start = std::time::Instant::now();
+                let json = render_routes(
+                    &snap,
+                    &fqdns,
+                    cfg,
+                    &traffic_cache_guard,
+                    &rate_limit_cache_guard,
+                );
+                let render_dur = render_start.elapsed();
+                metrics::histogram!("ingress.caddy.render_duration_seconds")
+                    .record(render_dur.as_secs_f64());
+
+                let load_start = std::time::Instant::now();
+                let result = caddy.load_config(&json).await;
+                let load_dur = load_start.elapsed();
+                metrics::histogram!("ingress.caddy.reload_duration_seconds")
+                    .record(load_dur.as_secs_f64());
+
+                match &result {
+                    Ok(()) => {
+                        metrics::counter!("ingress.caddy.reload_total", "status" => "success")
+                            .increment(1);
+                        *previous = Some(PreviousState {
+                            route_entries: snap,
+                            fqdn_bindings: fqdns,
+                        });
+                    }
+                    Err(_) => {
+                        metrics::counter!("ingress.caddy.reload_total", "status" => "failure")
+                            .increment(1);
+                    }
+                }
+                return result;
+            }
+
+            // Apply per-route diffs.
+            let mut ops_ok = true;
+            let load_start = std::time::Instant::now();
+
+            // Delete removed routes.
+            for id in &removed_ids {
+                if let Err(e) = caddy.delete_route(id).await {
+                    tracing::warn!(err = %e, route_id = %id, "failed to delete route");
+                    ops_ok = false;
+                    break;
+                }
+            }
+
+            // Delete removed FQDN routes.
+            if ops_ok {
+                for fqdn in &fqdn_removed {
+                    if let Err(e) = caddy.delete_route(fqdn).await {
+                        tracing::warn!(err = %e, fqdn = %fqdn, "failed to delete FQDN route");
+                        ops_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            // Upsert added + changed routes.
+            if ops_ok {
+                for (entry, _) in added.iter().chain(changed.iter()) {
+                    let route = render_single_route(
+                        entry,
+                        cfg,
+                        &traffic_cache_guard,
+                        &rate_limit_cache_guard,
+                    );
+                    if let Err(e) = caddy.upsert_route(&route).await {
+                        tracing::warn!(
+                            err = %e, tenant = %entry.tenant_id, app = %entry.app_name,
+                            "failed to upsert route"
+                        );
+                        ops_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            // Upsert added FQDN routes.
+            if ops_ok {
+                for fqdn_str in &fqdn_added {
+                    // Find the FqdnBinding by fqdn.
+                    if let Some(binding) = fqdns.iter().find(|b| b.fqdn == *fqdn_str) {
+                        let route = render_fqdn_route(binding, &snap, cfg, &rate_limit_cache_guard);
+                        if let Some(route) = route {
+                            if let Err(e) = caddy.upsert_route(&route).await {
+                                tracing::warn!(err = %e, fqdn = %fqdn_str, "failed to upsert FQDN route");
+                                ops_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let load_dur = load_start.elapsed();
+            metrics::histogram!("ingress.caddy.reload_duration_seconds")
+                .record(load_dur.as_secs_f64());
+
+            if ops_ok {
+                metrics::counter!("ingress.caddy.reload_total", "status" => "success").increment(1);
+                *previous = Some(PreviousState {
+                    route_entries: snap,
+                    fqdn_bindings: fqdns,
+                });
+                Ok(())
+            } else {
+                metrics::counter!("ingress.caddy.reload_total", "status" => "failure").increment(1);
+                // Reset previous on error so next push does a full reload.
+                Err(anyhow::anyhow!("incremental push failed"))
+            }
         }
     }
+}
 
-    result
+/// Render a single route for a (tenant, app) group.
+fn render_single_route(
+    entry: &RouteEntry,
+    _cfg: &Config,
+    _traffic_cache: &crate::traffic::TrafficSplitCache,
+    _rate_limit_cache: &crate::ratelimit::RateLimitCache,
+) -> serde_json::Value {
+    let host = crate::config::ingress_host(&entry.tenant_id, &entry.app_name);
+    let dial = format!("{}:{}", entry.worker_addr, entry.port);
+    let mut handle_chain = Vec::new();
+    handle_chain.push(serde_json::json!({
+        "handler": "reverse_proxy",
+        "upstreams": [{"dial": dial}],
+        "health_checks": {
+            "active": {"uri": "/", "expect_status": 2}
+        }
+    }));
+    serde_json::json!({
+        "@id": host,
+        "match": [{"host": [host]}],
+        "handle": [{
+            "handler": "subroute",
+            "routes": [{
+                "handle": handle_chain,
+            }]
+        }],
+        "terminal": true
+    })
+}
+
+/// Render a single FQDN route.
+fn render_fqdn_route(
+    binding: &FqdnBinding,
+    entries: &[RouteEntry],
+    _cfg: &Config,
+    _rate_limit_cache: &crate::ratelimit::RateLimitCache,
+) -> Option<serde_json::Value> {
+    let upstream = entries
+        .iter()
+        .find(|e| e.tenant_id == binding.tenant_id && e.app_name == binding.app_name)?;
+    let dial = format!("{}:{}", upstream.worker_addr, upstream.port);
+    let handle_chain = vec![serde_json::json!({
+        "handler": "reverse_proxy",
+        "upstreams": [{"dial": dial}],
+        "health_checks": {
+            "active": {"uri": "/", "expect_status": 2}
+        }
+    })];
+    Some(serde_json::json!({
+        "@id": binding.fqdn,
+        "match": [{"host": [binding.fqdn]}],
+        "handle": [{
+            "handler": "subroute",
+            "routes": [{
+                "handle": handle_chain,
+            }]
+        }],
+        "terminal": true,
+        "tls": {"on_demand": {}}
+    }))
 }
 
 #[cfg(test)]
@@ -632,7 +853,7 @@ mod tests {
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
 
-        push_now(&cfg, &table, &caddy, &cache, &rl_cache)
+        push_now(&cfg, &table, &caddy, &cache, &rl_cache, &mut None)
             .await
             .expect("push_now should succeed");
     }
@@ -656,7 +877,7 @@ mod tests {
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
 
-        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache)
+        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache, &mut None)
             .await
             .expect_err("push_now should fail with 502");
         assert!(
