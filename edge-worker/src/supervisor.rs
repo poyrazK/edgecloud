@@ -574,6 +574,139 @@ mod heartbeat_integration_tests {
         // This is fine — we're testing the diff+orchestration, not start_app.
         let _ = sup.handle_task_message(msg).await;
     }
+
+    // ── stop_app tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stop_app_not_found() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+        let result = sup.stop_app("nonexistent", "ghost").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stop_app_long_running_removes_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let (oneshot_tx, _) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18000,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: Some(oneshot_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state.clone());
+        let result = sup.stop_app("t_test", "my-app").await;
+        assert!(result.is_ok());
+        assert!(state.read().await.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_app_handler_with_broadcast_sends_signal() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<()>(1);
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: Some(tx),
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state.clone());
+        let result = sup.stop_app("t_test", "my-app").await;
+        assert!(result.is_ok());
+        assert!(state.read().await.apps.is_empty());
+    }
+
+    // ── build_heartbeat with observer_metrics ──────────────────────
+
+    #[tokio::test]
+    async fn heartbeat_with_observer_metrics() {
+        use edge_runtime::interfaces::observe::MetricsAccumulator;
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = load_handler_fixture(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        // MetricsAccumulator starts empty — this still exercises the
+        // Some(acc) branch in build_heartbeat.
+        let acc = MetricsAccumulator::new();
+
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        meter.record_outbound_bytes(512);
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18002,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: Some(Arc::new(acc)),
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+
+        let status = hb.apps.get("my-app").expect("app present");
+        assert_eq!(status.request_count, 2);
+        assert_eq!(status.outbound_bytes, 512);
+
+        // With an empty accumulator, observer_metrics is an empty vec
+        assert!(
+            status.observer_metrics.is_empty(),
+            "empty accumulator should produce empty observer_metrics"
+        );
+    }
 }
 
 // ── extracted pure functions tests ──────────────────────────────────────
@@ -733,25 +866,11 @@ impl Supervisor {
         let has_changes = !diff.apps_to_stop.is_empty() || !diff.apps_to_start.is_empty();
 
         for app_name in &diff.apps_to_stop {
-            if let Err(e) = self.stop_app(&tenant_id, app_name).await {
-                tracing::error!(
-                    tenant_id = %tenant_id,
-                    app_name,
-                    err = %e,
-                    "failed to stop app"
-                );
-            }
+            self.stop_app(&tenant_id, app_name).await?;
         }
 
         for (app_name, spec) in &diff.apps_to_start {
-            if let Err(e) = self.start_app(app_name, spec, &tenant_id).await {
-                tracing::error!(
-                    tenant_id = %tenant_id,
-                    app_name,
-                    err = %e,
-                    "failed to start app"
-                );
-            }
+            self.start_app(app_name, spec, &tenant_id).await?;
         }
 
         if has_changes {
@@ -2677,5 +2796,327 @@ mod tests {
     fn allowlist_empty_denies_all() {
         let policy = allowlist_to_egress_policy(&Some(vec![]));
         assert!(policy.check("https://example.com").is_err());
+    }
+
+    fn fixture_pre(
+        engine: &wasmtime::Engine,
+    ) -> wasmtime::component::InstancePre<edge_runtime::RuntimeState> {
+        let paths = [
+            "tests/fixtures/handler.wasm",
+            "edge-worker/tests/fixtures/handler.wasm",
+        ];
+        let wasm_path = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("handler.wasm fixture not found");
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let component = wasmtime::component::Component::from_binary(engine, &bytes)
+            .expect("compile handler component");
+        let linker = edge_runtime::create_component_linker_handler(engine).expect("create linker");
+        linker.instantiate_pre(&component).expect("instantiate_pre")
+    }
+
+    fn make_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
+        let jwt = crate::auth::WorkerJwtSigner::new(
+            String::new(),
+            None,
+            String::new(),
+            "w_test",
+            "fra",
+            "t_test",
+        );
+        let nats = Arc::new(crate::nats::tests::MockNatsClient::new());
+        Arc::new(Supervisor {
+            config: Config {
+                worker_id: "w_test".to_string(),
+                region: "fra".to_string(),
+                worker_addr: "127.0.0.1:9000".to_string(),
+                worker_tenant_id: "t_test".to_string(),
+                nats_url: String::new(),
+                control_plane_url: "http://localhost:0".to_string(),
+                cache_dir: std::path::PathBuf::from("/tmp"),
+                heartbeat_interval_secs: 30,
+                health_check_timeout_secs: 30,
+                worker_sync_threshold_secs: 30,
+                port_cooldown_secs: 1,
+                starting_port: 10000,
+                max_memory_mb: 256,
+                epoch_tick_ms: 10,
+                epoch_deadline_ticks: 100,
+                consumer_name: "test".to_string(),
+                queue_group: String::new(),
+                task_stream_replicas: 1,
+                worker_jwt_secret: String::new(),
+                worker_jwt_kid: None,
+                worker_jwt_issuer: String::new(),
+                worker_bootstrap_secret: String::new(),
+                handler_request_budget_ms: 1000,
+                handler_max_request_body_bytes: 0,
+                tls_cert_path: None,
+                tls_key_path: None,
+                socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+                hostname_pinning_enabled: false,
+                standby_pool_size: 1,
+                require_signature: false,
+                signing_keyring: None,
+                signing_keyring_path: None,
+            },
+            state,
+            downloader: Arc::new(Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                jwt.clone(),
+                None,
+            )),
+            port_pool: Arc::new(Mutex::new(PortPool::new(10000, 60))),
+            nats: nats as Arc<dyn NatsClient>,
+            log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
+            jwt_signer: jwt,
+            http: reqwest::Client::new(),
+            engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+        })
+    }
+
+    // ── evict_idle_apps tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn evict_idle_skips_long_running() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = fixture_pre(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19000,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        sup.evict_idle_apps(Duration::from_secs(1)).await;
+        assert_eq!(state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evict_idle_skips_no_dispatch() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = fixture_pre(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        sup.evict_idle_apps(Duration::from_secs(1)).await;
+        assert_eq!(state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evict_idle_skips_no_last_request() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = fixture_pre(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let cfg = HandlerConfig {
+            tenant_id: "t_test".into(),
+            egress: Arc::new(EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "my-app".into(),
+                tenant_id: "t_test".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            env: HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+        let dispatch = Arc::new(
+            HandlerDispatch::new(
+                19002,
+                1000,
+                10,
+                cfg,
+                None,
+                Arc::new(Downloader::new(
+                    "http://localhost".to_string(),
+                    std::path::PathBuf::from("/tmp"),
+                    crate::auth::WorkerJwtSigner::new(
+                        String::new(),
+                        None,
+                        String::new(),
+                        "w",
+                        "r",
+                        "t",
+                    ),
+                    None,
+                )),
+                "d1".into(),
+                Arc::new(StandbyPool::new(1).expect("pool")),
+                state.clone(),
+            )
+            .expect("HandlerDispatch::new"),
+        );
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19002,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: Some(dispatch),
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        sup.evict_idle_apps(Duration::from_secs(1)).await;
+        assert_eq!(state.read().await.apps.len(), 1);
+    }
+
+    // ── reset_meters_after tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reset_meters_after_subtracts_delta() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = fixture_pre(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        meter.record_outbound_bytes(100);
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19003,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(snap.request_count, 0);
+        assert_eq!(snap.outbound_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_meters_after_deployment_mismatch_skips() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = fixture_pre(&engine);
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(), // initial deployment
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19004,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+
+        // Build heartbeat with current state (deployment_id="d1")
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+
+        // Now simulate a new deployment replacing the app (deployment_id changes)
+        // between build_heartbeat and reset_meters_after
+        {
+            let mut guard = state.write().await;
+            let existing = guard
+                .apps
+                .get_mut(&("t_test".into(), "my-app".into()))
+                .unwrap();
+            let mut inst = existing.lock().await;
+            inst.deployment_id = "d2".into(); // deployment changed!
+        }
+
+        // Reset with the stale heartbeat (which has deployment_id="d1")
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(
+            snap.request_count, 2,
+            "meter should not be reset due to deployment_id mismatch"
+        );
     }
 }
