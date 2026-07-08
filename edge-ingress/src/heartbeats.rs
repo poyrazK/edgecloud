@@ -141,11 +141,25 @@ pub async fn apply_heartbeat(table: &RoutingTable, hb: &HeartbeatMessage) -> boo
         warn!("heartbeat has no worker_addr; cannot route any apps from it");
         return false;
     }
+
+    // Empty apps map signals a final heartbeat (worker shutting down).
+    // Remove all routes for this worker immediately instead of waiting
+    // for the stale pruner.
+    if hb.apps.is_empty() {
+        let removed = table.remove_worker(worker_addr).await;
+        if !removed.is_empty() {
+            warn!(
+                worker_addr = %worker_addr,
+                ?removed,
+                "worker sent empty heartbeat — removed all routes"
+            );
+            return true;
+        }
+        return false;
+    }
+
     let mut changed = false;
     for (key, app) in &hb.apps {
-        // Heartbeat key is now "app_name:deployment_id" to support canary
-        // (multiple concurrent deployments of the same app). Split to recover
-        // the two parts. AppStatus.deployment_id must match the key suffix.
         let (app_name, deployment_id) = match key.split_once(':') {
             Some((name, id)) => (name, Some(id)),
             None => (key.as_str(), None),
@@ -397,6 +411,51 @@ mod tests {
         assert!(changed);
         // The "crashed" app causes an upsert with that status, which
         // the routing table interprets as "remove".
+        assert_eq!(table.len().await, 0);
+    }
+
+    /// "draining" status keeps the route with weight=0.
+    #[tokio::test]
+    async fn apply_heartbeat_with_draining_status() {
+        let table = Arc::new(RoutingTable::new());
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "draining", 8081));
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(changed);
+        let snap = table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].weight, 0, "draining apps get weight=0");
+        assert_eq!(snap[0].app_name, "api");
+        assert_eq!(snap[0].port, 8081);
+    }
+
+    /// Empty apps map removes all routes for that worker.
+    #[tokio::test]
+    async fn apply_heartbeat_empty_apps_removes_worker_routes() {
+        let table = Arc::new(RoutingTable::new());
+        // First insert a route via normal heartbeat.
+        let mut apps = HashMap::new();
+        apps.insert("api".to_string(), app_status("t_a", "running", 8081));
+        let hb1 = hb_with_addr("203.0.113.10", apps);
+        assert!(apply_heartbeat(&table, &hb1).await);
+        assert_eq!(table.len().await, 1);
+
+        // Empty heartbeat from same worker removes all routes.
+        let hb2 = hb_with_addr("203.0.113.10", HashMap::new());
+        let changed = apply_heartbeat(&table, &hb2).await;
+        assert!(changed);
+        assert_eq!(table.len().await, 0);
+    }
+
+    /// Unknown worker with empty apps is a no-op.
+    #[tokio::test]
+    async fn apply_heartbeat_empty_apps_unknown_worker_noop() {
+        let table = Arc::new(RoutingTable::new());
+        let hb = hb_with_addr("203.0.113.10", HashMap::new());
+        let changed = apply_heartbeat(&table, &hb).await;
+        assert!(!changed);
         assert_eq!(table.len().await, 0);
     }
 
