@@ -74,6 +74,7 @@ fn wire_test_config(
         tls_key_path: None,
         socket_mode: SocketEgressPolicy::default(),
         hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
+        hostname_pinning_enabled: false,
     }
 }
 

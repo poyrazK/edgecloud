@@ -424,6 +424,7 @@ impl Supervisor {
                     metrics_acc: metrics_acc.clone(),
                     socket_mode: self.config.socket_mode,
                     hostname_pinning: self.config.hostname_pinning.clone(),
+                    hostname_pinning_enabled: self.config.hostname_pinning_enabled,
                 };
 
                 let tls_config =

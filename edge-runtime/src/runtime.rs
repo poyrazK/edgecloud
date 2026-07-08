@@ -240,7 +240,13 @@ impl RuntimeState {
         let cache_store = get_or_create_cache(&tenant_id);
         let scheduling = get_or_create_scheduler(&tenant_id);
 
-        let wasi_ctx = build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode);
+        let wasi_ctx = build_wasi_ctx_for_tenant(
+            &env,
+            &tenant_id,
+            &egress,
+            socket_mode,
+            hostname_pinning.clone(),
+        );
 
         let mut observe_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -341,6 +347,7 @@ impl Clone for RuntimeState {
                 &self.tenant_id,
                 &self.egress,
                 self.socket_mode,
+                self.hostname_pinning.clone(),
             ),
             // WasiHttpCtx is zero-sized in wasmtime 25 (`PhantomData`)
             // so this is a no-op clone. The per-Store resources still
@@ -816,11 +823,18 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 /// `AllowList` consults `EgressPolicy::check_address` (hard-deny +
 /// allowlist); mode = `AllowAll` is equivalent to
 /// `WasiCtxBuilder::inherit_network(true)` and is **off by default**.
+/// Mode = `HostnamePinned` consults `EgressPolicy::hostname_pinned_match`
+/// against the per-tenant `HostnamePinning` cache (passed in via
+/// `hostname_pinning`). Until the upstream wasmtime-wasi PR in
+/// `docs/upstream-wasmtime-resolve-check.patch` merges, the cache is
+/// empty — `HostnamePinned` therefore equals `BlockAll` today (issue
+/// #309 follow-up; dormant until the upstream hook is wired).
 fn build_wasi_ctx_for_tenant(
     env: &Arc<HashMap<String, String>>,
     tenant_id: &str,
     egress: &Arc<EgressPolicy>,
     mode: SocketEgressPolicy,
+    hostname_pinning: Arc<crate::socket_egress::HostnamePinning>,
 ) -> WasiCtx {
     // Apply the env blocklist BEFORE handing the env to `WasiCtx`. The
     // host exposes the env to the guest via two paths:
@@ -881,6 +895,7 @@ fn build_wasi_ctx_for_tenant(
         egress.clone(),
         mode,
         tenant_id.to_string(),
+        hostname_pinning,
     ));
 
     builder.build()

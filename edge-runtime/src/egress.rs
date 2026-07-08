@@ -12,6 +12,7 @@
 //!    host (exact or `*.suffix` wildcard). The sentinel value `"*"` allows
 //!    all non-hard-denied hosts and is used only in tests.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use url::{Host, Url};
 
@@ -77,6 +78,53 @@ impl EgressPolicy {
         } else {
             Ok(())
         }
+    }
+
+    /// Allowlist gate for the `SocketEgressPolicy::HostnamePinned` mode.
+    /// Returns `true` iff `addr.ip()` appears in `cache[hostname]` for
+    /// some `hostname` that satisfies the existing exact + `*.suffix`
+    /// allowlist match used by [`EgressPolicy::check`]. Honors the
+    /// `"*"` sentinel that bypasses allowlist matching.
+    ///
+    /// **Caller must have already** consulted [`EgressPolicy::check_resolved_ip`]
+    /// — hard-deny IPs are rejected upstream before this method runs.
+    /// The caller (the connect-side closure in `socket_egress.rs`)
+    /// checks hard-deny first, then calls this for the allowlist gate.
+    ///
+    /// Logic:
+    ///   1. If `allowlist` is empty → deny (default-deny).
+    ///   2. If `allowlist` contains the `"*"` sentinel → permit (the
+    ///      entire cache is in scope; operator opt-in).
+    ///   3. Otherwise: for each `cache_entry` in the allowlist, check
+    ///      `cache[cache_entry]` for `addr.ip()`. Returns true on the
+    ///      first hit; false if none match.
+    ///
+    /// The method consults `cache` (a snapshot of `HostnamePinning`) and
+    /// returns `false` on an empty cache.
+    pub fn hostname_pinned_match(
+        &self,
+        addr: SocketAddr,
+        cache: &HashMap<String, HashSet<IpAddr>>,
+    ) -> bool {
+        // Default-deny parity with `check_address`.
+        if self.allowlist.is_empty() {
+            return false;
+        }
+        // The "*" wildcard bypasses allowlist matching — any cache IP
+        // is admitted. Mirrors `check`'s behavior.
+        if self.allowlist.iter().any(|e| e == "*") {
+            return cache.values().any(|set| set.contains(&addr.ip()));
+        }
+        // Cache lookup by hostname allowlist member: an allowlist entry
+        // is consulted as a hostname key against the cache.
+        for entry in &self.allowlist {
+            if let Some(set) = cache.get(entry) {
+                if set.contains(&addr.ip()) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Check whether an outbound socket-level connection to `addr` is permitted.
@@ -258,6 +306,8 @@ pub(crate) fn is_blocked_hostname(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::EgressPolicy;
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, SocketAddr};
 
     // ── hard-deny: IPs ────────────────────────────────────────────────────
 
@@ -718,5 +768,90 @@ mod tests {
         let pinning = HostnamePinning::default();
         assert!(pinning.snapshot().is_empty());
         assert!(!pinning.contains("x", "127.0.0.1".parse().unwrap()));
+    }
+
+    // ── hostname_pinned_match: cache-aware allowlist gate ───────────────
+    //
+    // The full HostnamePinned mode dispatch (closure + cache wiring) is
+    // exercised in `socket_egress::tests`. These unit tests pin the
+    // EgressPolicy-side matcher logic: default-deny, the "*" wildcard
+    // bypass, exact cache lookup, and the asymmetric "unobserved IP"
+    // deny.
+
+    #[test]
+    fn hostname_pinned_match_empty_allowlist_denies() {
+        // Default-deny: an empty allowlist always returns false.
+        let policy = EgressPolicy::new(vec![]);
+        let mut cache: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        cache.insert(
+            "h".to_string(),
+            [IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))]
+                .into_iter()
+                .collect(),
+        );
+        let addr: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        assert!(
+            !policy.hostname_pinned_match(addr, &cache),
+            "empty allowlist must deny even with a populated cache"
+        );
+    }
+
+    #[test]
+    fn hostname_pinned_match_allowlist_match_permits() {
+        // Exact allowlist entry "api.example.com" exists in the cache
+        // AND contains the IP → permit.
+        let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        let mut cache: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        cache.insert(
+            "api.example.com".to_string(),
+            [IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))]
+                .into_iter()
+                .collect(),
+        );
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(policy.hostname_pinned_match(addr, &cache));
+    }
+
+    #[test]
+    fn hostname_pinned_match_unobserved_ip_denies() {
+        // Cache has the IP under a non-allowlisted hostname → deny.
+        let policy = EgressPolicy::new(vec!["api.example.com".to_string()]);
+        let mut cache: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        cache.insert(
+            "evil.com".to_string(),
+            [IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))]
+                .into_iter()
+                .collect(),
+        );
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(
+            !policy.hostname_pinned_match(addr, &cache),
+            "matching IP under a non-allowlisted hostname must deny"
+        );
+    }
+
+    #[test]
+    fn hostname_pinned_match_star_sentinel_admits_any() {
+        // "*" wildcard in the allowlist bypasses the per-hostname
+        // check — any cache entry's IP is admitted.
+        //
+        // We use `EgressPolicy::allow_all()` (which stores `["*"]`
+        // directly) instead of `EgressPolicy::new(vec!["*"])` because
+        // the latter strips `"*"` defensively (see `EgressPolicy::new`
+        // doc comment). The wildcard branch in
+        // `hostname_pinned_match` is only reachable when the policy
+        // was built via `allow_all()` or a future config path that
+        // honors the sentinel — both currently rare. Test the
+        // operator-visible path.
+        let policy = EgressPolicy::allow_all();
+        let mut cache: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        cache.insert(
+            "any".to_string(),
+            [IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))]
+                .into_iter()
+                .collect(),
+        );
+        let addr: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        assert!(policy.hostname_pinned_match(addr, &cache));
     }
 }

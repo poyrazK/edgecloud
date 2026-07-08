@@ -236,6 +236,17 @@ pub struct HandlerConfig {
     /// upstream PR merges. The cache is dormant today (no upstream
     /// hook populates it) — see `docs/upstream-wasmtime-resolve-check.patch`.
     pub hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
+    /// Effective `HostnamePinned` mode toggle for THIS app (mirrors
+    /// `Config::hostname_pinning_enabled`). When `true`, the per-request
+    /// builder switches `socket_mode` to `SocketEgressPolicy::HostnamePinned`
+    /// instead of the worker-wide `Config::socket_mode`. When `false`
+    /// (today's default everywhere), the existing `socket_mode` value
+    /// is used unchanged.
+    ///
+    /// Today this knob is dormant — `false` everywhere because the
+    /// upstream closure hook hasn't merged. Setting it to `true` has
+    /// the same effect as `BlockAll` (empty cache denies everything).
+    pub hostname_pinning_enabled: bool,
 }
 
 impl HandlerDispatch {
@@ -562,7 +573,19 @@ impl HandlerDispatch {
             self.config.log_sink.clone(),
             self.config.app_ctx.clone(),
             self.config.metrics_acc.clone(),
-            self.config.socket_mode,
+            // When the per-app HostnamePinned toggle is on, the
+            // closure consults the cache (see `socket_egress.rs`
+            // dispatch table). When off, the worker-wide
+            // `Config::socket_mode` is honored. Today both branches
+            // yield the same effective behavior — the cache is empty
+            // so `HostnamePinned` equals `BlockAll` (issue #309
+            // follow-up — dormant until
+            // docs/upstream-wasmtime-resolve-check.patch merges).
+            if self.config.hostname_pinning_enabled {
+                SocketEgressPolicy::HostnamePinned
+            } else {
+                self.config.socket_mode
+            },
             self.config.hostname_pinning.clone(),
         );
 

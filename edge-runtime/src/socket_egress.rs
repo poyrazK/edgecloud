@@ -31,6 +31,31 @@
 //! the `EDGE_EGRESS_SOCKET_MODE` env var. Default is `BlockAll`, matching
 //! the effective deny-all behavior of wasmtime's `SocketAddrCheck::default()`.
 //! See [`SocketEgressPolicy::from_env`] for the parsing rules.
+//!
+//! ## HostnamePinned mode (dormant)
+//!
+//! `SocketEgressPolicy::HostnamePinned` is the **fourth** mode and the
+//! one that addresses the documented asymmetry in `AllowList`. It
+//! closes the host-bypass by permitting a connect-side destination only
+//! if the destination IP was previously observed under a hostname in
+//! the tenant's `EgressPolicy::allowlist`. The mechanism uses a per-`RuntimeState`
+//! resolution cache ([`HostnamePinning`]) that the host would populate from
+//! `wasi:sockets/ip-name-lookup::resolve-addresses` at request time.
+//!
+//! ### Dormant state
+//!
+//! The mode is currently **dormant**: the upstream wasmtime-wasi 45.0.3
+//! host impl does not call back into the runtime for `resolve-addresses`,
+//! so the cache is empty. While dormant, `HostnamePinned` equals
+//! `BlockAll` (every connect denied). The runtime-side scaffolding
+//! (`HostnamePinning` cache + `Arc` plumbing + 4 dispatch arm) is live;
+//! the upstream change at `docs/upstream-wasmtime-resolve-check.patch`
+//! will turn it on without further runtime work.
+//!
+//! Operators opt into the dormant mode today via
+//! `EDGE_EGRESS_SOCKET_MODE=hostname-pinned` — this is intentionally a
+//! no-op (dormant == BlockAll) so future upgrades land in a single
+//! coordinated cutover rather than mid-flight.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -62,12 +87,27 @@ use crate::egress::EgressPolicy;
 ///   `WasiCtxBuilder::inherit_network(true)`. The hard-deny layer in
 ///   `EgressPolicy::check_address` is bypassed (the closure short-
 ///   circuits before consulting the policy) — use with caution.
+/// - [`HostnamePinned`] (**dormant today**): the closure consults a
+///   per-`RuntimeState` resolution cache ([`HostnamePinning`]) that the
+///   host impl populates from `wasi:sockets/ip-name-lookup::resolve-addresses`.
+///   A connect-side destination IP is permitted only if the cache says
+///   it was previously observed under a hostname in the tenant's
+///   `EgressPolicy::allowlist`. Binds are always permitted. With an
+///   empty cache (the **dormant state** today — the upstream PR is in
+///   `docs/upstream-wasmtime-resolve-check.patch`), this mode equals
+///   `BlockAll`. Once the upstream PR merges, `HostnamePinned` becomes
+///   active without further runtime changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SocketEgressPolicy {
     #[default]
     BlockAll,
     AllowList,
     AllowAll,
+    /// See the module-level `HostnamePinned mode (dormant)` section.
+    /// Until the upstream wasmtime-wasi PR in
+    /// `docs/upstream-wasmtime-resolve-check.patch` merges, this mode
+    /// is dormant — every connect-side call is denied.
+    HostnamePinned,
 }
 
 impl SocketEgressPolicy {
@@ -103,7 +143,7 @@ impl SocketEgressPolicy {
 
 /// Process-static "last value we logged" — encoded as a `u8` so we can
 /// use a single `AtomicU8` for thread-safe change detection without
-/// needing a `Mutex` or `OnceLock`. The three modes map to `0/1/2`;
+/// needing a `Mutex` or `OnceLock`. The four modes map to `0/1/2/3`;
 /// 255 is the "no previous value logged" sentinel.
 fn log_if_changed(mode: SocketEgressPolicy) {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -112,6 +152,7 @@ fn log_if_changed(mode: SocketEgressPolicy) {
         SocketEgressPolicy::BlockAll => 0,
         SocketEgressPolicy::AllowList => 1,
         SocketEgressPolicy::AllowAll => 2,
+        SocketEgressPolicy::HostnamePinned => 3,
     };
     let prev = LAST_LOGGED.swap(next, Ordering::Relaxed);
     if prev == next {
@@ -128,6 +169,13 @@ fn log_if_changed(mode: SocketEgressPolicy) {
             mode = %mode,
             "edge-runtime socket egress: hard-deny bypassed — use with caution"
         ),
+        // HostnamePinned is dormant until the upstream PR (see
+        // docs/upstream-wasmtime-resolve-check.patch) merges.
+        SocketEgressPolicy::HostnamePinned => tracing::info!(
+            mode = %mode,
+            "edge-runtime socket egress: HostnamePinned mode is dormant until \
+             docs/upstream-wasmtime-resolve-check.patch merges"
+        ),
     }
 }
 
@@ -138,8 +186,9 @@ impl FromStr for SocketEgressPolicy {
             "block-all" => Ok(Self::BlockAll),
             "allowlist" => Ok(Self::AllowList),
             "allow-all" => Ok(Self::AllowAll),
+            "hostname-pinned" => Ok(Self::HostnamePinned),
             other => Err(format!(
-                "unknown mode {:?} (expected one of: block-all, allowlist, allow-all)",
+                "unknown mode {:?} (expected one of: block-all, allowlist, allow-all, hostname-pinned)",
                 other
             )),
         }
@@ -152,6 +201,7 @@ impl std::fmt::Display for SocketEgressPolicy {
             Self::BlockAll => "block-all",
             Self::AllowList => "allowlist",
             Self::AllowAll => "allow-all",
+            Self::HostnamePinned => "hostname-pinned",
         })
     }
 }
@@ -199,7 +249,7 @@ impl HostnamePinning {
             .by_hostname
             .lock()
             .expect("HostnamePinning mutex poisoned");
-        guard.get(hostname).map_or(false, |set| set.contains(&ip))
+        guard.get(hostname).is_some_and(|set| set.contains(&ip))
     }
 
     /// Snapshot the full cache (for tests + debug logging). Cheap
@@ -216,19 +266,29 @@ impl HostnamePinning {
 ///
 /// The returned closure is `Send + Sync + 'static` so `WasiCtxBuilder`
 /// accepts it. It dispatches per-call on the captured `mode` and the
-/// `SocketAddrUse` variant:
-/// - `BlockAll` → always `false`.
-/// - `AllowAll` → always `true`.
-/// - `AllowList` + `TcpBind` / `UdpBind` → `true` (binds are local-only).
-/// - `AllowList` + `TcpConnect` / `UdpConnect` / `UdpOutgoingDatagram`
-///   → `EgressPolicy::check_address(addr).is_ok()`. Denials are logged
-///   with `tracing::warn!` in the same shape as
-///   `EgressHttpHooks::send_request` (see `runtime.rs:339-343`); allows
-///   are silent.
+/// `SocketAddrUse` variant. The 4-arm dispatch table:
+///
+/// | mode            | bind  | connect-side                                          |
+/// |-----------------|-------|-------------------------------------------------------|
+/// | `BlockAll`      | deny  | deny (closure always `false`)                         |
+/// | `AllowAll`      | allow | allow (hard-deny bypassed; operator opt-in)           |
+/// | `AllowList`     | allow | `EgressPolicy::check_address(addr)`                   |
+/// | `HostnamePinned`| allow | `EgressPolicy::hostname_pinned_match(addr, &cache)`   |
+///
+/// Denials for both gated modes (`AllowList`, `HostnamePinned`) are
+/// logged with `tracing::warn!` in the same shape as
+/// `EgressHttpHooks::send_request`. Allows are silent.
+///
+/// `HostnamePinned` is **dormant today** — the upstream closure hook
+/// (`docs/upstream-wasmtime-resolve-check.patch`) hasn't merged, so
+/// the cache is empty and the connect-side arm denies everything
+/// (behaves like `BlockAll`). The runtime-side machinery is live so
+/// the upstream change is the only delta needed to activate it.
 pub(crate) fn make_socket_addr_check(
     egress: Arc<EgressPolicy>,
     mode: SocketEgressPolicy,
     tenant_id: String,
+    hostname_pinning: Arc<HostnamePinning>,
 ) -> impl Fn(SocketAddr, SocketAddrUse) -> SocketAddrCheckFuture + Send + Sync + 'static {
     move |addr: SocketAddr, use_: SocketAddrUse| -> SocketAddrCheckFuture {
         match (mode, use_) {
@@ -238,11 +298,17 @@ pub(crate) fn make_socket_addr_check(
             // to `WasiCtxBuilder::inherit_network(true)`. Hard-deny is
             // bypassed here by design; this is the operator opt-in.
             (SocketEgressPolicy::AllowAll, _) => Box::pin(async { true }),
-            // `AllowList` — binds are local-only, always permitted.
+            // `AllowList` + `HostnamePinned` — binds are local-only,
+            // always permitted in either mode. Connect-side is what
+            // gets gated.
             (SocketEgressPolicy::AllowList, SocketAddrUse::TcpBind)
-            | (SocketEgressPolicy::AllowList, SocketAddrUse::UdpBind) => Box::pin(async { true }),
-            // `AllowList` — connect-side consults the policy. Log on deny
-            // in the same shape as `EgressHttpHooks::send_request`.
+            | (SocketEgressPolicy::AllowList, SocketAddrUse::UdpBind)
+            | (SocketEgressPolicy::HostnamePinned, SocketAddrUse::TcpBind)
+            | (SocketEgressPolicy::HostnamePinned, SocketAddrUse::UdpBind) => {
+                Box::pin(async { true })
+            }
+            // `AllowList` — connect-side consults the policy. Log on
+            // deny in the same shape as `EgressHttpHooks::send_request`.
             (
                 SocketEgressPolicy::AllowList,
                 SocketAddrUse::TcpConnect
@@ -267,6 +333,46 @@ pub(crate) fn make_socket_addr_check(
                     }
                 })
             }
+            // `HostnamePinned` (dormant) — connect-side consults the
+            // cache. Permits iff the cache says this IP was previously
+            // observed under a hostname in `egress.allowlist`. Today
+            // the cache is empty so this equals `BlockAll`. Denials are
+            // logged in the same shape as the `AllowList` connect-side
+            // arm above.
+            (
+                SocketEgressPolicy::HostnamePinned,
+                SocketAddrUse::TcpConnect
+                | SocketAddrUse::UdpConnect
+                | SocketAddrUse::UdpOutgoingDatagram,
+            ) => {
+                let cache = hostname_pinning.snapshot();
+                let egress = egress.clone();
+                let tenant_id = tenant_id.clone();
+                Box::pin(async move {
+                    // Hard-deny always wins (parity with the
+                    // AllowList path).
+                    if let Err(reason) = egress.check_resolved_ip(addr.ip()) {
+                        tracing::warn!(
+                            tenant_id = %tenant_id,
+                            addr = %addr,
+                            use_ = ?use_,
+                            reason = %reason,
+                            "egress denied (wasi:sockets, hostname-pinned)"
+                        );
+                        return false;
+                    }
+                    if egress.hostname_pinned_match(addr, &cache) {
+                        return true;
+                    }
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        addr = %addr,
+                        use_ = ?use_,
+                        "egress denied (wasi:sockets, hostname-pinned: not in resolution cache)"
+                    );
+                    false
+                })
+            }
         }
     }
 }
@@ -289,13 +395,24 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80)
     }
 
+    /// Helper: empty `HostnamePinning` cache, used as a default 4th
+    /// arg in tests that aren't exercising the new
+    /// `SocketEgressPolicy::HostnamePinned` arm.
+    fn empty_cache() -> Arc<HostnamePinning> {
+        Arc::new(HostnamePinning::default())
+    }
+
     // ── mode dispatch: BlockAll ──────────────────────────────────────────
 
     #[tokio::test]
     async fn block_all_denies_all_use_variants() {
         let egress = Arc::new(EgressPolicy::allow_all());
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::BlockAll,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         for use_ in [
             SocketAddrUse::TcpBind,
             SocketAddrUse::TcpConnect,
@@ -313,8 +430,12 @@ mod tests {
     #[tokio::test]
     async fn allow_all_permits_all_use_variants() {
         let egress = Arc::new(EgressPolicy::allow_all());
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowAll,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         for use_ in [
             SocketAddrUse::TcpBind,
             SocketAddrUse::TcpConnect,
@@ -332,8 +453,12 @@ mod tests {
         // `AllowAll` is operator opt-in: even hard-deny IPs are permitted.
         // Document this explicitly so reviewers don't mistake the design.
         let egress = Arc::new(EgressPolicy::allow_all());
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowAll, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowAll,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         let result = check(loopback_v4_addr(80), SocketAddrUse::TcpConnect).await;
         assert!(
             result,
@@ -346,8 +471,12 @@ mod tests {
     #[tokio::test]
     async fn allowlist_empty_allowlist_denies_connect_side() {
         let egress = Arc::new(EgressPolicy::new(vec![]));
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowList,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         // Connect-side on a public IP: empty allowlist ⇒ deny.
         assert!(!check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(!check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
@@ -359,8 +488,12 @@ mod tests {
         // The documented asymmetry: tenant hostname allowlist opts into
         // raw-socket egress to non-hard-denied IPs.
         let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowList,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         assert!(check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
         assert!(check(public_v4_addr(80), SocketAddrUse::UdpOutgoingDatagram).await);
@@ -371,8 +504,12 @@ mod tests {
         // Hard-deny ALWAYS wins over the allowlist, even on a non-empty
         // allowlist. Same posture as the HTTP layer.
         let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowList,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         assert!(!check(loopback_v4_addr(80), SocketAddrUse::TcpConnect).await);
         assert!(!check(metadata_addr(), SocketAddrUse::TcpConnect).await);
     }
@@ -381,8 +518,12 @@ mod tests {
     async fn allowlist_bind_variants_are_always_permitted() {
         // User decision: bind is local-only, allow always.
         let egress = Arc::new(EgressPolicy::new(vec![]));
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::AllowList, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::AllowList,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         assert!(check(loopback_v4_addr(0), SocketAddrUse::TcpBind).await);
         assert!(check(loopback_v4_addr(0), SocketAddrUse::UdpBind).await);
     }
@@ -391,8 +532,12 @@ mod tests {
     async fn allowlist_block_all_mode_denies_bind_too() {
         // Sanity: when mode is BlockAll, even binds are denied.
         let egress = Arc::new(EgressPolicy::allow_all());
-        let check =
-            make_socket_addr_check(egress, SocketEgressPolicy::BlockAll, "t_test".to_string());
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::BlockAll,
+            "t_test".to_string(),
+            empty_cache(),
+        );
         assert!(!check(public_v4_addr(0), SocketAddrUse::TcpBind).await);
         assert!(!check(public_v4_addr(0), SocketAddrUse::UdpBind).await);
     }
@@ -436,6 +581,18 @@ mod tests {
     }
 
     #[test]
+    fn from_env_parses_hostname_pinned() {
+        assert_eq!(
+            "hostname-pinned".parse::<SocketEgressPolicy>().unwrap(),
+            SocketEgressPolicy::HostnamePinned
+        );
+        assert_eq!(
+            "HOSTNAME-PINNED".parse::<SocketEgressPolicy>().unwrap(),
+            SocketEgressPolicy::HostnamePinned
+        );
+    }
+
+    #[test]
     fn from_env_rejects_unknown_values() {
         let err = "bogus".parse::<SocketEgressPolicy>().unwrap_err();
         assert!(
@@ -443,7 +600,10 @@ mod tests {
             "error message should mention the offending value: {err}"
         );
         assert!(
-            err.contains("block-all") && err.contains("allowlist") && err.contains("allow-all"),
+            err.contains("block-all")
+                && err.contains("allowlist")
+                && err.contains("allow-all")
+                && err.contains("hostname-pinned"),
             "error message should name the valid options: {err}"
         );
     }
@@ -454,6 +614,7 @@ mod tests {
             SocketEgressPolicy::BlockAll,
             SocketEgressPolicy::AllowList,
             SocketEgressPolicy::AllowAll,
+            SocketEgressPolicy::HostnamePinned,
         ] {
             assert_eq!(
                 mode.to_string().parse::<SocketEgressPolicy>().unwrap(),
@@ -516,5 +677,104 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(set.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
+    }
+
+    // ── mode dispatch: HostnamePinned (dormant) ───────────────────────────
+    //
+    // The HostnamePinned mode (issue #309 follow-up) consults the
+    // HostnamePinning resolution cache to gate connect-side traffic.
+    // Today the upstream PR (see docs/upstream-wasmtime-resolve-check.patch)
+    // is unmerged, so the cache is always empty at runtime and this mode
+    // behaves identically to `BlockAll` for connect-side calls.
+    //
+    // The tests below verify the cache + `EgressPolicy::hostname_pinned_match`
+    // logic directly so the dispatch arm is exercised end-to-end:
+    //
+    //   * empty cache → connect-side denied (dormant state)
+    //   * populated cache + matching hostname/IP → permit
+    //   * populated cache + unmatched IP → deny even with non-empty allowlist
+    //   * populated cache + hostname not in allowlist → deny
+
+    #[tokio::test]
+    async fn hostname_pinned_empty_cache_denies_all_use_variants() {
+        // Dormant state: cache is empty → every connect-side denied
+        // (parity with `BlockAll`); binds remain permitted.
+        let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+        let cache = empty_cache();
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::HostnamePinned,
+            "t_test".to_string(),
+            cache,
+        );
+
+        // Connect-side: denied.
+        assert!(!check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
+        assert!(!check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
+        assert!(!check(public_v4_addr(80), SocketAddrUse::UdpOutgoingDatagram).await);
+
+        // Binds: permitted (local-only, just like AllowList).
+        assert!(check(loopback_v4_addr(0), SocketAddrUse::TcpBind).await);
+        assert!(check(loopback_v4_addr(0), SocketAddrUse::UdpBind).await);
+    }
+
+    #[tokio::test]
+    async fn hostname_pinned_populated_cache_permits_observed_ip() {
+        // Seed the cache: "api.example.com" was resolved to 8.8.8.8
+        // (a public, non-hard-denied IP). Connect to 8.8.8.8:80 →
+        // allowed. Allowlist contains "api.example.com" so the
+        // wildcard/exact hostname match engages.
+        let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+        let cache = Arc::new(HostnamePinning::default());
+        cache.record("api.example.com", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::HostnamePinned,
+            "t_test".to_string(),
+            cache,
+        );
+        assert!(check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
+        assert!(check(public_v4_addr(80), SocketAddrUse::UdpConnect).await);
+        assert!(check(public_v4_addr(80), SocketAddrUse::UdpOutgoingDatagram).await);
+    }
+
+    #[tokio::test]
+    async fn hostname_pinned_unobserved_ip_is_denied_with_allowlist() {
+        // Cache says "api.example.com" → 8.8.8.8 (NOT 1.1.1.1). Connect
+        // to 1.1.1.1:80 → denied even though the allowlist contains a
+        // matching hostname (the IP wasn't seen under it). This is the
+        // core "pinned" semantics: only resolved IPs are admitted.
+        let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+        let cache = Arc::new(HostnamePinning::default());
+        cache.record("api.example.com", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::HostnamePinned,
+            "t_test".to_string(),
+            cache,
+        );
+        let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 80);
+        assert!(!check(other, SocketAddrUse::TcpConnect).await);
+        assert!(!check(other, SocketAddrUse::UdpOutgoingDatagram).await);
+    }
+
+    #[tokio::test]
+    async fn hostname_pinned_hostname_not_in_allowlist_denies() {
+        // Cache says "evil.com" → 8.8.8.8 (so the IP "appears" under a
+        // hostname), but the tenant's allowlist contains only
+        // "api.example.com". Because `hostname_pinned_match` requires
+        // the cache hostname to match an allowlist entry, this connect
+        // is denied. The cache cannot grant access for hostnames the
+        // tenant did not explicitly opt into.
+        let egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
+        let cache = Arc::new(HostnamePinning::default());
+        cache.record("evil.com", [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+        let check = make_socket_addr_check(
+            egress,
+            SocketEgressPolicy::HostnamePinned,
+            "t_test".to_string(),
+            cache,
+        );
+        assert!(!check(public_v4_addr(80), SocketAddrUse::TcpConnect).await);
     }
 }

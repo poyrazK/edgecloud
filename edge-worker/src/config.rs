@@ -153,6 +153,21 @@ pub struct Config {
     /// (see `docs/upstream-wasmtime-resolve-check.patch`) is the
     /// load-bearing piece that lets the host impl populate it.
     pub hostname_pinning: Arc<edge_runtime::socket_egress::HostnamePinning>,
+    /// Toggle for the dormant `SocketEgressPolicy::HostnamePinned`
+    /// mode (issue #309 follow-up). When `true`, the supervisor
+    /// installs `SocketEgressPolicy::HostnamePinned` into every
+    /// HandlerConfig + per-app RuntimeState; when `false` (the
+    /// default), the existing `socket_mode` value is used. The cache
+    /// is always populated (`Config::hostname_pinning`), so flipping
+    /// this knob to `true` is a runtime-only change.
+    ///
+    /// Today flipping it is a **no-op equivalent to `BlockAll`**
+    /// because the upstream closure hook
+    /// (`docs/upstream-wasmtime-resolve-check.patch`) hasn't merged
+    /// and the cache stays empty. The knob exists so operators can
+    /// opt in *before* the upstream merge and audit the config today.
+    /// Default: `false`. Override with `EDGE_EGRESS_HOSTNAME_PINNING`.
+    pub hostname_pinning_enabled: bool,
 }
 
 impl Config {
@@ -258,6 +273,7 @@ impl Config {
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             socket_mode: SocketEgressPolicy::from_env(),
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::default()),
+            hostname_pinning_enabled: parse_env_bool("EDGE_EGRESS_HOSTNAME_PINNING", false)?,
         })
     }
 
@@ -307,6 +323,24 @@ fn parse_env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
         Ok(s) => s
             .parse::<usize>()
             .with_context(|| format!("{} must be a non-negative integer (got {:?})", name, s)),
+    }
+}
+
+/// Parse a boolean-valued environment variable. Accepts `1`/`0` and
+/// `true`/`false` (case-insensitive). Returns `Err` for any other value
+/// so a typo'd env var doesn't silently coerce to a default.
+fn parse_env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(anyhow::anyhow!(
+                "{} must be a boolean (got {:?}; expected one of 1/0, true/false, yes/no, on/off)",
+                name,
+                other
+            )),
+        },
     }
 }
 
