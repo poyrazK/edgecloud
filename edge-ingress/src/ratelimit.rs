@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 /// A single per-app rate limit override.
@@ -133,6 +134,7 @@ pub fn spawn_rate_limit_fetcher(
     internal_token: Option<String>,
     table: Arc<crate::routing::RoutingTable>,
     fetch_interval: Duration,
+    shutdown: CancellationToken,
 ) {
     if fetch_interval.is_zero() {
         debug!("rate limit fetcher disabled (RATE_LIMIT_FETCH_INTERVAL=0)");
@@ -143,9 +145,16 @@ pub fn spawn_rate_limit_fetcher(
         let mut ticker = tokio::time::interval(fetch_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            let snap = table.snapshot().await;
-            process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("rate limit fetcher: shutdown signal received, stopping");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let snap = table.snapshot().await;
+                    process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
+                }
+            }
         }
     });
 }
