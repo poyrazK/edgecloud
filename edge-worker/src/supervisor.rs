@@ -141,7 +141,6 @@ mod heartbeat_integration_tests {
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
-            queue_group: "test".to_string(),
             consumer_name: "test".to_string(),
             task_stream_replicas: 1,
             worker_jwt_secret: String::new(),
@@ -1787,11 +1786,9 @@ impl Supervisor {
 
     /// Run the JetStream task-consume loop until `shutdown_rx` fires.
     ///
-    /// Subscribes to the queue-grouped consumer derived from
-    /// `config.queue_group` / `config.consumer_name`. Each delivered
-    /// `TaskMessage` is deserialized, passed to `handle_task_message`, and
-    /// ack'd on success. Failures are nack'd for redelivery; unparseable
-    /// (poison) messages are terminated so the consumer makes progress.
+    /// Subscribes to the task stream without a queue group (issue #316
+    /// fan-out). Every worker in the region receives every `TaskMessage`;
+    /// `handle_task_message`'s diff logic handles duplicates.
     ///
     /// Returns `Ok(())` only when `shutdown_rx` resolves. If the JetStream
     /// push stream ends (consumer deleted, server restart, transient
@@ -1803,17 +1800,12 @@ impl Supervisor {
     ) -> anyhow::Result<()> {
         let mut stream = self
             .nats
-            .subscribe_tasks(
-                &self.config.region,
-                &self.config.queue_group,
-                &self.config.consumer_name,
-            )
+            .subscribe_tasks(&self.config.region, &self.config.consumer_name)
             .await?;
         tracing::info!(
             region = %self.config.region,
-            queue_group = %self.config.queue_group,
             consumer = %self.config.consumer_name,
-            "subscribed to task stream"
+            "subscribed to task stream (fan-out mode)"
         );
 
         loop {

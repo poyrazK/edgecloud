@@ -1,8 +1,9 @@
 //! `edge dev` — local dev server with hot-reload.
 //!
-//! Builds the wasm artifact with `cargo build --target wasm32-wasip2`,
-//! serves it locally via `wasmtime serve`, and automatically rebuilds
-//! + restarts on file changes.
+//! Builds the wasm artifact with the language-appropriate toolchain
+//! (`cargo build --target wasm32-wasip2` for Rust, `javy compile` for
+//! JavaScript), serves it locally via `wasmtime serve`, and
+//! automatically rebuilds + restarts on file changes.
 
 use anyhow::{Context, Result};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -12,8 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::commands::build;
 use crate::config::EdgeToml;
 use crate::output;
+use crate::LangArg;
 
 /// Local development server with hot-reload.
 ///
@@ -21,27 +24,52 @@ use crate::output;
 /// project directory for changes. On modification or creation events,
 /// the child process is killed, the project is rebuilt, and a new
 /// `wasmtime serve` is spawned.
-pub fn run(path: &Path) -> Result<()> {
+///
+/// `lang` selects the build pipeline (Rust vs JS). The artifact path
+/// is resolved through [`build::path_for`] so the lookup stays
+/// language-aware — JS projects land at `target/javy/<name>.wasm`,
+/// Rust at `target/wasm32-wasip2/release/<name>.wasm`. Pre-fix this
+/// command hardcoded cargo + the Rust path, so `edge dev` after
+/// `edge init --lang=js myapp` failed with a misleading
+/// "Could not find Cargo.toml" (finding 3 of the PR #221 review).
+pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let project_name = edge_toml.project.name.clone();
+    let toml_lang = edge_toml.project.language_or_default();
+    let effective = match lang {
+        Some(flag) => {
+            if flag.as_str() != toml_lang {
+                anyhow::bail!(
+                    "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
+                     Re-run with `--lang {toml}` (or remove the `language` line from edge.toml) so \
+                     build and deploy stay in sync.",
+                    flag = flag.as_str(),
+                    toml = toml_lang,
+                );
+            }
+            flag
+        }
+        None => match toml_lang {
+            "rust" => LangArg::Rust,
+            "js" => LangArg::Js,
+            other => anyhow::bail!(
+                "unsupported language {other:?} in `[project] language` in edge.toml. \
+                 Supported values: `rust`, `js`."
+            ),
+        },
+    };
+
     let port = 8080;
 
     println!("Starting dev server for '{}'...", project_name);
 
-    // Initial build
-    build_project(path, &project_name)?;
+    // Initial build.
+    build_project(path, effective)?;
 
-    let artifact = if edge_toml.project.language == "js" {
-        path.join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{}.wasm", project_name))
-    } else {
-        path.join("target")
-            .join("wasm32-wasip2")
-            .join("debug")
-            .join(format!("{}.wasm", project_name))
-    };
+    // Resolve the artifact through `build::path_for` so the path
+    // layout stays in one place.
+    let artifact = build::path_for(path, &project_name, effective.as_str())
+        .context("resolving dev artifact path")?;
 
     if !artifact.exists() {
         anyhow::bail!(
@@ -119,7 +147,7 @@ pub fn run(path: &Path) -> Result<()> {
                 }
 
                 // Rebuild.
-                if let Err(e) = build_project(path, &project_name) {
+                if let Err(e) = build_project(path, effective) {
                     output::warn(&format!("Build failed: {e}"));
                     continue;
                 }
@@ -157,30 +185,22 @@ pub fn run(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_project(path: &Path, name: &str) -> Result<()> {
-    let edge_toml = EdgeToml::from_path(path)?;
-    if edge_toml.project.language == "js" || edge_toml.project.language == "javascript" {
-        return crate::commands::build::run(path);
-    }
-
-    let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2"])
-        .current_dir(path)
-        .spawn()?
-        .wait()?;
-
-    if !status.success() {
-        anyhow::bail!("build failed");
-    }
-
-    let artifact = path
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("debug")
-        .join(format!("{}.wasm", name));
-
-    if artifact.exists() {
-        println!("✓ Built: {}", artifact.display());
+fn build_project(path: &Path, lang: LangArg) -> Result<()> {
+    match lang {
+        LangArg::Rust => {
+            let status = Command::new("cargo")
+                .args(["build", "--target", "wasm32-wasip2"])
+                .current_dir(path)
+                .spawn()?
+                .wait()?;
+            if !status.success() {
+                anyhow::bail!("cargo build failed");
+            }
+            println!("✓ Built");
+        }
+        LangArg::Js => {
+            crate::commands::build::run(path, Some(LangArg::Js))?;
+        }
     }
     Ok(())
 }

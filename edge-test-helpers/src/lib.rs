@@ -22,7 +22,7 @@
 //! in the config — typically a wiremock URL for HTTP endpoints), the
 //! real NATS client, a real `LogForwarder`, and a real `reqwest::Client`.
 //! The only knob that varies between tests is the `Config` fields (in
-//! particular `worker_id`, `region`, `queue_group`, `consumer_name`,
+//! particular `worker_id`, `region`, `consumer_name`,
 //! `starting_port`, `cache_dir`, and `worker_tenant_id`).
 
 use std::path::PathBuf;
@@ -108,7 +108,7 @@ pub struct SupervisorGuard {
 
 /// Build a Supervisor pointed at a freshly-started NATS container. The
 /// caller controls every interesting test parameter via `config` — in
-/// particular `worker_id`, `region`, `queue_group`, `consumer_name`,
+/// particular `worker_id`, `region`, `consumer_name`,
 /// `starting_port`, `cache_dir`, `worker_tenant_id`, and
 /// `control_plane_url`. The `nats_url` field is overwritten with the
 /// fresh container's URL before construction.

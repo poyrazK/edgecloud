@@ -74,7 +74,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -118,7 +118,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -197,6 +197,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "US-EAST"}, // second is invalid
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid region, got nil")
@@ -228,6 +229,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		[]string{"us-east", "BAD-1", "BAD-2", "eu-west"},
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -266,6 +268,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		regions,
 		false,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for over-cap regions, got nil")
@@ -319,6 +322,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		bytes.NewReader(validWasmBytes),
 		regions,
 		false,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("Deploy at cap: %v", err)
@@ -373,7 +377,7 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
@@ -445,7 +449,7 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}

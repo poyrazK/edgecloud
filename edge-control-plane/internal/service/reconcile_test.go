@@ -138,6 +138,22 @@ func (f *fakeQuotaRepo) GetByTenantID(_ context.Context, tenantID string) (*doma
 	return q, nil
 }
 
+// fakeWorkerRepo implements reconcileWorkers for tests.
+type fakeWorkerRepo struct {
+	runningCounts map[string]int
+}
+
+func (f *fakeWorkerRepo) CountRunningWorkers(_ context.Context, _ string, appNames []string) (map[string]int, error) {
+	if f.runningCounts != nil {
+		return f.runningCounts, nil
+	}
+	out := make(map[string]int, len(appNames))
+	for _, name := range appNames {
+		out[name] = 0
+	}
+	return out, nil
+}
+
 // capturingPublisher is a no-op NATS publisher that records every
 // PublishFullSync call. We don't need to capture PublishTaskUpdate /
 // PublishHeartbeat because ReconcileService never calls them.
@@ -187,6 +203,7 @@ func reconcileSvcForTest(t *testing.T, tenants []domain.Tenant, active map[strin
 		&fakeActiveRepo{byTenant: active, byDeploymentID: deps},
 		&fakeAppEnvRepo{byApp: envs},
 		&fakeQuotaRepo{byTenant: quotas},
+		&fakeWorkerRepo{},
 		pub,
 		"global",
 	)

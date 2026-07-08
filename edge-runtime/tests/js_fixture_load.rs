@@ -11,7 +11,7 @@ use std::sync::Arc;
 use wasmtime::component::Component;
 
 fn js_component_path() -> PathBuf {
-    PathBuf::from("../samples/hello-js/target/wasm32-wasip2/release/hello-js.wasm")
+    PathBuf::from("../samples/hello-js/target/javy/hello-js.wasm")
 }
 
 fn runtime_state() -> RuntimeState {

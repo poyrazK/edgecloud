@@ -153,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
         worker_id = %config.worker_id,
         region = %config.region,
         worker_addr = %config.worker_addr,
-        queue_group = %config.queue_group,
         consumer = %config.consumer_name,
         "configuration loaded"
     );
@@ -381,7 +380,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         region = %config.region,
-        queue_group = %config.queue_group,
         "ready — waiting for task messages"
     );
 

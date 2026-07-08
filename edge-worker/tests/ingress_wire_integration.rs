@@ -61,7 +61,6 @@ fn wire_test_config(
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
-        queue_group: "ingress-wire-group".to_string(),
         consumer_name: format!("ingress-wire-{worker_id}"),
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),

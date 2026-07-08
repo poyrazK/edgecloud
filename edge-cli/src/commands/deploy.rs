@@ -3,11 +3,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use super::build;
 use super::state_io::load_state_optional;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
+use crate::LangArg;
 
 /// Dispatch to the upload or activate path based on whether `--id` was given.
 ///
@@ -22,6 +24,12 @@ use crate::state::State;
 /// #74). It is forwarded to the upload path; the activate path
 /// ignores it because the flag was already set at upload time and
 /// is read from the deployment row by ActivateDeployment.
+///
+/// `lang` is the source-language override. `Some(l)` requires the
+/// toml's `[project] language` to also resolve to `l`; mismatches
+/// surface as a clear error so a stale `rust` path can't be served
+/// for a Javy artifact. `None` defers to the toml entirely.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "network")]
 pub fn run(
     path: &Path,
@@ -29,12 +37,14 @@ pub fn run(
     id: Option<&str>,
     regions: &[String],
     auto_rollback: bool,
+    replicas: usize,
     file: Option<&Path>,
+    lang: Option<LangArg>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions, auto_rollback, file)
+    run_upload(path, app, regions, auto_rollback, replicas, file, lang)
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -47,13 +57,18 @@ pub fn run(
 /// get `auto_rollback_enabled = true`, which gates the
 /// worker-driven auto-rollback trigger and the heartbeat-driven
 /// stability-window promotion.
+/// `lang`: optional source-language override. `None` reads the
+/// project's `edge.toml`; `Some(l)` cross-checks the toml against `l`
+/// before resolving the artifact path.
 #[cfg(feature = "network")]
 fn run_upload(
     path: &Path,
     app: &str,
     regions: &[String],
     auto_rollback: bool,
+    replicas: usize,
     file: Option<&Path>,
+    lang: Option<LangArg>,
 ) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
@@ -61,13 +76,36 @@ fn run_upload(
     } else {
         edge_toml.project.name.clone()
     };
+    let toml_lang = edge_toml.project.language_or_default();
+    // Resolve the language used for the artifact-path lookup.
+    // `Some(l)` overrides only when it agrees with the toml — that
+    // mirrors `edge build`'s cross-check (finding 2 of the PR #221
+    // review) and prevents "stale toml says rust, Javy artifact
+    // exists" from silently serving the wrong file. `None` defers
+    // to the toml, which is the authoritative source.
+    let effective_lang = match lang {
+        Some(flag_lang) if flag_lang.as_str() != toml_lang => {
+            anyhow::bail!(
+                "`--lang {flag}` does not match `[project] language = {toml_value:?}` in edge.toml. \
+                 Re-run with `--lang {toml_value}` (or remove the `language` line from edge.toml) so \
+                 build and deploy stay in sync.",
+                flag = flag_lang.as_str(),
+                toml_value = toml_lang,
+            );
+        }
+        Some(flag_lang) => flag_lang.as_str().to_string(),
+        None => toml_lang.to_string(),
+    };
+    // Artifact path is language-aware (issue #317): Rust projects
+    // land at `target/wasm32-wasip2/release/<name>.wasm`, JS at
+    // `target/javy/<name>.wasm`. `build::path_for` is the single
+    // source of truth — `commands::build::run` writes through it,
+    // we read through it, so the two paths can never disagree.
+    // `--file` still overrides when present.
     let artifact = match file {
         Some(f) => f.to_path_buf(),
-        None => path
-            .join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{}.wasm", app_name)),
+        None => build::path_for(path, &app_name, &effective_lang)
+            .context("resolving deploy artifact path")?,
     };
 
     let wasm_bytes = std::fs::read(&artifact).map_err(|e| {
@@ -76,7 +114,7 @@ fn run_upload(
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback)?;
+    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback, replicas)?;
 
     let live_url = resp.url.clone();
     // Persist the regions the server actually accepted (it may
@@ -93,6 +131,7 @@ fn run_upload(
         app_name,
         live_url,
         regions: persisted_regions,
+        desired_replicas: resp.desired_replicas,
     };
     state.save(path)?;
 
@@ -190,7 +229,9 @@ pub fn run(
     _id: Option<&str>,
     _regions: &[String],
     _auto_rollback: bool,
+    _replicas: usize,
     _file: Option<&Path>,
+    _lang: Option<LangArg>,
 ) -> Result<()> {
     anyhow::bail!("deploy requires network support; rebuild with --features network")
 }
@@ -208,6 +249,7 @@ mod tests {
             // don't touch regions. The serde round-trip tests for
             // state.json live in state/mod.rs.
             regions: vec![],
+            desired_replicas: 0,
         }
     }
 
@@ -239,6 +281,7 @@ mod tests {
             app_name: "myapp".to_string(),
             live_url: String::new(),
             regions: vec![],
+            desired_replicas: 0,
         };
         let got = url_to_print(Some(&s), "myapp");
         assert_eq!(got, None);
