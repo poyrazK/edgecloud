@@ -20,6 +20,7 @@
 //! | `GET /log?msg=hello`          | observe.emit-log("info", msg, []) → 200     |
 //! | `GET /sockets/tcp/connect?ip=A.B.C.D&port=N` | wasi:sockets tcp-create-socket + start-connect → 200 body "allow" on Ok / "deny:<error>" on Err |
 //! | `GET /sockets/udp/bind?ip=A.B.C.D&port=N`    | wasi:sockets udp-create-socket + start-bind → same body shape; exercises `UdpBind` socket-use variant. UDP `send` is exercised only in unit tests (issue #309 tests in `edge-runtime/src/socket_egress.rs` cover `UdpConnect`/`UdpOutgoingDatagram`). |
+//! | `GET /sockets/dns-resolve-and-connect?host=H&port=N` | wasi:sockets ip_name_lookup::resolve_addresses + drive the resolve stream + tcp-connect to first address → 200 body `allow:<ip>` / `deny:<error>` / `deny:unresolvable` / `deny:empty`. Exercises the upstream-resolve hook required by `SocketEgressPolicy::HostnamePinned` once the patch in `docs/upstream-wasmtime-resolve-check.patch` merges. |
 //! | `GET /sched/once?ms=60000`    | scheduling.schedule-once(ms, []) → 200      |
 //!
 //! All other paths return 404.
@@ -50,6 +51,16 @@ use crate::wasi::sockets::network::{
 };
 use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;
 use crate::wasi::sockets::udp_create_socket::create_udp_socket;
+// For `/sockets/dns-resolve-and-connect` (issue #309 follow-up).
+// `resolve_addresses` returns a stream the guest must drive via
+// `wasi:io/poll`; we read the first non-blocking address and call
+// `start_connect`. Until the upstream patch in
+// `docs/upstream-wasmtime-resolve-check.patch` merges, the closure
+// has no resolve-side hook, so this path simply demonstrates the
+// guest-side API surface — the policy decision still happens at
+// `start-connect` (via the existing
+// `WasiCtxBuilder::socket_addr_check`).
+use crate::wasi::sockets::ip_name_lookup::resolve_addresses;
 
 // Edge cloud interface imports — available via generate_all.
 use crate::edge::cloud::kv_store;
@@ -372,6 +383,53 @@ impl Guest for Component {
                     .unwrap_or(0);
                 return_text(out, 200, &socket_call_string(ip, port, SocketKind::UdpBind));
             }
+            "/sockets/dns-resolve-and-connect" => {
+                // End-to-end hostname→TCP-connect path. Steps:
+                //
+                //   1. `resolve_addresses(network, host)` → returns a
+                //      stream + ready-to-poll handle (WASI Preview 2
+                //      pattern; some impls return the first address
+                //      inline, others require `subscribe().poll()`).
+                //   2. Drive the stream until a `resolve-next-address`
+                //      yields a non-empty `Some(IpAddress)` (IPv6
+                //      trampoline).
+                //   3. `create_tcp_socket(IPv4) +
+                //      start_connect(network, addr)` — THIS is what
+                //      the runtime's `socket_addr_check` closure
+                //      evaluates. A deny surfaces as
+                //      `Err(access-denied)` (or
+                //      `Err(name-unresolvable)` for unresolvable
+                //      hosts — handled before start-connect).
+                //
+                // Today (dormant) the closure sees only the connect-
+                // side addr. Once
+                // `docs/upstream-wasmtime-resolve-check.patch` merges,
+                // the closure additionally consults the resolved-host
+                // → IP set populated by the upstream resolve hook —
+                // which is what `SocketEgressPolicy::HostnamePinned`
+                // keys against (`EgressPolicy::hostname_pinned_match`).
+                //
+                // Body shapes the test asserts against:
+                //   * `allow:<ip>`                       — both steps Ok
+                //   * `allow:deny:<error-code>:<ip>`     — resolve Ok, connect denied
+                //   * `deny:resolve:<error-code>`        — resolve denied
+                //   * `deny:resolve-next:<error-code>`   — streaming error mid-resolve
+                //   * `deny:unresolvable`                — stream returned 0 addresses
+                //   * `deny:invalid-host`                — `host` query missing
+                //   * `deny:ipv6-unsupported`            — host resolved to v6 (this fixture is v4-only)
+                let host = match get_query_param(query, "host") {
+                    Some(h) if !h.is_empty() => h.to_string(),
+                    _ => return return_text(out, 200, b"deny:invalid-host"),
+                };
+                let port: u16 = get_query_param(query, "port")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(80);
+                return_text(
+                    out,
+                    200,
+                    &dns_resolve_then_connect_string(&host, port),
+                );
+            }
             _ => {
                 return_json(out, 404, br#"{"error":"not found"}"#);
             }
@@ -552,4 +610,101 @@ fn socket_call_string(ip: &str, port: u16, kind: SocketKind) -> Vec<u8> {
             }
         }
     }
+}
+
+/// Hostname → TCP-connect end-to-end fixture helper for the new
+/// `/sockets/dns-resolve-and-connect` path (issue #309 follow-up
+/// fixture work — exercises the upstream resolve hook surface once
+/// `docs/upstream-wasmtime-resolve-check.patch` merges).
+///
+/// WASI Preview 2 resolves are non-blocking by contract. The
+/// `resolve-next-address` returns either `Ok(Some(addr))`,
+/// `Ok(None)` (stream exhausted), or `Err(WouldBlock)` (not ready
+/// yet). The canonical host loop is:
+//
+///
+///     loop {
+///         match stream.resolve_next_address() {
+///             Ok(Some(addr)) => return addr,
+///             Ok(None)       => /* no more */,
+///             Err(WouldBlock) => pollable.block(),
+///         }
+///     }
+///
+/// In wit-bindgen 0.45 we have access to `wasi:io/poll` via
+/// `crate::wasi::io::poll::poll`, which takes a borrowed slice of
+/// `Pollable` handles and blocks until one is ready. The actual
+/// generated path is `crate::wasi::io::poll::poll` + the resource's
+/// `subscribe()` method.
+///
+/// We bound the polling to a few iterations to avoid hanging the
+/// test if a real network does not resolve within the budget
+/// (wasmtime's stub resolver does not block — it usually returns
+/// `Ok(None)` for `127.0.0.1`-style literal hostnames). For a
+/// non-resolvable name, wasmtime-wasi 45's stub returns an error
+/// from `resolve_addresses`; we surface that as
+/// `deny:resolve:<code>`.
+fn dns_resolve_then_connect_string(host: &str, port: u16) -> Vec<u8> {
+    let net = instance_network();
+    let mut stream = match resolve_addresses(&net, host) {
+        Ok(s) => s,
+        Err(e) => {
+            return format!("deny:resolve:{}", error_code_name(e)).into_bytes();
+        }
+    };
+
+    // Drive the resolver — bounded loop so a misconfigured host
+    // can't hang the test. Each iter: try once, if WouldBlock,
+    // subscribe-and-poll ONCE (the wasmtime-wasi 45 stub completes
+    // synchronously so this almost never trips more than a few
+    // times).
+    let mut resolved: Option<crate::wasi::sockets::network::IpAddress> = None;
+    for _ in 0..8 {
+        match stream.resolve_next_address() {
+            Ok(Some(addr)) => {
+                resolved = Some(addr);
+                break;
+            }
+            Ok(None) => break,
+            Err(SockErrorCode::WouldBlock) => {
+                let pollable = stream.subscribe();
+                let pollables = &[pollable];
+                let _ = crate::wasi::io::poll::poll(pollables);
+                continue;
+            }
+            Err(e) => {
+                return format!("deny:resolve-next:{}", error_code_name(e))
+                    .into_bytes()
+            }
+        }
+    }
+    let Some(ip_addr) = resolved else {
+        return b"deny:unresolvable".to_vec();
+    };
+
+    // Walk `IpAddress` enum to a v4 tuple. (v6 is documented as
+    // unsupported by this fixture; the runtime covers the v6
+    // hard-deny path in unit tests.)
+    let (a, b, c, d) = match ip_addr {
+        crate::wasi::sockets::network::IpAddress::Ipv4(v4) => {
+            let (a, b, c, d) = v4;
+            (a, b, c, d)
+        }
+        crate::wasi::sockets::network::IpAddress::Ipv6(_) => {
+            return b"deny:ipv6-unsupported".to_vec();
+        }
+    };
+    let address = (a, b, c, d);
+    let addr = IpSocketAddress::Ipv4(Ipv4SocketAddress { address, port });
+
+    let sock = match create_tcp_socket(IpAddressFamily::Ipv4) {
+        Ok(s) => s,
+        Err(e) => return format!("deny:create:{}", error_code_name(e)).into_bytes(),
+    };
+
+    let connect_body = match sock.start_connect(&net, addr) {
+        Ok(()) => format!("allow:{}", format!("{}.{}.{}.{}", a, b, c, d)),
+        Err(e) => format!("allow:deny:{}:{}", error_code_name(e), format!("{}.{}.{}.{}", a, b, c, d)),
+    };
+    connect_body.into_bytes()
 }

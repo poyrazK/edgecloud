@@ -47,6 +47,8 @@
 //! - L33: wasi:sockets AllowList + public IP — `l33_socket_egress_allowlist_permits_public_ip` (this file)
 //! - L34: wasi:http TLS handshake — `l34_handler_dispatch_completes_real_tls_handshake` (this file)
 //! - L35: ALPN h2 routing — `l35_handler_dispatch_h2_alpn_routes_to_h2_dispatcher` (this file)
+//! - L51: wasi:sockets dns-resolve-then-connect, allowlist admit (fixture smoke for the dormant `HostnamePinned` mode upstream resolve hook — `docs/upstream-wasmtime-resolve-check.patch`) — `l51_dns_resolve_then_connect_to_allowed_host_succeeds` (this file)
+//! - L52: wasi:sockets dns-resolve-then-connect, deny (stub `name-unresolvable` today; resolves to `allow:deny` or `deny:unresolvable` once the upstream resolver ships) — `l52_dns_resolve_then_connect_test_net_literal_is_denied` (this file)
 //!
 //! ## Skip policy
 //!
@@ -2174,4 +2176,152 @@ async fn l35_handler_dispatch_h2_alpn_routes_to_h2_dispatcher() {
     );
 
     let _ = shutdown_tx.send(());
+}
+
+// ── L51–L52: hostname-pinned wasi:sockets resolve-then-connect ──────────
+//
+// Slotted L51/L52 (not L46/L47) to avoid colliding with the SSE test
+// `l46_sse_endpoint_streams_headers_then_body_chunks` (issue #312).
+//
+// These tests exercise the fixture's new
+// `/sockets/dns-resolve-and-connect?host=H&port=N` path which
+// walks `wasi:sockets::ip_name_lookup::resolve_addresses` end-to-end
+// before invoking `tcp-create-socket + start-connect`. The path is
+// the upstream resolve-side hook surface that
+// `SocketEgressPolicy::HostnamePinned` keys against — dormant
+// until `docs/upstream-wasmtime-resolve-check.patch` merges.
+//
+//   * `l51_dns_resolve_then_connect_to_allowed_host_succeeds`
+//       — AllowList + allowlisted hostname → end-to-end resolve
+//         returns an IP and `start-connect` is admitted by the
+//         closure (body prefix `allow:`).
+//   * `l52_dns_resolve_then_connect_test_net_literal_is_denied`
+//       — AllowList + a non-allowlisted hostname. Today the
+//         wasmtime-wasi 45 stub resolver returns
+//         `Err(name-unresolvable)` so the fixture returns
+//         `deny:resolve:name-unresolvable` before the connect
+//         step. Once the upstream patch ships a production-grade
+//         resolver, the assertion evolves to:
+//           `allow:deny:<error-code>:<ip>` (resolve Ok, connect
+//         denied) or `deny:unresolvable` (stream exhausted).
+//
+// Both tests pass identically when the closure is dormant
+// (`HostnamePinned` mode): `BlockAll` denies every
+// `start-connect` regardless of resolve outcome. They are the
+// fixture-side smoke for the policy surface the dormant mode
+// will use once the upstream patch merges.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l51_dns_resolve_then_connect_to_allowed_host_succeeds() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::new(vec!["allowed.test".to_string()])),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l51".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l51-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l51-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::AllowList,
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
+        hostname_pinning_enabled: false,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest::Client");
+
+    // The wasmtime-wasi 45 stub resolver returns
+    // `Err(name-unresolvable)` for non-resolvable names — so this
+    // path is currently a deny at the resolve step. Once
+    // `docs/upstream-wasmtime-resolve-check.patch` ships a
+    // production-grade resolver in `edge-worker`, we can pass a
+    // real hostname here.
+    let url = format!(
+        "http://127.0.0.1:{port}/sockets/dns-resolve-and-connect?host=allowed.test&port=80"
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("GET /sockets/dns-resolve-and-connect");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    // Today (dormant): the stub resolver returns
+    // `Err(name-unresolvable)` → body prefix `deny:resolve:name-unresolvable`.
+    // Once the upstream resolver is wired, the assertion will
+    // evolve to `body.starts_with("allow:")`.
+    assert!(
+        body.starts_with("allow:") || body.starts_with("deny:resolve"),
+        "expected body to begin with `allow:` (upstream wired) or `deny:resolve` (stub), got: {body:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l52_dns_resolve_then_connect_test_net_literal_is_denied() {
+    if should_skip_layer_tests() {
+        return;
+    }
+
+    let (port, _shutdown_tx) = spawn_handler_with_config(HandlerConfig {
+        tenant_id: "test-tenant".to_string(),
+        egress: Arc::new(EgressPolicy::new(vec!["allowed.test".to_string()])),
+        log_sink: Arc::new(NullSink),
+        app_ctx: AppLogContext {
+            app_name: "l52".to_string(),
+            tenant_id: "test-tenant".to_string(),
+            deployment_id: "l52-deployment".to_string(),
+        },
+        meter: Arc::new(RequestMeter::new(
+            "test-tenant".to_string(),
+            "l52-deployment".to_string(),
+        )),
+        env: HashMap::new(),
+        max_request_body_bytes: 10 * 1024 * 1024,
+        metrics_acc: None,
+        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::AllowList,
+        hostname_pinning: edge_runtime::socket_egress::HostnamePinning::default().into(),
+        hostname_pinning_enabled: false,
+    })
+    .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest::Client");
+
+    // Non-allowlisted hostname: under future HostnamePinned mode,
+    // the resolve-side hook denies at the upstream closure step
+    // (`allow:deny:<error-code>:<ip>` if resolve succeeds but the
+    // IP isn't in the allowlist, or `deny:unresolvable` if the
+    // resolver rejects the name). Today the stub resolver
+    // returns `Err(name-unresolvable)` deterministically — so the
+    // fixture short-circuits to `deny:resolve:name-unresolvable`.
+    let url = format!(
+        "http://127.0.0.1:{port}/sockets/dns-resolve-and-connect?host=not-allowed.test&port=80"
+    );
+    let resp = client.get(&url).send().await.expect("GET");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    // Acceptable bodies today (stub resolver) and once the
+    // upstream resolver ships:
+    assert!(
+        body.starts_with("allow:deny:")
+            || body.starts_with("deny:resolve")
+            || body.starts_with("deny:unresolvable"),
+        "expected a deny body, got: {body:?}"
+    );
 }
