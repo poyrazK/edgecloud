@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use edge_runtime::linker::create_component_linker_long_running;
 use edge_runtime::{EgressPolicy, RequestMeter};
@@ -18,6 +19,7 @@ use crate::log_forwarder::LogForwarder;
 use crate::messages::{
     AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
 };
+use crate::metering_dedupe::dedupe_id;
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -1885,6 +1887,15 @@ impl Supervisor {
             self.config.worker_tenant_id.clone(),
         );
 
+        // Wall-clock at heartbeat time, used for the dedupe_id stamped on
+        // each AppStatus (issue #418). The control plane caches these IDs
+        // and skips re-applying deltas on JetStream redelivery within the
+        // same bucket. Same bucket = same ID; same ID = skip.
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         let state = self.state.read().await;
         // Iterate the (tenant_id, app_name)-keyed map. The heartbeat wire
         // format keys `apps` by app_name only, so if two tenants happen
@@ -1951,6 +1962,14 @@ impl Supervisor {
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                     ws_port: inst.ws_port,
+                    // Stamp the dedupe ID at heartbeat build time so two
+                    // redeliveries of the same heartbeat carry the same
+                    // ID and the CP can dedupe them (issue #418).
+                    dedupe_id: Some(dedupe_id(
+                        &self.config.worker_id,
+                        &inst.deployment_id,
+                        now_unix_secs,
+                    )),
                 },
             );
         }

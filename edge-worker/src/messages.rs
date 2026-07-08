@@ -218,6 +218,15 @@ pub struct AppStatus {
     /// routes WebSocket connections to this port instead of `port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws_port: Option<u16>,
+    /// Idempotency token for metering deduplication (issue #418). Stable
+    /// across redeliveries within the same `(worker_id, deployment_id,
+    /// 30s_bucket)` tuple, rotates per heartbeat interval. The control
+    /// plane uses this to skip re-applying the same delta on JetStream
+    /// redelivery or reconcile replay. Absent on pre-#418 workers —
+    /// legacy control planes ignore it; new control planes treat absence
+    /// as "no dedupe" (legacy behaviour preserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_id: Option<String>,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -371,6 +380,7 @@ mod tests {
             tenant_id: "t_1".into(),
             port: 8080,
             ws_port: None,
+            dedupe_id: None,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -434,6 +444,7 @@ mod tests {
             tenant_id: "t_1".into(),
             port: 8080,
             ws_port: None,
+            dedupe_id: None,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
