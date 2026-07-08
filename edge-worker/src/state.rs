@@ -51,7 +51,10 @@ pub struct AppInstance {
     /// Running apps keep using the `oneshot::Sender` above.
     pub shutdown_tx_broadcast: Option<tokio::sync::broadcast::Sender<()>>,
     /// Pre-compiled component for fast instantiation on restart.
-    pub instance_pre: InstancePre<edge_runtime::RuntimeState>,
+    /// `None` for Handler (FaaS) apps, which defer instantiation to
+    /// `wasmtime_wasi_http::ProxyPre::new` inside the dispatch path —
+    /// the supervisor only pre-instantiates for LongRunning apps.
+    pub instance_pre: Option<InstancePre<edge_runtime::RuntimeState>>,
     /// Handle to the spawned app task — used to propagate panics on stop.
     /// Wrapped in Arc so it can be cloned without taking ownership.
     pub handle: Option<std::sync::Arc<tokio::task::JoinHandle<()>>>,
