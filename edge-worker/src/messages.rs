@@ -79,6 +79,14 @@ pub struct DeploymentRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)]
     pub deployment_signature: Option<String>,
+    /// Logical key id (`"k1"`, `"k2"`, ...) identifying which key in the
+    /// worker's keyring signed this route's signature (issue #307 PR1
+    /// follow-up — multi-keyring). When absent (or empty string from a
+    /// legacy CP), the worker uses its keyring's default key.
+    /// `#[serde(default)]` keeps pre-keying messages parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub signing_key_id: Option<String>,
     /// Reserved for canary weight propagation; the worker currently uses 100%
     /// for every route and applies the weight at the ingress layer. Held on the
     /// struct so the wire format stays in sync with `edge-ingress` and the
@@ -108,6 +116,12 @@ pub struct AppSpec {
     /// config decides what to do (default: refuse to instantiate).
     #[serde(default)]
     pub deployment_signature: Option<String>,
+    /// Logical key id (`"k1"`, `"k2"`, ...) used to sign `deployment_signature`.
+    /// Follow-up-PR1 (multi-keyring). When `None` or `Some("")`, the worker
+    /// resolves against its keyring's default key. `#[serde(default)]` keeps
+    /// pre-keying messages parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
     /// listed (not just the primary one) concurrently. None = legacy mode
     /// (single deployment_id only).
     #[serde(default, skip_serializing_if = "Option::is_none")]

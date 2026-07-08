@@ -34,7 +34,7 @@ use crate::nats::NatsClientImpl;
 use crate::port_pool::PortPool;
 use crate::state::WorkerState;
 use crate::supervisor::Supervisor;
-use crate::verifier::SignatureVerifier;
+use crate::verifier::Keyring;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -214,36 +214,41 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     tracing::info!(dir = %config.cache_dir.display(), "cache directory ready");
 
-    // Build the Ed25519 signature verifier (issue #307, PR2).
+    // Build the Ed25519 signing keyring (issue #307 PR2 +
+    // PR1 follow-up multi-keyring with per-key `kid`).
     // Resolution order matches `Config::from_env`:
-    //   1. EDGE_SIGNING_PUBKEY_PATH (file) — production recommendation
-    //   2. EDGE_SIGNING_PUBKEY (inline 64 hex)
+    //   1. EDGE_SIGNING_KEYRING_PATH (file) — production recommendation
+    //   2. EDGE_SIGNING_KEYRING (inline `<kid> = <hex>` payload)
     //   3. None + require_signature=false → verifier = None + warn
     //   4. None + require_signature=true → unreachable: Config::from_env
     //      already bailed in that case.
-    let signature_verifier: Option<Arc<SignatureVerifier>> = match (
-        config.signing_pubkey.as_deref(),
-        config.signing_pubkey_path.as_deref(),
+    let signature_verifier: Option<Arc<Keyring>> = match (
+        config.signing_keyring.as_deref(),
+        config.signing_keyring_path.as_deref(),
     ) {
-        (_, Some(p)) => match SignatureVerifier::from_file(std::path::Path::new(p)) {
-            Ok(v) => {
+        (_, Some(p)) => match Keyring::from_file(std::path::Path::new(p)) {
+            Ok(k) => {
                 tracing::info!(
                     path = p,
-                    "loaded Ed25519 signing pubkey from EDGE_SIGNING_PUBKEY_PATH"
+                    keys = k.keys.len(),
+                    "loaded Ed25519 signing keyring from EDGE_SIGNING_KEYRING_PATH"
                 );
-                Some(Arc::new(v))
+                Some(Arc::new(k))
             }
             Err(e) => {
-                anyhow::bail!("loading EDGE_SIGNING_PUBKEY_PATH {p:?}: {e}");
+                anyhow::bail!("loading EDGE_SIGNING_KEYRING_PATH {p:?}: {e}");
             }
         },
-        (Some(h), _) => match SignatureVerifier::from_hex(h) {
-            Ok(v) => {
-                tracing::info!("loaded Ed25519 signing pubkey from EDGE_SIGNING_PUBKEY");
-                Some(Arc::new(v))
+        (Some(payload), _) => match Keyring::from_inline(payload) {
+            Ok(k) => {
+                tracing::info!(
+                    keys = k.keys.len(),
+                    "loaded Ed25519 signing keyring from EDGE_SIGNING_KEYRING"
+                );
+                Some(Arc::new(k))
             }
             Err(e) => {
-                anyhow::bail!("parsing EDGE_SIGNING_PUBKEY: {e}");
+                anyhow::bail!("parsing EDGE_SIGNING_KEYRING: {e}");
             }
         },
         (None, None) if config.require_signature => {
@@ -251,9 +256,9 @@ async fn main() -> anyhow::Result<()> {
         }
         (None, None) => {
             tracing::warn!(
-                "signature verification disabled: no EDGE_SIGNING_PUBKEY[_PATH] configured \
-                     and EDGE_REQUIRE_SIGNATURE=false. Unsigned artifacts will be accepted. \
-                     This is the rollout escape hatch and should NOT be set in production."
+                "signature verification disabled: no EDGE_SIGNING_KEYRING[_PATH] configured \
+                 and EDGE_REQUIRE_SIGNATURE=false. Unsigned artifacts will be accepted. \
+                 This is the rollout escape hatch and should NOT be set in production."
             );
             None
         }

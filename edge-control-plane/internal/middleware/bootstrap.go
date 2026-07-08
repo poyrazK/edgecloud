@@ -44,12 +44,12 @@ type BootstrapJWTConfig struct {
 
 // BootstrapRequest is the JSON body for a bootstrap request.
 type BootstrapRequest struct {
-	WorkerID    string `json:"worker_id"`
-	Region      string `json:"region"`
-	TenantID    string `json:"tenant_id"`
-	Timestamp   string `json:"timestamp"` // RFC3339, used for replay protection
-	Nonce       string `json:"nonce"`     // random value for replay protection
-	Signature   string `json:"signature"` // HMAC-SHA256 of worker_id+region+tenant_id+timestamp+nonce
+	WorkerID  string `json:"worker_id"`
+	Region    string `json:"region"`
+	TenantID  string `json:"tenant_id"`
+	Timestamp string `json:"timestamp"` // RFC3339, used for replay protection
+	Nonce     string `json:"nonce"`     // random value for replay protection
+	Signature string `json:"signature"` // HMAC-SHA256 of worker_id+region+tenant_id+timestamp+nonce
 }
 
 // ValidateAndVerifyBootstrapRequest verifies the bootstrap request's

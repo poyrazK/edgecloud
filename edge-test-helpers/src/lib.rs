@@ -44,7 +44,7 @@ use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
 use edge_worker::port_pool::PortPool;
 use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
-use edge_worker::verifier::SignatureVerifier;
+use edge_worker::verifier::Keyring;
 
 /// Returns `true` if integration tests should be skipped. We skip when:
 ///
@@ -117,14 +117,13 @@ pub struct SupervisorGuard {
 /// Returns a [`SupervisorGuard`] that owns both the Supervisor and the
 /// NATS container; dropping the guard stops the container.
 ///
-/// The `signature_verifier` is passed through to the
-/// `Supervisor`'s `Downloader`. Pass `None` for tests that
-/// don't exercise signature verification, or `Some(verifier)`
-/// for tests that need signed-artifact behavior (issue #307
-/// PR2).
+/// The `signature_verifier` is a multi-keyring (issue #307 PR1
+/// follow-up; was a single-pubkey verifier in PR2). Pass `None` for
+/// tests that don't exercise signature verification, or
+/// `Some(keyring)` for tests that need signed-artifact behavior.
 pub async fn build_supervisor_with(
     config: Config,
-    signature_verifier: Option<Arc<SignatureVerifier>>,
+    signature_verifier: Option<Arc<Keyring>>,
 ) -> SupervisorGuard {
     let (nats_container, nats_url) = start_nats().await;
     let mut config = config;
@@ -175,7 +174,7 @@ pub fn default_cache_dir() -> PathBuf {
 /// cluster).
 async fn build_supervisor_inner(
     config: &Config,
-    signature_verifier: Option<Arc<SignatureVerifier>>,
+    signature_verifier: Option<Arc<Keyring>>,
 ) -> anyhow::Result<Arc<Supervisor>> {
     let engine = create_engine()?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));

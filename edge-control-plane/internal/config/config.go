@@ -467,6 +467,15 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("EDGE_SIGNING_KEY_ID"); v != "" {
 		cfg.Signing.KeyID = v
 	}
+	// Multi-key keyring env vars (issue #307 follow-up PR1). When set,
+	// take precedence over the legacy single-key vars above; the legacy
+	// form remains accepted as a one-release deprecation fallback.
+	if v := os.Getenv("EDGE_SIGNING_KEYRING_PATH"); v != "" {
+		cfg.Signing.KeyringPath = v
+	}
+	if v := os.Getenv("EDGE_SIGNING_KEYRING"); v != "" {
+		cfg.Signing.Keyring = v
+	}
 
 	// Defaults for JWT config
 	if cfg.JWT.Issuer == "" {
@@ -554,8 +563,8 @@ func Load(path string) (*Config, error) {
 // so dev environments can boot without ceremony, but a missing key
 // entirely is a hard failure.
 func validateSigningConfig(s *SigningConfig) error {
-	if s.KeyPath == "" && s.Key == "" {
-		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH) or signing.key (EDGE_SIGNING_KEY) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
+	if s.KeyPath == "" && s.Key == "" && s.KeyringPath == "" && s.Keyring == "" {
+		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH), signing.key (EDGE_SIGNING_KEY), signing.keyring_path (EDGE_SIGNING_KEYRING_PATH), or signing.keyring (EDGE_SIGNING_KEYRING) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
 	}
 	return nil
 }
@@ -789,22 +798,36 @@ type MigrationConfig struct {
 // deployment's artifact at upload time; workers verify the
 // signature before instantiation. The private key never leaves the
 // CP. The public key is propagated to workers out-of-band (today:
-// the EDGE_SIGNING_PUBKEY env var on each worker). At least one of
-// KeyPath / Key must be set or the CP fails to start.
+// the EDGE_SIGNING_KEYRING env var on each worker). At least one of
+// KeyPath / Key / KeyringPath / Keyring must be set or the CP fails
+// to start.
 type SigningConfig struct {
-	// KeyPath is the path to a file containing the Ed25519 private
-	// key. Two formats are accepted (selected by file size): 32 raw
-	// bytes (seed form, expanded via ed25519.NewKeyFromSeed) or 64
-	// raw bytes (the full private key per RFC 8032 §5.1.2). Hex
-	// variants (64 or 128 hex chars) of either are also accepted.
+	// KeyPath is the path to a file containing a single Ed25519
+	// private key. Legacy single-key form; superseded by
+	// KeyringPath for rotation-aware deployments. Two formats are
+	// accepted (selected by file size): 32 raw bytes (seed form,
+	// expanded via ed25519.NewKeyFromSeed) or 64 raw bytes (the
+	// full private key per RFC 8032 §5.1.2). Hex variants (64 or
+	// 128 hex chars) of either are also accepted.
 	KeyPath string `yaml:"key_path"`
-	// Key is the inline Ed25519 private key, used when KeyPath is
-	// unset (typical in container deployments where the key is
-	// injected via a sealed secret). Same format rules as KeyPath.
+	// Key is the inline single Ed25519 private key, used when
+	// KeyPath is unset (typical in container deployments where the
+	// key is injected via a sealed secret). Legacy single-key form.
 	Key string `yaml:"key"`
 	// KeyID is a logical identifier (operator-chosen, e.g. "k1")
-	// stamped onto each `deployments` row at sign time. Required
-	// for clean rotation semantics; missing is allowed but emits a
-	// startup warning so operators see the footgun in their logs.
+	// stamped onto each `deployments` row at sign time. For the
+	// single-key legacy form this is implicit ("default"). For the
+	// keyring form it picks which key in the keyring is the
+	// active signing key.
 	KeyID string `yaml:"key_id"`
+	// KeyringPath is the path to a multi-key keyring file
+	// (issue #307 follow-up PR1). File format: one
+	// `<kid> = <32-byte seed hex>` per line; see
+	// `signing/keyring.go` for the full grammar. Takes precedence
+	// over KeyPath / Key when set. Loaded via
+	// `signing.LoadKeyringFromFile`.
+	KeyringPath string `yaml:"keyring_path"`
+	// Keyring is the inline multi-key keyring payload, used when
+	// KeyringPath is unset. Same format as the file.
+	Keyring string `yaml:"keyring"`
 }

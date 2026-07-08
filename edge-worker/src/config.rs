@@ -139,24 +139,27 @@ pub struct Config {
     /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
     pub standby_pool_size: usize,
 
-    /// Ed25519 artifact-signature enforcement (issue #307, PR2).
-    /// `true` (the default — secure-by-default) means the worker
-    /// refuses to instantiate any artifact whose `AppSpec` lacks a
-    /// `deployment_signature` field, AND verifies the signature
-    /// against the configured public key before instantiation.
-    /// `false` is the rollout escape hatch: a worker started with
-    /// `EDGE_REQUIRE_SIGNATURE=false` accepts unsigned artifacts,
-    /// which is what enables a mixed fleet during the
-    /// CP→worker signed-deployment rollout.
+    /// Ed25519 artifact-signature enforcement (issue #307, PR2 + PR1
+    /// follow-up multi-keyring). `true` (the default —
+    /// secure-by-default) means the worker refuses to instantiate
+    /// any artifact whose `AppSpec` lacks a `deployment_signature`
+    /// field, AND verifies the signature against a key in the
+    /// configured keyring before instantiation. `false` is the
+    /// rollout escape hatch: a worker started with
+    /// `EDGE_REQUIRE_SIGNATURE=false` accepts unsigned artifacts.
     pub require_signature: bool,
-    /// Inline Ed25519 public key, 64 lowercase hex chars (32 raw
-    /// bytes). Set via `EDGE_SIGNING_PUBKEY`. Mutually exclusive
-    /// with `signing_pubkey_path`; `pubkey_path` wins if both are
-    /// set (matches the CP-side precedence).
-    pub signing_pubkey: Option<String>,
-    /// Path to a file containing the Ed25519 public key, 64
-    /// lowercase hex chars on disk. Set via `EDGE_SIGNING_PUBKEY_PATH`.
-    pub signing_pubkey_path: Option<String>,
+    /// Inline keyring payload for the artifact-signature verifier
+    /// (issue #307 PR1 follow-up). Format: one
+    /// `<kid> = <64-lowercase-hex>` per line, same as the file format
+    /// — `Keyring::from_inline` parses both. Set via
+    /// `EDGE_SIGNING_KEYRING`. When `EDGE_SIGNING_KEYRING` and
+    /// `EDGE_SIGNING_KEYRING_PATH` are both set, `PATH` wins
+    /// (matches the CP-side precedence: explicit file > inline).
+    pub signing_keyring: Option<String>,
+    /// Path to a keyring file for the artifact-signature verifier.
+    /// Set via `EDGE_SIGNING_KEYRING_PATH`. See `signing_keyring`
+    /// for the file format.
+    pub signing_keyring_path: Option<String>,
 }
 
 impl Config {
@@ -197,13 +200,15 @@ impl Config {
     ///   instantiate an artifact without a valid Ed25519 signature
     ///   (issue #307). Set to `false` for the rollout window if the
     ///   worker is paired with a pre-PR1 control plane.
-    /// - `EDGE_SIGNING_PUBKEY` (default: unset) — inline 64-char
-    ///   lowercase hex Ed25519 public key. Mutually exclusive with
-    ///   `EDGE_SIGNING_PUBKEY_PATH`; the file path wins if both are
-    ///   set. Required when `EDGE_REQUIRE_SIGNATURE=true`.
-    /// - `EDGE_SIGNING_PUBKEY_PATH` (default: unset) — file with the
-    ///   64-char lowercase hex Ed25519 public key (one line, trailing
-    ///   newline tolerated). Production recommendation.
+    /// - `EDGE_SIGNING_KEYRING` (default: unset) — inline keyring
+    ///   payload; one `<kid> = <64-lowercase-hex>` per line. Useful for
+    ///   dev / single-key setups (issue #307 PR1 follow-up multi-keyring).
+    /// - `EDGE_SIGNING_KEYRING_PATH` (default: unset) — file containing
+    ///   a keyring payload, same format as the inline form. When both
+    ///   `EDGE_SIGNING_KEYRING_PATH` and `EDGE_SIGNING_KEYRING` are
+    ///   set, `PATH` wins (matches the CP-side precedence: explicit
+    ///   file > inline). Required when `EDGE_REQUIRE_SIGNATURE=true`.
+    ///   Production recommendation.
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -268,32 +273,31 @@ impl Config {
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
             standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
-            // Issue #307 PR2: signature verification config. The default
-            // for `require_signature` is `true` (secure-by-default) — a
-            // worker that boots with signing disabled would silently
-            // accept unsigned artifacts and undo the rollout's threat
-            // model. Operators who need the escape hatch explicitly set
-            // `EDGE_REQUIRE_SIGNATURE=false`.
+            // Issue #307 PR2 + PR1 follow-up: signature verification
+            // config. The default for `require_signature` is `true`
+            // (secure-by-default) — a worker that boots with signing
+            // disabled would silently accept unsigned artifacts and
+            // undo the rollout's threat model. Operators who need the
+            // escape hatch explicitly set `EDGE_REQUIRE_SIGNATURE=false`.
             require_signature: parse_env_bool("EDGE_REQUIRE_SIGNATURE", true)?,
-            signing_pubkey: std::env::var("EDGE_SIGNING_PUBKEY").ok(),
-            signing_pubkey_path: std::env::var("EDGE_SIGNING_PUBKEY_PATH").ok(),
+            signing_keyring: std::env::var("EDGE_SIGNING_KEYRING").ok(),
+            signing_keyring_path: std::env::var("EDGE_SIGNING_KEYRING_PATH").ok(),
         };
 
         // Validate the signature-config invariant: secure-by-default
         // means a worker with `require_signature=true` MUST have a
-        // public key configured. Without a key, the verifier is None
-        // and the worker would refuse to start any deployment —
-        // better to fail at boot with a clear message than to
-        // surface a confusing "missing pubkey" error on every
-        // task message.
+        // keyring configured. Without one, the verifier is None and
+        // the worker would refuse to start any deployment — better to
+        // fail at boot with a clear message than to surface a
+        // confusing "missing pubkey" error on every task message.
         if cfg.require_signature
-            && cfg.signing_pubkey.is_none()
-            && cfg.signing_pubkey_path.is_none()
+            && cfg.signing_keyring.is_none()
+            && cfg.signing_keyring_path.is_none()
         {
             anyhow::bail!(
-                "EDGE_REQUIRE_SIGNATURE=true but neither EDGE_SIGNING_PUBKEY nor \
-                 EDGE_SIGNING_PUBKEY_PATH is set. With secure-by-default, the worker \
-                 refuses to start until a public key is configured. Set \
+                "EDGE_REQUIRE_SIGNATURE=true but neither EDGE_SIGNING_KEYRING nor \
+                 EDGE_SIGNING_KEYRING_PATH is set. With secure-by-default, the worker \
+                 refuses to start until a keyring is configured. Set \
                  EDGE_REQUIRE_SIGNATURE=false to allow unsigned artifacts during the rollout."
             );
         }
@@ -609,17 +613,21 @@ mod tests {
         assert_eq!(cfg.worker_jwt_secret, "round-trip-secret");
     }
 
-    // ── Signature config tests (issue #307 PR2) ──────────────────────────
+    // ── Signature config tests (issue #307 PR2 + PR1 follow-up) ─────────
     //
-    // The five tests cover the three resolution paths and the
-    // secure-by-default fail-fast:
+    // The six tests cover the keyring resolution paths, the
+    // secure-by-default fail-fast, and the env-var plumbing that
+    // `main.rs` consumes to build the `Keyring`:
     //   1. require_signature defaults to true when EDGE_REQUIRE_SIGNATURE
     //      is unset.
     //   2. require_signature=false is honored when explicitly set.
-    //   3. EDGE_SIGNING_PUBKEY (inline 64-hex) is captured.
-    //   4. EDGE_SIGNING_PUBKEY_PATH (file path) is captured.
-    //   5. require_signature=true without any pubkey source fails fast
+    //   3. EDGE_SIGNING_KEYRING (inline) is captured.
+    //   4. EDGE_SIGNING_KEYRING_PATH (file path) is captured.
+    //   5. require_signature=true without any keyring source fails fast
     //      (the secure-by-default invariant).
+    //   6. Both keyring env vars unset round-trip to None (the
+    //      default-required-signature path is exercised in test 1;
+    //      here we cover the opt-out path).
 
     /// `EDGE_REQUIRE_SIGNATURE` is unset → defaults to true. Pins the
     /// secure-by-default contract: a future "fix" that flips the
@@ -627,9 +635,9 @@ mod tests {
     /// model, and this test catches it.
     #[test]
     fn config_from_env_require_signature_defaults_true() {
-        // Default `true` + no pubkey → secure-by-default must fail.
+        // Default `true` + no keyring → secure-by-default must fail.
         // To exercise the *default value* of the bool, set an inline
-        // pubkey so the validator's invariant check passes.
+        // keyring so the validator's invariant check passes.
         let _g = lock_and_set(&[
             ("WORKER_ID", Some("w_test")),
             ("REGION", Some("fra")),
@@ -638,19 +646,19 @@ mod tests {
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EDGE_REQUIRE_SIGNATURE", None),
             (
-                "EDGE_SIGNING_PUBKEY",
-                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                "EDGE_SIGNING_KEYRING",
+                Some("k1 = 0000000000000000000000000000000000000000000000000000000000000000"),
             ),
-            ("EDGE_SIGNING_PUBKEY_PATH", None),
+            ("EDGE_SIGNING_KEYRING_PATH", None),
         ]);
-        let cfg = Config::from_env().expect("from_env with inline pubkey");
+        let cfg = Config::from_env().expect("from_env with inline keyring");
         assert!(
             cfg.require_signature,
             "EDGE_REQUIRE_SIGNATURE must default to true when unset"
         );
         assert_eq!(
-            cfg.signing_pubkey.as_deref(),
-            Some("0000000000000000000000000000000000000000000000000000000000000000")
+            cfg.signing_keyring.as_deref(),
+            Some("k1 = 0000000000000000000000000000000000000000000000000000000000000000")
         );
     }
 
@@ -666,24 +674,30 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EDGE_REQUIRE_SIGNATURE", Some("false")),
-            ("EDGE_SIGNING_PUBKEY", None),
-            ("EDGE_SIGNING_PUBKEY_PATH", None),
+            ("EDGE_SIGNING_KEYRING", None),
+            ("EDGE_SIGNING_KEYRING_PATH", None),
         ]);
         let cfg = Config::from_env().expect("from_env with require_signature=false");
         assert!(
             !cfg.require_signature,
             "explicit EDGE_REQUIRE_SIGNATURE=false must round-trip"
         );
-        assert!(cfg.signing_pubkey.is_none(), "no inline pubkey set → None");
+        assert!(
+            cfg.signing_keyring.is_none(),
+            "no inline keyring set → None"
+        );
     }
 
-    /// `EDGE_SIGNING_PUBKEY` (inline 64 hex chars) is captured as-is
-    /// in the config. We don't validate the format here — that's
-    /// `SignatureVerifier::from_hex`'s job — only that the env var
+    /// `EDGE_SIGNING_KEYRING` (inline `<kid> = <64-hex>` payload) is
+    /// captured as-is in the config. We don't validate the format here
+    /// — that's `Keyring::from_inline`'s job — only that the env var
     /// is plumbed through.
     #[test]
-    fn config_from_env_signing_pubkey_inline() {
-        let pubkey_hex = "ab".repeat(32); // 64 hex chars
+    fn config_from_env_signing_keyring_inline() {
+        // Inline `<kid> = <64-hex>` payload — kid `k1`, 64 lowercase
+        // hex chars of arbitrary content (the test only checks env
+        // plumbing; format validation lives in `Keyring::from_inline`).
+        let payload = format!("k1 = {}", "ab".repeat(32));
         let _g = lock_and_set(&[
             ("WORKER_ID", Some("w_test")),
             ("REGION", Some("fra")),
@@ -691,20 +705,20 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EDGE_REQUIRE_SIGNATURE", Some("true")),
-            ("EDGE_SIGNING_PUBKEY", Some(pubkey_hex.as_str())),
-            ("EDGE_SIGNING_PUBKEY_PATH", None),
+            ("EDGE_SIGNING_KEYRING", Some(payload.as_str())),
+            ("EDGE_SIGNING_KEYRING_PATH", None),
         ]);
-        let cfg = Config::from_env().expect("from_env with inline pubkey");
-        assert_eq!(cfg.signing_pubkey.as_deref(), Some(pubkey_hex.as_str()));
+        let cfg = Config::from_env().expect("from_env with inline keyring");
+        assert_eq!(cfg.signing_keyring.as_deref(), Some(payload.as_str()));
     }
 
-    /// `EDGE_SIGNING_PUBKEY_PATH` (file with 64 hex chars) is captured
-    /// as a path string. The file is NOT read at config-load time —
-    /// `main.rs` reads it after `Config::from_env` and constructs
-    /// the verifier. Here we just pin that the path is plumbed.
+    /// `EDGE_SIGNING_KEYRING_PATH` is captured as a path string. The
+    /// file is NOT read at config-load time — `main.rs` reads it
+    /// after `Config::from_env` and constructs the keyring. Here we
+    /// just pin that the path is plumbed.
     #[test]
-    fn config_from_env_signing_pubkey_from_file() {
-        let path = "/etc/edge/signing.pub.hex";
+    fn config_from_env_signing_keyring_from_file() {
+        let path = "/etc/edge/signing.keyring";
         let _g = lock_and_set(&[
             ("WORKER_ID", Some("w_test")),
             ("REGION", Some("fra")),
@@ -712,15 +726,18 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EDGE_REQUIRE_SIGNATURE", Some("true")),
-            ("EDGE_SIGNING_PUBKEY", None),
-            ("EDGE_SIGNING_PUBKEY_PATH", Some(path)),
+            ("EDGE_SIGNING_KEYRING", None),
+            ("EDGE_SIGNING_KEYRING_PATH", Some(path)),
         ]);
-        let cfg = Config::from_env().expect("from_env with pubkey file path");
-        assert_eq!(cfg.signing_pubkey_path.as_deref(), Some(path));
-        assert!(cfg.signing_pubkey.is_none(), "no inline pubkey set → None");
+        let cfg = Config::from_env().expect("from_env with keyring file path");
+        assert_eq!(cfg.signing_keyring_path.as_deref(), Some(path));
+        assert!(
+            cfg.signing_keyring.is_none(),
+            "no inline keyring set → None"
+        );
     }
 
-    /// Secure-by-default: `require_signature=true` + no pubkey source
+    /// Secure-by-default: `require_signature=true` + no keyring source
     /// is a fatal startup error. The error message must mention both
     /// env var names so the operator knows exactly what to set.
     #[test]
@@ -732,16 +749,48 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EDGE_REQUIRE_SIGNATURE", Some("true")),
-            ("EDGE_SIGNING_PUBKEY", None),
-            ("EDGE_SIGNING_PUBKEY_PATH", None),
+            ("EDGE_SIGNING_KEYRING", None),
+            ("EDGE_SIGNING_KEYRING_PATH", None),
         ]);
         let err = Config::from_env().expect_err("require_signature=true + no key must fail");
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("EDGE_REQUIRE_SIGNATURE")
-                && msg.contains("EDGE_SIGNING_PUBKEY")
-                && msg.contains("EDGE_SIGNING_PUBKEY_PATH"),
+                && msg.contains("EDGE_SIGNING_KEYRING")
+                && msg.contains("EDGE_SIGNING_KEYRING_PATH"),
             "error must name all three env vars; got: {msg}"
+        );
+    }
+
+    /// Both keyring env vars unset, with the secure-by-default
+    /// escape hatch also unset, round-trips to None + require=true.
+    /// This is the *negative* mirror of test 1: the secure-by-default
+    /// validator short-circuits before reaching the keyring
+    /// plumbing, so we cover the "no keyring at all + require=true"
+    /// path here explicitly.
+    #[test]
+    fn config_from_env_both_keyring_envs_unset_round_trip() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("true")),
+            ("EDGE_SIGNING_KEYRING", None),
+            ("EDGE_SIGNING_KEYRING_PATH", None),
+        ]);
+        let err = Config::from_env().expect_err(
+            "no keyring + require_signature=true must fail the secure-by-default check",
+        );
+        // The error must surface the *kid* failure mode for ops
+        // debugging after a rotation — the failure should mention
+        // both keyring env vars (not the legacy EDGE_SIGNING_PUBKEY
+        // names from PR2; the operator has been told to migrate).
+        let msg = format!("{:#}", err);
+        assert!(
+            !msg.contains("EDGE_SIGNING_PUBKEY") && !msg.contains("EDGE_SIGNING_PUBKEY_PATH"),
+            "error must NOT mention the legacy PR2 env vars; got: {msg}"
         );
     }
 }

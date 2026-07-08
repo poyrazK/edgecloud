@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"embed"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,6 +35,18 @@ func testConfig(t *testing.T, artifactPath string) *config.Config {
 	if err := os.WriteFile(keyPath, make([]byte, 32), 0o600); err != nil {
 		t.Fatalf("write fixture signing key: %v", err)
 	}
+
+	// keyHexMaterial returns the on-disk key's bytes as 64 lowercase
+	// hex chars — the form `signing.LoadKeyringFromInline` parses.
+	// Issue #307 PR1: the test config exercises the new keyring
+	// loader instead of the legacy single-key fallback.
+	keyHexMaterial := func() string {
+		data, err := os.ReadFile(keyPath)
+		if err != nil {
+			t.Fatalf("read fixture signing key: %v", err)
+		}
+		return hex.EncodeToString(data)
+	}()
 	return &config.Config{
 		Database: config.DatabaseConfig{
 			Host: "localhost", Port: 5432, User: "test", Password: "test", Name: "test", SSLMode: "disable",
@@ -54,8 +67,13 @@ func testConfig(t *testing.T, artifactPath string) *config.Config {
 		// Without this, New() log.Fatalf's with the missing-key
 		// error and the test binary exits 1.
 		Signing: config.SigningConfig{
-			KeyPath: keyPath,
-			KeyID:   "test-k1",
+			// Issue #307 PR1: the CP now boots with a keyring
+			// (`EDGE_SIGNING_KEYRING[_PATH]`); the legacy single-key
+			// form (`KeyPath` + `KeyID`) is a one-release deprecation
+			// fallback that refuses a non-default KeyID. Test the
+			// supported keyring path here.
+			Keyring: "test-k1 = " + keyHexMaterial,
+			KeyID:   "test-k1", // active signing kid — must be present in the keyring
 		},
 	}
 }

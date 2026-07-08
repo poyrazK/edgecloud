@@ -54,13 +54,13 @@ type deploymentPromoter interface {
 
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService, artifactStore storage.ArtifactStore, wasm2cwasmPath string) *DeploymentHandler {
 	return &DeploymentHandler{
-		deploymentSvc: deploymentSvc,
-		workerSvc:     workerSvc,
-		trafficSvc:    trafficSvc,
-		rollbackSvc:   deploymentSvc,
-		activateSvc:   deploymentSvc,
-		promoteSvc:    deploymentSvc,
-		artifactStore: artifactStore,
+		deploymentSvc:  deploymentSvc,
+		workerSvc:      workerSvc,
+		trafficSvc:     trafficSvc,
+		rollbackSvc:    deploymentSvc,
+		activateSvc:    deploymentSvc,
+		promoteSvc:     deploymentSvc,
+		artifactStore:  artifactStore,
 		wasm2cwasmPath: wasm2cwasmPath,
 	}
 }

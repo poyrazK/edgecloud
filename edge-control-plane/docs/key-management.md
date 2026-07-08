@@ -25,15 +25,17 @@ rotate that key.
 ## Key generation
 
 Generate a fresh Ed25519 keypair and write the **private** key to a
-file only the CP can read:
+file only the CP can read. Operators building a keyring generate
+one such file per kid and combine them into a single keyring
+file (see [Rotation](#rotation-zero-downtime) below):
 
 ```bash
 # 32-byte seed → 64-byte private key (Go's crypto/ed25519 will
 # auto-expand either shape; we accept both. See
 # internal/signing/signer.go::parsePrivateKey for the loader.)
-openssl rand -hex 32 > /etc/edge/signing.key
-chmod 0600 /etc/edge/signing.key
-chown edge-control-plane:edge /etc/edge/signing.key
+openssl rand -hex 32 > /etc/edge/signing.k1.key
+chmod 0600 /etc/edge/signing.k1.key
+chown edge-control-plane:edge /etc/edge/signing.k1.key
 ```
 
 Generate the **public** key (in the format the worker consumes):
@@ -72,28 +74,59 @@ without Go access can use Option B with PyNaCl as a one-off:
 ## Control plane configuration
 
 The CP refuses to start without a signing key (issue #307 fail-fast).
+As of PR #307 follow-up PR1, the CP boots from a **keyring** (a
+named map of `kid → private key`). The legacy single-key form is
+still accepted as a one-release deprecation fallback and logs a
+warning at startup.
+
+### Keyring form (recommended)
+
+The keyring is one `<kid> = <32-byte-seed-hex>` line per key:
+
+```text
+# /etc/edge/signing.keyring
+# Lines starting with `#` and blank lines are ignored.
+# The kid is operator-chosen; conventionally lowercase short
+# identifiers (e.g. "k1", "k2"). The value is the 32-byte Ed25519
+# seed as 64 lowercase hex characters.
+
+k1 = 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+k2 = 5b6e6c4e1a8f4b9d2e7f3c1a5b6e6c4e1a8f4b9d2e7f3c1a5b6e6c4e1a8f4b9d
+```
+
+`EDGE_SIGNING_KEY_ID` selects which key is active for new
+deployments. Set it to a kid that's present in the keyring — a
+typo or stale value fails the CP at startup with `ErrInvalidKey`.
+
+```bash
+# Recommended (containers):
+export EDGE_SIGNING_KEYRING_PATH=/etc/edge/signing.keyring
+export EDGE_SIGNING_KEY_ID=k2      # current active signing key
+# Inline form (dev only):
+export EDGE_SIGNING_KEYRING='k1 = <hex>\nk2 = <hex>'
+export EDGE_SIGNING_KEY_ID=k2
+```
+
+Or via YAML config:
 
 ```yaml
 signing:
-  key_path: /etc/edge/signing.key
-  key_id: k1   # logical key id, stamped onto deployments.signing_key_id
+  keyring_path: /etc/edge/signing.keyring
+  key_id: k2
 ```
 
-or via env vars (recommended for containers):
+### Legacy single-key form (deprecated)
+
+The pre-PR1 single-key env vars (`EDGE_SIGNING_KEY_PATH` /
+`EDGE_SIGNING_KEY`) still work; they wrap the key in a 1-entry
+keyring with kid `"default"` and log a deprecation warning at
+startup. Migrate by generating a keyring file and switching the
+env vars. The deprecation will be removed in a follow-up release.
 
 ```bash
-export EDGE_SIGNING_KEY_PATH=/etc/edge/signing.key
-export EDGE_SIGNING_KEY_ID=k1
-# Inline hex variant (development only):
-export EDGE_SIGNING_KEY=$(cat /etc/edge/signing.key)
+export EDGE_SIGNING_KEY_PATH=/etc/edge/signing.key    # deprecated
+export EDGE_SIGNING_KEY_ID=k1                         # must be empty or "default"
 ```
-
-`key_id` is optional in v1 — operators that don't care about
-rotation can leave it empty (a startup warning logs that rotation
-semantics will be ambiguous). The string is purely diagnostic —
-distinct key ids let operators reason about "is this artifact signed
-by the current key?" without a code change today, and forms the
-basis of the rotation plumbing in a follow-up PR.
 
 ## Worker configuration
 
@@ -104,29 +137,32 @@ rejected.
 
 ```bash
 export EDGE_REQUIRE_SIGNATURE=true
+export EDGE_SIGNING_KEYRING_PATH=/etc/edge/signing.pub.keyring
+# (or, for the single-key legacy form)
 export EDGE_SIGNING_PUBKEY=<64-hex-of-public-key>
-# (or)
 export EDGE_SIGNING_PUBKEY_PATH=/etc/edge/signing.pub.hex
 ```
 
-The two env-var shapes mirror the CP config (inline vs file path).
-The file-path shape is the production recommendation: it lets
-operators rotate the key via a ConfigMap mount without restarting
-the process on a key change (the worker reads the file once at
-boot).
+The keyring file format mirrors the CP side, but each line is
+`<kid> = <32-byte-pubkey-hex>` (the public counterpart):
 
-**Pubkey resolution order (worker startup):**
+```text
+# /etc/edge/signing.pub.keyring
+k1 = d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+k2 = 5b6e6c4e1a8f4b9d2e7f3c1a5b6e6c4e1a8f4b9d2e7f3c1a5b6e6c4e1a8f4b9d
+```
 
-1. `EDGE_SIGNING_PUBKEY_PATH` — file with the 64-char lowercase hex
-   pubkey (trailing newline tolerated). Wins if set.
-2. `EDGE_SIGNING_PUBKEY` — inline 64-char lowercase hex pubkey.
-3. Neither set + `EDGE_REQUIRE_SIGNATURE=false` → verifier is `None`
-   and the worker accepts unsigned artifacts (the rollout escape
-   hatch).
-4. Neither set + `EDGE_REQUIRE_SIGNATURE=true` → worker refuses to
-   start with a clear error naming all three env vars. Operators
-   seeing this should either set one of the pubkey env vars or
-   explicitly opt into the unsigned mode.
+**Keyring resolution order (worker startup):**
+
+1. `EDGE_SIGNING_KEYRING_PATH` — multi-key keyring file. Wins if set.
+2. `EDGE_SIGNING_KEYRING` — inline keyring payload.
+3. `EDGE_SIGNING_PUBKEY_PATH` — legacy single-key file (deprecation
+   fallback; wraps in a 1-entry keyring with kid `default`).
+4. `EDGE_SIGNING_PUBKEY` — legacy inline single-key.
+5. None of the above + `EDGE_REQUIRE_SIGNATURE=false` → no keyring,
+   unsigned artifacts accepted (rollout escape hatch).
+6. None of the above + `EDGE_REQUIRE_SIGNATURE=true` → worker
+   refuses to start with a clear error naming all six env vars.
 
 **Signed message layout** (for operators debugging a failing verify
 or running a non-Go verifier out-of-band): the worker reconstructs
@@ -135,43 +171,90 @@ the signed payload as `sha256_raw_32_bytes || deployment_id_bytes`
 must hash the artifact, take the raw 32 bytes, append the raw
 `deployment_id` bytes, and verify with the public key.
 
-## Rotation
+## Rotation (zero-downtime)
 
-The rotation story is being finalized in a follow-up PR. The shape
-today:
+The keyring makes signing-key rotation a no-restart-for-the-worker
+operation. Sequence:
 
-1. Generate a new keypair (k2).
-2. Update the CP's `signing.key_id` to `k2` and rotate the file at
-   `EDGE_SIGNING_KEY_PATH` (or set `EDGE_SIGNING_KEY_ID=k2` +
-   rotate file).
-3. **CP behavior:** every artifact uploaded after the rotation
-   carries `signing_key_id=k2`. Existing `signing_key_id=k1` rows
-   are unchanged (no re-sign), but workers running the old
-   `k1`-era public key can no longer verify `k2` artifacts.
-4. **Worker behavior:** today the worker holds a single public key
-   via `EDGE_SIGNING_PUBKEY`. To accept both `k1` (in-flight) and
-   `k2` (new) signatures, the worker must accept a keyring until
-   the k1 artifacts age out. The follow-up PR adds
-   `EDGE_SIGNING_PUBKEY_<KID>=...` env-var support for this
-   transition.
+1. **Generate** a fresh keypair (k2). Keep k1 around — in-flight
+   artifacts are signed by k1.
 
-**Operational guidance for now:** roll the worker with the new
-public key after re-deploying every active app. The "fail closed"
-default of `EDGE_REQUIRE_SIGNATURE=true` ensures a stale public key
-rejects in-flight unverified builds rather than silently accepting
-an unsigned or wrong-key artifact.
+   ```bash
+   openssl rand -hex 32 > /etc/edge/signing.k2.key
+   chmod 0600 /etc/edge/signing.k2.key
+   ```
+
+2. **Derive k2's public key** (using one of the recipes above).
+
+3. **Update the worker keyring** to include both k1 and k2:
+
+   ```text
+   # /etc/edge/signing.pub.keyring (mounted into the worker)
+   k1 = <hex-of-current-pubkey>
+   k2 = <hex-of-new-pubkey>
+   ```
+
+   No worker restart needed if the keyring is mounted from a
+   ConfigMap the operator can hot-swap (the worker reads the file
+   once at boot today; in-process hot-reload is a future-PR
+   concern — until then, **restart the worker** to pick up the new
+   keyring).
+
+4. **Update the CP keyring** to include both keys and rotate the
+   active kid:
+
+   ```text
+   # /etc/edge/signing.keyring (mounted into the CP)
+   k1 = <hex-of-current-seed>
+   k2 = <hex-of-new-seed>
+   ```
+
+   ```bash
+   export EDGE_SIGNING_KEY_ID=k2      # CP signs new artifacts with k2
+   ```
+
+   Restart the CP. New artifacts carry `signing_key_id=k2`; old
+   `k1` artifacts on disk still verify because the worker keyring
+   still has k1.
+
+5. **Audit retirement.** Operators can list deployments signed by
+   the retired key with:
+
+   ```sql
+   SELECT id, app_name, created_at FROM deployments
+   WHERE signing_key_id = 'k1'
+   ORDER BY created_at DESC;
+   ```
+
+   Once that list is empty (all k1-signed artifacts aged out via
+   re-deploy or natural eviction), remove k1 from both keyring
+   files.
+
+6. **Worker keyring reload.** Until hot-reload lands, repeat step
+   3's worker restart as part of the rotation cutover. The total
+   window is small (~1 CP restart + 1 worker restart, no
+   in-flight artifact failures).
+
+The `signing_key_id` column on `deployments` is already populated
+by every signing path since PR #355, so the operator audit query
+in step 5 works without a new migration.
 
 ## File format reference
 
-| Path                              | Format                  | Size     |
-| --------------------------------- | ----------------------- | -------- |
-| `EDGE_SIGNING_KEY_PATH`           | raw bytes or hex        | 32 / 64 / 64-hex / 128-hex |
-| `EDGE_SIGNING_KEY` (inline)       | raw bytes or hex        | same     |
-| `EDGE_SIGNING_PUBKEY`             | hex (32 bytes)          | 64 chars |
-| `EDGE_SIGNING_PUBKEY_PATH`        | hex file                | 64 chars on disk |
+| Path                              | Format                          | Size         |
+| --------------------------------- | ------------------------------- | ------------ |
+| `EDGE_SIGNING_KEYRING_PATH`       | keyring file (CP, private keys) | one line per kid |
+| `EDGE_SIGNING_KEYRING`            | inline keyring (CP)             | same         |
+| `EDGE_SIGNING_KEY_PATH`           | raw bytes or hex (CP, single)   | 32 / 64 / 64-hex / 128-hex |
+| `EDGE_SIGNING_KEY`                | inline (CP, single)              | same         |
+| `EDGE_SIGNING_KEYRING_PATH` (worker) | keyring file (pubkeys)        | one line per kid |
+| `EDGE_SIGNING_PUBKEY`             | hex (32 bytes, single)          | 64 chars |
+| `EDGE_SIGNING_PUBKEY_PATH`        | hex file (single)               | 64 chars on disk |
 
-The CP's loader (`internal/signing/signer.go::parsePrivateKey`)
-auto-detects size and content. Wrong sizes, non-ASCII, or non-hex
-content return a typed `ErrInvalidKey` error with a size hint; the
-server fails to start with a clear message instead of running with
-the default placeholder.
+The CP's loader (`internal/signing/keyring.go::parseKeyringLines`
+for the keyring form, `internal/signing/signer.go::parsePrivateKey`
+for the legacy single-key form) auto-detects size and content.
+Wrong sizes, non-ASCII, non-hex, malformed `<kid> = <hex>` lines,
+or duplicate kids return a typed `ErrInvalidKey` error with a
+specific message; the server fails to start with that message
+instead of running with a default placeholder.

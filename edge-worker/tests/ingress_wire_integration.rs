@@ -77,8 +77,8 @@ fn wire_test_config(
         // Issue #307 PR2: signature config off — ingress wire
         // test focuses on the heartbeat → routing table path.
         require_signature: false,
-        signing_pubkey: None,
-        signing_pubkey_path: None,
+        signing_keyring: None,
+        signing_keyring_path: None,
     }
 }
 

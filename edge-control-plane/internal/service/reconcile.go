@@ -319,7 +319,8 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 			// j.Hash was confirmed Valid by the orphan filter above;
 			// Hash.String is the non-NULL hash from the joined deployments row.
 			j.Hash.String,
-			j.Signature.String, // issue #307: signature is empty for legacy rows; worker honors EDGE_REQUIRE_SIGNATURE
+			j.Signature.String,    // issue #307: signature is empty for legacy rows; worker honors EDGE_REQUIRE_SIGNATURE
+			j.SigningKeyID.String, // issue #307 PR1: per-key kid
 			envMap,
 			allowlist,
 			maxMemoryMB,
@@ -495,7 +496,8 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 			// where Hash is SQL NULL, so by construction Hash.String
 			// is the populated hash.
 			j.Hash.String,
-			j.Signature.String, // issue #307: empty for legacy rows
+			j.Signature.String,    // issue #307: empty for legacy rows
+			j.SigningKeyID.String, // issue #307 PR1: per-key kid
 			envMap,
 			allowlist,
 			maxMemoryMB,

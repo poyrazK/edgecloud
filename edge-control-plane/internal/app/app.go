@@ -79,14 +79,15 @@ func New(
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
-	// Load the Ed25519 signing key (issue #307). The config validator
-	// already enforced that at least one of KeyPath / Key is set;
-	// here we resolve the actual signer and surface any load-time
-	// errors (malformed key, missing file) as a fatal startup
-	// condition rather than a runtime failure on the first Deploy.
-	signer, err := loadSigner(&cfg.Signing)
+	// Load the Ed25519 signing keyring (issue #307 PR1). The config
+	// validator already enforced that at least one of KeyringPath /
+	// Keyring / KeyPath / Key is set; here we resolve the actual
+	// keyring and surface any load-time errors (malformed key, missing
+	// file, empty keyring) as a fatal startup condition rather than a
+	// runtime failure on the first Deploy.
+	keyring, err := loadKeyring(&cfg.Signing)
 	if err != nil {
-		log.Fatalf("loading signing key: %v", err)
+		log.Fatalf("loading signing keyring: %v", err)
 	}
 	if cfg.Signing.KeyID == "" {
 		log.Printf("WARNING: EDGE_SIGNING_KEY_ID is empty; rotation semantics will be ambiguous. Set a logical key id (e.g. \"k1\") before shipping rotation code.")
@@ -99,7 +100,7 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, signer,
+		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, keyring,
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
@@ -112,7 +113,7 @@ func New(
 	migrationSvc := service.NewMigrationService(
 		deploymentRepo, artifactStore,
 		cfg.Migration.EdgeMigratePath, cfg.Migration.WasiSdkPath, cfg.Migration.RustcPath,
-		signer,
+		keyring,
 	)
 	trafficSvc := service.NewTrafficService(
 		db, trafficSplitRepo, deploymentRepo, activeDeploymentRepo,
@@ -574,21 +575,44 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 	return d
 }
 
-// loadSigner constructs a *signing.Signer from the validated config.
-// Precedence matches `signing.LoadFromEnv`: file path (KeyPath)
-// wins over inline (Key). The config validator has already rejected
-// the case where both are empty, so exactly one path here is taken —
-// but this function is also reachable from tests that bypass Load
+// loadKeyring constructs a *signing.Keyring from the validated config.
+// Precedence matches `signing.LoadFromEnv`: keyring file (KeyringPath)
+// > inline keyring (Keyring) > legacy single-key file (KeyPath) >
+// inline single-key (Key). The legacy forms are kept as a one-release
+// deprecation fallback and produce a 1-entry keyring with kid
+// "default" (a deprecation warning is logged here so operators see
+// it from one place). The config validator has already rejected the
+// case where all four are empty, so at least one path here is taken
+// — but this function is also reachable from tests that bypass Load
 // (the bundled-config regression guard bypasses Load and asserts the
 // error is logged in a stable way). The empty-guard here returns the
 // same sentinel error the validator would emit, so callers see one
 // consistent message regardless of which layer caught it.
-func loadSigner(cfg *config.SigningConfig) (*signing.Signer, error) {
-	if cfg.KeyPath == "" && cfg.Key == "" {
-		return nil, fmt.Errorf("%w: EDGE_SIGNING_KEY_PATH (or EDGE_SIGNING_KEY) is required (issue #307)", signing.ErrInvalidKey)
+func loadKeyring(cfg *config.SigningConfig) (*signing.Keyring, error) {
+	if cfg.KeyPath == "" && cfg.Key == "" && cfg.KeyringPath == "" && cfg.Keyring == "" {
+		return nil, fmt.Errorf("%w: EDGE_SIGNING_KEYRING_PATH (or EDGE_SIGNING_KEYRING, EDGE_SIGNING_KEY_PATH, EDGE_SIGNING_KEY) is required (issue #307 PR1)", signing.ErrInvalidKey)
 	}
+	if cfg.KeyringPath != "" {
+		return signing.LoadKeyringFromFile(cfg.KeyringPath, cfg.KeyID)
+	}
+	if cfg.Keyring != "" {
+		return signing.LoadKeyringFromInline(cfg.Keyring, cfg.KeyID)
+	}
+	// Legacy single-key fallback (deprecated).
+	if cfg.KeyID != "" && cfg.KeyID != signing.DefaultKeyID {
+		return nil, fmt.Errorf("%w: legacy single-key cannot satisfy EDGE_SIGNING_KEY_ID=%q; use EDGE_SIGNING_KEYRING", signing.ErrInvalidKey, cfg.KeyID)
+	}
+	log.Printf("signing: EDGE_SIGNING_KEY[_PATH] is deprecated; use EDGE_SIGNING_KEYRING[_PATH] (issue #307 PR1)")
 	if cfg.KeyPath != "" {
-		return signing.LoadFromFile(cfg.KeyPath, cfg.KeyID)
+		s, err := signing.LoadFromFile(cfg.KeyPath, signing.DefaultKeyID)
+		if err != nil {
+			return nil, err
+		}
+		return signing.KeyringFromSigner(s, signing.DefaultKeyID), nil
 	}
-	return signing.LoadFromRaw([]byte(cfg.Key), cfg.KeyID)
+	s, err := signing.LoadFromRaw([]byte(cfg.Key), signing.DefaultKeyID)
+	if err != nil {
+		return nil, err
+	}
+	return signing.KeyringFromSigner(s, signing.DefaultKeyID), nil
 }

@@ -68,13 +68,13 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // (issue #104). When empty, the bootstrap endpoint returns 501
 // (not configured). Set via `BOOTSTRAP_SECRET` env var.
 type InternalHandler struct {
-	deploymentSvc  autoRollbacker
-	workerSvc      workerRegisterer
-	domainSvc      InternalDomainServiceInterface
-	logEntryRepo   logEntryRepo
-	reconcileSvc   syncRequester
-	syncBuilder    syncPayloadBuilder
-	cpRegion       string
+	deploymentSvc   autoRollbacker
+	workerSvc       workerRegisterer
+	domainSvc       InternalDomainServiceInterface
+	logEntryRepo    logEntryRepo
+	reconcileSvc    syncRequester
+	syncBuilder     syncPayloadBuilder
+	cpRegion        string
 	bootstrapSecret string
 	// jwtSecret is the JWT_SECRET the bootstrap handshake delivers to workers.
 	jwtSecret string
@@ -141,13 +141,13 @@ func NewInternalHandler(
 	jwtSecret string,
 ) *InternalHandler {
 	return &InternalHandler{
-		deploymentSvc: deploymentSvc,
-		workerSvc:     workerSvc,
-		domainSvc:     domainSvc,
-		logEntryRepo:  logEntryRepo,
-		reconcileSvc:  reconcileSvc,
-		syncBuilder:   syncBuilder,
-		cpRegion:      cpRegion,
+		deploymentSvc:   deploymentSvc,
+		workerSvc:       workerSvc,
+		domainSvc:       domainSvc,
+		logEntryRepo:    logEntryRepo,
+		reconcileSvc:    reconcileSvc,
+		syncBuilder:     syncBuilder,
+		cpRegion:        cpRegion,
 		bootstrapSecret: bootstrapSecret,
 		jwtSecret:       jwtSecret,
 	}
@@ -577,9 +577,9 @@ type WorkerBootstrapRequest struct {
 	WorkerID  string `json:"worker_id"`
 	Region    string `json:"region"`
 	TenantID  string `json:"tenant_id"`
-	Timestamp string `json:"timestamp"`  // RFC3339, for replay protection
-	Nonce     string `json:"nonce"`      // random value for replay protection
-	Signature string `json:"signature"`  // HMAC-SHA256 of worker_id+":"+region+":"+tenant_id+":"+timestamp+":"+nonce
+	Timestamp string `json:"timestamp"` // RFC3339, for replay protection
+	Nonce     string `json:"nonce"`     // random value for replay protection
+	Signature string `json:"signature"` // HMAC-SHA256 of worker_id+":"+region+":"+tenant_id+":"+timestamp+":"+nonce
 }
 
 // Bootstrap handles POST /api/internal/bootstrap — the first phase of

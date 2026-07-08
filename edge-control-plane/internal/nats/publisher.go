@@ -48,12 +48,20 @@ type AppConfig struct {
 	// whether empty signatures are accepted. Each DeploymentRoute
 	// carries its own signature so canary splits can verify
 	// independently.
-	DeploymentSignature string            `json:"deployment_signature,omitempty"`
-	Routes              []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
-	Env                 map[string]string `json:"env"`
-	Allowlist           []string          `json:"allowlist"`
-	MaxMemoryMB         int               `json:"max_memory_mb"`
-	CpuBudgetMS         int               `json:"cpu_budget_ms"`
+	DeploymentSignature string `json:"deployment_signature,omitempty"`
+	// SigningKeyID is the logical key id (`EDGE_SIGNING_KEY_ID`
+	// on the CP) the signature above was produced with (issue #307
+	// follow-up PR1). Workers look this id up in their configured
+	// keyring to pick the right public key for verification; empty
+	// falls back to the default key. Omitted from the wire when
+	// empty so pre-PR1 workers silently ignore it (the field is
+	// additive and backward-compatible).
+	SigningKeyID string            `json:"signing_key_id,omitempty"`
+	Routes       []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
+	Env          map[string]string `json:"env"`
+	Allowlist    []string          `json:"allowlist"`
+	MaxMemoryMB  int               `json:"max_memory_mb"`
+	CpuBudgetMS  int               `json:"cpu_budget_ms"`
 }
 
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
@@ -62,7 +70,11 @@ type DeploymentRoute struct {
 	DeploymentID        string `json:"deployment_id"`
 	DeploymentHash      string `json:"deployment_hash"`
 	DeploymentSignature string `json:"deployment_signature,omitempty"`
-	Weight              int    `json:"weight"`
+	// SigningKeyID mirrors AppConfig.SigningKeyID for canary splits;
+	// each route is independently signed and may have been produced
+	// by a different key during key rotation.
+	SigningKeyID string `json:"signing_key_id,omitempty"`
+	Weight       int    `json:"weight"`
 }
 
 // HeartbeatMessage is published by workers to edgecloud.heartbeats.<region>.
@@ -140,8 +152,14 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 // publishes; pass a non-empty slice to activate canary splits. The
 // `omitempty` JSON tag on AppConfig.Routes means nil and missing
 // produce identical wire output.
+//
+// `signingKeyID` is the `EDGE_SIGNING_KEY_ID` the artifact was
+// signed with (issue #307 follow-up PR1). Empty string means "use
+// the worker's default key" — see `verifier::Keyring` on the
+// worker side. The `omitempty` JSON tag means an empty string is
+// dropped from the wire so pre-PR1 workers ignore it.
 func BuildAppConfig(
-	deploymentID, deploymentHash, deploymentSignature string,
+	deploymentID, deploymentHash, deploymentSignature, signingKeyID string,
 	env map[string]string,
 	allowlist []string,
 	maxMemoryMB int,
@@ -151,6 +169,7 @@ func BuildAppConfig(
 		DeploymentID:        deploymentID,
 		DeploymentHash:      deploymentHash,
 		DeploymentSignature: deploymentSignature,
+		SigningKeyID:        signingKeyID,
 		Env:                 env,
 		Allowlist:           allowlist,
 		MaxMemoryMB:         maxMemoryMB,

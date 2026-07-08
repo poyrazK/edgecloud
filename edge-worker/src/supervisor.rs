@@ -155,10 +155,13 @@ mod heartbeat_integration_tests {
             standby_pool_size: 1,
             // Issue #307 PR2: these tests predate the signature
             // verification feature; they don't exercise signing, so
-            // use the unsigned-friendly defaults.
+            // use the unsigned-friendly defaults. (PR1 follow-up:
+            // `signing_pubkey`/`signing_pubkey_path` became
+            // `signing_keyring`/`signing_keyring_path` for the
+            // multi-keyring shape.)
             require_signature: false,
-            signing_pubkey: None,
-            signing_pubkey_path: None,
+            signing_keyring: None,
+            signing_keyring_path: None,
         }
     }
 
@@ -422,6 +425,7 @@ mod heartbeat_integration_tests {
                 deployment_id: "d1".into(),
                 deployment_hash: "abc123".into(),
                 deployment_signature: None,
+                signing_key_id: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -550,6 +554,7 @@ mod heartbeat_integration_tests {
                 deployment_id: "d2".into(),
                 deployment_hash: "abc124".into(),
                 deployment_signature: None,
+                signing_key_id: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -875,6 +880,7 @@ impl Supervisor {
                 &spec.deployment_id,
                 &spec.deployment_hash,
                 spec.deployment_signature.as_deref(),
+                spec.signing_key_id.as_deref(),
             )
             .await
         {
@@ -2080,6 +2086,7 @@ mod tests {
             deployment_id: deployment_id.to_string(),
             deployment_hash: "abc123".to_string(),
             deployment_signature: None,
+            signing_key_id: None,
             routes: None,
             env: HashMap::new(),
             allowlist: None,

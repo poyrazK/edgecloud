@@ -19,9 +19,9 @@ const testBootstrapJWTSecret = "test-bootstrap-jwt-secret-32-bytes"
 
 func testBootstrapCfg() BootstrapJWTConfig {
 	return BootstrapJWTConfig{
-		BootstrapSecret:   testBootstrapSecret,
+		BootstrapSecret:    testBootstrapSecret,
 		BootstrapJWTSecret: testBootstrapJWTSecret,
-		Issuer:            "edgecloud-test",
+		Issuer:             "edgecloud-test",
 	}
 }
 
@@ -325,9 +325,9 @@ func TestVerifyBootstrapJWT_WrongSecret(t *testing.T) {
 	cfg := testBootstrapCfg()
 	token, _ := IssueBootstrapJWT(cfg, "w1", "t1", "fra")
 	wrongCfg := BootstrapJWTConfig{
-		BootstrapSecret:   "wrong-secret",
+		BootstrapSecret:    "wrong-secret",
 		BootstrapJWTSecret: "wrong-jwt-secret",
-		Issuer:            "edgecloud-test",
+		Issuer:             "edgecloud-test",
 	}
 	_, err := VerifyBootstrapJWT(token, wrongCfg)
 	if err == nil {
