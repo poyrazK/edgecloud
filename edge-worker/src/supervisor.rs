@@ -153,6 +153,12 @@ mod heartbeat_integration_tests {
             tls_key_path: None,
             socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             standby_pool_size: 1,
+            // Issue #307 PR2: these tests predate the signature
+            // verification feature; they don't exercise signing, so
+            // use the unsigned-friendly defaults.
+            require_signature: false,
+            signing_pubkey: None,
+            signing_pubkey_path: None,
         }
     }
 
@@ -192,6 +198,7 @@ mod heartbeat_integration_tests {
                 "http://localhost:0".to_string(),
                 std::path::PathBuf::from("/tmp"),
                 jwt.clone(),
+                None,
             )),
             port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
             nats: nats as Arc<dyn NatsClient>,
@@ -414,6 +421,7 @@ mod heartbeat_integration_tests {
             AppSpec {
                 deployment_id: "d1".into(),
                 deployment_hash: "abc123".into(),
+                deployment_signature: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -541,6 +549,7 @@ mod heartbeat_integration_tests {
             AppSpec {
                 deployment_id: "d2".into(),
                 deployment_hash: "abc124".into(),
+                deployment_signature: None,
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
@@ -814,13 +823,59 @@ impl Supervisor {
             None
         };
 
+        // Issue #307: refuse to instantiate an artifact we can't
+        // verify. Default-secure: EDGE_REQUIRE_SIGNATURE defaults to
+        // true in v1; the supervisor also requires an explicit
+        // signature on the AppSpec when the worker is configured
+        // to verify. The Downloader will re-verify on the actual
+        // download path, but we short-circuit here so the failing
+        // app doesn't even hit the network — surface the error
+        // before consuming a port + WASM instantiation slot.
+        if self.config.require_signature {
+            if spec.deployment_signature.is_none() {
+                let mut pool = self.port_pool.lock().await;
+                pool.release(raw_port);
+                if let Some(ws) = ws_port {
+                    pool.release(ws);
+                }
+                anyhow::bail!(
+                    "deployment {} has no signature; worker is configured \
+                     EDGE_REQUIRE_SIGNATURE=true. Either re-deploy from the \
+                     control plane (post-PR1 CPs always sign) or set \
+                     EDGE_REQUIRE_SIGNATURE=false on this worker.",
+                    spec.deployment_id
+                );
+            }
+            // Defensive: config validation in Config::from_env
+            // already ensures require_signature=true implies a
+            // verifier was constructed (i.e. a pubkey was set), so
+            // this branch is a worker-side invariant guard. If it
+            // ever fires, the early-fail is the right behavior —
+            // it's a "this should be impossible" check.
+            if self.downloader.signature_verifier.is_none() {
+                anyhow::bail!(
+                    "EDGE_REQUIRE_SIGNATURE=true but no signature verifier \
+                     constructed for {}; this is a worker-side bug",
+                    spec.deployment_id
+                );
+            }
+        }
+
         // Download artifact (blocking on first request).
         // Note: Downloader::get_artifact verifies SHA-256 against
-        // spec.deployment_hash before returning; on mismatch/empty/malformed it
-        // returns Err, which this arm propagates and the port-release path handles.
+        // spec.deployment_hash AND (when a verifier is configured)
+        // the Ed25519 signature over (hash || deployment_id) before
+        // returning. On any verification failure (hash mismatch,
+        // signature missing, signature wire-format error, or
+        // signature verify-false) it returns Err, which this arm
+        // propagates and the port-release path handles.
         let artifact = match self
             .downloader
-            .get_artifact(&spec.deployment_id, &spec.deployment_hash)
+            .get_artifact(
+                &spec.deployment_id,
+                &spec.deployment_hash,
+                spec.deployment_signature.as_deref(),
+            )
             .await
         {
             Ok(a) => a,
@@ -1997,6 +2052,7 @@ mod tests {
         AppSpec {
             deployment_id: deployment_id.to_string(),
             deployment_hash: "abc123".to_string(),
+            deployment_signature: None,
             routes: None,
             env: HashMap::new(),
             allowlist: None,
@@ -2363,6 +2419,7 @@ mod tests {
             "http://localhost".to_string(),
             std::path::PathBuf::from("/tmp"),
             crate::auth::WorkerJwtSigner::new(vec![], None, "", "", "", ""),
+            None,
         ));
 
         let dispatch_a = Arc::new(

@@ -44,6 +44,7 @@ use edge_worker::nats::{NatsClient as NatsClientTrait, NatsClientImpl};
 use edge_worker::port_pool::PortPool;
 use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
+use edge_worker::verifier::SignatureVerifier;
 
 /// Returns `true` if integration tests should be skipped. We skip when:
 ///
@@ -115,11 +116,20 @@ pub struct SupervisorGuard {
 ///
 /// Returns a [`SupervisorGuard`] that owns both the Supervisor and the
 /// NATS container; dropping the guard stops the container.
-pub async fn build_supervisor_with(config: Config) -> SupervisorGuard {
+///
+/// The `signature_verifier` is passed through to the
+/// `Supervisor`'s `Downloader`. Pass `None` for tests that
+/// don't exercise signature verification, or `Some(verifier)`
+/// for tests that need signed-artifact behavior (issue #307
+/// PR2).
+pub async fn build_supervisor_with(
+    config: Config,
+    signature_verifier: Option<Arc<SignatureVerifier>>,
+) -> SupervisorGuard {
     let (nats_container, nats_url) = start_nats().await;
     let mut config = config;
     config.nats_url = nats_url.clone();
-    let supervisor = build_supervisor_inner(&config)
+    let supervisor = build_supervisor_inner(&config, signature_verifier)
         .await
         .expect("build supervisor");
     SupervisorGuard {
@@ -127,6 +137,14 @@ pub async fn build_supervisor_with(config: Config) -> SupervisorGuard {
         nats_url,
         _nats_container: nats_container,
     }
+}
+
+/// Like [`build_supervisor_with`] but with no signature verifier wired
+/// in. The vast majority of tests are about non-crypto behavior
+/// (heartbeats, ports, ingress wiring) and would otherwise have to
+/// fabricate a key pair just to construct the supervisor.
+pub async fn build_supervisor_unsigned(config: Config) -> SupervisorGuard {
+    build_supervisor_with(config, None).await
 }
 
 /// Build a Supervisor that connects to an externally-managed NATS URL.
@@ -139,7 +157,7 @@ pub async fn build_supervisor_from_url(
 ) -> anyhow::Result<Arc<Supervisor>> {
     let mut config = config;
     config.nats_url = nats_url.to_string();
-    build_supervisor_inner(&config).await
+    build_supervisor_inner(&config, None).await
 }
 
 /// Default cache directory used by tests that don't care about cache
@@ -155,7 +173,10 @@ pub fn default_cache_dir() -> PathBuf {
 /// (the worker process asserts that streams already exist on startup;
 /// tests don't create the streams so they can run without a real NATS
 /// cluster).
-async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Supervisor>> {
+async fn build_supervisor_inner(
+    config: &Config,
+    signature_verifier: Option<Arc<SignatureVerifier>>,
+) -> anyhow::Result<Arc<Supervisor>> {
     let engine = create_engine()?;
     let state = Arc::new(tokio::sync::RwLock::new(WorkerState::new(engine)));
     let jwt_signer = WorkerJwtSigner::new(
@@ -170,6 +191,7 @@ async fn build_supervisor_inner(config: &Config) -> anyhow::Result<Arc<Superviso
         config.control_plane_url.clone(),
         config.cache_dir.clone(),
         jwt_signer.clone(),
+        signature_verifier,
     ));
     let port_pool = Arc::new(TokioMutex::new(PortPool::new(
         config.starting_port,

@@ -10,3 +10,10 @@ Cargo.lock
 *.swo
 *~
 .claude/
+# Artifact-signing keys (issue #307). Operators should NEVER commit
+# a generated Ed25519 private key — the wildcard catches hand-named
+# files like `signing.key`; the `*.key` form catches suffixes used
+# by some secret-management tooling. The pubkey is safe to commit
+# but the wildcard covers both, which is the safe default.
+*.key
+signing.key

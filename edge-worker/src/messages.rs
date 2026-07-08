@@ -69,6 +69,16 @@ pub struct DeploymentRoute {
     /// differs from the primary's).
     #[allow(dead_code)]
     pub deployment_hash: String,
+    /// Ed25519 signature over `(sha256(artifact) || deployment_id)` for
+    /// this route, base64url no-pad (issue #307). Each route carries its
+    /// own signature for the same reason `deployment_hash` is per-route:
+    /// the worker downloads each route's artifact separately, and the
+    /// signature must match that artifact's hash + that route's id.
+    /// Absent (or `None`) for pre-PR2 control planes — workers running
+    /// with `EDGE_REQUIRE_SIGNATURE=false` accept unsigned routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub deployment_signature: Option<String>,
     /// Reserved for canary weight propagation; the worker currently uses 100%
     /// for every route and applies the weight at the ingress layer. Held on the
     /// struct so the wire format stays in sync with `edge-ingress` and the
@@ -82,6 +92,22 @@ pub struct DeploymentRoute {
 pub struct AppSpec {
     pub deployment_id: String,
     pub deployment_hash: String,
+    /// Ed25519 signature over `(sha256(artifact) || deployment_id)` for
+    /// the primary deployment, base64url no-pad (issue #307). The
+    /// `Downloader` reconstructs the signed payload from
+    /// `deployment_hash` (decoded from hex to 32 raw bytes) and
+    /// `deployment_id`, then verifies the signature against the
+    /// worker's configured public key before instantiating the wasm.
+    ///
+    /// `#[serde(default)]` is the critical bit: pre-PR2 control planes
+    /// do NOT emit this field, and the deserializer would otherwise
+    /// fail with "missing field `deployment_signature`" on every
+    /// task message, which would brick every PR1-or-earlier
+    /// deployment in the wild. With `default`, the field is `None`
+    /// for legacy messages and the worker's `require_signature`
+    /// config decides what to do (default: refuse to instantiate).
+    #[serde(default)]
+    pub deployment_signature: Option<String>,
     /// listed (not just the primary one) concurrently. None = legacy mode
     /// (single deployment_id only).
     #[serde(default, skip_serializing_if = "Option::is_none")]

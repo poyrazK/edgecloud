@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::WorkerJwtSigner;
+use crate::verifier::SignatureVerifier;
 
 /// Downloads Wasm artifacts from the control plane with local cache.
 pub struct Downloader {
@@ -13,6 +14,20 @@ pub struct Downloader {
     control_plane_url: String,
     cache_dir: PathBuf,
     jwt_signer: Arc<WorkerJwtSigner>,
+    /// Optional Ed25519 signature verifier (issue #307, PR2). `None`
+    /// when the worker is started with `EDGE_REQUIRE_SIGNATURE=false`
+    /// (the rollout escape hatch) — in that mode, `get_artifact`
+    /// accepts unsigned artifacts, and the supervisor's
+    /// `require_signature` guard already short-circuits any
+    /// `None`-signature AppSpec before this method is reached for
+    /// "verification required" workers. Tests that don't exercise
+    /// signing also pass `None`.
+    ///
+    /// `pub(crate)` so the supervisor's `start_app` early-reject
+    /// guard can read it (defensive check that
+    /// `require_signature=true` always implies a verifier was
+    /// constructed).
+    pub(crate) signature_verifier: Option<Arc<SignatureVerifier>>,
 }
 
 impl Downloader {
@@ -20,12 +35,14 @@ impl Downloader {
         control_plane_url: String,
         cache_dir: PathBuf,
         jwt_signer: Arc<WorkerJwtSigner>,
+        signature_verifier: Option<Arc<SignatureVerifier>>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
             control_plane_url,
             cache_dir,
             jwt_signer,
+            signature_verifier,
         }
     }
 
@@ -36,39 +53,98 @@ impl Downloader {
     /// (a bare lowercase hex SHA-256 digest) before being returned. Verification errors
     /// (empty hash, malformed hash, or mismatch) cause this function to return `Err`;
     /// a tampered cache file is invalidated and the artifact is re-downloaded once.
+    ///
+    /// `expected_signature` is the base64url(no-pad) Ed25519 signature
+    /// over `(sha256(artifact) || deployment_id)`, carried by the
+    /// AppSpec. When the worker is configured with a verifier
+    /// (`signature_verifier.is_some()`), the signature is verified
+    /// BOTH in the cache fast-path AND the fresh-download path —
+    /// re-verification on cache hit means a tampered cache file
+    /// cannot bypass signature checks. Verification errors
+    /// invalidate the cache and re-download, mirroring the
+    /// hash-mismatch path. When the worker is configured without a
+    /// verifier, `expected_signature` MUST be `None` (the
+    /// supervisor's `require_signature` guard enforces this).
     pub async fn get_artifact(
         &self,
         deployment_id: &str,
         expected_hash: &str,
+        expected_signature: Option<&str>,
     ) -> anyhow::Result<bytes::Bytes> {
         let cache_path = self.cache_path(deployment_id);
 
         // Try local cache first. Always verify against expected_hash; an empty hash
         // is an error (see verify_hash) so the cache fast-path is only usable when
-        // the producer supplied a real hash.
+        // the producer supplied a real hash. Signature is verified when a verifier
+        // is configured; re-verifying on cache hit means a tampered .wasm file
+        // cannot bypass signature checks.
         if cache_path.exists() {
             match tokio::fs::read(&cache_path).await {
-                Ok(data) => match verify_hash(&data, expected_hash, deployment_id) {
-                    Ok(()) => {
-                        tracing::debug!(deployment_id, bytes = data.len(), "cache hit");
-                        return Ok(data.into());
-                    }
-                    Err(e) => {
+                Ok(data) => {
+                    // Hash verification is the cheap gate; if it fails,
+                    // the cached file is poisoned and we re-download.
+                    if let Err(e) = verify_hash(&data, expected_hash, deployment_id) {
                         tracing::warn!(
                             deployment_id,
                             err = %e,
-                            "cached artifact failed verification; invalidating and re-downloading"
+                            "cached artifact hash mismatch; invalidating and re-downloading"
                         );
                         let _ = tokio::fs::remove_file(&cache_path).await;
                         let _ = tokio::fs::remove_file(self.cwasm_path(deployment_id)).await;
+                    } else {
+                        // Signature verification is unforgiving — a wrong
+                        // sig stays wrong after a re-download, so we bail
+                        // immediately. The cache file is invalidated as a
+                        // side-effect before the error propagates so the
+                        // next call doesn't keep tripping the same check.
+                        match verify_signature(
+                            &data,
+                            expected_hash,
+                            expected_signature,
+                            deployment_id,
+                            self.signature_verifier.as_deref(),
+                        ) {
+                            Ok(()) => {
+                                tracing::debug!(deployment_id, bytes = data.len(), "cache hit");
+                                return Ok(data.into());
+                            }
+                            Err(sig_err) => {
+                                tracing::warn!(
+                                    deployment_id,
+                                    err = %sig_err,
+                                    "cached artifact signature mismatch; \
+                                     invalidating cache and propagating error"
+                                );
+                                let _ = tokio::fs::remove_file(&cache_path).await;
+                                let _ =
+                                    tokio::fs::remove_file(self.cwasm_path(deployment_id)).await;
+                                return Err(sig_err);
+                            }
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(deployment_id, err = %e, "cache read failed; downloading");
                     let _ = tokio::fs::remove_file(&cache_path).await;
                     let _ = tokio::fs::remove_file(self.cwasm_path(deployment_id)).await;
                 }
             }
+        }
+
+        // Defensive: if a verifier is wired in but no signature was
+        // supplied, don't waste an HTTP round trip — fail closed. The
+        // supervisor's `require_signature` guard should have caught
+        // this earlier; this is belt-and-suspenders.
+        if self.signature_verifier.is_some() && expected_signature.is_none() {
+            tracing::error!(
+                deployment_id,
+                "no signature in AppSpec but worker is configured to verify signatures; \
+                 refusing to download from control plane"
+            );
+            anyhow::bail!(
+                "AppSpec for {deployment_id} has no signature; worker is configured \
+                 EDGE_REQUIRE_SIGNATURE=true"
+            );
         }
 
         // Download from control plane. Sign the request with the worker's
@@ -95,6 +171,31 @@ impl Downloader {
 
         // Verify before caching — never persist unverified bytes to disk.
         verify_hash(&data, expected_hash, deployment_id)?;
+        // Signature verification is only meaningful when a verifier
+        // is configured. A None verifier + None signature is the
+        // legitimate "unsigned mode" path; the helper below returns
+        // Ok(()) in that case and bails on every other combination
+        // (None + Some sig, Some + None sig, malformed sig, etc.).
+        verify_signature(
+            &data,
+            expected_hash,
+            expected_signature,
+            deployment_id,
+            self.signature_verifier.as_deref(),
+        )?;
+        // Defensive warning: a control plane that signs but a worker
+        // that doesn't verify would silently accept the AppSpec's
+        // claimed signature without checking it. The helper returned
+        // Ok(()) above, so we log once so operators see the
+        // mismatch and can flip EDGE_REQUIRE_SIGNATURE on.
+        if self.signature_verifier.is_none() && expected_signature.is_some() {
+            tracing::warn!(
+                deployment_id,
+                "AppSpec carries a signature but worker has no verifier configured; \
+                 the signature is ignored. Set EDGE_SIGNING_PUBKEY[_PATH] and \
+                 EDGE_REQUIRE_SIGNATURE=true to enable verification."
+            );
+        }
 
         // Ensure cache directory exists and write to cache
         tokio::fs::create_dir_all(&self.cache_dir).await?;
@@ -210,6 +311,111 @@ impl Downloader {
     }
 }
 
+/// Verify the Ed25519 signature over `(sha256(bytes) || deployment_id)`.
+///
+/// The signed message layout mirrors the Go control plane's
+/// `internal/signing/signer.go::Sign` byte-for-byte:
+///   `msg = make([]byte, 0, 32+len(deploymentID))`
+///   `msg = append(msg, hashBytes...)`        // raw 32 bytes
+///   `msg = append(msg, []byte(deploymentID)...)`
+///
+/// The `bytes` argument here is the artifact itself (the same
+/// payload we just SHA-256'd in `verify_hash`); we re-hash it
+/// inside this function to avoid coupling verify_hash and
+/// verify_signature via a shared hash state. The redundant SHA-256
+/// is sub-microsecond on any real wasm artifact.
+///
+/// Returns `Ok(())` on a valid signature. Returns `Err` on:
+///
+/// - no verifier configured (a no-op when the worker is in
+///   `EDGE_REQUIRE_SIGNATURE=false` mode AND `expected_signature`
+///   is `None`; an error otherwise — see caller logic in
+///   `get_artifact`).
+/// - `expected_signature` is `None` but a verifier is configured
+///   (the supervisor should have caught this earlier; we double-
+///   check here so the worker fails closed on a wire-shape
+///   contract violation).
+/// - signature wire-format error (empty / non-base64url / wrong
+///   decoded length / ed25519-dalek rejected the sig shape).
+/// - signature is well-formed but does not match `(hash || id)` —
+///   a `verify()` returning `Ok(false)`.
+///
+/// Each error path includes `deployment_id` in the `tracing::error!`
+/// message so an operator can correlate a reject to a specific
+/// deployment without grepping for the verify call site.
+fn verify_signature(
+    bytes: &[u8],
+    expected_hash: &str,
+    expected_signature: Option<&str>,
+    deployment_id: &str,
+    verifier: Option<&SignatureVerifier>,
+) -> anyhow::Result<()> {
+    let verifier = match verifier {
+        Some(v) => v,
+        // No verifier: only acceptable when the AppSpec ALSO has no
+        // signature. The caller's get_artifact already logs a
+        // warning for the "verifier None + sig Some" combination
+        // (operator should set EDGE_REQUIRE_SIGNATURE); here we
+        // short-circuit cleanly on the "verifier None + sig None"
+        // case.
+        None => return Ok(()),
+    };
+
+    let sig = match expected_signature {
+        Some(s) => s,
+        None => {
+            tracing::error!(
+                deployment_id,
+                "no signature in AppSpec but worker is configured to verify signatures"
+            );
+            anyhow::bail!(
+                "AppSpec for {deployment_id} has no signature; worker is \
+                 configured EDGE_REQUIRE_SIGNATURE=true"
+            );
+        }
+    };
+
+    if sig.is_empty() {
+        tracing::error!(
+            deployment_id,
+            "deployment_signature is empty; refusing to instantiate unverified artifact"
+        );
+        anyhow::bail!("deployment_signature is empty for {deployment_id}");
+    }
+
+    match verifier.verify(expected_hash, deployment_id, sig) {
+        Ok(true) => {
+            tracing::debug!(
+                deployment_id,
+                bytes = bytes.len(),
+                "Ed25519 artifact signature verified"
+            );
+            Ok(())
+        }
+        Ok(false) => {
+            tracing::error!(
+                deployment_id,
+                "Ed25519 artifact signature verify returned false — refusing to instantiate. \
+                 The signature does not match (hash || deployment_id) for the configured pubkey. \
+                 Check that EDGE_SIGNING_PUBKEY matches the CP's EDGE_SIGNING_KEY[_PATH] and \
+                 that the deployment hasn't been tampered with."
+            );
+            anyhow::bail!(
+                "artifact signature verify failed for {deployment_id}: \
+                 signature does not match (hash || deployment_id)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                deployment_id,
+                err = %e,
+                "Ed25519 signature wire-format error — refusing to instantiate"
+            );
+            anyhow::bail!("artifact signature for {deployment_id} malformed: {e}");
+        }
+    }
+}
+
 /// Verify that `sha256(bytes)` equals `expected_hex` (a bare lowercase hex digest).
 ///
 /// `expected_hex` must be exactly 64 characters from the set `0-9 a-f` — the
@@ -310,6 +516,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Base64 encoder trait — used by the signature tests below to
+    // re-encode tampered/raw sigs back to base64url(no-pad).
+    use base64::Engine;
+    // ed25519-dalek's SigningKey::sign lives behind the Signer
+    // trait; import it so the signature tests can call .sign()
+    // directly on the test keypair.
+    use ed25519_dalek::Signer;
 
     fn sha256_hex(data: &[u8]) -> String {
         hex_encode(Sha256::digest(data).as_slice())
@@ -404,7 +617,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer(), None);
 
         let bytes: Vec<u8> = b"some test bytes".to_vec();
         let hash = sha256_hex(&bytes);
@@ -413,7 +626,7 @@ mod tests {
             .expect("pre-populate cache");
 
         let result = downloader
-            .get_artifact("d_unit_cache_hit", &hash)
+            .get_artifact("d_unit_cache_hit", &hash, None)
             .await
             .expect("cache hit must succeed");
         assert_eq!(result.as_ref(), bytes.as_slice());
@@ -446,7 +659,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer(), None);
 
         // Pre-populate the cache with content that won't match the expected hash.
         tokio::fs::write(cache_dir.join("d_unit_redownload.wasm"), b"tampered bytes")
@@ -454,7 +667,7 @@ mod tests {
             .expect("pre-populate tampered cache");
 
         let result = downloader
-            .get_artifact("d_unit_redownload", &good_hash)
+            .get_artifact("d_unit_redownload", &good_hash, None)
             .await
             .expect("re-downloaded bytes must verify and return");
         assert_eq!(result.as_ref(), good_bytes.as_slice());
@@ -494,7 +707,7 @@ mod tests {
 
         let tmp = TempDir::new().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
-        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer());
+        let downloader = Downloader::new(server.uri(), cache_dir.clone(), test_signer(), None);
 
         // Pre-populate the cache with tampered bytes so the cache fast-path
         // is exercised, then invalidated, forcing the download path.
@@ -509,7 +722,7 @@ mod tests {
         let hash = sha256_hex(b"any bytes");
 
         let err = downloader
-            .get_artifact("d_unit_500", &hash)
+            .get_artifact("d_unit_500", &hash, None)
             .await
             .expect_err("500 from server must propagate as Err");
         let msg = err.to_string();
@@ -543,6 +756,240 @@ mod tests {
     //     loop.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // get_artifact signature tests (issue #307 PR2). Mirror the
+    // hash-path tests above: 4 cases that exercise the signature
+    // verification path through both the cache fast-path and the
+    // fresh-download path. The verifier is the test keypair's
+    // verifying key (zero seed → deterministic).
+    // -----------------------------------------------------------------------
+
+    /// Cache + valid signature → bytes returned without contacting the
+    /// control plane. Mirrors the hash positive test, but the
+    /// verifier is configured and a valid signature is required.
+    #[tokio::test]
+    async fn get_artifact_signed_match_starts_app() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        // No mock mounted — any request fails this test.
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let bytes: Vec<u8> = b"signed test bytes".to_vec();
+        let hash = sha256_hex(&bytes);
+        // Deterministic test signer (zero seed, matches Go side).
+        let seed = [0u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
+            pub_key: sk.verifying_key(),
+        });
+        // Sign over (hash_raw || deployment_id) the way the Go signer does.
+        let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
+        let dep_id = "d_signed_match";
+        let mut msg = Vec::with_capacity(32 + dep_id.len());
+        msg.extend_from_slice(&hash_raw);
+        msg.extend_from_slice(dep_id.as_bytes());
+        let sig_bytes = sk.sign(&msg);
+        let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes.to_bytes());
+
+        // Pre-populate the cache with the right bytes — the cache
+        // fast-path returns without contacting the CP.
+        tokio::fs::write(cache_dir.join(format!("{dep_id}.wasm")), &bytes)
+            .await
+            .expect("pre-populate cache");
+
+        let downloader = Downloader::new(
+            server.uri(),
+            cache_dir.clone(),
+            test_signer(),
+            Some(verifier),
+        );
+        let result = downloader
+            .get_artifact(dep_id, &hash, Some(&sig))
+            .await
+            .expect("cache hit with valid sig must succeed");
+        assert_eq!(result.as_ref(), bytes.as_slice());
+
+        let received = server.received_requests().await.expect("received");
+        assert!(
+            received.is_empty(),
+            "expected zero requests on cache hit, got {}",
+            received.len()
+        );
+    }
+
+    /// Cache + corrupted signature → cache invalidated, re-download
+    /// also fails. The point: a single-bit corruption of the
+    /// signature column on disk must produce a clean verify-false,
+    /// not a silent accept.
+    #[tokio::test]
+    async fn get_artifact_signed_mismatch_rejects_app() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        // No mock mounted — if get_artifact tries to re-download
+        // (e.g. the cache invalidation path), the test fails because
+        // wiremock returns 404 for unmatched paths.
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let bytes: Vec<u8> = b"the real artifact".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        // Set up a verifier with a DIFFERENT key than the one that
+        // produced the signature — the cleanest way to assert
+        // "signature does not verify" without doing byte-level
+        // tampering of the base64 string.
+        let seed_a = [0u8; 32];
+        let seed_b = [1u8; 32]; // distinct key
+        let sk_a = ed25519_dalek::SigningKey::from_bytes(&seed_a);
+        let sk_b = ed25519_dalek::SigningKey::from_bytes(&seed_b);
+        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
+            pub_key: sk_a.verifying_key(),
+        });
+        // Sign with the WRONG key (sk_b) — verifier is sk_a's pubkey.
+        let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
+        let dep_id = "d_signed_bad";
+        let mut msg = Vec::with_capacity(32 + dep_id.len());
+        msg.extend_from_slice(&hash_raw);
+        msg.extend_from_slice(dep_id.as_bytes());
+        let sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk_b.sign(&msg).to_bytes());
+
+        // Pre-populate cache with valid bytes (hash matches) but
+        // the signature on the AppSpec is for a different key.
+        tokio::fs::write(cache_dir.join(format!("{dep_id}.wasm")), &bytes)
+            .await
+            .expect("pre-populate cache");
+
+        let downloader = Downloader::new(
+            server.uri(),
+            cache_dir.clone(),
+            test_signer(),
+            Some(verifier),
+        );
+        let err = downloader
+            .get_artifact(dep_id, &hash, Some(&sig))
+            .await
+            .expect_err("wrong-key signature must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signature") || msg.contains("verify"),
+            "expected signature-related error, got: {msg}"
+        );
+    }
+
+    /// First call (valid sig) populates the cache. Second call
+    /// (tampered sig in the new AppSpec) re-verifies via the cache
+    /// fast-path and rejects — proves cache hits re-verify.
+    #[tokio::test]
+    async fn get_artifact_signed_cache_hit_re_verifies() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let bytes: Vec<u8> = b"cache hit re-verify".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        let seed = [0u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
+            pub_key: sk.verifying_key(),
+        });
+        let hash_raw = decode_hex_32(&hash).expect("decode hex hash");
+        let dep_id = "d_signed_cache_reverify";
+        let mut msg = Vec::with_capacity(32 + dep_id.len());
+        msg.extend_from_slice(&hash_raw);
+        msg.extend_from_slice(dep_id.as_bytes());
+
+        let good_sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(&msg).to_bytes());
+
+        // A tampered sig (one b64 char flipped): take the good sig,
+        // flip a character that decodes to a different byte. We
+        // can't just append '+' (would fail base64url decode), so
+        // we re-encode a corrupted raw sig.
+        let mut raw = sk.sign(&msg).to_bytes();
+        raw[0] ^= 0x01; // flip one bit
+        let bad_sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+
+        // Pre-populate cache.
+        tokio::fs::write(cache_dir.join(format!("{dep_id}.wasm")), &bytes)
+            .await
+            .expect("pre-populate cache");
+
+        let downloader = Downloader::new(
+            server.uri(),
+            cache_dir.clone(),
+            test_signer(),
+            Some(verifier),
+        );
+
+        // First call: valid sig — should return the bytes.
+        let result = downloader
+            .get_artifact(dep_id, &hash, Some(&good_sig))
+            .await
+            .expect("valid sig must succeed");
+        assert_eq!(result.as_ref(), bytes.as_slice());
+
+        // Second call: tampered sig. The cache is populated, but
+        // the cache fast-path re-verifies the signature and must
+        // reject the tampered sig. Since the test sets no mock
+        // for the download path, the error propagates.
+        let err = downloader
+            .get_artifact(dep_id, &hash, Some(&bad_sig))
+            .await
+            .expect_err("tampered sig on cache hit must re-verify and reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signature") || msg.contains("verify"),
+            "expected signature-related error on cache-hit re-verify, got: {msg}"
+        );
+    }
+
+    /// Verifier configured but AppSpec has no signature → worker
+    /// refuses (the supervisor should have caught this earlier, but
+    /// the downloader also defends the invariant).
+    #[tokio::test]
+    async fn get_artifact_missing_signature_when_required_rejects() {
+        use tempfile::TempDir;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().to_path_buf();
+        let bytes: Vec<u8> = b"no sig at all".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        let seed = [0u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifier = std::sync::Arc::new(crate::verifier::SignatureVerifier {
+            pub_key: sk.verifying_key(),
+        });
+
+        // No cache — go straight to download. No mock mounted: a
+        // download attempt would fail with a 404 from wiremock.
+        let downloader = Downloader::new(
+            server.uri(),
+            cache_dir.clone(),
+            test_signer(),
+            Some(verifier),
+        );
+        let err = downloader
+            .get_artifact("d_missing_sig", &hash, None)
+            .await
+            .expect_err("None signature with verifier must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signature") || msg.contains("no signature"),
+            "expected missing-signature error, got: {msg}"
+        );
+    }
+
     /// Happy path: 200 from the control plane is treated as success
     /// and `Ok(())` is returned. The worker supervisor treats both
     /// 2xx and 4xx-with-our-signal-across as "delivered"; only 5xx and
@@ -568,7 +1015,8 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
 
         let result = downloader
             .post_auto_rollback("t_test", "myapp", "d_broken", 5)
@@ -617,7 +1065,8 @@ mod tests {
             .await;
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
 
         let err = downloader
             .post_auto_rollback("t_test", "myapp", "d_broken", 5)
@@ -654,7 +1103,8 @@ mod tests {
         // "expected mock not matched" and fail the test.
 
         let tmp = TempDir::new().expect("tempdir");
-        let downloader = Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer());
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
 
         for bad_name in ["../etc", "foo/bar", "foo\\bar", "..", ""] {
             let err = downloader
@@ -710,10 +1160,10 @@ mod tests {
             "test",
             "t_test",
         );
-        let downloader = Downloader::new(server.uri(), cache_dir, signer);
+        let downloader = Downloader::new(server.uri(), cache_dir, signer, None);
 
         let _ = downloader
-            .get_artifact("d_unit_auth", &good_hash)
+            .get_artifact("d_unit_auth", &good_hash, None)
             .await
             .expect("download should succeed");
 

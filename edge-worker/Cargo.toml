@@ -34,6 +34,12 @@ hmac = "0.12"
 hex = "0.4"
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
+# Artifact-signing verifier (issue #307, PR2). Both crates are already
+# transitive via reqwest's dependency tree — promoted to direct deps so
+# we can pin the version we depend on (transitive bumps would otherwise
+# pin us implicitly, and ed25519-dalek's 2.x → 1.x is a breaking change).
+ed25519-dalek = { version = "2.2", features = ["std"] }
+base64 = "0.22"
 
 # HTTP server for Handler dispatch (C6). axum hosts the public listener;
 # each request drives one `ProxyPre` instance through the guest's
@@ -62,6 +68,10 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
+# Used by the signature integration tests (issue #307 PR2) to
+# sign fixtures with the deterministic test keypair.
+ed25519-dalek = { version = "2.2", features = ["std"] }
+base64 = "0.22"
 # Generate self-signed TLS certs for the try_load_tls_config test (issue #209).
 rcgen = { version = "0.13", features = ["pem"] }
 # Shared test harness: NATS container startup, skip predicate, and

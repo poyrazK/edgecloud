@@ -138,6 +138,25 @@ pub struct Config {
     /// Configured size of the warm standby pool of Wasmtime engines.
     /// Default is 10. Configure via `EDGE_STANDBY_POOL_SIZE`.
     pub standby_pool_size: usize,
+
+    /// Ed25519 artifact-signature enforcement (issue #307, PR2).
+    /// `true` (the default — secure-by-default) means the worker
+    /// refuses to instantiate any artifact whose `AppSpec` lacks a
+    /// `deployment_signature` field, AND verifies the signature
+    /// against the configured public key before instantiation.
+    /// `false` is the rollout escape hatch: a worker started with
+    /// `EDGE_REQUIRE_SIGNATURE=false` accepts unsigned artifacts,
+    /// which is what enables a mixed fleet during the
+    /// CP→worker signed-deployment rollout.
+    pub require_signature: bool,
+    /// Inline Ed25519 public key, 64 lowercase hex chars (32 raw
+    /// bytes). Set via `EDGE_SIGNING_PUBKEY`. Mutually exclusive
+    /// with `signing_pubkey_path`; `pubkey_path` wins if both are
+    /// set (matches the CP-side precedence).
+    pub signing_pubkey: Option<String>,
+    /// Path to a file containing the Ed25519 public key, 64
+    /// lowercase hex chars on disk. Set via `EDGE_SIGNING_PUBKEY_PATH`.
+    pub signing_pubkey_path: Option<String>,
 }
 
 impl Config {
@@ -174,6 +193,17 @@ impl Config {
     ///   NATS (local dev).
     /// - `EDGE_EGRESS_SOCKET_MODE` (default: `block-all`) — see
     ///   `Config::socket_mode`.
+    /// - `EDGE_REQUIRE_SIGNATURE` (default: `true`) — refuse to
+    ///   instantiate an artifact without a valid Ed25519 signature
+    ///   (issue #307). Set to `false` for the rollout window if the
+    ///   worker is paired with a pre-PR1 control plane.
+    /// - `EDGE_SIGNING_PUBKEY` (default: unset) — inline 64-char
+    ///   lowercase hex Ed25519 public key. Mutually exclusive with
+    ///   `EDGE_SIGNING_PUBKEY_PATH`; the file path wins if both are
+    ///   set. Required when `EDGE_REQUIRE_SIGNATURE=true`.
+    /// - `EDGE_SIGNING_PUBKEY_PATH` (default: unset) — file with the
+    ///   64-char lowercase hex Ed25519 public key (one line, trailing
+    ///   newline tolerated). Production recommendation.
     pub fn from_env() -> anyhow::Result<Self> {
         let worker_id = std::env::var("WORKER_ID").context("WORKER_ID not set")?;
         let consumer_name =
@@ -197,7 +227,7 @@ impl Config {
                 worker_id,
             );
         }
-        Ok(Config {
+        let cfg = Config {
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
             consumer_name,
             worker_id,
@@ -238,7 +268,37 @@ impl Config {
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
             socket_mode: SocketEgressPolicy::from_env(),
             standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
-        })
+            // Issue #307 PR2: signature verification config. The default
+            // for `require_signature` is `true` (secure-by-default) — a
+            // worker that boots with signing disabled would silently
+            // accept unsigned artifacts and undo the rollout's threat
+            // model. Operators who need the escape hatch explicitly set
+            // `EDGE_REQUIRE_SIGNATURE=false`.
+            require_signature: parse_env_bool("EDGE_REQUIRE_SIGNATURE", true)?,
+            signing_pubkey: std::env::var("EDGE_SIGNING_PUBKEY").ok(),
+            signing_pubkey_path: std::env::var("EDGE_SIGNING_PUBKEY_PATH").ok(),
+        };
+
+        // Validate the signature-config invariant: secure-by-default
+        // means a worker with `require_signature=true` MUST have a
+        // public key configured. Without a key, the verifier is None
+        // and the worker would refuse to start any deployment —
+        // better to fail at boot with a clear message than to
+        // surface a confusing "missing pubkey" error on every
+        // task message.
+        if cfg.require_signature
+            && cfg.signing_pubkey.is_none()
+            && cfg.signing_pubkey_path.is_none()
+        {
+            anyhow::bail!(
+                "EDGE_REQUIRE_SIGNATURE=true but neither EDGE_SIGNING_PUBKEY nor \
+                 EDGE_SIGNING_PUBKEY_PATH is set. With secure-by-default, the worker \
+                 refuses to start until a public key is configured. Set \
+                 EDGE_REQUIRE_SIGNATURE=false to allow unsigned artifacts during the rollout."
+            );
+        }
+
+        Ok(cfg)
     }
 
     /// Returns the minimum level the worker log layer ships to the
@@ -287,6 +347,33 @@ fn parse_env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
         Ok(s) => s
             .parse::<usize>()
             .with_context(|| format!("{} must be a non-negative integer (got {:?})", name, s)),
+    }
+}
+
+/// Parse a boolean environment variable. Accepts the common truthy
+/// spellings (`1`, `true`, `yes`, `on`) and falsy spellings (`0`,
+/// `false`, `no`, `off`), case-insensitive. Any other value is
+/// rejected with a clear error rather than silently coerced to the
+/// default — operators debugging `EDGE_REQUIRE_SIGNATURE=true_or_false`
+/// prefer a startup failure to a mystery default.
+///
+/// Mirrors the `parse_env_u64` style: missing → `default`, present
+/// but unparseable → `Err` with the var name + value in the message.
+fn parse_env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(s) => {
+            let lower = s.to_ascii_lowercase();
+            match lower.as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                _ => anyhow::bail!(
+                    "{} must be a boolean (true/false/1/0/yes/no/on/off, got {:?})",
+                    name,
+                    s
+                ),
+            }
+        }
     }
 }
 
@@ -419,6 +506,9 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("APP_MAX_MEMORY_MB", Some("64")),
+            // Issue #307 PR2: secure-by-default requires a pubkey
+            // unless signing is explicitly disabled for this test.
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
         ]);
         let cfg = Config::from_env().expect("from_env");
         assert_eq!(cfg.max_memory_mb, 64, "APP_MAX_MEMORY_MB should be 64");
@@ -438,6 +528,9 @@ mod tests {
             ("WORKER_TENANT_ID", Some("t_test")),
             ("EPOCH_TICK_MS", Some("5")),
             ("EPOCH_DEADLINE_TICKS", Some("50")),
+            // Issue #307 PR2: same rationale as
+            // config_from_env_reads_max_memory_mb.
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
         ]);
         let cfg = Config::from_env().expect("from_env");
         assert_eq!(cfg.epoch_tick_ms, 5, "EPOCH_TICK_MS should be 5");
@@ -461,6 +554,11 @@ mod tests {
             ("APP_MAX_MEMORY_MB", None),
             ("EPOCH_TICK_MS", None),
             ("EPOCH_DEADLINE_TICKS", None),
+            // Issue #307 PR2: this test focuses on memory/epoch
+            // defaults; disable secure-by-default to let the config
+            // load (the require_signature defaults are asserted in
+            // their own tests below).
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
         ]);
         let cfg = Config::from_env().expect("from_env");
         assert_eq!(cfg.max_memory_mb, 256, "default max_memory_mb is 256");
@@ -490,6 +588,13 @@ mod tests {
             ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
             ("WORKER_TENANT_ID", Some("t_test")),
             ("WORKER_JWT_SECRET", None),
+            // Issue #307 PR2: this test predates signature
+            // verification; lock the secure-by-default invariant off so
+            // its absence doesn't trigger the new "no pubkey, refusing
+            // to start" validator when this test runs after one that
+            // unset `EDGE_REQUIRE_SIGNATURE` (nextest reorders across
+            // worker threads).
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
         ]);
         let cfg = Config::from_env().expect("from_env with no JWT secret");
         assert_eq!(
@@ -502,5 +607,141 @@ mod tests {
         unsafe { std::env::set_var("WORKER_JWT_SECRET", "round-trip-secret") };
         let cfg = Config::from_env().expect("from_env with JWT secret");
         assert_eq!(cfg.worker_jwt_secret, "round-trip-secret");
+    }
+
+    // ── Signature config tests (issue #307 PR2) ──────────────────────────
+    //
+    // The five tests cover the three resolution paths and the
+    // secure-by-default fail-fast:
+    //   1. require_signature defaults to true when EDGE_REQUIRE_SIGNATURE
+    //      is unset.
+    //   2. require_signature=false is honored when explicitly set.
+    //   3. EDGE_SIGNING_PUBKEY (inline 64-hex) is captured.
+    //   4. EDGE_SIGNING_PUBKEY_PATH (file path) is captured.
+    //   5. require_signature=true without any pubkey source fails fast
+    //      (the secure-by-default invariant).
+
+    /// `EDGE_REQUIRE_SIGNATURE` is unset → defaults to true. Pins the
+    /// secure-by-default contract: a future "fix" that flips the
+    /// default to false would silently undo the rollout's threat
+    /// model, and this test catches it.
+    #[test]
+    fn config_from_env_require_signature_defaults_true() {
+        // Default `true` + no pubkey → secure-by-default must fail.
+        // To exercise the *default value* of the bool, set an inline
+        // pubkey so the validator's invariant check passes.
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", None),
+            (
+                "EDGE_SIGNING_PUBKEY",
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            ("EDGE_SIGNING_PUBKEY_PATH", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with inline pubkey");
+        assert!(
+            cfg.require_signature,
+            "EDGE_REQUIRE_SIGNATURE must default to true when unset"
+        );
+        assert_eq!(
+            cfg.signing_pubkey.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
+    /// `EDGE_REQUIRE_SIGNATURE=false` is honored verbatim. The escape
+    /// hatch exists for the rollout window; this test pins the
+    /// bool-parser contract for the false path.
+    #[test]
+    fn config_from_env_require_signature_explicit_false() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
+            ("EDGE_SIGNING_PUBKEY", None),
+            ("EDGE_SIGNING_PUBKEY_PATH", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with require_signature=false");
+        assert!(
+            !cfg.require_signature,
+            "explicit EDGE_REQUIRE_SIGNATURE=false must round-trip"
+        );
+        assert!(cfg.signing_pubkey.is_none(), "no inline pubkey set → None");
+    }
+
+    /// `EDGE_SIGNING_PUBKEY` (inline 64 hex chars) is captured as-is
+    /// in the config. We don't validate the format here — that's
+    /// `SignatureVerifier::from_hex`'s job — only that the env var
+    /// is plumbed through.
+    #[test]
+    fn config_from_env_signing_pubkey_inline() {
+        let pubkey_hex = "ab".repeat(32); // 64 hex chars
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("true")),
+            ("EDGE_SIGNING_PUBKEY", Some(pubkey_hex.as_str())),
+            ("EDGE_SIGNING_PUBKEY_PATH", None),
+        ]);
+        let cfg = Config::from_env().expect("from_env with inline pubkey");
+        assert_eq!(cfg.signing_pubkey.as_deref(), Some(pubkey_hex.as_str()));
+    }
+
+    /// `EDGE_SIGNING_PUBKEY_PATH` (file with 64 hex chars) is captured
+    /// as a path string. The file is NOT read at config-load time —
+    /// `main.rs` reads it after `Config::from_env` and constructs
+    /// the verifier. Here we just pin that the path is plumbed.
+    #[test]
+    fn config_from_env_signing_pubkey_from_file() {
+        let path = "/etc/edge/signing.pub.hex";
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("true")),
+            ("EDGE_SIGNING_PUBKEY", None),
+            ("EDGE_SIGNING_PUBKEY_PATH", Some(path)),
+        ]);
+        let cfg = Config::from_env().expect("from_env with pubkey file path");
+        assert_eq!(cfg.signing_pubkey_path.as_deref(), Some(path));
+        assert!(cfg.signing_pubkey.is_none(), "no inline pubkey set → None");
+    }
+
+    /// Secure-by-default: `require_signature=true` + no pubkey source
+    /// is a fatal startup error. The error message must mention both
+    /// env var names so the operator knows exactly what to set.
+    #[test]
+    fn config_from_env_require_signature_true_without_key_fails() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://127.0.0.1:0")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("true")),
+            ("EDGE_SIGNING_PUBKEY", None),
+            ("EDGE_SIGNING_PUBKEY_PATH", None),
+        ]);
+        let err = Config::from_env().expect_err("require_signature=true + no key must fail");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("EDGE_REQUIRE_SIGNATURE")
+                && msg.contains("EDGE_SIGNING_PUBKEY")
+                && msg.contains("EDGE_SIGNING_PUBKEY_PATH"),
+            "error must name all three env vars; got: {msg}"
+        );
     }
 }
