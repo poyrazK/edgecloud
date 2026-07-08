@@ -168,6 +168,16 @@ pub struct DeployResponse {
     /// Desired replica count (issue #316). 0 means no threshold.
     #[serde(default)]
     pub desired_replicas: usize,
+    /// Signed SLSA L1 envelope (issue #307 PR2). The control plane
+    /// returns the full DSSE wrapper as JSON. We just persist it
+    /// verbatim to `.edge/attestation.json` — a downstream verifier
+    /// (or operator audit script) reads the file later. May be
+    /// `None` when the server is built without the PR2 envelope
+    /// constructor (pre-PR2 CP versions). Optional so a CLI built
+    /// with PR2 still talks to a CP without it — the deploy
+    /// succeeds, no attestation is recorded.
+    #[serde(default)]
+    pub build_attestation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,6 +577,7 @@ impl ApiClient {
         regions: &[String],
         auto_rollback: bool,
         replicas: usize,
+        build_metadata: Option<&serde_json::Value>,
     ) -> Result<DeployResponse> {
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         // Always parse the URL so we can append optional query params
@@ -598,12 +609,37 @@ impl ApiClient {
         }
         url = parsed.to_string();
 
+        // Issue #307 PR2: switch the deploy wire format from
+        // raw octet-stream to multipart/form-data so we can carry
+        // the SLSA L1 build_metadata alongside the wasm bytes in
+        // a single atomic request. The `build_metadata` part is
+        // optional — `None` still works (older CLI versions never
+        // produced it), the server treats an absent part the same
+        // as a JSON document with every field empty.
+        let mut form = reqwest::blocking::multipart::Form::new();
+        // `file` part: the wasm bytes with a sensible filename so
+        // the server's `mime/multipart` parser sees
+        // `filename="<app>.wasm"` (helps when the handler wants to
+        // log the name).
+        let cursor = std::io::Cursor::new(wasm_bytes.to_vec());
+        let file_part = reqwest::blocking::multipart::Part::reader(cursor)
+            .file_name(format!("{}.wasm", app_name))
+            .mime_str("application/wasm")
+            .map_err(|e| anyhow::anyhow!("invalid mime: {e}"))?;
+        form = form.part("file", file_part);
+        if let Some(meta) = build_metadata {
+            // `build_metadata` is JSON — encode it once and ship as
+            // a text part so the server-side handler can
+            // `multipart.FormValue` it and parse.
+            let raw = serde_json::to_string(meta)?;
+            form = form.text("build_metadata", raw);
+        }
+
         let resp = self
             .http
             .post(&url)
             .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/octet-stream")
-            .body(wasm_bytes.to_vec())
+            .multipart(form)
             .send()?;
 
         let resp = check_response(resp).map_err(|e| match e {

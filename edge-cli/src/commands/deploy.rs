@@ -8,7 +8,7 @@ use super::state_io::load_state_optional;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
-use crate::state::State;
+use crate::state::{BuildMetadata, State};
 use crate::LangArg;
 
 /// Dispatch to the upload or activate path based on whether `--id` was given.
@@ -114,7 +114,32 @@ fn run_upload(
     })?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let resp = client.deploy(&app_name, &wasm_bytes, regions, auto_rollback, replicas)?;
+    // Issue #307 PR2: read `.edge/build_metadata.json` (written by
+    // `edge build`) and forward it as the multipart `build_metadata`
+    // part. The control plane uses these fields to populate the SLSA
+    // L1 envelope's `predicate.invocation.parameters` and
+    // `predicate.buildTools[]` entries. Absent file = "no toolchain
+    // info available" — the server still builds an envelope, just with
+    // empty `buildTools[]` and a null `invocation.parameters`.
+    let build_metadata_json = match BuildMetadata::load_opt(path) {
+        Ok(Some(bm)) => Some(serde_json::to_value(&bm).context("serialize BuildMetadata")?),
+        Ok(None) => None,
+        Err(e) => {
+            // A corrupt build_metadata.json shouldn't fail the
+            // deploy — log and continue without it. The deploy
+            // envelope will have empty buildTools[].
+            eprintln!("warning: failed to read build_metadata.json: {e}");
+            None
+        }
+    };
+    let resp = client.deploy(
+        &app_name,
+        &wasm_bytes,
+        regions,
+        auto_rollback,
+        replicas,
+        build_metadata_json.as_ref(),
+    )?;
 
     let live_url = resp.url.clone();
     // Persist the regions the server actually accepted (it may
@@ -127,13 +152,26 @@ fn run_upload(
         regions.to_vec()
     };
     let state = State {
-        deployment_id: resp.id,
-        app_name,
-        live_url,
+        deployment_id: resp.id.clone(),
+        app_name: app_name.clone(),
+        live_url: live_url.clone(),
         regions: persisted_regions,
         desired_replicas: resp.desired_replicas,
     };
     state.save(path)?;
+
+    // Issue #307 PR2: persist the signed SLSA L1 envelope to
+    // `.edge/attestation.json` so the user can verify it later (or
+    // a downstream audit pipeline can ingest it). The server returns
+    // the full DSSE wrapper as JSON. We re-serialize pretty so the
+    // file is human-readable.
+    if let Some(att) = resp.build_attestation.as_ref() {
+        let attestation_path = path.join(".edge").join("attestation.json");
+        std::fs::create_dir_all(path.join(".edge")).context("create .edge/ for attestation")?;
+        let raw = serde_json::to_string_pretty(att).context("serialize build_attestation")?;
+        std::fs::write(&attestation_path, raw)
+            .with_context(|| format!("failed to write {}", attestation_path.display()))?;
+    }
 
     output::success("Deployed successfully");
     println!("  URL: {}", resp.url);

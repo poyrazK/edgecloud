@@ -303,7 +303,11 @@ fn transform_tree_c(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport>
             }
             None => MigrationReport::from_pattern_matches(app_name, matches),
         };
-        file_reports.push(FileReport::from_report(entry.path.clone(), report, &entry.source));
+        file_reports.push(FileReport::from_report(
+            entry.path.clone(),
+            report,
+            &entry.source,
+        ));
     }
     file_reports
 }
@@ -319,7 +323,11 @@ fn transform_tree_rust(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileRepo
     for entry in &entries {
         let matches = analyzer.analyze(&entry.source);
         let report = MigrationReport::from_pattern_matches(app_name, matches);
-        file_reports.push(FileReport::from_report(entry.path.clone(), report, &entry.source));
+        file_reports.push(FileReport::from_report(
+            entry.path.clone(),
+            report,
+            &entry.source,
+        ));
     }
     file_reports
 }

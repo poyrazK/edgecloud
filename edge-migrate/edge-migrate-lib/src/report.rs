@@ -710,7 +710,10 @@ mod tests {
             preprocessor: None,
         };
         let failed = FileReport::from_error("broken.c".to_string(), 0, "boom".to_string(), "");
-        let files = vec![FileReport::from_report("a.c".to_string(), success, ""), failed];
+        let files = vec![
+            FileReport::from_report("a.c".to_string(), success, ""),
+            failed,
+        ];
         let tree = TreeMigrationReport::from_files("hello".to_string(), files);
         assert!(matches!(tree.status, MigrationStatus::Failed));
         assert!(!tree.is_migratable());
@@ -796,67 +799,67 @@ mod tests {
     }
 }
 
-    #[test]
-    fn test_file_report_sha256_is_lowercase_hex_of_source() {
-        let r = MigrationReport {
-            status: MigrationStatus::Success,
-            wasm_stored: false,
-            deployment_id: None,
-            app_name: "x".to_string(),
-            patterns_detected: vec![],
-            patterns_transformed: vec![],
-            patterns_manual_review: vec![],
-            errors: vec![],
-            preprocessor: None,
-        };
-        let fr = FileReport::from_report("a.c".to_string(), r, "hello world");
-        // "hello world" → expected hex digest, lowercased.
-        let want = sha256_hex(b"hello world");
-        assert_eq!(fr.sha256, want);
-        assert_eq!(fr.sha256.len(), 64);
-    }
+#[test]
+fn test_file_report_sha256_is_lowercase_hex_of_source() {
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "hello world");
+    // "hello world" → expected hex digest, lowercased.
+    let want = sha256_hex(b"hello world");
+    assert_eq!(fr.sha256, want);
+    assert_eq!(fr.sha256.len(), 64);
+}
 
-    #[test]
-    fn test_file_report_empty_source_leaves_sha256_blank() {
-        let r = MigrationReport {
-            status: MigrationStatus::Success,
-            wasm_stored: false,
-            deployment_id: None,
-            app_name: "x".to_string(),
-            patterns_detected: vec![],
-            patterns_transformed: vec![],
-            patterns_manual_review: vec![],
-            errors: vec![],
-            preprocessor: None,
-        };
-        let fr = FileReport::from_report("a.c".to_string(), r, "");
-        assert!(fr.sha256.is_empty(), "expected empty sha256 for empty source, got {}", fr.sha256);
-    }
+#[test]
+fn test_file_report_empty_source_leaves_sha256_blank() {
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "");
+    assert!(
+        fr.sha256.is_empty(),
+        "expected empty sha256 for empty source, got {}",
+        fr.sha256
+    );
+}
 
-    #[test]
-    fn test_file_report_serializes_with_sha256_when_present() {
-        // Round-trip: a non-empty sha256 must persist through JSON
-        // serialization (issue #307 PR2.7 wires the digest into the
-        // SLSA materials array).
-        let r = MigrationReport {
-            status: MigrationStatus::Success,
-            wasm_stored: false,
-            deployment_id: None,
-            app_name: "x".to_string(),
-            patterns_detected: vec![],
-            patterns_transformed: vec![],
-            patterns_manual_review: vec![],
-            errors: vec![],
-            preprocessor: None,
-        };
-        let fr = FileReport::from_report(
-            "a.c".to_string(),
-            r,
-            "int main() { return 0; }",
-        );
-        let want_sha = fr.sha256.clone();
-        let tree = TreeMigrationReport::from_files("hello".to_string(), vec![fr]);
-        let json = serde_json::to_string(&tree).expect("serialize");
-        assert!(json.contains("\"sha256\""), "json: {}", json);
-        assert!(json.contains(&want_sha), "json: {}", json);
-    }
+#[test]
+fn test_file_report_serializes_with_sha256_when_present() {
+    // Round-trip: a non-empty sha256 must persist through JSON
+    // serialization (issue #307 PR2.7 wires the digest into the
+    // SLSA materials array).
+    let r = MigrationReport {
+        status: MigrationStatus::Success,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: "x".to_string(),
+        patterns_detected: vec![],
+        patterns_transformed: vec![],
+        patterns_manual_review: vec![],
+        errors: vec![],
+        preprocessor: None,
+    };
+    let fr = FileReport::from_report("a.c".to_string(), r, "int main() { return 0; }");
+    let want_sha = fr.sha256.clone();
+    let tree = TreeMigrationReport::from_files("hello".to_string(), vec![fr]);
+    let json = serde_json::to_string(&tree).expect("serialize");
+    assert!(json.contains("\"sha256\""), "json: {}", json);
+    assert!(json.contains(&want_sha), "json: {}", json);
+}
