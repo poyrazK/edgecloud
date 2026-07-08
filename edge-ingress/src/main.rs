@@ -10,16 +10,19 @@ mod caddy;
 mod config;
 mod domains;
 pub mod heartbeats;
+mod ingress_metrics;
 mod messages;
 mod ratelimit;
 mod routing;
 pub mod traffic;
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::Notify;
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
@@ -58,8 +61,20 @@ async fn main() -> ExitCode {
         region = %cfg.region,
         caddy = %cfg.caddy_admin_url,
         cert = %cfg.cert_file,
+        metrics = %cfg.metrics_listen,
         "edge-ingress starting"
     );
+
+    // Install the Prometheus metrics recorder and register descriptions.
+    let metrics_addr: SocketAddr = cfg
+        .metrics_listen
+        .parse()
+        .expect("invalid INGRESS_METRICS_LISTEN address");
+    PrometheusBuilder::new()
+        .with_http_listener(metrics_addr)
+        .install()
+        .expect("failed to install Prometheus metrics recorder");
+    ingress_metrics::describe_metrics();
 
     let table = Arc::new(RoutingTable::new());
     let caddy = match CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()) {
@@ -113,6 +128,7 @@ async fn main() -> ExitCode {
                 tracing::warn!("heartbeats::run returned cleanly; re-running in 1s");
             }
             Err(e) => {
+                metrics::counter!("ingress.nats.reconnects_total").increment(1);
                 tracing::error!(err = %e, "heartbeats::run failed; re-running in 5s");
                 sleep(Duration::from_secs(5)).await;
             }
