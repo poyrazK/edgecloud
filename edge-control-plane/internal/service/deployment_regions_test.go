@@ -123,10 +123,10 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 
 	// 1. deploymentRepo.GetByID returns a row with 3 regions.
 	regionsCol := `{"us-east","eu-west","ap-south"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", "", []byte{}, 0))
 
 	// 2. ActivateDeployment wraps the GetForUpdate + Set in a tx
 	// (so concurrent activate/rollback serialize via FOR UPDATE).
@@ -227,10 +227,10 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_legacy"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -288,10 +288,10 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	svc, mock, cleanup := activateSvcForTest(t, pub, "us-east")
 	defer cleanup()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs("d_x").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -355,10 +355,10 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_partial"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -431,10 +431,10 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 
 	const deploymentID = "d_zero_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -499,10 +499,10 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 
 	const deploymentID = "d_no_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", ""))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").

@@ -186,6 +186,44 @@ func (s *Signer) PublicKeyHex() string {
 // EDGE_SIGNING_KEY_ID.
 func (s *Signer) KeyID() string { return s.keyID }
 
+// SignBytes returns the base64url(no-pad) Ed25519 signature over an
+// arbitrary byte payload. Unlike Sign, there is no deployment-id
+// binding and no enforced payload shape — the caller is responsible
+// for canonicalizing whatever envelope (e.g. in-toto Statement) is
+// being signed and for re-canonicalizing the same way at verify
+// time. Used by issue #307 PR2's SLSA L1 provenance path: the
+// payload is the canonical JSON serialization of the in-toto
+// Statement v0.1 envelope, and the verifier re-canonicalizes the
+// payload from the DSSE wrapper before checking the signature.
+//
+// Empty `msg` is rejected with ErrInvalidDeploymentID — same
+// sentinel reused for "signature input rejected for shape" because
+// the caller almost certainly has a serialization bug if it hands
+// us an empty payload.
+func (s *Signer) SignBytes(msg []byte) (string, error) {
+	if len(msg) == 0 {
+		return "", fmt.Errorf("%w: empty payload", ErrInvalidDeploymentID)
+	}
+	sig := ed25519.Sign(s.priv, msg)
+	return base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+// VerifyBytes is the mirror of SignBytes: takes the payload bytes
+// directly and verifies the base64url(no-pad) signature against
+// this signer's public key. Used by operator tooling and by the
+// provenance unit tests; production verification of artifact
+// signatures still goes through Keyring.Verify.
+func (s *Signer) VerifyBytes(msg []byte, signatureB64 string) (bool, error) {
+	if len(msg) == 0 {
+		return false, fmt.Errorf("%w: empty payload", ErrInvalidDeploymentID)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(signatureB64)
+	if err != nil {
+		return false, fmt.Errorf("base64url decode signature: %w", err)
+	}
+	return ed25519.Verify(s.pub, msg, sig), nil
+}
+
 // Sign returns the base64url(no-pad) Ed25519 signature over
 // `sha256(artifact_bytes) || deployment_id`.
 //
