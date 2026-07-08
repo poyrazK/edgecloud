@@ -1,0 +1,23 @@
+[package]
+name = "edge-js-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "edgeCloud JavaScript runtime — QuickJS + edge:cloud WIT bindings"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Use wit-bindgen 0.45 to match other crates
+wit-bindgen = "0.45"
+# rquickjs with bindgen feature
+rquickjs = { version = "0.9.0", features = ["bindgen"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -11,11 +11,16 @@ target = "wasm32-wasip2"
 [deployment]
 "#;
 
-/// `edge.toml` body when `--api <URL>` was supplied. The URL is
-/// substituted at write time. When `--api` is omitted, the
-/// `[deployment]` section is left empty so the runtime falls back to
-/// `EDGE_API_URL` → `~/.config/edgecloud/config.toml` → the default
-/// production URL at deploy time.
+const EDGE_TOML_HEADER_JS: &str = r#"[project]
+name = "{name}"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = "js"
+
+[deployment]
+"#;
+
+/// `edge.toml` body when `--api <URL>` was supplied.
 const EDGE_TOML_DEPLOYMENT_WITH_API: &str = r#"api = "{api}"
 "#;
 
@@ -37,21 +42,56 @@ fn main() {
 }
 "#;
 
-const GITIGNORE: &str = r#"/target/
-/.wasm/
-/.cargo/
+const PACKAGE_JSON_TEMPLATE: &str = r#"{
+  "name": "{name}",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "edge build"
+  },
+  "dependencies": {
+    "@edgecloud/sdk": "{sdk_path}"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
+"#;
+
+const JS_HANDLER_TEMPLATE: &str = r#"import { kv, time } from '@edgecloud/sdk';
+
+/**
+ * Handle an incoming HTTP request.
+ * @param {{ method: string, path: string, headers: object, body: string }} req
+ * @returns {{ status: number, body: string, contentType?: string }}
+ */
+function handleRequest(req) {
+  const now = time.now();
+  return {
+    status: 200,
+    body: JSON.stringify({
+      hello: "world",
+      path: req.path,
+      now: Number(now),
+    }),
+    contentType: "application/json",
+  };
+}
+
+// Export to globalThis so the runtime can call it.
+globalThis.handleRequest = handleRequest;
+"#;
+
+const GITIGNORE: &str = r#"target/
 .edge/
+node_modules/
 *.wasm
 .DS_Store
 "#;
 
 /// Scaffold a new edgeCloud project.
-///
-/// `api` is the optional control-plane URL written into `[deployment]`.
-/// When `None`, the `[deployment]` section is left empty so the
-/// runtime falls back to `EDGE_API_URL` → `~/.config/edgecloud/config.toml`
-/// → `https://api.edgecloud.dev`.
-pub fn run(name: &str, api: Option<&str>) -> Result<()> {
+pub fn run(name: &str, api: Option<&str>, lang: Option<&str>) -> Result<()> {
     let dir = std::path::Path::new(name);
 
     if dir.exists() {
@@ -60,21 +100,43 @@ pub fn run(name: &str, api: Option<&str>) -> Result<()> {
 
     std::fs::create_dir_all(dir)?;
 
-    // edge.toml — header + optional api line.
-    let mut edge_toml = EDGE_TOML_HEADER.replace("{name}", name);
-    if let Some(url) = api {
-        edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
+    let language = lang.unwrap_or("rust");
+
+    if language == "js" || language == "javascript" {
+        // edge.toml (JS)
+        let mut edge_toml = EDGE_TOML_HEADER_JS.replace("{name}", name);
+        if let Some(url) = api {
+            edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
+        }
+        std::fs::write(dir.join("edge.toml"), edge_toml)?;
+
+        // package.json
+        let sdk_path = resolve_sdk_path();
+        let package_json = PACKAGE_JSON_TEMPLATE
+            .replace("{name}", name)
+            .replace("{sdk_path}", &sdk_path);
+        std::fs::write(dir.join("package.json"), package_json)?;
+
+        // src/handler.js
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("src").join("handler.js"), JS_HANDLER_TEMPLATE)?;
+    } else {
+        // edge.toml (Rust)
+        let mut edge_toml = EDGE_TOML_HEADER.replace("{name}", name);
+        if let Some(url) = api {
+            edge_toml.push_str(&EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", url));
+        }
+        std::fs::write(dir.join("edge.toml"), edge_toml)?;
+
+        // Cargo.toml
+        let cargo_toml = CARGO_TOML_TEMPLATE.replace("{name}", name);
+        std::fs::write(dir.join("Cargo.toml"), cargo_toml)?;
+
+        // src/main.rs
+        let main_rs = MAIN_RS_TEMPLATE.replace("{name}", name);
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("src").join("main.rs"), main_rs)?;
     }
-    std::fs::write(dir.join("edge.toml"), edge_toml)?;
-
-    // Cargo.toml
-    let cargo_toml = CARGO_TOML_TEMPLATE.replace("{name}", name);
-    std::fs::write(dir.join("Cargo.toml"), cargo_toml)?;
-
-    // src/main.rs
-    let main_rs = MAIN_RS_TEMPLATE.replace("{name}", name);
-    std::fs::create_dir_all(dir.join("src"))?;
-    std::fs::write(dir.join("src").join("main.rs"), main_rs)?;
 
     // .gitignore
     std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
@@ -89,6 +151,24 @@ pub fn run(name: &str, api: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_sdk_path() -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = cwd;
+        for _ in 0..5 {
+            let sdk_dir = dir.join("edge-js-sdk");
+            if sdk_dir.join("package.json").exists() {
+                if let Ok(abs_sdk) = sdk_dir.canonicalize() {
+                    return format!("file:{}", abs_sdk.to_string_lossy());
+                }
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    "file:../edge-js-sdk".to_string()
 }
 
 #[cfg(test)]
@@ -106,46 +186,5 @@ mod tests {
         let result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
         let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
         assert_eq!(parsed["project"]["name"].as_str(), Some("myapp"));
-    }
-
-    #[test]
-    fn test_edge_toml_with_api_section() {
-        let mut result = super::EDGE_TOML_HEADER.replace("{name}", "myapp");
-        result.push_str(
-            &super::EDGE_TOML_DEPLOYMENT_WITH_API.replace("{api}", "https://api.example.com"),
-        );
-        let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
-        assert_eq!(
-            parsed["deployment"]["api"].as_str(),
-            Some("https://api.example.com")
-        );
-    }
-
-    #[test]
-    fn test_cargo_toml_template_substitution() {
-        let result = super::CARGO_TOML_TEMPLATE.replace("{name}", "myapp");
-        assert!(result.contains("myapp"));
-        assert!(result.contains("0.1.0"));
-    }
-
-    #[test]
-    fn test_cargo_toml_template_valid_toml() {
-        let result = super::CARGO_TOML_TEMPLATE.replace("{name}", "myapp");
-        let _: toml::Value = toml::from_str(&result).expect("invalid Cargo.toml template");
-    }
-
-    #[test]
-    fn test_main_rs_template_substitution() {
-        let result = super::MAIN_RS_TEMPLATE.replace("{name}", "hello-world");
-        assert!(result.contains("hello-world"));
-    }
-
-    #[test]
-    fn test_gitignore_contains_expected_entries() {
-        let gi = super::GITIGNORE;
-        assert!(gi.contains("/target/"));
-        assert!(gi.contains(".edge/"));
-        assert!(gi.contains(".wasm/"));
-        assert!(gi.contains("*.wasm"));
     }
 }

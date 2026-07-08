@@ -19,6 +19,13 @@ pub struct Project {
     #[allow(dead_code)]
     pub version: String,
     pub target: String,
+    /// Programming language: "rust" (default) or "js".
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "rust".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

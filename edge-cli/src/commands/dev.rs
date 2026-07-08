@@ -31,11 +31,17 @@ pub fn run(path: &Path) -> Result<()> {
     // Initial build
     build_project(path, &project_name)?;
 
-    let artifact = path
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("debug")
-        .join(format!("{}.wasm", project_name));
+    let artifact = if edge_toml.project.language == "js" {
+        path.join("target")
+            .join("wasm32-wasip2")
+            .join("release")
+            .join(format!("{}.wasm", project_name))
+    } else {
+        path.join("target")
+            .join("wasm32-wasip2")
+            .join("debug")
+            .join(format!("{}.wasm", project_name))
+    };
 
     if !artifact.exists() {
         anyhow::bail!(
@@ -49,8 +55,8 @@ pub fn run(path: &Path) -> Result<()> {
         .args([
             "serve",
             &artifact.to_string_lossy(),
-            "--port",
-            &port.to_string(),
+            "--addr",
+            &format!("127.0.0.1:{}", port),
         ])
         .spawn()
         .with_context(|| {
@@ -95,6 +101,15 @@ pub fn run(path: &Path) -> Result<()> {
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(event) if event.kind.is_modify() || event.kind.is_create() => {
+                // Ignore changes to target/, .edge/, and node_modules/
+                let should_ignore = event.paths.iter().any(|p| {
+                    let s = p.to_string_lossy();
+                    s.contains("/target/") || s.contains("/.edge/") || s.contains("/node_modules/")
+                });
+                if should_ignore {
+                    continue;
+                }
+
                 println!("\n--- Change detected, rebuilding ---");
 
                 // Kill the running wasmtime process.
@@ -114,8 +129,8 @@ pub fn run(path: &Path) -> Result<()> {
                     .args([
                         "serve",
                         &artifact.to_string_lossy(),
-                        "--port",
-                        &port.to_string(),
+                        "--addr",
+                        &format!("127.0.0.1:{}", port),
                     ])
                     .spawn()
                 {
@@ -143,6 +158,11 @@ pub fn run(path: &Path) -> Result<()> {
 }
 
 fn build_project(path: &Path, name: &str) -> Result<()> {
+    let edge_toml = EdgeToml::from_path(path)?;
+    if edge_toml.project.language == "js" || edge_toml.project.language == "javascript" {
+        return crate::commands::build::run(path);
+    }
+
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2"])
         .current_dir(path)
