@@ -1,0 +1,21 @@
+{
+  "name": "@edgecloud/sdk",
+  "version": "0.2.0",
+  "description": "edgeCloud JavaScript SDK — access edge:cloud host APIs",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": "./src/index.js",
+    "./kv": "./src/kv.js",
+    "./cache": "./src/cache.js",
+    "./observe": "./src/observe.js",
+    "./time": "./src/time.js",
+    "./scheduling": "./src/scheduling.js",
+    "./process": "./src/process.js"
+  },
+  "files": [
+    "src/"
+  ],
+  "license": "MIT"
+}

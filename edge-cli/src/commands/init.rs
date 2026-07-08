@@ -18,11 +18,17 @@ language = "{language}"
 [deployment]
 "#;
 
-/// `edge.toml` body when `--api <URL>` was supplied. The URL is
-/// substituted at write time. When `--api` is omitted, the
-/// `[deployment]` section is left empty so the runtime falls back to
-/// `EDGE_API_URL` → `~/.config/edgecloud/config.toml` → the default
-/// production URL at deploy time.
+#[allow(dead_code)]
+const EDGE_TOML_HEADER_JS: &str = r#"[project]
+name = "{name}"
+version = "0.1.0"
+target = "wasm32-wasip2"
+language = "js"
+
+[deployment]
+"#;
+
+/// `edge.toml` body when `--api <URL>` was supplied.
 const EDGE_TOML_DEPLOYMENT_WITH_API: &str = r#"api = "{api}"
 "#;
 
@@ -44,6 +50,47 @@ fn main() {
 }
 "#;
 
+const PACKAGE_JSON_TEMPLATE: &str = r#"{
+  "name": "{name}",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "edge build"
+  },
+  "dependencies": {
+    "@edgecloud/sdk": "{sdk_path}"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
+"#;
+
+const JS_HANDLER_TEMPLATE: &str = r#"import { kv, time } from '@edgecloud/sdk';
+
+/**
+ * Handle an incoming HTTP request.
+ * @param {{ method: string, path: string, headers: object, body: string }} req
+ * @returns {{ status: number, body: string, contentType?: string }}
+ */
+function handleRequest(req) {
+  const now = time.now();
+  return {
+    status: 200,
+    body: JSON.stringify({
+      hello: "world",
+      path: req.path,
+      now: Number(now),
+    }),
+    contentType: "application/json",
+  };
+}
+
+// Export to globalThis so the runtime can call it.
+globalThis.handleRequest = handleRequest;
+"#;
+
 /// JS starter for `edge init --lang=js`. Exports `handle(request)`
 /// in the shape Javy v3.x expects for a wasi:http/incoming-handler
 /// component. Uses the canonical `Request`/`Response` globals
@@ -54,6 +101,7 @@ fn main() {
 /// written as plain single braces here (NOT `{{` / `}}` — this is a
 /// raw string, not a `format!` invocation, so brace escaping is
 /// unnecessary and would render literally in the output).
+#[allow(dead_code)]
 const INDEX_JS_TEMPLATE: &str = r#"// {name} — built with edgeCloud (JavaScript via Javy).
 //
 // The runtime hands you a Fetch-style Request and expects a Response
@@ -83,6 +131,7 @@ const GITIGNORE: &str = r#"/target/
 .edge/
 *.wasm
 .DS_Store
+/node_modules/
 "#;
 
 /// Scaffold a new edgeCloud project.
@@ -93,10 +142,8 @@ const GITIGNORE: &str = r#"/target/
 /// → `https://api.edgecloud.dev`.
 ///
 /// `lang` selects the starter template. `Rust` (the default) writes a
-/// Cargo project; `Js` writes `index.js` with a Javy-compatible
-/// wasi:http starter. The choice is persisted to `[project] language`
-/// in `edge.toml` so `edge build` and `edge deploy` know which pipeline
-/// to invoke.
+/// Cargo project; `Js` writes a Javascript project using esbuild and the JS SDK.
+/// The choice is persisted to `[project] language` in `edge.toml`.
 pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
     let dir = std::path::Path::new(name);
 
@@ -134,6 +181,24 @@ pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
     Ok(())
 }
 
+fn resolve_sdk_path() -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = cwd;
+        for _ in 0..5 {
+            let sdk_dir = dir.join("edge-js-sdk");
+            if sdk_dir.join("package.json").exists() {
+                if let Ok(abs_sdk) = sdk_dir.canonicalize() {
+                    return format!("file:{}", abs_sdk.to_string_lossy());
+                }
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    "file:../edge-js-sdk".to_string()
+}
+
 /// Rust starter: edge.toml + Cargo.toml + src/main.rs + .gitignore.
 fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
     write_edge_toml(dir, name, LangArg::Rust, api)?;
@@ -149,15 +214,18 @@ fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result
     Ok(())
 }
 
-/// JS starter: edge.toml + index.js + .gitignore. No Cargo.toml or
-/// `src/` — the project is intentionally JS-only, and Javy compiles
-/// `index.js` at the project root into a Preview 2 component under
-/// `target/javy/<name>.wasm`.
+/// JS starter: edge.toml + package.json + src/handler.js + .gitignore.
 fn scaffold_js(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
     write_edge_toml(dir, name, LangArg::Js, api)?;
 
-    let index_js = INDEX_JS_TEMPLATE.replace("{name}", name);
-    std::fs::write(dir.join("index.js"), index_js)?;
+    let sdk_path = resolve_sdk_path();
+    let package_json = PACKAGE_JSON_TEMPLATE
+        .replace("{name}", name)
+        .replace("{sdk_path}", &sdk_path);
+    std::fs::write(dir.join("package.json"), package_json)?;
+
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("src").join("handler.js"), JS_HANDLER_TEMPLATE)?;
 
     std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
     Ok(())

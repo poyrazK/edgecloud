@@ -83,8 +83,8 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
         .args([
             "serve",
             &artifact.to_string_lossy(),
-            "--port",
-            &port.to_string(),
+            "--addr",
+            &format!("127.0.0.1:{}", port),
         ])
         .spawn()
         .with_context(|| {
@@ -129,6 +129,15 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(event) if event.kind.is_modify() || event.kind.is_create() => {
+                // Ignore changes to target/, .edge/, and node_modules/
+                let should_ignore = event.paths.iter().any(|p| {
+                    let s = p.to_string_lossy();
+                    s.contains("/target/") || s.contains("/.edge/") || s.contains("/node_modules/")
+                });
+                if should_ignore {
+                    continue;
+                }
+
                 println!("\n--- Change detected, rebuilding ---");
 
                 // Kill the running wasmtime process.
@@ -148,8 +157,8 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
                     .args([
                         "serve",
                         &artifact.to_string_lossy(),
-                        "--port",
-                        &port.to_string(),
+                        "--addr",
+                        &format!("127.0.0.1:{}", port),
                     ])
                     .spawn()
                 {
@@ -176,18 +185,6 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     Ok(())
 }
 
-/// Run the language-appropriate build. Dispatches on `lang`:
-/// - `rust` → `cargo build --target wasm32-wasip2` (debug profile;
-///   release is overkill for a local dev loop).
-/// - `js`   → `javy compile -o <artifact> index.js`.
-///
-/// Re-invokes the toolchain directly instead of delegating to
-/// `commands::build::run` because the dev loop wants the debug
-/// profile and the JS entry to be the project-root `index.js`
-/// (matching the `edge init --lang=js` starter), whereas `build::run`
-/// hardcodes `--release` and uses cargo's release layout. The
-/// per-language commands still come from the same set as `edge build`
-/// so the toolchain surface stays consistent.
 fn build_project(path: &Path, lang: LangArg) -> Result<()> {
     match lang {
         LangArg::Rust => {
@@ -202,45 +199,7 @@ fn build_project(path: &Path, lang: LangArg) -> Result<()> {
             println!("✓ Built");
         }
         LangArg::Js => {
-            let javy = build::probe_javy_with(|name| which::which(name).ok()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "`javy` was not found on PATH.\n  \
-                     Install from https://github.com/bytecodealliance/javy/releases \
-                     (v3.x recommended)\n  \
-                     and ensure it is on your PATH before running `edge dev --lang=js`."
-                )
-            })?;
-            let entry = path.join("index.js");
-            if !entry.is_file() {
-                anyhow::bail!(
-                    "`index.js` not found in {} — create it at the project root \
-                     (matching the `edge init --lang=js` starter).",
-                    path.display(),
-                );
-            }
-            let target_dir = path.join("target").join("javy");
-            std::fs::create_dir_all(&target_dir)?;
-            // The exact filename is `<project_name>.wasm`; resolve
-            // it via the same path_for helper the initial build used
-            // so we don't duplicate the layout.
-            // Read `edge.toml` once to grab the project name — if
-            // it's missing the watcher should have caught it earlier.
-            let edge_toml = EdgeToml::from_path(path)?;
-            let artifact = build::path_for(path, &edge_toml.project.name, "js")
-                .context("resolving dev JS artifact path")?;
-            let output = Command::new(&javy)
-                .arg("compile")
-                .arg("-o")
-                .arg(&artifact)
-                .arg(&entry)
-                .current_dir(path)
-                .output()?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                output::error(&format!("javy compile failed:\n{stderr}"));
-                anyhow::bail!("javy compile failed (see error above)");
-            }
-            println!("✓ Built");
+            crate::commands::build::run(path, Some(LangArg::Js))?;
         }
     }
     Ok(())

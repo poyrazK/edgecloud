@@ -1,0 +1,51 @@
+import { kv, time, observe } from '@edgecloud/sdk';
+
+function handleRequest(req) {
+  const now = time.now();
+
+  observe.emitLog("info", `JS handler hit: ${req.path}`, [
+    ["method", req.method],
+  ]);
+
+  if (req.method === "POST" && req.path === "/kv") {
+    const body = JSON.parse(req.body || "{}");
+    if (body.key && body.value) {
+      kv.set(body.key, new TextEncoder().encode(body.value));
+      return { 
+        status: 201, 
+        body: JSON.stringify({ stored: body.key }),
+        contentType: "application/json"
+      };
+    }
+    return { 
+      status: 400, 
+      body: JSON.stringify({ error: "missing key or value" }),
+      contentType: "application/json"
+    };
+  }
+
+  if (req.path.startsWith("/kv/")) {
+    const key = req.path.slice(4);
+    const val = kv.get(key);
+    if (val) {
+      return { 
+        status: 200, 
+        body: new TextDecoder().decode(val),
+        contentType: "text/plain"
+      };
+    }
+    return { 
+      status: 404, 
+      body: JSON.stringify({ error: "not found" }),
+      contentType: "application/json"
+    };
+  }
+
+  return {
+    status: 200,
+    body: JSON.stringify({ hello: "world", path: req.path, now: Number(now) }),
+    contentType: "application/json"
+  };
+}
+
+globalThis.handleRequest = handleRequest;

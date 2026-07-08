@@ -1,0 +1,12 @@
+{
+  "name": "hello-js",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@edgecloud/sdk": "file:../../edge-js-sdk"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

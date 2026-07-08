@@ -429,7 +429,6 @@ enum AppsCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     match cli.command {
         Command::Init { name, api, lang } => commands::init::run(&name, api.as_deref(), lang),
         Command::Build { lang } => commands::build::run(&cli.path, lang),

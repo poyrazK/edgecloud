@@ -2,10 +2,9 @@
 //!
 //! The dispatch on source language lives in [`run`]. The current
 //! supported languages are `rust` (cargo build --target wasm32-wasip2)
-//! and `js` (javy compile). Each language writes its artifact to a
-//! language-namespaced path under `<project>/target/<lang>/` so multiple
-//! languages can coexist in the same checkout (e.g. a workspace that
-//! runs an integration fixture in JS against a Rust handler).
+//! and `js` (QuickJS custom runtime). Each language writes its artifact to a
+//! language-namespaced path under `<project>/target/` so multiple
+//! languages can coexist in the same checkout.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -29,9 +28,7 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     let effective = match lang {
         Some(flag) => {
             // Cross-check the CLI `--lang` against `edge.toml`'s
-            // `[project] language`. Mismatches used to surface as a confusing
-            // missing-artifact error at deploy time (finding 2 of the
-            // PR #221 review); rejecting here is the user-friendly fix.
+            // `[project] language`. Mismatches are rejected here.
             if flag.as_str() != toml_lang {
                 anyhow::bail!(
                     "`--lang {flag}` does not match `[project] language = {toml:?}` in edge.toml. \
@@ -76,9 +73,7 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
 ///
 /// Layout:
 /// - `rust` → `target/wasm32-wasip2/release/<name>.wasm` (cargo output)
-/// - `js`   → `target/javy/<name>.wasm`                  (javy output)
-/// - any other value defaults to the rust path; callers should
-///   reject unknown values before reaching here.
+/// - `js`   → `target/javy/<name>.wasm`                  (javy/QuickJS component output)
 pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<PathBuf> {
     let artifact = match lang {
         "rust" => project_root
@@ -100,24 +95,7 @@ pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<Pa
     Ok(artifact)
 }
 
-/// Locate the `javy` binary on PATH. Testable seam: pass any
-/// `which_fn` (e.g. `which::which`) and assert the discovered path
-/// or `None`. Mirrors the `Preprocessor::discover_with` pattern at
-/// `edge-migrate/edge-migrate-lib/src/preprocessor.rs:98-114`.
-///
-/// `which_fn` is invoked with the literal string `"javy"`. We do NOT
-/// consult a `$JAVY_PATH` env var (Javy has no standard install
-/// convention analogous to `$WASI_SDK_PATH`); users put javy on PATH.
-pub(crate) fn probe_javy_with<F>(which_fn: F) -> Option<PathBuf>
-where
-    F: Fn(&str) -> Option<PathBuf>,
-{
-    which_fn("javy")
-}
-
-/// Build via `cargo build --target wasm32-wasip2 --release`. The
-/// pre-language-dispatch original logic; kept verbatim so existing
-/// Rust projects get byte-identical output.
+/// Build via `cargo build --target wasm32-wasip2 --release`.
 fn build_rust(path: &Path, project_name: &str) -> Result<()> {
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "--release"])
@@ -139,57 +117,93 @@ fn build_rust(path: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build via `javy compile -o <artifact> <source>`. Requires Javy
-/// v3.x on PATH; surfaces a friendly error with install URL if not.
-/// Captures Javy's stderr and surfaces it on non-zero exit (sharper
-/// than the Rust path's silent cargo-output).
+/// JavaScript build pipeline:
+///   1. npm install (if node_modules missing)
+///   2. esbuild bundle
+///   3. cargo build edge-js-runtime (with EDGE_JS_BUNDLE env)
+///   4. wasm-tools component new
 fn build_js(path: &Path, project_name: &str) -> Result<()> {
-    let javy = probe_javy_with(|name| which::which(name).ok()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "`javy` was not found on PATH.\n  \
-             Install from https://github.com/bytecodealliance/javy/releases \
-             (v3.x recommended)\n  \
-             and ensure it is on your PATH before running `edge build --lang=js`."
-        )
-    })?;
+    let edge_dir = path.join(".edge");
+    std::fs::create_dir_all(&edge_dir)?;
 
-    let entry = path.join("index.js");
-    if !entry.is_file() {
-        anyhow::bail!(
-            "`index.js` not found in {} — create it at the project root \
-             (matching the `edge init --lang=js` starter).",
-            path.display(),
-        );
+    // 1. npm install if needed
+    if !path.join("node_modules").exists() {
+        println!("  Installing npm dependencies...");
+        let status = Command::new("npm")
+            .args(["install"])
+            .current_dir(path)
+            .spawn()?
+            .wait()?;
+        if !status.success() {
+            anyhow::bail!("npm install failed");
+        }
     }
 
-    // Create the language-namespaced target dir idempotently.
-    let target_dir = path.join("target").join("javy");
-    std::fs::create_dir_all(&target_dir)?;
+    // 2. Bundle with esbuild
+    let bundle_path = edge_dir.join("bundle.js");
+    let entry = path.join("src/handler.js");
+    if !entry.exists() {
+        anyhow::bail!("entry point not found: src/handler.js");
+    }
 
-    let artifact = target_dir.join(format!("{}.wasm", project_name));
-
-    // Use `Command::output()` (not `spawn/wait`) so Javy's stderr
-    // reaches the terminal on non-zero exit. Javy compile is fast
-    // enough that blocking on it is fine; we don't need streaming.
-    let output = Command::new(&javy)
-        .arg("compile")
-        .arg("-o")
-        .arg(&artifact)
-        .arg(&entry)
+    println!("  Bundling JS...");
+    let status = Command::new("npx")
+        .args([
+            "esbuild",
+            &entry.to_string_lossy(),
+            "--bundle",
+            "--format=iife",
+            "--platform=neutral",
+            &format!("--outfile={}", bundle_path.display()),
+        ])
         .current_dir(path)
-        .output()?;
+        .spawn()?
+        .wait()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        crate::output::error(&format!("javy compile failed:\n{stderr}"));
-        anyhow::bail!("javy compile failed (see error above)");
+    if !status.success() {
+        anyhow::bail!("esbuild bundling failed");
     }
 
-    if !artifact.exists() {
-        anyhow::bail!(
-            "javy exited successfully but artifact is missing at {}",
-            artifact.display(),
-        );
+    // 3. Build the JS runtime crate with the bundled JS embedded.
+    let runtime_dir = resolve_runtime_dir()?;
+
+    println!("  Compiling JS runtime...");
+    let status = Command::new("cargo")
+        .args(["build", "--target", "wasm32-wasip1", "--release"])
+        .current_dir(&runtime_dir)
+        .env("EDGE_JS_BUNDLE", bundle_path.canonicalize()?)
+        .spawn()?
+        .wait()?;
+
+    if !status.success() {
+        anyhow::bail!("JS runtime compilation failed");
+    }
+
+    // 4. Componentize with wasm-tools
+    let core_wasm = runtime_dir.join("target/wasm32-wasip1/release/edge_js_runtime.wasm");
+    let adapter = runtime_dir.join("wasi_snapshot_preview1.reactor.wasm");
+
+    let artifact = path_for(path, project_name, "js").context("resolving JS artifact path")?;
+    if let Some(parent) = artifact.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("  Creating component...");
+    let status = Command::new("wasm-tools")
+        .args([
+            "component",
+            "new",
+            &core_wasm.to_string_lossy(),
+            "--adapt",
+            &adapter.to_string_lossy(),
+            "-o",
+            &artifact.to_string_lossy(),
+        ])
+        .spawn()?
+        .wait()?;
+
+    if !status.success() {
+        anyhow::bail!("wasm-tools component new failed");
     }
 
     println!("✓ Built successfully");
@@ -197,25 +211,33 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the edge-js-runtime crate directory.
+fn resolve_runtime_dir() -> Result<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("EDGE_JS_RUNTIME_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+
+    // Walk up from CWD looking for edge-js-runtime/
+    let mut dir = std::env::current_dir()?;
+    for _ in 0..5 {
+        let candidate = dir.join("edge-js-runtime");
+        if candidate.join("Cargo.toml").exists() {
+            return Ok(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    anyhow::bail!(
+        "Cannot find edge-js-runtime/ crate. Set EDGE_JS_RUNTIME_DIR \
+         or run from within the edgecloud monorepo."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn probe_javy_with_returns_none_when_javy_missing() {
-        let result = probe_javy_with(|_| None);
-        assert!(result.is_none(), "expected None, got {result:?}");
-    }
-
-    #[test]
-    fn probe_javy_with_returns_some_when_javy_on_path() {
-        let expected = PathBuf::from("/usr/local/bin/javy");
-        let result = probe_javy_with(|name| {
-            assert_eq!(name, "javy", "probe_javy must look up exactly 'javy'");
-            Some(expected.clone())
-        });
-        assert_eq!(result, Some(expected));
-    }
 
     #[test]
     fn path_for_returns_rust_target_dir() {
@@ -236,11 +258,6 @@ mod tests {
 
     #[test]
     fn path_for_rejects_unknown_language_with_clear_error() {
-        // The old `_` arm silently routed unknown languages to the
-        // rust path, which made typos (e.g. `language = "ruby"`) surface
-        // as a confusing missing-file error at deploy time instead of
-        // a friendly unknown-language error. The helper is now the one
-        // place that knows the supported set.
         let root = Path::new("/proj");
         let err = path_for(root, "myapp", "ruby")
             .expect_err("unknown language must error, not fall back");
@@ -253,11 +270,6 @@ mod tests {
 
     #[test]
     fn path_for_rejects_empty_string_with_clear_error() {
-        // Combined with `Project::language_or_default`, an empty
-        // string in the toml now resolves to "rust" before reaching
-        // here. But callers that bypass the default (e.g. a future
-        // direct API) should still get a clear error, not a
-        // silent fall-through.
         let root = Path::new("/proj");
         let err =
             path_for(root, "myapp", "").expect_err("empty language must error, not fall back");

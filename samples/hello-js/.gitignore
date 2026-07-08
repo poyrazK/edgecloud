@@ -1,3 +1,5 @@
-/target/
-/.wasm/
+target/
+.edge/
+node_modules/
 *.wasm
+.DS_Store
