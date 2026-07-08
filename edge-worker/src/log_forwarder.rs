@@ -947,4 +947,88 @@ mod tests {
         f.flush_in_flight
             .store(false, std::sync::atomic::Ordering::Release);
     }
+
+    // ── Spool persist/replay tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn persist_failed_batch_without_spool_is_noop() {
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            None,
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        // No spool → persist returns early without error.
+        let f = LogForwarder::new("http://127.0.0.1:1", "w_test", "test-region", signer);
+        let body = IngestLogsRequest { entries: vec![] };
+        // This should not panic or error.
+        f.persist_failed_batch(&body).await;
+    }
+
+    #[tokio::test]
+    async fn persist_failed_batch_with_spool_appends() {
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            None,
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = edge_spool::Spool::open(dir.path())
+            .await
+            .expect("spool open");
+        let f = LogForwarder::new_with_spool(
+            "http://127.0.0.1:1",
+            "w_test",
+            "test-region",
+            signer,
+            Some(spool.clone()),
+        );
+        let body = IngestLogsRequest {
+            entries: vec![WireEntry {
+                level: "info".into(),
+                message: "hello".into(),
+                labels: serde_json::json!({}),
+                app_name: "my-app".into(),
+                deployment_id: "d1".into(),
+                tenant_id: "t1".into(),
+                worker_id: "w_test".into(),
+                region: "test-region".into(),
+            }],
+        };
+        f.persist_failed_batch(&body).await;
+
+        // Drain the spool — should contain the batch we persisted.
+        let batches = spool.drain(None).await.expect("drain");
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replay_empty_spool_returns_early() {
+        let signer = crate::auth::WorkerJwtSigner::new(
+            b"test-secret".to_vec(),
+            None,
+            "edgecloud",
+            "w_test",
+            "test-region",
+            "t_test",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = edge_spool::Spool::open(dir.path())
+            .await
+            .expect("spool open");
+        let f = LogForwarder::new_with_spool(
+            "http://127.0.0.1:1",
+            "w_test",
+            "test-region",
+            signer,
+            Some(spool),
+        );
+        // Empty spool → replay returns without error.
+        f.replay_spool().await;
+    }
 }

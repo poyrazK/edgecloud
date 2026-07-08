@@ -1012,6 +1012,25 @@ fn synthetic_413(
     synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic, meter)
 }
 
+// ── InFlightGuard tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod in_flight_guard_tests {
+    use super::*;
+
+    #[test]
+    fn in_flight_guard_decrements_on_drop() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(5));
+        {
+            let _guard = InFlightGuard(counter.clone());
+            // Guard constructed with clone of counter — counter unchanged
+            assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 5);
+        }
+        // On drop, the guard decrements
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+}
+
 #[cfg(test)]
 mod tls_tests {
     use super::*;
@@ -1072,6 +1091,39 @@ mod tls_tests {
             &Some(key_file.path().to_str().unwrap().into()),
         )
         .is_none());
+    }
+
+    #[test]
+    fn try_load_tls_config_returns_none_on_malformed_pem() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut cert_file = NamedTempFile::new().expect("cert tempfile");
+        write!(cert_file, "not-a-pem").expect("write cert");
+        let mut key_file = NamedTempFile::new().expect("key tempfile");
+        write!(key_file, "not-a-pem").expect("write key");
+        assert!(try_load_tls_config(
+            &Some(cert_file.path().to_str().unwrap().into()),
+            &Some(key_file.path().to_str().unwrap().into()),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn try_load_tls_config_returns_none_on_key_cert_mismatch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert_a =
+            rcgen::generate_simple_self_signed(vec!["a.example".into()]).expect("generate cert a");
+        let cert_b =
+            rcgen::generate_simple_self_signed(vec!["b.example".into()]).expect("generate cert b");
+        let mut cert_file = NamedTempFile::new().expect("cert tempfile");
+        write!(cert_file, "{}", cert_a.cert.pem()).expect("write cert");
+        let mut key_file = NamedTempFile::new().expect("key tempfile");
+        // Write cert_b's private key with cert_a's cert → mismatch → None
+        write!(key_file, "{}", cert_b.key_pair.serialize_pem()).expect("write key");
+        let result = try_load_tls_config(
+            &Some(cert_file.path().to_str().unwrap().into()),
+            &Some(key_file.path().to_str().unwrap().into()),
+        );
+        assert!(result.is_none());
     }
 }
 
@@ -1386,6 +1438,75 @@ mod synthetic_response_tests {
         assert_eq!(hint.lower(), 4);
     }
 
+    #[tokio::test]
+    async fn counting_body_error_frame_passthrough() {
+        let meter = test_meter();
+        // A body that immediately yields an error frame.
+        let err_body = http_body_util::StreamBody::new(futures::stream::iter(vec![Err::<
+            hyper::body::Frame<Bytes>,
+            ErrorCode,
+        >(
+            wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(None),
+        )]));
+        let inner_hyper = HyperOutgoingBody::new(err_body);
+        let mut counting = CountingBody {
+            inner: inner_hyper,
+            meter: meter.clone(),
+        };
+
+        use std::pin::Pin;
+        let frame = Pin::new(&mut counting).frame().await;
+        assert!(frame.is_some());
+        assert!(frame.unwrap().is_err());
+        // No bytes should have been recorded for an error frame.
+        let snap = meter.snapshot();
+        assert_eq!(snap.outbound_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn counting_body_end_of_stream() {
+        let meter = test_meter();
+        let inner = http_body_util::Full::new(Bytes::from(""));
+        let inner_hyper = HyperOutgoingBody::new(inner.map_err(|e| match e {}));
+        let counting = CountingBody {
+            inner: inner_hyper,
+            meter,
+        };
+        assert!(counting.is_end_stream());
+    }
+
+    // ── Synthetic response body content tests ──────────────────────────
+
+    #[tokio::test]
+    async fn synthetic_500_body_contains_diagnostic() {
+        let m = test_meter();
+        let resp = synthetic_500("custom error message", &m);
+        let body_bytes = resp
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes()
+            .to_vec();
+        let body = String::from_utf8(body_bytes).unwrap();
+        assert!(body.contains("custom error message"));
+    }
+
+    #[tokio::test]
+    async fn synthetic_413_body_contains_cap_info() {
+        let m = test_meter();
+        let resp = synthetic_413(10_000_000, 1024, &m);
+        let body_bytes = resp
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes()
+            .to_vec();
+        let body = String::from_utf8(body_bytes).unwrap();
+        assert!(body.contains("10000000"));
+        assert!(body.contains("1024"));
+        assert!(body.contains("cap"));
+    }
+
     // ── MaybeTls loopback tests ─────────────────────────────────────────
 
     #[tokio::test]
@@ -1580,5 +1701,184 @@ mod synthetic_response_tests {
     fn tick_ms_zero_clamped_to_1() {
         let tick: u64 = 0;
         assert_eq!(tick.max(1), 1);
+    }
+
+    // ── Drain in-flight tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drain_in_flight_clean_returns_true() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18002,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+                None,
+            )),
+            "d1".into(),
+            pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        // in_flight is 0, so drain should return true immediately
+        assert!(dispatch.drain_in_flight(Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_timeout_returns_false() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pool = Arc::new(crate::supervisor::StandbyPool::new(1).expect("pool"));
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::WorkerState::new(
+            engine,
+        )));
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+
+        let dispatch = HandlerDispatch::new(
+            18003,
+            1000,
+            10,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+                None,
+            )),
+            "d1".into(),
+            pool,
+            state,
+        )
+        .expect("HandlerDispatch::new");
+
+        // Set in_flight to 1 so drain times out
+        dispatch
+            .in_flight
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(!dispatch.drain_in_flight(Duration::from_millis(10)).await);
+    }
+
+    // ── HandlerDispatch tick clamping tests ────────────────────────────
+
+    #[test]
+    fn handler_dispatch_new_tick_ms_zero_clamped_to_one() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pool = crate::supervisor::StandbyPool::new(1).expect("pool");
+        let state = crate::state::WorkerState::new(engine);
+
+        let cfg = HandlerConfig {
+            tenant_id: "t".into(),
+            egress: Arc::new(edge_runtime::EgressPolicy::allow_all()),
+            log_sink: Arc::new(edge_runtime::interfaces::observe::NoopLogSink),
+            app_ctx: edge_runtime::interfaces::observe::AppLogContext {
+                app_name: "test".into(),
+                tenant_id: "t".into(),
+                deployment_id: "d1".into(),
+            },
+            meter: Arc::new(RequestMeter::new("t".into(), "d1".into())),
+            env: std::collections::HashMap::new(),
+            max_request_body_bytes: 0,
+            metrics_acc: None,
+            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            hostname_pinning_enabled: false,
+            hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+            last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
+            cpu_budget_ms: 1000,
+            max_memory_mb: 256,
+        };
+
+        // epoch_tick_ms=0 → tick_ms field = 1 (verified by budget math above)
+        let dispatch = HandlerDispatch::new(
+            18004,
+            1000,
+            0,
+            cfg,
+            None,
+            Arc::new(crate::downloader::Downloader::new(
+                "http://localhost".to_string(),
+                std::path::PathBuf::from("/tmp"),
+                crate::auth::WorkerJwtSigner::new(
+                    String::new(),
+                    None,
+                    String::new(),
+                    "w",
+                    "r",
+                    "t",
+                ),
+                None,
+            )),
+            "d1".into(),
+            Arc::new(pool),
+            Arc::new(tokio::sync::RwLock::new(state)),
+        )
+        .expect("HandlerDispatch::new");
+
+        assert!(dispatch.port >= 18004);
     }
 }

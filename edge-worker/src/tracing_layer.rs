@@ -433,4 +433,106 @@ mod tests {
         // Exactly ONE outer push — the inner warn was suppressed.
         assert_eq!(*sink.outer_calls.lock().unwrap(), 1);
     }
+
+    /// Event with no message → falls back to metadata.name() (non-empty).
+    #[test]
+    fn on_event_fallback_to_metadata_name() {
+        let sink = Arc::new(CapturingSink::default());
+        with_layer(sink.clone(), Level::INFO, || {
+            // Use tracing::event! with only a structured field, no literal message.
+            // The metadata.name() fallback produces a non-empty string.
+            tracing::event!(target: "my_function", Level::INFO, key = "val");
+        });
+        let records = sink.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let (rec, _) = &records[0];
+        // The message should be non-empty (metadata.name() fallback).
+        // The exact content depends on the tracing implementation.
+        assert!(
+            !rec.message.is_empty(),
+            "message should be non-empty (metadata.name fallback)"
+        );
+    }
+
+    /// Tracing event with a u64 field captured via record_u64.
+    #[test]
+    fn on_event_handles_u64_field() {
+        let sink = Arc::new(CapturingSink::default());
+        with_layer(sink.clone(), Level::INFO, || {
+            tracing::info!(port = 8080u64, "server bound");
+        });
+        let records = sink.records.lock().unwrap();
+        let (rec, _) = &records[0];
+        let labels: std::collections::HashMap<_, _> = rec.labels.iter().cloned().collect();
+        assert_eq!(labels.get("port").map(String::as_str), Some("8080"));
+    }
+
+    /// Tracing event with an i64 field captured via record_i64.
+    #[test]
+    fn on_event_handles_i64_field() {
+        let sink = Arc::new(CapturingSink::default());
+        with_layer(sink.clone(), Level::INFO, || {
+            tracing::info!(exit_code = -1i64, "process exited");
+        });
+        let records = sink.records.lock().unwrap();
+        let (rec, _) = &records[0];
+        let labels: std::collections::HashMap<_, _> = rec.labels.iter().cloned().collect();
+        assert_eq!(labels.get("exit_code").map(String::as_str), Some("-1"));
+    }
+
+    /// Tracing event with a bool field captured via record_bool.
+    #[test]
+    fn on_event_handles_bool_field() {
+        let sink = Arc::new(CapturingSink::default());
+        with_layer(sink.clone(), Level::INFO, || {
+            tracing::info!(ready = true, "component loaded");
+        });
+        let records = sink.records.lock().unwrap();
+        let (rec, _) = &records[0];
+        let labels: std::collections::HashMap<_, _> = rec.labels.iter().cloned().collect();
+        assert_eq!(labels.get("ready").map(String::as_str), Some("true"));
+    }
+
+    /// Debug fallback: f64 values captured via record_debug.
+    #[test]
+    fn on_event_handles_debug_fallback() {
+        let sink = Arc::new(CapturingSink::default());
+        with_layer(sink.clone(), Level::INFO, || {
+            tracing::info!(latency_ms = 42.5f64, "request completed");
+        });
+        let records = sink.records.lock().unwrap();
+        let (rec, _) = &records[0];
+        let labels: std::collections::HashMap<_, _> = rec.labels.iter().cloned().collect();
+        let val = labels.get("latency_ms").unwrap();
+        assert!(
+            val.contains("42.5"),
+            "expected debug formatting of f64, got {val}"
+        );
+    }
+
+    /// tracing_level_to_log_level maps all 5 variants correctly.
+    #[test]
+    fn tracing_level_to_log_level_maps_error() {
+        assert_eq!(tracing_level_to_log_level(Level::ERROR), LogLevel::Error);
+    }
+
+    #[test]
+    fn tracing_level_to_log_level_maps_warn() {
+        assert_eq!(tracing_level_to_log_level(Level::WARN), LogLevel::Warn);
+    }
+
+    #[test]
+    fn tracing_level_to_log_level_maps_info() {
+        assert_eq!(tracing_level_to_log_level(Level::INFO), LogLevel::Info);
+    }
+
+    #[test]
+    fn tracing_level_to_log_level_maps_debug() {
+        assert_eq!(tracing_level_to_log_level(Level::DEBUG), LogLevel::Debug);
+    }
+
+    #[test]
+    fn tracing_level_to_log_level_maps_trace() {
+        assert_eq!(tracing_level_to_log_level(Level::TRACE), LogLevel::Trace);
+    }
 }

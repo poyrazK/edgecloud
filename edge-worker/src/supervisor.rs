@@ -2622,4 +2622,60 @@ mod tests {
             "app-a should have been evicted"
         );
     }
+
+    // ── StandbyPool size-zero and release-to-full tests ─────────────
+
+    #[tokio::test]
+    async fn test_standby_pool_new_size_zero() {
+        // size=0 should be clamped to 1
+        let pool = StandbyPool::new(0).expect("pool with size 0");
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = RwLock::new(WorkerState::new(engine));
+        let _e = pool.acquire(&state).await;
+    }
+
+    #[tokio::test]
+    async fn test_standby_pool_release_to_full_pool() {
+        let pool = StandbyPool::new(2).expect("pool");
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = RwLock::new(WorkerState::new(engine));
+
+        // Drain both engines from the pool
+        let e1 = pool.acquire(&state).await;
+        let e2 = pool.acquire(&state).await;
+
+        // Release both back — second release fills the channel, third is silent drop
+        pool.release(e1);
+        pool.release(e2);
+
+        // Acquire one — should succeed without timeout since an engine was released
+        let start = std::time::Instant::now();
+        let _reacquired = pool.acquire(&state).await;
+        assert!(
+            start.elapsed().as_millis() < 450,
+            "should not timeout after release"
+        );
+    }
+
+    // ── allowlist_to_egress_policy tests ────────────────────────────
+
+    #[test]
+    fn allowlist_none_is_allow_all() {
+        let policy = allowlist_to_egress_policy(&None);
+        // allow_all policy should pass any URL
+        assert!(policy.check("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn allowlist_some_allows_matching() {
+        let policy = allowlist_to_egress_policy(&Some(vec!["example.com".into()]));
+        assert!(policy.check("https://example.com/api").is_ok());
+        assert!(policy.check("https://evil.com").is_err());
+    }
+
+    #[test]
+    fn allowlist_empty_denies_all() {
+        let policy = allowlist_to_egress_policy(&Some(vec![]));
+        assert!(policy.check("https://example.com").is_err());
+    }
 }
