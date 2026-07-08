@@ -220,24 +220,6 @@ func skipIfNoClang(t *testing.T) {
 	}
 }
 
-// skipIfNoRustcWasip2 skips the test if rustc is not on PATH or if the
-// wasm32-wasip2 target isn't installed. The latter is the most common
-// failure mode on a fresh checkout — rustc is bundled with rustup but
-// `rustup target add wasm32-wasip2` has to be run separately.
-func skipIfNoRustcWasip2(t *testing.T) {
-	rustc, err := exec.LookPath("rustc")
-	if err != nil {
-		t.Skip("rustc not in PATH")
-	}
-	out, err := exec.Command(rustc, "--print", "target-list").Output()
-	if err != nil {
-		t.Skipf("rustc --print target-list failed: %v", err)
-	}
-	if !strings.Contains(string(out), "wasm32-wasip2") {
-		t.Skip("rustc target wasm32-wasip2 not installed; run `rustup target add wasm32-wasip2`")
-	}
-}
-
 // rustHTTPSource is a minimal Rust program that exercises the
 // auto-transformable patterns: TcpBind (std::net::TcpListener::bind),
 // FsOpen (std::fs::File::open), and FsWrite (std::fs::write). After
