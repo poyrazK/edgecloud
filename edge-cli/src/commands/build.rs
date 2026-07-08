@@ -180,8 +180,7 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     }
 
     // 4. Componentize with wasm-tools
-    let core_wasm = runtime_dir
-        .join("target/wasm32-wasip1/release/edge_js_runtime.wasm");
+    let core_wasm = runtime_dir.join("target/wasm32-wasip1/release/edge_js_runtime.wasm");
     let adapter = runtime_dir.join("wasi_snapshot_preview1.reactor.wasm");
 
     let artifact = path_for(path, project_name, "js").context("resolving JS artifact path")?;
@@ -192,10 +191,13 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     println!("  Creating component...");
     let status = Command::new("wasm-tools")
         .args([
-            "component", "new",
+            "component",
+            "new",
             &core_wasm.to_string_lossy(),
-            "--adapt", &adapter.to_string_lossy(),
-            "-o", &artifact.to_string_lossy(),
+            "--adapt",
+            &adapter.to_string_lossy(),
+            "-o",
+            &artifact.to_string_lossy(),
         ])
         .spawn()?
         .wait()?;
