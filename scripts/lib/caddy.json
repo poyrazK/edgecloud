@@ -1,0 +1,21 @@
+{
+  "admin": {
+    "listen": "0.0.0.0:2019",
+    "identity": {
+      "identifiers": ["dev-token"],
+      "keys": {
+        "dev-token": "dev-token"
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "servers": {}
+    },
+    "tls": {
+      "automation": {
+        "on_demand": false
+      }
+    }
+  }
+}

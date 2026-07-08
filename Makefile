@@ -9,7 +9,8 @@
 # See README.md → "Local development" for the full workflow.
 
 .PHONY: infra-up infra-down infra-logs infra-ps infra-reset \
-        migrate run-api run-worker help
+        migrate run-api run-worker help \
+        dev dev-prereqs dev-install dev-config dev-down dev-clean
 
 help:                   ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "Targets:\n"} \
@@ -72,3 +73,36 @@ run-api:               ## Run the control plane in the foreground.
 # Example: REGION=fra WORKER_ID=w_fra_dev WORKER_TENANT_ID=t_system WORKER_JWT_SECRET=change-me-in-production make run-worker
 run-worker:            ## Run a worker in the foreground (env vars required).
 	cargo run --bin edge-worker
+
+# ----- Single-command dev stack (macOS-friendly) -----
+#
+# `make dev` brings up the full stack — Postgres + NATS + control plane
+# + worker + ingress + Caddy + a deployed samples/hello FaaS handler —
+# in the foreground with prefixed logs and Ctrl+C cleanup. It is the
+# recommended entry point for new contributors on macOS.
+#
+# The targets below DO NOT chain the existing infra-up/run-api/run-worker
+# targets because Make can't express the signal-trap and process-group
+# semantics needed for foreground orchestration with cleanup.
+#
+# Prerequisites: Docker Desktop running, Go 1.23+, Rust + rustup with
+# `wasm32-wasip2` target, jq, openssl. `make dev-install` handles all
+# of these on a fresh macOS box with Homebrew.
+
+dev:                   ## Bring up the full edgeCloud stack (foreground; Ctrl+C to stop).
+	@bash scripts/dev-up.sh
+
+dev-prereqs:           ## Verify macOS prereqs (no install). Exits non-zero on missing.
+	@bash scripts/dev-up.sh --check-only
+
+dev-install:           ## Install macOS prereqs via Homebrew + rustup.
+	@bash scripts/dev-install.sh
+
+dev-config:            ## Regenerate ~/.edgecloud/env.sh + edge-control-plane/config.local.yaml.
+	@bash scripts/dev-up.sh --write-config
+
+dev-down:              ## Stop postgres + nats containers (preserves the Postgres volume).
+	@docker compose down
+
+dev-clean:             ## Stop everything + wipe ~/.edgecloud state. Run with `bash scripts/dev-clean.sh --purge` to also wipe artifacts.
+	@bash scripts/dev-clean.sh

@@ -511,7 +511,19 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
 				return ErrInvalidWasm
 			}
-			hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r)
+			// The 4 bytes we just consumed must be re-attached to
+			// the stream that SaveAndHash will hash and write —
+			// otherwise the stored artifact is 4 bytes short
+			// (worker can't parse it, the supervisor's
+			// `detect_execution_model_from_bytes` substring
+			// scan finds no exports, and the SHA-256 in `deployments.hash`
+			// is the digest of the truncated bytes, so a later
+			// operator re-verifying the file with a real wasm
+			// tool gets a confusing mismatch). MultiReader glues
+			// the buffered prefix back in front of the still-to-read
+			// remainder.
+			full := io.MultiReader(bytes.NewReader(magic), r)
+			hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, full)
 			if saveErr != nil {
 				return saveErr
 			}
@@ -571,7 +583,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			err = fmt.Errorf("reading wasm magic: %w", readErr)
 		} else if !bytes.Equal(magic, []byte{0x00, 0x61, 0x73, 0x6d}) {
 			err = ErrInvalidWasm
-		} else if hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, r); saveErr != nil {
+		} else if hash, saveErr := s.artifactStore.SaveAndHash(ctx, tenantID, appName, deployment.ID, io.MultiReader(bytes.NewReader(magic), r)); saveErr != nil {
 			// Compensate in the same order as the tx branch's
 			// equivalent: apps-row cleanup BEFORE deployment-row
 			// cleanup, so the NOT EXISTS guard on
