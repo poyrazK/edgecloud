@@ -69,7 +69,9 @@ func isClientMigrationError(err error) bool {
 		errors.Is(err, service.ErrMigrationFailed) ||
 		errors.Is(err, service.ErrEdgeMigrateFailed) ||
 		errors.Is(err, service.ErrClangFailed) ||
-		errors.Is(err, service.ErrRustcFailed)
+		errors.Is(err, service.ErrRustcFailed) ||
+		errors.Is(err, service.ErrWasmToolsFailed) ||
+		errors.Is(err, service.ErrCargoBuildFailed)
 }
 
 // MigrationHandler handles migration requests.
@@ -216,10 +218,19 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Language gate. M2 accepted only C; M3 widens to c + rust.
+	// Language gate. M2 accepted only C; M3 widens to c + rust,
+	// but tree mode is C-only (issue #415): the cargo-based Rust
+	// pipeline builds a single-file Cargo project, while a tree
+	// submission would need a synthesized Cargo.toml + multi-file
+	// src/lib.rs wrapper. Single-file Rust is routed through
+	// POST /api/v1/migrate instead.
 	language := r.MultipartForm.Value["language"]
 	if len(language) == 0 || (language[0] != "c" && language[0] != "rust") {
 		http.Error(w, `{"error":"only c and rust are supported"}`, http.StatusBadRequest)
+		return
+	}
+	if language[0] == "rust" {
+		http.Error(w, `{"error":"rust tree-mode migration is not supported; submit a single-file project via POST /api/v1/migrate"}`, http.StatusBadRequest)
 		return
 	}
 
