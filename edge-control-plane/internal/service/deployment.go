@@ -15,6 +15,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/provenance"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
@@ -343,7 +344,7 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
@@ -480,6 +481,14 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			}
 			deployment.Signature = sig
 			deployment.SigningKeyID = kid
+			// PR2.6 — Build the SLSA L1 in-toto Statement envelope
+			// inside the tx so an envelope-build failure rolls the
+			// row + artifact back atomically. The envelope is
+			// persisted onto the deployment row verbatim (see
+			// domain.Deployment.BuildAttestation).
+			if attachErr := s.attachBuildAttestation(deployment, buildMeta); attachErr != nil {
+				return fmt.Errorf("attaching build attestation: %w", attachErr)
+			}
 			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
 				return fmt.Errorf("creating deployment: %w", err)
 			}
@@ -539,7 +548,12 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			} else {
 				deployment.Signature = sig
 				deployment.SigningKeyID = kid
-				if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
+				// PR2.6 — same envelope construction as the tx
+				// branch. No-tx path is test-only; production goes
+				// through the tx branch above.
+				if attachErr := s.attachBuildAttestation(deployment, buildMeta); attachErr != nil {
+					err = fmt.Errorf("attaching build attestation: %w", attachErr)
+				} else if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
 					err = fmt.Errorf("creating deployment: %w", createErr)
 				}
 			}
@@ -1392,4 +1406,74 @@ func (s *DeploymentService) GetArtifact(ctx context.Context, tenantID, appName, 
 		return nil, fmt.Errorf("deployment not found")
 	}
 	return s.artifactStore.OpenFormat(ctx, tenantID, appName, deploymentID, format)
+}
+
+// attachBuildAttestation constructs and signs an SLSA L1 in-toto
+// Statement v0.1 envelope for the freshly-saved artifact and
+// stores it on the deployment row as a JSONB byte slice.
+//
+// Called from inside the Deploy transaction callback so a
+// signing error rolls the row + artifact back atomically; the
+// pre-existing PR2.5 handler contract (build_metadata part of the
+// multipart envelope is optional) means buildMeta may be nil —
+// in that case we still build an envelope with "unknown"
+// toolchain fields so downstream audit pipelines always get a
+// well-formed attestation, just with a partial provenance
+// picture. Future EDGE_PROVENANCE_REQUIRED=true will tighten
+// this contract; for now nil is best-effort.
+//
+// Returns the canonical JSON bytes of the DSSE wrapper — the
+// service stores them verbatim on the deployments.build_attestation
+// JSONB column. The struct-marshal round-trip is avoided so the
+// bytes that go to disk are bit-for-bit identical to the bytes
+// the verifier will recompute.
+func (s *DeploymentService) attachBuildAttestation(deployment *domain.Deployment, buildMeta *provenance.CLISideMetadata) error {
+	if s.keyring == nil {
+		return fmt.Errorf("signing is not configured (deployment service requires a keyring at construction)")
+	}
+
+	// Populate toolchain entries from buildMeta. Optional fields
+	// stay empty — that matches the "unknown" toolchain story in
+	// the function docstring above.
+	var tools []provenance.ToolEntry
+	if buildMeta != nil {
+		if buildMeta.ToolchainRustc != "" {
+			tools = append(tools, provenance.ToolEntry{Name: "rustc", Version: buildMeta.ToolchainRustc})
+		}
+		if buildMeta.ToolchainCargo != "" {
+			tools = append(tools, provenance.ToolEntry{Name: "cargo", Version: buildMeta.ToolchainCargo})
+		}
+		if buildMeta.ToolchainClang != "" {
+			tools = append(tools, provenance.ToolEntry{Name: "clang", Version: buildMeta.ToolchainClang})
+		}
+	}
+
+	// Subject path is the on-disk artifact path so audit
+	// consumers can correlate the envelope back to the bytes.
+	artifactPath := fmt.Sprintf("/registry/%s/%s/%s.wasm",
+		deployment.TenantID, deployment.AppName, deployment.ID)
+
+	now := time.Now()
+	stmt, stmtErr := provenance.NewStatement(provenance.BuildOptions{
+		ArtifactSHA256:  deployment.Hash,
+		ArtifactPath:    artifactPath,
+		BuildStartedOn:  now,
+		BuildFinishedOn: now,
+		Tools:           tools,
+	})
+	if stmtErr != nil {
+		return fmt.Errorf("build statement: %w", stmtErr)
+	}
+
+	envelope, _, signErr := provenance.SignStatement(stmt, s.keyring)
+	if signErr != nil {
+		return fmt.Errorf("sign statement: %w", signErr)
+	}
+
+	envelopeBytes, marshalErr := json.Marshal(envelope)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal envelope: %w", marshalErr)
+	}
+	deployment.BuildAttestation = json.RawMessage(envelopeBytes)
+	return nil
 }

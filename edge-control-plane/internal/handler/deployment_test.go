@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 
@@ -377,22 +379,21 @@ func TestDeploy_TooManyRegions_Returns400(t *testing.T) {
 // (Request Entity Too Large) with a JSON error body, before the
 // deployment service is ever called.
 //
+// PR2 switched the wire format to multipart/form-data, so this
+// test now wraps the oversized payload in a multipart envelope so
+// the request reaches the size check (otherwise the handler
+// returns 415 for non-multipart Content-Type — the deliberate
+// wire format break is covered by
+// TestDeploy_NonMultipartContentType_Returns415).
+//
 // Pre-fix this returned 500 (or hung the handler on a multi-GiB
 // allocation) because io.ReadAll on an unbounded r.Body consumed
 // the full payload before the service layer's io.LimitReader ran.
 func TestDeploy_OversizedBody_Returns413(t *testing.T) {
 	mux := newDeployMux()
-	// Allocate MaxArtifactSize+1 bytes — one byte over the cap.
-	// We don't actually allocate MaxArtifactSize+1 in memory; we
-	// use a Reader that emits bytes on demand to keep the test
-	// cheap.
-	oversized := io.NopCloser(io.LimitReader(zeroReader{}, service.MaxArtifactSize+1))
-	req := httptest.NewRequest("POST", "/api/deploy/myapp", oversized)
-	// Set ContentLength explicitly so the handler's pre-check
-	// (Content-Length > MaxArtifactSize → 413) triggers before
-	// any service call. In the new streaming flow the service
-	// reads the body directly, so without this pre-check the
-	// service would be called and panic on a nil deploymentSvc.
+	body, ctype := oversizedMultipartBody(t, service.MaxArtifactSize+1)
+	req := httptest.NewRequest("POST", "/api/deploy/myapp", body)
+	req.Header.Set("Content-Type", ctype)
 	req.ContentLength = service.MaxArtifactSize + 1
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
@@ -416,4 +417,93 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 0
 	}
 	return len(p), nil
+}
+
+// oversizedMultipartBody wraps the zeroReader stream in a real
+// multipart envelope whose total advertised size equals
+// `wantContentLength`. Used by TestDeploy_OversizedBody_Returns413
+// to drive the size-cap path on the post-PR2 multipart wire.
+//
+// The total Content-Length (set by the test on the resulting
+// http.Request) is `wantContentLength` so the handler's pre-check
+// (Content-Length > MaxArtifactSize) fires before any I/O.
+//
+// We don't actually allocate wantContentLength-1 bytes; the
+// multipart writer streams. The MaxBytesReader fires mid-stream
+// and maps to 413.
+func oversizedMultipartBody(t *testing.T, wantContentLength int64) (*io.PipeReader, string) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		if err := mw.WriteField("build_metadata", "{}"); err != nil {
+			return
+		}
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Disposition", `form-data; name="file"; filename="app.wasm"`)
+		h.Set("Content-Type", "application/wasm")
+		fp, err := mw.CreatePart(h)
+		if err != nil {
+			return
+		}
+		// Emit wantContentLength-1 bytes (one less than the cap)
+		// so MaxBytesReader fires during the actual io.Copy and
+		// the assertion path matches the streaming rejection, not
+		// a pre-check rejection.
+		_, _ = io.CopyN(fp, zeroReader{}, wantContentLength-1)
+		_ = mw.Close()
+	}()
+	return pr, mw.FormDataContentType()
+}
+
+// TestDeploy_NonMultipartContentType_Returns415 verifies the PR2
+// wire-format break: deploy requests that don't arrive as
+// multipart/form-data are rejected with 415 (Unsupported Media
+// Type). The CLI ships alongside the CP, so the wire break is
+// acceptable per the PR2 release notes.
+func TestDeploy_NonMultipartContentType_Returns415(t *testing.T) {
+	mux := newDeployMux()
+	// Raw octet-stream — the pre-PR2 wire shape. Should be rejected
+	// with 415 and a message pointing the operator at the CLI
+	// upgrade.
+	req := httptest.NewRequest("POST", "/api/deploy/myapp",
+		io.NopCloser(strings.NewReader("not really a wasm")))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "multipart/form-data") {
+		t.Errorf("body = %q, want it to mention 'multipart/form-data'", rr.Body.String())
+	}
+}
+
+// TestDeploy_MultipartMissingFile_Returns400 verifies that a
+// multipart request that doesn't carry the required `file` part
+// returns 400 with a precise error, instead of being silently
+// accepted as a no-op.
+func TestDeploy_MultipartMissingFile_Returns400(t *testing.T) {
+	mux := newDeployMux()
+	var buf strings.Builder
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("build_metadata", "{}")
+	_ = mw.Close()
+
+	req := httptest.NewRequest("POST", "/api/deploy/myapp",
+		io.NopCloser(strings.NewReader(buf.String())))
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "'file' part") {
+		t.Errorf("body = %q, want it to mention the missing 'file' part", rr.Body.String())
+	}
 }

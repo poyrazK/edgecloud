@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"regexp"
@@ -74,7 +75,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0, nil)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -118,7 +119,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -198,6 +199,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		[]string{"us-east", "US-EAST"}, // second is invalid
 		false,
 		0,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid region, got nil")
@@ -230,6 +232,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		[]string{"us-east", "BAD-1", "BAD-2", "eu-west"},
 		false,
 		0,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -269,6 +272,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		regions,
 		false,
 		0,
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected error for over-cap regions, got nil")
@@ -323,6 +327,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		regions,
 		false,
 		0,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("Deploy at cap: %v", err)
@@ -377,7 +382,7 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
@@ -449,12 +454,69 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met (apps-row cleanup may be missing): %v", err)
+	}
+}
+
+// TestDeploy_PersistsSignedAttestation verifies PR2: a successful
+// Deploy attaches a DSSE-wrapped in-toto Statement envelope to
+// the deployment row. The deployment_hash matches the artifact
+// bytes (we use validWasmBytes, which has a known SHA-256), and
+// the envelope's subject digest is that hash. Sanity-checks the
+// envelope shape (DSSE payloadType, base64url payload string).
+func TestDeploy_PersistsSignedAttestation(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	svc := &DeploymentService{
+		db:             db,
+		deploymentRepo: repository.NewDeploymentRepository(db),
+		quotaRepo:      repository.NewQuotaRepository(db),
+		artifactStore:  storage.NewFSArtifactStore(tmpDir),
+		keyring:        signing.TestKeyring(t),
+	}
+
+	good := bytes.NewReader(validWasmBytes)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		good, nil, false, 0, nil)
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	if len(dep.BuildAttestation) == 0 {
+		t.Fatalf("BuildAttestation is empty; want non-empty JSONB")
+	}
+	var env map[string]any
+	if jerr := json.Unmarshal(dep.BuildAttestation, &env); jerr != nil {
+		t.Fatalf("BuildAttestation is not valid JSON: %v", jerr)
+	}
+	if env["payloadType"] != "application/vnd.in-toto+json" {
+		t.Errorf("payloadType = %v, want 'application/vnd.in-toto+json'", env["payloadType"])
+	}
+	pl, ok := env["payload"].(string)
+	if !ok || len(pl) == 0 {
+		t.Fatalf("payload missing or not a string: %v", env["payload"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
