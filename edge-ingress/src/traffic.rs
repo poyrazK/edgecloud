@@ -5,6 +5,7 @@
 //! at render time to override the heartbeat-derived weight with the
 //! authoritative split from the control plane DB.
 
+use crate::routing::RouteEntry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -282,6 +283,141 @@ mod tests {
 
         assert!(matches!(outcome, FetchOutcome::Ok(_)));
     }
+
+    // ── process_tick tests ───────────────────────────────────────────
+
+    fn route_entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
+        RouteEntry {
+            tenant_id: tenant.to_string(),
+            app_name: app.to_string(),
+            deployment_id: None,
+            weight: 100,
+            worker_addr: addr.to_string(),
+            port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            last_seen: std::time::Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_tick_empty_table() {
+        let cache: SharedCache = Default::default();
+        let (fetched, unauthorized) = process_tick(
+            &reqwest::Client::new(),
+            "http://localhost:1",
+            &[],
+            &cache,
+            None,
+        )
+        .await;
+        assert_eq!(fetched, 0);
+        assert_eq!(unauthorized, 0);
+    }
+
+    #[tokio::test]
+    async fn process_tick_success() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "splits": [
+                    {"deployment_id": "d1", "weight": 80},
+                    {"deployment_id": "d2", "weight": 20}
+                ]}),
+            ))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedCache = Default::default();
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        let (fetched, unauthorized) =
+            process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        assert_eq!(fetched, 1);
+        assert_eq!(unauthorized, 0);
+
+        // Cache should now have the weights.
+        let cache_r = cache.read().await;
+        assert_eq!(cache_r.weight("t1", "app1", "d1"), Some(80));
+    }
+
+    #[tokio::test]
+    async fn process_tick_unauthorized() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedCache = Default::default();
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        let (fetched, unauthorized) =
+            process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        assert_eq!(fetched, 0);
+        assert_eq!(unauthorized, 1);
+    }
+
+    #[tokio::test]
+    async fn process_tick_transient() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedCache = Default::default();
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        // Pre-populate cache to verify it's NOT cleared on transient error.
+        cache.write().await.update("t1".into(), "app1".into(), {
+            let mut h = std::collections::HashMap::new();
+            h.insert("d1".into(), 100u8);
+            h
+        });
+
+        let (fetched, unauthorized) =
+            process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        assert_eq!(fetched, 0);
+        assert_eq!(unauthorized, 0);
+
+        // Previous cache value survives.
+        let cache_r = cache.read().await;
+        assert_eq!(cache_r.weight("t1", "app1", "d1"), Some(100));
+    }
+
+    #[tokio::test]
+    async fn process_tick_mixed() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t1/app1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "splits": [{"deployment_id": "d1", "weight": 100}]}),
+            ))
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/internal/traffic/t2/app2"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedCache = Default::default();
+        let snap = vec![
+            route_entry("t1", "app1", "1.2.3.4", 8081),
+            route_entry("t2", "app2", "5.6.7.8", 8082),
+        ];
+        let (fetched, unauthorized) =
+            process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        // t1/app1 succeeds, t2/app2 unauthorized.
+        assert_eq!(fetched, 1);
+        assert_eq!(unauthorized, 1);
+
+        // Only t1/app1 is in the cache.
+        let cache_r = cache.read().await;
+        assert_eq!(cache_r.weight("t1", "app1", "d1"), Some(100));
+        assert_eq!(cache_r.weight("t2", "app2", "d1"), None);
+    }
 }
 
 /// Outcome of a single traffic-split fetch. The spawn_fetcher loop uses
@@ -396,71 +532,85 @@ pub fn spawn_fetcher(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            // Derive the app list from the routing table, not the cache.
-            // The cache starts empty and is only populated by this loop,
-            // so relying on cache.known_apps() creates a chicken-and-egg
-            // bug where no apps are ever fetched (issue #152).
-            let apps: Vec<(String, String)> = {
-                let snap = table.snapshot().await;
-                let mut seen = std::collections::HashSet::new();
-                for entry in snap {
-                    seen.insert((entry.tenant_id, entry.app_name));
-                }
-                seen.into_iter().collect()
-            };
-            cache.write().await.evict_stale();
-            let mut tick_unauthorized_logged = false;
-            for (tenant_id, app_name) in apps {
-                let outcome = fetch_app_split(
-                    &http,
-                    &api_url,
-                    &tenant_id,
-                    &app_name,
-                    internal_token.as_deref(),
-                )
-                .await;
-                match outcome {
-                    FetchOutcome::Ok(weights) => {
-                        metrics::counter!("ingress.traffic_fetch.total", "status" => "success")
-                            .increment(1);
-                        let mut cache = cache.write().await;
-                        cache.update(tenant_id.clone(), app_name.clone(), weights);
-                    }
-                    FetchOutcome::Unauthorized => {
-                        metrics::counter!("ingress.traffic_fetch.total", "status" => "unauthorized").increment(1);
-                        if !tick_unauthorized_logged {
-                            // EDGE_INTERNAL_TOKEN is unset on the control
-                            // plane, or doesn't match what this ingress
-                            // has. Every canary/blue-green deployment is
-                            // silently degrading to single-deployment
-                            // routing. The marker is stable for alert
-                            // rules; "canary_routing_degraded=true" is
-                            // the structured field a metrics exporter
-                            // would key off.
-                            error!(
-                                reason = "internal_token_unauthorized",
-                                api_url = %api_url,
-                                canary_routing_degraded = true,
-                                "control plane rejected internal token; ingress is serving single-deployment weights only — set EDGE_INTERNAL_TOKEN on the control plane and edge-ingress"
-                            );
-                            tick_unauthorized_logged = true;
-                        }
-                    }
-                    FetchOutcome::Transient(reason) => {
-                        metrics::counter!("ingress.traffic_fetch.total", "status" => "failure")
-                            .increment(1);
-                        // Per-app warn is fine here — transient is
-                        // expected on network blips and a per-app line
-                        // helps correlate with operator reports.
-                        debug!(
-                            tenant = %tenant_id,
-                            app = %app_name,
-                            err = %reason,
-                            "transient traffic-split fetch error; will retry on next tick"
-                        );
-                    }
-                }
-            }
+            let snap = table.snapshot().await;
+            process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
         }
     });
+}
+
+/// Process one tick of the traffic-split fetcher: derive the app list from
+/// the routing table snapshot, evict stale cache entries, fetch each app's
+/// traffic split from the control plane API, and log aggregate stats.
+///
+/// Returns the number of successful fetches and the number of unauthorized
+/// responses so callers can surface high-level health.
+///
+/// This is `pub(crate)` so unit tests can exercise the tick logic directly
+/// with a wiremock control plane and synthetic routing snapshots.
+pub(crate) async fn process_tick(
+    http: &reqwest::Client,
+    api_url: &str,
+    table_snap: &[RouteEntry],
+    cache: &SharedCache,
+    internal_token: Option<&str>,
+) -> (usize, usize) {
+    // Derive the app list from the routing table, not the cache.
+    // The cache starts empty and is only populated by this loop,
+    // so relying on cache.known_apps() creates a chicken-and-egg
+    // bug where no apps are ever fetched (issue #152).
+    let apps: Vec<(String, String)> = {
+        let mut seen = std::collections::HashSet::new();
+        for entry in table_snap {
+            seen.insert((entry.tenant_id.clone(), entry.app_name.clone()));
+        }
+        seen.into_iter().collect()
+    };
+
+    cache.write().await.evict_stale();
+
+    let mut fetch_count = 0usize;
+    let mut unauthorized_count = 0usize;
+    let mut tick_unauthorized_logged = false;
+
+    for (tenant_id, app_name) in apps {
+        let outcome = fetch_app_split(http, api_url, &tenant_id, &app_name, internal_token).await;
+        match outcome {
+            FetchOutcome::Ok(weights) => {
+                metrics::counter!("ingress.traffic_fetch.total", "status" => "success")
+                    .increment(1);
+                fetch_count += 1;
+                let mut cache = cache.write().await;
+                cache.update(tenant_id, app_name, weights);
+            }
+            FetchOutcome::Unauthorized => {
+                metrics::counter!("ingress.traffic_fetch.total", "status" => "unauthorized")
+                    .increment(1);
+                unauthorized_count += 1;
+                if !tick_unauthorized_logged {
+                    error!(
+                        reason = "internal_token_unauthorized",
+                        api_url = %api_url,
+                        canary_routing_degraded = true,
+                        "control plane rejected internal token; ingress is serving single-deployment weights only — set EDGE_INTERNAL_TOKEN on the control plane and edge-ingress"
+                    );
+                    tick_unauthorized_logged = true;
+                }
+            }
+            FetchOutcome::Transient(reason) => {
+                metrics::counter!("ingress.traffic_fetch.total", "status" => "failure")
+                    .increment(1);
+                // Per-app warn is fine here — transient is
+                // expected on network blips and a per-app line
+                // helps correlate with operator reports.
+                debug!(
+                    tenant = %tenant_id,
+                    app = %app_name,
+                    err = %reason,
+                    "transient traffic-split fetch error; will retry on next tick"
+                );
+            }
+        }
+    }
+
+    (fetch_count, unauthorized_count)
 }

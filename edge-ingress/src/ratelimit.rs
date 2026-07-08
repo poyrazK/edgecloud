@@ -10,6 +10,7 @@
 //!   3. Config.rate_limit_rps_default/burst_default
 //!   4. No rate limiting (all values 0/absent)
 
+use crate::routing::RouteEntry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,59 +144,226 @@ pub fn spawn_rate_limit_fetcher(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-
-            // Derive the app list from the routing table.
-            let apps: Vec<(String, String)> = {
-                let snap = table.snapshot().await;
-                let mut seen = std::collections::HashSet::new();
-                for entry in snap {
-                    seen.insert((entry.tenant_id, entry.app_name));
-                }
-                seen.into_iter().collect()
-            };
-
-            for (tenant_id, app_name) in apps {
-                match fetch_rate_limit(
-                    &http,
-                    &api_url,
-                    &tenant_id,
-                    &app_name,
-                    internal_token.as_deref(),
-                )
-                .await
-                {
-                    Ok(Some(entry)) => {
-                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "success")
-                            .increment(1);
-                        debug!(
-                            tenant = %tenant_id,
-                            app = %app_name,
-                            rps = entry.rps,
-                            burst = entry.burst,
-                            "fetched per-app rate limit override"
-                        );
-                        cache.write().await.update(tenant_id, app_name, entry);
-                    }
-                    Ok(None) => {
-                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "not_found").increment(1);
-                        // No override — app uses global defaults.
-                        // Remove any stale override so render_routes
-                        // falls through to RouteEntry/Config defaults.
-                        cache.write().await.inner.remove(&(tenant_id, app_name));
-                    }
-                    Err(e) => {
-                        metrics::counter!("ingress.rate_limit_fetch.total", "status" => "failure")
-                            .increment(1);
-                        // Transient failure — keep cached value.
-                        debug!(
-                            tenant = %tenant_id,
-                            app = %app_name,
-                            err = %e,
-                            "transient rate-limit fetch error; keeping cached value"
-                        );
-                    }
-                }
-            }
+            let snap = table.snapshot().await;
+            process_tick(&http, &api_url, &snap, &cache, internal_token.as_deref()).await;
         }
     });
+}
+
+/// Process one tick of the rate-limit fetcher: derive the app list from
+/// the routing table snapshot and fetch each app's rate limit override.
+///
+/// Returns the number of successful fetches so callers can track progress.
+///
+/// This is `pub(crate)` so unit tests can exercise the tick logic directly
+/// with a wiremock control plane and synthetic routing snapshots.
+pub(crate) async fn process_tick(
+    http: &reqwest::Client,
+    api_url: &str,
+    table_snap: &[RouteEntry],
+    cache: &SharedRateLimitCache,
+    internal_token: Option<&str>,
+) -> usize {
+    let apps: Vec<(String, String)> = {
+        let mut seen = std::collections::HashSet::new();
+        for entry in table_snap {
+            seen.insert((entry.tenant_id.clone(), entry.app_name.clone()));
+        }
+        seen.into_iter().collect()
+    };
+
+    let mut count = 0usize;
+
+    for (tenant_id, app_name) in apps {
+        match fetch_rate_limit(http, api_url, &tenant_id, &app_name, internal_token).await {
+            Ok(Some(entry)) => {
+                metrics::counter!("ingress.rate_limit_fetch.total", "status" => "success")
+                    .increment(1);
+                count += 1;
+                debug!(
+                    tenant = %tenant_id,
+                    app = %app_name,
+                    rps = entry.rps,
+                    burst = entry.burst,
+                    "fetched per-app rate limit override"
+                );
+                cache.write().await.update(tenant_id, app_name, entry);
+            }
+            Ok(None) => {
+                metrics::counter!("ingress.rate_limit_fetch.total", "status" => "not_found")
+                    .increment(1);
+                // No override — app uses global defaults.
+                // Remove any stale override so render_routes
+                // falls through to RouteEntry/Config defaults.
+                cache.write().await.inner.remove(&(tenant_id, app_name));
+            }
+            Err(e) => {
+                metrics::counter!("ingress.rate_limit_fetch.total", "status" => "failure")
+                    .increment(1);
+                // Transient failure — keep cached value.
+                debug!(
+                    tenant = %tenant_id,
+                    app = %app_name,
+                    err = %e,
+                    "transient rate-limit fetch error; keeping cached value"
+                );
+            }
+        }
+    }
+
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::RouteEntry;
+    use std::time::Instant;
+
+    fn route_entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
+        RouteEntry {
+            tenant_id: tenant.to_string(),
+            app_name: app.to_string(),
+            deployment_id: None,
+            weight: 100,
+            worker_addr: addr.to_string(),
+            port,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_tick_empty_table() {
+        let cache: SharedRateLimitCache = Default::default();
+        let count = process_tick(
+            &reqwest::Client::new(),
+            "http://localhost:1",
+            &[],
+            &cache,
+            None,
+        )
+        .await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn process_tick_success() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/rate-limits/t1/app1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "rps": 50, "burst": 100 })),
+            )
+            .mount(&mock)
+            .await;
+
+        let cache: SharedRateLimitCache = Default::default();
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        let count = process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        assert_eq!(count, 1);
+
+        let r = cache.read().await;
+        let entry = r.get("t1", "app1").unwrap();
+        assert_eq!(entry.rps, 50);
+        assert_eq!(entry.burst, 100);
+    }
+
+    #[tokio::test]
+    async fn process_tick_not_found() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/rate-limits/t1/app1",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedRateLimitCache = Default::default();
+        // Pre-populate a stale entry.
+        cache.write().await.update(
+            "t1".into(),
+            "app1".into(),
+            RateLimitEntry { rps: 99, burst: 99 },
+        );
+
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        let count = process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        // 404 means "no override" — no error, but the stale entry is removed.
+        assert_eq!(count, 0);
+        let r = cache.read().await;
+        assert!(
+            r.get("t1", "app1").is_none(),
+            "stale entry must be removed on 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_tick_transient() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/rate-limits/t1/app1",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedRateLimitCache = Default::default();
+        cache.write().await.update(
+            "t1".into(),
+            "app1".into(),
+            RateLimitEntry { rps: 10, burst: 10 },
+        );
+
+        let snap = vec![route_entry("t1", "app1", "1.2.3.4", 8081)];
+        let count = process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        assert_eq!(count, 0);
+
+        // Stale value survives.
+        let r = cache.read().await;
+        let entry = r.get("t1", "app1").unwrap();
+        assert_eq!(entry.rps, 10);
+    }
+
+    #[tokio::test]
+    async fn process_tick_mixed() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/rate-limits/t1/app1",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "rps": 50, "burst": 100 })),
+            )
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/api/v1/internal/rate-limits/t2/app2",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let cache: SharedRateLimitCache = Default::default();
+        let snap = vec![
+            route_entry("t1", "app1", "1.2.3.4", 8081),
+            route_entry("t2", "app2", "5.6.7.8", 8082),
+        ];
+        let count = process_tick(&reqwest::Client::new(), &mock.uri(), &snap, &cache, None).await;
+        // t1/app1 succeeds (1), t2/app2 not-found (0).
+        assert_eq!(count, 1);
+
+        let r = cache.read().await;
+        let entry = r.get("t1", "app1").unwrap();
+        assert_eq!(entry.rps, 50);
+        assert!(r.get("t2", "app2").is_none());
+    }
 }
