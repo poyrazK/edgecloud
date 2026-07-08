@@ -43,6 +43,14 @@ pub struct Config {
     /// so each worker has its own cursor and resumes from its last ack on
     /// restart. Override with `EDGE_CONSUMER_NAME`.
     pub consumer_name: String,
+    /// NATS JetStream queue group for fan-out delivery within a region
+    /// (issue #86). Workers in the same region joined to the same
+    /// `queue_group` share a single delivery of each `TaskMessage`, so
+    /// exactly one worker per group starts the app.
+    /// Override with `EDGE_QUEUE_GROUP`. Empty string disables queue-group
+    /// pinning (each consumer receives a copy — the historical fan-out
+    /// behavior).
+    pub queue_group: String,
     /// Number of JetStream replicas for the `edgecloud-tasks` stream.
     /// Must be 1 on non-clustered NATS (local dev); defaults to 3 for
     /// production. Override with `TASK_STREAM_REPLICAS`.
@@ -249,6 +257,7 @@ impl Config {
         let cfg = Config {
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
             consumer_name,
+            queue_group: std::env::var("EDGE_QUEUE_GROUP").unwrap_or_default(),
             worker_id,
             region: std::env::var("REGION").context("REGION not set")?,
             worker_addr: std::env::var("EDGE_WORKER_ADDR").context("EDGE_WORKER_ADDR not set")?,

@@ -117,6 +117,12 @@ impl SocketEgressPolicy {
 fn log_if_changed(mode: SocketEgressPolicy) {
     use std::sync::atomic::{AtomicU8, Ordering};
     static LAST_LOGGED: AtomicU8 = AtomicU8::new(255);
+    // The `_` arm is required because `SocketEgressPolicy` is
+    // `#[non_exhaustive]` — it makes the match future-proof against
+    // variants added in later releases. Today the match is exhaustive
+    // (all 4 variants covered above), so the `_` is dead. Suppress the
+    // warning rather than remove the arm so future contributors see
+    // the pattern and don't accidentally drop the wildcard.
     let next = match mode {
         SocketEgressPolicy::BlockAll => 0,
         SocketEgressPolicy::AllowList => 1,

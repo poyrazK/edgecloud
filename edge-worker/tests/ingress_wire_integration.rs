@@ -63,6 +63,7 @@ fn wire_test_config(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: format!("ingress-wire-{worker_id}"),
+        queue_group: String::new(),
         worker_jwt_secret: "test-secret".to_string(),
         worker_jwt_issuer: "edgecloud".to_string(),
         worker_tenant_id: "t_test".to_string(),

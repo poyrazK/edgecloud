@@ -142,6 +142,7 @@ mod heartbeat_integration_tests {
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
             consumer_name: "test".to_string(),
+            queue_group: String::new(),
             task_stream_replicas: 1,
             worker_jwt_secret: String::new(),
             worker_jwt_kid: None,

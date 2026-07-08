@@ -2,7 +2,8 @@
 //! successfully on the actual edgeCloud host runtime.
 
 use edge_runtime::{
-    create_component_linker_handler, create_engine, socket_egress::SocketEgressPolicy,
+    create_component_linker_handler, create_engine,
+    socket_egress::{HostnamePinning, SocketEgressPolicy},
     EgressPolicy, RuntimeState,
 };
 use std::collections::HashMap;
@@ -46,6 +47,7 @@ fn runtime_state() -> RuntimeState {
         },
         None,
         SocketEgressPolicy::default(),
+        Arc::new(HostnamePinning::new()),
     )
 }
 

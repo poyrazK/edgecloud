@@ -37,13 +37,27 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// Build the JetStream consumer config for subscribing to task messages.
 /// Extracted as a pure function so the wire contract can be unit-tested
 /// without a real NATS connection.
-pub fn build_consumer_config(consumer_name: &str, region: &str) -> PushConsumerConfig {
+///
+/// `queue_group` enables intra-region HA pinning (issue #86): when set,
+/// NATS delivers each `TaskMessage` to exactly one worker in the group,
+/// so multiple workers in the same region don't all try to start the
+/// same app. Empty string → fan-out (the historical default).
+pub fn build_consumer_config(
+    consumer_name: &str,
+    region: &str,
+    queue_group: &str,
+) -> PushConsumerConfig {
     let deliver_subject = format!("_INBOX.task.{}", consumer_name);
+    let deliver_group = if queue_group.is_empty() {
+        None
+    } else {
+        Some(queue_group.to_string())
+    };
     PushConsumerConfig {
         name: Some(consumer_name.to_string()),
         durable_name: Some(consumer_name.to_string()),
         deliver_subject,
-        deliver_group: None,
+        deliver_group,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
         filter_subject: format!("edgecloud.tasks.{}", region),
@@ -106,15 +120,25 @@ pub trait NatsClient: Send + Sync + 'static {
 pub struct NatsClientImpl {
     client: async_nats::Client,
     task_stream_replicas: usize,
+    /// NATS JetStream queue group for intra-region fan-out pinning
+    /// (issue #86). Empty string → fan-out (every consumer gets every
+    /// message). Non-empty → each message is delivered to exactly one
+    /// consumer in the group.
+    queue_group: String,
 }
 
 impl NatsClientImpl {
     /// Connect to a NATS server.
-    pub async fn connect(url: &str, task_stream_replicas: usize) -> anyhow::Result<Self> {
+    pub async fn connect(
+        url: &str,
+        task_stream_replicas: usize,
+        queue_group: String,
+    ) -> anyhow::Result<Self> {
         let client = async_nats::connect(url).await?;
         Ok(Self {
             client,
             task_stream_replicas,
+            queue_group,
         })
     }
 
@@ -151,10 +175,12 @@ impl NatsClient for NatsClientImpl {
             .map_err(nats_err)
             .context("tasks stream missing after EnsureStream")?;
 
-        // Durable push consumer with explicit ack (no queue group —
-        // issue #316 fan-out). Every worker in the region receives every
-        // `TaskMessage`; the supervisor's diff logic handles duplicates.
-        let config = build_consumer_config(consumer_name, region);
+        // Durable push consumer with explicit ack. If `queue_group` is
+        // set, NATS delivers each `TaskMessage` to exactly one worker in
+        // the group (intra-region HA pinning, issue #86). Empty group →
+        // fan-out (every worker in the region receives every
+        // `TaskMessage`; the supervisor's diff logic handles duplicates).
+        let config = build_consumer_config(consumer_name, region, &self.queue_group);
         let consumer: jetstream::consumer::PushConsumer = stream
             .get_or_create_consumer(consumer_name, config)
             .await
@@ -217,14 +243,14 @@ pub(crate) mod tests {
 
     #[test]
     fn consumer_config_has_correct_name() {
-        let cfg = build_consumer_config("my-consumer", "fra");
+        let cfg = build_consumer_config("my-consumer", "fra", "");
         assert_eq!(cfg.name.as_deref(), Some("my-consumer"));
         assert_eq!(cfg.durable_name.as_deref(), Some("my-consumer"));
     }
 
     #[test]
     fn consumer_config_has_no_queue_group() {
-        let cfg = build_consumer_config("c1", "sfo");
+        let cfg = build_consumer_config("c1", "sfo", "");
         assert!(
             cfg.deliver_group.is_none(),
             "fan-out mode: deliver_group must be None"
@@ -232,32 +258,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn consumer_config_queue_group_sets_deliver_group() {
+        // Issue #86: when a queue group is configured, NATS delivers
+        // each message to exactly one consumer in the group.
+        let cfg = build_consumer_config("c1", "sfo", "ha-group-fra");
+        assert_eq!(
+            cfg.deliver_group.as_deref(),
+            Some("ha-group-fra"),
+            "queue group must propagate to deliver_group for HA pinning"
+        );
+    }
+
+    #[test]
     fn consumer_config_filter_subject_matches_region() {
-        let cfg = build_consumer_config("c1", "fra");
+        let cfg = build_consumer_config("c1", "fra", "");
         assert_eq!(cfg.filter_subject, "edgecloud.tasks.fra");
     }
 
     #[test]
     fn consumer_config_has_explicit_ack() {
-        let cfg = build_consumer_config("c1", "fra");
+        let cfg = build_consumer_config("c1", "fra", "");
         assert_eq!(cfg.ack_policy, jetstream::consumer::AckPolicy::Explicit);
     }
 
     #[test]
     fn consumer_config_deliver_policy_is_all() {
-        let cfg = build_consumer_config("c1", "fra");
+        let cfg = build_consumer_config("c1", "fra", "");
         assert_eq!(cfg.deliver_policy, jetstream::consumer::DeliverPolicy::All);
     }
 
     #[test]
     fn consumer_config_max_deliver_is_twenty() {
-        let cfg = build_consumer_config("c1", "fra");
+        let cfg = build_consumer_config("c1", "fra", "");
         assert_eq!(cfg.max_deliver, 20);
     }
 
     #[test]
     fn consumer_config_deliver_subject_contains_consumer_name() {
-        let cfg = build_consumer_config("my-worker-42", "fra");
+        let cfg = build_consumer_config("my-worker-42", "fra", "");
         assert!(cfg.deliver_subject.contains("my-worker-42"));
     }
 

@@ -91,6 +91,7 @@ fn test_config(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: format!("test-{}", worker_id),
+        queue_group: String::new(),
         worker_addr: "test-host:0".to_string(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
@@ -194,6 +195,7 @@ impl TestHarness {
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
             consumer_name: "test-consumer".to_string(),
+            queue_group: String::new(),
             worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
             worker_jwt_kid: Some("test-kid".to_string()),
             worker_jwt_issuer: "edgecloud".to_string(),
@@ -423,6 +425,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: "test-heartbeat-consumer".to_string(),
+        queue_group: String::new(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
@@ -955,6 +958,9 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         standby_pool_size: 10,
+        require_signature: false,
+        signing_pubkey: None,
+        signing_pubkey_path: None,
     };
     let sup_a = build_supervisor_from_url(&nats_url, config_a).await?;
 
@@ -988,6 +994,9 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         standby_pool_size: 10,
+        require_signature: false,
+        signing_pubkey: None,
+        signing_pubkey_path: None,
     };
     let sup_b = build_supervisor_from_url(&nats_url, config_b).await?;
 
@@ -1794,6 +1803,7 @@ async fn build_supervisor_only_with_cp(
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
         consumer_name: "test-sync-consumer".to_string(),
+        queue_group: String::new(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
