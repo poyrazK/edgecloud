@@ -151,18 +151,19 @@ impl RoutingTable {
             Some(id) => AppKey::with_deployment(tenant_id, app_name, id),
             None => AppKey::new(tenant_id, app_name),
         };
-        if status != "running" {
+        if status != "running" && status != "draining" {
             self.remove(&key).await;
             return;
         }
         let mut inner = self.by_app.write().await;
+        let effective_weight = if status == "draining" { 0 } else { weight };
         inner.insert(
             key.clone(),
             RouteEntry {
                 tenant_id: tenant_id.to_string(),
                 app_name: app_name.to_string(),
                 deployment_id: deployment_id.map(|s| s.to_string()),
-                weight,
+                weight: effective_weight,
                 worker_addr: worker_addr.to_string(),
                 port,
                 rate_limit_rps: None,
@@ -192,6 +193,22 @@ impl RoutingTable {
             inner.remove(k);
         }
         stale
+    }
+
+    /// Remove all routes for a given worker address. Used when a worker
+    /// sends a final heartbeat with an empty `apps` map, signalling it
+    /// is shutting down.
+    pub async fn remove_worker(&self, worker_addr: &str) -> Vec<AppKey> {
+        let mut inner = self.by_app.write().await;
+        let removed: Vec<AppKey> = inner
+            .iter()
+            .filter(|(_, e)| e.worker_addr == worker_addr)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &removed {
+            inner.remove(k);
+        }
+        removed
     }
 
     /// Snapshot of all current routes. Order is unspecified.

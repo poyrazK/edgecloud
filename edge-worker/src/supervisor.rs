@@ -1235,7 +1235,14 @@ impl Supervisor {
         }
     }
 
-    /// Stop an app gracefully.
+    /// Stop an app gracefully with a drain phase.
+    ///
+    /// 1. Set status to `Draining` — heartbeat reports "draining" with
+    ///    weight=0, ingress sends no new traffic.
+    /// 2. Signal `serve()` to stop accepting new connections (broadcast).
+    /// 3. Wait for in-flight requests to complete (up to 30s).
+    /// 4. Set status to `Stopping`, remove from state map, free port.
+    /// 5. Abort ticker and await/abort the app task.
     pub async fn stop_app(&self, tenant_id: &str, app_name: &str) -> anyhow::Result<()> {
         let key = (tenant_id.to_string(), app_name.to_string());
         // Clone the Arc so we can lock it while the instance is still in the map.
@@ -1244,27 +1251,45 @@ impl Supervisor {
             state.apps.get(&key).cloned()
         };
 
-        let (port, handle, ticker) = if let Some(inst) = instance {
-            // Extract port, handle, ticker, and the per-app shutdown
-            // channels while locked. Both `shutdown_tx` (oneshot for
-            // LongRunning) and `shutdown_tx_broadcast` (broadcast for
-            // Handler) are taken out; we ignore failures because the
-            // consumer may have already dropped the receiver.
+        let (port, handle, ticker, _dispatch) = if let Some(inst) = instance {
+            // Phase 1: set Draining, signal serve() to stop accepting,
+            // then drain in-flight requests.
             let mut inst = inst.lock().await;
-            inst.status = AppInstanceStatus::Stopping;
+            inst.status = AppInstanceStatus::Draining;
             let port = inst.port;
             let handle = inst.handle.clone();
             let ticker = inst.ticker.take();
-            let oneshot_tx = inst.shutdown_tx.take();
             let broadcast_tx = inst.shutdown_tx_broadcast.take();
-            drop(inst); // release lock before sending
-            if let Some(tx) = oneshot_tx {
-                let _ = tx.send(());
-            }
+            let dispatch = inst.dispatch.clone();
+            drop(inst);
+
+            // Signal serve() to stop accepting new connections.
             if let Some(tx) = broadcast_tx {
                 let _ = tx.send(());
             }
-            (port, handle, ticker)
+
+            // Phase 2: wait for in-flight requests to drain (up to 30s).
+            if let Some(ref d) = dispatch {
+                let drained = d.drain_in_flight(Duration::from_secs(30)).await;
+                if !drained {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        app_name = %app_name,
+                        "drain timeout reached — forcing stop"
+                    );
+                }
+            }
+
+            // Set stopping status after drain.
+            {
+                let state = self.state.read().await;
+                if let Some(stopping_inst) = state.apps.get(&key) {
+                    let mut stopping_inst = stopping_inst.lock().await;
+                    stopping_inst.status = AppInstanceStatus::Stopping;
+                }
+            }
+
+            (port, handle, ticker, dispatch)
         } else {
             return Ok(()); // already gone
         };
@@ -1936,6 +1961,7 @@ pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
     match status {
         AppInstanceStatus::Running => "running",
         AppInstanceStatus::Starting => "starting",
+        AppInstanceStatus::Draining => "draining",
         AppInstanceStatus::Stopping => "stopping",
         AppInstanceStatus::Crashed { .. } => "crashed",
         AppInstanceStatus::Hung => "hung",
@@ -1945,7 +1971,7 @@ pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
 /// Map an AppInstanceStatus to its heartbeat exit_code.
 pub fn app_status_exit_code(status: &AppInstanceStatus) -> Option<i32> {
     match status {
-        AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Stopping => {
+        AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Draining | AppInstanceStatus::Stopping => {
             None
         }
         AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung => Some(1),
@@ -2025,6 +2051,14 @@ mod tests {
         assert_eq!(
             app_status_to_string(&AppInstanceStatus::Starting),
             "starting"
+        );
+    }
+
+    #[test]
+    fn status_to_string_draining() {
+        assert_eq!(
+            app_status_to_string(&AppInstanceStatus::Draining),
+            "draining"
         );
     }
 

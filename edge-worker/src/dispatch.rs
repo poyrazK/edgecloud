@@ -188,6 +188,10 @@ pub struct HandlerDispatch {
     engine_pool: Arc<crate::supervisor::StandbyPool>,
     proxy_pre: tokio::sync::RwLock<Option<HandlerProxyPre>>,
     state: Arc<tokio::sync::RwLock<crate::state::WorkerState>>,
+    /// Number of in-flight HTTP requests currently being processed.
+    /// Incremented before spawning the handler task, decremented
+    /// on completion. Used by the graceful drain flow (issue #graceful-draining).
+    pub in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Per-app context handed to every FaaS request.
@@ -255,6 +259,7 @@ impl HandlerDispatch {
             deployment_id,
             engine_pool,
             state,
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -265,6 +270,19 @@ impl HandlerDispatch {
         pre: wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>,
     ) {
         *self.proxy_pre.write().await = Some(pre);
+    }
+
+    /// Wait for all in-flight requests to complete, up to `timeout`.
+    /// Returns `true` if all requests drained, `false` if timeout was reached.
+    pub async fn drain_in_flight(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
     }
 
     /// Spawn the HTTP server on `0.0.0.0:port`. Returns once the
@@ -475,6 +493,16 @@ impl HandlerDispatch {
     }
 }
 
+/// RAII guard that decrements an in_flight counter on drop.
+/// Used to track in-flight HTTP requests for graceful shutdown.
+struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Tokio-based executor for hyper HTTP/2 connections.
 #[derive(Clone, Copy, Debug)]
 struct TokioExecutor;
@@ -563,6 +591,9 @@ impl HandlerDispatch {
         self: Arc<Self>,
         req: HyperRequest<Incoming>,
     ) -> anyhow::Result<HyperResponse<HyperOutgoingBody>> {
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _guard = InFlightGuard(self.in_flight.clone());
+
         {
             let mut lock = self.config.last_request_at.lock().await;
             *lock = Some(std::time::Instant::now());

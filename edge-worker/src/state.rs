@@ -18,6 +18,10 @@ pub enum AppInstanceStatus {
     #[allow(dead_code)]
     Starting,
     Running,
+    /// Draining: still handling in-flight requests but not accepting
+    /// new ones. Published as "draining" in heartbeats so the ingress
+    /// keeps the route with weight=0 (issue #graceful-draining).
+    Draining,
     #[allow(dead_code)]
     Stopping,
     Crashed {
@@ -127,7 +131,7 @@ mod tests {
     fn running_is_active() {
         assert!(matches!(
             AppInstanceStatus::Running,
-            AppInstanceStatus::Running | AppInstanceStatus::Starting
+            AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Draining
         ));
     }
 
@@ -136,6 +140,22 @@ mod tests {
         assert!(matches!(
             AppInstanceStatus::Starting,
             AppInstanceStatus::Running | AppInstanceStatus::Starting
+        ));
+    }
+
+    #[test]
+    fn draining_is_active() {
+        assert!(matches!(
+            AppInstanceStatus::Draining,
+            AppInstanceStatus::Running | AppInstanceStatus::Starting | AppInstanceStatus::Draining
+        ));
+    }
+
+    #[test]
+    fn draining_is_not_terminal() {
+        assert!(!matches!(
+            AppInstanceStatus::Draining,
+            AppInstanceStatus::Crashed { .. } | AppInstanceStatus::Hung
         ));
     }
 
