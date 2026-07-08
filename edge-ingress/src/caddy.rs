@@ -646,6 +646,13 @@ fn health_checks_block(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// Diff result for routing entries: (added with item, removed IDs, changed with item).
+type DiffResult<'a> = (
+    Vec<(&'a RouteEntry, serde_json::Value)>,
+    Vec<String>,
+    Vec<(&'a RouteEntry, serde_json::Value)>,
+);
+
 /// Compute the delta between two routing table snapshots.
 ///
 /// Returns `(added, removed, changed)` where:
@@ -657,14 +664,7 @@ fn health_checks_block(cfg: &Config) -> serde_json::Value {
 /// Comparison uses `RouteEntry::route_id()` as the stable key.
 /// Two entries are considered "changed" if any routing-relevant
 /// field differs (worker_addr, port, weight, rate_limit_rps/burst).
-pub(crate) fn diff_routes<'a>(
-    prev: &'a [RouteEntry],
-    curr: &'a [RouteEntry],
-) -> (
-    Vec<(&'a RouteEntry, serde_json::Value)>,
-    Vec<String>,
-    Vec<(&'a RouteEntry, serde_json::Value)>,
-) {
+pub(crate) fn diff_routes<'a>(prev: &'a [RouteEntry], curr: &'a [RouteEntry]) -> DiffResult<'a> {
     let prev_by_id: HashMap<String, &RouteEntry> = prev.iter().map(|e| (e.route_id(), e)).collect();
     let curr_by_id: HashMap<String, &RouteEntry> = curr.iter().map(|e| (e.route_id(), e)).collect();
 
