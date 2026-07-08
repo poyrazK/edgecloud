@@ -739,6 +739,31 @@ func TestAPIKeyService_DeleteAPIKey_WrongTenant(t *testing.T) {
 	}
 }
 
+func TestNewAPIKeyService(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	if svc == nil {
+		t.Fatal("NewAPIKeyService returned nil")
+	}
+}
+
+func TestAPIKeyService_SetAPIKeyRepo(t *testing.T) {
+	svc := NewAPIKeyService(nil)
+	repo := &mockAPIKeyRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.APIKey, error) {
+			return &domain.APIKey{ID: id}, nil
+		},
+	}
+	svc.SetAPIKeyRepo(repo)
+	// Verify the repo was injected by calling a method
+	key, err := svc.GetByID(context.Background(), "k_1")
+	if err != nil {
+		t.Fatalf("GetByID after SetAPIKeyRepo: %v", err)
+	}
+	if key == nil || key.ID != "k_1" {
+		t.Errorf("unexpected key: %+v", key)
+	}
+}
+
 func TestAPIKeyService_DeleteAPIKey_NotFound(t *testing.T) {
 	svc := NewAPIKeyService(nil)
 	svc.apiKeyRepo = &mockAPIKeyRepo{}

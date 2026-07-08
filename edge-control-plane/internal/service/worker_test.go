@@ -27,6 +27,7 @@ type mockWorkerRepo struct {
 	listRunningAppTargetFunc func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 	getAppStatusFunc         func(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
 	getByIDFunc              func(ctx context.Context, id string) (*domain.Worker, error)
+	deleteOlderThanFunc      func(ctx context.Context, age time.Duration) (int64, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -73,6 +74,9 @@ func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker
 }
 
 func (m *mockWorkerRepo) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	if m.deleteOlderThanFunc != nil {
+		return m.deleteOlderThanFunc(ctx, age)
+	}
 	return 0, nil
 }
 
@@ -1275,4 +1279,69 @@ func TestHandleHeartbeat_AutoRegister_OnFKError(t *testing.T) {
 	if autoRegTenant != "t_autoreg" {
 		t.Errorf("auto-register called with tenant %q, want t_autoreg", autoRegTenant)
 	}
+}
+
+func TestNewWorkerService_DefaultStableWindow(t *testing.T) {
+	svc := NewWorkerService(nil, nil, nil, nil, nil, 0, nil)
+	if svc.stableWindow != 30*time.Second {
+		t.Errorf("stableWindow = %v, want 30s", svc.stableWindow)
+	}
+}
+
+func TestNewWorkerService_CustomStableWindow(t *testing.T) {
+	svc := NewWorkerService(nil, nil, nil, nil, nil, 10*time.Second, nil)
+	if svc.stableWindow != 10*time.Second {
+		t.Errorf("stableWindow = %v, want 10s", svc.stableWindow)
+	}
+}
+
+func TestWorkerGCService_Run_InvalidInterval(t *testing.T) {
+	svc := NewWorkerGCService(&mockWorkerRepo{})
+	// Should return immediately with invalid interval
+	svc.Run(context.Background(), 0, 5*time.Minute)
+}
+
+func TestWorkerGCService_Run_InvalidMaxAge(t *testing.T) {
+	svc := NewWorkerGCService(&mockWorkerRepo{})
+	svc.Run(context.Background(), 5*time.Minute, 0)
+}
+
+func TestWorkerGCService_Run_ContextCancelled(t *testing.T) {
+	svc := NewWorkerGCService(&mockWorkerRepo{
+		deleteOlderThanFunc: func(ctx context.Context, age time.Duration) (int64, error) {
+			t.Error("DeleteOlderThan should not be called when context is cancelled")
+			return 0, nil
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc.Run(ctx, time.Hour, 5*time.Minute)
+}
+
+func TestIngestMetrics_EmptyRaw(t *testing.T) {
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{})
+	svc.ingestMetrics(nil) // should not panic
+	svc.ingestMetrics(json.RawMessage("")) // should not panic
+}
+
+func TestIngestMetrics_MalformedJSON(t *testing.T) {
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{})
+	svc.ingestMetrics(json.RawMessage("{invalid")) // should not panic
+}
+
+func TestNotifyDisableTenant_NilNATS(t *testing.T) {
+	svc := &WorkerService{nc: nil}
+	svc.notifyDisableTenant(context.Background(), "t_1") // should not panic
+}
+
+func TestNotifyDisableTenant_NoActiveDeployments(t *testing.T) {
+	svc := &WorkerService{
+		nc: nil,
+		activeRepo: &mockActiveRepo{
+			listByTenantFunc: func(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
+				return nil, nil
+			},
+		},
+	}
+	svc.notifyDisableTenant(context.Background(), "t_1")
 }

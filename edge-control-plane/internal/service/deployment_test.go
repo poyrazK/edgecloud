@@ -13,10 +13,12 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // Mock types for testing non-tx deployment methods.
@@ -76,6 +78,28 @@ func (m *mockDeployActiveRepo) ListByTenant(ctx context.Context, tenantID string
 func (m *mockDeployActiveRepo) AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
 func (m *mockDeployActiveRepo) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
 func (m *mockDeployActiveRepo) AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error { return nil }
+
+type mockDeployAppEnvRepo struct {
+	listFn func(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
+}
+
+func (m *mockDeployAppEnvRepo) WithTx(tx *sqlx.Tx) *repository.AppEnvRepository { return nil }
+func (m *mockDeployAppEnvRepo) List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error) {
+	if m.listFn != nil { return m.listFn(ctx, tenantID, appName) }
+	return nil, nil
+}
+
+type mockDeployPublisher struct {
+	publishFn func(region string, msg *nats.TaskMessage) error
+}
+
+func (m *mockDeployPublisher) PublishTaskUpdate(region string, msg *nats.TaskMessage) error {
+	if m.publishFn != nil { return m.publishFn(region, msg) }
+	return nil
+}
+func (m *mockDeployPublisher) PublishFullSync(region string, msg *nats.TaskMessage) error { return nil }
+func (m *mockDeployPublisher) PublishHeartbeat(region string, msg *nats.HeartbeatMessage) error { return nil }
+func (m *mockDeployPublisher) EnsureStream(cfg nats.StreamConfig) error { return nil }
 
 // newDeploymentMockDB wires a sqlmock-backed *sqlx.DB for deployment tests.
 func newDeploymentMockDB(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
@@ -807,5 +831,180 @@ func TestIsValidRegion(t *testing.T) {
 	}
 	if IsValidRegion("has.dot") {
 		t.Error("expected invalid for dot")
+	}
+}
+
+// --- PromoteDeployment tests ---
+
+func TestPromoteDeployment_NotFound(t *testing.T) {
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{}}
+	err := svc.PromoteDeployment(context.Background(), "t_test", "target-app", "d_missing")
+	if !errors.Is(err, ErrDeploymentNotFound) {
+		t.Fatalf("PromoteDeployment = %v, want ErrDeploymentNotFound", err)
+	}
+}
+
+func TestPromoteDeployment_WrongTenant(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			return &domain.Deployment{ID: id, TenantID: "t_other"}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo}
+	err := svc.PromoteDeployment(context.Background(), "t_test", "target-app", "d_1")
+	if !errors.Is(err, ErrDeploymentNotFound) {
+		t.Fatalf("PromoteDeployment = %v, want ErrDeploymentNotFound", err)
+	}
+}
+
+// --- RollbackDeployment tests ---
+
+func TestRollbackDeployment_NoActiveDeployment(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	adRows := sqlmock.NewRows([]string{
+		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled",
+		"stable_since", "regions_published", "regions_failed", "regions_cached",
+		"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+	})
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT`).WillReturnRows(adRows)
+	mock.ExpectRollback()
+
+	svc := &DeploymentService{
+		db:         db,
+		activeRepo: repository.NewActiveDeploymentRepository(db),
+	}
+	_, err := svc.RollbackDeployment(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, ErrNoActiveDeployment) {
+		t.Fatalf("RollbackDeployment = %v, want ErrNoActiveDeployment", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestRollbackDeployment_NoLastGood(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	now := time.Now()
+	adRows := sqlmock.NewRows([]string{
+		"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled",
+		"stable_since", "regions_published", "regions_failed", "regions_cached",
+		"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+	}).AddRow("t_test", "myapp", "d_bad", nil, false, nil, pq.StringArray{}, pq.StringArray{}, pq.StringArray{}, pq.StringArray{}, now, "att_1")
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT`).WillReturnRows(adRows)
+	mock.ExpectRollback()
+
+	svc := &DeploymentService{
+		db:         db,
+		activeRepo: repository.NewActiveDeploymentRepository(db),
+	}
+	_, err := svc.RollbackDeployment(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, ErrNoLastGood) {
+		t.Fatalf("RollbackDeployment = %v, want ErrNoLastGood", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// --- RepublishActiveDeployments tests ---
+
+func TestRepublishActiveDeployments_Empty(t *testing.T) {
+	svc := &DeploymentService{activeRepo: &mockDeployActiveRepo{}}
+	err := svc.RepublishActiveDeployments(context.Background(), "t_test")
+	if err != nil {
+		t.Fatalf("RepublishActiveDeployments: %v", err)
+	}
+}
+
+func TestRepublishActiveDeployments_SkipsMissingDeployment(t *testing.T) {
+	activeRepo := &mockDeployActiveRepo{
+		listByTenantFn: func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
+			return []domain.ActiveDeployment{
+				{AppName: "app-a", DeploymentID: "d_1"},
+				{AppName: "app-b", DeploymentID: "d_missing"},
+			}, nil
+		},
+	}
+	deploymentRepo := &mockDeployDeploymentRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Deployment, error) {
+			if id == "d_missing" {
+				return nil, nil
+			}
+			return &domain.Deployment{ID: id, Hash: "abc"}, nil
+		},
+	}
+	svc := &DeploymentService{
+		activeRepo:     activeRepo,
+		deploymentRepo: deploymentRepo,
+		tenantRepo:     &mockTenantSvcRepo{getByIDFn: func(_ context.Context, _ string) (*domain.Tenant, error) {
+			return &domain.Tenant{ID: "t_test"}, nil
+		}},
+		quotaRepo: &mockQuotaSvcRepo{
+			getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+				return &domain.Quota{}, nil
+			},
+		},
+		appEnvRepo: &mockDeployAppEnvRepo{listFn: func(_ context.Context, _, _ string) ([]domain.AppEnv, error) {
+			return nil, nil
+		}},
+		publisher: &mockDeployPublisher{},
+	}
+	err := svc.RepublishActiveDeployments(context.Background(), "t_test")
+	if err == nil {
+		t.Fatal("expected error for missing deployment")
+	}
+}
+
+func TestDeploymentService_Setters(t *testing.T) {
+	svc := &DeploymentService{}
+	svc.SetCachePusher(nil)
+	svc.SetRegionArtifactCaches(nil)
+	svc.SetAppService(nil)
+	svc.SetEnvService(nil)
+	svc.SetWebhookService(nil)
+	// No panic is the assertion
+}
+
+func TestNewDeploymentService_DefaultsRegion(t *testing.T) {
+	svc := NewDeploymentService(nil, nil, nil, nil, nil, nil, nil, nil, "", nil)
+	if svc.defaultRegion != "global" {
+		t.Errorf("defaultRegion = %q, want global", svc.defaultRegion)
+	}
+}
+
+func TestNewDeploymentService_PreservesExplicitRegion(t *testing.T) {
+	svc := NewDeploymentService(nil, nil, nil, nil, nil, nil, nil, nil, "us-east-1", nil)
+	if svc.defaultRegion != "us-east-1" {
+		t.Errorf("defaultRegion = %q, want us-east-1", svc.defaultRegion)
+	}
+}
+
+func TestPublishError_Unwrap(t *testing.T) {
+	pe := &PublishError{Err: ErrPublishFailed}
+	if !errors.Is(pe, ErrPublishFailed) {
+		t.Error("errors.Is(PublishError, ErrPublishFailed) should be true")
+	}
+	// nil receiver
+	var nilPe *PublishError
+	if errors.Is(nilPe, ErrPublishFailed) {
+		t.Error("nil PublishError should not match ErrPublishFailed")
+	}
+}
+
+func TestPublishError_Error(t *testing.T) {
+	pe := &PublishError{
+		Published: []string{"us-east-1"},
+		Failed:    []string{"eu-west-1"},
+		Err:       ErrPublishFailed,
+	}
+	msg := pe.Error()
+	if msg == "" {
+		t.Error("PublishError.Error() returned empty string")
 	}
 }
