@@ -187,6 +187,12 @@ impl RuntimeState {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<Vec<_>>(),
             )
+            // Enable `wasi:sockets/ip-name-lookup` so the fixture's
+            // `/sockets/dns-resolve-and-connect` path can exercise
+            // `resolve_addresses`. The resolve hook is dormant (see
+            // `HostnamePinning` field docs) — the connect side stays
+            // gated by `socket_addr_check`.
+            .allow_ip_name_lookup(true)
             .build();
         let egress = Arc::new(EgressPolicy::allow_all());
         let exit_code = Arc::new(AtomicU32::new(0));
@@ -866,6 +872,14 @@ fn build_wasi_ctx_for_tenant(
         process::filter_env_vars(env.iter().map(|(k, v)| (k.clone(), v.clone()))).collect();
     let mut builder = WasiCtxBuilder::new();
     builder.envs(&env_strings);
+
+    // Enable `wasi:sockets/ip-name-lookup` so guests can call
+    // `resolve_addresses`. Required for the L51 / L52 fixture path
+    // `/sockets/dns-resolve-and-connect` (issue #309 follow-up).
+    // The resolve hook stays dormant (see
+    // `docs/upstream-wasmtime-resolve-check.patch`) — the connect
+    // side is gated by `socket_addr_check` regardless.
+    builder.allow_ip_name_lookup(true);
 
     if let Some(base) = resolve_edge_fs_path() {
         let tenant_dir = base.join(tenant_id);

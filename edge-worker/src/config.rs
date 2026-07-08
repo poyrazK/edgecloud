@@ -399,7 +399,6 @@ fn parse_env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-mod tests {
     use super::*;
     use std::sync::Mutex;
 
