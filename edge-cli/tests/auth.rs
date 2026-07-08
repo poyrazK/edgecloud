@@ -938,6 +938,7 @@ async fn status_falls_through_to_env_api_url_when_toml_has_no_api() {
 name = "fallthrough"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,

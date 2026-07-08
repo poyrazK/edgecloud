@@ -17,6 +17,7 @@ fn write_minimal_edge_toml(project: &TempDir) {
 name = "apps-test"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,

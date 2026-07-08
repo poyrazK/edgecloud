@@ -74,6 +74,7 @@ async fn handler_fixture_instantiates() {
                  Build it with: cd edge-worker/tests/fixtures/handler && \
                  cargo build --target wasm32-unknown-unknown --release && \
                  wasm-tools component new --world edge-runtime-handler \
+                   --wit-dir ../../../wit \
                    target/wasm32-unknown-unknown/release/edge_fixture_handler.wasm \
                    -o ../handler.wasm"
             );

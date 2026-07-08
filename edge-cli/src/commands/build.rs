@@ -1,10 +1,11 @@
 //! `edge build` — compile the project to WebAssembly.
 //!
 //! The dispatch on source language lives in [`run`]. The current
-//! supported languages are `rust` (cargo build --target wasm32-wasip2)
-//! and `js` (QuickJS custom runtime). Each language writes its artifact to a
-//! language-namespaced path under `<project>/target/` so multiple
-//! languages can coexist in the same checkout.
+//! supported languages are `rust` (cargo build --target <target> +
+//! `wasm-tools component new` wrap) and `js` (QuickJS custom runtime).
+//! Each language writes its artifact to a language-namespaced path
+//! under `<project>/target/` so multiple languages can coexist in the
+//! same checkout.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -56,14 +57,20 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     };
 
     println!(
-        "Building '{}' (target: {}, language: {})...",
+        "Building '{}' (target: {}, world: {}, language: {})...",
         project_name,
         edge_toml.project.target,
+        edge_toml.project.world,
         effective.as_str(),
     );
 
     match effective {
-        LangArg::Rust => build_rust(path, project_name),
+        LangArg::Rust => build_rust(
+            path,
+            project_name,
+            &edge_toml.project.target,
+            &edge_toml.project.world,
+        ),
         LangArg::Js => build_js(path, project_name),
     }
 }
@@ -73,16 +80,15 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
 /// `deploy.rs` (which reads it). Exposed `pub(crate)` so the deploy
 /// command can call it without duplicating the path layout.
 ///
-/// Layout:
-/// - `rust` → `target/wasm32-wasip2/release/<name>.wasm` (cargo output)
-/// - `js`   → `target/javy/<name>.wasm`                  (javy/QuickJS component output)
+/// Layout (issue #410):
+/// - `rust` → `target/component.wasm` (the wasm-tools-wrapped component
+///   the worker loads). The intermediate cargo output
+///   `target/<target>/release/<name>.wasm` is the core module; it
+///   stays on disk for debugging but is NOT what `edge deploy` reads.
+/// - `js`   → `target/javy/<name>.wasm`  (javy/QuickJS component output)
 pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<PathBuf> {
     let artifact = match lang {
-        "rust" => project_root
-            .join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{}.wasm", name)),
+        "rust" => project_root.join("target").join("component.wasm"),
         "js" => project_root
             .join("target")
             .join("javy")
@@ -97,23 +103,107 @@ pub(crate) fn path_for(project_root: &Path, name: &str, lang: &str) -> Result<Pa
     Ok(artifact)
 }
 
-/// Build via `cargo build --target wasm32-wasip2 --release`.
-fn build_rust(path: &Path, project_name: &str) -> Result<()> {
+/// Resolve the intermediate cargo output path for a Rust project.
+/// Exposed `pub(crate)` so the regression test (and any future
+/// `edge build --keep-core` style flag) can locate the file. Lives
+/// next to `path_for` so the two layout choices stay in sync.
+pub(crate) fn core_path_for(project_root: &Path, name: &str, target: &str) -> PathBuf {
+    project_root
+        .join("target")
+        .join(target)
+        .join("release")
+        .join(format!("{}.wasm", name))
+}
+
+/// Build a Rust project: cargo → core module, then `wasm-tools
+/// component new` → wrapped component at `target/component.wasm`.
+///
+/// `target` is the cargo target triple (defaults to
+/// `wasm32-unknown-unknown`); `world` is the WIT world name (e.g.
+/// `edge-runtime-handler`). Both come from `edge.toml`; see
+/// [`config::edgetoml::Project`] for the defaults / required fields.
+fn build_rust(path: &Path, project_name: &str, target: &str, world: &str) -> Result<()> {
     let started_iso = iso8601_now();
 
+    // Step 1: cargo build --target <target> --release. Produces the
+    // core wasm module at target/<target>/release/<name>.wasm.
+    // Issue #410: <target> defaults to wasm32-unknown-unknown
+    // (NOT wasm32-wasip2) because the latter's bundled
+    // wit-component 0.241.x emits wasi:http@0.2.4, which wasmtime
+    // 45.0.3's linker rejects. Building the core module with
+    // wasm32-unknown-unknown leaves the wrapping to wasm-tools,
+    // which produces a wasi:http@0.2.1 component.
     let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2", "--release"])
+        .args(["build", "--target", target, "--release"])
         .current_dir(path)
-        .spawn()?
-        .wait()?;
+        .spawn()
+        .context("failed to spawn `cargo build`")?
+        .wait()
+        .context("failed to wait for `cargo build`")?;
 
     if !status.success() {
-        anyhow::bail!("cargo build failed");
+        anyhow::bail!("cargo build failed (target: {target})");
     }
 
+    let core = core_path_for(path, project_name, target);
+    if !core.exists() {
+        anyhow::bail!(
+            "cargo output not found at {} — did `cargo build --target {target}` produce a \
+             cdylib artifact named `{project_name}.wasm`? Check the crate's `[lib] name`.",
+            core.display()
+        );
+    }
+
+    // Step 2: wasm-tools component new <core> -o target/component.wasm.
+    // Wraps the core module into a component the worker can load.
+    //
+    // The world name + WIT interface definitions are read from
+    // `wit-component-encoding` custom sections that `wit-bindgen`
+    // embedded in the core module at compile time — `wasm-tools
+    // component new` (1.252.0+) does NOT need `--world` or
+    // `--wit-dir` flags. The `world` parameter is still threaded
+    // through to `build_rust` so it appears in the print banner (a
+    // self-documenting sanity check) and so future enhancements
+    // (e.g. cross-check the declared world against the produced
+    // component's actual world) have it on hand.
+    let _ = world; // intentionally unused — see comment above.
     let artifact = path_for(path, project_name, "rust").context("resolving rust artifact path")?;
+    if let Some(parent) = artifact.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating artifact parent directory {}", parent.display()))?;
+    }
+
+    println!("  Wrapping with wasm-tools...");
+    let status = Command::new("wasm-tools")
+        .args([
+            "component",
+            "new",
+            &core.to_string_lossy(),
+            "-o",
+            &artifact.to_string_lossy(),
+        ])
+        .spawn()
+        .context(
+            "failed to spawn `wasm-tools component new`. Install with: \
+             `cargo install wasm-tools --locked`",
+        )?
+        .wait()
+        .context("failed to wait for `wasm-tools component new`")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "wasm-tools component new failed — the cargo output is at {} if you want to debug. \
+             Common causes: a stale `target/` (try `cargo clean` first), or a `wit-bindgen` \
+             version that emits a wasi:http version wasmtime 45.0.3 doesn't accept.",
+            core.display()
+        );
+    }
+
     if !artifact.exists() {
-        anyhow::bail!("artifact not found at {}", artifact.display());
+        anyhow::bail!(
+            "artifact not found at {} after a reportedly successful wasm-tools run",
+            artifact.display()
+        );
     }
 
     // Issue #307 PR2 — capture build-time metadata into
@@ -123,19 +213,17 @@ fn build_rust(path: &Path, project_name: &str) -> Result<()> {
     // envelope's `predicate.buildTools[]` and
     // `predicate.invocation.parameters` entries.
     //
-    // Toolchain fields are best-effort: a missing toolchain
-    // binary just leaves an empty string, and the envelope
-    // builder on the server side already treats empty fields
-    // as "unknown". `source_digest` is the same digest the
-    // server-side edge-migrate analysis mints per-file —
-    // surface-level mismatch is OK, the server uses the
-    // authoritative value when compiling.
+    // `target` here is the cargo-side target triple (what the
+    // user wrote in edge.toml). The control plane treats this as
+    // an opaque string — the SLSA envelope's
+    // `predicate.invocation.parameters.target` field is just a
+    // record of what was used, not a validation point.
     let build_metadata = BuildMetadata {
         toolchain_rustc: capture_tool_version("rustc", &["--version"]),
         toolchain_cargo: capture_tool_version("cargo", &["--version"]),
         toolchain_clang: String::new(),
         toolchain_rustup: capture_tool_version("rustup", &["show", "active-toolchain"]),
-        target: "wasm32-wasip2".to_string(),
+        target: target.to_string(),
         profile: "release".to_string(),
         source_digest: compute_source_digest(path).unwrap_or_default(),
         build_started_on: started_iso,
@@ -148,6 +236,7 @@ fn build_rust(path: &Path, project_name: &str) -> Result<()> {
 
     println!("✓ Built successfully");
     println!("  Artifact: {}", artifact.display());
+    println!("  Core:     {}", core.display());
     Ok(())
 }
 
@@ -274,13 +363,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_for_returns_rust_target_dir() {
+    fn path_for_returns_rust_component_wasm() {
+        // Issue #410: the `rust` artifact path is now the wrapped
+        // component at `target/component.wasm`, not the raw cargo
+        // output. The deploy path reads this file; the cargo output
+        // (`core_path_for`) is an intermediate.
         let root = Path::new("/proj");
         let got = path_for(root, "myapp", "rust").expect("rust is a supported language");
-        assert_eq!(
-            got,
-            PathBuf::from("/proj/target/wasm32-wasip2/release/myapp.wasm")
-        );
+        assert_eq!(got, PathBuf::from("/proj/target/component.wasm"));
     }
 
     #[test]
@@ -288,6 +378,20 @@ mod tests {
         let root = Path::new("/proj");
         let got = path_for(root, "myapp", "js").expect("js is a supported language");
         assert_eq!(got, PathBuf::from("/proj/target/javy/myapp.wasm"));
+    }
+
+    #[test]
+    fn core_path_for_uses_target_subdir() {
+        // The cargo output is at `target/<target>/release/<name>.wasm`,
+        // matching cargo's own layout. Test pinning the target string
+        // so a future refactor that drops the target prefix trips the
+        // test (the deploy path would silently point at a stale file).
+        let root = Path::new("/proj");
+        let got = core_path_for(root, "myapp", "wasm32-unknown-unknown");
+        assert_eq!(
+            got,
+            PathBuf::from("/proj/target/wasm32-unknown-unknown/release/myapp.wasm")
+        );
     }
 
     #[test]

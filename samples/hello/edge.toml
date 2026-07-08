@@ -1,12 +1,23 @@
 # edgeCloud project config consumed by `edge deploy` / `edge build`.
 #
-# `[project].name` is the wasm app name; the CLI looks for
-# `target/wasm32-wasip2/release/<name>.wasm` by default, which the
-# preview CI populates by wrapping the `wasm32-unknown-unknown` build
-# with `wasm-tools component new`. See samples/hello/README.md.
+# `[project].target` is the cargo target triple used to build the
+# core wasm module. Defaults to `wasm32-unknown-unknown`, which is
+# the supported target for the standard `edge build` pipeline
+# (cargo + `wasm-tools component new` wrap). The legacy
+# `wasm32-wasip2` target produces components that wasmtime 45.0.3
+# rejects (`wasi:http@0.2.4` vs the runtime's `wasi:http@0.2.1`) —
+# see samples/hello/README.md for the full explanation.
+#
+# `[project].world` is the WIT world the guest component implements.
+# Must match the `world: "..."` arg in your `wit_bindgen::generate!`
+# call (see src/lib.rs). Two valid values today: `edge-runtime`
+# (long-running) and `edge-runtime-handler` (FaaS — this sample).
 
 [project]
 name = "hello"
+version = "0.1.0"
+target = "wasm32-unknown-unknown"
+world = "edge-runtime-handler"
 
 [deployment]
 # Default API. Override with `EDGE_API_URL` env var or pass

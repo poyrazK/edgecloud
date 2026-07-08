@@ -38,6 +38,7 @@ fn seed_project(project: &TempDir, app_name: &str) {
 name = "{app_name}"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#
