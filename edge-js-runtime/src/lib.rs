@@ -5,7 +5,7 @@ mod edge_modules;
 // Generate bindings matching the handler world
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
-    path: "../edge-worker/tests/fixtures/wit",
+    path: "../wit",
     generate_all,
 });
 

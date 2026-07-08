@@ -16,25 +16,37 @@ interface.
 
 ## Build
 
-The two-step build is required because of a WIT-version mismatch between
-the `wasm32-wasip2` target (which embeds `wit-component 0.241.x` and emits
-`wasi:io@0.2.6` / `wasi:http/types@0.2.4`) and `wasmtime 45.0.3` (which
-expects `wasi:io@0.2.1` / `wasi:http/types@0.2.1`). The matching
-toolchain is `wasm32-unknown-unknown` core module + `wasm-tools component
-new` wrapping with `--world edge-runtime-handler`.
+The CLI does the two-step build (cargo + `wasm-tools component new`
+wrap) for you:
 
 ```sh
 cd samples/hello
-cargo build --target wasm32-unknown-unknown --release
-wasm-tools component new \
-  target/wasm32-unknown-unknown/release/hello.wasm \
-  --world edge-runtime-handler \
-  -o target/component.wasm
+../../target/release/edge build
 ```
 
-The wrapped `target/component.wasm` is what `edge deploy` uploads. The
-preview CI copies it to `target/wasm32-wasip2/release/hello.wasm` (the
-path the CLI looks at by default) before invoking `edge deploy --preview`.
+That command runs `cargo build --target wasm32-unknown-unknown --release`
+and then `wasm-tools component new <core> --world <detected>
+--wit-dir ../../wit -o target/component.wasm`. The wrapped
+`target/component.wasm` is what `edge deploy` uploads.
+
+### Why the two-step build exists
+
+rustc 1.93.0's `wasm32-wasip2` target embeds `wit-component 0.241.x` in
+the produced core module, which emits `wasi:io@0.2.6` and
+`wasi:http/types@0.2.4`. Wasmtime 45.0.3 (the version this repo ships
+in `edge-runtime` and `edge-worker`) is built against the WASI WIT
+files at `edge-runtime/src/wit/deps/`, which declare
+`wasi:http@0.2.1` / `wasi:io@0.2.1`. The component model's resolver
+rejects any component that imports a higher minor version than the
+linker was built with — the load fails with a `wasi:http` import
+mismatch before any guest code runs.
+
+Building the core module with `wasm32-unknown-unknown` (which doesn't
+embed the buggy `wit-component`) and then wrapping it with
+`wasm-tools component new` produces a component that uses the
+matching `wasi:http@0.2.1` interface. The `wasm-tools 1.252.x` default
+adapter is what makes the wrap step "just work" — no `--adapt` flag
+required.
 
 ## Deploy
 
@@ -51,21 +63,22 @@ the preview composite action captures and posts to the originating PR.
 ```
 samples/hello/
 ├── Cargo.toml         # crate-type = ["cdylib"], isolated [workspace]
-├── edge.toml          # [project] name = "hello", [deployment] api = ...
+├── edge.toml          # [project] name + target, [deployment] api
 ├── README.md          # this file
 └── src/
     └── lib.rs         # wasi:http/incoming-handler implementation
 ```
 
-The WIT tree used by `wit-bindgen` lives in
-[`edge-worker/tests/fixtures/wit/`](../../edge-worker/tests/fixtures/wit/)
-and is referenced via the `path: "../../edge-worker/tests/fixtures/wit"`
-field in `src/lib.rs`. The runtime's own WIT at
+The WIT tree used by `wit-bindgen` lives at
+[`wit/`](../../wit/) (with `wit/deps/*` for the WASI 0.2.1 deps) and
+is referenced via the `path: "../../wit"` field in `src/lib.rs`. The
+runtime's own WIT at
 [`edge-runtime/src/wit/`](../../edge-runtime/src/wit/) is the source of
 truth for wasmtime's resolver but isn't directly usable by
 `wit-bindgen` — its `include wasi:cli/command@0.2.1;` syntax is
 wasmtime-only and its dep `.wit` files don't carry top-level
-`package` declarations. The fixture tree was explicitly adapted for
-`wit-bindgen` (with package decls and a `wasi:http/outgoing-handler`
+`package` declarations. The top-level `wit/` tree is explicitly adapted
+for `wit-bindgen` (with package decls and a `wasi:http/outgoing-handler`
 import on the handler world), so the sample points at it instead of
-duplicating 33 files.
+duplicating 33 files. The historical
+`edge-worker/tests/fixtures/wit/` path is now a symlink to `wit/`.

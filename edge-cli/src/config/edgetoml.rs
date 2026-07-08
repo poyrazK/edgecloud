@@ -18,7 +18,24 @@ pub struct Project {
     pub name: String,
     #[allow(dead_code)]
     pub version: String,
+    /// Cargo build target for the project's primary crate. Defaults
+    /// to `"wasm32-unknown-unknown"` (via [`default_target`]) so the
+    /// common Rust path — `edge build` running cargo + a `wasm-tools
+    /// component new` wrap — works on a toml that omits the key.
+    /// Set explicitly for projects that need a different target
+    /// (e.g. `wasm32-wasip1`).
+    #[serde(default = "default_target")]
     pub target: String,
+    /// WIT world the guest component implements, used to wrap the
+    /// cargo output into a component via `wasm-tools component new
+    /// --world <world>`. Required: there's no good default because
+    /// `edge:cloud@0.2.0` declares two worlds (`edge-runtime` and
+    /// `edge-runtime-handler`) and the user's `wit_bindgen::generate!`
+    /// call in `lib.rs` already names the world explicitly
+    /// (e.g. `samples/hello/src/lib.rs:36`). Surfacing a missing
+    /// field at parse time is much friendlier than failing
+    /// `wasm-tools` mid-build with a vague "world not found" error.
+    pub world: String,
     /// Source language this project builds with. `None` (and absent
     /// from legacy `edge.toml` files) resolves to `"rust"` via
     /// [`Project::language_or_default`].
@@ -31,6 +48,18 @@ pub struct Project {
     /// `rollback`) keep working on tomls with stale language fields.
     #[serde(default)]
     pub language: Option<String>,
+}
+
+/// Default `[project].target` for projects that omit the key. Picked
+/// at serde-deserialize time so `Project::target` is always a
+/// non-empty string at use sites — `build_rust` doesn't have to
+/// special-case a missing field. `wasm32-unknown-unknown` is the
+/// supported build target for the standard `edge build` pipeline
+/// (cargo + `wasm-tools component new` wrap). The legacy
+/// `wasm32-wasip2` target produces components that wasmtime 45.0.3
+/// rejects (`wasi:http@0.2.4` vs the runtime's `wasi:http@0.2.1`).
+fn default_target() -> String {
+    "wasm32-unknown-unknown".to_string()
 }
 
 impl Project {
@@ -98,6 +127,7 @@ mod tests {
 name = "x"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 api = "https://from-toml"
@@ -127,6 +157,7 @@ api = "https://from-toml"
 name = "x"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,
@@ -153,6 +184,7 @@ target = "wasm32-wasip2"
 name = "x"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 language = "js"
 
 [deployment]
@@ -172,6 +204,7 @@ language = "js"
 name = "x"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,
@@ -193,6 +226,7 @@ target = "wasm32-wasip2"
 name = "x"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 language = ""
 
 [deployment]
@@ -200,5 +234,71 @@ language = ""
         );
         assert_eq!(toml.project.language.as_deref(), Some(""));
         assert_eq!(toml.project.language_or_default(), "rust");
+    }
+
+    // ── target field (issue #410) ────────────────────────────────────
+
+    #[test]
+    fn target_defaults_when_absent() {
+        // An edge.toml that omits the `target` line parses cleanly
+        // and `Project::target` resolves to the documented default
+        // (`wasm32-unknown-unknown`). Issue #410: this default is
+        // what makes the `edge build` two-step recipe (cargo +
+        // `wasm-tools component new` wrap) work without a target
+        // override in the sample's edge.toml.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.target, "wasm32-unknown-unknown");
+    }
+
+    #[test]
+    fn target_respects_explicit_value() {
+        // Setting `target = "wasm32-wasip1"` (or any other value) is
+        // preserved verbatim — the default is only the fallback for
+        // absent keys. This keeps backward compat with projects that
+        // explicitly opt into non-default targets.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip1"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.target, "wasm32-wasip1");
+    }
+
+    #[test]
+    fn world_is_required() {
+        // `[project].world` has no default. The two valid values today
+        // are `edge-runtime` (long-running) and `edge-runtime-handler`
+        // (FaaS), both declared in `wit/edge-cloud.wit`. Missing-key
+        // errors at parse time rather than at `wasm-tools` time, so
+        // the user gets a pointer to the field they need to add
+        // instead of a confusing "world not found" later in the
+        // pipeline.
+        let result = toml::from_str::<EdgeToml>(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+
+[deployment]
+"#,
+        );
+        let err = result.expect_err("missing `world` field must fail parse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("world") || msg.contains("missing field"),
+            "expected the parse error to mention `world` or `missing field`, got: {msg}"
+        );
     }
 }

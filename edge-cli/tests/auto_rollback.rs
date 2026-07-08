@@ -29,6 +29,7 @@ fn seed_project(project: &TempDir, app_name: &str) {
 name = "{app_name}"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#
@@ -36,18 +37,12 @@ target = "wasm32-wasip2"
     )
     .unwrap();
     // Drop the wasm artifact at the expected location so the CLI's
-    // upload path finds it.
-    let artifact_dir = project
-        .path()
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("release");
+    // upload path finds it. Issue #410: the rust layout moved from
+    // `target/wasm32-wasip2/release/<name>.wasm` (cargo output) to
+    // `target/component.wasm` (the wasm-tools-wrapped component).
+    let artifact_dir = project.path().join("target");
     std::fs::create_dir_all(&artifact_dir).unwrap();
-    std::fs::write(
-        artifact_dir.join(format!("{app_name}.wasm")),
-        VALID_WASM_HEADER,
-    )
-    .unwrap();
+    std::fs::write(artifact_dir.join("component.wasm"), VALID_WASM_HEADER).unwrap();
 }
 
 /// `edge deploy --auto-rollback` MUST append `?auto-rollback=true`
@@ -101,6 +96,7 @@ async fn deploy_with_file_flag_uploads_custom_artifact() {
 name = "myapp"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,

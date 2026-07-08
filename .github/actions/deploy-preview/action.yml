@@ -10,7 +10,7 @@ inputs:
     required: false
     default: 'https://api.edgecloud.dev'
   build:
-    description: 'Whether to run `cargo build --target wasm32-wasip2 --release` before deploying. Set to "false" if the caller has already built the wasm (e.g. via dtolnay/rust-toolchain).'
+    description: 'Whether to run `edge build` before deploying. The CLI runs the proven `cargo build` + `wasm-tools component new` recipe (issue #410 — wasi:http@0.2.1 vs 0.2.4). Set to "false" if the caller has already produced the artifact.'
     required: false
     default: 'true'
   comment-on-pr:
@@ -42,9 +42,16 @@ runs:
     - name: Build wasm
       if: inputs.build == 'true'
       shell: bash
-      run: |
-        rustup target add wasm32-wasip2
-        cargo build --target wasm32-wasip2 --release
+      # `edge build` does the proven two-step recipe: cargo build
+      # under the chosen `[project].target` (default
+      # `wasm32-unknown-unknown`) followed by `wasm-tools component
+      # new` to wrap the core module into a wasi:http@0.2.1 component
+      # the worker (wasmtime 45.0.3) can instantiate. Replaces the
+      # historical hand-written `rustup target add wasm32-wasip2`
+      # + `cargo build --target wasm32-wasip2 --release` recipe,
+      # which rustc 1.93.0 broke by emitting wasi:http@0.2.4 (issue
+      # #410).
+      run: edge build
 
     - name: Deploy preview
       id: deploy

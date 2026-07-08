@@ -23,6 +23,7 @@ fn seed_project_with_state(project: &TempDir, app_name: &str, deployment_id: &st
 name = "opentest"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,
@@ -200,6 +201,7 @@ async fn open_without_state_exits_non_zero() {
 name = "opentest"
 version = "0.1.0"
 target = "wasm32-wasip2"
+world = "edge-runtime-handler"
 
 [deployment]
 "#,

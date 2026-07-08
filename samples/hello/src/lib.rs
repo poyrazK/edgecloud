@@ -9,40 +9,32 @@
 //!
 //! ## Build
 //!
-//! ```sh
-//! # 1. Compile the Rust source to a core wasm module.
-//! cd samples/hello
-//! cargo build --target wasm32-unknown-unknown --release
+//! The CLI does the two-step build (cargo + wasm-tools wrap) for you:
 //!
-//! # 2. Wrap the core module into a wasi:http component matching the
-//! #    runtime's expected WIT version (wasi:http@0.2.1, wasi:io@0.2.1).
-//! #    The `wasm32-wasip2` target embeds wit-component 0.241.x, which
-//! #    emits @0.2.4 / @0.2.6 and is rejected by wasmtime 45.0.3's
-//! #    wasi:http wiring. Building core + wrapping is the only path
-//! #    that matches the runtime today.
-//! wasm-tools component new \
-//!   target/wasm32-unknown-unknown/release/hello.wasm \
-//!   --world edge-runtime-handler \
-//!   -o target/component.wasm
+//! ```sh
+//! cd samples/hello
+//! ../../target/release/edge build
 //! ```
 //!
-//! The `preview.yml` CI does the same two-step build, copies the
-//! wrapped component to `target/wasm32-wasip2/release/hello.wasm` (the
-//! path `edge deploy` looks for by default), and uploads it.
+//! See `README.md` for why the `wasm32-wasip2` target alone is
+//! insufficient (wasi:http@0.2.4 vs 0.2.1 mismatch with wasmtime 45.0.3).
 
 #![no_main]
 
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
-    // Point at the host repo's existing wit-bindgen-compatible WIT tree
-    // (edge-worker/tests/fixtures/wit/) instead of vendoring. The runtime's
-    // own edge-runtime/src/wit/ is the source of truth for wasmtime's
+    // Canonical wit-bindgen-compatible WIT lives at the repo root
+    // (`wit/edge-cloud.wit` + `wit/deps/*`). The runtime's own
+    // `edge-runtime/src/wit/` is the source of truth for wasmtime's
     // resolver but is NOT directly usable by wit-bindgen: its `include
-    // wasi:cli/command@0.2.1;` syntax is wasmtime-only, and its dep .wit
-    // files don't carry top-level `package` declarations. The fixture tree
-    // was explicitly adapted for wit-bindgen (with package decls and a
-    // `wasi:http/outgoing-handler` import on the handler world).
-    path: "../../edge-worker/tests/fixtures/wit",
+    // wasi:cli/command@0.2.1;` syntax is wasmtime-only, and its dep
+    // .wit files don't carry top-level `package` declarations. The
+    // top-level `wit/` tree is explicitly adapted for wit-bindgen
+    // (with package decls and a `wasi:http/outgoing-handler` import
+    // on the handler world). `edge-worker/tests/fixtures/wit` is a
+    // symlink to the same tree, kept around for fixture-build scripts
+    // that look for it there.
+    path: "../../wit",
     generate_all,
 });
 
