@@ -341,6 +341,15 @@ impl Clone for RuntimeState {
         //     Store). It captures the same `Arc<EgressPolicy>` and the
         //     same `self.socket_mode`, but the closure trait object is
         //     a new allocation; it is NOT shared across clones.
+        //   * `exit_code: Arc<AtomicU32>` — SHARED via Arc. A
+        //     `process::exit(N)` write through the clone's `Process`
+        //     (which holds a clone of the same Arc — see
+        //     `with_env_and_meter` at runtime.rs:276-279) is visible
+        //     to `exit_requested()` on any clone. Required by the FaaS
+        //     dispatch path: see dispatch.rs::handle_request where one
+        //     base `RuntimeState` is cloned per request, and the worker
+        //     reads `exit_code_arc` after the guest call to distinguish
+        //     a clean `process::exit` from a wasm trap.
         Self {
             kv_store: self.kv_store.clone(),
             cache: self.cache.clone(),
@@ -376,7 +385,18 @@ impl Clone for RuntimeState {
             // (tests) and via the upstream resolve hook tomorrow.
             hostname_pinning: self.hostname_pinning.clone(),
             http_hooks: EgressHttpHooks::new(self.egress.clone(), self.tenant_id.clone()),
-            exit_code: Arc::new(AtomicU32::new(0)),
+            // Arc::clone so every RuntimeState::clone shares the same
+            // exit_code AtomicU32 as the original. Required for the
+            // FaaS dispatch path (dispatch.rs::handle_request clones
+            // a base RuntimeState per request): writes via
+            // `Process::exit(N)` on the clone must be observable via
+            // `exit_requested()` on the parent. Without this, a clean
+            // guest exit is misclassified as a wasm trap (the
+            // supervisor's `exit_requested()` check always returns
+            // None). See `clone_shares_exit_code_arc` in
+            // `with_env_and_meter_tests` for the load-bearing
+            // regression test.
+            exit_code: Arc::clone(&self.exit_code),
             store_limits: None, // set fresh by create_store for each new Store
         }
     }
@@ -1396,5 +1416,63 @@ mod with_env_and_meter_tests {
             !Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
             "different tenants must have different scheduling Arcs"
         );
+    }
+
+    // ── Clone semantics: exit_code Arc is shared ──────────────────
+    //
+    // The FaaS dispatch path (edge-worker/src/dispatch.rs) clones a
+    // base `RuntimeState` per request. For a guest `process::exit(N)`
+    // write to be observable via `exit_requested()` on the parent,
+    // the `exit_code` Arc must be SHARED across clones. The
+    // `Clone for RuntimeState` impl at runtime.rs:321-383 used to
+    // allocate a fresh `Arc<AtomicU32>` per clone, silently breaking
+    // this invariant. These two tests pin the shared-Arc semantics:
+    // the first catches the bug at the field level, the second
+    // exercises the writer (clone's `Process::exit`) and both
+    // readers (top-level `exit_requested`, `Process::exit_requested`).
+
+    #[test]
+    fn clone_shares_exit_code_arc() {
+        let original = state_with_env(
+            HashMap::new(),
+            &format!("exit-arc-{}", uuid::Uuid::new_v4()),
+        );
+        // Sanity baseline: fresh state has no exit requested.
+        assert_eq!(original.exit_requested(), None);
+
+        let clone = original.clone();
+        // Drives the bug: Arc::ptr_eq must hold between
+        // original.exit_code and clone.exit_code. If the Clone impl
+        // breaks the promise (regression to a fresh
+        // `Arc<AtomicU32>`), this assertion catches it without
+        // needing a guest call.
+        assert!(
+            Arc::ptr_eq(&original.exit_code, &clone.exit_code),
+            "RuntimeState::clone must share the exit_code Arc"
+        );
+
+        // Drive a guest exit through the CLONE's `Process` (which
+        // itself holds the same Arc, by way of
+        // `with_env_and_meter::Process::with_env_and_exit_code` at
+        // runtime.rs:276-279).
+        clone.process.exit(7);
+        // The original observes the write — proves the Arc-shared
+        // semantics end to end.
+        assert_eq!(original.exit_requested(), Some(7));
+    }
+
+    #[test]
+    fn clone_exit_requested_via_process_field_independent() {
+        // Pin the reader-via-`Process` path: a clone that goes
+        // through its own `Process::exit` writer must read back via
+        // `process.exit_requested()` AND via the top-level field.
+        let original = state_with_env(HashMap::new(), &format!("exit-pp-{}", uuid::Uuid::new_v4()));
+        let clone = original.clone();
+        clone.process.exit(13);
+        // Top-level reader.
+        assert_eq!(clone.exit_requested(), Some(13));
+        // Process-side reader (which also reads through the same
+        // Arc).
+        assert_eq!(clone.process.exit_requested(), Some(13));
     }
 }
