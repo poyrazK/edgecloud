@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"log"
 	"regexp"
 	"strings"
@@ -158,6 +159,83 @@ func TestActivateDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 // in service itself). Helper used only by the subtests in this file.
 func isErrTenantDisabled(err error) bool {
 	return err != nil && strings.Contains(err.Error(), ErrTenantDisabled.Error())
+}
+
+// TestActivateDeployment_DisabledAtPostCommit_ReturnsErrTenantDisabled
+// pins the defence-in-depth post-commit check at deployment.go:984:
+// the tx-time guard passes (tenant.GetForUpdate returns enabled_at=nil)
+// and the tx commits, but the post-commit GetByID observes a tenant
+// that became disabled between the lock release and the read. The
+// activate must still abort with ErrTenantDisabled (now wrapping the
+// sentinel so the handler maps to 409) and must NOT publish.
+//
+// This covers a future non-tx activation path that skips the tx-time
+// FOR UPDATE check, or a race where a disable commits in the narrow
+// window between the tx-time check and the post-commit read. Without
+// this test, dropping the post-commit check would not be caught by
+// the existing test suite.
+func TestActivateDeployment_DisabledAtPostCommit_ReturnsErrTenantDisabled(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		deploymentID = "d_abc123"
+		appName      = "myapp"
+		tenantID     = "t_postcommit_disabled"
+	)
+
+	// 1. deploymentRepo.GetByID.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "hash", `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	// 2. Activate tx: tenant.GetForUpdate returns ENABLED (the tx-time
+	//    guard passes). active_deployments get/insert/clear all succeed
+	//    so the tx commits cleanly.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
+		WithArgs(tenantID, appName).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	// 3. appEnvRepo.List — return no env vars (activate flow does
+	//    DecryptEnvMap-via-List when envSvc is nil; we want to reach
+	//    the post-commit tenant GetByID, so the env query must
+	//    succeed first).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+
+	// 4. Post-commit tenant.GetByID returns a DISABLED row (a disable
+	//    raced into the gap between the tx-time FOR UPDATE release
+	//    and this read). The defence-in-depth check at deployment.go:984
+	//    must fire here, wrap ErrTenantDisabled, and short-circuit
+	//    before publishSwap runs.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), time.Now()))
+
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	if err == nil {
+		t.Fatalf("ActivateDeployment on post-commit-disabled tenant returned nil; want ErrTenantDisabled")
+	}
+	if !isErrTenantDisabled(err) {
+		t.Errorf("err = %v, want ErrTenantDisabled (post-commit check must wrap the sentinel)", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publish regions = %v, want none (post-commit check must short-circuit before publishSwap)", got)
+	}
 }
 
 // TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty

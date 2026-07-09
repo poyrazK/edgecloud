@@ -777,11 +777,20 @@ func (s *WorkerService) disableTenantAtomically(ctx context.Context, tenantID st
 	return nil
 }
 
-// diffActiveDeployments returns the set of rows in `now` that were not
-// present in `baseline`, keyed by (tenant_id, app_name). A row counts as
-// "the same" only if both keys match; deployment_id changes on a known
-// (tenant, app) are treated as a new row because the racing activate
-// flipped it and we want to know.
+// diffActiveDeployments returns the rows in `now` whose (tenant_id,
+// app_name) was not present in `baseline`.
+//
+// The diff is keyed on (tenant, app) only — NOT on deployment_id. A
+// racing activate that swapped a deployment_id on an existing (tenant,
+// app) row is intentionally NOT counted as new: that activate published
+// its non-empty task_update against the same primary key, so workers
+// will converge on the new deployment_id; the disable side can safely
+// publish empty without killing the freshly-started app.
+//
+// Empty `baseline` is treated as a catch-all and returns `now` verbatim:
+// the disable path takes the in-tx snapshot before the racing activate
+// can write, so an empty baseline with non-empty `now` is exactly the
+// signal we want to skip the empty publish on.
 func diffActiveDeployments(baseline, now []domain.ActiveDeployment) []domain.ActiveDeployment {
 	if len(baseline) == 0 {
 		return now

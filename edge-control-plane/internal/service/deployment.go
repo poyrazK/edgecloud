@@ -982,7 +982,14 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("tenant not found")
 	}
 	if tenant.IsDisabled() {
-		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
+		// Issue #440 belt-and-braces: the tx-time check above catches
+		// the racing case under the tenants-row FOR UPDATE lock. This
+		// post-commit check covers the (theoretical) case where a
+		// future non-tx activation path skips that lock and observes
+		// the disabled tenant only after its own write commits. Wrap
+		// with ErrTenantDisabled so the handler's `errors.Is` branch
+		// maps it to 409, matching the tx-time path's status.
+		return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
 	}
 
 	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
