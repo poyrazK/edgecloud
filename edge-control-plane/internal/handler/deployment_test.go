@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -626,5 +629,187 @@ func TestParsePreviewOpts_PRNumberWithoutID_ReturnsErr(t *testing.T) {
 	_, err := parsePreviewOpts("", "123", "")
 	if err == nil {
 		t.Errorf("err = nil, want non-nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// statusResponse DTO mapper — pins the wire contract for
+// GET /api/v1/status/{id}, GET /api/v1/apps/{app}/active, and the
+// items in GET /api/v1/list/{app}. The CLI deserializes these
+// endpoints and was previously broken by `*domain.Deployment` being
+// emitted raw (PascalCase, no `URL`). These tests lock the snake_case
+// DTO shape so the wire contract can't drift again.
+// ---------------------------------------------------------------------------
+
+// TestNewStatusResponse_SnakeCaseAndURL pins every field of the DTO
+// mapper: snake_case keys, RFC3339 timestamp, computed URL, optional
+// preview/signature fields suppressed when unset. A regression here
+// would break the CLI's `edge status`, `edge deployments`, and
+// `edge open` against a real CP.
+func TestNewStatusResponse_SnakeCaseAndURL(t *testing.T) {
+	previewID := "abcd1234"
+	prNum := 42
+	expires := time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC)
+	d := &domain.Deployment{
+		ID:                  "d_abc",
+		TenantID:            "t_test",
+		AppName:             "myapp",
+		Status:              "active",
+		Hash:                "3a2f5e4b",
+		Signature:           "5c1e9b",
+		SigningKeyID:        "prod-2026-q3",
+		Regions:             pq.StringArray{"us-east-1", "eu-west-1"},
+		AutoRollbackEnabled: true,
+		DesiredReplicas:     3,
+		BuildAttestation:    json.RawMessage(`{"payload":"..."}`),
+		PreviewID:           &previewID,
+		PreviewPRNumber:     &prNum,
+		PreviewExpiresAt:    &expires,
+		CreatedAt:           time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC),
+	}
+
+	got := newStatusResponse(d, "t_test", "myapp")
+
+	if got.ID != "d_abc" {
+		t.Errorf("ID = %q, want d_abc", got.ID)
+	}
+	if got.TenantID != "t_test" {
+		t.Errorf("TenantID = %q, want t_test", got.TenantID)
+	}
+	if got.AppName != "myapp" {
+		t.Errorf("AppName = %q, want myapp", got.AppName)
+	}
+	if got.Status != "active" {
+		t.Errorf("Status = %q, want active", got.Status)
+	}
+	if got.Hash != "3a2f5e4b" {
+		t.Errorf("Hash = %q, want 3a2f5e4b", got.Hash)
+	}
+	if got.Signature != "5c1e9b" {
+		t.Errorf("Signature = %q, want 5c1e9b", got.Signature)
+	}
+	if got.SigningKeyID != "prod-2026-q3" {
+		t.Errorf("SigningKeyID = %q, want prod-2026-q3", got.SigningKeyID)
+	}
+	if !equalSlices(got.Regions, []string{"us-east-1", "eu-west-1"}) {
+		t.Errorf("Regions = %v, want [us-east-1 eu-west-1]", got.Regions)
+	}
+	if !got.AutoRollbackEnabled {
+		t.Errorf("AutoRollbackEnabled = false, want true")
+	}
+	if got.DesiredReplicas != 3 {
+		t.Errorf("DesiredReplicas = %d, want 3", got.DesiredReplicas)
+	}
+	if !bytes.Contains(got.BuildAttestation, []byte(`"payload"`)) {
+		t.Errorf("BuildAttestation = %s, want to contain payload", got.BuildAttestation)
+	}
+	if got.PreviewID != "abcd1234" {
+		t.Errorf("PreviewID = %q, want abcd1234", got.PreviewID)
+	}
+	if got.PreviewPRNumber == nil || *got.PreviewPRNumber != 42 {
+		t.Errorf("PreviewPRNumber = %v, want Some(42)", got.PreviewPRNumber)
+	}
+	if got.PreviewExpiresAt != "2026-07-16T00:00:00Z" {
+		t.Errorf("PreviewExpiresAt = %q, want 2026-07-16T00:00:00Z", got.PreviewExpiresAt)
+	}
+	if got.CreatedAt != "2026-07-01T12:00:00Z" {
+		t.Errorf("CreatedAt = %q, want 2026-07-01T12:00:00Z", got.CreatedAt)
+	}
+	if got.URL != "https://t_test-myapp.edgecloud.dev" {
+		t.Errorf("URL = %q, want https://t_test-myapp.edgecloud.dev", got.URL)
+	}
+}
+
+// TestNewStatusResponse_OmitsOptionalFieldsWhenNil asserts that a row
+// with no preview / signature / attestation produces an empty DTO
+// for those fields. `omitempty` on the JSON tags means the wire body
+// stays free of empty strings / null pointers — important because the
+// CLI uses `#[serde(default)]` and benefits from the absence being
+// well-defined.
+func TestNewStatusResponse_OmitsOptionalFieldsWhenNil(t *testing.T) {
+	d := &domain.Deployment{
+		ID:        "d_min",
+		TenantID:  "t_x",
+		AppName:   "a",
+		Status:    "deployed",
+		Hash:      "h",
+		Regions:   pq.StringArray{},
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	got := newStatusResponse(d, "t_x", "a")
+
+	if got.Signature != "" {
+		t.Errorf("Signature = %q, want empty (omitempty)", got.Signature)
+	}
+	if got.SigningKeyID != "" {
+		t.Errorf("SigningKeyID = %q, want empty (omitempty)", got.SigningKeyID)
+	}
+	if got.BuildAttestation != nil {
+		t.Errorf("BuildAttestation = %s, want nil (omitempty)", got.BuildAttestation)
+	}
+	if got.PreviewID != "" {
+		t.Errorf("PreviewID = %q, want empty (omitempty)", got.PreviewID)
+	}
+	if got.PreviewPRNumber != nil {
+		t.Errorf("PreviewPRNumber = %v, want nil (omitempty)", got.PreviewPRNumber)
+	}
+	if got.PreviewExpiresAt != "" {
+		t.Errorf("PreviewExpiresAt = %q, want empty (omitempty)", got.PreviewExpiresAt)
+	}
+}
+
+// TestNewStatusResponse_RoundTripJSON confirms the DTO round-trips
+// through encoding/json with the exact snake_case field names the
+// CLI expects. This is the single most important regression guard
+// — if anyone renames a field or drops a `json:` tag, the CLI breaks
+// against the real CP and this test catches it.
+func TestNewStatusResponse_RoundTripJSON(t *testing.T) {
+	previewID := "abcd1234"
+	prNum := 7
+	d := &domain.Deployment{
+		ID:              "d_rt",
+		TenantID:        "t_rt",
+		AppName:         "rt",
+		Status:          "active",
+		Hash:            "h",
+		Regions:         pq.StringArray{"us-east"},
+		PreviewID:       &previewID,
+		PreviewPRNumber: &prNum,
+		CreatedAt:       time.Date(2026, 7, 9, 0, 0, 0, 0, time.UTC),
+	}
+	got := newStatusResponse(d, "t_rt", "rt")
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire map[string]interface{}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal into map: %v", err)
+	}
+
+	wantStrings := map[string]string{
+		"id":         "d_rt",
+		"tenant_id":  "t_rt",
+		"app_name":   "rt",
+		"status":     "active",
+		"hash":       "h",
+		"preview_id": "abcd1234",
+		"url":        "https://t_rt-rt.edgecloud.dev",
+		"created_at": "2026-07-09T00:00:00Z",
+	}
+	for k, want := range wantStrings {
+		if got, _ := wire[k].(string); got != want {
+			t.Errorf("wire[%q] = %q, want %q", k, got, want)
+		}
+	}
+	if _, ok := wire["signature"]; ok {
+		t.Errorf("wire should not contain \"signature\" when empty (omitempty)")
+	}
+	if _, ok := wire["build_attestation"]; ok {
+		t.Errorf("wire should not contain \"build_attestation\" when empty (omitempty)")
+	}
+	if prNum, _ := wire["preview_pr_number"].(float64); int(prNum) != 7 {
+		t.Errorf("wire[preview_pr_number] = %v, want 7", wire["preview_pr_number"])
 	}
 }
