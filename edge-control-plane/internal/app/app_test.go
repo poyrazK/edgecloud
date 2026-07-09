@@ -283,10 +283,10 @@ func TestRunBackground_DoesNotPanic(t *testing.T) {
 // path.
 //
 // This test verifies the same shape via the loophealth tracker directly:
-// the wrappers around the actual GC services would need a real DB (the
-// sqlmock has no expectations for their DELETEs, which would block), so
-// we exercise RunErr/Run wrappers in isolation with stub bodies that
-// mirror how RunBackground uses them.
+// wrapping the real GC services would need a real DB (the sqlmock has
+// no expectations registered for the SQL statements those loops issue,
+// which would block), so we exercise RunErr/Run wrappers in isolation
+// with stub bodies that mirror how RunBackground uses them.
 func TestRunBackground_WrappersRegisterAndRecover(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
@@ -406,7 +406,21 @@ func TestHealth_HealthyReturns200(t *testing.T) {
 	app := New(cfg, db, publisher, artifactStore, emptyFS)
 
 	// Pre-populate the tracker so the loops map is non-empty.
+	// Run is now non-blocking (wrapper spawns its own goroutine), so
+	// poll for the body to have entered before the GET — otherwise
+	// the goroutine may not have registered the loop yet and the
+	// assertion races the scheduler.
 	app.loopHealth.Run(context.Background(), "log_gc", "log_gc: ", func(string, ...any) {}, func(context.Context) {})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !app.loopHealth.Get("log_gc").StartedAt().IsZero() {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if app.loopHealth.Get("log_gc").StartedAt().IsZero() {
+		t.Fatalf("log_gc loop never entered within 2s (tracker race after Run wrapper change)")
+	}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
