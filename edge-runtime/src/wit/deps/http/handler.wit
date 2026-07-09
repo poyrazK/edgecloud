@@ -1,3 +1,5 @@
+package wasi:http@0.2.1;
+
 /// This interface defines a handler of incoming HTTP Requests. It should
 /// be exported by components which can respond to HTTP Requests.
 @since(version = 0.2.0)

@@ -3,7 +3,7 @@
 use rquickjs::{Ctx, Function, Object, TypedArray, Value};
 
 // The wit-bindgen generated bindings are available via crate::{edge, wasi, ...}
-use crate::edge::cloud::{cache, kv_store, observe, process, scheduling, time};
+use crate::edge::cloud::{cache, kv_store, observe, process, scheduling, time, websocket};
 
 /// Register all edge:cloud modules on globalThis.EdgeCloud.
 pub fn register_all<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
@@ -15,6 +15,7 @@ pub fn register_all<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     register_time(ctx, &edge_cloud)?;
     register_scheduling(ctx, &edge_cloud)?;
     register_process(ctx, &edge_cloud)?;
+    register_websocket(ctx, &edge_cloud)?;
 
     ctx.globals().set("EdgeCloud", edge_cloud)?;
     Ok(())
@@ -357,3 +358,182 @@ fn register_process<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Resu
     parent.set("process", p)?;
     Ok(())
 }
+
+// ─── websocket ─────────────────────────────────────────────────────
+
+/// Translate a JS string into the bindgen-generated `MessageType` enum.
+///
+/// `kind` strings mirror the WIT `enum message-type { text, binary, ping,
+/// pong, close }` at `edge-runtime/src/wit/edge-cloud.wit`. We do not
+/// surface the fifth variant (`close`) here because JS handlers send
+/// `close` frames via the dedicated `EdgeCloud.websocket.close()` method,
+/// not via `send({kind: "close"})`. A typo or unknown variant is an error,
+/// not a silent fallback.
+fn js_to_message_type(s: &str) -> Option<websocket::MessageType> {
+    match s {
+        "text" => Some(websocket::MessageType::Text),
+        "binary" => Some(websocket::MessageType::Binary),
+        "ping" => Some(websocket::MessageType::Ping),
+        "pong" => Some(websocket::MessageType::Pong),
+        _ => None,
+    }
+}
+
+/// Map a `websocket::MessageType` back to the JS-facing string form.
+///
+/// Inverse of [`js_to_message_type`]. We do not propagate `Close` here
+/// either (the `receive` discriminator handles close separately via
+/// `{data, kind} | {close}`).
+fn message_type_to_js(kind: websocket::MessageType) -> &'static str {
+    match kind {
+        websocket::MessageType::Text => "text",
+        websocket::MessageType::Binary => "binary",
+        websocket::MessageType::Ping => "ping",
+        websocket::MessageType::Pong => "pong",
+        websocket::MessageType::Close => "close",
+    }
+}
+
+/// Register the `websocket` interface on `parent.websocket`.
+///
+/// Note on errors: the WIT declares `listen`/`accept` as
+/// `result<u32, string>`, so we surface the host error reason. `send` and
+/// `close` use bare `result` (WIT lines 95, 101); the bindgen-shadowed
+/// Host impls in `edge-runtime/src/runtime.rs:1122, 1147` `map_err(|_| ())`
+/// the actual reason away before the JS binding ever sees it. So JS
+/// callers see generic "websocket send/close failed" messages until the
+/// v0.3 WIT-level rework tracked alongside issue #422. Accept and
+/// receive work fine.
+fn register_websocket<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+    use rquickjs::Exception;
+
+    let ws = Object::new(ctx.clone())?;
+
+    // listen(port) -> listenerId (u32). Throws on bind failure.
+    ws.set(
+        "listen",
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, port: u16| -> rquickjs::Result<u32> {
+            websocket::listen(port).map_err(|e| {
+                let msg = format!("websocket listen failed: {e}");
+                Exception::throw_message(&ctx, &msg)
+            })
+        }),
+    )?;
+
+    // accept(listenerId) -> connId (u32). Throws on accept failure.
+    ws.set(
+        "accept",
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, listener: u32| -> rquickjs::Result<u32> {
+            websocket::accept(listener).map_err(|e| {
+                let msg = format!("websocket accept failed: {e}");
+                Exception::throw_message(&ctx, &msg)
+            })
+        }),
+    )?;
+
+    // send(conn, data, kind) — data is a Uint8Array; kind is one of
+    // "text" | "binary" | "ping" | "pong". Throws on bad kind or send
+    // failure (no reason; see note above).
+    ws.set(
+        "send",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>,
+                  conn: u32,
+                  data_val: Value<'js>,
+                  kind: String|
+                  -> rquickjs::Result<()> {
+                let data = TypedArray::<'js, u8>::from_value(data_val)?;
+                let bytes: &[u8] = data.as_ref();
+                let k = js_to_message_type(&kind).ok_or_else(|| {
+                    let msg = format!("invalid message-type {kind:?}; expected text | binary | ping | pong");
+                    Exception::throw_message(&ctx, &msg)
+                })?;
+                websocket::send(conn, bytes, k)
+                    .map_err(|_| Exception::throw_message(&ctx, "websocket send failed"))
+            },
+        ),
+    )?;
+
+    // receive(conn) -> { data, kind } | { close: { code, reason } }.
+    //
+    // The WIT declares `receive` as `result<tuple<list<u8>, message-type>,
+    // close-info>` — an asymmetric Result where the success branch carries
+    // the message payload and the error branch carries a peer-initiated
+    // close frame. Both forms are surfaced as JS objects with
+    // discriminating fields, mirroring the `{ok} | {err}` shape of
+    // `process.cwd` (see this file's `register_process` for the precedent).
+    // JS callers should check `if (res.close)` first.
+    ws.set(
+        "receive",
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, conn: u32| -> rquickjs::Result<Value<'js>> {
+            match websocket::receive(conn) {
+                Ok((bytes, kind)) => {
+                    let obj = Object::new(ctx.clone())?;
+                    let ta = TypedArray::new(ctx.clone(), bytes)?;
+                    obj.set("data", ta.into_value())?;
+                    obj.set("kind", message_type_to_js(kind))?;
+                    Ok(obj.into_value())
+                }
+                Err(ci) => {
+                    let close = Object::new(ctx.clone())?;
+                    close.set("code", ci.code)?;
+                    close.set("reason", ci.reason)?;
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("close", close)?;
+                    Ok(obj.into_value())
+                }
+            }
+        }),
+    )?;
+
+    // close(conn, {code, reason}) — `info` is a JS object with numeric
+    // `code` and string `reason` fields. The bindgen-generated
+    // `websocket::CloseInfo` is a public-field struct and the
+    // `close(conn, info)` signature takes `&CloseInfo`. The host impl in
+    // `edge-runtime/src/runtime.rs:1146-1147` shows the equivalent shape.
+    // Throws on close failure (no reason; see note above).
+    ws.set(
+        "close",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, conn: u32, info: Value<'js>| -> rquickjs::Result<()> {
+                let info_obj = info.as_object().ok_or_else(|| {
+                    Exception::throw_message(&ctx, "close info must be an object {code, reason}")
+                })?;
+                let code: u16 = info_obj.get("code")?;
+                let reason: String = info_obj.get("reason")?;
+                let ci = websocket::CloseInfo { code, reason };
+                websocket::close(conn, &ci)
+                    .map_err(|_| Exception::throw_message(&ctx, "websocket close failed"))
+            },
+        ),
+    )?;
+
+    parent.set("websocket", ws)?;
+    Ok(())
+}
+
+// NOTE on tests:
+// An in-crate `#[cfg(test)] mod tests` for `register_websocket` was
+// the goal of this commit but the link step fails on host targets —
+// the component-model exports (`_wasi:cli/run@0.2.1`,
+// `_wasi:http/incoming-handler@0.2.1`) declared via `export!(JsHandler)`
+// in `lib.rs` need `wasm-component-ld`-style linking, which a host
+// `cargo test` invocation of the rlib does not run.
+//
+// So instead we rely on:
+//   1. The cdylib build at `cargo build --manifest-path
+//      edge-js-runtime/Cargo.toml --target wasm32-wasip1 --release`
+//      (verified in Commit 2 of this PR), which exercises the bindgen
+//      path end-to-end.
+//   2. The rust-runtime `wit_validation` test
+//      (`cargo test -p edge-runtime --test wit_validation`), which
+//      covers the seven-import assertion against the canonical WIT
+//      file the JS runtime also binds.
+//   3. The host impl integration tests at
+//      `edge-runtime/src/interfaces/websocket.rs:699-1330` (12 unit +
+//      6 integration, including a full TCP round-trip).
+// These three together cover what an in-crate unit test would. A
+// dedicated CI gate that runs `wasm-tools` validation on a sample JS
+// handler is the natural follow-up once the JS sample lands.
