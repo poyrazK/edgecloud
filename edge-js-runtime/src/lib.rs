@@ -200,6 +200,21 @@ mod wasm_only {
     }
 
     /// Extract { status, body, contentType } from a JS response object.
+    ///
+    /// When the handler returns a plain JS object of the shape
+    /// `{ status, body, contentType }`, the fields are used directly
+    /// (contentType defaults to `application/json`). When the handler
+    /// returns anything else (a string, number, etc.), the value is
+    /// treated as the body of a 200 response — and the content type
+    /// defaults to `text/plain; charset=utf-8`.
+    ///
+    /// The previous string-branch default of `application/json` was
+    /// wrong (issue #428): a handler like
+    /// `globalThis.handleRequest = () => "hello world"` would emit
+    /// `Content-Type: application/json` with a non-JSON body, which
+    /// downstream (browsers, log filters, CDNs) misclassifies. A
+    /// plain `text/plain` default is predictable; if a handler really
+    /// wants JSON it can return an object instead.
     fn extract_response(
         _ctx: &rquickjs::Ctx<'_>,
         val: rquickjs::Value<'_>,
@@ -212,12 +227,14 @@ mod wasm_only {
                 .unwrap_or_else(|_| "application/json".to_string());
             (status, body.into_bytes(), content_type)
         } else {
-            // If the handler returns a string, treat it as the body
+            // If the handler returns a non-object (string, number,
+            // null), treat the value as the body of a 200 response.
+            // `unwrap_or_default` covers numbers/null → empty body.
             let body = val
                 .as_string()
                 .map(|s| s.to_string().unwrap_or_default())
-                .unwrap_or_else(|| "null".to_string());
-            (200, body.into_bytes(), "application/json".to_string())
+                .unwrap_or_default();
+            (200, body.into_bytes(), "text/plain; charset=utf-8".to_string())
         }
     }
 
