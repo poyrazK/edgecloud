@@ -90,16 +90,20 @@ jobs:
         # `edge-cli deploy` reads `./edge.toml` from the cwd to find
         # the `[project] name` and the wasm artifact path. The hello
         # sample's edge.toml lives at samples/hello/edge.toml, so the
-        # composite action (which runs in the workflow's default cwd
-        # = repo root) needs to be told to chdir. Without this, the
-        # deploy step fails with
-        # `failed to read ./edge.toml (os error 2)`.
-        working-directory: samples/hello
+        # composite action needs to `cd` into that directory before
+        # invoking edge-cli. Composite actions don't accept
+        # `working-directory:` at the call site (GitHub Actions rejects
+        # the key on `uses:` steps that reference a composite — see
+        # the `Resolve app directory` step in the action for the
+        # detailed rationale). The action exposes an `app-dir` input
+        # that we set here. The default of "." is preserved for
+        # callers that invoke the action from the project root.
         with:
           api-key: ${{ secrets.EDGECLOUD_API_KEY }}
           api-url: ${{ secrets.EDGECLOUD_API_URL }}
           pr-number: ${{ github.event.pull_request.number }}
           build: 'false'
+          app-dir: samples/hello
 
       - name: Comment PR
         if: steps.deploy.outputs.preview-url != ''

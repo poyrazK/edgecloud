@@ -21,6 +21,10 @@ inputs:
     description: 'When "true", post a comment with the preview URL on the PR that triggered this run. Only meaningful on `pull_request` events.'
     required: false
     default: 'false'
+  app-dir:
+    description: 'Working directory containing the project (edge.toml + the wasm artifact). The composite `cd`s into this directory before running `edge-cli build` and `edge-cli deploy`. Defaults to "." for actions invoked from the project root. Composite actions cannot use `working-directory:` on the call site (GitHub Actions rejects the key on `uses:` steps that reference a composite), so this input is the supported way to point the action at a project that lives in a subdirectory.'
+    required: false
+    default: '.'
 outputs:
   preview-url:
     description: 'URL of the deployed preview. Empty when the API key is absent, the deploy fails, or the CLI does not emit a URL.'
@@ -42,6 +46,21 @@ runs:
         # edge-cli's only workspace dep is `edge-config`, which cargo
         # resolves from the workspace root.
         cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+
+    # Resolve and export APP_DIR (the project directory) so downstream
+    # steps can `cd` into it. Composite actions don't accept
+    # `working-directory:` at the call site (GitHub Actions rejects
+    # the key on `uses:` steps that reference a composite — see
+    # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idsteps), so
+    # we accept an `app-dir` input and propagate it via $GITHUB_ENV.
+    # The default is "." for callers that invoke this action from the
+    # project root (the historical usage). Callers with the project
+    # in a subdirectory (e.g. samples/hello) pass `app-dir: samples/hello`.
+    - name: Resolve app directory
+      id: resolve-app-dir
+      shell: bash
+      run: |
+        echo "APP_DIR=${{ inputs.app-dir }}" >> "$GITHUB_ENV"
 
     # Required for the downstream `edge-cli build` / `edge-cli deploy` steps
     # to find the binary. `cargo install --root $CARGO_HOME` does NOT
@@ -67,7 +86,7 @@ runs:
       # which rustc 1.93.0 broke by emitting wasi:http@0.2.4 (issue
       # #410). Note the binary name is `edge-cli` (per
       # edge-cli/Cargo.toml [package].name), NOT `edge`.
-      run: edge-cli build
+      run: cd "$APP_DIR" && edge-cli build
 
     - name: Deploy preview
       id: deploy
@@ -85,6 +104,8 @@ runs:
           echo "preview-url=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+
+        cd "$APP_DIR"
 
         # `set -o pipefail` ensures a failing `edge-cli deploy --preview`
         # makes the step fail instead of masking the failure via
