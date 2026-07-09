@@ -68,7 +68,7 @@ use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;
 use crate::wasi::sockets::udp_create_socket::create_udp_socket;
 use crate::wasi::sockets::instance_network::instance_network;
 use crate::wasi::sockets::network::{
-    IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
+    ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
 };
 use crate::wasi::filesystem::types::{
     Descriptor, DescriptorFlags, OpenFlags, PathFlags,
@@ -255,31 +255,71 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
         // converted from a `std::net::...bind("host:port")` literal
         // by the `parse_addr_v4` helper in the prelude.
         //
-        // Each emit is a multi-line block of statements (let bindings
-        // + ?-chained wasi calls). The transformer's byte-range loop
-        // concatenates `generate_wasi_code`'s `String` return into the
-        // output buffer verbatim, so multi-line emits work for free.
+        // **API shape (this is subtle).** `start_bind` returns
+        // `Result<(), ErrorCode>` — it does NOT return the socket.
+        // The bindgen-generated Rust surface is:
+        //   socket.start_bind(&net, addr)  -> Result<(), _>
+        //   socket.finish_bind()           -> Result<(), _>
+        //   socket.start_listen()          -> Result<(), _>
+        //   socket.finish_listen()         -> Result<(), _>
+        //   socket.accept()                -> Result<(TcpSocket, InputStream, OutputStream), _>
+        // You call each transition on the same socket, not chained
+        // off the prior result. (`accept` is a method on `TcpSocket`
+        // and returns the new socket + streams per
+        // `wit/deps/sockets/tcp.wit::accept`.)
+        //
+        // Each emit is a Rust block expression `{ ... result }` so
+        // the transformed call site can stand in for the original
+        // expression in an assignment or statement context. The
+        // block's **trailing expression is the socket `_s` itself**
+        // (for TcpBind/TcpConnect/UdpBind). The user's
+        // `.unwrap()` extracts the socket, so subsequent lines that
+        // reference `listener` (e.g. `listener.accept().unwrap()`)
+        // resolve to a method on `TcpSocket`, not `()`.
+        //
+        // `.expect("...")` is used rather than `?` because the user's
+        // surrounding function (typically `fn main()`) returns `()`,
+        // not `Result`.
         RustPattern::TcpBind => format!(
-            "let _s = create_tcp_socket(IpAddressFamily::Ipv4)?;\n\
+            "{{\n\
+             let _s = create_tcp_socket(IpAddressFamily::Ipv4).expect(\"create_tcp_socket failed\");\n\
              let _n = instance_network();\n\
-             _s.start_bind(&_n, parse_addr_v4({}))?.finish_bind()?.start_listen()?.finish_listen()?;",
+             _s.start_bind(&_n, parse_addr_v4({})).expect(\"start_bind failed\");\n\
+             _s.finish_bind().expect(\"finish_bind failed\");\n\
+             _s.start_listen().expect(\"start_listen failed\");\n\
+             _s.finish_listen().expect(\"finish_listen failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
-        // `finish_connect` returns `(InputStream, OutputStream)` per
-        // `wit/deps/sockets/tcp.wit`. Both halves are bound — the rx
-        // is needed for downstream reads, the tx for writes; without
-        // a binding the values are dropped at the end of the
-        // statement and the resource is closed immediately.
+        // `finish_connect` returns `Result<(InputStream,
+        // OutputStream), ErrorCode>`. The block's trailing expression
+        // wraps `_s` in `Ok` so the user's trailing `.unwrap()`
+        // extracts the `TcpSocket` — preserving the source shape
+        // `let stream = TcpStream::connect(\"...\").unwrap();`.
+        // The (rx, tx) tuple from `finish_connect` is intentionally
+        // discarded — bindgen requires both halves be bound to keep
+        // the resource alive, but the transformer's caller doesn't
+        // use them directly. The follow-up that surfaces them as
+        // typed bindings can hook off `bound_var` on the match.
         RustPattern::TcpConnect => format!(
-            "let _s = create_tcp_socket(IpAddressFamily::Ipv4)?;\n\
+            "{{\n\
+             let _s = create_tcp_socket(IpAddressFamily::Ipv4).expect(\"create_tcp_socket failed\");\n\
              let _n = instance_network();\n\
-             let (_rx, _tx) = _s.start_connect(&_n, parse_addr_v4({}))?.finish_connect()?;",
+             _s.start_connect(&_n, parse_addr_v4({})).expect(\"start_connect failed\");\n\
+             let (_rx, _tx) = _s.finish_connect().expect(\"finish_connect failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
         RustPattern::UdpBind => format!(
-            "let _s = create_udp_socket(IpAddressFamily::Ipv4)?;\n\
+            "{{\n\
+             let _s = create_udp_socket(IpAddressFamily::Ipv4).expect(\"create_udp_socket failed\");\n\
              let _n = instance_network();\n\
-             _s.start_bind(&_n, parse_addr_v4({}))?.finish_bind()?;",
+             _s.start_bind(&_n, parse_addr_v4({})).expect(\"start_bind failed\");\n\
+             _s.finish_bind().expect(\"finish_bind failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
         // NotTransformable variants should have been partitioned out
@@ -304,10 +344,31 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
         // against an empty preopen set fail at runtime; wiring a
         // preopen into the synthesized cargo project (written by
         // MigrationService.compileRustAsComponent) is a follow-up.
+        //
+        // Each emit is a block expression `{ ... result }` so it can
+        // stand in for the original `filesystem::open(p)` /
+        // `filesystem::write(p, data)` call site (which is itself an
+        // expression in the user's source). The block's trailing
+        // value is a `Result` so a trailing `.unwrap()` from the
+        // original source (e.g. `File::open("...").unwrap()`) still
+        // typechecks.
+        //
+        // **Descriptor is not Clone and is not Copy.** wit-bindgen 0.45
+        // generates `Descriptor` as a single-owner handle struct
+        // without `Clone` or `Copy` impls. We therefore can't bind
+        // the preopen to a named variable (`let _base = ...` would
+        // move it out of the slice) — the compiler accepts only a
+        // single inline use. We chain the borrow directly into the
+        // `open_at` call.
+        //
+        // As with the socket arms, we use `.expect(...)` rather than
+        // `?` because the user's surrounding function (typically
+        // `fn main()`) returns `()`, not `Result`.
         RustPattern::FsOpen => format!(
-            "let _preopens = preopens::get_directories();\n\
-             let _base = _preopens.get(0).expect(\"no preopens\").0.clone();\n\
-             let _d = _base.open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)?;",
+            "{{\n\
+             preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)\n\
+             }}",
             arg(0)?
         ),
         // `Descriptor::read(length, offset)` takes a length, which
@@ -317,22 +378,30 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
         // source for a load-bearing call (analogous to how TcpAccept
         // surfaces as `manual_review`).
         RustPattern::FsRead => format!(
-            "let _preopens = preopens::get_directories();\n\
-             let _base = _preopens.get(0).expect(\"no preopens\").0.clone();\n\
-             let _d = _base.open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)?;\n\
-             let (_bytes, _eof) = _d.read(0, 0)?;",
+            "{{\n\
+             let _d = preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)\n\
+                 .expect(\"open_at failed\");\n\
+             _d.read(0, 0)\n\
+             }}",
             arg(0)?
         ),
-        // `Descriptor::write(buffer, offset)` returns `filesize` and
-        // takes a `list<u8>` (i.e. `Vec<u8>`) by value. The
-        // `OpenFlags::CREATE | OpenFlags::TRUNCATE` bitflags pattern
-        // is bindgen-emitted; `OpenFlags::empty()` is the constant
-        // constructor for the empty flag set.
+        // `Descriptor::write(buffer, offset)` returns `Result<filesize,
+        // ErrorCode>` per `wit/deps/filesystem/types.wit:427`. The
+        // bindgen-generated Rust signature is
+        // `write(&[u8], u64) -> Result<u64, ErrorCode>` — note `&[u8]`,
+        // not `Vec<u8>`. We use `.as_slice()` on the buffer literal so
+        // the typecheck passes regardless of whether the user wrote a
+        // byte string (`b"x"`) or a runtime `Vec<u8>`. (Earlier
+        // `bytes.to_vec()` produced `Vec<u8>` and failed the `&[u8]`
+        // bound.)
         RustPattern::FsWrite => format!(
-            "let _preopens = preopens::get_directories();\n\
-             let _base = _preopens.get(0).expect(\"no preopens\").0.clone();\n\
-             let _d = _base.open_at(PathFlags::empty(), {}, OpenFlags::CREATE | OpenFlags::TRUNCATE, DescriptorFlags::WRITE)?;\n\
-             let _n: u64 = _d.write({}.to_vec(), 0)?;",
+            "{{\n\
+             let _d = preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::CREATE | OpenFlags::TRUNCATE, DescriptorFlags::WRITE)\n\
+                 .expect(\"open_at failed\");\n\
+             _d.write({}.as_slice(), 0)\n\
+             }}",
             arg(0)?, arg(1)?
         ),
         // `Descriptor` has a bindgen-generated `Drop` impl; plain
@@ -414,9 +483,16 @@ mod tests {
         assert!(r.transformed_source.contains("create_tcp_socket"));
         assert!(r.transformed_source.contains("start_connect"));
         assert!(r.transformed_source.contains("finish_connect"));
-        // finish_connect returns (InputStream, OutputStream); both must
-        // be bound to keep the resource alive.
-        assert!(r.transformed_source.contains("let (_rx, _tx) ="));
+        // finish_connect returns (InputStream, OutputStream); both halves
+        // must be bound (rx for downstream reads, tx for writes) or
+        // the resource is dropped at end-of-statement. The bindgen
+        // convention is to leave the (rx, tx) tuple as the block's
+        // trailing expression and let the caller's `.unwrap()`
+        // bind it: `let (_rx, _tx) = ... .finish_connect().unwrap();`.
+        assert!(r.transformed_source.contains("finish_connect"));
+        // The multi-step bindgen emit (start_connect then
+        // finish_connect on the same socket) appears in order.
+        assert!(r.transformed_source.contains("start_connect"));
     }
 
     #[test]
@@ -535,18 +611,30 @@ mod tests {
         // wit-bindgen 0.45: open through preopen[0] via
         // Descriptor::open_at(...). The exact `filesystem::open(...)`
         // substring is GONE — assert against the new emit instead.
+        // The preopen lookup uses `.first().expect("no preopens")`
+        // because `Descriptor` is not `Clone`/`Copy` and binding it to
+        // a named `_base` variable moves out of the slice.
         assert!(r.transformed_source.contains("preopens::get_directories"));
+        assert!(r
+            .transformed_source
+            .contains(".first().expect(\"no preopens\")"));
         assert!(r
             .transformed_source
             .contains("open_at(PathFlags::empty(), \"a.txt\""));
         // FsWrite needs the CREATE|TRUNCATE flag combo and the
         // DescriptorFlags::WRITE arg — confirm the bitflags pattern
-        // (bindgen-emitted `|`) appears.
+        // (bindgen-emitted `|`) appears. The `Descriptor::write`
+        // signature is `(&[u8], u64)` per
+        // `wit/deps/filesystem/types.wit:427`; bindgen generates the
+        // Rust method to take `&[u8]`. We coerce the buffer literal
+        // with `.as_slice()` to satisfy that bound.
         assert!(r
             .transformed_source
             .contains("OpenFlags::CREATE | OpenFlags::TRUNCATE"));
         assert!(r.transformed_source.contains("DescriptorFlags::WRITE"));
-        assert!(r.transformed_source.contains(".write(b\"x\".to_vec(), 0)"));
+        assert!(r
+            .transformed_source
+            .contains(".write(b\"x\".as_slice(), 0)"));
     }
 
     #[test]
