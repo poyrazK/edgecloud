@@ -91,6 +91,96 @@ type deployResponse struct {
 	PreviewExpiresAt string `json:"preview_expires_at,omitempty"` // RFC3339
 }
 
+// statusResponse is the JSON shape returned by
+// `GET /api/v1/status/{deploymentID}`, `GET /api/v1/apps/{appName}/active`,
+// and the items in `GET /api/v1/list/{appName}`. Typed (vs the prior
+// anonymous `*domain.Deployment`) so the wire shape stays decoupled
+// from the DB row — adding a column to `deployments` no longer leaks
+// to clients, and the contract matches `openapi.yaml#Deployment`.
+//
+// The `URL` field is computed from `tenant_id` + `app_name` via
+// `domain.IngressHost`, the same helper that powers `deployResponse.URL`,
+// so every read endpoint surfaces the live ingress hostname.
+type statusResponse struct {
+	ID                  string          `json:"id"`
+	TenantID            string          `json:"tenant_id"`
+	AppName             string          `json:"app_name"`
+	Status              string          `json:"status"`
+	Hash                string          `json:"hash"`
+	Signature           string          `json:"signature,omitempty"`
+	SigningKeyID        string          `json:"signing_key_id,omitempty"`
+	Regions             []string        `json:"regions"`
+	AutoRollbackEnabled bool            `json:"auto_rollback_enabled"`
+	DesiredReplicas     int             `json:"desired_replicas"`
+	BuildAttestation    json.RawMessage `json:"build_attestation,omitempty"`
+	PreviewID           string          `json:"preview_id,omitempty"`
+	PreviewPRNumber     *int            `json:"preview_pr_number,omitempty"`
+	PreviewExpiresAt    string          `json:"preview_expires_at,omitempty"` // RFC3339
+	CreatedAt           string          `json:"created_at"`                   // RFC3339
+	URL                 string          `json:"url"`
+}
+
+// deploymentListResponse is the envelope returned by
+// `GET /api/v1/list/{appName}`. Mirrors the `DeploymentListResponse`
+// schema in `openapi.yaml`.
+type deploymentListResponse struct {
+	Items  []statusResponse `json:"items"`
+	Total  int              `json:"total"`
+	Limit  int              `json:"limit"`
+	Offset int              `json:"offset"`
+}
+
+// newStatusResponse maps a DB row to the typed wire DTO. The same
+// mapper is used by `GetStatus`, `GetActive`, and `List` so the three
+// endpoints can't drift in shape — any new field on the wire shows up
+// in all three (or none), enforced by this single construction site.
+//
+// Precondition: `tenantID` MUST equal `d.TenantID`. All three call
+// sites select the row with a WHERE clause on the auth-resolved
+// tenant id, so this holds today. If a future caller passes a
+// cross-tenant row (admin override), the body's `tenant_id` and the
+// computed `url` will disagree — don't do that without adapting this
+// mapper first.
+func newStatusResponse(d *domain.Deployment, tenantID, appName string) statusResponse {
+	r := statusResponse{
+		ID:                  d.ID,
+		TenantID:            d.TenantID,
+		AppName:             d.AppName,
+		Status:              d.Status,
+		Hash:                d.Hash,
+		Regions:             domain.StringArrayTo(d.Regions),
+		AutoRollbackEnabled: d.AutoRollbackEnabled,
+		DesiredReplicas:     d.DesiredReplicas,
+		URL:                 "https://" + domain.IngressHost(tenantID, appName),
+		CreatedAt:           d.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if d.Signature != "" {
+		r.Signature = d.Signature
+	}
+	if d.SigningKeyID != "" {
+		r.SigningKeyID = d.SigningKeyID
+	}
+	if len(d.BuildAttestation) > 0 {
+		r.BuildAttestation = json.RawMessage(d.BuildAttestation)
+	}
+	if d.PreviewID != nil {
+		r.PreviewID = *d.PreviewID
+	}
+	if d.PreviewPRNumber != nil {
+		// Copy the int so the DTO doesn't share a pointer with the
+		// DB row. The repo pool reuses domain.Deployment values; if
+		// we aliased, a later mutation on the row would silently
+		// change a response already on the wire. Cheaper than a
+		// deep clone because the value is one word.
+		n := *d.PreviewPRNumber
+		r.PreviewPRNumber = &n
+	}
+	if d.PreviewExpiresAt != nil {
+		r.PreviewExpiresAt = d.PreviewExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return r
+}
+
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -459,7 +549,8 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+	resp := newStatusResponse(deployment, tenantID, deployment.AppName)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("GetStatus: failed to encode response: %v", err)
 	}
 }
@@ -488,12 +579,17 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	items := make([]statusResponse, len(deployments))
+	for i := range deployments {
+		items[i] = newStatusResponse(&deployments[i], tenantID, appName)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"items":  deployments,
-		"total":  total,
-		"limit":  limit,
-		"offset": offset,
+	if err := json.NewEncoder(w).Encode(deploymentListResponse{
+		Items:  items,
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
 	}); err != nil {
 		log.Printf("List deployments: failed to encode response: %v", err)
 	}
@@ -717,7 +813,8 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(deployment); err != nil {
+	resp := newStatusResponse(deployment, tenantID, deployment.AppName)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("GetActive: failed to encode response: %v", err)
 	}
 }

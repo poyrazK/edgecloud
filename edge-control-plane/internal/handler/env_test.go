@@ -96,15 +96,19 @@ func TestEnvHandler_List(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
-	var resp map[string]string
+	var resp []envVarResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp["LOG_LEVEL"] != "debug" {
-		t.Errorf("LOG_LEVEL = %q, want 'debug'", resp["LOG_LEVEL"])
+	if len(resp) != 2 {
+		t.Fatalf("len(resp) = %d, want 2", len(resp))
 	}
-	if resp["DATABASE_URL"] != "postgres://localhost" {
-		t.Errorf("DATABASE_URL = %q", resp["DATABASE_URL"])
+	// Sorted alphabetically: DATABASE_URL before LOG_LEVEL.
+	if resp[0].Key != "DATABASE_URL" || resp[0].Value != "postgres://localhost" {
+		t.Errorf("resp[0] = %+v, want {DATABASE_URL postgres://localhost}", resp[0])
+	}
+	if resp[1].Key != "LOG_LEVEL" || resp[1].Value != "debug" {
+		t.Errorf("resp[1] = %+v, want {LOG_LEVEL debug}", resp[1])
 	}
 }
 

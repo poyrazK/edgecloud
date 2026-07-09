@@ -34,9 +34,7 @@ pub fn run(path: &Path) -> Result<()> {
     println!("Deployment: {}", status.id);
     println!("Status: {}", status.status);
     println!("Created: {}", status.created_at);
-    if let Some(url) = status.url {
-        println!("URL: {}", url);
-    }
+    println!("URL: {}", status.url);
     Ok(())
 }
 

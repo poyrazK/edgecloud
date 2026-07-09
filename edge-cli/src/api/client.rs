@@ -234,7 +234,10 @@ pub struct StatusResponse {
     pub id: String,
     pub status: String,
     pub created_at: String,
-    pub url: Option<String>,
+    /// Public ingress hostname computed server-side from
+    /// `tenant_id` + `app_name`. Always populated by the CP since
+    /// commit 1 of the wire-mismatch fix.
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +251,8 @@ pub struct DeploymentSummary {
     pub id: String,
     pub status: String,
     pub created_at: String,
-    pub url: Option<String>,
+    /// Public ingress hostname. Always populated.
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,15 +274,23 @@ pub struct CreateAPIKeyResponse {
 }
 
 /// One API key as returned by `GET /api/v1/keys`. Mirrors the Go
-/// `domain.APIKey` field-for-field, minus `last_used` which the
-/// server deliberately omits from the response even though it is
-/// stored in the DB (see issue #106 design notes).
+/// `SafeAPIKeyResponse` (handler/api_key.go → domain/api_key.go):
+/// id / name / role / created_at are always present; `last_used`
+/// and `expires_at` are populated by the server when non-NULL in
+/// the DB and serialized via `omitempty` so they're absent for
+/// never-used / never-expiring keys. `#[serde(default)]` keeps
+/// the deserialize path tolerant of both old CPs (no fields) and
+/// new CPs (both fields absent for an unused key).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct APIKeySummary {
     pub id: String,
     pub name: String,
     pub role: String,
     pub created_at: String,
+    #[serde(default)]
+    pub last_used: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +411,29 @@ pub struct App {
 #[allow(dead_code)]
 struct AppListResponse {
     apps: Vec<App>,
+    limit: u32,
+    offset: u32,
+}
+
+/// Wrapper for the paginated deployments response:
+/// `{"items": [...], "total": N, "limit": 20, "offset": 0}`
+/// returned by `GET /api/v1/list/{appName}`.
+///
+/// Field types mirror the server (Go) side: `total` is signed so a
+/// future "unknown" sentinel can travel as `-1`, while `limit` and
+/// `offset` are unsigned because pagination offsets are always
+/// non-negative.
+///
+/// `#[allow(dead_code)]` covers `total`/`limit`/`offset` — they are
+/// accepted but not rendered by `edge deployments` today. The allow
+/// is intentional: when a future `edge deployments --page N` lands,
+/// the deserializer doesn't need a second round-trip. (see project
+/// audit notes; CLI gap #2 deferred from PR #457)
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DeploymentListResponse {
+    items: Vec<DeploymentSummary>,
+    total: i64,
     limit: u32,
     offset: u32,
 }
@@ -928,9 +963,10 @@ impl ApiClient {
 
     /// List all deployments for an app.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        self.get_json_anyhow("list deployments", |base| {
+        let resp: DeploymentListResponse = self.get_json_anyhow("list deployments", |base| {
             format!("{base}/api/v1/list/{app_name}")
-        })
+        })?;
+        Ok(resp.items)
     }
 
     /// GET `/api/v1/apps` — list all apps for the authenticated tenant.
