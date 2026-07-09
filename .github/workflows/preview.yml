@@ -7,7 +7,7 @@ on:
 #
 # Fires on every PR open/synchronize. Builds the samples/hello wasm,
 # then delegates to .github/actions/deploy-preview which installs
-# the CLI and runs `edge deploy --preview --pr-number=<N>`. The
+# the CLI and runs `edge-cli deploy --preview --pr-number=<N>`. The
 # resulting URL is commented back on the PR (when EDGECLOUD_API_KEY
 # is configured — fork PRs lack it and silently no-op).
 jobs:
@@ -33,34 +33,27 @@ jobs:
         run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
       # Build the hello sample (samples/hello/) into a deployable
-      # wasm component via the CLI. `edge build` runs the proven
-      # two-step recipe (cargo under wasm32-unknown-unknown +
-      # `wasm-tools component new`) internally, so the workflow no
-      # longer needs to install wasm-tools or stage files manually.
+      # wasm component via the CLI. The CLI binary is named `edge-cli`
+      # (per edge-cli/Cargo.toml's [package].name — not `edge`). `edge-cli`
+      # runs the proven two-step recipe (cargo under
+      # wasm32-unknown-unknown + `wasm-tools component new`)
+      # internally, so the workflow no longer needs to install
+      # wasm-tools or stage files manually.
       # See samples/hello/README.md for the wasi:http@0.2.1 vs 0.2.4
       # rationale.
-      #
-      # Inline PATH export — `$GITHUB_PATH` propagation has a race
-      # on Node-24 runners (rc=127 'command not found' for `edge`).
-      # Setting `env.PATH:` directly also fails because `${{ env.PATH }}`
-      # resolves to the runner-provided PATH at step-start and the
-      # `env:` block replaces it rather than prepending (the GitHub
-      # docs' documented behaviour, but easy to miss). The fix that
-      # actually works: prepend in the same shell line that runs
-      # `edge build`. No env-block mutation, no PATH-step race.
       - name: Build hello sample
         working-directory: samples/hello
-        run: PATH="$CARGO_HOME/bin:$PATH" edge build
+        run: edge-cli build
 
-      # Delegate install-cli + edge deploy + URL capture to the
+      # Delegate install-cli + edge-cli deploy + URL capture to the
       # reusable composite action. We pass `build: 'false'` because
       # the wasm build is handled above (the composite's default
-      # `edge build` from cwd would run against the workspace root
+      # `edge-cli build` from cwd would run against the workspace root
       # which has no `[project]` section, so it would fail to find
       # an edge.toml).
       #
       # `pr-number` is the GitHub PR number the composite action
-      # forwards to `edge deploy --pr-number=<N>`. The control
+      # forwards to `edge-cli deploy --pr-number=<N>`. The control
       # plane stamps it into the guest env as
       # `EDGE_PREVIEW_PR_NUMBER` so samples/hello can render
       # PR-aware UI. Empty string when the trigger isn't a PR (the

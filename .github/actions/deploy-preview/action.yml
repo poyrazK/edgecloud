@@ -10,11 +10,11 @@ inputs:
     required: false
     default: 'https://api.edgecloud.dev'
   build:
-    description: 'Whether to run `edge build` before deploying. The CLI runs the proven `cargo build` + `wasm-tools component new` recipe (issue #410 — wasi:http@0.2.1 vs 0.2.4). Set to "false" if the caller has already produced the artifact.'
+    description: 'Whether to run `edge-cli build` before deploying. The CLI runs the proven `cargo build` + `wasm-tools component new` recipe (issue #410 — wasi:http@0.2.1 vs 0.2.4). Set to "false" if the caller has already produced the artifact. The binary name is `edge-cli` (per edge-cli/Cargo.toml [package].name), NOT `edge`.'
     required: false
     default: 'true'
   pr-number:
-    description: 'GitHub PR number the workflow forwards to `edge deploy --pr-number=<N>` (issue #308). Empty string when not on a pull_request trigger; the CLI treats empty as "no PR context" and the guest just sees no `EDGE_PREVIEW_PR_NUMBER` env var.'
+    description: 'GitHub PR number the workflow forwards to `edge-cli deploy --pr-number=<N>` (issue #308). Empty string when not on a pull_request trigger; the CLI treats empty as "no PR context" and the guest just sees no `EDGE_PREVIEW_PR_NUMBER` env var. The binary name is `edge-cli` (per edge-cli/Cargo.toml [package].name), NOT `edge`.'
     required: false
     default: ''
   comment-on-pr:
@@ -43,7 +43,7 @@ runs:
         # resolves from the workspace root.
         cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
-    # Required for the downstream `edge build` / `edge deploy` steps
+    # Required for the downstream `edge-cli build` / `edge-cli deploy` steps
     # to find the binary. `cargo install --root $CARGO_HOME` does NOT
     # update $PATH for subsequent shell steps (rc=127, `command not
     # found`). `$GITHUB_PATH` is a special file GitHub Actions reads
@@ -57,7 +57,7 @@ runs:
     - name: Build wasm
       if: inputs.build == 'true'
       shell: bash
-      # `edge build` does the proven two-step recipe: cargo build
+      # `edge-cli build` does the proven two-step recipe: cargo build
       # under the chosen `[project].target` (default
       # `wasm32-unknown-unknown`) followed by `wasm-tools component
       # new` to wrap the core module into a wasi:http@0.2.1 component
@@ -65,8 +65,9 @@ runs:
       # historical hand-written `rustup target add wasm32-wasip2`
       # + `cargo build --target wasm32-wasip2 --release` recipe,
       # which rustc 1.93.0 broke by emitting wasi:http@0.2.4 (issue
-      # #410).
-      run: edge build
+      # #410). Note the binary name is `edge-cli` (per
+      # edge-cli/Cargo.toml [package].name), NOT `edge`.
+      run: edge-cli build
 
     - name: Deploy preview
       id: deploy
@@ -78,14 +79,14 @@ runs:
         # Skip silently when no API key is configured (typical for
         # fork PRs where secrets aren't shared). The downstream
         # "Comment PR" step gates on `preview-url != ''` so this is a
-        # no-op for the PR — and cheap (no cargo, no `edge deploy`).
+        # no-op for the PR — and cheap (no cargo, no `edge-cli deploy`).
         if [ -z "$EDGE_API_KEY" ]; then
           echo "no EDGE_API_KEY configured — skipping preview deploy"
           echo "preview-url=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # `set -o pipefail` ensures a failing `edge deploy --preview`
+        # `set -o pipefail` ensures a failing `edge-cli deploy --preview`
         # makes the step fail instead of masking the failure via
         # `tee`'s success exit code (the previous version used a
         # `... | tee` pipeline with no pipefail, so `grep` failing on
@@ -95,9 +96,9 @@ runs:
         # Capture merged stdout+stderr to a buffer so the URL parse
         # below can run against the full output regardless of where
         # the CLI wrote it.
-        output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" edge deploy --preview --pr-number="${{ inputs.pr-number }}" 2>&1) || {
+        output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" edge-cli deploy --preview --pr-number="${{ inputs.pr-number }}" 2>&1) || {
           rc=$?
-          echo "::error::edge deploy --preview failed (rc=$rc)"
+          echo "::error::edge-cli deploy --preview failed (rc=$rc)"
           printf '%s\n' "$output"
           echo "preview-url=" >> "$GITHUB_OUTPUT"
           exit "$rc"
