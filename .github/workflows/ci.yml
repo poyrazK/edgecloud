@@ -237,9 +237,18 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Set up Go
+        # setup-go@v6 hard-sets GOTOOLCHAIN=local (v5 used `auto`),
+        # which blocks the silent toolchain auto-upgrade that used to
+        # paper over a go-version mismatch. edge-control-plane/go.mod
+        # requires go >= 1.25.0, so this job must pin a matching Go
+        # explicitly — otherwise `go run` fails with
+        # `go.mod requires go >= 1.25.0 (running go 1.23.12; ...)`.
+        # The other Go jobs (go-fmt, golangci-lint, go-test,
+        # go-test-integration) already pin 1.25.0; this brings
+        # openapi-validate in line.
         uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version: '1.25.0'
 
       - name: Validate spec coverage
         run: go run ./scripts/openapi_check.go
