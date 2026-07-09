@@ -63,6 +63,16 @@ jobs:
 
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          # cargo-deny-action runs cargo inside a sandboxed Docker
+          # container. The container reads .cargo/config.toml from
+          # the volume mount, which sets build.rustc-wrapper =
+          # "sccache" — but sccache is not installed inside the
+          # container, so cargo aborts with
+          # `could not execute process sccache ... (never executed)`.
+          # Override at step scope (env vars beat config files in
+          # cargo's precedence) to disable the wrapper for this step.
+          CARGO_BUILD_RUSTC_WRAPPER: ""
         with:
           command: check
           manifest-path: Cargo.toml
