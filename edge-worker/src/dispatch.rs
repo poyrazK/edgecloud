@@ -20,10 +20,31 @@
 //!
 //! # Per-request isolation
 //!
-//! Every request gets a fresh `ResourceTable` and a fresh `WasiCtx`
-//! (rebuilt from the stored env `HashMap` through `RuntimeState::clone`).
-//! Per-tenant `KvStore` / `Cache` / `Scheduler` are Arc-shared, so
-//! cheap to clone.
+//! Every request constructs a fresh `RuntimeState` via
+//! `RuntimeState::with_env_and_meter`. The constructor builds a
+//! fresh `ResourceTable` and a fresh `WasiCtx` (rebuilt from the
+//! stored env `HashMap`), so resource handles from one request
+//! don't leak to the next. Per-tenant `KvStore` / `Cache` /
+//! `Scheduler` are pulled from the runtime's global registry
+//! (memoized via `OnceCell`-rooted RwLock reads) so two requests
+//! for the same tenant share the same `Arc<KvStore>` etc.
+//!
+//! The `with_env_and_meter` call also allocates a fresh
+//! `Arc<AtomicU32>` for the `exit_code` flag and wires it into the
+//! per-request `Process` — see `RuntimeState::with_env_and_meter`
+//! at edge-runtime/src/runtime.rs:252-296. After the guest call we
+//! manual-clone that Arc into `exit_code_arc` so we can read the
+//! flag once the `RuntimeState` has been moved into the
+//! `wasmtime::Store`.
+//!
+//! `RuntimeState::clone` (edge-runtime/src/runtime.rs:321-383) is
+//! available as a documented alternative but currently unused —
+//! the WasiCtx inside `RuntimeState` is `!Sync`, which would
+//! force any `Arc<RuntimeState>` field to live on a struct that
+//! does not need `Send`, a constraint that the FaaS dispatcher's
+//! `tokio::spawn` path cannot satisfy without restructuring. The
+//! per-request `with_env_and_meter` is correct and the expensive
+//! parts (registry lookups + observer config) are O(1) amortized.
 //!
 //! # Per-request budget
 //!
