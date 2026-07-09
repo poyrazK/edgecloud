@@ -73,6 +73,33 @@ func (r *TenantRepository) ListActive(ctx context.Context) ([]domain.Tenant, err
 	return tenants, err
 }
 
+// GetForUpdate reads the tenants row for `tenantID` under a row-level
+// `SELECT … FOR UPDATE` lock. The lock is held until the surrounding
+// `repository.Transaction` commits or rolls back, so the caller has
+// exclusive write access to the disabled_at column for the duration.
+//
+// Issue #440 serializes ActivateDeployment vs the disable path through
+// this lock: ActivateDeployment acquires it inside its tx and rejects
+// the activation when disabled_at is non-nil; the disable path acquires
+// it before SetDisabledAt + notifyDisableTenant so a racing activate
+// either commits before disable (disable's post-commit active-deployments
+// diff sees the fresh row and skips the empty task_update publish) or
+// blocks waiting for the lock (the activate then observes disabled_at
+// != nil and returns ErrTenantDisabled). Mirrors the pattern on
+// AppRepository.GetForUpdate and ActiveDeploymentRepository.GetForUpdate.
+//
+// Returns (nil, nil) when no tenant exists; callers map that to
+// ErrTenantNotFound.
+func (r *TenantRepository) GetForUpdate(ctx context.Context, tenantID string) (*domain.Tenant, error) {
+	var t domain.Tenant
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = $1 FOR UPDATE`
+	err := r.db.GetContext(ctx, &t, query, tenantID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
 // SetDisabledAt marks a tenant as disabled at the given timestamp. Called
 // when a tenant exceeds their outbound bandwidth quota (issue #155).
 func (r *TenantRepository) SetDisabledAt(ctx context.Context, tenantID string, at time.Time) error {
