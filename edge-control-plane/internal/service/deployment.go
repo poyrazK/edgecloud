@@ -1432,88 +1432,11 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 	return nil
 }
 
-func (s *DeploymentService) waitForWorkers(ctx context.Context, tenantID, appName, deploymentID string, regions []string) error {
-	workerRepo := repository.NewWorkerRepository(s.db)
-
-	workers, err := workerRepo.List(ctx)
-	if err != nil {
-		return fmt.Errorf("listing workers: %w", err)
-	}
-
-	targetRegions := make(map[string]struct{}, len(regions))
-	for _, r := range regions {
-		targetRegions[r] = struct{}{}
-	}
-
-	var targetWorkers []string
-	now := time.Now()
-	for _, w := range workers {
-		if _, exists := targetRegions[w.Region]; exists {
-			// A worker is active if it sent a heartbeat within the last 90 seconds.
-			if now.Sub(w.LastSeen) <= 90*time.Second {
-				targetWorkers = append(targetWorkers, w.ID)
-			}
-		}
-	}
-
-	if len(targetWorkers) == 0 {
-		// No active workers in the target regions. Nothing to wait for.
-		return nil
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		statuses, err := workerRepo.GetLatestStatuses(ctx, targetWorkers)
-		if err != nil {
-			return fmt.Errorf("getting worker statuses: %w", err)
-		}
-
-		allConfirmed := true
-		for _, wID := range targetWorkers {
-			ws, ok := statuses[wID]
-			if !ok {
-				allConfirmed = false
-				break
-			}
-
-			var apps map[string]domain.AppStatus
-			if err := json.Unmarshal(ws.Apps, &apps); err != nil {
-				allConfirmed = false
-				break
-			}
-
-			confirmed := false
-			for rawKey, app := range apps {
-				currAppName := rawKey
-				if i := strings.IndexByte(rawKey, ':'); i >= 0 {
-					currAppName = rawKey[:i]
-				}
-
-				if currAppName == appName && app.DeploymentID == deploymentID && app.Status == "running" {
-					confirmed = true
-					break
-				}
-			}
-
-			if !confirmed {
-				allConfirmed = false
-				break
-			}
-		}
-
-		if allConfirmed {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-
-	return fmt.Errorf("timeout waiting for workers in regions %v to confirm deployment %s", regions, deploymentID)
-}
+// Issue #42 removed (*DeploymentService).waitForWorkers. The
+// synchronous worker-confirmation wait is redundant now that the
+// outbox makes publish durable — workers pick up the new active
+// deployment on their next heartbeat-driven reconcile, and
+// publishSwap's only post-tx work is the per-region cache push.
 
 // RollbackDeployment atomically swaps the active deployment back to the
 // stored last_good_deployment_id and republishes a TaskMessage so workers
