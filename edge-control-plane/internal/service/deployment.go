@@ -22,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -390,6 +391,13 @@ type idempotencyRepoForDeploymentSvc interface {
 	Insert(ctx context.Context, k *domain.IdempotencyKey) error
 }
 
+// outboxRepoForDeploymentSvc is the subset of *repository.OutboxRepository
+// methods used by DeploymentService. The interface exists so tests can
+// inject a sqlmock-backed fake without depending on the tx machinery.
+type outboxRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.OutboxRepository
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -406,6 +414,7 @@ type DeploymentService struct {
 	// test harnesses that don't care about the cache don't need
 	// to thread an extra arg.
 	idempotencyRepo idempotencyRepoForDeploymentSvc
+	outboxRepo      outboxRepoForDeploymentSvc
 	artifactStore   storage.ArtifactStore
 	publisher       nats.Publisher
 	appSvc          *AppService
@@ -450,6 +459,7 @@ func NewDeploymentService(
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
 	tenantRepo *repository.TenantRepository,
+	outboxRepo *repository.OutboxRepository,
 	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
@@ -471,6 +481,7 @@ func NewDeploymentService(
 		appEnvRepo:     appEnvRepo,
 		quotaRepo:      quotaRepo,
 		tenantRepo:     tenantRepo,
+		outboxRepo:     outboxRepo,
 		artifactStore:  artifactStore,
 		publisher:      publisher,
 		defaultRegion:  defaultRegion,
@@ -1106,8 +1117,9 @@ func previewPRNumberFromDeployment(d *domain.Deployment) int {
 }
 
 // activateDeployment is the shared inner logic for ActivateDeployment
-// and PromoteDeployment. It sets the active deployment row and publishes
-// a task update, without checking the deployment's original app name.
+// and PromoteDeployment. It sets the active deployment row and enqueues
+// a durable NATS publish via the transactional outbox (issue #42),
+// without checking the deployment's original app name.
 func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
 
 	// Atomically move the current active id into last_good_deployment_id
@@ -1119,6 +1131,24 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	//   - Re-activate the same id: current.deployment_id == newID →
 	//     last_good becomes equal to deployment_id (visually a no-op,
 	//     but the row stays consistent).
+	//
+	// Phase 1 (transactional): the active_deployments upsert +
+	// ClearStableSince + the outbox row are written in a single tx.
+	// The outbox row carries the marshaled TaskMessage so the
+	// background OutboxDrainer can publish it durably after commit;
+	// before #42 this publish ran synchronously here, with a
+	// process/NATS crash between commit and publish leaving the row
+	// active but no worker ever receiving the TaskMessage (until the
+	// reconcile loop's 5-minute FullSync safety net).
+	//
+	// buildPublishPayload reads env / tenant / quota via the same tx
+	// so the payload reflects post-commit state even if another
+	// activate lands before this one drains. The reads happen against
+	// the tx's connection so they see a consistent snapshot.
+	regions := domain.StringArrayTo(deployment.Regions)
+	if len(regions) == 0 {
+		regions = []string{s.defaultRegion}
+	}
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
@@ -1170,45 +1200,102 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
+
+		// Build the TaskMessage payload inside the tx so env /
+		// tenant / quota reads participate in the same atomic
+		// snapshot as the active_deployments mutation. Decryption
+		// (CPU-only, no DB) is fine inside the closure. The
+		// dedupe_key is `<tenant>:<app>:<attempt_id>` — UNIQUE in
+		// the outbox schema so a buggy re-enqueue surfaces as a
+		// constraint violation rather than a double-publish.
+		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
+			deploymentID, deployment, regions)
+		if err != nil {
+			return fmt.Errorf("building publish payload: %w", err)
+		}
+		attemptID := uuid.NewString()
+		if err := s.outboxRepo.WithTx(tx).Enqueue(ctx, &repository.OutboxRow{
+			TenantID:  tenantID,
+			AppName:   appName,
+			Kind:      "task_update",
+			Payload:   payload,
+			Regions:   pq.StringArray(regions),
+			DedupeKey: tenantID + ":" + appName + ":" + attemptID,
+		}); err != nil {
+			return fmt.Errorf("enqueueing outbox row: %w", err)
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
 	}
 
-	// Publish task update
-	var envMap map[string]string
-	var pubErr error
-	if s.envSvc != nil {
-		envMap, pubErr = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
-		if pubErr != nil {
-			return fmt.Errorf("preparing env vars for publish: %w", pubErr)
+	// Phase 2 (post-tx, fire-and-forget): the optional per-region
+	// artifact cache push. Cache failures are best-effort (logged,
+	// not returned) — the worker falls back to /api/internal/download
+	// when the cache misses. The NATS TaskMessage is durably queued
+	// in the outbox; the OutboxDrainer will publish it independently
+	// of this handler.
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, regions); err != nil {
+		// publishSwap returns nil on cache-push errors today
+		// (best-effort), but defensive: a future regression that
+		// returns an error here should not break activate.
+		log.Printf("activate: cache-push post-state failed for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
+	}
+	if s.webhookSvc != nil {
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
+			"deployment_id": deploymentID,
+		})
+	}
+	return nil
+}
+
+// buildPublishPayload assembles the marshaled TaskMessage that
+// accompanies the active_deployments mutation. Runs INSIDE the
+// caller's tx so env / tenant / quota reads participate in the same
+// snapshot (the on-wire message reflects post-commit state). Decryption
+// is CPU-only and safe inside the closure.
+//
+// Takes pre-resolved regions (so the activate path's default-region
+// fallback and the rollback path's deployment-regions resolution
+// aren't duplicated) plus the deployment row (for hash / signature /
+// signing_key_id / preview linkage). Returns the marshaled JSON
+// payload ready to be stored on the outbox row.
+func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx, tenantID, appName, deploymentID string, deployment *domain.Deployment, regions []string) ([]byte, error) {
+	envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
+	if err != nil {
+		return nil, fmt.Errorf("listing env vars: %w", err)
+	}
+	envMap := make(map[string]string, len(envsList))
+	for _, e := range envsList {
+		if s.envSvc != nil {
+			// envSvc decrypts the ciphertext values stored in
+			// app_env (when secrets encryption is enabled).
+			// Decryption is CPU-only and safe to do inside the tx
+			// closure. On per-key decrypt error we fall through
+			// with the raw value — matches the pre-#42 activate
+			// behavior (log but continue).
+			if plain, derr := s.envSvc.Decrypt(e.EnvValue); derr == nil {
+				envMap[e.EnvKey] = plain
+				continue
+			}
 		}
-	} else {
-		var envs []domain.AppEnv
-		envs, pubErr = s.appEnvRepo.List(ctx, tenantID, appName)
-		if pubErr != nil {
-			return fmt.Errorf("listing env vars: %w", pubErr)
-		}
-		envMap = make(map[string]string, len(envs))
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
-		}
+		envMap[e.EnvKey] = e.EnvValue
 	}
 
-	tenant, pubErr := s.tenantRepo.GetByID(ctx, tenantID)
-	if pubErr != nil {
-		return fmt.Errorf("getting tenant: %w", pubErr)
+	tenant, err := s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("getting tenant: %w", err)
 	}
 	if tenant == nil {
-		return fmt.Errorf("tenant not found")
+		return nil, fmt.Errorf("tenant not found")
 	}
 	if tenant.IsDisabled() {
-		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
+		return nil, fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
 	}
 
-	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if pubErr != nil {
-		return fmt.Errorf("getting quota: %w", pubErr)
+	quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("getting quota: %w", err)
 	}
 	maxMemoryMB := 256
 	if quota != nil && quota.MaxMemoryMB > 0 {
@@ -1233,295 +1320,109 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			),
 		},
 	}
-
-	// Resolve the effective regions list to publish to via the
-	// shared helper. publishSwap is also used by RollbackDeployment,
-	// which previously published to "global" only — a silent
-	// multi-region regression. Keeping both paths through one helper
-	// guarantees they fan out identically.
-	//
-	// deployment.Regions is pq.StringArray on this branch; convert to
-	// []string so publishSwap can iterate it directly.
-	regions := domain.StringArrayTo(deployment.Regions)
-	if len(regions) == 0 {
-		regions = []string{s.defaultRegion}
-	}
-	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
-		return err
-	}
-	if s.webhookSvc != nil {
-		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
-			"deployment_id": deploymentID,
-		})
-	}
-	return nil
+	return json.Marshal(msg)
 }
 
-// publishSwap fans a TaskMessage out to every region in `regions`,
-// skipping regions that have already been published for this
-// (tenant, app) activation and always retrying regions in
-// regions_failed. Used by ActivateDeployment and RollbackDeployment
-// so they cannot drift in their region-fanout behavior (the prior
-// Rollback path published to "global" only, leaving multi-region
-// deployments stuck on the broken version until the next heartbeat).
+// publishSwap is the post-commit cache-push step. Pre-#42 this also
+// fanned out the NATS TaskMessage; that responsibility now lives on
+// the OutboxDrainer. publishSwap only handles:
 //
-// Idempotency (issue #127 step 6):
-//   - Reads the committed active_deployments row to discover
-//     regions_published (skip — already on the wire) and
-//     regions_failed (always retry — never let a stale
-//     regions_published mask a real failure; see Risk 3 in the
-//     issue #127 plan).
-//   - The publish set is (regions ∪ regions_failed) − regions_published.
-//   - If empty (every region already published), returns nil
-//     without touching the publisher or the DB.
+//   - reading the committed active row to discover regions_published
+//     (skip — already on the wire) and regions_cached (skip — push
+//     already happened, the cache-skip-on-activation optimization
+//     from issue #332 Layer 3),
+//   - pushing the artifact bytes to per-region edge-artifact-cache
+//     binaries,
+//   - persisting the cache-state outcome via AppendRegionsCacheState.
 //
-// Failures in a single region are logged and accumulated into the
-// returned *PublishError — we keep publishing to the remaining
-// regions rather than aborting on the first failure, so a
-// transient NATS blip in one region doesn't starve the others.
-//
-// On success, persists the per-region outcome via
-// activeRepo.AppendRegionsPublished / AppendRegionsFailed so the
-// next retry call can short-circuit. The append is best-effort:
-// a DB write failure is logged but does not change the returned
-// error — the publish itself already succeeded and the operator
-// would rather see the per-region 502 envelope than a misleading
-// 500.
-//
-// The DB tx has already committed by the time we get here, so
-// workers may still be serving the prior deployment; the caller
-// surfaces this as a transient 502 to the client.
-//
-// Returns nil on full success, or *PublishError{Published, Failed}
-// wrapping ErrPublishFailed on any per-region failure.
-// errors.Is(err, ErrPublishFailed) matches via the *PublishError's
-// Unwrap, preserving the contract the pre-step-6 handler relied on.
-func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string) error {
-	// Read the committed row's publish state. The Set upsert at the
-	// start of Activate / Rollback wipes regions_published and
-	// regions_failed to empty (see ActiveDeploymentRepository.Set's
-	// DO UPDATE clause), so on a first attempt the toPublish set
-	// equals `regions`; on a retry of a partially-failed
-	// activation, prior successes are skipped and prior failures
-	// are included.
+// The function never returns an error today: cache-push failures are
+// best-effort (logged, not returned). The signature keeps the
+// `error` return so a future regression that surfaces a cache error
+// doesn't break the caller — log-and-continue stays the default.
+func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, regions []string) error {
+	// Cache push only — pre-#42 this function also fanned out the
+	// NATS TaskMessage via s.publisher.PublishTaskUpdate. That
+	// responsibility now lives on the OutboxDrainer
+	// (internal/service/outbox_drainer.go). The handler-side
+	// activate/rollback no longer publishes NATS directly; the
+	// outbox row carries the TaskMessage and the drainer relays
+	// it. publishSwap is now strictly cache-push + cache-state
+	// post-write.
+	//
+	// Best-effort: a cache push error does NOT bubble up as a 502
+	// to the client (the activation succeeded — the worker will
+	// pull from /api/internal/download when its cache miss is
+	// detected). The error is logged and the per-region state is
+	// persisted to regions_cache_failed for operator visibility.
+	//
+	// Skip conditions:
+	//   - s.cachePusher is nil (cache feature disabled at runtime)
+	//   - s.regionArtifactCaches[region] is unset or empty
+	//   - region is in alreadyCached (issue #332, Layer 3): a Set
+	//     with the same deployment_id preserves RegionsCached via
+	//     the CASE WHEN in the DO UPDATE clause, so this branch
+	//     fires on a re-activation of the same deployment where
+	//     the cache is still warm from a prior activation.
+	if s.cachePusher == nil || len(s.regionArtifactCaches) == 0 {
+		return nil
+	}
+
+	// Read the committed row's cache state so the alreadyCached
+	// skip-on-activation optimization fires correctly.
 	current, err := s.activeRepo.Get(ctx, tenantID, appName)
 	if err != nil {
-		return fmt.Errorf("reading publish state: %w", err)
+		return fmt.Errorf("reading cache state: %w", err)
 	}
-	alreadyPublished := make(map[string]struct{}, len(current.RegionsPublished))
-	for _, r := range current.RegionsPublished {
-		alreadyPublished[r] = struct{}{}
-	}
-	mustRetry := make(map[string]struct{}, len(current.RegionsFailed))
-	for _, r := range current.RegionsFailed {
-		mustRetry[r] = struct{}{}
-	}
-	// alreadyCached (issue #332, Layer 3): regions whose
-	// edge-artifact-cache binary already holds the artifact bytes
-	// from a prior activation. The cache-push loop below skips
-	// these regions (no PUT); the NATS publish loop still runs
-	// for them, since the worker may not have received the prior
-	// TaskMessage (NATS workqueue dedupes by message id, but the
-	// two messages are different so the worker will get a refresh).
-	// The skipped regions are recorded in `cached` for the 502
-	// envelope; on a future re-activation with the same row, both
-	// `alreadyPublished` AND `alreadyCached` keep re-publishing /
-	// skipping respectively — until a new Set wipes them.
 	alreadyCached := make(map[string]struct{}, len(current.RegionsCached))
 	for _, r := range current.RegionsCached {
 		alreadyCached[r] = struct{}{}
 	}
 
-	// toPublish = (regions ∪ regions_failed) − regions_published
-	// Preserves input order for log determinism.
+	// Build the per-region toPush set, deduping against the
+	// alreadyCached map.
 	seen := make(map[string]struct{}, len(regions))
-	toPublish := make([]string, 0, len(regions)+len(mustRetry))
-	for _, r := range regions {
-		if _, ok := alreadyPublished[r]; ok {
-			continue
-		}
-		if _, dup := seen[r]; dup {
-			continue
-		}
-		seen[r] = struct{}{}
-		toPublish = append(toPublish, r)
-	}
-	for r := range mustRetry {
-		if _, ok := alreadyPublished[r]; ok {
-			continue
-		}
-		if _, dup := seen[r]; dup {
-			continue
-		}
-		seen[r] = struct{}{}
-		toPublish = append(toPublish, r)
-	}
-	if len(toPublish) == 0 {
-		// All requested regions already published. Short-circuit;
-		// do not bump last_publish_at since nothing happened.
-		return nil
-	}
-
-	attemptID := uuid.NewString()
-	now := time.Now()
-
-	// Per-region artifact-cache push (issue #332, Layer 3). Runs
-	// BEFORE the NATS publish so the worker has the artifact in
-	// the local cache by the time it receives the TaskMessage.
-	//
-	// Cache push failures are best-effort: a push failure does NOT
-	// add the region to `failed` (the NATS publish still happens
-	// and the worker falls back to pulling the artifact from the
-	// control plane's /api/internal/download/). The failure is
-	// recorded separately in `cacheFailed` and persisted via
-	// AppendRegionsCacheState so an operator can see which regions
-	// are currently failing in the row's regions_cache_failed
-	// column — but the activation return value is NOT shaped by
-	// cache failures. The 502 envelope is reserved for NATS publish
-	// failures (worker was never notified).
-	//
-	// Skip conditions (region in `toPublish` is NOT pushed when):
-	//   - s.cachePusher is nil (cache feature disabled at runtime)
-	//   - s.regionArtifactCaches[region] is unset or empty
-	//   - region is in `alreadyCached`: a Set with the same
-	//     deployment_id preserves RegionsCached via the CASE WHEN
-	//     in the DO UPDATE clause (PR 2 follow-up), so this branch
-	//     fires on a re-activation of the same deployment where the
-	//     cache is still warm from a prior activation. The cache
-	//     bytes are identical, so a redundant push is wasted work.
-	//
-	// The third condition means cache push is best-effort +
-	// idempotent: a successful push on activation A leaves
-	// RegionsCached populated; activation B (same id) sees the
-	// region in alreadyCached and skips — no network traffic for
-	// regions whose cache already has the bytes. If the cache
-	// between activations is wiped, the next activation re-pushes
-	// (because the cache pusher's Push call returns an error and
-	// the region ends up in cacheFailed, NOT cachedSucceeded, so
-	// the row's RegionsCached is NOT updated for that region).
 	var cachedSucceeded []string
 	var cachedSkipped []string
 	var cacheFailed []string
-	if s.cachePusher != nil && len(s.regionArtifactCaches) > 0 {
-		for _, region := range toPublish {
-			if _, ok := alreadyCached[region]; ok {
-				// Already cached from a prior activation. Record as
-				// skipped so the row reflects "no push was needed";
-				// don't attempt a redundant push. Persisted via
-				// AppendRegionsCacheState alongside the success
-				// slice below.
-				cachedSkipped = append(cachedSkipped, region)
-				continue
-			}
-			cacheURL, ok := s.regionArtifactCaches[region]
-			if !ok || cacheURL == "" {
-				// No cache configured for this region; the worker
-				// will pull from the CP as today.
-				continue
-			}
-			if err := s.cachePusher.Push(ctx, cacheURL, tenantID, appName, deploymentID); err != nil {
-				log.Printf("artifact cache push failed for region %q (deployment %s): %v", region, deploymentID, err)
-				cacheFailed = append(cacheFailed, region)
-				continue
-			}
-			cachedSucceeded = append(cachedSucceeded, region)
-		}
-	}
-
-	var published []string
-	var failed []string
-	for _, region := range toPublish {
-		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
-			log.Printf("publishing task update failed for region %q (deployment %s): %v", region, deploymentID, err)
-			failed = append(failed, region)
+	for _, region := range regions {
+		if _, ok := alreadyCached[region]; ok {
+			cachedSkipped = append(cachedSkipped, region)
 			continue
 		}
-		published = append(published, region)
+		if _, dup := seen[region]; dup {
+			continue
+		}
+		seen[region] = struct{}{}
+		cacheURL, ok := s.regionArtifactCaches[region]
+		if !ok || cacheURL == "" {
+			// No cache configured for this region; the worker
+			// will pull from the CP as today.
+			continue
+		}
+		if err := s.cachePusher.Push(ctx, cacheURL, tenantID, appName, deploymentID); err != nil {
+			log.Printf("artifact cache push failed for region %q (deployment %s): %v", region, deploymentID, err)
+			cacheFailed = append(cacheFailed, region)
+			continue
+		}
+		cachedSucceeded = append(cachedSucceeded, region)
 	}
 
-	// Best-effort persistence. Failures here are logged but do
-	// not change the returned error — the publish itself already
-	// happened, and the operator would rather see the structured
-	// 502 envelope than a misleading 500 caused by an audit-log
-	// write failing.
-	//
-	// All four appends (regions_published, regions_failed,
-	// regions_cached, regions_cache_failed) share one tx so the
-	// row's per-region state stays consistent even if the process
-	// crashes mid-write. Within the closure, returning the first
-	// error aborts the tx and Rollback discards every append — the
-	// desired atomicity. PR 2 (issue #332) added `regions_cached`
-	// to this same tx; PR 2 follow-up replaced it with the
-	// `AppendRegionsCacheState` helper that updates both
-	// regions_cached (succeeded+skipped) and regions_cache_failed
-	// in a single statement.
-	if len(published) > 0 || len(failed) > 0 || len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
+	// Persist cache-state outcome. Best-effort — a DB error is
+	// logged but does not change the function's return value.
+	if len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
+		now := time.Now()
 		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 			txRepo := s.activeRepo.WithTx(tx)
-			if len(published) > 0 {
-				if err := txRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
-					return fmt.Errorf("append regions_published: %w", err)
-				}
-			}
-			if len(failed) > 0 {
-				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
-					return fmt.Errorf("append regions_failed: %w", err)
-				}
-			}
-			// AppendRegionsCacheState is invoked whenever the
-			// cache loop ran. `succeeded` is the deduped union of
-			// cachedSucceeded (real push returned 2xx) and
-			// cachedSkipped (already cached from a prior
-			// activation, no push attempted) — both go into
-			// regions_cached so the next activation's alreadyCached
-			// check fires. `failed` goes into regions_cache_failed.
-			// In the no-op case (cache disabled or no region has a
-			// cache URL) we skip the tx entirely via the outer
-			// guard.
-			if len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
-				mergedSucceeded := append([]string{}, cachedSucceeded...)
-				mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
-				if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
-					return fmt.Errorf("append regions_cache_state: %w", err)
-				}
+			mergedSucceeded := append([]string{}, cachedSucceeded...)
+			mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
+			if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
+				return fmt.Errorf("append regions_cache_state: %w", err)
 			}
 			return nil
 		}); err != nil {
-			log.Printf("warning: persisting publish state for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
+			log.Printf("warning: persisting cache state for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
 		}
 	}
-
-	// Only NATS publish failures trigger the 502 envelope. Cache
-	// push failures are best-effort — see the comment above the
-	// cache loop — and are persisted in the row's
-	// regions_cache_failed column for operator visibility. The
-	// worker still receives the TaskMessage for those regions
-	// (the NATS publish succeeded) and will fall back to the
-	// control plane's download endpoint.
-	if len(failed) > 0 {
-		return &PublishError{
-			Published:       published,
-			Failed:          failed,
-			CachedSucceeded: cachedSucceeded,
-			CachedSkipped:   cachedSkipped,
-			CacheFailed:     cacheFailed,
-			Err:             ErrPublishFailed,
-		}
-	}
-
-	// Block until active workers confirm they have started the deployment (issue #331, Layer 3).
-	if err := s.waitForWorkers(ctx, tenantID, appName, deploymentID, regions); err != nil {
-		log.Printf("waitForWorkers failed/timeout: %v", err)
-		return &PublishError{
-			Published:       published,
-			Failed:          regions,
-			CachedSucceeded: cachedSucceeded,
-			CachedSkipped:   cachedSkipped,
-			CacheFailed:     cacheFailed,
-			Err:             ErrPublishFailed,
-		}
-	}
-
 	return nil
 }
 
@@ -1630,9 +1531,6 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	var rollbackPreviewID string
 	var rollbackPreviewPRNumber int
 	var regions []string
-	var tenant *domain.Tenant
-	var envs []domain.AppEnv
-	var maxMemoryMB int
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
@@ -1708,72 +1606,50 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
 
-		// Snapshot the publish inputs inside the tx so the message
-		// reflects post-rollback state even if another activate lands
-		// between commit and publish (which would itself race with this
-		// publish; see plan §"Risk register"). All four reads below use
-		// WithTx(tx) so they participate in the same atomic transaction
-		// as the active_deployments Set above — without the wrapper the
-		// reads would happen on the main connection pool and could
-		// observe a different snapshot than the one we're about to
-		// commit.
-		envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
+		// Build the TaskMessage payload inside the tx (issue #42) so
+		// env / tenant / quota reads participate in the same atomic
+		// snapshot as the active_deployments mutation. The drainer
+		// will relay the marshaled payload after commit.
+		deploymentForPayload := &domain.Deployment{
+			Hash:            deploymentHash,
+			Signature:       deploymentSignature,
+			SigningKeyID:    deploymentSigningKeyID,
+			PreviewID:       nil,
+			PreviewPRNumber: nil,
+		}
+		if rollbackPreviewID != "" {
+			pid := rollbackPreviewID
+			deploymentForPayload.PreviewID = &pid
+			pr := rollbackPreviewPRNumber
+			deploymentForPayload.PreviewPRNumber = &pr
+		}
+		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
+			rolledBackID, deploymentForPayload, regions)
 		if err != nil {
-			return fmt.Errorf("listing env vars: %w", err)
+			return fmt.Errorf("building publish payload: %w", err)
 		}
-		envs = envsList
-		tenant, err = s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
-		if err != nil || tenant == nil {
-			return fmt.Errorf("getting tenant: %w", err)
-		}
-		quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
-		if err != nil {
-			return fmt.Errorf("getting quota: %w", err)
-		}
-		maxMemoryMB = 256
-		if quota != nil && quota.MaxMemoryMB > 0 {
-			maxMemoryMB = quota.MaxMemoryMB
+		attemptID := uuid.NewString()
+		if err := s.outboxRepo.WithTx(tx).Enqueue(ctx, &repository.OutboxRow{
+			TenantID:  tenantID,
+			AppName:   appName,
+			Kind:      "task_update",
+			Payload:   payload,
+			Regions:   pq.StringArray(regions),
+			DedupeKey: tenantID + ":" + appName + ":" + attemptID,
+		}); err != nil {
+			return fmt.Errorf("enqueueing outbox row: %w", err)
 		}
 		return nil
 	}); err != nil {
 		return "", err
 	}
 
-	envMap := make(map[string]string, len(envs))
-	if s.envSvc != nil {
-		for _, e := range envs {
-			v, err := s.envSvc.Decrypt(e.EnvValue)
-			if err != nil {
-				return "", fmt.Errorf("rollback: decrypting env %s: %w", e.EnvKey, err)
-			}
-			envMap[e.EnvKey] = v
-		}
-	} else {
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
-		}
-	}
-
-	msg := &nats.TaskMessage{
-		Type:      "task_update",
-		Timestamp: time.Now().UTC(),
-		TenantID:  tenantID,
-		Apps: map[string]nats.AppConfig{
-			appName: nats.BuildAppConfig(
-				rolledBackID,
-				deploymentHash,
-				deploymentSignature,
-				deploymentSigningKeyID, // issue #307 PR1: per-key kid
-				rollbackPreviewID,      // issue #308: preserved across rollback
-				rollbackPreviewPRNumber,
-				envMap,
-				tenant.AllowlistedDestinations,
-				maxMemoryMB,
-			),
-		},
-	}
-	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
-		return "", err
+	// Post-tx: cache push only (the outbox row above carries the
+	// TaskMessage; the drainer relays it). publishSwap never errors
+	// for the rollback path today — log defensively if a future
+	// regression surfaces a cache error.
+	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, regions); err != nil {
+		log.Printf("rollback: cache-push post-state failed for %s/%s/%s: %v", tenantID, appName, rolledBackID, err)
 	}
 
 	if s.webhookSvc != nil {
