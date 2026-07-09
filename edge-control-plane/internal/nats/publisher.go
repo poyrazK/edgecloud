@@ -231,7 +231,7 @@ func BuildAppConfigWithSocketMode(
 		"", // preview_id — socket-mode sibling does not carry preview metadata;
 		//     preview-aware callers must use BuildAppConfig directly so they
 		//     pass preview_id + preview_pr_number explicitly.
-		0,  // preview_pr_number — same reasoning as preview_id above.
+		0, // preview_pr_number — same reasoning as preview_id above.
 		env, allowlist, maxMemoryMB, routes...,
 	)
 	cfg.SocketMode = socketMode

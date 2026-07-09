@@ -255,7 +255,7 @@ type PreviewBlobRef struct {
 // oldest-expiry-first so a thundering-herd of expired previews is
 // reclaimed in a predictable order. Used by PreviewGCService to
 // enumerate the artifact blobs that need to be unlinked from
-// /registry/ before the DB row is DELETEd.
+// /registry/ before the DB row is deleted.
 //
 // Three reasons for separating this from DeleteExpiredPreviews:
 //

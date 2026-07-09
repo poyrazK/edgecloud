@@ -161,6 +161,14 @@ export interface paths {
          * @description Stores the artifact, registers a new deployment, and auto-creates
          *     the app record if it does not already exist. The artifact is
          *     validated as a WebAssembly binary before storage.
+         *
+         *     **Preview deploys (issue #308):** set `?preview-id=<hex>` to mark
+         *     the deploy as a preview. The control plane allocates a per-preview
+         *     store scope (KV/cache/scheduler) on the worker and stamps
+         *     `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env when a PR number
+         *     is forwarded. The PreviewGCService deletes the row + artifact
+         *     blob once `preview_expires_at` is in the past (default 7d,
+         *     override via `?preview-ttl=<duration>`).
          */
         post: operations["deploy"];
         delete?: never;
@@ -1221,6 +1229,30 @@ export interface components {
              * @example 2026-01-02T03:04:05Z
              */
             created_at?: string;
+            /**
+             * @description Hex preview-id (issue #308). Present iff the deployment was
+             *     uploaded via `?preview-id=<hex>`. The worker scopes its
+             *     per-tenant persistent stores under
+             *     `<EDGE_*_PATH>/{tenant_id}/preview-{id}/` so concurrent
+             *     previews don't trample each other's keys.
+             * @example abcd1234
+             */
+            preview_id?: string | null;
+            /**
+             * @description GitHub PR number the composite action forwarded. When
+             *     non-null, the guest sees `EDGE_PREVIEW_PR_NUMBER=<N>` in
+             *     its `process.get_environment` response.
+             * @example 123
+             */
+            preview_pr_number?: number | null;
+            /**
+             * Format: date-time
+             * @description Absolute TIMESTAMPTZ the deployment row is deleted at by
+             *     the PreviewGCService sweep. Set on every preview deploy;
+             *     null for non-preview rows.
+             * @example 2026-07-16T00:00:00Z
+             */
+            preview_expires_at?: string | null;
         };
         DeployResponse: {
             /**
@@ -1238,6 +1270,28 @@ export interface components {
              * @example https://web-app.t_abc123.edgecloud.dev
              */
             url?: string;
+            /**
+             * @description Echo of the `preview-id` query param (issue #308). Empty
+             *     string for non-preview deploys.
+             * @example abcd1234
+             */
+            preview_id?: string;
+            /**
+             * @description Echo of the `preview-pr-number` query param. Zero for
+             *     non-preview deploys or for `--preview` runs without a PR
+             *     context.
+             * @example 123
+             */
+            preview_pr_number?: number;
+            /**
+             * Format: date-time
+             * @description RFC3339 expiry the control plane computed. Empty for
+             *     non-preview deploys. The CLI persists this into
+             *     `.edge/state.json` so `edge status` can show "expires in
+             *     5d 12h" without re-querying the server.
+             * @example 2026-07-16T00:00:00Z
+             */
+            preview_expires_at?: string;
         };
         DeploymentListResponse: {
             items?: components["schemas"]["Deployment"][];
@@ -2111,7 +2165,33 @@ export interface operations {
     };
     deploy: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Hex preview-id (issue #308). When set, the deploy is
+                 *     stamped as a preview: the worker scopes its KV/cache/
+                 *     scheduler stores under a `/preview-{id}/` subdirectory,
+                 *     and the response includes the resolved `expires_at`
+                 *     timestamp. Must match `^[a-f0-9]{8,16}$` if present.
+                 */
+                "preview-id"?: string;
+                /**
+                 * @description GitHub PR number forwarded by the composite action. When
+                 *     set alongside `preview-id`, the control plane stamps
+                 *     `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env so the
+                 *     service can render PR-aware UI. Optional: a laptop user
+                 *     running `--preview` outside CI sets `preview-id` without
+                 *     this param.
+                 */
+                "preview-pr-number"?: number;
+                /**
+                 * @description Go-style duration string (e.g. `"24h"`, `"168h"`).
+                 *     Defaults to 168h (7d) when `preview-id` is set. The control
+                 *     plane resolves it to an absolute TIMESTAMPTZ stored on the
+                 *     deployment row; the PreviewGCService deletes expired rows
+                 *     on its sweep tick.
+                 */
+                "preview-ttl"?: string;
+            };
             header?: never;
             path: {
                 /** @description Unique name of the app within the tenant. */
