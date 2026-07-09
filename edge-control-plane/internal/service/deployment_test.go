@@ -116,6 +116,80 @@ func newDeploymentMockDB(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
 	return sqlxDB, mock, func() { _ = mockDB.Close() }
 }
 
+// ── Issue #420: deploy-time 402 PAYMENT_REQUIRED tests ───────────────
+// The four pre-checks use different seams (billingRepo, tenantRepo,
+// quotaRepo.VerifyUnderCap), so each test mocks only the seam it
+// exercises. The mock types satisfy the seam interfaces declared in
+// deployment.go and are reusable across all of them.
+
+// mockDeployQuotaRepo satisfies quotaRepoForDeploymentSvc.
+type mockDeployQuotaRepo struct {
+	getByTenantIDFn  func(ctx context.Context, tenantID string) (*domain.Quota, error)
+	verifyUnderCapFn func(ctx context.Context, tenantID string, projectedReqs, projectedBytes int64) (bool, error)
+}
+
+func (m *mockDeployQuotaRepo) WithTx(_ *sqlx.Tx) *repository.QuotaRepository { return nil }
+func (m *mockDeployQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.getByTenantIDFn != nil {
+		return m.getByTenantIDFn(ctx, tenantID)
+	}
+	// Default to "loose cap" — used by tests that don't care about
+	// VerifyUnderCap and only need a non-nil row.
+	return &domain.Quota{MaxDeployments: 100}, nil
+}
+func (m *mockDeployQuotaRepo) VerifyUnderCap(ctx context.Context, tenantID string, projectedReqs, projectedBytes int64) (bool, error) {
+	if m.verifyUnderCapFn != nil {
+		return m.verifyUnderCapFn(ctx, tenantID, projectedReqs, projectedBytes)
+	}
+	return true, nil
+}
+
+// mockDeployTenantRepo satisfies tenantRepoForDeploymentSvc.
+type mockDeployTenantRepo struct {
+	getByIDFn func(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
+func (m *mockDeployTenantRepo) WithTx(_ *sqlx.Tx) *repository.TenantRepository { return nil }
+func (m *mockDeployTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, id)
+	}
+	// Default to "free tier, not disabled" — disables the tenant /
+	// disabled short-circuit but lets quota-based tests proceed.
+	return &domain.Tenant{ID: id, Plan: "free"}, nil
+}
+
+// mockDeployBillingRepo satisfies billingRepoForDeploymentSvc.
+type mockDeployBillingRepo struct {
+	getSubscriptionStatusFn func(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error)
+}
+
+func (m *mockDeployBillingRepo) GetSubscriptionStatus(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error) {
+	if m.getSubscriptionStatusFn != nil {
+		return m.getSubscriptionStatusFn(ctx, tenantID)
+	}
+	return domain.SubscriptionActive, nil
+}
+
+// errIsPaymentRequired confirms the error from Deploy is a
+// PaymentRequiredError (i.e., returns 402) and surfaces the reason
+// string for test assertion.
+func errIsPaymentRequired(t *testing.T, err error) (string, bool) {
+	t.Helper()
+	if err == nil {
+		return "", false
+	}
+	var pr *PaymentRequiredError
+	if errors.As(err, &pr) {
+		return pr.Reason, true
+	}
+	// Fallback: maybe wrapped
+	if errors.Is(err, ErrPaymentRequired) {
+		return "wrapped", true
+	}
+	return "", false
+}
+
 // validWasmBytes is the smallest sequence that passes validateWasm: the
 // 4-byte magic (\0asm) is enough for a first-line check. Real modules
 // need more, but the guard's job is to catch obviously-non-wasm inputs,
@@ -142,6 +216,11 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs after the quota
+	// lookup and before the CountByApp call. Return a single row so
+	// the cap passes.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 
 	// CountByApp is the second DB call.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
@@ -188,6 +267,11 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs before
+	// CountByApp. Return a single row so the projection (1 request,
+	// 0 bytes) passes the cap.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -399,6 +483,11 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs before
+	// CountByApp. Return a single row so the projection (1 request,
+	// 0 bytes) passes the cap.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -457,6 +546,11 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs before
+	// CountByApp. Return a single row so the projection (1 request,
+	// 0 bytes) passes the cap.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -520,6 +614,11 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs before
+	// CountByApp. Return a single row so the projection (1 request,
+	// 0 bytes) passes the cap.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -581,6 +680,11 @@ func TestDeploy_PersistsSignedAttestation(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb",
 		}).AddRow("t_test", 100, 50, 10, 1024, 1024))
+	// Issue #420: deploy-time cap verification runs before
+	// CountByApp. Return a single row so the projection (1 request,
+	// 0 bytes) passes the cap.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_request_count = used_request_count + 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_test"))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM deployments`)).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
@@ -850,5 +954,268 @@ func TestIsValidRegion(t *testing.T) {
 	}
 	if IsValidRegion("has.dot") {
 		t.Error("expected invalid for dot")
+	}
+}
+
+// ── Issue #420 — deploy-time 402 PAYMENT_REQUIRED tests ───────────────
+// These tests directly construct DeploymentService with mock seam
+// types (no DB) so we can exercise each pre-check in isolation. They
+// do NOT run through the full artifact-save / tx-callback path — the
+// 402 returns BEFORE any of that work happens (so no quota UPDATE, no
+// artifact write, no COUNT, no INSERT), and we assert that nothing
+// happened past the failing check.
+
+// TestDeploy_SubscriptionPastDue_Returns402 covers Pre-check 1:
+// billing subscription is past_due → 402 PAYMENT_REQUIRED,
+// reason="subscription_past_due".
+func TestDeploy_SubscriptionPastDue_Returns402(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+		verifyUnderCapFn: func(_ context.Context, _ string, _, _ int64) (bool, error) {
+			t.Error("VerifyUnderCap must not be called when subscription is past_due (pre-check 1 short-circuits)")
+			return false, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionPastDue, nil
+		},
+	}
+	svc := &DeploymentService{
+		db:             db,
+		quotaRepo:      q,
+		billingRepo:    b,
+		tenantRepo:     &mockDeployTenantRepo{},
+		deploymentRepo: &mockDeployDeploymentRepo{},
+		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+	}
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil)
+	reason, ok := errIsPaymentRequired(t, err)
+	if !ok {
+		t.Fatalf("expected PaymentRequiredError, got %v", err)
+	}
+	if reason != "subscription_past_due" {
+		t.Errorf("reason = %q, want %q", reason, "subscription_past_due")
+	}
+}
+
+// TestDeploy_FreeTierLockdown_Returns402 covers Pre-check 2:
+// tenants.disabled_at IS NOT NULL → 402 PAYMENT_REQUIRED,
+// reason="free_tier_locked". Subscription is active (so pre-check 1
+// passes), the free-tier disabled flag is the failing condition.
+func TestDeploy_FreeTierLockdown_Returns402(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	disabledAt := time.Now().UTC().Add(-time.Hour)
+	q := &mockDeployQuotaRepo{
+		verifyUnderCapFn: func(_ context.Context, _ string, _, _ int64) (bool, error) {
+			t.Error("VerifyUnderCap must not be called when tenant is disabled (pre-check 2 short-circuits)")
+			return false, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	ten := &mockDeployTenantRepo{
+		getByIDFn: func(_ context.Context, _ string) (*domain.Tenant, error) {
+			return &domain.Tenant{ID: "t_test", Plan: "free", DisabledAt: &disabledAt}, nil
+		},
+	}
+	svc := &DeploymentService{
+		db:             db,
+		quotaRepo:      q,
+		billingRepo:    b,
+		tenantRepo:     ten,
+		deploymentRepo: &mockDeployDeploymentRepo{},
+		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+	}
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil)
+	reason, ok := errIsPaymentRequired(t, err)
+	if !ok {
+		t.Fatalf("expected PaymentRequiredError, got %v", err)
+	}
+	if reason != "free_tier_locked" {
+		t.Errorf("reason = %q, want %q", reason, "free_tier_locked")
+	}
+}
+
+// TestDeploy_OverageGraceSkipsCapCheck covers Pre-check 3:
+// tenants.overage_allowed_until > now() → VerifyUnderCap is SKIPPED.
+// We assert this via the mockDeployQuotaRepo contract: if
+// VerifyUnderCap is called, the test fails. The deployment will fail
+// later for an unrelated reason (no DB tx setup), but it should NOT
+// have a 402 reason — the grace override means pre-check 4 is
+// bypassed.
+func TestDeploy_OverageGraceSkipsCapCheck(t *testing.T) {
+	_, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			// With grace active, GetByTenantID is still called (it's
+			// the very first thing in Deploy) but quota gets nilled
+			// out at pre-check 3.
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+		verifyUnderCapFn: func(_ context.Context, _ string, _, _ int64) (bool, error) {
+			t.Error("VerifyUnderCap must NOT be called when overage grace is active (pre-check 3 short-circuits pre-check 4)")
+			return false, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	grace := time.Now().UTC().Add(time.Hour)
+	ten := &mockDeployTenantRepo{
+		getByIDFn: func(_ context.Context, _ string) (*domain.Tenant, error) {
+			return &domain.Tenant{
+				ID:                  "t_test",
+				Plan:                "pro",
+				OverageAllowedUntil: &grace,
+			}, nil
+		},
+	}
+	// We force the count check (pre-check 5) to fail by returning a
+	// count error. The exact error doesn't matter — the assertion is
+	// that VerifyUnderCap was bypassed (mock), and the returned err
+	// is NOT 402.
+	dep := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			return 0, errors.New("forced count failure to short-circuit deploy")
+		},
+	}
+	svc := &DeploymentService{
+		// No db → legacy non-tx path: Create() is called instead of
+		// db.BeginTx. The test only cares about the pre-check ordering,
+		// not the artifact-save path.
+		db:             nil,
+		quotaRepo:      q,
+		billingRepo:    b,
+		tenantRepo:     ten,
+		deploymentRepo: dep,
+		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+		keyring:        signing.TestKeyring(t),
+	}
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil)
+	if err == nil {
+		t.Fatalf("expected an error from the count check; we should have fallen through to it")
+	}
+	if errors.Is(err, ErrPaymentRequired) {
+		t.Fatalf("got 402, expected a count-quota error after the grace bypassed pre-check 4: %v", err)
+	}
+	// The exact error is the count-check failure; we just want to be
+	// sure we got THAT and not a 402.
+	if !strings.Contains(err.Error(), "counting deployments") {
+		t.Errorf("err = %v, want a counting-deployments error", err)
+	}
+}
+
+// TestDeploy_VerifyUnderCap_Returns402 covers Pre-check 4:
+// VerifyUnderCap returns false (cap would be exceeded) → 402 with
+// reason="quota_will_be_exceeded". Subscription active, no lockdown,
+// no grace.
+func TestDeploy_VerifyUnderCap_Returns402(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		verifyUnderCapFn: func(_ context.Context, _ string, _, _ int64) (bool, error) {
+			return false, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	ten := &mockDeployTenantRepo{
+		getByIDFn: func(_ context.Context, _ string) (*domain.Tenant, error) {
+			return &domain.Tenant{ID: "t_test", Plan: "pro"}, nil
+		},
+	}
+	dep := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			t.Error("CountByApp must not be called when VerifyUnderCap fails (pre-check 4 short-circuits)")
+			return 0, nil
+		},
+	}
+	svc := &DeploymentService{
+		db:             db,
+		quotaRepo:      q,
+		billingRepo:    b,
+		tenantRepo:     ten,
+		deploymentRepo: dep,
+		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+	}
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil)
+	reason, ok := errIsPaymentRequired(t, err)
+	if !ok {
+		t.Fatalf("expected PaymentRequiredError, got %v", err)
+	}
+	if reason != "quota_will_be_exceeded" {
+		t.Errorf("reason = %q, want %q", reason, "quota_will_be_exceeded")
+	}
+}
+
+// TestDeploy_VerifyUnderCap_BoundarySuccess proves the boundary case:
+// VerifyUnderCap returns true → deploy proceeds past the gate.
+func TestDeploy_VerifyUnderCap_BoundarySuccess(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		verifyUnderCapFn: func(_ context.Context, _ string, projectedReqs, projectedBytes int64) (bool, error) {
+			if projectedReqs != 1 || projectedBytes != 0 {
+				t.Errorf("default projection = (%d, %d), want (1, 0)", projectedReqs, projectedBytes)
+			}
+			return true, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	ten := &mockDeployTenantRepo{
+		getByIDFn: func(_ context.Context, _ string) (*domain.Tenant, error) {
+			return &domain.Tenant{ID: "t_test", Plan: "pro"}, nil
+		},
+	}
+	svc := &DeploymentService{
+		db:             db,
+		quotaRepo:      q,
+		billingRepo:    b,
+		tenantRepo:     ten,
+		deploymentRepo: &mockDeployDeploymentRepo{},
+		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+	}
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil)
+	if err == nil {
+		// We expect ErrMaxDeploymentsQuotaExceeded from the deployment
+		// count check (default count=0 < MaxDeployments=100, actually
+		// no error)... wait we fall through to artifact save which
+		// needs DB tx setup. The graceful path test passed the count
+		// check; here we let the tx path fail. Either way: we should
+		// NOT have a 402.
+		t.Log("grace path returned nil; that's fine, but unlikely — leaving as informational")
+	}
+	if errors.Is(err, ErrPaymentRequired) {
+		t.Fatalf("got 402, expected to pass pre-check 4 (VerifyUnderCap returned true): %v", err)
 	}
 }

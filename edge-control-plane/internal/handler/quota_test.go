@@ -32,6 +32,13 @@ func (m *mockQuotaTenantSvc) GetQuota(ctx context.Context, tenantID string) (*do
 	return m.quota, nil
 }
 
+func (m *mockQuotaTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.quotaErr != nil {
+		return nil, m.quotaErr
+	}
+	return m.quota, nil
+}
+
 func TestQuotaHandler_GetQuota_Success(t *testing.T) {
 	q, err := domain.QuotaForPlan("free")
 	if err != nil {

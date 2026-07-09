@@ -408,6 +408,17 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
 			return
 		}
+		// Issue #420: deploy-time 402 PAYMENT_REQUIRED. The typed
+		// PaymentRequiredError carries a stable reason code
+		// (subscription_past_due, quota_will_be_exceeded, etc.) that
+		// the client can route on; we surface it as the message so
+		// the response shape stays aligned with the rest of the
+		// httperror envelope (no extra top-level field).
+		var prErr *service.PaymentRequiredError
+		if errors.As(err, &prErr) {
+			httperror.PaymentRequiredCtx(w, r, "deployment blocked: "+prErr.Reason)
+			return
+		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max apps quota exceeded")
 			return

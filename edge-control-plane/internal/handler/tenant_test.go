@@ -33,6 +33,8 @@ type mockTenantSvc struct {
 	deleteTenantErr     error
 	getQuotaResp        *domain.Quota
 	getQuotaErr         error
+	overrideResp        *domain.TenantWithQuota
+	overrideErr         error
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
@@ -84,6 +86,20 @@ func (m *mockTenantSvc) GetQuota(ctx context.Context, tenantID string) (*domain.
 		return nil, m.getQuotaErr
 	}
 	return m.getQuotaResp, nil
+}
+
+func (m *mockTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.getQuotaErr != nil {
+		return nil, m.getQuotaErr
+	}
+	return m.getQuotaResp, nil
+}
+
+func (m *mockTenantSvc) OverrideTenantQuota(ctx context.Context, req service.QuotaOverrideRequest) (*domain.TenantWithQuota, error) {
+	if m.overrideErr != nil {
+		return nil, m.overrideErr
+	}
+	return m.overrideResp, nil
 }
 
 // ---------------------------------------------------------------------------

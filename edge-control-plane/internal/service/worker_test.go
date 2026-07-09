@@ -81,6 +81,7 @@ type mockQuotaRepo struct {
 	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)
 	addOutboundBytesFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addRequestCountFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	setGraceUntilFunc    func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -104,6 +105,13 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 	return &domain.Quota{}, nil
 }
 
+func (m *mockQuotaRepo) SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error {
+	if m.setGraceUntilFunc != nil {
+		return m.setGraceUntilFunc(ctx, tenantID, until)
+	}
+	return nil
+}
+
 // mockActiveRepo implements activeRepoInterface for testing the
 // stability-window evaluator. Each method records its args so tests
 // can assert the wire shape; default funcs return zero values
@@ -111,6 +119,17 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 // stub the others.
 type mockTenantRepo struct {
 	tenantRepoInterface
+	getByIDFunc func(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
+func (m *mockTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
+	if m.getByIDFunc != nil {
+		return m.getByIDFunc(ctx, id)
+	}
+	// Default to a free-tier tenant so applyTenantDelta exercises the
+	// dual-write (SetGraceUntil + SetDisabledAt) path. Tests that
+	// specifically want the paid-tenant shortcut stub getByIDFunc.
+	return &domain.Tenant{ID: id, Plan: "free"}, nil
 }
 
 func (m *mockTenantRepo) SetDisabledAt(_ context.Context, _ string, _ time.Time) error {
