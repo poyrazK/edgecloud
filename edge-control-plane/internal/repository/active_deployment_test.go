@@ -255,16 +255,17 @@ func TestResetStableSinceForRollback_NoRowsReturnsErrNoLastGood(t *testing.T) {
 	mock.ExpectQuery(`WITH updated AS`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow("t_test", "myapp", "d_v2", nil, true, nil,
 			"{}", "{}", "{}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	_, err := repo.ResetStableSinceForRollback(context.Background(), "t_test", "myapp")

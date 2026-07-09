@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::time::SystemTime;
 
+use crate::config::EdgeToml;
+
 /// Source language for the `edge build` and `edge init` commands
 /// (issue #317 — Multi-language runtime support). Each variant maps
 /// to a dedicated build pipeline; the lowercase clap value (`rust`,
@@ -211,6 +213,24 @@ enum Command {
         /// Use `edge deploy --promote <id>` to promote a preview to production.
         #[arg(long)]
         preview: bool,
+
+        /// Forward a GitHub PR number alongside a `--preview` deploy
+        /// (issue #308). The control plane stamps
+        /// `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env so the
+        /// deployed service can render PR-aware UI, and the preview
+        /// TTL sweeper treats the deploy as PR-linked for observability.
+        /// Only meaningful with `--preview`; ignored otherwise. The
+        /// GitHub composite action forwards `${{ github.event.pull_request.number }}`
+        /// automatically — laptop users rarely need to set this.
+        #[arg(long, value_name = "number")]
+        pr_number: Option<u32>,
+
+        /// Override the default preview TTL (168h / 7d). Go duration
+        /// string: "24h", "168h", "720h". Only meaningful with
+        /// `--preview`. Per-deploy overrides win over the server
+        /// default, which in turn wins over `PREVIEW_RETENTION` env.
+        #[arg(long, value_name = "duration")]
+        preview_ttl: Option<String>,
 
         /// Promote a preview deployment to production.
         /// Takes a deployment ID that was deployed as a preview and activates it
@@ -440,17 +460,48 @@ fn main() -> Result<()> {
             replicas,
             file,
             preview,
+            pr_number,
+            preview_ttl,
             promote,
             lang,
         } => {
             if let Some(dep_id) = promote {
                 return commands::deploy::run_promote(&cli.path, &app, &dep_id);
             }
-            let preview_app = if preview {
-                Some(format!("{}--preview-{}", &app, &short_hash()))
+            // Resolve the app name once — main.rs needs it to build
+            // the preview suffix, but `run_upload` re-reads edge.toml
+            // to do the same job. Reading here keeps the URL mint
+            // aligned with whatever edge.toml the project ships
+            // (issue #308: the suffix must use the same app name the
+            // server will see).
+            let resolved_app = if !app.is_empty() {
+                app.clone()
             } else {
-                None
+                let toml = EdgeToml::from_path(&cli.path).with_context(|| {
+                    format!(
+                        "edge deploy requires edge.toml with [project] name in {}",
+                        cli.path.display()
+                    )
+                })?;
+                toml.project.name
             };
+            let preview_suffix = if preview { Some(short_hash()) } else { None };
+            let preview_app = preview_suffix
+                .as_ref()
+                .map(|s| format!("{}--preview-{}", &resolved_app, s));
+            // issue #308: build the PreviewOpts payload for the
+            // server when --preview is set. The preview-id is the
+            // same hash we used to suffix the app name — that's
+            // deliberate, the URL and the server-side store key
+            // share the suffix so a tenant can grep their preview
+            // list by URL.
+            let preview_opts = preview_suffix.map(|s| {
+                crate::api::PreviewOpts::new(
+                    s,
+                    pr_number.unwrap_or(0),
+                    preview_ttl.clone().unwrap_or_default(),
+                )
+            });
             commands::deploy::run(
                 &cli.path,
                 preview_app.as_deref().unwrap_or(&app),
@@ -460,6 +511,7 @@ fn main() -> Result<()> {
                 replicas,
                 file.as_deref(),
                 lang,
+                preview_opts.as_ref(),
             )
         }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {

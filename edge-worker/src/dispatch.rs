@@ -273,6 +273,18 @@ pub struct HandlerConfig {
     pub last_request_at: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     pub max_memory_mb: u64,
     pub cpu_budget_ms: u64,
+    /// Preview-id forwarded from `TaskMessage` (issue #308). When `Some`,
+    /// the FaaS dispatch constructs the per-request `RuntimeState` with
+    /// `with_env_and_meter_preview`, which scopes the per-tenant
+    /// persistent stores (KV / cache / scheduler) under a
+    /// `/preview-{id}/` subdirectory. `None` for non-preview deploys;
+    /// `with_env_and_meter_preview(..., None, None, ...)` collapses to
+    /// the pre-#308 behavior.
+    pub preview_id: Option<String>,
+    /// PR-number forwarded from `TaskMessage`. When `Some`, stamped
+    /// into the guest env as `EDGE_PREVIEW_PR_NUMBER` so the guest
+    /// can render PR-aware UI.
+    pub preview_pr_number: Option<u32>,
 }
 
 impl HandlerDispatch {
@@ -778,10 +790,12 @@ impl HandlerDispatch {
                 Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             ),
         };
-        let request_state = RuntimeState::with_env_and_meter(
+        let request_state = RuntimeState::with_env_and_meter_preview(
             self.config.env.clone(),
             Some(self.config.meter.clone()),
             self.config.tenant_id.clone(),
+            self.config.preview_id.as_deref(),
+            self.config.preview_pr_number,
             self.config.egress.clone(),
             self.config.log_sink.clone(),
             self.config.app_ctx.clone(),
@@ -1606,6 +1620,10 @@ mod synthetic_response_tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: default to non-preview for unit tests; specific
+            // tests can override these by building a custom HandlerConfig.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1668,6 +1686,10 @@ mod synthetic_response_tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: default to non-preview for unit tests; specific
+            // tests can override these by building a custom HandlerConfig.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1762,6 +1784,10 @@ mod synthetic_response_tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: default to non-preview for unit tests; specific
+            // tests can override these by building a custom HandlerConfig.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1820,6 +1846,10 @@ mod synthetic_response_tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: default to non-preview for unit tests; specific
+            // tests can override these by building a custom HandlerConfig.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1881,6 +1911,10 @@ mod synthetic_response_tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: default to non-preview for unit tests; specific
+            // tests can override these by building a custom HandlerConfig.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         // epoch_tick_ms=0 → tick_ms field = 1 (verified by budget math above)

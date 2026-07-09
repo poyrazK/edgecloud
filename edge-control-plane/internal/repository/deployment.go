@@ -43,14 +43,19 @@ func (r *DeploymentRepository) Create(ctx context.Context, d *domain.Deployment)
 	// empty json.RawMessage maps to SQL NULL, which is the right
 	// shape for "no attestation yet" rows (pre-PR2 deployments or a
 	// deploy that didn't supply build metadata).
-	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
-	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID, d.BuildAttestation, d.DesiredReplicas)
+	//
+	// `preview_id`, `preview_pr_number`, `preview_expires_at`
+	// (migration 021, issue #308) are NULLABLE; the service layer
+	// passes a *string/*int/*time.Time that's nil for non-preview
+	// deploys, and sqlx maps nil → SQL NULL via the pq driver.
+	query := `INSERT INTO deployments (id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
+	_, err := r.db.ExecContext(ctx, query, d.ID, d.TenantID, d.AppName, d.Status, d.Hash, pq.Array(regions), d.CreatedAt, d.AutoRollbackEnabled, d.Signature, d.SigningKeyID, d.BuildAttestation, d.DesiredReplicas, d.PreviewID, d.PreviewPRNumber, d.PreviewExpiresAt)
 	return err
 }
 
 func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
 	var d domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id = $1`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`
 	err := r.db.GetContext(ctx, &d, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -60,14 +65,14 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.
 
 func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName)
 	return deployments, err
 }
 
 func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
 	return deployments, err
 }
@@ -226,4 +231,100 @@ func (r *DeploymentRepository) DeleteOlderThanBatched(
 		}
 	}
 	return total, nil
+}
+
+// PreviewBlobRef identifies the (tenant, app, deployment) tuple the
+// GC needs to unlink from /registry/{tenant_id}/{app_name}/{id}.wasm
+// after the deployments row is gone. Returned by
+// ListExpiredPreviewBlobs so the PreviewGCService can call
+// ArtifactStore.Delete for each row.
+//
+// Distinct from DeletedDeployment because the sweep key is
+// `preview_expires_at < NOW()` (the preview-only expiry), not
+// `created_at + retention`. Two different GC loops, two different
+// shapes — sharing one struct would force callers to ignore the
+// fields they don't care about.
+type PreviewBlobRef struct {
+	ID       string `db:"id"`
+	TenantID string `db:"tenant_id"`
+	AppName  string `db:"app_name"`
+}
+
+// ListExpiredPreviewBlobs returns up to `batchSize` preview
+// deployments whose `preview_expires_at` is in the past, ordered
+// oldest-expiry-first so a thundering-herd of expired previews is
+// reclaimed in a predictable order. Used by PreviewGCService to
+// enumerate the artifact blobs that need to be unlinked from
+// /registry/ before the DB row is deleted.
+//
+// Three reasons for separating this from DeleteExpiredPreviews:
+//
+//  1. Order matters: the GC must delete the artifact blob first
+//     and the row second. If the blob delete fails after the row
+//     is gone, we leak a blob (cheap; an orphan on disk).
+//     Reversing the order would let a row point at a missing blob,
+//     which the worker's download handler has to handle by
+//     re-issuing a 404 mid-stream — a worse failure mode.
+//
+//  2. Clock-skew immunity: same as DeleteOlderThanBatched — the
+//     cutoff is server-side NOW() (not Go's time.Now()).
+//
+//  3. Partial index utilization: the WHERE clause
+//     `preview_expires_at IS NOT NULL AND preview_expires_at < NOW()`
+//     matches the partial index `idx_deployments_preview_expires_at`
+//     from migration 021, so the sweep stays cheap as the table
+//     grows with non-preview rows.
+func (r *DeploymentRepository) ListExpiredPreviewBlobs(
+	ctx context.Context, batchSize int,
+) ([]PreviewBlobRef, error) {
+	if batchSize <= 0 {
+		return nil, fmt.Errorf("batchSize must be positive, got %d", batchSize)
+	}
+	var refs []PreviewBlobRef
+	err := r.db.SelectContext(ctx, &refs,
+		`SELECT id, tenant_id, app_name
+		 FROM deployments
+		 WHERE preview_expires_at IS NOT NULL
+		   AND preview_expires_at < NOW()
+		 ORDER BY preview_expires_at ASC
+		 LIMIT $1`,
+		int64(batchSize))
+	if err != nil {
+		return nil, fmt.Errorf("listing expired preview blobs: %w", err)
+	}
+	return refs, nil
+}
+
+// DeleteExpiredPreviewsByIDs deletes up to `batchSize` preview
+// deployments by ID, looping until either the input set is empty
+// or `maxBatches` is hit. Returns the deleted rows so the caller
+// can audit / log the GC outcome (the blob cleanup already
+// happened in the ListExpiredPreviewBlobs step).
+//
+// Idempotent on missing IDs: rows already deleted (e.g., by a
+// concurrent sweep) are silently skipped, because the WHERE id IN
+// (...) predicate matches whatever's still present.
+//
+// `ids` is the slice returned by ListExpiredPreviewBlobs (possibly
+// split into chunks by the caller). The service layer is
+// responsible for the chunking — this method just runs the DELETE
+// per chunk to keep the batch size bounded.
+func (r *DeploymentRepository) DeleteExpiredPreviewsByIDs(
+	ctx context.Context, ids []string,
+) ([]DeletedDeployment, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var deleted []DeletedDeployment
+	err := r.db.SelectContext(ctx, &deleted,
+		`DELETE FROM deployments
+		 WHERE id = ANY($1)
+		   AND preview_expires_at IS NOT NULL
+		   AND preview_expires_at < NOW()
+		 RETURNING id, tenant_id, app_name`,
+		pq.Array(ids))
+	if err != nil {
+		return nil, fmt.Errorf("deleting expired preview rows: %w", err)
+	}
+	return deleted, nil
 }

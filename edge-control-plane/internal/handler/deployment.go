@@ -10,8 +10,10 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -79,6 +81,14 @@ type deployResponse struct {
 	Regions             []string `json:"regions"`
 	AutoRollbackEnabled bool     `json:"auto_rollback_enabled"`
 	DesiredReplicas     int      `json:"desired_replicas"`
+	// Preview metadata (issue #308). All three fields are
+	// omitempty so non-preview deploys serialize identically to
+	// pre-#308 responses. The CLI echoes them into
+	// .edge/state.json so `edge status` can show the preview's
+	// expiry. Empty strings / zero ints drop from the wire.
+	PreviewID        string `json:"preview_id,omitempty"`
+	PreviewPRNumber  int    `json:"preview_pr_number,omitempty"`
+	PreviewExpiresAt string `json:"preview_expires_at,omitempty"` // RFC3339
 }
 
 func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +129,37 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	desiredReplicas, rerr := parseIntQuery(r.URL.Query().Get("replicas"), 0)
 	if rerr != nil {
 		http.Error(w, `{"error": "`+rerr.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Parse preview metadata (issue #308). Three optional query
+	// params:
+	//   ?preview-id=<hex>           — 8..16 lowercase hex chars
+	//   ?preview-pr-number=<int>    — >= 0
+	//   ?preview-ttl=<duration>     — Go duration string (e.g. "24h")
+	//
+	// preview-id is the marker: setting it (with or without
+	// preview-pr-number) makes the deploy a preview. Without
+	// preview-id the request is a normal (non-preview) deploy
+	// regardless of the other two params.
+	//
+	// preview-id + preview-pr-number are an OPTIONAL pair: a
+	// laptop user running `edge deploy --preview` without a PR
+	// context sets preview-id but not preview-pr-number.
+	// Conversely, preview-pr-number without preview-id is
+	// rejected — the pr number without a preview marker is a
+	// client bug.
+	//
+	// preview-ttl defaults to PreviewDefaultTTL (7 days) when
+	// preview-id is set. The handler resolves it to an absolute
+	// time so the service layer doesn't need to import time math.
+	previewOpts, perr := parsePreviewOpts(
+		r.URL.Query().Get("preview-id"),
+		r.URL.Query().Get("preview-pr-number"),
+		r.URL.Query().Get("preview-ttl"),
+	)
+	if perr != nil {
+		http.Error(w, `{"error": "`+perr.Error()+`"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -184,7 +225,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, filePart, regions, autoRollback, desiredReplicas, cliMeta)
+	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, filePart, regions, autoRollback, desiredReplicas, cliMeta, previewOpts)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -225,13 +266,28 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(deployResponse{
+	// Build the response with preview fields populated only when
+	// the deploy was a preview (issue #308). The three omitempty
+	// tags keep the non-preview wire shape byte-identical to the
+	// pre-#308 response, so a CLI built before #308 still parses
+	// the response cleanly.
+	resp := deployResponse{
 		ID:                  deployment.ID,
 		Hash:                deployment.Hash,
 		URL:                 "https://" + domain.IngressHost(tenantID, appName),
 		Regions:             domain.StringArrayTo(deployment.Regions),
 		AutoRollbackEnabled: deployment.AutoRollbackEnabled,
-	}); err != nil {
+	}
+	if deployment.PreviewID != nil {
+		resp.PreviewID = *deployment.PreviewID
+	}
+	if deployment.PreviewPRNumber != nil {
+		resp.PreviewPRNumber = *deployment.PreviewPRNumber
+	}
+	if deployment.PreviewExpiresAt != nil {
+		resp.PreviewExpiresAt = deployment.PreviewExpiresAt.UTC().Format(time.RFC3339)
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Deploy: failed to encode response: %v", err)
 	}
 	auditRecord(r, "deploy", "deployment", deployment.ID, "deployment "+deployment.ID+" created for app "+appName, "success")
@@ -308,6 +364,83 @@ func parseIntQuery(raw string, defaultVal int) (int, error) {
 		return 0, fmt.Errorf("negative value not allowed: %d", n)
 	}
 	return n, nil
+}
+
+// previewIDPattern constrains the preview-id query param to 8..16
+// lowercase hex chars (issue #308). The min length defends against
+// accidental 2-char abbreviations; the max length caps the
+// runtime's `<EDGE_KV_STORE_PATH>/{tenant_id}/preview-{id}/` path
+// length to a sensible value. Matches the constraint in
+// service.PreviewOpts / mintPreviewID (12 hex chars from
+// crypto/rand = 48 bits of entropy) so the server-minted default
+// always passes this regex.
+var previewIDPattern = regexp.MustCompile(`^[a-f0-9]{8,16}$`)
+
+// parsePreviewOpts resolves the three preview query params into
+// a service.PreviewOpts (issue #308). Returns nil when no preview
+// marker is set — the caller passes nil to DeploymentService.Deploy
+// to preserve the pre-#308 non-preview path.
+//
+// Validation rules:
+//   - preview-id (when set) must match previewIDPattern.
+//   - preview-pr-number (when set) must be >= 0; preview-pr-number
+//     without preview-id is rejected (the pr number without a
+//     preview marker is a client bug — silently dropping it would
+//     lose data the caller thought they sent).
+//   - preview-ttl (when set) must parse as a Go duration string.
+//     preview-ttl without preview-id is rejected for the same
+//     reason.
+//   - When preview-id is set and preview-ttl is not, the TTL
+//     defaults to service.PreviewDefaultTTL (7 days). The handler
+//     resolves the duration to an absolute time before returning
+//     so the service layer doesn't import time math.
+//
+// Errors are returned as a flat string suitable for inclusion
+// in a 400 response body (matches the shape of parseRegions /
+// parseIntQuery — caller does `{"error": "..."}`).
+func parsePreviewOpts(idRaw, prRaw, ttlRaw string) (*service.PreviewOpts, error) {
+	// Empty preview-id means "not a preview" — drop everything
+	// else and return nil regardless of what the caller sent
+	// for prRaw / ttlRaw. We do this even if the caller passed
+	// the other two, because preview-pr-number / preview-ttl
+	// without preview-id is a client bug and we want to surface
+	// it as a clean 400 rather than silently dropping the call.
+	if idRaw == "" {
+		if prRaw != "" {
+			return nil, fmt.Errorf("preview-pr-number set without preview-id; both must be present together")
+		}
+		if ttlRaw != "" {
+			return nil, fmt.Errorf("preview-ttl set without preview-id; both must be present together")
+		}
+		return nil, nil
+	}
+	if !previewIDPattern.MatchString(idRaw) {
+		return nil, fmt.Errorf("invalid preview-id %q: must match ^[a-f0-9]{8,16}$", idRaw)
+	}
+	opts := &service.PreviewOpts{PreviewID: idRaw}
+	if prRaw != "" {
+		n, err := strconv.Atoi(prRaw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid preview-pr-number %q: %w", prRaw, err)
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("preview-pr-number must be >= 0, got %d", n)
+		}
+		opts.PreviewPRNumber = &n
+	}
+	if ttlRaw == "" {
+		opts.ExpiresAt = time.Now().Add(service.PreviewDefaultTTL)
+	} else {
+		d, err := time.ParseDuration(ttlRaw)
+		if err != nil {
+			return nil, fmt.Errorf("invalid preview-ttl %q: must be a Go duration string (e.g. \"24h\", \"30m\")", ttlRaw)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("preview-ttl must be positive, got %s", d)
+		}
+		opts.ExpiresAt = time.Now().Add(d)
+	}
+	return opts, nil
 }
 
 func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {

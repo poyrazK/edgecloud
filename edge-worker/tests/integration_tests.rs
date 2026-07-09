@@ -333,6 +333,8 @@ async fn test_app_lifecycle() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
 
     let msg = TaskMessage::TaskUpdate {
@@ -501,6 +503,8 @@ async fn test_stop_all_apps() {
             max_memory_mb: 256,
             cpu_budget_ms: None,
             routes: None,
+            preview_id: None,
+            preview_pr_number: None,
         };
         let msg = TaskMessage::TaskUpdate {
             timestamp: "2026-06-15T00:00:00Z".to_string(),
@@ -570,6 +574,8 @@ async fn test_artifact_hash_match_starts_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -630,6 +636,8 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let bad_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -666,6 +674,8 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let good_msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:01Z".to_string(),
@@ -736,6 +746,8 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -810,6 +822,8 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -869,6 +883,8 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-17T00:00:00Z".to_string(),
@@ -1190,6 +1206,8 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         max_memory_mb: 0,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-18T00:00:00Z".to_string(),
@@ -1379,6 +1397,8 @@ async fn test_emit_log_reaches_ingest_within_5s() {
         max_memory_mb: 0,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-06-26T00:00:00Z".to_string(),
@@ -1723,6 +1743,8 @@ async fn test_handle_task_message_bumps_timestamp_on_partial_diff_failure_inner(
         socket_mode: None,
         max_memory_mb: 256,
         cpu_budget_ms: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let mut apps = HashMap::new();
     apps.insert("myapp".to_string(), bad_app);
@@ -1906,6 +1928,8 @@ async fn test_artifact_signature_match_starts_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:00Z".to_string(),
@@ -1965,6 +1989,8 @@ async fn test_artifact_signature_mismatch_rejects_app() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:00Z".to_string(),
@@ -2021,6 +2047,8 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg1 = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:00Z".to_string(),
@@ -2060,6 +2088,8 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg2 = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:01Z".to_string(),
@@ -2125,6 +2155,8 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:00Z".to_string(),
@@ -2192,6 +2224,8 @@ async fn test_artifact_missing_signature_rejects_when_required() {
         max_memory_mb: 256,
         cpu_budget_ms: None,
         routes: None,
+        preview_id: None,
+        preview_pr_number: None,
     };
     let msg = TaskMessage::TaskUpdate {
         timestamp: "2026-07-07T00:00:00Z".to_string(),

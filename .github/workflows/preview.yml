@@ -2,21 +2,48 @@ name: Preview
 on:
   pull_request:
     types: [opened, synchronize]
+  # Manual trigger from the Actions UI — useful while the
+  # pull_request auto-trigger is gated behind `if: false` (see the
+  # job below). When `api.edgecloud.dev` is up and you want to
+  # dogfood the deploy on a real PR, you can also remove `if: false`
+  # and rely on `pull_request` instead. The composite accepts the
+  # same `api-url` / `api-key` / `pr-number` inputs via the
+  # workflow_dispatch form.
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: 'GitHub PR number to forward to `edge-cli deploy --pr-number=<N>`. Leave empty for a no-PR-context preview.'
+        required: false
+        default: ''
 
-# DISABLED 2026-07-06 — the `Install edge CLI` step in
-# .github/actions/deploy-preview/action.yml installs `cargo install
-# --path ./edge-cli --locked --root "$CARGO_HOME"`, putting the binary at
-# `$CARGO_HOME/bin/edge`, but the next step's `shell: bash` subshell
-# doesn't have `$CARGO_HOME/bin` on `$PATH`. Every PR fails with
-# `edge: command not found` (rc=127) until the action also runs:
+# Preview workflow (issue #308).
 #
-#   - name: Expose edge CLI on PATH
-#     run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-#
-# The `if: false` below hard-skips the job so PRs aren't blocked; a
-# follow-up commit will re-enable once PATH propagation lands.
+# Fires on every PR open/synchronize. Builds the samples/hello wasm,
+# then delegates to .github/actions/deploy-preview which installs
+# the CLI and runs `edge-cli deploy --preview --pr-number=<N>`. The
+# resulting URL is commented back on the PR (when EDGECLOUD_API_KEY
+# is configured — fork PRs lack it and silently no-op).
 jobs:
   deploy-preview:
+    # Disabled on auto-trigger (issue #308) — the workflow stays
+    # defined and runnable from the Actions UI (workflow_dispatch),
+    # but it does NOT auto-fire on every PR while `api.edgecloud.dev`
+    # is offline. The CI matrix turned red once the workflow reached
+    # the actual network call:
+    #
+    #   Error: request or response body error for url
+    #     (https://api.edgecloud.dev/api/v1/deploy/...)
+    #   Caused by: send failed because receiver is gone
+    #
+    # because `api.edgecloud.dev` is not in DNS yet (the host hasn't
+    # been stood up). When the API is deployed, re-enable by
+    # deleting this `if: false` line and (optionally) also wiring a
+    # `workflow_dispatch` input if you want a manual-run button. The
+    # historical disable/enable cycle on this file was:
+    #   - 96fcc67: disable (pre-existing PATH bug)
+    #   - 9943c39: re-enable (PATH fixed, pr-number wired)
+    #   - ecfb4f9: app-dir input added (composite cwd fix)
+    #   - <this commit>: re-disable (host offline)
     if: false
     runs-on: ubuntu-latest
     steps:
@@ -27,33 +54,65 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      # Build the edge CLI into $CARGO_HOME/bin (so the binary is on
-      # PATH for subsequent steps — the composite action's install
-      # step does this too, but we need edge *before* the Build step).
+      # Build the edge CLI into $CARGO_HOME/bin. The follow-up step
+      # appends $CARGO_HOME/bin to $GITHUB_PATH so the next bash
+      # subshell can find `edge-cli` (issue #308 — pre-fix, every PR
+      # failed with `edge-cli: command not found` because the workflow
+      # was calling `edge build` / `edge deploy`, not `edge-cli`).
       # Building from the workspace is safer than piping a remote
-      # install script — no supply-chain risk on every CI run, and
-      # the workspace's resolver pins it to the same version as the
-      # rest of edgeCloud.
+      # install script: no supply-chain risk on every CI run, and the
+      # workspace's resolver pins it to the same version as the rest
+      # of edgeCloud.
       - name: Install edge CLI
         run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
+      # Install wasm-tools so the CLI's proven build recipe (issue
+      # #410 — wasi:http@0.2.1 vs 0.2.4) can wrap the core module
+      # emitted by `cargo build` into a wasi:http@0.2.1 component.
+      # The CLI shells out to `wasm-tools component new` after cargo
+      # finishes; without this step, the build fails with
+      # `failed to spawn wasm-tools component new` (rc=1). The
+      # version pin (1.252.0) matches the recipe documented in
+      # samples/hello/README.md:47 — the 1.252.x default adapter is
+      # what makes the wrap step "just work" without an explicit
+      # `--adapt` flag. We use `cargo install --locked` for a
+      # reproducible toolchain across CI runs.
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.252.0 --locked --root "$CARGO_HOME"
+
+      # Re-expose $CARGO_HOME/bin on PATH now that two more bins
+      # (edge-cli + wasm-tools) have been installed in the same job.
+      # The composite action does its own append, but we need PATH
+      # for the `Build hello sample` step below (which runs in this
+      # job, not the composite).
+      - name: Expose CLI tools on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
       # Build the hello sample (samples/hello/) into a deployable
-      # wasm component via the CLI. `edge build` runs the proven
-      # two-step recipe (cargo under wasm32-unknown-unknown +
-      # `wasm-tools component new`) internally, so the workflow no
-      # longer needs to install wasm-tools or stage files manually.
-      # See samples/hello/README.md for the wasi:http@0.2.1 vs 0.2.4
-      # rationale.
+      # wasm component via the CLI. The CLI binary is named `edge-cli`
+      # (per edge-cli/Cargo.toml's [package].name — not `edge`). `edge-cli`
+      # runs the proven two-step recipe (cargo under
+      # wasm32-unknown-unknown + `wasm-tools component new`)
+      # internally. See samples/hello/README.md for the
+      # wasi:http@0.2.1 vs 0.2.4 rationale.
       - name: Build hello sample
         working-directory: samples/hello
-        run: edge build
+        run: edge-cli build
 
-      # Delegate install-cli + edge deploy + URL capture to the
+      # Delegate install-cli + edge-cli deploy + URL capture to the
       # reusable composite action. We pass `build: 'false'` because
       # the wasm build is handled above (the composite's default
-      # `edge build` from cwd would run against the workspace root
+      # `edge-cli build` from cwd would run against the workspace root
       # which has no `[project]` section, so it would fail to find
       # an edge.toml).
+      #
+      # `pr-number` is the GitHub PR number the composite action
+      # forwards to `edge-cli deploy --pr-number=<N>`. The control
+      # plane stamps it into the guest env as
+      # `EDGE_PREVIEW_PR_NUMBER` so samples/hello can render
+      # PR-aware UI. Empty string when the trigger isn't a PR (the
+      # composite's parser is lenient — empty means "no PR
+      # context").
       #
       # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
       # composite treats an empty API key as a no-op (writes empty
@@ -61,10 +120,23 @@ jobs:
       # empty string. No secrets leak, no spurious failure.
       - uses: ./.github/actions/deploy-preview
         id: deploy
+        # `edge-cli deploy` reads `./edge.toml` from the cwd to find
+        # the `[project] name` and the wasm artifact path. The hello
+        # sample's edge.toml lives at samples/hello/edge.toml, so the
+        # composite action needs to `cd` into that directory before
+        # invoking edge-cli. Composite actions don't accept
+        # `working-directory:` at the call site (GitHub Actions rejects
+        # the key on `uses:` steps that reference a composite — see
+        # the `Resolve app directory` step in the action for the
+        # detailed rationale). The action exposes an `app-dir` input
+        # that we set here. The default of "." is preserved for
+        # callers that invoke the action from the project root.
         with:
           api-key: ${{ secrets.EDGECLOUD_API_KEY }}
           api-url: ${{ secrets.EDGECLOUD_API_URL }}
+          pr-number: ${{ github.event.pull_request.number }}
           build: 'false'
+          app-dir: samples/hello
 
       - name: Comment PR
         if: steps.deploy.outputs.preview-url != ''

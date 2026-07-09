@@ -95,7 +95,7 @@ CI jobs:
 | `typos` | crate-ci/typos across the whole repo |
 | `coverage-rust` | cargo-llvm-cov (informational) |
 
-`.github/workflows/preview.yml` is a `deploy-preview` job that is **DISABLED** (`if: false`) — the underlying action had a `$CARGO_HOME/bin` PATH-propagation bug. Until that lands, no PR previews deploy.
+`.github/workflows/preview.yml` is a `deploy-preview` job that runs on every PR `opened`/`synchronize` event (issue #308). The composite action at `.github/actions/deploy-preview/action.yml` builds the CLI via `cargo install --root $CARGO_HOME`, then runs `edge deploy --preview --pr-number=${{ github.event.pull_request.number }}`. The action includes a `Expose edge CLI on PATH` step that appends `$CARGO_HOME/bin` to `$GITHUB_PATH` — without it the next bash step fails with `edge: command not found` (rc=127). The URL is parsed from the CLI's stdout and exposed as the `preview-url` step output; the workflow's `Comment PR` step posts it on the PR when `EDGECLOUD_API_KEY` is set (fork PRs lack the secret and silently no-op).
 
 ## Agent Behavior
 
@@ -375,6 +375,7 @@ Per-app, per-deployment:
 - `ReconcileSvc.Run` — periodic full_sync.
 - `WorkerGC.Run` — evicts workers that haven't heartbeated in `WORKER_MAX_AGE` (default 15 min).
 - `AutoscaleSvc.Subscribe` — no-op when disabled.
+- `PreviewGC.Run` — issue #308. TTL'd preview deployment GC: every `PREVIEW_GC_INTERVAL` (default 1h), sweep deployments whose `preview_expires_at < NOW()`, delete their artifact blobs FIRST, then delete the rows. Mirror of `LogGC.Run`; same batched-delete + immediate-first-sweep shape.
 
 ### Secrets encryption (`edge-control-plane/internal/service/secrets.go`)
 

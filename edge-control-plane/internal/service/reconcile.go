@@ -321,6 +321,8 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 			j.Hash.String,
 			j.Signature.String,    // issue #307: signature is empty for legacy rows; worker honors EDGE_REQUIRE_SIGNATURE
 			j.SigningKeyID.String, // issue #307 PR1: per-key kid
+			"",                    // issue #308: preview_id is empty on the reconcile path (full_sync never carries preview metadata)
+			0,                     // issue #308: preview_pr_number — same reasoning as preview_id
 			envMap,
 			allowlist,
 			maxMemoryMB,
@@ -498,6 +500,8 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 			j.Hash.String,
 			j.Signature.String,    // issue #307: empty for legacy rows
 			j.SigningKeyID.String, // issue #307 PR1: per-key kid
+			"",                    // issue #308: preview_id is empty on the reconcile path (full_sync never carries preview metadata)
+			0,                     // issue #308: preview_pr_number — same reasoning as preview_id
 			envMap,
 			allowlist,
 			maxMemoryMB,

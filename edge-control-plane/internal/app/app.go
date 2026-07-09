@@ -47,6 +47,12 @@ type App struct {
 	LogGC        *service.LogGCService
 	WorkerGC     *service.WorkerGCService
 	DeploymentGC *service.DeploymentGCService
+	// PreviewGC (issue #308) reclaims expired preview deployments
+	// and their artifact blobs. Tunable via env
+	// (PREVIEW_GC_INTERVAL, PREVIEW_RETENTION). Disabled by
+	// invalid interval/retention — PreviewGCService.Run refuses
+	// to start with non-positive values.
+	PreviewGC *service.PreviewGCService
 	// DeploymentSvc is exposed so main.go can inject the per-region
 	// artifact-cache pusher (issue #332) after construction. Optional
 	// post-New wiring — when not set, the deployment service runs
@@ -513,8 +519,14 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		LogGC:           service.NewLogGCService(logEntryRepo),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
 		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
-		DeploymentSvc:   deploymentSvc,
-		AutoscaleSvc:    autoscaleSvc,
+		// Preview GC (issue #308). Wired with the deployment
+		// repo (for ListExpiredPreviewBlobs +
+		// DeleteExpiredPreviewsByIDs) and the artifact store
+		// (for blob unlink). See service/preview_gc.go for
+		// the run loop and ordering invariants.
+		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
+		DeploymentSvc: deploymentSvc,
+		AutoscaleSvc:  autoscaleSvc,
 	}
 }
 
@@ -547,6 +559,16 @@ func (a *App) RunBackground(ctx context.Context) {
 	deployGCInterval := parseDurationEnv("DEPLOY_GC_INTERVAL", 1*time.Hour)
 	deployRetention := parseDurationEnv("DEPLOY_RETENTION", 7*24*time.Hour)
 	go a.DeploymentGC.Run(ctx, deployGCInterval, deployRetention)
+
+	// Preview GC (issue #308). Reclaims expired preview
+	// deployments (rows + their artifact blobs). The retention
+	// env var is currently a no-op on the GC itself (per-row
+	// expiry is stamped at deploy time via PreviewOpts.ExpiresAt)
+	// but is read here for parity with the other GC knobs and
+	// as a forward-compatible hook.
+	previewGCInterval := parseDurationEnv("PREVIEW_GC_INTERVAL", 1*time.Hour)
+	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
+	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately.

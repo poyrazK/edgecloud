@@ -21,6 +21,19 @@ pub struct State {
     /// `#[serde(default)]` for backward compat with pre-#316 state.json.
     #[serde(default)]
     pub desired_replicas: usize,
+    /// Preview-id (issue #308). Empty for non-preview deploys.
+    /// `#[serde(default)]` keeps pre-#308 state.json parseable.
+    #[serde(default)]
+    pub preview_id: String,
+    /// PR number forwarded via `--pr-number`. 0 for non-preview
+    /// deploys or for laptop `edge deploy --preview` runs without a
+    /// PR context.
+    #[serde(default)]
+    pub preview_pr_number: u32,
+    /// RFC3339 expiry timestamp the control plane returned. Empty
+    /// for non-preview deploys.
+    #[serde(default)]
+    pub preview_expires_at: String,
 }
 
 impl State {
@@ -157,6 +170,9 @@ mod tests {
             live_url: "https://example.test".to_string(),
             regions: vec!["us-east".to_string(), "eu-west".to_string()],
             desired_replicas: 3,
+            preview_id: String::new(),
+            preview_pr_number: 0,
+            preview_expires_at: String::new(),
         };
         original.save(dir.path()).unwrap();
         let loaded = State::load(dir.path()).unwrap();
@@ -213,6 +229,9 @@ mod tests {
             live_url: "https://x.test".to_string(),
             regions: vec!["us-east".to_string(), "ap-south".to_string()],
             desired_replicas: 5,
+            preview_id: String::new(),
+            preview_pr_number: 0,
+            preview_expires_at: String::new(),
         };
         state.save(dir.path()).unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".edge").join("state.json")).unwrap();

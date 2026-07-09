@@ -77,6 +77,9 @@ mod tests {
             live_url: "https://example.test".to_string(),
             regions: vec![],
             desired_replicas: 0,
+            preview_id: String::new(),
+            preview_pr_number: 0,
+            preview_expires_at: String::new(),
         }
     }
 

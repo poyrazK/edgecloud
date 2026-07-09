@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -94,6 +95,69 @@ const MaxArtifactSize = storage.MaxArtifactSize
 // can target. Defensive ceiling against fan-out abuse; realistic tenants
 // want ≤10 regions. Operators can raise this constant if needed.
 const MaxRegionsPerDeployment = 16
+
+// PreviewDefaultTTL is the default expiry applied to preview
+// deployments (issue #308) when the HTTP request omits ?preview-ttl=.
+// 168h = 7 days, matching the LOG_RETENTION default in CLAUDE.md so
+// the operator's mental model is "abandoned previews get reclaimed
+// in a week." Per-deploy overridable via ?preview-ttl=24h. Operators
+// can change the global default by editing this constant (no env var
+// wired today — the GC interval + retention are env-tunable in
+// preview_gc.go, but the default TTL on a new preview row is a code
+// constant so the service can decide on a per-Deploy basis without
+// a config round-trip).
+const PreviewDefaultTTL = 168 * time.Hour
+
+// PreviewOpts is the bundle of preview metadata the HTTP handler
+// hands to DeploymentService.Deploy when the request includes
+// ?preview-id= / ?preview-pr-number= / ?preview-ttl= (issue #308).
+// Nil means "this is not a preview" — the service preserves the
+// pre-#308 behavior (no preview columns stamped, no GC expiry).
+//
+// All three fields are populated together when present: a non-nil
+// PreviewOpts with a zero-value PreviewPRNumber means "preview with
+// no PR linkage" (a non-CI user running `edge deploy --preview`
+// from a laptop). The handler validates this shape before
+// constructing the struct.
+//
+// PreviewID is the hex suffix the runtime uses as the store-scope
+// key (`<EDGE_KV_STORE_PATH>/{tenant_id}/preview-{id}/`). It also
+// appears in the published TaskMessage so the worker can forward it
+// to edge-runtime::RuntimeState. See mintPreviewID for the
+// server-side default.
+//
+// PreviewPRNumber is the GitHub PR number the composite action
+// forwards via ?preview-pr-number=. Optional; nil for non-CI users.
+//
+// ExpiresAt is the absolute TIMESTAMPTZ the PreviewGCService
+// compares against NOW() on each sweep. The handler resolves
+// `?preview-ttl=` to an absolute time before constructing this
+// struct; the service layer trusts the value.
+type PreviewOpts struct {
+	PreviewID       string
+	PreviewPRNumber *int
+	ExpiresAt       time.Time
+}
+
+// mintPreviewID returns a 12-character lowercase-hex string for
+// server-side preview-id generation (issue #308). Used as a fallback
+// when the HTTP request didn't carry ?preview-id= (the CLI mints its
+// own; the server falls back when the request is from a tool that
+// doesn't). Cryptographic-random so two parallel requests can't
+// collide; 12 hex chars = 48 bits = ~280 trillion values, plenty of
+// headroom for any realistic PR throughput.
+//
+// Returns a non-empty string on success. crypto/rand.Read failure
+// returns empty — the caller is expected to fall back to its own
+// identifier in that case (the caller is the handler, which uses
+// uuid.New() as the broader fallback).
+func mintPreviewID() string {
+	var b [6]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // Sentinel errors.
 //
@@ -392,10 +456,18 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // `IsValidRegion`; the first invalid entry fails the call before any
 // DB or storage I/O.
 //
+// `previewOpts` is the preview-metadata bundle (issue #308). Nil
+// preserves the pre-#308 behavior — no preview columns stamped, no
+// GC expiry. Non-nil stamps preview_id + preview_pr_number + preview_expires_at
+// onto the deployments row and (via ActivateDeployment) onto the
+// active row, so the worker can scope per-preview persistent stores
+// and stamp `EDGE_PREVIEW_PR_NUMBER` into the guest env. See
+// PreviewOpts for the per-field contract.
+//
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata, previewOpts *PreviewOpts) (*domain.Deployment, error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name")
@@ -481,6 +553,41 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		// "no threshold" — the reconcile loop won't warn about
 		// under-replication.
 		DesiredReplicas: desiredReplicas,
+	}
+	// Preview metadata (issue #308). Stamped onto the deployment
+	// row so PreviewGCService can find expired previews via
+	// preview_expires_at < NOW() (partial index migration 021)
+	// AND so the published TaskMessage can carry preview_id +
+	// preview_pr_number to the worker. When previewOpts is nil
+	// the three fields stay nil and the columns persist as SQL
+	// NULL — the legacy non-preview path is unchanged.
+	if previewOpts != nil {
+		previewID := previewOpts.PreviewID
+		if previewID == "" {
+			// Fallback for handlers that pass a non-nil
+			// PreviewOpts without an explicit id (e.g., a
+			// future "preview mode" toggle that doesn't carry
+			// one). mintPreviewID uses crypto/rand; on the
+			// effectively-unreachable failure path, fall
+			// back to a UUID-derived hex so the row is still
+			// unique. The TTL still fires; only the store-
+			// scope key becomes opaque-but-unique.
+			previewID = mintPreviewID()
+			if previewID == "" {
+				previewID = uuid.New().String()[:12]
+			}
+		}
+		deployment.PreviewID = &previewID
+		deployment.PreviewPRNumber = previewOpts.PreviewPRNumber
+		expires := previewOpts.ExpiresAt
+		if expires.IsZero() {
+			// Defensive default — handler should always set
+			// this, but if a future caller forgets, fall
+			// back to PreviewDefaultTTL so the preview is
+			// still reclaimable.
+			expires = time.Now().Add(PreviewDefaultTTL)
+		}
+		deployment.PreviewExpiresAt = &expires
 	}
 
 	// Wrap the row insert and the artifact save in a transaction
@@ -713,6 +820,34 @@ func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, tar
 	return s.activateDeployment(ctx, tenantID, targetAppName, deploymentID, deployment, deployment.AutoRollbackEnabled)
 }
 
+// previewIDFromDeployment unwraps the *string on the deployment
+// row into a value suitable for the AppConfig wire field
+// (issue #308). Returns "" when the deployment is not a preview —
+// the JSON tag `omitempty` on AppConfig.PreviewID then drops it
+// from the wire, so pre-#308 workers ignore the field silently.
+//
+// Local helper rather than a method on Deployment to keep the
+// "nil pointer → empty string" conversion colocated with the
+// BuildAppConfig call site (the pattern repeats three times in
+// this file: activate, rollback, full-sync republish).
+func previewIDFromDeployment(d *domain.Deployment) string {
+	if d == nil || d.PreviewID == nil {
+		return ""
+	}
+	return *d.PreviewID
+}
+
+// previewPRNumberFromDeployment unwraps the *int on the deployment
+// row into a value suitable for AppConfig.PreviewPRNumber
+// (issue #308). Returns 0 when unset — the JSON tag `omitempty`
+// then drops the field from the wire.
+func previewPRNumberFromDeployment(d *domain.Deployment) int {
+	if d == nil || d.PreviewPRNumber == nil {
+		return 0
+	}
+	return *d.PreviewPRNumber
+}
+
 // activateDeployment is the shared inner logic for ActivateDeployment
 // and PromoteDeployment. It sets the active deployment row and publishes
 // a task update, without checking the deployment's original app name.
@@ -750,6 +885,18 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			// Copy the desired replica count (issue #316). The
 			// reconcile loop uses this as a monitoring threshold.
 			DesiredReplicas: deployment.DesiredReplicas,
+			// Preview linkage (issue #308). When the deployment
+			// was uploaded with previewOpts, copy preview_id +
+			// preview_pr_number onto the active row so the
+			// published TaskMessage carries them. The runtime
+			// reads these to scope per-preview persistent stores
+			// and stamp EDGE_PREVIEW_PR_NUMBER into the guest
+			// env. Non-preview deploys leave both nil — the
+			// active row has NULL columns and the runtime falls
+			// back to per-tenant scoping, preserving the
+			// pre-#308 behavior.
+			PreviewID:       deployment.PreviewID,
+			PreviewPRNumber: deployment.PreviewPRNumber,
 		}); err != nil {
 			return fmt.Errorf("setting active deployment: %w", err)
 		}
@@ -821,6 +968,8 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 				deployment.Hash,
 				deployment.Signature,
 				deployment.SigningKeyID, // issue #307 PR1: per-key kid
+				previewIDFromDeployment(deployment),
+				previewPRNumberFromDeployment(deployment),
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -1215,6 +1364,14 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	var deploymentHash string
 	var deploymentSignature string
 	var deploymentSigningKeyID string
+	// Preview linkage (issue #308) — preserved across rollback so
+	// the published TaskMessage keeps per-preview store scoping +
+	// EDGE_PREVIEW_PR_NUMBER stamping. Sourced from the rolled-
+	// back-to deployment row inside the tx (see the assignment
+	// below). Defaults to zero values so a non-preview rollback
+	// doesn't need to special-case.
+	var rollbackPreviewID string
+	var rollbackPreviewPRNumber int
 	var regions []string
 	var tenant *domain.Tenant
 	var envs []domain.AppEnv
@@ -1247,6 +1404,17 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		deploymentHash = dep.Hash
 		deploymentSignature = dep.Signature
 		deploymentSigningKeyID = dep.SigningKeyID
+		// Preview linkage (issue #308) — preserved across rollback.
+		// The rolled-back-TO deployment may itself be a preview
+		// (e.g., promote-then-rollback); re-publish its preview
+		// fields so the worker continues to scope per-preview
+		// stores and stamp EDGE_PREVIEW_PR_NUMBER. Sourced from
+		// the deployment row (not the active row) because the
+		// active row's preview_* was just cleared via the Set
+		// call below — the deployment row is the authoritative
+		// source for the artifact's metadata.
+		rollbackPreviewID = previewIDFromDeployment(dep)
+		rollbackPreviewPRNumber = previewPRNumberFromDeployment(dep)
 		// Use the rolled-BACK-TO deployment's regions so we publish
 		// to exactly the regions where this artifact was originally
 		// destined. Previously this published to "global" only, which
@@ -1339,6 +1507,8 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 				deploymentHash,
 				deploymentSignature,
 				deploymentSigningKeyID, // issue #307 PR1: per-key kid
+				rollbackPreviewID,      // issue #308: preserved across rollback
+				rollbackPreviewPRNumber,
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -1424,8 +1594,10 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 				ad.AppName: nats.BuildAppConfig(
 					ad.DeploymentID,
 					deployment.Hash,
-					deployment.Signature,    // issue #307
-					deployment.SigningKeyID, // issue #307 PR1: per-key kid
+					deployment.Signature,                      // issue #307
+					deployment.SigningKeyID,                   // issue #307 PR1: per-key kid
+					previewIDFromDeployment(deployment),       // issue #308
+					previewPRNumberFromDeployment(deployment), // issue #308
 					envMap,
 					tenant.AllowlistedDestinations,
 					maxMemoryMB,

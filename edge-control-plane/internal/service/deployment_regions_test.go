@@ -123,10 +123,10 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 
 	// 1. deploymentRepo.GetByID returns a row with 3 regions.
 	regionsCol := `{"us-east","eu-west","ap-south"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 
 	// 2. ActivateDeployment wraps the GetForUpdate + Set in a tx
 	// (so concurrent activate/rollback serialize via FOR UPDATE).
@@ -227,10 +227,10 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_legacy"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -288,10 +288,10 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	svc, mock, cleanup := activateSvcForTest(t, pub, "us-east")
 	defer cleanup()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs("d_x").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -355,10 +355,10 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_partial"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -431,10 +431,10 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 
 	const deploymentID = "d_zero_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -499,10 +499,10 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 
 	const deploymentID = "d_no_quota"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
@@ -597,7 +597,7 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 	// region state columns zeroed, so the read returns the empty
 	// values.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -605,10 +605,11 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_xxx", nil, false, nil,
 			"{}", "{}", "{}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	// AppendRegionsPublished / AppendRegionsFailed fire on a
@@ -673,7 +674,7 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 	// 1. Post-commit read returns empty arrays — publishSwap will
 	//    publish to both regions (us-east + eu-west).
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -681,10 +682,11 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_atomic", nil, false, nil,
 			"{}", "{}", "{}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	pub := &RecordingPublisher{
@@ -825,7 +827,7 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	// loop should skip "fra" and push "iad". The NATS publish
 	// loop runs for BOTH regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -833,10 +835,11 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_skip", nil, false, nil,
 			"{}", "{}", "{fra}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	pub := &RecordingPublisher{}
@@ -937,7 +940,7 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 
 	// Post-commit read: empty arrays; both regions are in toPublish.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -945,10 +948,11 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_atomic_cache", nil, false, nil,
 			"{}", "{}", "{}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	pub := &RecordingPublisher{}
@@ -1059,7 +1063,7 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 	// skipped and `iad` is pushed. The cache pusher is wired so
 	// the cache loop runs. NATS publishes for both regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1067,10 +1071,11 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_split", nil, false, nil,
 			"{}", "{}", "{fra}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	pub := &RecordingPublisher{}
@@ -1167,7 +1172,7 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 	// (no failFor on the publisher). The cache pusher fails for
 	// both regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1175,10 +1180,11 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled", "stable_since",
 			"regions_published", "regions_failed", "regions_cached",
 			"regions_cache_failed", "last_publish_at", "last_publish_attempt_id",
+			"preview_id", "preview_pr_number",
 		}).AddRow(
 			tenantID, appName, "d_best_effort", nil, false, nil,
 			"{}", "{}", "{}", "{}",
-			nil, nil,
+			nil, nil, nil, nil,
 		))
 
 	pub := &RecordingPublisher{}
