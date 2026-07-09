@@ -8,6 +8,16 @@ use std::sync::Arc;
 use crate::auth::WorkerJwtSigner;
 use crate::verifier::Keyring;
 
+/// Worker-side cap on artifact-download response bodies (issue #451).
+///
+/// The control plane caps at `MaxArtifactSize = 100 MiB`
+/// (`edge-control-plane/internal/storage/storage.go:12`); this is the
+/// worker-side defense-in-depth: a buggy or compromised control plane
+/// must not be able to OOM a worker with one oversized response. The
+/// worker pre-checks `Content-Length` against this cap, then streams
+/// the body and aborts as soon as the running byte count exceeds it.
+pub(crate) const MAX_ARTIFACT_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Downloads Wasm artifacts from the control plane with local cache.
 pub struct Downloader {
     client: reqwest::Client,
@@ -27,6 +37,12 @@ pub struct Downloader {
     /// can read it (defensive check that `require_signature=true`
     /// always implies a keyring was constructed).
     pub(crate) signature_verifier: Option<Arc<Keyring>>,
+    /// Worker-side response-body cap (issue #451). Production code goes
+    /// through `Downloader::new` which seeds this with
+    /// `MAX_ARTIFACT_DOWNLOAD_BYTES`. Tests use
+    /// `with_max_download_bytes` to exercise the cap with a small value
+    /// — see `mod tests`.
+    max_download_bytes: u64,
 }
 
 impl Downloader {
@@ -36,12 +52,34 @@ impl Downloader {
         jwt_signer: Arc<WorkerJwtSigner>,
         signature_verifier: Option<Arc<Keyring>>,
     ) -> Self {
+        Self::with_max_download_bytes(
+            control_plane_url,
+            cache_dir,
+            jwt_signer,
+            signature_verifier,
+            MAX_ARTIFACT_DOWNLOAD_BYTES,
+        )
+    }
+
+    /// Constructor with an explicit response-body cap. `pub(crate)` so
+    /// only this crate's tests can exercise the cap directly without
+    /// pulling a 100 MiB body through every assertion. Production code
+    /// uses `Downloader::new`, which seeds this with
+    /// `MAX_ARTIFACT_DOWNLOAD_BYTES`.
+    pub(crate) fn with_max_download_bytes(
+        control_plane_url: String,
+        cache_dir: PathBuf,
+        jwt_signer: Arc<WorkerJwtSigner>,
+        signature_verifier: Option<Arc<Keyring>>,
+        max_download_bytes: u64,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             control_plane_url,
             cache_dir,
             jwt_signer,
             signature_verifier,
+            max_download_bytes,
         }
     }
 
@@ -171,7 +209,56 @@ impl Downloader {
             .error_for_status()
             .with_context(|| format!("HTTP error for {}", url))?;
 
-        let data: bytes::Bytes = response.bytes().await?;
+        // Defense-in-depth cap on the response body (issue #451). The
+        // control plane caps at MaxArtifactSize = 100 MiB; this stops
+        // a buggy / compromised CP from OOM-ing the worker. Bind
+        // `content_length` BEFORE calling `bytes_stream()` because the
+        // stream call moves `response`.
+        let cap = self.max_download_bytes;
+        let content_length = response.content_length();
+        if let Some(cl) = content_length {
+            if cl > cap {
+                tracing::warn!(
+                    deployment_id,
+                    url = %url,
+                    content_length = cl,
+                    cap,
+                    "rejecting artifact download: Content-Length exceeds worker cap"
+                );
+                anyhow::bail!(
+                    "artifact response for {deployment_id} exceeded cap of {cap} bytes \
+                     (Content-Length: {cl})"
+                );
+            }
+        }
+
+        // Even when Content-Length is missing or wrong (e.g. compressed
+        // responses — see reqwest::Response::content_length docs), cap
+        // the stream. `total` is updated BEFORE `extend_from_slice` so
+        // we bail before buffering further bytes (the bytes::BytesMut
+        // grow path is unchecked).
+        use futures::TryStreamExt;
+        let mut stream = response.bytes_stream();
+        let mut total: usize = 0;
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = stream.try_next().await? {
+            total = total.saturating_add(chunk.len());
+            if total > cap as usize {
+                tracing::warn!(
+                    deployment_id,
+                    url = %url,
+                    cap,
+                    total,
+                    "aborting artifact download: streamed body exceeded worker cap"
+                );
+                anyhow::bail!(
+                    "artifact response for {deployment_id} exceeded cap of {cap} bytes \
+                     after reading {total} bytes (Content-Length: {content_length:?})"
+                );
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let data: bytes::Bytes = buf.freeze();
 
         // Verify before caching — never persist unverified bytes to disk.
         verify_hash(&data, expected_hash, deployment_id)?;
@@ -541,6 +628,11 @@ mod tests {
     fn sha256_hex(data: &[u8]) -> String {
         hex_encode(Sha256::digest(data).as_slice())
     }
+
+    /// Cap used by the body-cap tests below (issue #451). 1 KiB is small
+    /// enough to keep test bodies cheap, large enough that wiremock can
+    /// chunk / delay without surprises.
+    const TEST_CAP: u64 = 1024;
 
     #[test]
     fn verify_hash_rejects_empty() {
@@ -1204,6 +1296,166 @@ mod tests {
             "test",
             "t_test",
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // get_artifact body-cap tests (issue #451). These exercise the
+    // worker-side defense-in-depth cap that mirrors the control plane's
+    // MaxArtifactSize. The downloader is constructed via the
+    // `with_max_download_bytes` ctor with a small TEST_CAP so the test
+    // bodies stay cheap.
+    // -----------------------------------------------------------------------
+
+    /// Body just under the cap succeeds; downloader streams the body
+    /// and returns the bytes. Wiremock auto-derives Content-Length from
+    /// the body, so the pre-check passes (cl < cap).
+    #[tokio::test]
+    async fn get_artifact_response_within_cap_succeeds() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = vec![0u8; (TEST_CAP - 1) as usize];
+        let hash = sha256_hex(&body);
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_cap_under"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::with_max_download_bytes(
+            server.uri(),
+            tmp.path().to_path_buf(),
+            test_signer(),
+            None,
+            TEST_CAP,
+        );
+
+        let result = downloader
+            .get_artifact("d_cap_under", &hash, None, None)
+            .await
+            .expect("body under cap must succeed");
+        assert_eq!(result.len() as u64, TEST_CAP - 1);
+    }
+
+    /// Body exactly at the cap succeeds (boundary: `>` not `>=`).
+    #[tokio::test]
+    async fn get_artifact_response_exactly_at_cap_succeeds() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = vec![0u8; TEST_CAP as usize];
+        let hash = sha256_hex(&body);
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_cap_exact"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::with_max_download_bytes(
+            server.uri(),
+            tmp.path().to_path_buf(),
+            test_signer(),
+            None,
+            TEST_CAP,
+        );
+
+        let result = downloader
+            .get_artifact("d_cap_exact", &hash, None, None)
+            .await
+            .expect("body exactly at cap must succeed (>)");
+        assert_eq!(result.len() as u64, TEST_CAP);
+    }
+
+    /// Content-Length exceeds the cap → downloader bails before reading
+    /// any body chunk. We use a tiny cap (1 byte) and send an honestly-
+    /// CL'd body of 2 bytes; the pre-read check sees CL=2 > cap=1 and
+    /// bails. Hyper accepts the response because CL agrees with the
+    /// body length — there's no lying-CL attack needed to exercise
+    /// this branch.
+    #[tokio::test]
+    async fn get_artifact_content_length_exceeds_cap_rejects_pre_read() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Body of 2 bytes, CL auto-derived = 2, cap = 1 → pre-read
+        // bail.
+        let body = vec![0u8, 1u8];
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_cap_pre_read"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::with_max_download_bytes(
+            server.uri(),
+            tmp.path().to_path_buf(),
+            test_signer(),
+            None,
+            1,
+        );
+
+        // Any hash will do — the bail happens before hash verify.
+        let err = downloader
+            .get_artifact("d_cap_pre_read", &sha256_hex(b"any"), None, None)
+            .await
+            .expect_err("body whose CL exceeds cap must reject pre-read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Content-Length") && msg.contains("cap"),
+            "expected error to mention Content-Length and cap, got: {msg}"
+        );
+    }
+
+    /// Body of (cap * 4) bytes is sent without a Content-Length override,
+    /// so wiremock sets Content-Length = cap*4 too. The streaming
+    /// accumulator bails when the running total exceeds the cap. This
+    /// covers the threat model where the pre-read Content-Length check
+    /// is bypassed (e.g. a server that omits Content-Length, sends a
+    /// lying CL, or compresses the body so the on-wire CL is smaller
+    /// than the decompressed size). In all three cases the per-chunk
+    /// accumulator is the load-bearing defense — without it, the worker
+    /// would happily buffer the whole body.
+    #[tokio::test]
+    async fn get_artifact_streaming_chunk_exceeds_cap_aborts() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = vec![0u8; (TEST_CAP * 4) as usize];
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_cap_stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader = Downloader::with_max_download_bytes(
+            server.uri(),
+            tmp.path().to_path_buf(),
+            test_signer(),
+            None,
+            TEST_CAP,
+        );
+
+        let err = downloader
+            .get_artifact("d_cap_stream", &sha256_hex(b"any"), None, None)
+            .await
+            .expect_err("4x cap body must abort streaming");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeded"),
+            "expected error to mention 'exceeded', got: {msg}"
+        );
     }
 
     #[test]
