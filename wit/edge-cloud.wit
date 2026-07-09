@@ -132,6 +132,19 @@ world edge-runtime {
   import scheduling;
   import process;
   import websocket;
+
+  // The long-running entry point. The supervisor's `execute_app`
+  // (edge-worker/src/supervisor.rs::execute_app) calls
+  // `instance.get_typed_func("start")` once and awaits the result.
+  // A guest that wants to keep running (e.g. a long-running HTTP
+  // server) loops internally; a normal return signals "I want to be
+  // restarted" and the supervisor's exponential-backoff machinery
+  // (`run_app_loop`, which `execute_app` returns to) takes over.
+  // The previous `_start` symbol came from wasi-snapshot-preview1
+  // reactor components; with the component-model canonical world
+  // below, the entry point is a top-level world function named
+  // `start`.
+  export start: func();
 }
 
 // FaaS world. Components implement wasi:http/incoming-handler and the

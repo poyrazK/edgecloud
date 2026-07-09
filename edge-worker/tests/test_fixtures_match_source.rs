@@ -18,6 +18,24 @@ use sha2::{Digest, Sha256};
 const EXPECTED_HANDLER_HASH: &str =
     "f039dc033db3dec5f0c365ae1c9ead16702879b760b2ef5eb11ff72ea25e508a";
 
+// Issue #448: `samples/hello-js-ws` is the long-running JS shim
+// (`world = "edge-runtime"`, `export start: func()`) wrapped via
+// `wasm-tools component new --adapt
+// wasi_snapshot_preview1.reactor.wasm`. The fixture is committed at
+// `tests/fixtures/js_websocket_handler.wasm`. Rebuild with:
+//   cd samples/hello-js-ws
+//   npx esbuild src/handler.js --bundle --format=iife \
+//     --platform=neutral --outfile=.edge/bundle.js
+//   EDGE_JS_BUNDLE=$PWD/.edge/bundle.js \
+//     cargo build --target wasm32-wasip1 --release
+//   wasm-tools component new \
+//     $HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/hello_js_ws.wasm \
+//     --adapt \
+//     $HOME/.cargo/registry/src/index.crates.io-*/wasi-preview1-component-adapter-provider-45.0.3/artefacts/wasi_snapshot_preview1.reactor.wasm \
+//     -o ../edge-worker/tests/fixtures/js_websocket_handler.wasm
+const EXPECTED_JS_WEBSOCKET_HASH: &str =
+    "5f785981710bc687f16b640e62a508f61b9aa00327b66caa2a35db09f9345c6e";
+
 fn sha256_hex(bytes: &[u8]) -> String {
     // Production SHA-256 via the `sha2` crate (already a regular
     // `[dependencies]` entry on `edge-worker` — used by
@@ -69,6 +87,11 @@ fn assert_hash(rel: &str, expected: &str) {
 #[test]
 fn handler_fixture_intact() {
     assert_hash("handler.wasm", EXPECTED_HANDLER_HASH);
+}
+
+#[test]
+fn js_websocket_fixture_intact() {
+    assert_hash("js_websocket_handler.wasm", EXPECTED_JS_WEBSOCKET_HASH);
 }
 
 #[test]

@@ -1,0 +1,30 @@
+[package]
+name = "hello-js-ws"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "edgeCloud hello-js-ws — long-running JS sample for issue #448 e2e. Pairs a small Rust shim (world = edge-runtime) with an esbuild-bundled JS that calls websocket.listen + accept + send + receive."
+
+# Isolated workspace: without this, cargo would walk up to the parent
+# edgeCloud workspace and try to resolve `hello-js-ws` against the host
+# repo's members (edge-runtime, edge-cli, edge-worker, …). Those are
+# host-only crates that can't be cross-compiled to wasm32-unknown-unknown.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Same wit-bindgen major as edge-worker/tests/fixtures/handler/Cargo.toml
+# and samples/hello/Cargo.toml. wasmtime 45.0.3 (the runtime version this
+# repo ships) expects a wasi:http@0.2.1 component, which wit-bindgen
+# 0.45 emits. Same exact dependency shape as `edge-js-runtime/Cargo.toml`.
+wit-bindgen = "0.45"
+# rquickjs 0.9 with the bindgen feature, matching `edge-js-runtime`.
+rquickjs = { version = "0.9.0", features = ["bindgen"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
