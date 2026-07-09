@@ -328,7 +328,27 @@ enum Command {
     },
 
     /// List all deployments for the app.
-    Deployments,
+    ///
+    /// Calls `GET /api/v1/list/{appName}` and prints a 4-column
+    /// table (ID / STATUS / CREATED / URL). When the tenant has
+    /// more deployments than fit on one page, renders a
+    /// `page X of N` footer with `prev:` / `next:` hints; small
+    /// lists render silently.
+    Deployments {
+        /// 1-indexed page number. Defaults to 1. Page numbers are
+        /// validated to be `>= 1`; `edge deployments --page 0`
+        /// exits non-zero with a clear error rather than
+        /// silently rendering the first page.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        page: u32,
+
+        /// Page size forwarded as `?limit=` on the request. The
+        /// server's default (20) is used when this flag is absent
+        /// (the CLI sends 0 to mean "server default" — the wire
+        /// request omits the query param entirely).
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        limit: u32,
+    },
 
     /// Show tenant quota and usage.
     Quota,
@@ -536,7 +556,7 @@ fn main() -> Result<()> {
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev { lang } => commands::dev::run(&cli.path, lang),
         Command::Open { force } => commands::open::run(&cli.path, force),
-        Command::Deployments => commands::deployments::run(&cli.path),
+        Command::Deployments { page, limit } => commands::deployments::run(&cli.path, page, limit),
         Command::Quota => commands::quota::run(&cli.path),
         Command::Ingress { app } => commands::ingress::run(&cli.path, &app),
         Command::Logs {
