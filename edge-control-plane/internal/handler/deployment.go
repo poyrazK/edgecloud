@@ -132,7 +132,15 @@ type deploymentListResponse struct {
 
 // newStatusResponse maps a DB row to the typed wire DTO. The same
 // mapper is used by `GetStatus`, `GetActive`, and `List` so the three
-// endpoints can't drift.
+// endpoints can't drift in shape — any new field on the wire shows up
+// in all three (or none), enforced by this single construction site.
+//
+// Precondition: `tenantID` MUST equal `d.TenantID`. All three call
+// sites select the row with a WHERE clause on the auth-resolved
+// tenant id, so this holds today. If a future caller passes a
+// cross-tenant row (admin override), the body's `tenant_id` and the
+// computed `url` will disagree — don't do that without adapting this
+// mapper first.
 func newStatusResponse(d *domain.Deployment, tenantID, appName string) statusResponse {
 	r := statusResponse{
 		ID:                  d.ID,
@@ -159,6 +167,11 @@ func newStatusResponse(d *domain.Deployment, tenantID, appName string) statusRes
 		r.PreviewID = *d.PreviewID
 	}
 	if d.PreviewPRNumber != nil {
+		// Copy the int so the DTO doesn't share a pointer with the
+		// DB row. The repo pool reuses domain.Deployment values; if
+		// we aliased, a later mutation on the row would silently
+		// change a response already on the wire. Cheaper than a
+		// deep clone because the value is one word.
 		n := *d.PreviewPRNumber
 		r.PreviewPRNumber = &n
 	}

@@ -417,10 +417,18 @@ struct AppListResponse {
 
 /// Wrapper for the paginated deployments response:
 /// `{"items": [...], "total": N, "limit": 20, "offset": 0}`
-/// returned by `GET /api/v1/list/{appName}`. The metadata fields
-/// are accepted but unused by the CLI today — pinning them
-/// defensively in case a future command wants to render "page
-/// 2 of N" without a second round-trip.
+/// returned by `GET /api/v1/list/{appName}`.
+///
+/// Field types mirror the server (Go) side: `total` is signed so a
+/// future "unknown" sentinel can travel as `-1`, while `limit` and
+/// `offset` are unsigned because pagination offsets are always
+/// non-negative.
+///
+/// `#[allow(dead_code)]` covers `total`/`limit`/`offset` — they are
+/// accepted but not rendered by `edge deployments` today. The allow
+/// is intentional: when a future `edge deployments --page N` lands,
+/// the deserializer doesn't need a second round-trip. (see project
+/// audit notes; CLI gap #2 deferred from PR #457)
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DeploymentListResponse {
