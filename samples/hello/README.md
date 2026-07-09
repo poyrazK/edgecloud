@@ -58,6 +58,37 @@ EDGE_API_KEY=... EDGE_API_URL=https://api.edgecloud.dev \
 The CLI prints the deployed URL on its own line (`  URL: <url>`), which
 the preview composite action captures and posts to the originating PR.
 
+### Preview environment flags (issue #308)
+
+`edge deploy --preview` accepts two optional flags the composite action
+forwards automatically:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--pr-number=<N>` | unset | Stamps `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env. The composite action sets this to `${{ github.event.pull_request.number }}`. |
+| `--preview-ttl=<duration>` | `168h` (7d) | Override the per-deploy TTL. The PreviewGCService deletes the row + artifact blob after the deadline passes. |
+
+The sample doesn't read `EDGE_PREVIEW_PR_NUMBER` today — adding it is
+straightforward:
+
+```rust
+// src/lib.rs (excerpt)
+fn handler(req: Request) -> Result<Response, ErrorCode> {
+    let env = process::get_environment();
+    let pr_number = env.into_iter()
+        .find(|(k, _)| k == "EDGE_PREVIEW_PR_NUMBER")
+        .map(|(_, v)| v);
+    // render the response with `pr_number` when set
+    // ...
+}
+```
+
+The guest's `process.get_environment` returns the merged env map
+(declarative app env + runtime-injected vars); `EDGE_PREVIEW_PR_NUMBER`
+is one of the runtime-injected ones, set when the deployment was
+uploaded with `?preview-pr-number=<N>`. Non-preview deploys simply
+don't see the key — branch on presence, not on empty string.
+
 ## Layout
 
 ```
