@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 48 // 24 .up.sql + 24 .down.sql on current main (after 021_add_preview_columns, issue #308)
+const splitFileCount = 54 // 27 .up.sql + 27 .down.sql on current main (after 024_billing_subscriptions_relax_customer_id, issue #419 review)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -87,6 +87,8 @@ var wantTables = []string{
 	"audit_logs",
 	"webhooks",
 	"webhook_deliveries",
+	"billing_subscriptions", // 022 (issue #419)
+	"billing_events",        // 023 (issue #419)
 }
 
 // wantColumns enumerates the public-schema columns each table must
@@ -276,6 +278,27 @@ var wantColumns = map[string][]string{
 		"max_attempts",
 		"created_at",
 		"completed_at",
+	},
+	"billing_subscriptions": { // 022 (issue #419)
+		"tenant_id",
+		"provider",
+		"provider_customer_id",
+		"provider_subscription_id",
+		"plan",
+		"status",
+		"current_period_end",
+		"cancel_at_period_end",
+		"created_at",
+		"updated_at",
+	},
+	"billing_events": { // 023 (issue #419)
+		"event_id",
+		"provider",
+		"event_type",
+		"tenant_id",
+		"received_at",
+		"processed_at",
+		"payload_hash",
 	},
 }
 
@@ -470,6 +493,27 @@ var wantTypes = map[string]map[string]string{
 		"created_at":    "timestamptz",
 		"completed_at":  "timestamptz", // nullable
 	},
+	"billing_subscriptions": { // 022 (issue #419)
+		"tenant_id":                "varchar",     // VARCHAR(64)
+		"provider":                 "varchar",     // VARCHAR(32)
+		"provider_customer_id":     "varchar",     // VARCHAR(128)
+		"provider_subscription_id": "varchar",     // VARCHAR(128), nullable
+		"plan":                     "varchar",     // VARCHAR(32)
+		"status":                   "varchar",     // VARCHAR(32)
+		"current_period_end":       "timestamptz", // nullable
+		"cancel_at_period_end":     "bool",
+		"created_at":               "timestamptz",
+		"updated_at":               "timestamptz",
+	},
+	"billing_events": { // 023 (issue #419)
+		"event_id":     "varchar", // VARCHAR(128)
+		"provider":     "varchar", // VARCHAR(32)
+		"event_type":   "varchar", // VARCHAR(64)
+		"tenant_id":    "varchar", // VARCHAR(64), nullable
+		"received_at":  "timestamptz",
+		"processed_at": "timestamptz", // nullable
+		"payload_hash": "varchar",     // VARCHAR(128)
+	},
 }
 
 // wantNotNull enumerates the columns that must have is_nullable='NO'.
@@ -639,6 +683,24 @@ var wantNotNull = map[string][]string{
 		"created_at",
 		// status_code, completed_at are nullable.
 	},
+	"billing_subscriptions": { // 022 (issue #419); 024 (issue #419 review) relaxed provider_customer_id
+		"tenant_id",
+		"provider",
+		"plan",
+		"status",
+		"cancel_at_period_end",
+		"created_at",
+		"updated_at",
+		// provider_customer_id, provider_subscription_id, current_period_end are nullable.
+	},
+	"billing_events": { // 023 (issue #419)
+		"event_id",
+		"provider",
+		"event_type",
+		"received_at",
+		"payload_hash",
+		// tenant_id, processed_at are nullable.
+	},
 }
 
 // wantIndexes enumerates every CREATE INDEX in the migrations. The
@@ -649,26 +711,28 @@ var wantNotNull = map[string][]string{
 // Update when a migration creates or renames an index. Inline comments
 // reference the migration number where the index was created.
 var wantIndexes = []IndexExpectation{
-	{Table: "deployments", Name: "idx_deployments_tenant_app"},            // 002_add_indexes
-	{Table: "deployments", Name: "idx_deployments_tenant"},                // 002_add_indexes
-	{Table: "workers", Name: "idx_workers_region"},                        // 002_add_indexes
-	{Table: "api_keys", Name: "idx_api_keys_tenant"},                      // 002_add_indexes
-	{Table: "active_deployments", Name: "idx_active_deployments_tenant"},  // 002_add_indexes
-	{Table: "app_env", Name: "idx_app_env_tenant_app"},                    // 002_add_indexes
-	{Table: "workers", Name: "idx_workers_tenant_id"},                     // 003_workers_tenant_id
-	{Table: "apps", Name: "idx_apps_tenant_id"},                           // 004_apps
-	{Table: "logs", Name: "idx_logs_tenant_app_ts"},                       // 005_logs
-	{Table: "logs", Name: "idx_logs_ts"},                                  // 005_logs
-	{Table: "api_keys", Name: "idx_api_keys_lookup_hash"},                 // 006_api_key_lookup_hash
-	{Table: "app_traffic_splits", Name: "idx_ats_tenant_app"},             // 009_traffic_splits
-	{Table: "domains", Name: "idx_domains_tenant_app"},                    // 010_domains
-	{Table: "domains", Name: "idx_domains_fqdn"},                          // 010_domains
-	{Table: "autoscale_events", Name: "idx_autoscale_events_region_time"}, // 012_autoscale_events
-	{Table: "audit_logs", Name: "idx_audit_logs_tenant_created"},          // 014_audit_logs
-	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                // 014_audit_logs
-	{Table: "webhooks", Name: "idx_webhooks_tenant"},                      // 015_webhooks
-	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"}, // 015_webhooks
-	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},    // 021_add_preview_columns (issue #308)
+	{Table: "deployments", Name: "idx_deployments_tenant_app"},                            // 002_add_indexes
+	{Table: "deployments", Name: "idx_deployments_tenant"},                                // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_region"},                                        // 002_add_indexes
+	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                      // 002_add_indexes
+	{Table: "active_deployments", Name: "idx_active_deployments_tenant"},                  // 002_add_indexes
+	{Table: "app_env", Name: "idx_app_env_tenant_app"},                                    // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_tenant_id"},                                     // 003_workers_tenant_id
+	{Table: "apps", Name: "idx_apps_tenant_id"},                                           // 004_apps
+	{Table: "logs", Name: "idx_logs_tenant_app_ts"},                                       // 005_logs
+	{Table: "logs", Name: "idx_logs_ts"},                                                  // 005_logs
+	{Table: "api_keys", Name: "idx_api_keys_lookup_hash"},                                 // 006_api_key_lookup_hash
+	{Table: "app_traffic_splits", Name: "idx_ats_tenant_app"},                             // 009_traffic_splits
+	{Table: "domains", Name: "idx_domains_tenant_app"},                                    // 010_domains
+	{Table: "domains", Name: "idx_domains_fqdn"},                                          // 010_domains
+	{Table: "autoscale_events", Name: "idx_autoscale_events_region_time"},                 // 012_autoscale_events
+	{Table: "audit_logs", Name: "idx_audit_logs_tenant_created"},                          // 014_audit_logs
+	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                                // 014_audit_logs
+	{Table: "webhooks", Name: "idx_webhooks_tenant"},                                      // 015_webhooks
+	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"},                 // 015_webhooks
+	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
+	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
+	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -710,6 +774,9 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 	},
 	"apps": {
 		{"apps_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id)"},
+	},
+	"billing_subscriptions": { // 022 (issue #419)
+		{"billing_subscriptions_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
 	},
 	"deployments": {
 		{"deployments_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
@@ -785,6 +852,14 @@ var wantDefaults = map[string]map[string]string{
 		"resource_id": "''::text",              // 014
 		"role":        "''::character varying", // 014
 		"tenant_id":   "''::character varying", // 014
+	},
+	"billing_subscriptions": { // 022 (issue #419)
+		"cancel_at_period_end": "false", // 022
+		"created_at":           "now()", // 022
+		"updated_at":           "now()", // 022
+	},
+	"billing_events": { // 023 (issue #419)
+		"received_at": "now()", // 023
 	},
 	"deployments": {
 		"auto_rollback_enabled": "false",            // 009

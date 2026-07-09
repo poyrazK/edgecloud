@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/autoscale"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/noop"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/stripe"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -62,7 +65,7 @@ type App struct {
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
-// It instantiates all 11 repositories, 12 services, 16 handlers, middleware,
+// It instantiates all 13 repositories, 14 services, 18 handlers, middleware,
 // and registers every route on a single http.Handler.
 func New(
 	cfg *config.Config,
@@ -84,6 +87,8 @@ func New(
 	logEntryRepo := repository.NewLogEntryRepository(db)
 	domainRepo := repository.NewDomainRepository(db)
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
+	// Billing (issue #419): billing_subscriptions + billing_events.
+	billingRepo := repository.NewBillingRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -168,6 +173,18 @@ func New(
 	webhookSvc := service.NewWebhookService(webhookRepo)
 	deploymentSvc.SetWebhookService(webhookSvc)
 	webhookHandler := handler.NewWebhookHandler(webhookSvc)
+
+	// Billing service (issue #419). The provider is selected by
+	// cfg.Billing.Provider; validateBillingConfig has already
+	// enforced presence of the required credentials. The factory
+	// pattern keeps stripe-go scoped to its sub-package — only
+	// app.go's import graph knows about both providers.
+	billingProvider := newBillingProvider(cfg.Billing)
+	billingSvc := billing.NewService(
+		db, billingRepo, billingProvider, tenantSvc,
+		cfg.Billing.SuccessURL, cfg.Billing.CancelURL,
+	)
+	billingHandler := handler.NewBillingHandler(billingSvc)
 
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
@@ -404,6 +421,13 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("PUT /api/v1/webhooks/{webhookID}", webhookHandler.Update)
 	api.HandleFunc("DELETE /api/v1/webhooks/{webhookID}", webhookHandler.Delete)
 
+	// Billing routes (issue #419). Three are auth-required; the
+	// webhook below is mounted on the public mux because the
+	// provider's VerifyWebhook checks the signature inline.
+	api.HandleFunc("POST /api/v1/billing/checkout", billingHandler.StartCheckout)
+	api.HandleFunc("POST /api/v1/billing/portal", billingHandler.OpenPortal)
+	api.HandleFunc("GET /api/v1/billing/subscription", billingHandler.GetSubscription)
+
 	// Admin routes (require owner role)
 	admin := http.NewServeMux()
 	admin.HandleFunc("GET /api/v1/admin/tenants", tenantHandler.List)
@@ -494,6 +518,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 			),
 		)
 	}
+
+	// Billing webhook (issue #419): no auth middleware — the provider
+	// verifies the signature inline. Mirrors the bootstrap mount
+	// above. Public surface; protected only by the webhook secret
+	// configured under billing.stripe.webhook_secret.
+	mux.HandleFunc("POST /api/v1/billing/webhook", billingHandler.StripeWebhook)
 
 	// /api/internal/download is mounted under a separate middleware
 	// chain that accepts either a worker JWT OR an X-Internal-Token header.
@@ -650,4 +680,28 @@ func loadKeyring(cfg *config.SigningConfig) (*signing.Keyring, error) {
 		return nil, err
 	}
 	return signing.KeyringFromSigner(s, signing.DefaultKeyID), nil
+}
+
+// newBillingProvider returns the BillingProvider implementation
+// selected by cfg.Billing.Provider. validateBillingConfig has
+// already enforced the per-provider prerequisites; here we just
+// translate the config block into a typed provider.
+//
+// Adding a new provider = append a new case here + add a new
+// sub-package under internal/billing/<name>/. The interface
+// boundary means no service / handler code changes.
+func newBillingProvider(cfg config.BillingConfig) billing.BillingProvider {
+	switch cfg.Provider {
+	case "stripe":
+		return stripe.New(billing.StripeConfig{
+			SecretKey:      cfg.Stripe.SecretKey,
+			WebhookSecret:  cfg.Stripe.WebhookSecret,
+			PublishableKey: cfg.Stripe.PublishableKey,
+			PriceIDs:       cfg.Stripe.PriceIDs,
+		})
+	default:
+		// "noop" or empty (defaulted to "noop" by validateBillingConfig
+		// in dev|test environments).
+		return noop.New()
+	}
 }

@@ -546,3 +546,212 @@ storage:
 		t.Errorf("error %q should mention 'STORAGE_S3_PATH_STYLE'", err.Error())
 	}
 }
+
+// TestLoad_Billing_NoopInDev_Accepted: the default-empty provider
+// defaults to "noop" and is allowed when app.env is dev.
+func TestLoad_Billing_NoopInDev_Accepted(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "")
+	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "")
+
+	body := `
+app:
+  env: dev
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Billing.Provider != "noop" {
+		t.Errorf("Billing.Provider = %q, want noop (defaulted)", cfg.Billing.Provider)
+	}
+}
+
+// TestLoad_Billing_NoopInTest_Accepted: noop is also accepted in
+// test environment (CI runs the binary with app.env=test).
+func TestLoad_Billing_NoopInTest_Accepted(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "")
+	body := `
+app:
+  env: test
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Billing.Provider != "noop" {
+		t.Errorf("Billing.Provider = %q, want noop (defaulted)", cfg.Billing.Provider)
+	}
+}
+
+// TestLoad_Billing_NoopInProd_Rejected: a noop provider in
+// production would silently accept every checkout as "succeeded"
+// without ever taking payment. Fail-closed.
+func TestLoad_Billing_NoopInProd_Rejected(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "")
+	body := `
+app:
+  env: production
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for noop in production, got nil")
+	}
+	if !strings.Contains(err.Error(), "noop") {
+		t.Errorf("error %q should mention 'noop'", err.Error())
+	}
+}
+
+// TestLoad_Billing_Stripe_MissingSecretKey: stripe without a
+// secret_key is a hard fail — Deploy would issue unsigned artifacts
+// and the webhook verifier would reject every delivery.
+func TestLoad_Billing_Stripe_MissingSecretKey(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
+	t.Setenv("STRIPE_PRICE_ID_PRO", "price_pro")
+	t.Setenv("STRIPE_PRICE_ID_BUSINESS", "price_biz")
+	t.Setenv("STRIPE_PRICE_ID_ENTERPRISE", "price_ent")
+	body := `
+app:
+  env: production
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for stripe without secret_key, got nil")
+	}
+	if !strings.Contains(err.Error(), "secret_key") {
+		t.Errorf("error %q should mention 'secret_key'", err.Error())
+	}
+}
+
+// TestLoad_Billing_Stripe_MissingWebhookSecret: stripe without a
+// webhook_secret means the verifier can't check signatures and
+// every delivery would 400. Hard fail.
+func TestLoad_Billing_Stripe_MissingWebhookSecret(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_abc")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "")
+	t.Setenv("STRIPE_PRICE_ID_PRO", "price_pro")
+	t.Setenv("STRIPE_PRICE_ID_BUSINESS", "price_biz")
+	t.Setenv("STRIPE_PRICE_ID_ENTERPRISE", "price_ent")
+	body := `
+app:
+  env: production
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for stripe without webhook_secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "webhook_secret") {
+		t.Errorf("error %q should mention 'webhook_secret'", err.Error())
+	}
+}
+
+// TestLoad_Billing_Stripe_MissingPriceIDs: every paid plan must
+// have a price_id. "free" is exempt because the checkout handler
+// rejects it before any merchant call.
+func TestLoad_Billing_Stripe_MissingPriceIDs(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_abc")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
+	t.Setenv("STRIPE_PRICE_ID_PRO", "price_pro")
+	// business and enterprise deliberately missing.
+	t.Setenv("STRIPE_PRICE_ID_BUSINESS", "")
+	t.Setenv("STRIPE_PRICE_ID_ENTERPRISE", "")
+	body := `
+app:
+  env: production
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for missing price_ids, got nil")
+	}
+	if !strings.Contains(err.Error(), "price_ids") {
+		t.Errorf("error %q should mention 'price_ids'", err.Error())
+	}
+}
+
+// TestLoad_Billing_Stripe_FullyConfigured_Accepted: the happy
+// path — every required field set, validator passes.
+func TestLoad_Billing_Stripe_FullyConfigured_Accepted(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "stripe")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_abc")
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_test")
+	t.Setenv("STRIPE_PUBLISHABLE_KEY", "pk_test_abc")
+	t.Setenv("STRIPE_PRICE_ID_PRO", "price_pro")
+	t.Setenv("STRIPE_PRICE_ID_BUSINESS", "price_biz")
+	t.Setenv("STRIPE_PRICE_ID_ENTERPRISE", "price_ent")
+	body := `
+app:
+  env: production
+billing:
+  provider: stripe
+  success_url: https://app.example.com/billing/success
+  cancel_url: https://app.example.com/billing/cancel
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Billing.Provider != "stripe" {
+		t.Errorf("Billing.Provider = %q, want stripe", cfg.Billing.Provider)
+	}
+	if cfg.Billing.Stripe.SecretKey != "sk_test_abc" {
+		t.Errorf("Billing.Stripe.SecretKey = %q, want sk_test_abc", cfg.Billing.Stripe.SecretKey)
+	}
+	if got := cfg.Billing.Stripe.PriceIDs["pro"]; got != "price_pro" {
+		t.Errorf("PriceIDs[pro] = %q, want price_pro", got)
+	}
+	if cfg.Billing.SuccessURL != "https://app.example.com/billing/success" {
+		t.Errorf("SuccessURL = %q", cfg.Billing.SuccessURL)
+	}
+}
+
+// TestLoad_Billing_UnknownProvider_Rejected: a typo in the
+// provider name should not silently fall through to noop.
+func TestLoad_Billing_UnknownProvider_Rejected(t *testing.T) {
+	t.Setenv("BILLING_PROVIDER", "stripes") // typo
+	body := `
+app:
+  env: dev
+` + validBaseYAML(t)
+	path := writeConfig(t, body)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for unknown provider, got nil")
+	}
+	if !strings.Contains(err.Error(), "not recognized") {
+		t.Errorf("error %q should mention 'not recognized'", err.Error())
+	}
+}
+
+// validBaseYAML returns a YAML string with the minimum fields every
+// Load() call needs: a non-empty JWT secret and a signing key
+// (the latter is wired via t.Setenv, not YAML). Used by the
+// billing tests to keep the per-test YAML focused on the field
+// under test.
+func validBaseYAML(t *testing.T) string {
+	t.Helper()
+	return `
+jwt:
+  secret: "` + validSecret + `"
+  ttl_hours: 24
+  issuer: edgecloud
+`
+}
