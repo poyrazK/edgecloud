@@ -14,17 +14,27 @@ type mockArtifactStoreForCache struct {
 	openFn func(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error)
 }
 
-func (m *mockArtifactStoreForCache) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error { return nil }
+func (m *mockArtifactStoreForCache) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
+	return nil
+}
 func (m *mockArtifactStoreForCache) Open(ctx context.Context, tenantID, appName, deploymentID string) (io.ReadCloser, error) {
 	if m.openFn != nil {
 		return m.openFn(ctx, tenantID, appName, deploymentID)
 	}
 	return io.NopCloser(strings.NewReader("wasm")), nil
 }
-func (m *mockArtifactStoreForCache) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) { return nil, nil }
-func (m *mockArtifactStoreForCache) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error { return nil }
-func (m *mockArtifactStoreForCache) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) { return nil, nil }
-func (m *mockArtifactStoreForCache) Delete(ctx context.Context, tenantID, appName, deploymentID string) error { return nil }
+func (m *mockArtifactStoreForCache) SaveAndHash(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) ([]byte, error) {
+	return nil, nil
+}
+func (m *mockArtifactStoreForCache) SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error {
+	return nil
+}
+func (m *mockArtifactStoreForCache) OpenFormat(ctx context.Context, tenantID, appName, deploymentID, format string) (io.ReadCloser, error) {
+	return nil, nil
+}
+func (m *mockArtifactStoreForCache) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
+	return nil
+}
 
 func TestNewHTTPArtifactCachePusher_HasTimeout(t *testing.T) {
 	p := NewHTTPArtifactCachePusher(&mockArtifactStoreForCache{}, "token")

@@ -11,6 +11,7 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -505,5 +506,125 @@ func TestDeploy_MultipartMissingFile_Returns400(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "'file' part") {
 		t.Errorf("body = %q, want it to mention the missing 'file' part", rr.Body.String())
+	}
+}
+
+// ── parsePreviewOpts (issue #308) ───────────────────────────────────────
+//
+// Unit tests for the preview query-param parser. We exercise it
+// directly rather than going through the full Deploy handler so the
+// assertion space stays narrow and the failure mode ("which input
+// produced this error?") is obvious.
+
+func TestParsePreviewOpts_AllEmpty_ReturnsNil(t *testing.T) {
+	// No preview-id, no pr-number, no ttl → not a preview deploy.
+	// Caller treats nil as "no preview" and the rest of Deploy
+	// proceeds identically to the pre-#308 code path.
+	got, err := parsePreviewOpts("", "", "")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != nil {
+		t.Errorf("opts = %+v, want nil", got)
+	}
+}
+
+func TestParsePreviewOpts_OnlyID_NoPRNumber_NoTTL(t *testing.T) {
+	// preview-id alone is allowed — the CLI mints this for a
+	// laptop `edge deploy --preview` where there's no GitHub PR
+	// context. The TTL falls back to PreviewDefaultTTL (7 days).
+	got, err := parsePreviewOpts("abcd1234", "", "")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got == nil {
+		t.Fatal("opts = nil, want non-nil")
+	}
+	if got.PreviewID != "abcd1234" {
+		t.Errorf("PreviewID = %q, want %q", got.PreviewID, "abcd1234")
+	}
+	if got.PreviewPRNumber != nil {
+		t.Errorf("PreviewPRNumber = %v, want nil", *got.PreviewPRNumber)
+	}
+	// Default TTL: the handler resolves to a future time, so we
+	// just assert it's roughly 7d from now.
+	if d := time.Until(got.ExpiresAt); d < 6*24*time.Hour || d > 8*24*time.Hour {
+		t.Errorf("ExpiresAt is %v from now, want roughly 7 days", d)
+	}
+}
+
+func TestParsePreviewOpts_FullParams(t *testing.T) {
+	got, err := parsePreviewOpts("abcd1234", "123", "24h")
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got.PreviewID != "abcd1234" {
+		t.Errorf("PreviewID = %q, want %q", got.PreviewID, "abcd1234")
+	}
+	if got.PreviewPRNumber == nil || *got.PreviewPRNumber != 123 {
+		t.Errorf("PreviewPRNumber = %v, want Some(123)", got.PreviewPRNumber)
+	}
+	// 24h ttl: assert it's in (23h, 25h) to allow clock skew.
+	if d := time.Until(got.ExpiresAt); d < 23*time.Hour || d > 25*time.Hour {
+		t.Errorf("ExpiresAt is %v from now, want ~24h", d)
+	}
+}
+
+func TestParsePreviewOpts_InvalidIDFormat_ReturnsErr(t *testing.T) {
+	// preview-id must be 8..16 lowercase hex chars. The handler
+	// rejects non-conforming input before any DB writes — a
+	// malformed id is the cheapest of the failure modes (no
+	// row created, no blob stored, no preview allocated).
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"too short", "abc"},
+		{"too long", "abcdef01234567890"},
+		{"uppercase", "ABCD1234"},
+		{"non-hex chars", "abcd123g"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parsePreviewOpts(tc.id, "", "")
+			if err == nil {
+				t.Errorf("id=%q: err = nil, want non-nil", tc.id)
+			}
+		})
+	}
+}
+
+func TestParsePreviewOpts_InvalidPRNumber_ReturnsErr(t *testing.T) {
+	// Negative pr-number is rejected. The composite action
+	// forwards `${{ github.event.pull_request.number }}` which is
+	// always >= 1; a negative value means a CLI bug or a
+	// curl-based caller.
+	_, err := parsePreviewOpts("abcd1234", "-1", "")
+	if err == nil {
+		t.Errorf("err = nil, want non-nil")
+	}
+}
+
+func TestParsePreviewOpts_InvalidTTL_ReturnsErr(t *testing.T) {
+	// Negative ttl (or zero) is rejected — both are foot-guns
+	// that would expire the preview immediately.
+	_, err := parsePreviewOpts("abcd1234", "", "-1h")
+	if err == nil {
+		t.Errorf("err = nil, want non-nil")
+	}
+	_, err = parsePreviewOpts("abcd1234", "", "0s")
+	if err == nil {
+		t.Errorf("err = nil, want non-nil (0s)")
+	}
+}
+
+func TestParsePreviewOpts_PRNumberWithoutID_ReturnsErr(t *testing.T) {
+	// preview-pr-number without preview-id is meaningless: the
+	// pr-number is metadata for a preview that doesn't exist.
+	// Reject so a CLI bug surfaces immediately rather than as
+	// confusing stored-row metadata.
+	_, err := parsePreviewOpts("", "123", "")
+	if err == nil {
+		t.Errorf("err = nil, want non-nil")
 	}
 }

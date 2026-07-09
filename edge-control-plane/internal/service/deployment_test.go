@@ -32,27 +32,39 @@ type mockDeployDeploymentRepo struct {
 
 func (m *mockDeployDeploymentRepo) WithTx(tx *sqlx.Tx) *repository.DeploymentRepository { return nil }
 func (m *mockDeployDeploymentRepo) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
-	if m.getByIDFn != nil { return m.getByIDFn(ctx, id) }
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, id)
+	}
 	return nil, nil
 }
 func (m *mockDeployDeploymentRepo) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
-	if m.listByAppFn != nil { return m.listByAppFn(ctx, tenantID, appName) }
+	if m.listByAppFn != nil {
+		return m.listByAppFn(ctx, tenantID, appName)
+	}
 	return nil, nil
 }
 func (m *mockDeployDeploymentRepo) CountByApp(ctx context.Context, tenantID, appName string) (int, error) {
-	if m.countByAppFn != nil { return m.countByAppFn(ctx, tenantID, appName) }
+	if m.countByAppFn != nil {
+		return m.countByAppFn(ctx, tenantID, appName)
+	}
 	return 0, nil
 }
 func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
-	if m.listByAppPaginatedFn != nil { return m.listByAppPaginatedFn(ctx, tenantID, appName, limit, offset) }
+	if m.listByAppPaginatedFn != nil {
+		return m.listByAppPaginatedFn(ctx, tenantID, appName, limit, offset)
+	}
 	return nil, nil
 }
 func (m *mockDeployDeploymentRepo) Create(ctx context.Context, deployment *domain.Deployment) error {
-	if m.createFn != nil { return m.createFn(ctx, deployment) }
+	if m.createFn != nil {
+		return m.createFn(ctx, deployment)
+	}
 	return nil
 }
 func (m *mockDeployDeploymentRepo) DeleteByID(ctx context.Context, id string) error {
-	if m.deleteByIDFn != nil { return m.deleteByIDFn(ctx, id) }
+	if m.deleteByIDFn != nil {
+		return m.deleteByIDFn(ctx, id)
+	}
 	return nil
 }
 
@@ -63,19 +75,35 @@ type mockDeployActiveRepo struct {
 
 func (m *mockDeployActiveRepo) WithTx(tx *sqlx.Tx) *repository.ActiveDeploymentRepository { return nil }
 func (m *mockDeployActiveRepo) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
-	if m.getFn != nil { return m.getFn(ctx, tenantID, appName) }
+	if m.getFn != nil {
+		return m.getFn(ctx, tenantID, appName)
+	}
 	return nil, nil
 }
-func (m *mockDeployActiveRepo) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) { return nil, nil }
-func (m *mockDeployActiveRepo) Set(ctx context.Context, ad *domain.ActiveDeployment) error { return nil }
-func (m *mockDeployActiveRepo) ClearStableSince(ctx context.Context, tenantID, appName string) error { return nil }
+func (m *mockDeployActiveRepo) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
+	return nil, nil
+}
+func (m *mockDeployActiveRepo) Set(ctx context.Context, ad *domain.ActiveDeployment) error {
+	return nil
+}
+func (m *mockDeployActiveRepo) ClearStableSince(ctx context.Context, tenantID, appName string) error {
+	return nil
+}
 func (m *mockDeployActiveRepo) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
-	if m.listByTenantFn != nil { return m.listByTenantFn(ctx, tenantID) }
+	if m.listByTenantFn != nil {
+		return m.listByTenantFn(ctx, tenantID)
+	}
 	return nil, nil
 }
-func (m *mockDeployActiveRepo) AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
-func (m *mockDeployActiveRepo) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error { return nil }
-func (m *mockDeployActiveRepo) AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error { return nil }
+func (m *mockDeployActiveRepo) AppendRegionsPublished(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error {
+	return nil
+}
+func (m *mockDeployActiveRepo) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error {
+	return nil
+}
+func (m *mockDeployActiveRepo) AppendRegionsCacheState(ctx context.Context, tenantID, appName string, succeeded, failed []string, ts time.Time) error {
+	return nil
+}
 
 // newDeploymentMockDB wires a sqlmock-backed *sqlx.DB for deployment tests.
 func newDeploymentMockDB(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
@@ -133,7 +161,7 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0, nil)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", bad, nil, false, 0, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-wasm bytes, got nil")
 	}
@@ -177,7 +205,7 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
+	dep, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}
@@ -258,6 +286,7 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		false,
 		0,
 		nil,
+		nil, // previewOpts
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid region, got nil")
@@ -291,6 +320,7 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		false,
 		0,
 		nil,
+		nil, // previewOpts
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -331,6 +361,7 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		false,
 		0,
 		nil,
+		nil, // previewOpts
 	)
 	if err == nil {
 		t.Fatal("expected error for over-cap regions, got nil")
@@ -386,6 +417,7 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		false,
 		0,
 		nil,
+		nil, // previewOpts
 	)
 	if err != nil {
 		t.Fatalf("Deploy at cap: %v", err)
@@ -440,7 +472,7 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil, nil)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
@@ -512,7 +544,7 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 	}
 
 	good := bytes.NewReader(validWasmBytes)
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil)
+	_, err := svc.Deploy(context.Background(), "t_test", "myapp", good, nil, false, 0, nil, nil)
 	if err == nil {
 		t.Fatal("expected Deploy to fail when artifact save fails")
 	}
@@ -556,7 +588,7 @@ func TestDeploy_PersistsSignedAttestation(t *testing.T) {
 
 	good := bytes.NewReader(validWasmBytes)
 	dep, err := svc.Deploy(context.Background(), "t_test", "myapp",
-		good, nil, false, 0, nil)
+		good, nil, false, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
 	}

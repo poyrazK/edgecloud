@@ -239,6 +239,8 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 				dep.Hash,
 				dep.Signature,    // issue #307
 				dep.SigningKeyID, // issue #307 PR1: per-key kid
+				"",               // issue #308: preview_id — RepublishActiveDeployments only fires for production actives, never previews
+				0,                // issue #308: preview_pr_number — same reasoning as preview_id
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
@@ -355,6 +357,8 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 				primaryHash,
 				routes[0].DeploymentSignature, // primary signature (issue #307)
 				primarySigningKeyID,           // issue #307 PR1: per-key kid
+				"",                            // issue #308: preview_id — canary splits are production-only by design
+				0,                             // issue #308: preview_pr_number — same reasoning as preview_id
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,

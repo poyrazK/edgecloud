@@ -56,12 +56,30 @@ type AppConfig struct {
 	// falls back to the default key. Omitted from the wire when
 	// empty so pre-PR1 workers silently ignore it (the field is
 	// additive and backward-compatible).
-	SigningKeyID string            `json:"signing_key_id,omitempty"`
-	Routes       []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
-	Env          map[string]string `json:"env"`
-	Allowlist    []string          `json:"allowlist"`
-	MaxMemoryMB  int               `json:"max_memory_mb"`
-	CpuBudgetMS  int               `json:"cpu_budget_ms"`
+	SigningKeyID string `json:"signing_key_id,omitempty"`
+	// PreviewID is the hex suffix the CLI (or server, as a fallback)
+	// minted when this deployment was uploaded as a preview
+	// (issue #308). The worker reads it and forwards it to
+	// edge-runtime::RuntimeState so the per-tenant persistent stores
+	// (KV/cache/scheduling) get a `/preview-{id}/` subdirectory —
+	// preventing two concurrent previews of the same app from
+	// trampling each other's keys. Empty for non-preview deploys;
+	// omitted from the wire when empty so pre-#308 workers
+	// silently ignore it.
+	PreviewID string `json:"preview_id,omitempty"`
+	// PreviewPRNumber is the integer GitHub PR number the composite
+	// action forwards via ?preview-pr-number=. The worker reads it
+	// and stamps `EDGE_PREVIEW_PR_NUMBER=<n>` into the guest env
+	// so the guest can render PR-aware UI. Zero for non-preview
+	// deploys or for `edge deploy --preview` from a laptop
+	// (no PR linkage); omitted from the wire when zero so
+	// pre-#308 workers ignore it.
+	PreviewPRNumber int               `json:"preview_pr_number,omitempty"`
+	Routes          []DeploymentRoute `json:"routes,omitempty"` // populated when canary splits are active
+	Env             map[string]string `json:"env"`
+	Allowlist       []string          `json:"allowlist"`
+	MaxMemoryMB     int               `json:"max_memory_mb"`
+	CpuBudgetMS     int               `json:"cpu_budget_ms"`
 }
 
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
@@ -160,6 +178,8 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 // dropped from the wire so pre-PR1 workers ignore it.
 func BuildAppConfig(
 	deploymentID, deploymentHash, deploymentSignature, signingKeyID string,
+	previewID string,
+	previewPRNumber int,
 	env map[string]string,
 	allowlist []string,
 	maxMemoryMB int,
@@ -170,6 +190,8 @@ func BuildAppConfig(
 		DeploymentHash:      deploymentHash,
 		DeploymentSignature: deploymentSignature,
 		SigningKeyID:        signingKeyID,
+		PreviewID:           previewID,
+		PreviewPRNumber:     previewPRNumber,
 		Env:                 env,
 		Allowlist:           allowlist,
 		MaxMemoryMB:         maxMemoryMB,
