@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::{ingress_host, Config};
+use crate::quota::QuotaCache;
 use crate::ratelimit::RateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry};
 use crate::traffic::TrafficSplitCache;
@@ -306,6 +307,7 @@ pub fn render_routes(
     cfg: &Config,
     traffic_cache: &TrafficSplitCache,
     rate_limit_cache: &RateLimitCache,
+    quota_cache: &QuotaCache,
 ) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
@@ -320,6 +322,20 @@ pub fn render_routes(
     // Sort groups by (tenant_id, app_name) for deterministic output.
     let mut group_keys: Vec<_> = groups.keys().collect();
     group_keys.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+
+    // Issue #420: snapshot the over-cap tenant set once at the top so the
+    // `routes` iterator below stays pure. We use it to (a) prepend a
+    // tenant-wide `static_response` 402 block in front of every host route
+    // for that tenant, and (b) skip FQDN rendering for tenants in the set
+    // (the 402 block above also covers the FQDN since the FQDN is bound
+    // to a (tenant, app) tuple that has its own host route — but we
+    // additionally render a wildcard 402 to be safe for tenants with
+    // FQDNs that don't appear in the snapshot).
+    let over_cap_tenants: std::collections::HashSet<&str> = group_keys
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| quota_cache.is_over_cap(t))
+        .collect();
 
     let mut routes: Vec<Value> = group_keys
         .iter()
@@ -424,6 +440,56 @@ pub fn render_routes(
         })
         .collect();
 
+    // Issue #420 — quota enforcement at the edge. For each tenant that
+    // the quota cache reports as over cap, prepend a tenant-wide
+    // `static_response` 402 route. Caddy's matcher picks the first
+    // terminal route that matches, so any host route under this tenant
+    // short-circuits with 402 + Retry-After:3600 BEFORE the
+    // reverse_proxy ever fires. We generate one tenant-wide block
+    // (matched by host suffix on the `*.edgecloud.dev` wildcard cert)
+    // rather than per-host blocks to avoid duplication — the
+    // subroute under it covers all apps for the tenant.
+    //
+    // Fail-open semantics: when the quota cache has no entry for a
+    // tenant (cache cold-start or transient CP outage), `is_over_cap`
+    // returns false and we do NOT inject the 402 — the previous
+    // (no-quota-block) Caddy config is preserved.
+    //
+    // For FQDN-bound tenants, the 402 block needs to match the FQDN
+    // string, not the synthetic host. We render a per-tenant FQDN 402
+    // block below when iterating `fqdns`. The synthetic-host 402
+    // above covers traffic to `<tenant>-<app>.edgecloud.dev`.
+    let mut quota_402_routes: Vec<Value> = Vec::new();
+    for tenant_id in &over_cap_tenants {
+        quota_402_routes.push(json!({
+            "@id": format!("{}:quota-402-synthetic", tenant_id),
+            // Tenant id is `t_<slug>` (e.g. `t_acme`) and only
+            // contains `[a-z0-9_]` per the control-plane validation
+            // (see `validatePathComponent`). The synthetic host
+            // pattern is `<tenant>-<app>.edgecloud.dev`. Caddy's
+            // `host_regexp` uses RE2; we anchor with `^` and `$`
+            // to avoid matching unrelated tenants. We place this
+            // block BEFORE the per-host reverse_proxy routes (see
+            // `routes.prepend` below) so it short-circuits first.
+            "match": [{
+                "host_regexp": format!(
+                    "^{}-[^.]+\\.{}$",
+                    tenant_id,
+                    crate::config::INGRESS_HOST_SUFFIX,
+                )
+            }],
+            "handle": [{
+                "handler": "static_response",
+                "status_code": 402,
+                "body": "Payment Required",
+                "headers": {
+                    "Retry-After": ["3600"]
+                }
+            }],
+            "terminal": true
+        }));
+    }
+
     // Build a (tenant, app) → upstream lookup from the by_app snapshot.
     // The FQDN map carries no upstream info by design; we resolve at
     // render time. See the routing.rs module-level doc comment for why.
@@ -436,6 +502,11 @@ pub fn render_routes(
             )
         })
         .collect();
+
+    // Prepend the synthetic-host 402 blocks. They are terminal and
+    // listed first so Caddy's route matcher short-circuits them
+    // before evaluating per-app reverse_proxy routes below.
+    routes = quota_402_routes.into_iter().chain(routes).collect();
 
     // Build a (tenant, app) → rate limit lookup for FQDN routes.
     let rate_limit_index: HashMap<(String, String), (u32, u32)> = entries
@@ -466,6 +537,31 @@ pub fn render_routes(
         else {
             continue;
         };
+
+        // Issue #420 — quota 402 for FQDN routes. The synthetic-host
+        // 402 block above does NOT match custom FQDNs (the host_regexp
+        // is anchored to `<tenant>-<app>.edgecloud.dev`). When the
+        // tenant is over cap, emit a per-FQDN 402 block in place of
+        // the reverse_proxy and `continue` so we don't also emit a
+        // dead reverse_proxy. Caddy's route-list order makes the
+        // 402 the first match for this host.
+        if over_cap_tenants.contains(b.tenant_id.as_str()) {
+            routes.push(json!({
+                "@id": format!("{}:quota-402-fqdn", b.fqdn),
+                "match": [{"host": [b.fqdn.clone()]}],
+                "handle": [{
+                    "handler": "static_response",
+                    "status_code": 402,
+                    "body": "Payment Required",
+                    "headers": {
+                        "Retry-After": ["3600"]
+                    }
+                }],
+                "terminal": true,
+                "tls": {"on_demand": {}}
+            }));
+            continue;
+        }
 
         // Resolve rate limit for this FQDN route.
         // Priority: per-app cache entry > RouteEntry field > Config default.
@@ -730,6 +826,14 @@ mod tests {
         RateLimitCache::default()
     }
 
+    /// Default `QuotaCache` for tests: no tenants over cap, so the
+    /// renderer does NOT inject any 402 `static_response` blocks. Tests
+    /// that want to exercise the 402 path construct a populated cache
+    /// directly.
+    fn test_quota_cache() -> crate::quota::QuotaCache {
+        crate::quota::QuotaCache::default()
+    }
+
     fn entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
         RouteEntry {
             tenant_id: tenant.to_string(),
@@ -800,6 +904,7 @@ mod tests {
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
+            quota_fetch_interval: Duration::from_secs(30),
             stale_timeout: Duration::from_secs(60),
             prune_interval: Duration::from_secs(30),
             health_check_interval: Duration::from_secs(10),
@@ -813,7 +918,7 @@ mod tests {
     fn render_empty_table_still_emits_servers_and_tls() {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
         assert!(servers.contains_key(SERVER_NAME_HTTP));
@@ -831,7 +936,8 @@ mod tests {
     fn wildcard_cert_takes_precedence_over_auto_tls() {
         let cache = TrafficSplitCache::default();
         let rl_cache = test_rate_limit_cache();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache);
+        let q_cache = test_quota_cache();
+        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
         // Caddy 2.11 removed the `app.http.automatic_https` field.
         // The wildcard cert in `tls.certificates.load_files` takes
         // precedence automatically — no need to disable auto-TLS.
@@ -846,7 +952,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let mut cfg = test_cfg();
         cfg.caddy_admin_listen = "0.0.0.0:2019".into();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         assert_eq!(
             cfg_json["admin"]["listen"], "0.0.0.0:2019",
             "render_routes must include admin.listen matching Config so \
@@ -863,7 +969,7 @@ mod tests {
             entry("t_acme", "web", "1.2.3.4", 8082),
             entry("t_globex", "api", "5.6.7.8", 9000),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -906,7 +1012,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 95),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 5),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -941,7 +1047,7 @@ mod tests {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
         let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         assert_eq!(upstreams.as_array().unwrap().len(), 1);
@@ -959,7 +1065,7 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.http_to_https = false;
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
@@ -975,7 +1081,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 0),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -1011,7 +1117,7 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -1039,7 +1145,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1073,7 +1179,7 @@ mod tests {
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         // FQDN binding is for t_other/web but the entries only have t_acme/api.
         let bindings = vec![fqdn("t_other", "web", "web.example.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1088,7 +1194,8 @@ mod tests {
     fn default_only_mode_omits_on_demand_ask_url() {
         let cache = TrafficSplitCache::default();
         let rl_cache = test_rate_limit_cache();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache);
+        let q_cache = test_quota_cache();
+        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
         assert!(
             cfg_json["apps"]["tls"].get("automation").is_none(),
             "no automation block when control_plane_url is empty"
@@ -1102,7 +1209,7 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.control_plane_url = "http://control-plane:8080".into();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         assert_eq!(
             cfg_json["apps"]["tls"]["automation"]["on_demand"]["ask"],
             "http://control-plane:8080/api/internal/tls-allowed"
@@ -1121,7 +1228,7 @@ mod tests {
             fqdn("t_acme", "api", "alpha.example.com"),
             fqdn("t_acme", "api", "mike.example.com"),
         ];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1150,7 +1257,7 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache());
+        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1178,7 +1285,7 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(),
+            &test_rate_limit_cache(), &test_quota_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1217,7 +1324,7 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(),
+            &test_rate_limit_cache(), &test_quota_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1244,7 +1351,7 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(),
+            &test_rate_limit_cache(), &test_quota_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert_eq!(server["max_conns"], 1000);
@@ -1263,7 +1370,7 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(),
+            &test_rate_limit_cache(), &test_quota_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert!(
