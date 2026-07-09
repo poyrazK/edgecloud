@@ -2497,6 +2497,20 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The tenant is currently disabled (issue #440). Activations
+             *     are rejected until the tenant is re-enabled via the admin
+             *     endpoint or the quota-billing cycle resets. Distinct from
+             *     any future 409 returned for canary-state conflicts.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2528,6 +2542,19 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description The tenant is currently disabled (issue #440). Promotions
+             *     are rejected until the tenant is re-enabled via the admin
+             *     endpoint or the quota-billing cycle resets.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2555,9 +2582,13 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             /**
-             * @description No prior `last_good_deployment_id` is recorded for this app,
-             *     so there is nothing to roll back to. Returned when the app
-             *     has only ever had one deployment.
+             * @description No prior `last_good_deployment_id` is recorded for this
+             *     app, so there is nothing to roll back to. Returned when the
+             *     app has only ever had one deployment.
+             *
+             *     Also returned when the tenant is currently disabled
+             *     (issue #440); re-enable via the admin endpoint (or wait
+             *     for the quota-billing cycle to reset) and retry.
              */
             409: {
                 headers: {
