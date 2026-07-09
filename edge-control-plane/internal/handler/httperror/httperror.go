@@ -17,6 +17,7 @@ const (
 	CodeNotFound           ErrorCode = "NOT_FOUND"
 	CodeConflict           ErrorCode = "CONFLICT"
 	CodeQuotaExceeded      ErrorCode = "QUOTA_EXCEEDED"
+	CodePaymentRequired    ErrorCode = "PAYMENT_REQUIRED"
 	CodeInternalError      ErrorCode = "INTERNAL_ERROR"
 	CodeBadGateway         ErrorCode = "BAD_GATEWAY"
 	CodePayloadTooLarge    ErrorCode = "PAYLOAD_TOO_LARGE"
@@ -122,6 +123,21 @@ func QuotaExceededCtx(w http.ResponseWriter, r *http.Request, message string) {
 	write(w, CodeQuotaExceeded, message, http.StatusTooManyRequests, requestIDFromContext(r.Context()))
 }
 
+// PaymentRequired reports a billing-boundary violation (HTTP 402). Used
+// by the deploy-time enforcement path (issue #420) when a tenant is
+// over their cap, has a past_due/canceled subscription, or is in
+// free-tier lockdown. Distinct from QuotaExceeded (429): 402 says
+// "this is a billing boundary, waiting won't fix it" while 429 says
+// "you're rate-limited, back off and retry".
+func PaymentRequired(w http.ResponseWriter, message string) {
+	write(w, CodePaymentRequired, message, http.StatusPaymentRequired, "")
+}
+
+// PaymentRequiredCtx reports a billing-boundary violation with trace context (HTTP 402).
+func PaymentRequiredCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodePaymentRequired, message, http.StatusPaymentRequired, requestIDFromContext(r.Context()))
+}
+
 // InternalError reports an unspecified server fault (HTTP 500).
 // Use this when logging has already captured the real error; the client
 // always sees "internal error" regardless of what happened.
@@ -203,6 +219,8 @@ func WriteCtx(w http.ResponseWriter, r *http.Request, httpStatus int, message st
 		code = CodeConflict
 	case http.StatusTooManyRequests:
 		code = CodeQuotaExceeded
+	case http.StatusPaymentRequired:
+		code = CodePaymentRequired
 	case http.StatusServiceUnavailable:
 		code = CodeServiceUnavailable
 	default:
