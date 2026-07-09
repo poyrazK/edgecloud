@@ -982,8 +982,81 @@ export interface components {
             };
         };
         HealthResponse: {
-            /** @example ok */
-            status?: string;
+            /**
+             * @description `ok` — all background loops are healthy. `degraded` — at
+             *     least one loop has panicked or is stale; the response is
+             *     still 200 so load balancers keep the CP in rotation. See
+             *     `degraded_reasons` and `loops` for the per-loop state.
+             *     `unhealthy` — DB or NATS connectivity failed; the response
+             *     is 503.
+             * @example ok
+             * @enum {string}
+             */
+            status?: "ok" | "degraded" | "unhealthy";
+            /**
+             * @description Per-background-loop liveness state, sourced from
+             *     `internal/loophealth` (issue #443). Keys are the loop
+             *     names (`heartbeat`, `log_gc`, `reconcile`, `worker_gc`,
+             *     `deployment_gc`, `autoscale`).
+             * @example {
+             *       "heartbeat": {
+             *         "name": "heartbeat",
+             *         "panics": 0,
+             *         "running": true,
+             *         "stale": false
+             *       },
+             *       "log_gc": {
+             *         "name": "log_gc",
+             *         "panics": 0,
+             *         "running": true,
+             *         "stale": false
+             *       }
+             *     }
+             */
+            loops?: {
+                [key: string]: components["schemas"]["LoopState"];
+            };
+            /**
+             * @description Loop names currently in degraded state
+             *     (panics>0 or stale=true). Absent when status is `ok`.
+             * @example [
+             *       "heartbeat"
+             *     ]
+             */
+            degraded_reasons?: string[];
+        };
+        LoopState: {
+            /** @example heartbeat */
+            name?: string;
+            /**
+             * Format: date-time
+             * @description RFC3339 timestamp the loop body first entered.
+             */
+            started_at?: string | null;
+            /**
+             * Format: date-time
+             * @description RFC3339 timestamp of the most recent liveness beat. For
+             *     the heartbeat and autoscale loops the drain bumps this
+             *     per message / per tick (issue #443 review finding #3);
+             *     for the GC loops the wrapper bumps it on entry.
+             */
+            last_beat_at?: string | null;
+            /**
+             * @description Count of recovered panics since process start.
+             * @example 0
+             */
+            panics?: number;
+            /**
+             * @description True while the loop body is currently executing.
+             * @example true
+             */
+            running?: boolean;
+            /**
+             * @description True if `now - last_beat_at` exceeds `LOOP_STALE_AFTER`
+             *     (default 2 minutes).
+             * @example false
+             */
+            stale?: boolean;
         };
         BootstrapRequest: {
             /**
