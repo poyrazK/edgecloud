@@ -353,3 +353,309 @@ async fn js_component_handles_request_on_host() {
         String::from_utf8_lossy(&body)
     );
 }
+
+/// Issue #428 regression: `extract_response`'s string-branch default
+/// for `Content-Type` must be `text/plain; charset=utf-8`, not
+/// `application/json`. The fixture (`benches/fixtures/issues/428-string-default.js`)
+/// is a single bundle whose handler dispatches on the request path:
+///
+/// - `/string`   → bare string, expect `text/plain; charset=utf-8`
+///                 (the bugfix; was `application/json` before)
+/// - `/object`   → `{ status, body }` object with no contentType,
+///                 expect `application/json` (unchanged behavior)
+/// - `/explicit` → object with explicit `contentType: text/html`,
+///                 expect `text/html; charset=utf-8` (handler wins)
+///
+/// The three checks share one build (built once in a `OnceLock`),
+/// re-issue the artifact, and assert on the `Content-Type` header
+/// of the response. Skips if `cargo` or `wasm-tools` aren't on
+/// PATH, or the build fails — same gating as the other
+/// `js_fixture_load` tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn extract_response_picks_content_type() {
+    use http_body_util::combinators::BoxBody;
+    use http_body_util::BodyExt as _;
+    use std::pin::Pin;
+    use std::process::Command;
+    use std::task::{Context, Poll};
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::p2::bindings::ProxyPre;
+    use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+    use wasmtime_wasi_http::p2::WasiHttpView;
+
+    /// Body that immediately reports end-of-stream. Its `Error` is
+    /// `hyper::Error` (the bindgen impl only covers `hyper::Error`
+    /// for `B::Error: Into<ErrorCode>`); see the matching struct
+    /// in `js_component_handles_request_on_host` for the full
+    /// rationale.
+    struct EmptyHyperBody;
+    impl hyper::body::Body for EmptyHyperBody {
+        type Data = bytes::Bytes;
+        type Error = hyper::Error;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(None)
+        }
+    }
+
+    /// Path to the JS fixture whose three-path handler drives
+    /// this test.
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("edge-js-runtime")
+            .join("benches")
+            .join("fixtures")
+            .join("issues")
+            .join("428-string-default.js")
+    }
+
+    /// Where the test-built wasm component lives. The artifact path
+    /// is keyed by source path (so two tests using different
+    /// fixtures don't clobber each other).
+    fn artifact_path() -> PathBuf {
+        let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.cache/edgecloud-cargo")
+        });
+        let stamp = fixture_path().to_string_lossy().replace('/', "_");
+        PathBuf::from(format!(
+            "{target}/wasm32-wasip1/issue428_{stamp}.component.wasm"
+        ))
+    }
+
+    /// Build (or reuse) the wasm component. Build steps:
+    /// 1. `cargo build --target wasm32-wasip1 --release` on
+    ///    `edge-js-runtime` with `EDGE_JS_BUNDLE=<fixture>` so the
+    ///    user's JS gets embedded at compile time.
+    /// 2. `wasm-tools component new <core> --adapt <adapter> -o <out>`
+    ///    to wrap the core module as a WASI Preview 2 component
+    ///    the host linker accepts.
+    ///
+    /// Both commands honor `CARGO_TARGET_DIR` (cargo) / operate
+    /// on the absolute paths we pass (wasm-tools), so the build
+    /// does not write into any worktree's `target/`.
+    fn build() -> Option<PathBuf> {
+        let fixture = fixture_path();
+        if !fixture.exists() {
+            eprintln!(
+                "SKIPPED: fixture not found at {} — the edge-js-runtime checkout must be at the expected path.",
+                fixture.display()
+            );
+            return None;
+        }
+        let artifact = artifact_path();
+        if artifact.exists() {
+            return Some(artifact);
+        }
+
+        let runtime_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("edge-runtime has a parent")
+            .join("edge-js-runtime");
+
+        let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.cache/edgecloud-cargo")
+        });
+        let target_dir = PathBuf::from(target_dir);
+
+        // Step 1: cargo build
+        let cargo_status = Command::new("cargo")
+            .args(["build", "--target", "wasm32-wasip1", "--release"])
+            .current_dir(&runtime_dir)
+            .env("EDGE_JS_BUNDLE", &fixture)
+            .status()
+            .expect("spawn cargo");
+        if !cargo_status.success() {
+            eprintln!("SKIPPED: cargo build failed (no wasm toolchain?)");
+            return None;
+        }
+
+        let core = target_dir
+            .join("wasm32-wasip1")
+            .join("release")
+            .join("edge_js_runtime.wasm");
+        if !core.exists() {
+            eprintln!("SKIPPED: core wasm missing after cargo build");
+            return None;
+        }
+
+        // Step 2: locate adapter
+        let cargo_home = match std::env::var("CARGO_HOME") {
+            Ok(s) => s,
+            Err(_) => match std::env::var("HOME") {
+                Ok(h) => format!("{h}/.cargo"),
+                Err(_) => {
+                    eprintln!("SKIPPED: neither CARGO_HOME nor HOME is set");
+                    return None;
+                }
+            },
+        };
+        let mut adapter = None;
+        if let Ok(entries) = std::fs::read_dir(format!("{cargo_home}/registry/src")) {
+            for entry in entries.flatten() {
+                if let Ok(subs) = std::fs::read_dir(entry.path()) {
+                    for sub in subs.flatten() {
+                        if sub
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("wasi-preview1-component-adapter-provider-")
+                        {
+                            let candidate = sub
+                                .path()
+                                .join("artefacts")
+                                .join("wasi_snapshot_preview1.reactor.wasm");
+                            if candidate.exists() {
+                                adapter = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                    if adapter.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        let adapter = match adapter {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIPPED: wasi-preview1 adapter not found in cargo registry");
+                return None;
+            }
+        };
+
+        if let Some(parent) = artifact.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let wrap_status = Command::new("wasm-tools")
+            .args([
+                "component",
+                "new",
+                &core.to_string_lossy(),
+                "--adapt",
+                &adapter.to_string_lossy(),
+                "-o",
+                &artifact.to_string_lossy(),
+            ])
+            .status()
+            .expect("spawn wasm-tools");
+        if !wrap_status.success() {
+            eprintln!("SKIPPED: wasm-tools wrap failed");
+            return None;
+        }
+        Some(artifact)
+    }
+
+    let artifact = match build() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let engine = create_engine().expect("engine");
+    let linker = create_component_linker_handler(&engine).expect("linker");
+    let bytes = std::fs::read(&artifact).expect("read artifact");
+    let component = Component::from_binary(&engine, &bytes).expect("parse component");
+    let instance_pre = linker.instantiate_pre(&component).expect("instantiate_pre");
+    let pre = ProxyPre::new(instance_pre).expect("ProxyPre::new");
+
+    /// Drive one request through the artifact and return the
+    /// (status, Content-Type header value, body) tuple. Takes the
+    /// linker by reference for documentation symmetry with the
+    /// component-store pattern; `ProxyPre` is the only entry point
+    /// used at runtime.
+    async fn dispatch(
+        engine: &wasmtime::Engine,
+        pre: &wasmtime_wasi_http::p2::bindings::ProxyPre<edge_runtime::RuntimeState>,
+        request_path: &str,
+    ) -> (u16, String, bytes::Bytes) {
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!("http://dispatch.local/{request_path}"))
+            .body(BoxBody::new(EmptyHyperBody))
+            .expect("build test request");
+
+        let mut store = wasmtime::Store::new(engine, runtime_state());
+        store.set_epoch_deadline(u64::MAX);
+
+        let (sender, receiver) = tokio::sync::oneshot::channel::<
+            Result<hyper::Response<HyperOutgoingBody>, ErrorCode>,
+        >();
+        let req_handle = store
+            .data_mut()
+            .http()
+            .new_incoming_request(
+                wasmtime_wasi_http::p2::bindings::http::types::Scheme::Http,
+                req,
+            )
+            .expect("new_incoming_request");
+        let out = store
+            .data_mut()
+            .http()
+            .new_response_outparam(sender)
+            .expect("new_response_outparam");
+
+        let proxy = pre
+            .instantiate_async(&mut store)
+            .await
+            .expect("instantiate via ProxyPre");
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, req_handle, out)
+            .await
+            .expect("call_handle should not error");
+
+        let resp = receiver
+            .await
+            .expect("response channel should deliver")
+            .expect("response should be Ok, not HttpError");
+
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        (status, content_type, body)
+    }
+
+    let (status, ct, body) = dispatch(&engine, &pre, "string").await;
+    assert_eq!(status, 200, "string handler: status");
+    assert_eq!(
+        ct, "text/plain; charset=utf-8",
+        "string handler: Content-Type — issue #428 fix"
+    );
+    assert_eq!(&body[..], b"hello world", "string handler: body");
+
+    let (status, ct, body) = dispatch(&engine, &pre, "object").await;
+    assert_eq!(status, 200, "object handler: status");
+    assert_eq!(
+        ct, "application/json",
+        "object handler: Content-Type — default must be JSON"
+    );
+    assert_eq!(&body[..], br#"{"ok":true}"#, "object handler: body");
+
+    let (status, ct, body) = dispatch(&engine, &pre, "explicit").await;
+    assert_eq!(status, 200, "explicit handler: status");
+    assert_eq!(
+        ct, "text/html; charset=utf-8",
+        "explicit handler: Content-Type — handler wins over default"
+    );
+    assert_eq!(
+        &body[..],
+        b"<html><body>hi</body></html>",
+        "explicit handler: body"
+    );
+
+    println!("✓ issue #428: extract_response picks the right Content-Type for all three shapes");
+}
