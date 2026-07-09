@@ -1,25 +1,100 @@
 //! Register edge:cloud/* WIT interfaces as QuickJS globalThis.EdgeCloud methods.
 
+// `TypedArray` is only used inside the WASI-bound helpers (kv_store,
+// cache, etc.) which are gated behind `#[cfg(target_arch = "wasm32")]`
+// below. On the host target the import is unused, so silence the
+// warning there.
+#[allow(unused_imports)]
 use rquickjs::{Ctx, Function, Object, TypedArray, Value};
 
-// The wit-bindgen generated bindings are available via crate::{edge, wasi, ...}
-use crate::edge::cloud::{cache, kv_store, observe, process, scheduling, time, websocket};
+// The wit-bindgen generated bindings are available via
+// `crate::wasm_only::edge::cloud::*` — but ONLY when
+// `wit_bindgen::generate!` has run, which is gated to
+// `target_arch = "wasm32"` in `lib.rs` (inside `mod wasm_only`).
+// The host-target build (rlib for the bench) does not get these
+// bindings, so the real `register_all` (in `lib.rs::wasm_only`)
+// and the per-namespace registrars (in this file's `mod wasm_only`)
+// are gated on `wasm32`. The `register_all_stub` below is always
+// compiled.
 
 /// Register all edge:cloud modules on globalThis.EdgeCloud.
+///
+/// Moved into the `wasm_only` mod below so it can reach the per-namespace
+/// registrars (which themselves depend on `wit_bindgen` symbols only
+/// present on the wasm target). Exposed as `pub` so `lib.rs::wasm::Guest::handle`
+/// can call it.
+#[cfg(target_arch = "wasm32")]
 pub fn register_all<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     let edge_cloud = Object::new(ctx.clone())?;
 
-    register_kv_store(ctx, &edge_cloud)?;
-    register_cache(ctx, &edge_cloud)?;
-    register_observe(ctx, &edge_cloud)?;
-    register_time(ctx, &edge_cloud)?;
-    register_scheduling(ctx, &edge_cloud)?;
-    register_process(ctx, &edge_cloud)?;
-    register_websocket(ctx, &edge_cloud)?;
+    wasm_only::register_kv_store(ctx, &edge_cloud)?;
+    wasm_only::register_cache(ctx, &edge_cloud)?;
+    wasm_only::register_observe(ctx, &edge_cloud)?;
+    wasm_only::register_time(ctx, &edge_cloud)?;
+    wasm_only::register_scheduling(ctx, &edge_cloud)?;
+    wasm_only::register_process(ctx, &edge_cloud)?;
+    wasm_only::register_websocket(ctx, &edge_cloud)?;
 
     ctx.globals().set("EdgeCloud", edge_cloud)?;
     Ok(())
 }
+
+/// No-op stub of `register_all` for host-target unit tests and the
+/// `warm_vs_cold` benchmark. Mirrors the real registration's shape
+/// (one `Object` per edge:cloud namespace, each with at least one
+/// `Function::new` closure) so the closure-allocation cost in the
+/// bench approximates the wasm-target cost.
+///
+/// Always compiled (no `cfg` gate) because the bench target doesn't
+/// propagate the `bench` feature to the lib dep — `cargo bench
+/// --features bench` activates the feature for the bench target, but
+/// the lib is built separately as a normal dependency. The stub is
+/// ~30 `Function::new` closures and a handful of `Object` allocations;
+/// it does not bloat the wasm artifact meaningfully (a few KB at most).
+pub fn register_all_stub<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
+    let edge_cloud = Object::new(ctx.clone())?;
+
+    for ns_name in [
+        "kv",
+        "cache",
+        "observe",
+        "time",
+        "scheduling",
+        "process",
+        "websocket",
+    ] {
+        let ns = Object::new(ctx.clone())?;
+        // Three closures per namespace — close enough to the real
+        // average closure count per `register_*` helper.
+        for method in ["get", "set", "delete"] {
+            let method_name = method.to_string();
+            let f = Function::new(
+                ctx.clone(),
+                move |_ctx: Ctx<'js>, _args: Value<'js>| -> rquickjs::Result<Value<'js>> {
+                    Ok(Value::new_null(_ctx.clone()))
+                },
+            )?;
+            ns.set(method_name.as_str(), f)?;
+        }
+        edge_cloud.set(ns_name, ns)?;
+    }
+
+    ctx.globals().set("EdgeCloud", edge_cloud)?;
+    Ok(())
+}
+
+// ─── WASI-bound helpers + per-namespace registrars (wasm target only) ──
+//
+// Everything below references the `wit_bindgen`-generated modules under
+// `crate::edge::cloud::*`, which only exist when targeting
+// `wasm32-wasip1`. The host-target build (rlib used by the bench)
+// skips this whole block.
+#[cfg(target_arch = "wasm32")]
+mod wasm_only {
+    use super::{Ctx, Function, Object, TypedArray, Value};
+    use crate::wasm_only::edge::cloud::{
+        cache, kv_store, observe, process, scheduling, time, websocket,
+    };
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -85,7 +160,7 @@ fn js_to_set_many_items<'js>(val: Value<'js>) -> rquickjs::Result<Vec<(String, V
 
 // ─── kv-store ──────────────────────────────────────────────────────
 
-fn register_kv_store<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_kv_store<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let kv = Object::new(ctx.clone())?;
 
     kv.set("get", Function::new(ctx.clone(), |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
@@ -152,7 +227,7 @@ fn register_kv_store<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Res
 
 // ─── cache ──────────────────────────────────────────────────────────
 
-fn register_cache<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_cache<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let c = Object::new(ctx.clone())?;
 
     c.set("get", Function::new(ctx.clone(), |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
@@ -223,7 +298,7 @@ fn register_cache<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result
 
 // ─── observe ────────────────────────────────────────────────────────
 
-fn register_observe<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_observe<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let obs = Object::new(ctx.clone())?;
 
     obs.set("incrementCounter", Function::new(ctx.clone(), |name: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
@@ -274,7 +349,7 @@ fn register_observe<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Resu
 
 // ─── time ───────────────────────────────────────────────────────────
 
-fn register_time<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_time<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let t = Object::new(ctx.clone())?;
 
     t.set("now", Function::new(ctx.clone(), || -> u64 {
@@ -295,7 +370,7 @@ fn register_time<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<
 
 // ─── scheduling ─────────────────────────────────────────────────────
 
-fn register_scheduling<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_scheduling<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let s = Object::new(ctx.clone())?;
 
     s.set("scheduleOnce", Function::new(ctx.clone(), |delay_ms: u64, payload_val: Value<'js>| -> rquickjs::Result<String> {
@@ -320,7 +395,7 @@ fn register_scheduling<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::R
 
 // ─── process ────────────────────────────────────────────────────────
 
-fn register_process<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_process<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     let p = Object::new(ctx.clone())?;
 
     p.set("getEnv", Function::new(ctx.clone(), |key: String| -> Option<String> {
@@ -404,7 +479,7 @@ fn message_type_to_js(kind: websocket::MessageType) -> &'static str {
 /// callers see generic "websocket send/close failed" messages until the
 /// v0.3 WIT-level rework tracked alongside issue #422. Accept and
 /// receive work fine.
-fn register_websocket<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+pub(super) fn register_websocket<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
     use rquickjs::Exception;
 
     let ws = Object::new(ctx.clone())?;
@@ -537,3 +612,4 @@ fn register_websocket<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Re
 // These three together cover what an in-crate unit test would. A
 // dedicated CI gate that runs `wasm-tools` validation on a sample JS
 // handler is the natural follow-up once the JS sample lands.
+} // close `mod wasm_only`
