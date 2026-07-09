@@ -3601,6 +3601,8 @@ export interface operations {
                         key_ids?: string[];
                         active_key?: string;
                         encryption_enabled?: boolean;
+                        /** @example 0 */
+                        plaintext_row_count?: number;
                     };
                 };
             };
@@ -3630,6 +3632,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         re_encrypted?: number;
+                        /** @example 0 */
+                        plaintext_skipped?: number;
                         status?: string;
                     };
                 };
