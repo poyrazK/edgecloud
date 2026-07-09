@@ -25,6 +25,12 @@ type Config struct {
 	// key never leaves the CP. The public key is propagated to workers
 	// out-of-band (today: EDGE_SIGNING_PUBKEY env var on each worker).
 	Signing SigningConfig `yaml:"signing"`
+	// Billing configures the merchant-agnostic billing surface
+	// (issue #419). Provider selects which BillingProvider impl is
+	// wired: "stripe" (real) or "noop" (dev/CI/test). The Stripe
+	// sub-block carries the per-merchant credentials and the
+	// plan→price_id map.
+	Billing BillingConfig `yaml:"billing"`
 	// Autoscale configures the cluster autoscaler (issue #85).
 	// Disabled by default — operators flip `enabled: true` once the
 	// fleet has multiple workers and the cloud-provider integration
@@ -341,6 +347,44 @@ func Load(path string) (*Config, error) {
 			}
 		}
 	}
+
+	// Billing provider selection + per-merchant credentials (issue #419).
+	if v := os.Getenv("BILLING_PROVIDER"); v != "" {
+		cfg.Billing.Provider = v
+	}
+	if v := os.Getenv("BILLING_SUCCESS_URL"); v != "" {
+		cfg.Billing.SuccessURL = v
+	}
+	if v := os.Getenv("BILLING_CANCEL_URL"); v != "" {
+		cfg.Billing.CancelURL = v
+	}
+	if v := os.Getenv("BILLING_PORTAL_RETURN_URL"); v != "" {
+		cfg.Billing.PortalReturnURL = v
+	}
+	if v := os.Getenv("STRIPE_SECRET_KEY"); v != "" {
+		cfg.Billing.Stripe.SecretKey = v
+	}
+	if v := os.Getenv("STRIPE_WEBHOOK_SECRET"); v != "" {
+		cfg.Billing.Stripe.WebhookSecret = v
+	}
+	if v := os.Getenv("STRIPE_PUBLISHABLE_KEY"); v != "" {
+		cfg.Billing.Stripe.PublishableKey = v
+	}
+	// STRIPE_PRICE_ID_<PLAN> env vars override entries in
+	// cfg.Billing.Stripe.PriceIDs — same pattern as the secrets
+	// keyring overrides so a single plan can be tweaked without
+	// rewriting the whole config file.
+	for _, e := range os.Environ() {
+		if before, after, ok := strings.Cut(e, "="); ok && strings.HasPrefix(before, "STRIPE_PRICE_ID_") {
+			plan := strings.ToLower(before[len("STRIPE_PRICE_ID_"):])
+			if plan != "" {
+				if cfg.Billing.Stripe.PriceIDs == nil {
+					cfg.Billing.Stripe.PriceIDs = make(map[string]string)
+				}
+				cfg.Billing.Stripe.PriceIDs[plan] = after
+			}
+		}
+	}
 	if v := os.Getenv("JWT_ACTIVE_KID"); v != "" {
 		cfg.JWT.ActiveKID = v
 	}
@@ -552,6 +596,13 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Validate the billing provider selection. Empty defaults to
+	// "noop" in dev|test, fatal in production. "stripe" requires
+	// secret_key + webhook_secret + a price_id for every paid plan.
+	if err := validateBillingConfig(&cfg.Billing, cfg.App.Env); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
@@ -567,6 +618,77 @@ func validateSigningConfig(s *SigningConfig) error {
 		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH), signing.key (EDGE_SIGNING_KEY), signing.keyring_path (EDGE_SIGNING_KEYRING_PATH), or signing.keyring (EDGE_SIGNING_KEYRING) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
 	}
 	return nil
+}
+
+// validateBillingConfig enforces the per-provider prerequisites
+// for the billing surface (issue #419). Rules:
+//
+//   - Provider is "stripe": SecretKey, WebhookSecret, and a
+//     PriceIDs entry for every paid plan in domain.Plans() must
+//     be set. "free" is allowed to be absent because the checkout
+//     handler rejects it before any merchant call is made.
+//   - Provider is "noop": allowed only when appEnv is "dev" or
+//     "test". A noop in production is a misconfiguration that
+//     would silently accept every checkout as "succeeded" without
+//     ever taking payment — fail-closed.
+//   - Provider is "": same as "noop" — defaulted, then the noop
+//     rule above applies.
+//   - Anything else: hard error so a typo in config doesn't
+//     silently fall through.
+//
+// The plan list is taken from domain.Plans() at the time of
+// validation; adding a new tier automatically requires a matching
+// PriceIDs entry under stripe.
+func validateBillingConfig(b *BillingConfig, appEnv string) error {
+	// Default Provider to "noop" if empty; downstream code reads
+	// cfg.Billing.Provider and may rely on it being non-empty.
+	provider := b.Provider
+	if provider == "" {
+		provider = "noop"
+		b.Provider = provider
+	}
+
+	switch provider {
+	case "noop":
+		// Fail-closed against accidental production noop. A noop
+		// provider in production would silently accept every
+		// checkout as "succeeded" without ever taking payment.
+		// Treat empty appEnv as dev — tests that pre-date the
+		// billing surface (config_test.go: minimalConfigYAML)
+		// don't set app.env and shouldn't have to be touched.
+		if appEnv != "" && appEnv != "dev" && appEnv != "test" {
+			return fmt.Errorf("billing.provider=noop is only allowed when app.env is dev or test (got %q); use billing.provider=stripe for production", appEnv)
+		}
+		return nil
+	case "stripe":
+		if b.Stripe.SecretKey == "" {
+			return fmt.Errorf("billing.provider=stripe requires billing.stripe.secret_key (or STRIPE_SECRET_KEY env var)")
+		}
+		if b.Stripe.WebhookSecret == "" {
+			return fmt.Errorf("billing.provider=stripe requires billing.stripe.webhook_secret (or STRIPE_WEBHOOK_SECRET env var)")
+		}
+		// Every paid plan in the canonical tier list must have a
+		// matching PriceIDs entry. "free" is skipped because the
+		// checkout handler rejects it before this point.
+		for _, p := range paidPlans() {
+			if b.Stripe.PriceIDs[p] == "" {
+				return fmt.Errorf("billing.provider=stripe requires billing.stripe.price_ids[%q] (or STRIPE_PRICE_ID_%s env var)", p, strings.ToUpper(p))
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("billing.provider=%q is not recognized; valid values are \"stripe\" or \"noop\"", provider)
+	}
+}
+
+// paidPlans returns the list of plan names the billing service is
+// expected to be able to charge for. Mirrors domain.Plans() minus
+// "free" (which never reaches the checkout path). Kept as a
+// local helper so the config package doesn't import domain — the
+// duplication is two lines and the alternative would be a domain
+// dep that drags the rest of the billing surface in.
+func paidPlans() []string {
+	return []string{"pro", "business", "enterprise"}
 }
 
 // insecureJWTSecretValues is the set of well-known placeholder JWT secrets
@@ -846,4 +968,72 @@ type SigningConfig struct {
 	// Keyring is the inline multi-key keyring payload, used when
 	// KeyringPath is unset. Same format as the file.
 	Keyring string `yaml:"keyring"`
+}
+
+// BillingConfig configures the merchant-agnostic billing surface
+// (issue #419). The provider field selects which BillingProvider
+// implementation is wired at app composition time; the Stripe
+// sub-block carries the per-merchant credentials and the
+// plan→price_id map.
+//
+// Default Provider is empty. validateBillingConfig in Load()
+// interprets empty as "noop" in dev|test and as a fatal error in
+// production — operators must opt into a real merchant explicitly.
+type BillingConfig struct {
+	// Provider is the BillingProvider name. Recognized values:
+	//   "stripe" — wraps stripe-go; real merchant credentials required
+	//   "noop"   — dev/CI/test; never accepted outside dev|test
+	// Empty string defaults to "noop" in dev|test, fatal elsewhere.
+	Provider string `yaml:"provider"`
+
+	// SuccessURL is the redirect target the hosted checkout page
+	// lands on after a successful payment. The handler threads
+	// this into every CreateCheckoutSession call.
+	SuccessURL string `yaml:"success_url"`
+
+	// CancelURL is the redirect target the hosted checkout page
+	// lands on if the user backs out. Same threading as SuccessURL.
+	CancelURL string `yaml:"cancel_url"`
+
+	// PortalReturnURL is the redirect target the self-service
+	// portal lands on when the user clicks "back to app". The
+	// handler does not consume this today; the service uses
+	// per-request return_url from the API call.
+	PortalReturnURL string `yaml:"portal_return_url"`
+
+	// Stripe carries the per-merchant credentials. Ignored when
+	// Provider != "stripe" but still parsed so a misconfigured
+	// operator gets a clear validation error.
+	Stripe BillingStripeConfig `yaml:"stripe"`
+}
+
+// BillingStripeConfig is the per-merchant credential block. Same
+// shape as billing.StripeConfig but lives in the config package so
+// YAML env overrides have a stable binding target. The factory in
+// app.go converts this into billing.StripeConfig and passes it to
+// stripe.New.
+type BillingStripeConfig struct {
+	// SecretKey is the Stripe secret key (sk_live_… or sk_test_…).
+	// Required when Provider == "stripe".
+	SecretKey string `yaml:"secret_key"`
+
+	// WebhookSecret is the endpoint signing secret (whsec_…) used
+	// to verify the Stripe-Signature header on inbound webhooks.
+	// Required when Provider == "stripe".
+	WebhookSecret string `yaml:"webhook_secret"`
+
+	// PublishableKey is the Stripe publishable key
+	// (pk_live_… / pk_test_…). Surfaced to the dashboard for
+	// client-side rendering of the hosted checkout; not
+	// required at startup.
+	PublishableKey string `yaml:"publishable_key"`
+
+	// PriceIDs maps the domain plan name (free / pro / business /
+	// enterprise) to the merchant's price id (price_…). The
+	// CreateCheckoutSession call uses this to pick the right
+	// product for the chosen plan. validateBillingConfig
+	// enforces that every paid plan in domain.Plans() has a
+	// matching entry; "free" is allowed to be absent because
+	// the checkout path rejects it at the handler.
+	PriceIDs map[string]string `yaml:"price_ids"`
 }

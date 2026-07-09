@@ -56,11 +56,11 @@ func (h *TenantHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		plan = "free"
 	}
 	// Self-service bootstrap only accepts the free tier — paid plans must
-	// go through the Stripe checkout endpoint (follow-up ticket). Reject
-	// pro/business/enterprise here so a tenant can't claim paid quotas
-	// without payment.
+	// go through the billing checkout endpoint (issue #419, billing
+	// abstraction). Reject pro/business/enterprise here so a tenant
+	// can't claim paid quotas without payment.
 	if plan != "free" {
-		httperror.BadRequestCtx(w, r, "plan: only 'free' is accepted at bootstrap; paid tiers require the checkout endpoint (coming soon)")
+		httperror.BadRequestCtx(w, r, "plan: only 'free' is accepted at bootstrap; paid tiers require /api/v1/billing/checkout first")
 		return
 	}
 

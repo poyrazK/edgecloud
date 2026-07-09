@@ -296,6 +296,94 @@ components:
             $ref: '#/components/schemas/Webhook'
 
     # -------------------------------------------------------------------------
+    # Billing (issue #419)
+    # -------------------------------------------------------------------------
+    BillingCheckoutRequest:
+      type: object
+      required: [plan]
+      properties:
+        plan:
+          type: string
+          enum: [pro, business, enterprise]
+          description: Paid tier to charge for. "free" is rejected.
+        success_url:
+          type: string
+          format: uri
+          description: Optional override for the post-checkout redirect target.
+        cancel_url:
+          type: string
+          format: uri
+          description: Optional override for the user-canceled redirect target.
+
+    BillingCheckoutResponse:
+      type: object
+      properties:
+        checkout_url:
+          type: string
+          format: uri
+          description: Hosted checkout page the tenant's browser should be redirected to.
+          example: https://checkout.stripe.com/c/pay/cs_test_abc
+        session_id:
+          type: string
+          description: Provider-side session identifier.
+          example: cs_test_abc
+        expires_at:
+          type: string
+          format: date-time
+          description: When the checkout session expires.
+
+    BillingPortalRequest:
+      type: object
+      required: [return_url]
+      properties:
+        return_url:
+          type: string
+          format: uri
+          description: URL the provider-hosted portal redirects to when the user clicks "back to app".
+
+    BillingPortalResponse:
+      type: object
+      properties:
+        portal_url:
+          type: string
+          format: uri
+          description: Self-service portal URL the tenant's browser should be redirected to.
+
+    BillingSubscription:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        provider:
+          type: string
+          enum: [stripe, noop]
+          example: stripe
+        provider_customer_id:
+          type: string
+          example: cus_abc123
+        provider_subscription_id:
+          type: string
+          example: sub_xyz789
+        plan:
+          type: string
+          enum: [free, pro, business, enterprise]
+        status:
+          type: string
+          enum: [active, past_due, canceled, incomplete, trialing]
+        current_period_end:
+          type: string
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # -------------------------------------------------------------------------
     # Apps
     # -------------------------------------------------------------------------
     CreateAppRequest:
@@ -379,33 +467,6 @@ components:
           type: string
           format: date-time
           example: "2026-01-02T03:04:05Z"
-        preview_id:
-          type: string
-          nullable: true
-          description: |
-            Hex preview-id (issue #308). Present iff the deployment was
-            uploaded via `?preview-id=<hex>`. The worker scopes its
-            per-tenant persistent stores under
-            `<EDGE_*_PATH>/{tenant_id}/preview-{id}/` so concurrent
-            previews don't trample each other's keys.
-          example: abcd1234
-        preview_pr_number:
-          type: integer
-          nullable: true
-          description: |
-            GitHub PR number the composite action forwarded. When
-            non-null, the guest sees `EDGE_PREVIEW_PR_NUMBER=<N>` in
-            its `process.get_environment` response.
-          example: 123
-        preview_expires_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: |
-            Absolute TIMESTAMPTZ the deployment row is deleted at by
-            the PreviewGCService sweep. Set on every preview deploy;
-            null for non-preview rows.
-          example: "2026-07-16T00:00:00Z"
 
     DeployResponse:
       type: object
@@ -422,28 +483,6 @@ components:
           type: string
           description: The target ingress URL for this deployment.
           example: https://web-app.t_abc123.edgecloud.dev
-        preview_id:
-          type: string
-          description: |
-            Echo of the `preview-id` query param (issue #308). Empty
-            string for non-preview deploys.
-          example: abcd1234
-        preview_pr_number:
-          type: integer
-          description: |
-            Echo of the `preview-pr-number` query param. Zero for
-            non-preview deploys or for `--preview` runs without a PR
-            context.
-          example: 123
-        preview_expires_at:
-          type: string
-          format: date-time
-          description: |
-            RFC3339 expiry the control plane computed. Empty for
-            non-preview deploys. The CLI persists this into
-            `.edge/state.json` so `edge status` can show "expires in
-            5d 12h" without re-querying the server.
-          example: "2026-07-16T00:00:00Z"
 
     DeploymentListResponse:
       type: object
@@ -1486,14 +1525,6 @@ paths:
         Stores the artifact, registers a new deployment, and auto-creates
         the app record if it does not already exist. The artifact is
         validated as a WebAssembly binary before storage.
-
-        **Preview deploys (issue #308):** set `?preview-id=<hex>` to mark
-        the deploy as a preview. The control plane allocates a per-preview
-        store scope (KV/cache/scheduler) on the worker and stamps
-        `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env when a PR number
-        is forwarded. The PreviewGCService deletes the row + artifact
-        blob once `preview_expires_at` is in the past (default 7d,
-        override via `?preview-ttl=<duration>`).
       parameters:
         - name: appName
           in: path
@@ -1501,42 +1532,6 @@ paths:
           schema:
             type: string
           description: Unique name of the app within the tenant.
-        - name: preview-id
-          in: query
-          required: false
-          schema:
-            type: string
-            pattern: '^[a-f0-9]{8,16}$'
-          description: |
-            Hex preview-id (issue #308). When set, the deploy is
-            stamped as a preview: the worker scopes its KV/cache/
-            scheduler stores under a `/preview-{id}/` subdirectory,
-            and the response includes the resolved `expires_at`
-            timestamp. Must match `^[a-f0-9]{8,16}$` if present.
-        - name: preview-pr-number
-          in: query
-          required: false
-          schema:
-            type: integer
-            minimum: 0
-          description: |
-            GitHub PR number forwarded by the composite action. When
-            set alongside `preview-id`, the control plane stamps
-            `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env so the
-            service can render PR-aware UI. Optional: a laptop user
-            running `--preview` outside CI sets `preview-id` without
-            this param.
-        - name: preview-ttl
-          in: query
-          required: false
-          schema:
-            type: string
-          description: |
-            Go-style duration string (e.g. `"24h"`, `"168h"`).
-            Defaults to 168h (7d) when `preview-id` is set. The control
-            plane resolves it to an absolute TIMESTAMPTZ stored on the
-            deployment row; the PreviewGCService deletes expired rows
-            on its sweep tick.
       requestBody:
         required: true
         content:
@@ -2463,6 +2458,97 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # Billing (issue #419)
+  # -------------------------------------------------------------------------
+  /api/v1/billing/checkout:
+    post:
+      operationId: startBillingCheckout
+      summary: Open a hosted checkout page for a paid plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingCheckoutRequest'
+      responses:
+        '201':
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingCheckoutResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/portal:
+    post:
+      operationId: openBillingPortal
+      summary: Open the provider-hosted self-service portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingPortalRequest'
+      responses:
+        '200':
+          description: Portal session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingPortalResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Tenant has no subscription yet — start a checkout first.
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/subscription:
+    get:
+      operationId: getBillingSubscription
+      summary: Get the authenticated tenant's current subscription
+      responses:
+        '200':
+          description: Current subscription state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSubscription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Tenant has no subscription.
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/webhook:
+    post:
+      operationId: receiveBillingWebhook
+      summary: Provider webhook ingress (signature-verified inline)
+      description: |
+        Inbound webhook from the configured billing provider
+        (e.g. Stripe). The provider verifies the signature inline
+        using its webhook secret; no Bearer token is required.
+        Returns 200 on success or idempotent replay, 400 on
+        signature failure (provider retries), 422 on
+        tenant-unresolved events, 500 on a DB error.
+      security: []
+      responses:
+        '200':
+          description: Event accepted (or already processed).
+        '400':
+          description: Signature failure or tenant unresolved.
         '500':
           $ref: '#/components/responses/InternalError'
 

@@ -161,14 +161,6 @@ export interface paths {
          * @description Stores the artifact, registers a new deployment, and auto-creates
          *     the app record if it does not already exist. The artifact is
          *     validated as a WebAssembly binary before storage.
-         *
-         *     **Preview deploys (issue #308):** set `?preview-id=<hex>` to mark
-         *     the deploy as a preview. The control plane allocates a per-preview
-         *     store scope (KV/cache/scheduler) on the worker and stamps
-         *     `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env when a PR number
-         *     is forwarded. The PreviewGCService deletes the row + artifact
-         *     blob once `preview_expires_at` is in the past (default 7d,
-         *     override via `?preview-ttl=<duration>`).
          */
         post: operations["deploy"];
         delete?: never;
@@ -622,6 +614,82 @@ export interface paths {
         post?: never;
         /** Delete a webhook subscription */
         delete: operations["deleteWebhook"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/billing/checkout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Open a hosted checkout page for a paid plan */
+        post: operations["startBillingCheckout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/billing/portal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Open the provider-hosted self-service portal */
+        post: operations["openBillingPortal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/billing/subscription": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the authenticated tenant's current subscription */
+        get: operations["getBillingSubscription"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/billing/webhook": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Provider webhook ingress (signature-verified inline)
+         * @description Inbound webhook from the configured billing provider
+         *     (e.g. Stripe). The provider verifies the signature inline
+         *     using its webhook secret; no Bearer token is required.
+         *     Returns 200 on success or idempotent replay, 400 on
+         *     signature failure (provider retries), 422 on
+         *     tenant-unresolved events, 500 on a DB error.
+         */
+        post: operations["receiveBillingWebhook"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1170,6 +1238,79 @@ export interface components {
         WebhookListResponse: {
             webhooks?: components["schemas"]["Webhook"][];
         };
+        BillingCheckoutRequest: {
+            /**
+             * @description Paid tier to charge for. "free" is rejected.
+             * @enum {string}
+             */
+            plan: "pro" | "business" | "enterprise";
+            /**
+             * Format: uri
+             * @description Optional override for the post-checkout redirect target.
+             */
+            success_url?: string;
+            /**
+             * Format: uri
+             * @description Optional override for the user-canceled redirect target.
+             */
+            cancel_url?: string;
+        };
+        BillingCheckoutResponse: {
+            /**
+             * Format: uri
+             * @description Hosted checkout page the tenant's browser should be redirected to.
+             * @example https://checkout.stripe.com/c/pay/cs_test_abc
+             */
+            checkout_url?: string;
+            /**
+             * @description Provider-side session identifier.
+             * @example cs_test_abc
+             */
+            session_id?: string;
+            /**
+             * Format: date-time
+             * @description When the checkout session expires.
+             */
+            expires_at?: string;
+        };
+        BillingPortalRequest: {
+            /**
+             * Format: uri
+             * @description URL the provider-hosted portal redirects to when the user clicks "back to app".
+             */
+            return_url: string;
+        };
+        BillingPortalResponse: {
+            /**
+             * Format: uri
+             * @description Self-service portal URL the tenant's browser should be redirected to.
+             */
+            portal_url?: string;
+        };
+        BillingSubscription: {
+            /** @example t_abc123 */
+            tenant_id?: string;
+            /**
+             * @example stripe
+             * @enum {string}
+             */
+            provider?: "stripe" | "noop";
+            /** @example cus_abc123 */
+            provider_customer_id?: string;
+            /** @example sub_xyz789 */
+            provider_subscription_id?: string;
+            /** @enum {string} */
+            plan?: "free" | "pro" | "business" | "enterprise";
+            /** @enum {string} */
+            status?: "active" | "past_due" | "canceled" | "incomplete" | "trialing";
+            /** Format: date-time */
+            current_period_end?: string;
+            cancel_at_period_end?: boolean;
+            /** Format: date-time */
+            created_at?: string;
+            /** Format: date-time */
+            updated_at?: string;
+        };
         CreateAppRequest: {
             /**
              * @description Optional human-readable description.
@@ -1229,30 +1370,6 @@ export interface components {
              * @example 2026-01-02T03:04:05Z
              */
             created_at?: string;
-            /**
-             * @description Hex preview-id (issue #308). Present iff the deployment was
-             *     uploaded via `?preview-id=<hex>`. The worker scopes its
-             *     per-tenant persistent stores under
-             *     `<EDGE_*_PATH>/{tenant_id}/preview-{id}/` so concurrent
-             *     previews don't trample each other's keys.
-             * @example abcd1234
-             */
-            preview_id?: string | null;
-            /**
-             * @description GitHub PR number the composite action forwarded. When
-             *     non-null, the guest sees `EDGE_PREVIEW_PR_NUMBER=<N>` in
-             *     its `process.get_environment` response.
-             * @example 123
-             */
-            preview_pr_number?: number | null;
-            /**
-             * Format: date-time
-             * @description Absolute TIMESTAMPTZ the deployment row is deleted at by
-             *     the PreviewGCService sweep. Set on every preview deploy;
-             *     null for non-preview rows.
-             * @example 2026-07-16T00:00:00Z
-             */
-            preview_expires_at?: string | null;
         };
         DeployResponse: {
             /**
@@ -1270,28 +1387,6 @@ export interface components {
              * @example https://web-app.t_abc123.edgecloud.dev
              */
             url?: string;
-            /**
-             * @description Echo of the `preview-id` query param (issue #308). Empty
-             *     string for non-preview deploys.
-             * @example abcd1234
-             */
-            preview_id?: string;
-            /**
-             * @description Echo of the `preview-pr-number` query param. Zero for
-             *     non-preview deploys or for `--preview` runs without a PR
-             *     context.
-             * @example 123
-             */
-            preview_pr_number?: number;
-            /**
-             * Format: date-time
-             * @description RFC3339 expiry the control plane computed. Empty for
-             *     non-preview deploys. The CLI persists this into
-             *     `.edge/state.json` so `edge status` can show "expires in
-             *     5d 12h" without re-querying the server.
-             * @example 2026-07-16T00:00:00Z
-             */
-            preview_expires_at?: string;
         };
         DeploymentListResponse: {
             items?: components["schemas"]["Deployment"][];
@@ -2165,33 +2260,7 @@ export interface operations {
     };
     deploy: {
         parameters: {
-            query?: {
-                /**
-                 * @description Hex preview-id (issue #308). When set, the deploy is
-                 *     stamped as a preview: the worker scopes its KV/cache/
-                 *     scheduler stores under a `/preview-{id}/` subdirectory,
-                 *     and the response includes the resolved `expires_at`
-                 *     timestamp. Must match `^[a-f0-9]{8,16}$` if present.
-                 */
-                "preview-id"?: string;
-                /**
-                 * @description GitHub PR number forwarded by the composite action. When
-                 *     set alongside `preview-id`, the control plane stamps
-                 *     `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env so the
-                 *     service can render PR-aware UI. Optional: a laptop user
-                 *     running `--preview` outside CI sets `preview-id` without
-                 *     this param.
-                 */
-                "preview-pr-number"?: number;
-                /**
-                 * @description Go-style duration string (e.g. `"24h"`, `"168h"`).
-                 *     Defaults to 168h (7d) when `preview-id` is set. The control
-                 *     plane resolves it to an absolute TIMESTAMPTZ stored on the
-                 *     deployment row; the PreviewGCService deletes expired rows
-                 *     on its sweep tick.
-                 */
-                "preview-ttl"?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 /** @description Unique name of the app within the tenant. */
@@ -3061,6 +3130,122 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    startBillingCheckout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BillingCheckoutRequest"];
+            };
+        };
+        responses: {
+            /** @description Checkout session created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BillingCheckoutResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    openBillingPortal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BillingPortalRequest"];
+            };
+        };
+        responses: {
+            /** @description Portal session created. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BillingPortalResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Tenant has no subscription yet — start a checkout first. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getBillingSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current subscription state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BillingSubscription"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Tenant has no subscription. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    receiveBillingWebhook: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Event accepted (or already processed). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signature failure or tenant unresolved. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             500: components["responses"]["InternalError"];
         };
     };
