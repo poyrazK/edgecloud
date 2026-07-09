@@ -361,10 +361,22 @@ fn keys_create(_name: &str, _role: &str) -> Result<()> {
 
 /// `edge auth keys list [--json]`
 ///
-/// Calls `GET /api/v1/keys` and prints a 5-column table (ID / NAME /
-/// ROLE / CREATED / NOTE) for the current tenant's keys. The key used
-/// to authenticate this CLI session is annotated with `* (current)`
-/// so the user can see which one would be lost on self-revoke.
+/// Calls `GET /api/v1/keys` and prints a 7-column table
+/// (ID / NAME / ROLE / CREATED / LAST USED / EXPIRES / NOTE) for the
+/// current tenant's keys. The key used to authenticate this CLI
+/// session is annotated with `* (current)` so the user can see which
+/// one would be lost on self-revoke.
+///
+/// The full table is ~149 chars wide; it wraps under 120-col
+/// terminals. `--no-extras` would be a one-line follow-up if that
+/// becomes a frequent complaint — see the deferred items in
+/// PR #457's body.
+///
+/// Timestamps are rendered as absolute RFC3339 (matching every other
+/// timestamp column in the CLI). Relative-time formatting is
+/// intentionally NOT provided: adding `chrono` just for this one
+/// column would be +~150 KB of binary. Users who want "3m ago"
+/// formatting can pipe `--json` through a 5-line jq filter.
 ///
 /// `--json` emits the raw `Vec<APIKeySummary>` pretty-printed — used
 /// by `edge keys list --json | jq '.[] | select(.role=="owner")'`.
@@ -398,16 +410,18 @@ fn keys_list(as_json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<38} {:<24} {:<12} {:<22} NOTE",
-        "ID", "NAME", "ROLE", "CREATED"
+        "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE",
+        "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     );
-    println!("{}", "-".repeat(102));
+    println!("{}", "-".repeat(149));
     for k in &keys {
         let is_current = current_id.as_deref() == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
+        let last_used = k.last_used.as_deref().unwrap_or("");
+        let expires_at = k.expires_at.as_deref().unwrap_or("");
         println!(
-            "{:<38} {:<24} {:<12} {:<22} {}",
-            k.id, k.name, k.role, k.created_at, note
+            "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} {}",
+            k.id, k.name, k.role, k.created_at, last_used, expires_at, note
         );
     }
     Ok(())
@@ -565,7 +579,12 @@ fn confirmation_required(yes: bool, is_tty: bool) -> Result<()> {
 }
 
 /// Render a key list table to a string. The `current_id` parameter marks
-/// one row with `* (current)`.
+/// one row with `* (current)`. Mirrors the production `keys_list`
+/// renderer; the test mirror keeps both branches in lockstep.
+///
+/// Columns: ID / NAME / ROLE / CREATED / LAST USED / EXPIRES / NOTE.
+/// Empty `Option`s render as empty strings so a missing timestamp
+/// stays a blank slot rather than a printed "None" or "null".
 #[cfg(test)]
 fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
     if keys.is_empty() {
@@ -573,17 +592,19 @@ fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<38} {:<24} {:<12} {:<22} NOTE\n",
-        "ID", "NAME", "ROLE", "CREATED"
+        "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE\n",
+        "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     ));
-    out.push_str(&"-".repeat(102));
+    out.push_str(&"-".repeat(149));
     out.push('\n');
     for k in keys {
         let is_current = current_id == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
+        let last_used = k.last_used.as_deref().unwrap_or("");
+        let expires_at = k.expires_at.as_deref().unwrap_or("");
         out.push_str(&format!(
-            "{:<38} {:<24} {:<12} {:<22} {}\n",
-            k.id, k.name, k.role, k.created_at, note
+            "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} {}\n",
+            k.id, k.name, k.role, k.created_at, last_used, expires_at, note
         ));
     }
     out
