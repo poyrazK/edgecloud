@@ -41,6 +41,23 @@ function handleRequest(req) {
     };
   }
 
+  if (req.path === "/ws") {
+    // Issue #448 — the FaaS (Handler) execution model can't accept
+    // WebSocket upgrades because the host owns the TCP listener and
+    // the request-scoped JS runtime is destroyed between requests.
+    // Return 426 Upgrade Required so clients see a clear error
+    // rather than guessing why the connection failed; the actual WS
+    // echo is in `samples/hello-js-ws/` (long-running model).
+    return {
+      status: 426,
+      body: JSON.stringify({
+        error: "websocket unavailable on FaaS handler — deploy a long-running sample instead",
+        sample: "hello-js-ws",
+      }),
+      contentType: "application/json",
+    };
+  }
+
   return {
     status: 200,
     body: JSON.stringify({ hello: "world", path: req.path, now: Number(now) }),

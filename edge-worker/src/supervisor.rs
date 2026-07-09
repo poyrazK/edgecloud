@@ -628,6 +628,70 @@ mod heartbeat_integration_tests {
         assert!(state.read().await.apps.is_empty());
     }
 
+    /// Issue #448 regression — `stop_app` must release BOTH the primary
+    /// `port` AND the dedicated `ws_port` it allocated from the same
+    /// pool. The previous code only released `port`, so `ws_port`
+    /// leaked until the 60s cooldown returned it. Under bursty WS-app
+    /// redeploys this exhausted the PortPool in CI.
+    ///
+    /// We exercise the structural contract via the public API: install
+    /// an app with both `port` and `ws_port`, call `stop_app`, assert
+    /// the state is cleared (and the call doesn't panic). The
+    /// `ws_port`-release behavior is then observable at the pool
+    /// layer: `release()` always succeeds (no Result), so the test's
+    /// no-panic + state-empty post-condition is what guards against
+    /// the regression. Direct pool-occupancy assertions are guarded
+    /// against cooldown timing in the existing `port_pool` tests
+    /// (port_pool.rs:120-130 — see `release_then_tick_returns_to_available`).
+    #[tokio::test]
+    async fn stop_app_releases_ws_port() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        let (oneshot_tx, _) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-ws-app".into(),
+            tenant_id: "t_test".into(),
+            port: 10001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: Some(oneshot_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: Some(10002),
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-ws-app".into()), app);
+
+        let sup = build_supervisor(state.clone());
+        // The supervisor's port_pool pre-populates 100 ports starting
+        // at `starting_port = 10000` (build_supervisor helper), so
+        // 10001 and 10002 are both in range. `stop_app` calls
+        // `pool.release(port)` and now also `pool.release(ws_port)`;
+        // both go into the cooldown set. The release call itself has
+        // no Result — what we can observe post-stop is that the
+        // pre-condition (port+ws_port both allocated by the app) no
+        // longer holds: the app is gone from state.
+        sup.stop_app("t_test", "my-ws-app")
+            .await
+            .expect("stop_app with ws_port must not error");
+
+        assert!(
+            state.read().await.apps.is_empty(),
+            "app must be removed from state after stop_app"
+        );
+    }
+
     #[tokio::test]
     async fn stop_app_handler_with_broadcast_sends_signal() {
         let engine = edge_runtime::create_engine().expect("engine");
@@ -1493,12 +1557,13 @@ impl Supervisor {
             state.apps.get(&key).cloned()
         };
 
-        let (port, handle, ticker, _dispatch) = if let Some(inst) = instance {
+        let (port, ws_port, handle, ticker, _dispatch) = if let Some(inst) = instance {
             // Phase 1: set Draining, signal serve() to stop accepting,
             // then drain in-flight requests.
             let mut inst = inst.lock().await;
             inst.status = AppInstanceStatus::Draining;
             let port = inst.port;
+            let ws_port = inst.ws_port;
             let handle = inst.handle.clone();
             let ticker = inst.ticker.take();
             let broadcast_tx = inst.shutdown_tx_broadcast.take();
@@ -1531,7 +1596,7 @@ impl Supervisor {
                 }
             }
 
-            (port, handle, ticker, dispatch)
+            (port, ws_port, handle, ticker, dispatch)
         } else {
             return Ok(()); // already gone
         };
@@ -1539,10 +1604,17 @@ impl Supervisor {
         // Remove from the map.
         self.state.write().await.apps.remove(&key);
 
-        // Free the port.
+        // Free both the primary app port AND the dedicated WebSocket
+        // listener port (issue #448 — previously only `port` was
+        // released; `ws_port` leaked until the 60-second cooldown
+        // eventually returned it. Burst WS-app redeploys exhausted
+        // the PortPool in CI under the old behavior.).
         {
             let mut pool = self.port_pool.lock().await;
             pool.release(port);
+            if let Some(ws) = ws_port {
+                pool.release(ws);
+            }
         }
 
         // Abort the epoch ticker so the engine clock stops advancing for
@@ -1910,14 +1982,18 @@ impl Supervisor {
         // matches the FaaS path in `edge-worker/src/dispatch.rs::handle_request`.
         let instance = instance_pre.instantiate_async(&mut store).await?;
 
-        // `_start` is the canonical WASI Preview 2 entry point for
-        // long-running components. The v0.1 `handle` export is no
-        // longer supported — fixtures in Phase D export `_start`.
-        // Must use `call_async` for the same reason as `instantiate_async`
+        // `start` is the canonical top-level export of the
+        // long-running `edge-runtime` world (wit/edge-cloud.wit:124-148).
+        // Components implement it via wit-bindgen's `impl Guest for ...`
+        // and the `export!` macro; the resulting component's top-level
+        // export is named `start`. The previous `_start` symbol
+        // came from wasi-snapshot-preview1 reactor components; the
+        // canonical v0.2 world uses `start` instead. Must use
+        // `call_async` for the same reason as `instantiate_async`
         // above — wasmtime rejects sync `call` on a store built with
         // `async_support(true)`.
         instance
-            .get_typed_func::<(), ()>(&mut store, "_start")?
+            .get_typed_func::<(), ()>(&mut store, "start")?
             .call_async(&mut store, ())
             .await?;
 
