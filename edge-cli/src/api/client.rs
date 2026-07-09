@@ -178,6 +178,55 @@ pub struct DeployResponse {
     /// succeeds, no attestation is recorded.
     #[serde(default)]
     pub build_attestation: Option<serde_json::Value>,
+    /// Preview-id stamped by the control plane (issue #308). Empty
+    /// for non-preview deploys; the CLI echoes it into `.edge/state.json`
+    /// so `edge status` can show which preview a deployment belongs to.
+    #[serde(default)]
+    pub preview_id: String,
+    /// GitHub PR number forwarded by the composite action. Zero for
+    /// non-preview deploys and for laptop `edge deploy --preview` runs
+    /// (no PR linkage). Persisted alongside `preview_id` for parity.
+    #[serde(default)]
+    pub preview_pr_number: u32,
+    /// RFC3339 expiry timestamp for the preview. Empty for non-preview
+    /// deploys. The state file persists this so a `edge status` can
+    /// surface "expires in 5d 12h" without re-querying the server.
+    #[serde(default)]
+    pub preview_expires_at: String,
+}
+
+/// Preview options forwarded to the control plane via the three
+/// `?preview-*` query params (issue #308). Construct via
+/// `PreviewOpts::from_cli` so the CLI-side defaults and validation
+/// stay in one place.
+#[derive(Debug, Clone)]
+pub struct PreviewOpts {
+    pub preview_id: String,
+    pub preview_pr_number: u32,
+    /// Go-style duration string like `"24h"` or `"168h"`. Server
+    /// resolves to an absolute timestamp; the CLI never interprets it
+    /// locally. Empty means "use server default" (currently 168h).
+    pub preview_ttl: String,
+}
+
+impl PreviewOpts {
+    /// Build a `PreviewOpts` from CLI flags. `preview_id` is required
+    /// to be a 8..16-char lowercase hex string (validated server-side;
+    /// the CLI just passes it through). Empty `preview_pr_number` and
+    /// `preview_ttl` map to server defaults — the CLI never errors on
+    /// them; the server-side handler validates and 400s if anything's
+    /// malformed.
+    pub fn new(
+        preview_id: impl Into<String>,
+        preview_pr_number: u32,
+        preview_ttl: impl Into<String>,
+    ) -> Self {
+        Self {
+            preview_id: preview_id.into(),
+            preview_pr_number,
+            preview_ttl: preview_ttl.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,6 +619,7 @@ impl ApiClient {
     /// stability-window promotion. Defaults to false on the wire (the
     /// server rejects unknown query values with 400 rather than
     /// silently coercing typos to false).
+    #[allow(clippy::too_many_arguments)]
     pub fn deploy(
         &self,
         app_name: &str,
@@ -578,6 +628,7 @@ impl ApiClient {
         auto_rollback: bool,
         replicas: usize,
         build_metadata: Option<&serde_json::Value>,
+        preview_opts: Option<&PreviewOpts>,
     ) -> Result<DeployResponse> {
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         // Always parse the URL so we can append optional query params
@@ -606,6 +657,29 @@ impl ApiClient {
             parsed
                 .query_pairs_mut()
                 .append_pair("replicas", &replicas.to_string());
+        }
+        // issue #308: forward preview metadata via the three query
+        // params the server's parsePreviewOpts handler reads. Only
+        // emit `preview-id` when non-empty — the server treats its
+        // presence as the "this is a preview" marker. `pr-number`
+        // and `ttl` are emitted only when their values are
+        // meaningful (non-zero / non-empty).
+        if let Some(opts) = preview_opts {
+            if !opts.preview_id.is_empty() {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("preview-id", &opts.preview_id);
+            }
+            if opts.preview_pr_number > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("preview-pr-number", &opts.preview_pr_number.to_string());
+            }
+            if !opts.preview_ttl.is_empty() {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("preview-ttl", &opts.preview_ttl);
+            }
         }
         url = parsed.to_string();
 

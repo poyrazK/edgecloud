@@ -40,11 +40,21 @@ pub fn run(
     replicas: usize,
     file: Option<&Path>,
     lang: Option<LangArg>,
+    preview_opts: Option<&crate::api::PreviewOpts>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
     }
-    run_upload(path, app, regions, auto_rollback, replicas, file, lang)
+    run_upload(
+        path,
+        app,
+        regions,
+        auto_rollback,
+        replicas,
+        file,
+        lang,
+        preview_opts,
+    )
 }
 
 /// Upload the project's compiled artifact to the control plane.
@@ -60,7 +70,12 @@ pub fn run(
 /// `lang`: optional source-language override. `None` reads the
 /// project's `edge.toml`; `Some(l)` cross-checks the toml against `l`
 /// before resolving the artifact path.
+/// `preview_opts`: when `Some`, the deploy is stamped as a preview
+/// (issue #308) — the server scopes its KV/cache/scheduler under a
+/// per-preview subdirectory and stamps `EDGE_PREVIEW_PR_NUMBER` into
+/// the guest env. `None` for normal deploys.
 #[cfg(feature = "network")]
+#[allow(clippy::too_many_arguments)]
 fn run_upload(
     path: &Path,
     app: &str,
@@ -69,6 +84,7 @@ fn run_upload(
     replicas: usize,
     file: Option<&Path>,
     lang: Option<LangArg>,
+    preview_opts: Option<&crate::api::PreviewOpts>,
 ) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
@@ -139,6 +155,7 @@ fn run_upload(
         auto_rollback,
         replicas,
         build_metadata_json.as_ref(),
+        preview_opts,
     )?;
 
     let live_url = resp.url.clone();
@@ -157,6 +174,13 @@ fn run_upload(
         live_url: live_url.clone(),
         regions: persisted_regions,
         desired_replicas: resp.desired_replicas,
+        // issue #308: persist preview metadata so `edge status` can
+        // surface "expires in 5d 12h" + "PR #123" without re-querying
+        // the server. Defaults (empty / 0) round-trip cleanly on
+        // non-preview deploys.
+        preview_id: resp.preview_id.clone(),
+        preview_pr_number: resp.preview_pr_number,
+        preview_expires_at: resp.preview_expires_at.clone(),
     };
     state.save(path)?;
 
@@ -288,6 +312,9 @@ mod tests {
             // state.json live in state/mod.rs.
             regions: vec![],
             desired_replicas: 0,
+            preview_id: String::new(),
+            preview_pr_number: 0,
+            preview_expires_at: String::new(),
         }
     }
 
@@ -320,6 +347,9 @@ mod tests {
             live_url: String::new(),
             regions: vec![],
             desired_replicas: 0,
+            preview_id: String::new(),
+            preview_pr_number: 0,
+            preview_expires_at: String::new(),
         };
         let got = url_to_print(Some(&s), "myapp");
         assert_eq!(got, None);
