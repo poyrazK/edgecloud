@@ -3,21 +3,15 @@ on:
   pull_request:
     types: [opened, synchronize]
 
-# DISABLED 2026-07-06 — the `Install edge CLI` step in
-# .github/actions/deploy-preview/action.yml installs `cargo install
-# --path ./edge-cli --locked --root "$CARGO_HOME"`, putting the binary at
-# `$CARGO_HOME/bin/edge`, but the next step's `shell: bash` subshell
-# doesn't have `$CARGO_HOME/bin` on `$PATH`. Every PR fails with
-# `edge: command not found` (rc=127) until the action also runs:
+# Preview workflow (issue #308).
 #
-#   - name: Expose edge CLI on PATH
-#     run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-#
-# The `if: false` below hard-skips the job so PRs aren't blocked; a
-# follow-up commit will re-enable once PATH propagation lands.
+# Fires on every PR open/synchronize. Builds the samples/hello wasm,
+# then delegates to .github/actions/deploy-preview which installs
+# the CLI and runs `edge deploy --preview --pr-number=<N>`. The
+# resulting URL is commented back on the PR (when EDGECLOUD_API_KEY
+# is configured — fork PRs lack it and silently no-op).
 jobs:
   deploy-preview:
-    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,15 +21,26 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      # Build the edge CLI into $CARGO_HOME/bin (so the binary is on
-      # PATH for subsequent steps — the composite action's install
-      # step does this too, but we need edge *before* the Build step).
-      # Building from the workspace is safer than piping a remote
-      # install script — no supply-chain risk on every CI run, and
-      # the workspace's resolver pins it to the same version as the
-      # rest of edgeCloud.
+      # Build the edge CLI into $CARGO_HOME/bin. The follow-up step
+      # appends $CARGO_HOME/bin to $GITHUB_PATH so the next bash
+      # subshell can find `edge` (issue #308 — pre-fix, every PR
+      # failed with `edge: command not found` (rc=127)). Building
+      # from the workspace is safer than piping a remote install
+      # script: no supply-chain risk on every CI run, and the
+      # workspace's resolver pins it to the same version as the rest
+      # of edgeCloud.
       - name: Install edge CLI
         run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+
+      - name: Expose edge CLI on PATH
+        # Required for the next step (`edge build`) to find the
+        # binary — `cargo install --root $CARGO_HOME` doesn't update
+        # $PATH for subsequent steps. `$GITHUB_PATH` is a special
+        # file GitHub Actions reads to extend PATH for every later
+        # step in the job. Pre-#308 the comment block at the top of
+        # this file documented this exact fix; with it landed, the
+        # long block is gone.
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       # Build the hello sample (samples/hello/) into a deployable
       # wasm component via the CLI. `edge build` runs the proven
@@ -55,6 +60,14 @@ jobs:
       # which has no `[project]` section, so it would fail to find
       # an edge.toml).
       #
+      # `pr-number` is the GitHub PR number the composite action
+      # forwards to `edge deploy --pr-number=<N>`. The control
+      # plane stamps it into the guest env as
+      # `EDGE_PREVIEW_PR_NUMBER` so samples/hello can render
+      # PR-aware UI. Empty string when the trigger isn't a PR (the
+      # composite's parser is lenient — empty means "no PR
+      # context").
+      #
       # Fork PRs do not receive `secrets.EDGECLOUD_API_KEY` — the
       # composite treats an empty API key as a no-op (writes empty
       # `preview-url`), and the `Comment PR` step's `if:` skips on
@@ -64,6 +77,7 @@ jobs:
         with:
           api-key: ${{ secrets.EDGECLOUD_API_KEY }}
           api-url: ${{ secrets.EDGECLOUD_API_URL }}
+          pr-number: ${{ github.event.pull_request.number }}
           build: 'false'
 
       - name: Comment PR

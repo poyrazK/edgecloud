@@ -13,6 +13,10 @@ inputs:
     description: 'Whether to run `edge build` before deploying. The CLI runs the proven `cargo build` + `wasm-tools component new` recipe (issue #410 — wasi:http@0.2.1 vs 0.2.4). Set to "false" if the caller has already produced the artifact.'
     required: false
     default: 'true'
+  pr-number:
+    description: 'GitHub PR number the workflow forwards to `edge deploy --pr-number=<N>` (issue #308). Empty string when not on a pull_request trigger; the CLI treats empty as "no PR context" and the guest just sees no `EDGE_PREVIEW_PR_NUMBER` env var.'
+    required: false
+    default: ''
   comment-on-pr:
     description: 'When "true", post a comment with the preview URL on the PR that triggered this run. Only meaningful on `pull_request` events.'
     required: false
@@ -38,6 +42,17 @@ runs:
         # edge-cli's only workspace dep is `edge-config`, which cargo
         # resolves from the workspace root.
         cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+
+    # Required for the downstream `edge build` / `edge deploy` steps
+    # to find the binary. `cargo install --root $CARGO_HOME` does NOT
+    # update $PATH for subsequent shell steps (rc=127, `command not
+    # found`). `$GITHUB_PATH` is a special file GitHub Actions reads
+    # to extend PATH for every later step. Pre-#308 this fix lived
+    # in the calling workflow's preamble; inlining it here means
+    # the action is correct when called directly too.
+    - name: Expose edge CLI on PATH
+      shell: bash
+      run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
     - name: Build wasm
       if: inputs.build == 'true'
@@ -80,7 +95,7 @@ runs:
         # Capture merged stdout+stderr to a buffer so the URL parse
         # below can run against the full output regardless of where
         # the CLI wrote it.
-        output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" edge deploy --preview 2>&1) || {
+        output=$(EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" edge deploy --preview --pr-number="${{ inputs.pr-number }}" 2>&1) || {
           rc=$?
           echo "::error::edge deploy --preview failed (rc=$rc)"
           printf '%s\n' "$output"
