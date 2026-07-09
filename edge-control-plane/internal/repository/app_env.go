@@ -94,3 +94,29 @@ func (r *AppEnvRepository) DeleteByApp(ctx context.Context, tenantID, appName st
 	_, err := r.db.ExecContext(ctx, `DELETE FROM app_env WHERE tenant_id = $1 AND app_name = $2`, tenantID, appName)
 	return err
 }
+
+// StreamAll calls fn for every app_env row in the table. Used by the
+// startup plaintext-row check (issue #441) and the admin /secrets/keys
+// plaintext_row_count. Rows are streamed via the database/sql cursor
+// rather than buffered, so memory is bounded regardless of table size.
+// Order is (tenant_id, app_name, env_key) for stable iteration. The
+// callback may return an error to stop iteration early; that error is
+// returned to the caller.
+func (r *AppEnvRepository) StreamAll(ctx context.Context, fn func(domain.AppEnv) error) error {
+	rows, err := r.db.QueryxContext(ctx,
+		`SELECT tenant_id, app_name, env_key, env_value FROM app_env ORDER BY tenant_id, app_name, env_key`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var env domain.AppEnv
+		if err := rows.StructScan(&env); err != nil {
+			return err
+		}
+		if err := fn(env); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}

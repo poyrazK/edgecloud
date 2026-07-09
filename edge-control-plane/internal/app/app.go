@@ -184,6 +184,28 @@ func New(
 		deploymentSvc.SetEnvService(envSvc)
 		trafficSvc.SetEnvDecrypter(secretsEnc)
 		reconcileSvc.SetEnvDecrypter(secretsEnc)
+
+		// Issue #441: refuse to boot when plaintext app_env rows exist.
+		// Operators seed these by SQL migration (legacy) or attacker
+		// with DB write (injection elsewhere). Either way, the CP
+		// must not silently accept them — runtime Decrypt now errors
+		// (commits 1+2), so a plaintext row makes every publish of
+		// that app fail. Better to fail at boot, point operators at
+		// the migration path, and let them explicitly opt-in via
+		// EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true for the migration window.
+		//
+		// context.Background() because the request context hasn't been
+		// minted at startup; a slow COUNT shouldn't be cancellable.
+		n, err := envSvc.CountPlaintextRows(context.Background())
+		if err != nil {
+			log.Fatalf("counting plaintext app_env rows at startup: %v", err)
+		}
+		if n > 0 {
+			if !cfg.Secrets.AllowLegacyPlaintextEnv {
+				log.Fatalf("found %d plaintext app_env rows at startup (issue #441); re-encrypt via POST /api/v1/admin/secrets/re-encrypt or set EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true for the migration window", n)
+			}
+			log.Printf("WARNING: found %d plaintext app_env rows at startup; EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true (issue #441 migration window). Re-encrypt via POST /api/v1/admin/secrets/re-encrypt.", n)
+		}
 	}
 
 	webhookRepo := repository.NewWebhookRepository(db)

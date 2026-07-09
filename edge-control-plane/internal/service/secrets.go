@@ -45,6 +45,7 @@ var ErrPlaintextEnvNotAllowed = errors.New("plaintext env values are not allowed
 // either row tampering or that the keyring lost a key that the row
 // was encrypted with. Re-encrypt will not help; investigate.
 var ErrCiphertextMismatch = errors.New("env ciphertext failed authentication: keyring mismatch or row tampering")
+
 type SecretEncryptor struct {
 	keyring     map[string][]byte // all known keys for decryption
 	activeKeyID string            // which key encrypts new values
@@ -246,4 +247,26 @@ func (sec *SecretEncryptor) ActiveKeyID() string {
 		return ""
 	}
 	return sec.activeKeyID
+}
+
+// LooksLikeCipher reports whether value matches the encrypted shape
+// for some key in this keyring: `kid:hex-nonce:hex-ct` with a kid the
+// encryptor recognizes. Used by the startup plaintext-row check (issue
+// #441) to count legacy plaintext rows without attempting to decrypt
+// every row.
+//
+// Note: this is a SHAPE check, not an integrity check. A tampered row
+// with a valid kid prefix returns true here and surfaces as
+// ErrCiphertextMismatch at Decrypt time — that's the right behavior:
+// shape classification is for triage, integrity is for action.
+func (sec *SecretEncryptor) LooksLikeCipher(value string) bool {
+	if sec == nil || len(sec.keyring) == 0 {
+		return false
+	}
+	parts := strings.SplitN(value, ":", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	_, ok := sec.keyring[parts[0]]
+	return ok
 }

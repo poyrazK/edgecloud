@@ -99,6 +99,61 @@ func TestSecretsAdminHandler_ReEncrypt_WithEncryptionDisabled(t *testing.T) {
 	}
 }
 
+// TestSecretsAdminHandler_ListKeys_IncludesPlaintextCount pins the
+// issue #441 detection surface: when the encryptor is wired AND an
+// envSvc is provided, the response includes plaintext_row_count.
+func TestSecretsAdminHandler_ListKeys_IncludesPlaintextCount(t *testing.T) {
+	enc, _ := service.NewSecretEncryptorFromLegacy("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	envSvc := service.NewEnvService(&mockEnvRepo{})
+	envSvc.SetSecretEncryptor(enc)
+	mux := newSecretsMux(enc, envSvc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/secrets/keys", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	n, ok := resp["plaintext_row_count"]
+	if !ok {
+		t.Fatalf("plaintext_row_count missing from response: %+v", resp)
+	}
+	if n != float64(0) {
+		t.Errorf("plaintext_row_count = %v, want 0 (empty repo)", n)
+	}
+}
+
+// TestSecretsAdminHandler_ReEncrypt_IncludesPlaintextSkipped pins the
+// issue #441 ops surface: re-encrypt counts skipped plaintext rows
+// in the response so operators can verify a clean migration.
+func TestSecretsAdminHandler_ReEncrypt_IncludesPlaintextSkipped(t *testing.T) {
+	enc, _ := service.NewSecretEncryptorFromLegacy("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	mockRepo := &mockEnvRepo{}
+	envSvc := service.NewEnvService(mockRepo)
+	envSvc.SetSecretEncryptor(enc)
+	mux := newSecretsMux(enc, envSvc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/secrets/re-encrypt", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := resp["plaintext_skipped"]; !ok {
+		t.Fatalf("plaintext_skipped missing from response: %+v", resp)
+	}
+}
+
 // mockEnvRepo implements service.EnvRepoInterface with no apps.
 type mockEnvRepo struct{}
 
@@ -112,4 +167,7 @@ func (m *mockEnvRepo) ListByApps(ctx context.Context, tenantID string, appNames 
 func (m *mockEnvRepo) Delete(ctx context.Context, tenantID, appName, key string) error { return nil }
 func (m *mockEnvRepo) ListAllApps(ctx context.Context) ([]string, []string, error) {
 	return nil, nil, nil
+}
+func (m *mockEnvRepo) StreamAll(ctx context.Context, fn func(domain.AppEnv) error) error {
+	return nil
 }

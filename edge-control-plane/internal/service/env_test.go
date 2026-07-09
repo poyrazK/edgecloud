@@ -14,6 +14,7 @@ type mockEnvRepo struct {
 	listByAppsFn  func(ctx context.Context, tenantID string, appNames []string) ([]domain.AppEnv, error)
 	listAllAppsFn func(ctx context.Context) ([]string, []string, error)
 	deleteFn      func(ctx context.Context, tenantID, appName, key string) error
+	streamAllFn   func(ctx context.Context, fn func(domain.AppEnv) error) error
 }
 
 func (m *mockEnvRepo) Set(ctx context.Context, env *domain.AppEnv) error {
@@ -36,6 +37,12 @@ func (m *mockEnvRepo) ListAllApps(ctx context.Context) ([]string, []string, erro
 }
 func (m *mockEnvRepo) Delete(ctx context.Context, tenantID, appName, key string) error {
 	return m.deleteFn(ctx, tenantID, appName, key)
+}
+func (m *mockEnvRepo) StreamAll(ctx context.Context, fn func(domain.AppEnv) error) error {
+	if m.streamAllFn != nil {
+		return m.streamAllFn(ctx, fn)
+	}
+	return nil
 }
 
 func newEnvSvc(repo *mockEnvRepo) *EnvService {
@@ -208,5 +215,105 @@ func TestEnvService_ListEnv_PropagatesError(t *testing.T) {
 	_, err := svc.ListEnv(context.Background(), "t_1", "hello")
 	if !errors.Is(err, want) {
 		t.Errorf("error = %v, want %v", err, want)
+	}
+}
+
+// TestEnvService_CountPlaintextRows verifies the issue #441 startup
+// sweep: every row whose env_value does NOT match the encrypted shape
+// (kid:nonce:ct with a known kid) is counted.
+func TestEnvService_CountPlaintextRows(t *testing.T) {
+	sec, _ := NewSecretEncryptor(testMasterKey)
+	enc, _ := sec.Encrypt("secret")
+
+	repo := &mockEnvRepo{
+		streamAllFn: func(ctx context.Context, fn func(domain.AppEnv) error) error {
+			rows := []domain.AppEnv{
+				{TenantID: "t_1", AppName: "a", EnvKey: "K1", EnvValue: enc},                  // cipher
+				{TenantID: "t_1", AppName: "a", EnvKey: "K2", EnvValue: "plaintext-row"},      // plaintext
+				{TenantID: "t_1", AppName: "a", EnvKey: "K3", EnvValue: ""},                   // empty (plaintext shape)
+				{TenantID: "t_1", AppName: "b", EnvKey: "K1", EnvValue: "k1:hex:hex-unknown"}, // 3-part with unknown kid (plaintext shape)
+			}
+			for _, r := range rows {
+				if err := fn(r); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	svc := newEnvSvc(repo)
+	svc.SetSecretEncryptor(sec)
+
+	n, err := svc.CountPlaintextRows(context.Background())
+	if err != nil {
+		t.Fatalf("CountPlaintextRows: %v", err)
+	}
+	// 1 encrypted + 3 plaintext-shaped (plaintext, empty, 3-part unknown kid)
+	if n != 3 {
+		t.Errorf("CountPlaintextRows = %d, want 3", n)
+	}
+}
+
+// TestEnvService_CountPlaintextRows_NoEncryptor: dev mode (no
+// encryptor wired) returns 0 — there's nothing to be plaintext "against".
+func TestEnvService_CountPlaintextRows_NoEncryptor(t *testing.T) {
+	repo := &mockEnvRepo{
+		streamAllFn: func(ctx context.Context, fn func(domain.AppEnv) error) error {
+			return fn(domain.AppEnv{EnvValue: "anything"})
+		},
+	}
+	svc := newEnvSvc(repo)
+	n, err := svc.CountPlaintextRows(context.Background())
+	if err != nil {
+		t.Fatalf("CountPlaintextRows: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("CountPlaintextRows = %d, want 0 (no encryptor)", n)
+	}
+}
+
+// TestEnvService_ReEncryptAll_SkipsPlaintext: issue #441 — plaintext
+// rows are skipped and counted; only cipher rows are re-encrypted.
+func TestEnvService_ReEncryptAll_SkipsPlaintext(t *testing.T) {
+	sec, _ := NewSecretEncryptor(testMasterKey)
+	enc, _ := sec.Encrypt("secret")
+
+	var setCalls int
+	repo := &mockEnvRepo{
+		listAllAppsFn: func(ctx context.Context) ([]string, []string, error) {
+			return []string{"t_1", "t_1"}, []string{"a", "b"}, nil
+		},
+		listFn: func(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error) {
+			switch appName {
+			case "a":
+				return []domain.AppEnv{{TenantID: "t_1", AppName: "a", EnvKey: "K", EnvValue: enc}}, nil
+			case "b":
+				return []domain.AppEnv{{TenantID: "t_1", AppName: "b", EnvKey: "K", EnvValue: "plaintext-row"}}, nil
+			}
+			return nil, nil
+		},
+		setFn: func(ctx context.Context, env *domain.AppEnv) error {
+			setCalls++
+			if env.EnvValue == "plaintext-row" {
+				t.Errorf("plaintext row must not be re-written (would loop forever): %+v", env)
+			}
+			return nil
+		},
+	}
+	svc := newEnvSvc(repo)
+	svc.SetSecretEncryptor(sec)
+
+	reEncrypted, skipped, err := svc.ReEncryptAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReEncryptAll: %v", err)
+	}
+	if reEncrypted != 1 {
+		t.Errorf("reEncrypted = %d, want 1", reEncrypted)
+	}
+	if skipped != 1 {
+		t.Errorf("plaintextSkipped = %d, want 1", skipped)
+	}
+	if setCalls != 1 {
+		t.Errorf("setCalls = %d, want 1", setCalls)
 	}
 }

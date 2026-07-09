@@ -2934,6 +2934,13 @@ paths:
                     type: string
                   encryption_enabled:
                     type: boolean
+                  # Issue #441: count of app_env rows that don't match
+                  # the encrypted shape (kid:nonce:ct with a known kid).
+                  # Drives the operator migration to /admin/secrets/re-encrypt.
+                  # -1 means the count query errored (see handler).
+                  plaintext_row_count:
+                    type: integer
+                    example: 0
         '401':
           description: Missing or invalid internal token
 
@@ -2953,6 +2960,13 @@ paths:
                 properties:
                   re_encrypted:
                     type: integer
+                  # Issue #441: plaintext rows are already plaintext —
+                  # re-encrypting is a no-op — so they're counted here
+                  # and skipped. A non-zero value after a migration
+                  # run indicates the operator still has legacy rows.
+                  plaintext_skipped:
+                    type: integer
+                    example: 0
                   status:
                     type: string
         '400':
