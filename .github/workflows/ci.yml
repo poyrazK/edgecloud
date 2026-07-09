@@ -24,7 +24,7 @@ jobs:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -92,7 +92,7 @@ jobs:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -129,7 +129,7 @@ jobs:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -166,7 +166,7 @@ jobs:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -234,12 +234,21 @@ jobs:
       run:
         working-directory: edge-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        # setup-go@v6 hard-sets GOTOOLCHAIN=local (v5 used `auto`),
+        # which blocks the silent toolchain auto-upgrade that used to
+        # paper over a go-version mismatch. edge-control-plane/go.mod
+        # requires go >= 1.25.0, so this job must pin a matching Go
+        # explicitly — otherwise `go run` fails with
+        # `go.mod requires go >= 1.25.0 (running go 1.23.12; ...)`.
+        # The other Go jobs (go-fmt, golangci-lint, go-test,
+        # go-test-integration) already pin 1.25.0; this brings
+        # openapi-validate in line.
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version: '1.25.0'
 
       - name: Validate spec coverage
         run: go run ./scripts/openapi_check.go
@@ -253,12 +262,21 @@ jobs:
       run:
         working-directory: edge-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        # setup-node@v5 runs on Node 24 (silences the runner's
+        # Node-20 deprecation warning). The ts-client job never
+        # actually invokes npm/yarn/pnpm — it only needs the Node
+        # toolchain loaded so that bash + git diff work in the
+        # right environment. We omit `node-version:` so the action
+        # defaults to the runner's Node (24); `package-manager-cache`
+        # is set to false explicitly so v5's auto-cache-by-packageManager
+        # heuristic is a no-op even though there's no package.json
+        # in edge-control-plane/.
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          package-manager-cache: false
 
       - name: Generate TypeScript client
         run: bash ./scripts/generate_tsc.sh
@@ -275,10 +293,10 @@ jobs:
       run:
         working-directory: edge-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
@@ -294,10 +312,10 @@ jobs:
       run:
         working-directory: edge-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
@@ -317,15 +335,15 @@ jobs:
       run:
         working-directory: edge-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod/
           key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
@@ -337,7 +355,7 @@ jobs:
         run: go tool cover -func=cover.out
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: go-cover
           path: cover.out
@@ -382,15 +400,15 @@ jobs:
       DATABASE_NAME: edgecloud_test
       DATABASE_SSLMODE: disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
       - name: Cache Go modules
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod/
           key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
@@ -400,7 +418,7 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: go-integration-logs
           path: edge-control-plane/test-logs.txt
@@ -417,7 +435,7 @@ jobs:
   wit-drift-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Diff canonical vs vendored WIT
         run: |
@@ -438,7 +456,7 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check for typos
         uses: crate-ci/typos@v1
@@ -449,7 +467,7 @@ jobs:
   coverage-rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate Cargo.lock
         run: cargo generate-lockfile || true
@@ -466,7 +484,7 @@ jobs:
         run: cargo llvm-cov --lcov --output-path lcov-rust.info --workspace || true
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: lcov-rust
           path: lcov-rust.info
