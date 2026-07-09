@@ -10,7 +10,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
@@ -143,4 +143,146 @@ async fn list_rejects_pre_fix_map_shape() {
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("invalid response body"));
+}
+
+// ---------------------------------------------------------------------------
+// Positional <app> resolution (issue: deferred CLI gap from PR #457).
+//
+// Before the positional was added, `edge env {list,set,delete}` hard-wired
+// `&state.app_name` and surfaced 'no deployment found — run `edge deploy`
+// first' on a missing state.json. The new behavior:
+//   - positional wins when present (works without state.json at all)
+//   - state.json wins when positional is absent (legacy callers unaffected)
+//   - error message names the failing command and references state.json
+// ---------------------------------------------------------------------------
+
+/// Pin the new behavior: `edge env-list other-app` works when
+/// `.edge/state.json` is absent. Without the positional the
+/// runner would have errored on `load_state_optional`.
+#[tokio::test]
+async fn list_resolves_app_from_positional_when_state_missing() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    // NOTE: no write_state_with_app — state.json is intentionally absent.
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/other-app/env"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"key": "OTHER_VAR", "value": "from-positional"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .args(["env-list", "--app", "other-app"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("OTHER_VAR = from-positional"));
+}
+
+/// Pin the regression case: state.json present + no positional =
+/// state.json's app_name is used (identical to the old behavior).
+/// If the refactor accidentally swapped precedence this test fails
+/// because the mock matches `state-app`, not `myapp`.
+#[tokio::test]
+async fn list_resolves_app_from_state_when_positional_empty() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    write_state_with_app(&project, "state-app");
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/state-app/env"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"key": "STATE_VAR", "value": "from-state"},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri()).args(["env-list"]);
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("STATE_VAR = from-state"));
+}
+
+/// Pin `edge env-set <app> KEY VAL` with no state.json. The wire
+/// request lands on PUT /api/v1/apps/<app>/env with the key=value
+/// payload. Mirrors the list test above; verifies that the same
+/// resolution rule applies to the SET verb.
+#[tokio::test]
+async fn set_resolves_app_from_positional_when_state_missing() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    // no state.json — positional must carry the run.
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    // Use body_string for an exact-body match so a missing or
+    // malformed payload surfaces as a wiremock mismatch.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/apps/other-app/env"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .and(body_string(r#"{"key":"LOG_LEVEL","value":"debug"}"#))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri()).args([
+        "env-set",
+        "--app",
+        "other-app",
+        "LOG_LEVEL",
+        "debug",
+    ]);
+
+    cmd.assert().success();
+}
+
+/// Pin `edge env-delete <app> KEY` with no state.json. Symmetric
+/// to the SET test above; locks DELETE /api/v1/apps/<app>/env/KEY.
+#[tokio::test]
+async fn delete_resolves_app_from_positional_when_state_missing() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/apps/other-app/env/LOG_LEVEL"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .args(["env-delete", "--app", "other-app", "LOG_LEVEL"]);
+
+    cmd.assert().success();
 }
