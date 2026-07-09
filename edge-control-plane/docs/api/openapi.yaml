@@ -199,6 +199,22 @@ components:
           type: string
           format: date-time
           example: "2026-01-02T03:04:05Z"
+        last_used:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Most recent time this key authenticated a request. Absent
+            (or null) for keys that have never been used. RFC3339.
+          example: "2026-07-08T11:23:45Z"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Absolute expiry timestamp. Absent (or null) for keys
+            that do not expire.
+          example: "2027-01-01T00:00:00Z"
 
     UpdateAPIKeyRequest:
       type: object
@@ -375,6 +391,44 @@ components:
           type: string
           description: SHA-256 of the Wasm artifact (lowercase hex).
           example: 3a2f5e4b6c1d...
+        signature:
+          type: string
+          description: |
+            Ed25519 signature over `sha256_raw_32_bytes || deployment_id`
+            (lowercase hex of the artifact SHA-256, then the deployment
+            id). base64url, no padding.
+          example: 5c1e9b...
+        signing_key_id:
+          type: string
+          description: |
+            Operator-chosen kid identifying which Ed25519 public key from
+            the worker keyring should verify the signature.
+          example: prod-2026-q3
+        regions:
+          type: array
+          items: { type: string }
+          example: [us-east-1, eu-west-1]
+        auto_rollback_enabled:
+          type: boolean
+          example: false
+        desired_replicas:
+          type: integer
+          description: |
+            Number of workers that should run this deployment in each
+            region (issue #316). 0 means no threshold.
+          example: 0
+        build_attestation:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: SLSA L1 DSSE envelope (issue #307 PR2).
+        url:
+          type: string
+          description: |
+            Public ingress hostname computed from `tenant_id` + `app_name`
+            via `domain.IngressHost`. Always present in
+            status / list / active responses.
+          example: https://web-app.t_abc123.edgecloud.dev
         created_at:
           type: string
           format: date-time
@@ -652,13 +706,18 @@ components:
           type: string
           example: debug
 
-    EnvMap:
-      type: object
-      additionalProperties:
-        type: string
-      example:
-        LOG_LEVEL: debug
-        NODE_ENV: production
+    EnvList:
+      type: array
+      items:
+        type: object
+        required: [key, value]
+        properties:
+          key:
+            type: string
+            example: LOG_LEVEL
+          value:
+            type: string
+            example: debug
 
     # -------------------------------------------------------------------------
     # Egress
@@ -2041,11 +2100,13 @@ paths:
           description: Unique name of the app within the tenant.
       responses:
         '200':
-          description: Map of environment variable key-value pairs.
+          description: |
+            Array of environment variable key-value pairs, sorted
+            alphabetically by key.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EnvMap'
+                $ref: '#/components/schemas/EnvList'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':

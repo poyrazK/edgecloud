@@ -1089,6 +1089,20 @@ export interface components {
              * @example 2026-01-02T03:04:05Z
              */
             created_at?: string;
+            /**
+             * Format: date-time
+             * @description Most recent time this key authenticated a request. Absent
+             *     (or null) for keys that have never been used. RFC3339.
+             * @example 2026-07-08T11:23:45Z
+             */
+            last_used?: string | null;
+            /**
+             * Format: date-time
+             * @description Absolute expiry timestamp. Absent (or null) for keys
+             *     that do not expire.
+             * @example 2027-01-01T00:00:00Z
+             */
+            expires_at?: string | null;
         };
         UpdateAPIKeyRequest: {
             /**
@@ -1224,6 +1238,45 @@ export interface components {
              * @example 3a2f5e4b6c1d...
              */
             hash?: string;
+            /**
+             * @description Ed25519 signature over `sha256_raw_32_bytes || deployment_id`
+             *     (lowercase hex of the artifact SHA-256, then the deployment
+             *     id). base64url, no padding.
+             * @example 5c1e9b...
+             */
+            signature?: string;
+            /**
+             * @description Operator-chosen kid identifying which Ed25519 public key from
+             *     the worker keyring should verify the signature.
+             * @example prod-2026-q3
+             */
+            signing_key_id?: string;
+            /**
+             * @example [
+             *       "us-east-1",
+             *       "eu-west-1"
+             *     ]
+             */
+            regions?: string[];
+            /** @example false */
+            auto_rollback_enabled?: boolean;
+            /**
+             * @description Number of workers that should run this deployment in each
+             *     region (issue #316). 0 means no threshold.
+             * @example 0
+             */
+            desired_replicas?: number;
+            /** @description SLSA L1 DSSE envelope (issue */
+            build_attestation?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * @description Public ingress hostname computed from `tenant_id` + `app_name`
+             *     via `domain.IngressHost`. Always present in
+             *     status / list / active responses.
+             * @example https://web-app.t_abc123.edgecloud.dev
+             */
+            url?: string;
             /**
              * Format: date-time
              * @example 2026-01-02T03:04:05Z
@@ -1453,15 +1506,12 @@ export interface components {
             /** @example debug */
             value: string;
         };
-        /**
-         * @example {
-         *       "LOG_LEVEL": "debug",
-         *       "NODE_ENV": "production"
-         *     }
-         */
-        EnvMap: {
-            [key: string]: string;
-        };
+        EnvList: {
+            /** @example LOG_LEVEL */
+            key: string;
+            /** @example debug */
+            value: string;
+        }[];
         EgressAllowlist: {
             /**
              * @description Outbound hostname allowlist. Empty array means allow-all (no restriction). Each entry is either an exact FQDN (`api.stripe.com`) or a single-level wildcard pattern (`*.sendgrid.net`). Entries are stored lowercase.
@@ -2607,13 +2657,16 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Map of environment variable key-value pairs. */
+            /**
+             * @description Array of environment variable key-value pairs, sorted
+             *     alphabetically by key.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["EnvMap"];
+                    "application/json": components["schemas"]["EnvList"];
                 };
             };
             401: components["responses"]["Unauthorized"];
