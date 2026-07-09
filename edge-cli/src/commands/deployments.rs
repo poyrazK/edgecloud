@@ -25,10 +25,7 @@ pub fn run(path: &Path) -> Result<()> {
         for d in deployments {
             println!(
                 "{:<12} {:<10} {:<20} {}",
-                d.id,
-                d.status,
-                d.created_at,
-                d.url.unwrap_or_default()
+                d.id, d.status, d.created_at, d.url,
             );
         }
     }

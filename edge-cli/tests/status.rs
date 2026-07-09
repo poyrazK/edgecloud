@@ -401,7 +401,7 @@ async fn status_no_arg_routes_to_deployment_subcommand() {
             "id": "d_irrelevant",
             "status": "active",
             "created_at": "2026-06-26T00:00:00Z",
-            "url": null,
+            "url": "https://t_test-myapp.edgecloud.dev",
         })))
         .expect(1)
         .mount(&server)

@@ -694,6 +694,8 @@ mod tests {
             name: "default".into(),
             role: "owner".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: None,
+            expires_at: None,
         }];
         let rendered = render_key_list(&keys, Some("k_abc"));
         assert!(rendered.contains("(current)"));
@@ -706,6 +708,8 @@ mod tests {
             name: "default".into(),
             role: "owner".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: None,
+            expires_at: None,
         }];
         let rendered = render_key_list(&keys, None);
         assert!(!rendered.contains("(current)"));
@@ -725,12 +729,16 @@ mod tests {
                 name: "first".into(),
                 role: "viewer".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
+                last_used: None,
+                expires_at: None,
             },
             APIKeySummary {
                 id: "k_002".into(),
                 name: "second".into(),
                 role: "developer".into(),
                 created_at: "2026-06-01T00:00:00Z".into(),
+                last_used: None,
+                expires_at: None,
             },
         ];
         let rendered = render_key_list(&keys, Some("k_002"));
