@@ -74,6 +74,13 @@ fn sample_dir() -> PathBuf {
 /// Build the sample from scratch and return the path to the
 /// wrapped component. Cleans the sample's `target/` first so
 /// re-runs don't get a stale `target/component.wasm`.
+///
+/// We set `CARGO_TARGET_DIR=<sample>/target` for the `cargo build`
+/// invocation so the output lands at the expected path. Without
+/// that, the repo's `.cargo/config.toml` (which sets
+/// `build.target-dir = "$HOME/.cache/edgecloud-cargo"`) would route
+/// the output to the shared target dir and the per-test path
+/// assertion would fail.
 fn build_sample() -> PathBuf {
     let sample = sample_dir();
     let target = sample.join("target");
@@ -85,6 +92,7 @@ fn build_sample() -> PathBuf {
     let cargo_status = Command::new(cargo_bin().expect("cargo on PATH"))
         .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
         .current_dir(&sample)
+        .env("CARGO_TARGET_DIR", &target)
         .status()
         .expect("spawn cargo");
     assert!(

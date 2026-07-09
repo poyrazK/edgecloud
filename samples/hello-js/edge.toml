@@ -2,6 +2,9 @@
 name = "hello-js"
 version = "0.1.0"
 target = "wasm32-wasip2"
+# FaaS world: the QuickJS runtime exports `wasi:http/incoming-handler`,
+# the worker calls it per request via `wasmtime_wasi_http::ProxyPre`.
+world = "edge-runtime-handler"
 language = "js"
 
 [deployment]

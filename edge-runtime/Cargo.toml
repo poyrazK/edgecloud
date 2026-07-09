@@ -76,6 +76,12 @@ wit-parser = "0.217"
 semver = "1"
 tempfile = "3"
 temp-env = "0.3"
+# For the FaaS roundtrip test in tests/js_fixture_load.rs.
+# `bytes` provides the body buffer; `http-body-util` provides the
+# `Empty` body constructor. Both are transitively present via
+# `wasmtime-wasi-http` but the test references them by name.
+bytes = "1"
+http-body-util = "0.1"
 
 [features]
 # Default features gate only modules that still exist in

@@ -303,8 +303,16 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     }
 
     // 4. Componentize with wasm-tools
-    let core_wasm = runtime_dir.join("target/wasm32-wasip1/release/edge_js_runtime.wasm");
-    let adapter = runtime_dir.join("wasi_snapshot_preview1.reactor.wasm");
+    //
+    // The runtime's `cargo build --target wasm32-wasip1 --release`
+    // honors `CARGO_TARGET_DIR` (and the repo's `.cargo/config.toml`
+    // sets it to `$HOME/.cache/edgecloud-cargo` for shared builds
+    // across worktrees). Don't hardcode `<runtime_dir>/target/...`
+    // — that's the default only when no `CARGO_TARGET_DIR` is set;
+    // in the dev loop the artifact lives under
+    // `$CARGO_TARGET_DIR/wasm32-wasip1/release/`.
+    let core_wasm = resolve_runtime_core_wasm(&runtime_dir)?;
+    let adapter = resolve_wasi_adapter()?;
 
     let artifact = path_for(path, project_name, "js").context("resolving JS artifact path")?;
     if let Some(parent) = artifact.parent() {
@@ -334,6 +342,64 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the on-disk path of the wasm32-wasip1 core module that
+/// `cargo build` (above) produced. Probes three locations in order:
+///
+/// 1. `$CARGO_TARGET_DIR/wasm32-wasip1/release/...` — set explicitly
+///    by the parent (rare for a CLI invocation).
+/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/...` —
+///    the shared target dir pinned by the repo's
+///    `.cargo/config.toml` (`build.target-dir`).
+/// 3. `<runtime_dir>/target/wasm32-wasip1/release/...` — the
+///    per-crate default when no `CARGO_TARGET_DIR` is set.
+///
+/// The repo's `.cargo/config.toml` is *not* read by the child
+/// process directly — `build.target-dir` is a cargo-internal
+/// setting that's applied only when cargo runs. The shared target
+/// dir is the common case for the dev loop, so we probe it
+/// explicitly.
+fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = "edge_js_runtime.wasm";
+    let rel = |base: std::path::PathBuf| base.join("wasm32-wasip1").join("release").join(name);
+
+    let mut tried: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
+        let candidate = rel(std::path::PathBuf::from(t));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = rel(std::path::PathBuf::from(format!(
+            "{home}/.cache/edgecloud-cargo"
+        )));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    let default = rel(runtime_dir.join("target"));
+    if default.exists() {
+        return Ok(default);
+    }
+    tried.push(default);
+
+    anyhow::bail!(
+        "expected core wasm at one of:\n  - {}\n  - <CARGO_TARGET_DIR>/wasm32-wasip1/release/{name}\n\
+         Checked (in order):\n{}",
+        tried.first().map(|p| p.display().to_string()).unwrap_or_default(),
+        tried
+            .iter()
+            .map(|p| format!("  - {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// Resolve the edge-js-runtime crate directory.
 fn resolve_runtime_dir() -> Result<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("EDGE_JS_RUNTIME_DIR") {
@@ -355,6 +421,77 @@ fn resolve_runtime_dir() -> Result<std::path::PathBuf> {
     anyhow::bail!(
         "Cannot find edge-js-runtime/ crate. Set EDGE_JS_RUNTIME_DIR \
          or run from within the edgecloud monorepo."
+    )
+}
+
+/// Locate the `wasi_snapshot_preview1.reactor.wasm` adapter that
+/// `wasm-tools component new --adapt <path>` needs to wrap a
+/// `wasm32-wasip1` core module as a WASI Preview 2 component. The
+/// adapter is shipped by the
+/// `wasi-preview1-component-adapter-provider` crate, but it lives
+/// inside the cargo registry cache (under
+/// `$CARGO_HOME/registry/src/...`), not next to `edge-js-runtime`.
+///
+/// `EDGE_JS_WASI_ADAPTER` overrides the search; the default is to
+/// glob `$CARGO_HOME/registry/src/index.crates.io-*/wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.reactor.wasm`
+/// and return the first match.
+fn resolve_wasi_adapter() -> Result<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("EDGE_JS_WASI_ADAPTER") {
+        let path = std::path::PathBuf::from(&p);
+        if path.exists() {
+            return Ok(path);
+        }
+        anyhow::bail!("EDGE_JS_WASI_ADAPTER points at {p}, but that file does not exist");
+    }
+
+    // `CARGO_HOME` if set, else `$HOME/.cargo` (the conventional
+    // default; `cargo` itself uses this when the env var is unset).
+    let cargo_home = match std::env::var("CARGO_HOME") {
+        Ok(s) => s,
+        Err(_) => match std::env::var("HOME") {
+            Ok(h) => format!("{h}/.cargo"),
+            Err(_) => anyhow::bail!("neither CARGO_HOME nor HOME is set"),
+        },
+    };
+    let registry = std::path::Path::new(&cargo_home)
+        .join("registry")
+        .join("src");
+
+    // The index subdir name varies by host (e.g.
+    // `index.crates.io-1949cf8c6b5b557f`); walk one level deep,
+    // then look for the `wasi-preview1-component-adapter-provider-*`
+    // crate (matches all semver patch versions) and check for the
+    // artefact.
+    let entries = std::fs::read_dir(&registry).context(format!(
+        "reading cargo registry at {} (is the host's cache set up?)",
+        registry.display()
+    ))?;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(subs) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for sub in subs {
+            let Ok(sub) = sub else { continue };
+            let name = sub.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("wasi-preview1-component-adapter-provider-") {
+                let candidate = sub
+                    .path()
+                    .join("artefacts")
+                    .join("wasi_snapshot_preview1.reactor.wasm");
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Cannot find the wasi-preview1 adapter in {}. \
+         Run `cargo fetch` first, or set EDGE_JS_WASI_ADAPTER to the \
+         absolute path of wasi_snapshot_preview1.reactor.wasm.",
+        registry.display()
     )
 }
 

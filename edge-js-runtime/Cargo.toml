@@ -21,6 +21,24 @@ path = "src/lib.rs"
 wit-bindgen = "0.45"
 # rquickjs with bindgen feature
 rquickjs = { version = "0.9.0", features = ["bindgen"] }
+# `OnceCell` for the cached bytecode blob — see lib.rs::USER_BYTECODE.
+once_cell = "1.19"
+
+[dev-dependencies]
+# Host-target criterion bench; runs on the dev machine, not wasm32.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "plotters", "rayon"] }
+
+# Inert feature — when enabled, `register_all_stub` becomes available
+# so the `warm_vs_cold` bench can use the same `globalThis.EdgeCloud`
+# shape as the wasm-target runtime. Not enabled by `cargo build`
+# (which targets wasm32 and would otherwise pull in unused code).
+[features]
+bench = []
+
+[[bench]]
+name = "warm_vs_cold"
+harness = false
+required-features = ["bench"]
 
 [profile.release]
 opt-level = "s"
