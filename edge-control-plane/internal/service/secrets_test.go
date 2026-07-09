@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -156,24 +157,30 @@ func TestRotation_NewKeyDecryptsOldValues(t *testing.T) {
 	}
 }
 
-func TestDecrypt_UnknownKeyID_ReturnsPlaintext(t *testing.T) {
+func TestDecrypt_UnknownKeyID_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	sec, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
 
 	// Value that looks like new format but with unknown key_id.
+	// Issue #441: this used to silently pass through; now it returns
+	// ErrPlaintextEnvNotAllowed because we can't tell plaintext-with-colons
+	// from ciphertext-with-a-removed-kid.
 	enc := "unknown_key:0102030405060708090a0b0c0d0e0f10:aabbccdd"
 
-	dec, err := sec.Decrypt(enc)
-	if err != nil {
-		t.Fatalf("Decrypt with unknown key_id: %v", err)
+	_, err := sec.Decrypt(enc)
+	if err == nil {
+		t.Fatal("Decrypt with unknown key_id should error (issue #441), got nil")
 	}
-	if dec != enc {
-		t.Errorf("expected pass-through for unknown key_id, got %q", dec)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
+	}
+	if errors.Is(err, ErrCiphertextMismatch) {
+		t.Errorf("unknown-kid should NOT also be ErrCiphertextMismatch (kid was never in keyring)")
 	}
 }
 
-func TestDecrypt_OldFormatWithRemovedKey(t *testing.T) {
+func TestDecrypt_OldFormatWithRemovedKey_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	// Encrypt with key1, then remove key1 from keyring.
 	sec1, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
@@ -189,48 +196,55 @@ func TestDecrypt_OldFormatWithRemovedKey(t *testing.T) {
 		"key2": testKey2,
 	})
 
-	// Should return as-is (legacy plaintext passthrough).
-	dec, err := sec2.Decrypt(enc)
-	if err != nil {
-		t.Fatalf("Decrypt after key removal: %v", err)
+	// Issue #441: no key in the new keyring matches the encrypted value
+	// (kid is in keyring-less old format = 2 parts). This previously
+	// silently passed through as plaintext; now it returns ErrPlaintextEnvNotAllowed.
+	_, err = sec2.Decrypt(enc)
+	if err == nil {
+		t.Fatal("Decrypt after key removal should error (issue #441), got nil")
 	}
-	if dec != enc {
-		t.Errorf("expected pass-through for value encrypted with removed key, got %q", dec)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
 	}
 }
 
-func TestDecrypt_LegacyPlaintext(t *testing.T) {
+func TestDecrypt_LegacyPlaintext_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	sec, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
 
+	// Issue #441: legacy plaintext (no colons) used to silently pass
+	// through. Now it returns ErrPlaintextEnvNotAllowed so operators
+	// discover the row on the first read.
 	legacy := "DATABASE_URL=postgres://user:pass@host:5432/db"
-	dec, err := sec.Decrypt(legacy)
-	if err != nil {
-		t.Fatalf("Decrypt: %v", err)
+	_, err := sec.Decrypt(legacy)
+	if err == nil {
+		t.Fatal("Decrypt on legacy plaintext should error (issue #441), got nil")
 	}
-	if dec != legacy {
-		t.Errorf("expected pass-through, got %q", dec)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
 	}
 }
 
-func TestDecrypt_PlaintextWithColon(t *testing.T) {
+func TestDecrypt_PlaintextWithColon_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	sec, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
 
-	// Plaintext with colon must pass through.
+	// Issue #441: plaintext with internal colons (key:value:with:colons)
+	// has 4 parts after SplitN — the default branch returns
+	// ErrPlaintextEnvNotAllowed. Previously this passed through.
 	plaintext := "key:value:with:colons"
-	dec, err := sec.Decrypt(plaintext)
-	if err != nil {
-		t.Fatalf("Decrypt: %v", err)
+	_, err := sec.Decrypt(plaintext)
+	if err == nil {
+		t.Fatal("Decrypt on plaintext-with-colons should error (issue #441), got nil")
 	}
-	if dec != plaintext {
-		t.Errorf("expected pass-through, got %q", dec)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
 	}
 }
 
-func TestDecrypt_TamperedCiphertext(t *testing.T) {
+func TestDecrypt_TamperedCiphertext_ReturnsErrCiphertextMismatch(t *testing.T) {
 	sec, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
@@ -240,20 +254,24 @@ func TestDecrypt_TamperedCiphertext(t *testing.T) {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	// Flip a byte in the ciphertext portion.
+	// Flip a byte in the ciphertext portion. The kid is still in the
+	// keyring so the kid-known branch fires, then GCM auth fails.
 	parts := strings.SplitN(enc, ":", 3)
 	tampered := parts[0] + ":" + parts[1] + ":deadbeef" + parts[2][8:]
 
-	dec, err := sec.Decrypt(tampered)
-	if err != nil {
-		t.Fatalf("Decrypt(tampered) should passthrough: %v", err)
+	_, err = sec.Decrypt(tampered)
+	if err == nil {
+		t.Fatal("Decrypt on tampered ciphertext should error, got nil")
 	}
-	if dec != tampered {
-		t.Errorf("expected pass-through for tampered value, got %q", dec)
+	if !errors.Is(err, ErrCiphertextMismatch) {
+		t.Errorf("err = %v, want ErrCiphertextMismatch (tamper, not plaintext)", err)
+	}
+	if errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("tampered cipher must NOT be classified as ErrPlaintextEnvNotAllowed")
 	}
 }
 
-func TestDecrypt_WrongKey(t *testing.T) {
+func TestDecrypt_WrongKey_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	sec1, _ := NewSecretEncryptorFromConfig("key1", map[string]string{
 		"key1": testMasterKey,
 	})
@@ -266,12 +284,16 @@ func TestDecrypt_WrongKey(t *testing.T) {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	dec, err := sec2.Decrypt(enc)
-	if err != nil {
-		t.Fatalf("Decrypt with wrong key should passthrough: %v", err)
+	// Issue #441: sec2 doesn't have key1 in its keyring. The value is
+	// 3-part with an unknown kid — the unknown-kid branch returns
+	// ErrPlaintextEnvNotAllowed. (Previously this silently passed the
+	// ciphertext through as plaintext, which is the defect being fixed.)
+	_, err = sec2.Decrypt(enc)
+	if err == nil {
+		t.Fatal("Decrypt with key missing from keyring should error (issue #441), got nil")
 	}
-	if dec != enc {
-		t.Errorf("expected pass-through, got %q", dec)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
 	}
 }
 

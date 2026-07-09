@@ -117,7 +117,7 @@ func TestEnvService_ListEnv_Decrypts(t *testing.T) {
 	}
 }
 
-func TestEnvService_ListEnv_LegacyPlaintext(t *testing.T) {
+func TestEnvService_ListEnv_LegacyPlaintext_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {
 	sec, _ := NewSecretEncryptor(testMasterKey)
 
 	repo := &mockEnvRepo{
@@ -130,12 +130,14 @@ func TestEnvService_ListEnv_LegacyPlaintext(t *testing.T) {
 	svc := newEnvSvc(repo)
 	svc.SetSecretEncryptor(sec)
 
-	envs, err := svc.ListEnv(context.Background(), "t_1", "hello")
-	if err != nil {
-		t.Fatalf("ListEnv: %v", err)
+	// Issue #441: legacy plaintext rows now error at Decrypt time.
+	// ListEnv wraps the per-row decrypt error.
+	_, err := svc.ListEnv(context.Background(), "t_1", "hello")
+	if err == nil {
+		t.Fatal("ListEnv on legacy plaintext should error (issue #441), got nil")
 	}
-	if envs[0].EnvValue != "legacy-plaintext" {
-		t.Errorf("legacy plaintext should pass through; got %q", envs[0].EnvValue)
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed in chain", err)
 	}
 }
 
