@@ -593,7 +593,13 @@ func TestNewWithSecretsConfig(t *testing.T) {
 			"k1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 	}
-	db, _ := newMockDB(t)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	// Issue #441: with secrets configured, the startup plaintext check
+	// calls CountPlaintextRows → StreamAll. Expect the query and
+	// return zero rows so the check passes (n=0, no plaintext).
+	mock.ExpectQuery(`SELECT tenant_id, app_name, env_key, env_value FROM app_env ORDER BY tenant_id, app_name, env_key`).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
 	publisher := &nats.NATSPublisher{}
 	artifactStore := storage.NewFSArtifactStore(artifactPath)
 
@@ -603,6 +609,9 @@ func TestNewWithSecretsConfig(t *testing.T) {
 	}
 	if app.Handler == nil {
 		t.Fatal("Handler is nil")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
 

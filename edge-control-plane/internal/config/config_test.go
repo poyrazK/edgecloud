@@ -207,6 +207,52 @@ func TestBundledConfig_FailsStartup(t *testing.T) {
 	}
 }
 
+// TestLoad_AllowLegacyPlaintextEnv_DefaultsFalse pins the fail-closed
+// default for issue #441: when EDGE_ALLOW_LEGACY_PLAINTEXT_ENV is unset
+// (or any non-bool value), the field is false. Operators must opt in
+// explicitly to the migration window.
+func TestLoad_AllowLegacyPlaintextEnv_DefaultsFalse(t *testing.T) {
+	t.Setenv("EDGE_ALLOW_LEGACY_PLAINTEXT_ENV", "")
+	path := writeConfig(t, "jwt:\n  secret: \""+strings.Repeat("a", 32)+"\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Secrets.AllowLegacyPlaintextEnv {
+		t.Errorf("AllowLegacyPlaintextEnv = true, want false (default)")
+	}
+}
+
+// TestLoad_AllowLegacyPlaintextEnv_BindsTrue pins the env-var binding
+// for EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true. Used at startup to relax
+// the plaintext-row fail-fast during the migration window.
+func TestLoad_AllowLegacyPlaintextEnv_BindsTrue(t *testing.T) {
+	t.Setenv("EDGE_ALLOW_LEGACY_PLAINTEXT_ENV", "true")
+	path := writeConfig(t, "jwt:\n  secret: \""+strings.Repeat("a", 32)+"\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Secrets.AllowLegacyPlaintextEnv {
+		t.Errorf("AllowLegacyPlaintextEnv = false, want true (env opt-in)")
+	}
+}
+
+// TestLoad_AllowLegacyPlaintextEnv_RejectsInvalid pins the parse guard:
+// a non-bool value (e.g. "yes") must surface as a Load error so a
+// typo doesn't silently turn into "false" or "true".
+func TestLoad_AllowLegacyPlaintextEnv_RejectsInvalid(t *testing.T) {
+	t.Setenv("EDGE_ALLOW_LEGACY_PLAINTEXT_ENV", "yes")
+	path := writeConfig(t, "jwt:\n  secret: \""+strings.Repeat("a", 32)+"\"\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load with EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=yes should error")
+	}
+	if !strings.Contains(err.Error(), "EDGE_ALLOW_LEGACY_PLAINTEXT_ENV") {
+		t.Errorf("error %q should mention the env var name", err.Error())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Storage backend selection — issue #127 (cross-region artifact replication)
 //

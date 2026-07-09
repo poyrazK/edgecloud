@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,16 +15,37 @@ import (
 // with a keyring that supports zero-downtime key rotation.
 //
 // The active key (ActiveKeyID) encrypts new values; all keys in the
-// keyring are attempted for decryption. Old-format values (without a
-// key_id prefix) are handled via backward-compatible fallback.
+// keyring are attempted for decryption.
 //
-// Ciphertext format:
+// Ciphertext formats:
 //   - New:  <key_id>:<hex-nonce>:<hex-ciphertext+tag>
-//   - Old:  <hex-nonce>:<hex-ciphertext+tag>
-//   - Legacy plaintext: any value without two colons
+//   - Old:  <hex-nonce>:<hex-ciphertext+tag>  (no kid; tried against every key)
+//
+// Decrypt never returns plaintext. Stored values that don't match the
+// ciphertext shape return ErrPlaintextEnvNotAllowed — issue #441 closes
+// the silent-passthrough path that previously let operators (or
+// attackers with DB write) seed plaintext env rows that decrypted
+// cleanly. Cipher rows whose kid IS in the keyring but whose GCM tag
+// fails (tamper, wrong-key, corruption) return ErrCiphertextMismatch so
+// operators can distinguish "run re-encrypt" from "page a human".
 //
 // A nil SecretEncryptor is a no-op: Encrypt/Decrypt return the value
 // unchanged. This lets development setups run without encryption keys.
+
+// ErrPlaintextEnvNotAllowed is returned by Decrypt when the stored
+// value is not in any recognized ciphertext shape. Issue #441: the CP
+// must refuse to publish plaintext env values; run
+// POST /api/v1/admin/secrets/re-encrypt to migrate legacy rows, or
+// set EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true at startup as a temporary
+// migration escape (warning logged, not enforced).
+var ErrPlaintextEnvNotAllowed = errors.New("plaintext env values are not allowed; re-encrypt via POST /api/v1/admin/secrets/re-encrypt or set EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true")
+
+// ErrCiphertextMismatch is returned by Decrypt when the value has a
+// recognized kid prefix but AES-GCM authentication fails. This signals
+// either row tampering or that the keyring lost a key that the row
+// was encrypted with. Re-encrypt will not help; investigate.
+var ErrCiphertextMismatch = errors.New("env ciphertext failed authentication: keyring mismatch or row tampering")
+
 type SecretEncryptor struct {
 	keyring     map[string][]byte // all known keys for decryption
 	activeKeyID string            // which key encrypts new values
@@ -112,16 +134,10 @@ func (sec *SecretEncryptor) Encrypt(plaintext string) (string, error) {
 
 // Decrypt reverses Encrypt. Supports both old format (<nonce>:<ct>) and
 // new format (<key_id>:<nonce>:<ct>). Values that don't match either format
-// (legacy plaintext) are returned as-is.
+// return ErrPlaintextEnvNotAllowed (issue #441). Cipher rows whose kid is
+// in the keyring but whose GCM tag fails return ErrCiphertextMismatch.
 //
-// Backward compatibility:
-//   - New-format values (3 parts) are decrypted with the key identified by key_id.
-//     If the key_id is unknown, the value is treated as legacy plaintext (passthrough).
-//   - Old-format values (2 parts) are tried against every key in the keyring.
-//     If none succeeds, the value is treated as legacy plaintext (passthrough).
-//   - Legacy plaintext (0-1 parts, or unrecognized) is returned unchanged.
-//
-// A nil SecretEncryptor returns value unchanged.
+// A nil SecretEncryptor returns value unchanged (dev mode).
 func (sec *SecretEncryptor) Decrypt(value string) (string, error) {
 	if sec == nil || len(sec.keyring) == 0 {
 		return value, nil
@@ -131,23 +147,25 @@ func (sec *SecretEncryptor) Decrypt(value string) (string, error) {
 
 	switch len(parts) {
 	case 3:
-		// New format or plaintext-with-two-colons.
+		// New format: kid:nonce:ct.
 		keyID := parts[0]
 		if key, ok := sec.keyring[keyID]; ok {
 			result, err := sec.decryptWithKey(key, parts[1], parts[2])
 			if err == nil {
 				return result, nil
 			}
-			// Invalid ciphertext for this key. Could be plaintext that happens
-			// to have two colons. Fall through to passthrough.
+			// Kid IS in the keyring but GCM auth failed: row tampering,
+			// wrong-key, or corruption. NOT plaintext — return the
+			// distinct sentinel so operators can tell this apart from
+			// "just re-encrypt me".
+			return value, fmt.Errorf("%w: kid=%q", ErrCiphertextMismatch, keyID)
 		}
-		// Unknown key_id: the value might be plaintext containing colons,
-		// or was encrypted with a now-removed key. Return as-is.
-		return value, nil
+		// Unknown kid: this is plaintext that happens to contain two
+		// colons (a connection string, a credential, etc.). Reject
+		// rather than silently pass through.
+		return value, fmt.Errorf("%w: 3-part value with unknown kid %q", ErrPlaintextEnvNotAllowed, keyID)
 	case 2:
-		// Old format or legacy plaintext with colon(s).
-		// Try each key in the keyring. Order doesn't matter for correctness,
-		// but try the active key first for speed.
+		// Old format (no kid): try every key in the keyring.
 		ordered := make([][]byte, 0, len(sec.keyring))
 		if sec.activeKey != nil {
 			ordered = append(ordered, sec.activeKey)
@@ -159,19 +177,22 @@ func (sec *SecretEncryptor) Decrypt(value string) (string, error) {
 		}
 		for _, key := range ordered {
 			nonceHex, ctHex := parts[0], parts[1]
-			if len(parts) == 3 {
-				nonceHex, ctHex = parts[1], parts[2]
-			}
 			result, err := sec.decryptWithKey(key, nonceHex, ctHex)
 			if err == nil {
 				return result, nil
 			}
 		}
-		// Couldn't decrypt with any key — legacy plaintext passthrough.
-		return value, nil
+		// No key matched — either plaintext containing a colon, or a
+		// row encrypted with a key that has been removed from the
+		// keyring. Issue #441: in the latter case the operator needs
+		// to re-add the key and re-encrypt, not be silently handed
+		// the plaintext. We surface this as plaintext-rejected (it
+		// is observably not a ciphertext this keyring can read) —
+		// the failure mode is the same: the row cannot be decrypted.
+		return value, fmt.Errorf("%w: 2-part value with no keyring match", ErrPlaintextEnvNotAllowed)
 	default:
-		// 0 or 1 parts: definitely legacy plaintext.
-		return value, nil
+		// 0 or 1 parts: definitely plaintext.
+		return value, fmt.Errorf("%w: %d-part value", ErrPlaintextEnvNotAllowed, len(parts))
 	}
 }
 
@@ -226,4 +247,27 @@ func (sec *SecretEncryptor) ActiveKeyID() string {
 		return ""
 	}
 	return sec.activeKeyID
+}
+
+// LooksLikeCipher reports whether value has the three-part shape
+// `<kid>:<nonce>:<ct>` and the leading kid is one this encryptor's
+// keyring recognizes. The nonce and ct contents are NOT validated
+// (decoding them is part of the integrity check at Decrypt time).
+// Used by the startup plaintext-row check (issue #441) to count
+// legacy plaintext rows without attempting to decrypt every row.
+//
+// Note: this is a SHAPE check, not an integrity check. A tampered row
+// with a valid kid prefix returns true here and surfaces as
+// ErrCiphertextMismatch at Decrypt time — that's the right behavior:
+// shape classification is for triage, integrity is for action.
+func (sec *SecretEncryptor) LooksLikeCipher(value string) bool {
+	if sec == nil || len(sec.keyring) == 0 {
+		return false
+	}
+	parts := strings.SplitN(value, ":", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	_, ok := sec.keyring[parts[0]]
+	return ok
 }

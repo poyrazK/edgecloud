@@ -208,7 +208,10 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 	if err != nil {
 		return fmt.Errorf("listing env vars: %w", err)
 	}
-	envMap := buildEnvMap(envs, s.envDecrypter)
+	envMap, err := buildEnvMap(envs, s.envDecrypter)
+	if err != nil {
+		return err
+	}
 
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil || tenant == nil {
@@ -285,7 +288,10 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	if err != nil {
 		return fmt.Errorf("listing env vars: %w", err)
 	}
-	envMap := buildEnvMap(envs, s.envDecrypter)
+	envMap, err := buildEnvMap(envs, s.envDecrypter)
+	if err != nil {
+		return err
+	}
 
 	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 	if err != nil || tenant == nil {
@@ -383,18 +389,24 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 // buildEnvMap converts a slice of AppEnv rows into a map, decrypting values
 // when a decrypter is provided. Used by both publishClearTaskUpdate and
 // publishTaskUpdate.
-func buildEnvMap(envs []domain.AppEnv, dec TrafficEnvDecrypter) map[string]string {
+//
+// Issue #441: a decrypt error (ErrPlaintextEnvNotAllowed or
+// ErrCiphertextMismatch) is now propagated rather than swallowed —
+// publishing plaintext env values to workers would defeat the entire
+// secrets encryption model. Callers bubble the error up to the publish
+// boundary, which fails the activate / rollback / reconcile.
+func buildEnvMap(envs []domain.AppEnv, dec TrafficEnvDecrypter) (map[string]string, error) {
 	m := make(map[string]string, len(envs))
 	for _, e := range envs {
 		v := e.EnvValue
 		if dec != nil {
-			if d, err := dec.Decrypt(e.EnvValue); err == nil {
-				v = d
+			d, err := dec.Decrypt(e.EnvValue)
+			if err != nil {
+				return nil, fmt.Errorf("decrypting env %s: %w", e.EnvKey, err)
 			}
-			// Decrypt error: fall through with plaintext so decrypter
-			// misconfiguration doesn't break publishes.
+			v = d
 		}
 		m[e.EnvKey] = v
 	}
-	return m
+	return m, nil
 }

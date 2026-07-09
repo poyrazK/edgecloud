@@ -21,6 +21,10 @@ type DBTX interface {
 	// can do single-row reads from inside a CTE / RETURNING without
 	// having to switch to *sqlx.DB at the call site.
 	QueryRowxContext(ctx context.Context, query string, args ...any) *sqlx.Row
+	// QueryxContext returns *sqlx.Rows for multi-row streaming.
+	// Used by AppEnvRepository.StreamAll (issue #441 startup plaintext
+	// count) so we can iterate large tables with bounded memory.
+	QueryxContext(ctx context.Context, query string, args ...any) (*sqlx.Rows, error)
 }
 
 // NewDB creates a new database connection.

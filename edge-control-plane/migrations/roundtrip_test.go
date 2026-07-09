@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 54 // 27 .up.sql + 27 .down.sql on current main (after 024_billing_subscriptions_relax_customer_id, issue #419 review)
+const splitFileCount = 66 // 33 .up.sql + 33 .down.sql on current main (after 025_app_env_plaintext_audit, issue #441 PR #462 follow-up)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -308,5 +309,47 @@ func TestClearTraffic_NoActiveDeployment_Noop(t *testing.T) {
 	err := svc.ClearTraffic(context.Background(), "t_1", "hello")
 	if err != nil {
 		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+// TestBuildEnvMap_PlaintextRowReturnsError (issue #441): a plaintext
+// env row must NOT be silently passed through to a worker via
+// publishClearTaskUpdate / publishTaskUpdate. The plaintext sentinel
+// surfaces from Decrypt and buildEnvMap propagates it.
+func TestBuildEnvMap_PlaintextRowReturnsError(t *testing.T) {
+	envs := []domain.AppEnv{
+		{TenantID: "t_1", AppName: "hello", EnvKey: "API_KEY", EnvValue: "legacy-plaintext"},
+	}
+	// Real encryptor (not nil) so the plaintext branch is exercised.
+	sec, err := NewSecretEncryptor(testMasterKey)
+	if err != nil {
+		t.Fatalf("NewSecretEncryptor: %v", err)
+	}
+
+	got, err := buildEnvMap(envs, sec)
+	if err == nil {
+		t.Fatal("buildEnvMap should return error on plaintext row (issue #441), got nil")
+	}
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed in chain", err)
+	}
+	if got != nil {
+		t.Errorf("map should be nil on error, got %v", got)
+	}
+}
+
+// TestBuildEnvMap_NilDecrypter_PassesThrough is the dev-mode shape:
+// when no encryptor is configured, raw env values go into the map
+// unchanged (mirrors the nil-encryptor early-return in Decrypt).
+func TestBuildEnvMap_NilDecrypter_PassesThrough(t *testing.T) {
+	envs := []domain.AppEnv{
+		{TenantID: "t_1", AppName: "hello", EnvKey: "RAW", EnvValue: "raw-value"},
+	}
+	got, err := buildEnvMap(envs, nil)
+	if err != nil {
+		t.Fatalf("buildEnvMap(nil dec): %v", err)
+	}
+	if got["RAW"] != "raw-value" {
+		t.Errorf("nil-decrypter passthrough broken, got %q", got["RAW"])
 	}
 }

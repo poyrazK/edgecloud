@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -15,6 +16,8 @@ type EnvRepoInterface interface {
 	Delete(ctx context.Context, tenantID, appName, key string) error
 	// ListAllApps returns all distinct (tenant_id, app_name) pairs.
 	ListAllApps(ctx context.Context) ([]string, []string, error)
+	// StreamAll iterates every row in the table (issue #441).
+	StreamAll(ctx context.Context, fn func(domain.AppEnv) error) error
 }
 
 // EnvService handles environment variable business logic.
@@ -113,40 +116,70 @@ func (s *EnvService) DecryptEnvMapBulk(ctx context.Context, tenantID string, app
 
 // ReEncryptAll decrypts every env value across all tenants and re-encrypts
 // with the current active key. Used after key rotation to migrate old-format
-// or old-key values to the new key. Returns the total number of values
-// re-encrypted. Safe to run concurrently with active deploys — each env
-// value is read-decrypt-write under the row's upsert semantics.
-func (s *EnvService) ReEncryptAll(ctx context.Context) (int, error) {
+// or old-key values to the new key. Safe to run concurrently with active
+// deploys — each env value is read-decrypt-write under the row's upsert
+// semantics.
+//
+// Issue #441: plaintext rows (legacy or seeded via SQL migration) are
+// already plaintext, so re-encrypting them is a no-op. We count them
+// (plaintextSkipped) and move on. Hard decrypt errors (cipher mismatch)
+// still abort the sweep — those rows need investigation, not silent
+// rewrite. The (reEncrypted, plaintextSkipped, err) return shape lets
+// the admin handler surface both counts.
+func (s *EnvService) ReEncryptAll(ctx context.Context) (reEncrypted, plaintextSkipped int, err error) {
 	if s.encryptor == nil {
-		return 0, fmt.Errorf("encryption is disabled (no key configured)")
+		return 0, 0, fmt.Errorf("encryption is disabled (no key configured)")
 	}
 
 	tenants, apps, err := s.appEnvRepo.ListAllApps(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("listing apps: %w", err)
+		return 0, 0, fmt.Errorf("listing apps: %w", err)
 	}
 
-	var total int
 	for i := range tenants {
 		rows, err := s.appEnvRepo.List(ctx, tenants[i], apps[i])
 		if err != nil {
-			return total, fmt.Errorf("listing env for %s/%s: %w", tenants[i], apps[i], err)
+			return reEncrypted, plaintextSkipped, fmt.Errorf("listing env for %s/%s: %w", tenants[i], apps[i], err)
 		}
 		for _, row := range rows {
 			decrypted, err := s.encryptor.Decrypt(row.EnvValue)
-			if err != nil {
-				return total, fmt.Errorf("decrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+			if errors.Is(err, ErrPlaintextEnvNotAllowed) {
+				plaintextSkipped++
+				continue
 			}
-			reEncrypted, err := s.encryptor.Encrypt(decrypted)
 			if err != nil {
-				return total, fmt.Errorf("re-encrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+				return reEncrypted, plaintextSkipped, fmt.Errorf("decrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
 			}
-			row.EnvValue = reEncrypted
+			reEncryptedVal, err := s.encryptor.Encrypt(decrypted)
+			if err != nil {
+				return reEncrypted, plaintextSkipped, fmt.Errorf("re-encrypting %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+			}
+			row.EnvValue = reEncryptedVal
 			if err := s.appEnvRepo.Set(ctx, &row); err != nil {
-				return total, fmt.Errorf("writing %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
+				return reEncrypted, plaintextSkipped, fmt.Errorf("writing %s/%s/%s: %w", tenants[i], apps[i], row.EnvKey, err)
 			}
-			total++
+			reEncrypted++
 		}
 	}
-	return total, nil
+	return reEncrypted, plaintextSkipped, nil
+}
+
+// CountPlaintextRows streams every app_env row and counts how many do
+// NOT match the encrypted shape for some key in the keyring. Used at
+// startup (issue #441: refuse to boot when n>0 unless
+// EDGE_ALLOW_LEGACY_PLAINTEXT_ENV=true) and on GET /admin/secrets/keys
+// (plaintext_row_count field). Returns 0 immediately when the encryptor
+// is nil (dev mode — there's nothing to be plaintext "against").
+func (s *EnvService) CountPlaintextRows(ctx context.Context) (int, error) {
+	if s.encryptor == nil {
+		return 0, nil
+	}
+	n := 0
+	err := s.appEnvRepo.StreamAll(ctx, func(env domain.AppEnv) error {
+		if !s.encryptor.LooksLikeCipher(env.EnvValue) {
+			n++
+		}
+		return nil
+	})
+	return n, err
 }

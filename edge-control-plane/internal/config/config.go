@@ -183,10 +183,15 @@ type JWTConfig struct {
 
 // SecretsConfig configures envelope encryption with a keyring.
 // ActiveKeyID selects which key encrypts new values; all keys in
-// the map are available for decryption.
+// the map are available for decryption. AllowLegacyPlaintextEnv is
+// the issue #441 migration escape: when true, the CP will boot even
+// if plaintext app_env rows exist (logged as WARNING). Runtime
+// Decrypt still returns ErrPlaintextEnvNotAllowed for plaintext
+// rows — the flag relaxes startup, not reads.
 type SecretsConfig struct {
-	ActiveKeyID string            `yaml:"active_key_id"`
-	Keys        map[string]string `yaml:"keys"`
+	ActiveKeyID             string            `yaml:"active_key_id"`
+	Keys                    map[string]string `yaml:"keys"`
+	AllowLegacyPlaintextEnv bool              `yaml:"allow_legacy_plaintext_env"`
 }
 
 // RateLimitConfig controls per-tenant and per-IP rate limiting.
@@ -334,6 +339,17 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("EDGE_SECRETS_ACTIVE_KEY_ID"); v != "" {
 		cfg.Secrets.ActiveKeyID = v
+	}
+	// EDGE_ALLOW_LEGACY_PLAINTEXT_ENV: issue #441 migration escape.
+	// When set to a truthy value, the CP will boot even if plaintext
+	// app_env rows exist (logged as WARNING). Runtime Decrypt is
+	// unaffected — the flag relaxes startup, not reads. Default false.
+	if v := os.Getenv("EDGE_ALLOW_LEGACY_PLAINTEXT_ENV"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("EDGE_ALLOW_LEGACY_PLAINTEXT_ENV must be a valid boolean: %w", err)
+		}
+		cfg.Secrets.AllowLegacyPlaintextEnv = b
 	}
 	// EDGE_SECRETS_KEY_<ID> env vars override entries in cfg.Secrets.Keys.
 	for _, e := range os.Environ() {
