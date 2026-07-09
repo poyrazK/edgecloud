@@ -4,16 +4,17 @@ mod edge_modules;
 
 // Generate bindings matching the handler world.
 //
-// The `path` argument points at the canonical WIT under the `edge-runtime`
-// crate, not at the (now-removed) repo-root `wit/` copy. There is only one
-// canonical `edge-cloud.wit` in this repo, sourced from
-// `edge-runtime/src/wit/edge-cloud.wit` — keeping both crates bound to the
-// same canonical file prevents the two copies from drifting the way they
-// did before issue #422. The `wasi:cli/command@0.2.1` include + seven
-// `edge:cloud/*` imports are declared in that file.
+// The `path` points at the repo-root canonical `wit/` (promoted to
+// top-level by PR #414 and consumed by samples/hello, edge-js-runtime,
+// and edge-worker/test fixtures; mirrored into
+// `edge-control-plane/internal/service/wit/` for the Go control plane's
+// embed.FS). The wit-drift-check CI job fails the build if the two
+// copies diverge. The `wasi:cli/command@0.2.1` include + the seven
+// `edge:cloud/*` imports (kv-store, cache, observe, time, scheduling,
+// process, websocket) are declared in that file.
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
-    path: "../edge-runtime/src/wit",
+    path: "../wit",
     generate_all,
 });
 
