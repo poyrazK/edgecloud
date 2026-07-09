@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/stripe"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -62,6 +64,14 @@ type App struct {
 	// without cache push (existing behavior).
 	DeploymentSvc *service.DeploymentService
 	AutoscaleSvc  *autoscale.Service
+
+	// loopHealth tracks liveness of every background goroutine spawned
+	// by RunBackground (heartbeat, log_gc, reconcile, worker_gc,
+	// deployment_gc, autoscale). It also drives the per-loop map on
+	// /health so operators can see degraded state without scraping
+	// logs. See internal/loophealth for the package contract. Related
+	// to issue #443.
+	loopHealth *loophealth.Tracker
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -117,9 +127,16 @@ func New(
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
 	metricsAgg := service.NewMetricsAggregator()
+	// loopHealth tracks liveness of every background goroutine. It must
+	// be constructed before the services that need to feed it (so the
+	// heartbeat drain and autoscaler can call Beat/RecordPanic), and
+	// the same instance is reused by the /health closure and the App
+	// struct (issue #443 review findings #3 and #4).
+	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
 		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
+		loopHealth,
 	)
 	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
 	// Materialize the canonical WIT tree at startup. The MigrationService
@@ -210,6 +227,7 @@ func New(
 			DeployRepo: activeDeploymentRepo,
 			EventRepo:  autoscaleEventRepo,
 			Cloud:      cloud,
+			Tracker:    loopHealth,
 		})
 	}
 
@@ -260,6 +278,17 @@ func New(
 	// Health check — pings the database (and optionally NATS) so load
 	// balancers and orchestrators stop routing traffic to a control plane
 	// instance with a dead database connection (issue #142).
+	//
+	// On success the body includes a per-loop "loops" map sourced from
+	// the loophealth tracker (issue #443): if any background loop has
+	// panicked or gone stale, status becomes "degraded" (still 200 so
+	// load balancers don't pull the CP from rotation for a non-fatal
+	// heartbeat panic) and degraded_reasons lists the affected loop
+	// names. 503 is reserved for DB/NATS failures, same as before.
+	//
+	// The tracker is built once near the top of New() and threaded
+	// into the services that feed it; the closure below captures the
+	// same instance to read liveness for the response body.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		if err := db.PingContext(r.Context()); err != nil {
 			log.Printf("Health check: DB ping failed: %v", err)
@@ -278,8 +307,32 @@ func New(
 				return
 			}
 		}
+		// Build the extended healthy body. Even on the "ok" path we
+		// include the per-loop map so operators always see the same
+		// shape — the existing `{"status":"ok"}` field stays first for
+		// backward compatibility with clients that parse the JSON.
+		snapshot := loopHealth.Snapshot()
+		loops := make(map[string]loophealth.State, len(snapshot))
+		var degradedReasons []string
+		for _, s := range snapshot {
+			loops[s.Name] = s
+			if s.Panics > 0 || s.Stale {
+				degradedReasons = append(degradedReasons, s.Name)
+			}
+		}
+		status := "ok"
+		if len(degradedReasons) > 0 {
+			status = "degraded"
+		}
+		body := map[string]any{
+			"status": status,
+			"loops":  loops,
+		}
+		if len(degradedReasons) > 0 {
+			body["degraded_reasons"] = degradedReasons
+		}
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(body)
 	})
 
 	// OpenAPI spec — served as raw YAML
@@ -557,38 +610,69 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
+		loopHealth:    loopHealth,
 	}
+}
+
+// newLoopHealth constructs the per-loop liveness tracker used by
+// RunBackground and the /health handler. The staleness threshold is
+// tunable via LOOP_STALE_AFTER (default loophealth.DefaultStaleAfter).
+func newLoopHealth() *loophealth.Tracker {
+	tr := loophealth.NewTracker()
+	if d := parseDurationEnv("LOOP_STALE_AFTER", 0); d > 0 {
+		tr.SetStaleAfter(d)
+	}
+	return tr
 }
 
 // RunBackground starts all background goroutines. Call once the HTTP server
 // is running. Cancelling ctx tears all goroutines down cleanly.
+//
+// Every loop is wrapped in loophealth.Tracker.Run / RunErr, which spawns
+// the body in its own goroutine, recovers panics, logs the stack via
+// the loop's per-service prefix, and bumps a per-loop counter that the
+// /health handler surfaces. Without this, a panic in the heartbeat
+// consumer (issue #443's most-critical loop) would kill the goroutine
+// silently while /health kept reporting "ok".
 func (a *App) RunBackground(ctx context.Context) {
-	// NATS heartbeat subscriber for worker lifecycle management
-	go func() {
-		if err := a.WorkerSvc.SubscribeHeartbeats(ctx); err != nil {
-			log.Printf("Worker heartbeat subscription error: %v", err)
-		}
-	}()
+	logPrintf := log.Printf // local alias for the stdlib log adapter
 
 	// Log retention GC. Tunable via env (LOG_GC_INTERVAL, LOG_RETENTION).
 	logGCInterval := parseDurationEnv("LOG_GC_INTERVAL", time.Hour)
 	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
-	go a.LogGC.Run(ctx, logGCInterval, logRetention)
+	a.loopHealth.Run(ctx, "log_gc", "log_gc: ", logPrintf, func(c context.Context) {
+		a.LogGC.Run(c, logGCInterval, logRetention)
+	})
 
 	// Periodic full-state reconcile (issue #53). Tunable via RECONCILE_INTERVAL.
 	reconcileInterval := parseDurationEnv("RECONCILE_INTERVAL", 5*time.Minute)
-	go a.ReconcileSvc.Run(ctx, reconcileInterval)
+	a.loopHealth.Run(ctx, "reconcile", "reconcile: ", logPrintf, func(c context.Context) {
+		a.ReconcileSvc.Run(c, reconcileInterval)
+	})
 
 	// Stale worker GC. Tunable via env (WORKER_GC_INTERVAL, WORKER_MAX_AGE).
 	workerGCInterval := parseDurationEnv("WORKER_GC_INTERVAL", 5*time.Minute)
 	workerMaxAge := parseDurationEnv("WORKER_MAX_AGE", 15*time.Minute)
-	go a.WorkerGC.Run(ctx, workerGCInterval, workerMaxAge)
+	a.loopHealth.Run(ctx, "worker_gc", "worker_gc: ", logPrintf, func(c context.Context) {
+		a.WorkerGC.Run(c, workerGCInterval, workerMaxAge)
+	})
 
 	// Deployment GC. Deletes old deployments that are no longer active.
 	// Tunable via env (DEPLOY_GC_INTERVAL, DEPLOY_RETENTION).
 	deployGCInterval := parseDurationEnv("DEPLOY_GC_INTERVAL", 1*time.Hour)
 	deployRetention := parseDurationEnv("DEPLOY_RETENTION", 7*24*time.Hour)
-	go a.DeploymentGC.Run(ctx, deployGCInterval, deployRetention)
+	a.loopHealth.Run(ctx, "deployment_gc", "deployment_gc: ", logPrintf, func(c context.Context) {
+		a.DeploymentGC.Run(c, deployGCInterval, deployRetention)
+	})
+
+	// NATS heartbeat subscriber for worker lifecycle management.
+	// SubscribeHeartbeats spawns two inner goroutines itself (channel
+	// monitor + drain). The inner drain also has its own recover
+	// helper in service/worker.go (heartbeatRecover) since the outer
+	// wrapper here can't see panics inside it.
+	a.loopHealth.RunErr(ctx, "heartbeat", "heartbeat: ", logPrintf, func(c context.Context) error {
+		return a.WorkerSvc.SubscribeHeartbeats(c)
+	})
 
 	// Preview GC (issue #308). Reclaims expired preview
 	// deployments (rows + their artifact blobs). The retention
@@ -601,13 +685,22 @@ func (a *App) RunBackground(ctx context.Context) {
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
-	// is false — Subscribe returns nil immediately.
+	// is false — Subscribe returns nil immediately. The autoscale
+	// package uses log/slog rather than stdlib log, so we route the
+	// recovered-panic log through slog.Default() with structured attrs.
+	// slog.Logger.Error treats msg as a literal — the panic value and
+	// stack must be pre-formatted and passed as a "err" attr (review
+	// finding #2).
 	if a.AutoscaleSvc != nil {
-		go func() {
-			if err := a.AutoscaleSvc.Subscribe(ctx); err != nil {
-				log.Printf("autoscale subscription error: %v", err)
-			}
-		}()
+		slogErr := func(format string, args ...any) {
+			slog.Default().Error("autoscale: loop panic recovered",
+				"loop", "autoscale",
+				"err", fmt.Sprintf(format, args...),
+			)
+		}
+		a.loopHealth.RunErr(ctx, "autoscale", "autoscale: ", slogErr, func(c context.Context) error {
+			return a.AutoscaleSvc.Subscribe(c)
+		})
 	}
 }
 

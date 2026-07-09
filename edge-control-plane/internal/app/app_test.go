@@ -4,10 +4,13 @@ import (
 	"context"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -270,6 +273,315 @@ func TestRunBackground_DoesNotPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	app.RunBackground(ctx) // must not panic
+}
+
+// TestRunBackground_GoroutinesStart replaces the smoke-only behavior of
+// the original TestRunBackground_DoesNotPanic: the prior test used a
+// pre-cancelled ctx with a zero-value NATS publisher, so the heartbeat
+// and autoscale goroutines exited before doing anything and the four
+// GC loops only ran their "refuses to start on invalid intervals" code
+// path.
+//
+// This test verifies the same shape via the loophealth tracker directly:
+// wrapping the real GC services would need a real DB (the sqlmock has
+// no expectations registered for the SQL statements those loops issue,
+// which would block), so we exercise RunErr/Run wrappers in isolation
+// with stub bodies that mirror how RunBackground uses them.
+func TestRunBackground_WrappersRegisterAndRecover(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, _ := newMockDB(t)
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Mirror the wrapper invocations RunBackground would issue, but
+	// with bodies that don't touch the database. This verifies the
+	// tracker registration + panic recovery path of the wrappers.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.loopHealth.RunErr(ctx, "heartbeat", "heartbeat: ", func(string, ...any) {}, func(c context.Context) error {
+			<-c.Done()
+			return nil
+		})
+	}()
+	go func() {
+		app.loopHealth.Run(ctx, "log_gc", "log_gc: ", func(string, ...any) {}, func(c context.Context) {
+			<-c.Done()
+		})
+	}()
+
+	// Let wrappers enter their bodies (synchronously registers and sets running=true).
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+	time.Sleep(20 * time.Millisecond)
+
+	snap := app.loopHealth.Snapshot()
+	have := map[string]bool{}
+	for _, s := range snap {
+		have[s.Name] = true
+		if s.Panics != 0 {
+			t.Errorf("loop %s panicked %d times", s.Name, s.Panics)
+		}
+		if s.Running {
+			t.Errorf("loop %s still running after ctx cancel", s.Name)
+		}
+		if s.StartedAt == "" {
+			t.Errorf("loop %s missing started_at", s.Name)
+		}
+	}
+	for _, name := range []string{"heartbeat", "log_gc"} {
+		if !have[name] {
+			t.Errorf("expected loop %q in snapshot, got %v", name, snap)
+		}
+	}
+}
+
+// TestRunBackground_PanicInLogGCIsRecovered verifies that a panic inside
+// a GC loop body is recovered by the wrapper, counted, and logged —
+// without killing the other loops. We use the loophealth.Tracker.Run
+// helper directly because injecting a panic into the real LogGCService
+// would require a sqlmock dance that's brittle across refactors.
+func TestRunBackground_PanicInLogGCIsRecovered(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, _ := newMockDB(t)
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Simulate a panicking log_gc run. Run spawns its own goroutine
+	// (review finding #1 fix), so we poll for the panic counter to
+	// bump rather than waiting on a done channel.
+	app.loopHealth.Run(ctx, "log_gc", "log_gc: ", func(string, ...any) {
+		// discard — the LogFn path is exercised by loophealth_test.go
+	}, func(c context.Context) {
+		panic("forced panic in log_gc")
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.loopHealth.Get("log_gc").Panics() == 1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	cancel()
+
+	if got := app.loopHealth.Get("log_gc").Panics(); got != 1 {
+		t.Errorf("log_gc.Panics = %d, want 1", got)
+	}
+	if app.loopHealth.Get("log_gc").Running() {
+		t.Errorf("expected log_gc.Running=false after panic")
+	}
+
+	// Other loops should still be unaffected (untouched).
+	for _, name := range []string{"reconcile", "worker_gc", "deployment_gc", "heartbeat", "autoscale"} {
+		if got := app.loopHealth.Get(name).Panics(); got != 0 {
+			t.Errorf("%s.Panics = %d, want 0", name, got)
+		}
+	}
+}
+
+// TestHealth_HealthyReturns200 verifies the default /health response
+// shape: 200 + status=ok + loops map populated.
+func TestHealth_HealthyReturns200(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	// Allow PingContext to succeed.
+	mock.ExpectPing()
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	// Pre-populate the tracker so the loops map is non-empty.
+	// Run is now non-blocking (wrapper spawns its own goroutine), so
+	// poll for the body to have entered before the GET — otherwise
+	// the goroutine may not have registered the loop yet and the
+	// assertion races the scheduler.
+	app.loopHealth.Run(context.Background(), "log_gc", "log_gc: ", func(string, ...any) {}, func(context.Context) {})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !app.loopHealth.Get("log_gc").StartedAt().IsZero() {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if app.loopHealth.Get("log_gc").StartedAt().IsZero() {
+		t.Fatalf("log_gc loop never entered within 2s (tracker race after Run wrapper change)")
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["status"]; got != "ok" {
+		t.Errorf("status = %v, want ok", got)
+	}
+	loops, ok := body["loops"].(map[string]any)
+	if !ok {
+		t.Fatalf("loops field missing or wrong type: %v", body["loops"])
+	}
+	if _, exists := loops["log_gc"]; !exists {
+		t.Errorf("loops map missing log_gc entry: %v", loops)
+	}
+	if _, hasReasons := body["degraded_reasons"]; hasReasons {
+		t.Errorf("degraded_reasons should be absent on healthy response: %v", body)
+	}
+}
+
+// TestHealth_DegradedAfterLoopPanic verifies the new behavior: any loop
+// with panics>0 (or stale) flips status to "degraded" but stays 200 so
+// load balancers don't pull the CP from rotation.
+func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	mock.ExpectPing()
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	// Drive a real recovered panic through the wrapper so the test
+	// exercises the production panic-recovery path (review finding #4
+	// fix: the heartbeat drain now bumps the counter via the tracker
+	// field on WorkerService). Run is now non-blocking — poll for
+	// the counter to bump.
+	app.loopHealth.Run(context.Background(), "heartbeat", "heartbeat: ", func(string, ...any) {}, func(c context.Context) {
+		panic("forced for /health degraded test")
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.loopHealth.Get("heartbeat").Panics() == 1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if app.loopHealth.Get("heartbeat").Panics() != 1 {
+		t.Fatalf("heartbeat.Panics = %d, want 1 (recovered panic did not register)", app.loopHealth.Get("heartbeat").Panics())
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (degraded must stay 200); body=%s", rr.Code, rr.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["status"]; got != "degraded" {
+		t.Errorf("status = %v, want degraded", got)
+	}
+	reasons, ok := body["degraded_reasons"].([]any)
+	if !ok {
+		t.Fatalf("degraded_reasons field missing or wrong type: %v", body["degraded_reasons"])
+	}
+	if len(reasons) != 1 || reasons[0] != "heartbeat" {
+		t.Errorf("degraded_reasons = %v, want [heartbeat]", reasons)
+	}
+}
+
+// TestHealth_UnhealthyOnDBPingFailure preserves the existing 503
+// behavior: a failed DB ping must still produce status=unhealthy so
+// load balancers pull this instance from rotation.
+func TestHealth_UnhealthyOnDBPingFailure(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	mock.ExpectPing().WillReturnError(errDBPingFailed)
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["status"]; got != "unhealthy" {
+		t.Errorf("status = %v, want unhealthy", got)
+	}
+	if body["loops"] != nil {
+		t.Errorf("unhealthy response should not include loops map, got: %v", body["loops"])
+	}
+}
+
+// TestHealth_BackwardCompatibleStatusCode verifies that the response
+// shape on the healthy path still includes status="ok" as a string
+// field (so any operator script that grep'd for "ok" still works).
+func TestHealth_BackwardCompatibleStatusCode(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	mock.ExpectPing()
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"status":"ok"`) {
+		t.Errorf("body missing status=ok: %s", rr.Body.String())
+	}
+}
+
+// errDBPingFailed is a sentinel used to force the sqlmock PingContext
+// to return an error in TestHealth_UnhealthyOnDBPingFailure. Plain
+// errors.New matches the repo convention used in api_key_test.go and
+// deployment_regions_test.go:710.
+var errDBPingFailed = errors.New("forced ping failure")
+
+// newMockDBWithMock is a helper that returns the sqlx.DB and the
+// underlying sqlmock so individual tests can configure expectations
+// (Ping success/failure, etc.).
+func newMockDBWithMock(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
+	t.Helper()
+	mockDB, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	sqlxDB := sqlx.NewDb(mockDB, "postgres")
+	return sqlxDB, mock, func() { _ = sqlxDB.Close() }
 }
 
 func TestNewWithSecretsConfig(t *testing.T) {
