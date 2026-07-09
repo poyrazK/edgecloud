@@ -72,33 +72,40 @@ fn test_transform_rust_emits_wasi_socket_calls() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // The Rust transformer prepends a use block with the
-    // wasi::socket::tcp::TcpSocket and wasi::socket::udp::UdpSocket
-    // imports. The prelude may use either the full path or the
-    // shorter in-scope form (after the import); both are valid.
+    // `crate::wasi::sockets::tcp_create_socket::create_tcp_socket`
+    // import (matching the wit-bindgen 0.45 binding tree; see issue
+    // #417). The prelude always emits this exact import line — the
+    // older `use wasi::socket::tcp::TcpSocket;` form is gone.
     assert!(
-        stdout.contains("wasi::socket::tcp::TcpSocket")
-            || stdout.contains("use wasi::socket::tcp::TcpSocket"),
-        "expected wasi::socket::tcp::TcpSocket prelude, got:\n{}",
+        stdout.contains("crate::wasi::sockets::tcp_create_socket::create_tcp_socket"),
+        "expected crate::wasi::sockets::tcp_create_socket::create_tcp_socket import, got:\n{}",
         stdout
     );
 
-    // The TcpBind rewrite must appear in the transformed source.
-    // After the `use` prelude, the transformer may emit the
-    // fully-qualified form (`wasi::socket::tcp::TcpSocket::new`) or
-    // the in-scope form (`TcpSocket::new`); both are correct.
+    // The TcpBind rewrite now uses the bindgen-0.45 free-function
+    // factory `create_tcp_socket(IpAddressFamily::Ipv4)` instead of
+    // the older adapter-API `TcpSocket::new(AddressFamily::Ipv4)`.
     assert!(
-        stdout.contains("TcpSocket::new("),
-        "expected TcpSocket::new( rewrite, got:\n{}",
+        stdout.contains("create_tcp_socket("),
+        "expected create_tcp_socket( emit, got:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("AddressFamily::Ipv4"),
-        "expected AddressFamily::Ipv4 in rewrite, got:\n{}",
+        stdout.contains("IpAddressFamily::Ipv4"),
+        "expected IpAddressFamily::Ipv4 (bindgen-0.45 case) in emit, got:\n{}",
         stdout
     );
     assert!(
         stdout.contains(".start_bind("),
         "expected .start_bind( rewrite, got:\n{}",
+        stdout
+    );
+
+    // The prelude now exposes parse_addr_v4 as an inline helper so
+    // the address literal can be routed through it.
+    assert!(
+        stdout.contains("fn parse_addr_v4"),
+        "expected parse_addr_v4 helper in prelude, got:\n{}",
         stdout
     );
 
