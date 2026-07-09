@@ -918,7 +918,14 @@ mod tests {
     fn render_empty_table_still_emits_servers_and_tls() {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
         assert!(servers.contains_key(SERVER_NAME_HTTP));
@@ -952,7 +959,14 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let mut cfg = test_cfg();
         cfg.caddy_admin_listen = "0.0.0.0:2019".into();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         assert_eq!(
             cfg_json["admin"]["listen"], "0.0.0.0:2019",
             "render_routes must include admin.listen matching Config so \
@@ -969,7 +983,14 @@ mod tests {
             entry("t_acme", "web", "1.2.3.4", 8082),
             entry("t_globex", "api", "5.6.7.8", 9000),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1012,7 +1033,14 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 95),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 5),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1047,7 +1075,14 @@ mod tests {
         let cfg = test_cfg();
         let cache = TrafficSplitCache::default();
         let entries = vec![canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100)];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         assert_eq!(upstreams.as_array().unwrap().len(), 1);
@@ -1065,7 +1100,14 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.http_to_https = false;
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
@@ -1081,7 +1123,14 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 0),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -1117,7 +1166,14 @@ mod tests {
             canary_entry("t_acme", "api", "d_v1", "1.2.3.4", 8081, 100),
             canary_entry("t_acme", "api", "d_v2", "1.2.3.5", 8082, 100),
         ];
-        let cfg_json = render_routes(&entries, &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
         let upstreams_arr = upstreams.as_array().unwrap();
@@ -1145,7 +1201,14 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &bindings,
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1179,12 +1242,116 @@ mod tests {
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         // FQDN binding is for t_other/web but the entries only have t_acme/api.
         let bindings = vec![fqdn("t_other", "web", "web.example.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &bindings,
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
         // Only the default route renders; the orphan FQDN is dropped.
         assert_eq!(routes.len(), 1, "only the default route should render");
+    }
+
+    /// Quota cache is the source of truth for the 402 injection (issue
+    /// #420). This pins the three boundary cases:
+    /// * t_a: over_cap=true → a 402 `static_response` block IS emitted
+    /// * t_b: over_cap=false → NO 402 block
+    /// * t_c: absent from cache (cold start or transient CP outage) → NO 402 block (fail-open)
+    ///
+    /// We also assert the 402 block is placed BEFORE the per-app
+    /// reverse_proxy route so Caddy's matcher short-circuits first.
+    #[test]
+    fn quota_cache_boundary_drives_402_injection() {
+        let cfg = test_cfg();
+        let cache = TrafficSplitCache::default();
+        let entries = vec![
+            entry("t_a", "api", "1.2.3.4", 8081),
+            entry("t_b", "api", "5.6.7.8", 8082),
+        ];
+        let mut q_cache = test_quota_cache();
+        q_cache.update(
+            "t_a".to_string(),
+            crate::quota::QuotaState {
+                over_cap: true,
+                locked_until: None,
+                fetched_at: Some(Instant::now()),
+            },
+        );
+        q_cache.update(
+            "t_b".to_string(),
+            crate::quota::QuotaState {
+                over_cap: false,
+                locked_until: None,
+                fetched_at: Some(Instant::now()),
+            },
+        );
+        // t_c intentionally not in the cache.
+
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &q_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+
+        // t_a's 402 block must be present and have the right shape.
+        let t_a_block = routes
+            .iter()
+            .find(|r| r["@id"] == "t_a:quota-402-synthetic")
+            .expect("t_a quota 402 block must be emitted for over_cap=true");
+        assert_eq!(t_a_block["handle"][0]["status_code"], 402);
+        assert_eq!(t_a_block["terminal"], true);
+        let host_regex = t_a_block["match"][0]["host_regexp"].as_str().unwrap();
+        assert!(
+            host_regex.starts_with("^t_a-"),
+            "host_regexp anchored to tenant id, got {host_regex}"
+        );
+
+        // t_b's 402 block must NOT be present (over_cap=false).
+        let t_b_block = routes
+            .iter()
+            .find(|r| r["@id"] == "t_b:quota-402-synthetic");
+        assert!(
+            t_b_block.is_none(),
+            "t_b must not emit a 402 block when over_cap=false"
+        );
+
+        // t_c absent from cache → fail-open, NO 402 block.
+        let t_c_block = routes
+            .iter()
+            .find(|r| r["@id"] == "t_c:quota-402-synthetic");
+        assert!(
+            t_c_block.is_none(),
+            "t_c must fail open — not in cache, no 402 block"
+        );
+
+        // The 402 block must come BEFORE the per-app reverse_proxy route
+        // so Caddy short-circuits the request. routes[0] is the default
+        // route; the 402 block follows it; the per-app reverse_proxy
+        // routes follow.
+        let pos_402 = routes
+            .iter()
+            .position(|r| r["@id"] == "t_a:quota-402-synthetic")
+            .unwrap();
+        let app_id = crate::config::ingress_host("t_a", "api");
+        let pos_app = routes
+            .iter()
+            .position(|r| r["@id"] == app_id)
+            .unwrap_or_else(|| panic!("per-app reverse_proxy route {app_id} must exist"));
+        assert!(
+            pos_402 < pos_app,
+            "402 block at index {pos_402} must precede reverse_proxy route at {pos_app}"
+        );
     }
 
     /// Default-only mode (no `control_plane_url`): no `automation` block
@@ -1209,7 +1376,14 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.control_plane_url = "http://control-plane:8080".into();
         let cache = TrafficSplitCache::default();
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         assert_eq!(
             cfg_json["apps"]["tls"]["automation"]["on_demand"]["ask"],
             "http://control-plane:8080/api/internal/tls-allowed"
@@ -1228,7 +1402,14 @@ mod tests {
             fqdn("t_acme", "api", "alpha.example.com"),
             fqdn("t_acme", "api", "mike.example.com"),
         ];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &bindings,
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1257,7 +1438,14 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
         let bindings = vec![fqdn("t_acme", "api", "api.acme.com")];
-        let cfg_json = render_routes(&entries, &bindings, &cfg, &cache, &test_rate_limit_cache(), &test_quota_cache());
+        let cfg_json = render_routes(
+            &entries,
+            &bindings,
+            &cfg,
+            &cache,
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+        );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
             .unwrap();
@@ -1285,7 +1473,8 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(), &test_quota_cache(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1324,7 +1513,8 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(), &test_quota_cache(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1351,7 +1541,8 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(), &test_quota_cache(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert_eq!(server["max_conns"], 1000);
@@ -1370,7 +1561,8 @@ mod tests {
             &[],
             &cfg,
             &Default::default(),
-            &test_rate_limit_cache(), &test_quota_cache(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert!(
