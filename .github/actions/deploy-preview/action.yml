@@ -146,7 +146,7 @@ runs:
 
     - name: Comment PR
       if: inputs.comment-on-pr == 'true' && steps.deploy.outputs.preview-url != ''
-      uses: actions/github-script@v7
+      uses: actions/github-script@v8
       with:
         script: |
           github.rest.issues.createComment({

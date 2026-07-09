@@ -18,7 +18,7 @@ inputs:
     required: false
     default: '10G'
   cache-key-prefix:
-    description: 'Prefix for the actions/cache@v4 key. Append Cargo.lock hash + sccache version in the action so the cache invalidates only when one of those changes — keeps the cache warm across PRs that share a dep tree.'
+    description: 'Prefix for the actions/cache@v5 key. Append Cargo.lock hash + sccache version in the action so the cache invalidates only when one of those changes — keeps the cache warm across PRs that share a dep tree.'
     required: false
     default: 'sccache-edgecloud'
 runs:
@@ -107,7 +107,7 @@ runs:
         echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" >> "$GITHUB_ENV"
 
     - name: Cache sccache store
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         # Cache key prefix + sccache version so a bump invalidates.
         # The Cargo.lock hash is appended via hashFiles in the next
