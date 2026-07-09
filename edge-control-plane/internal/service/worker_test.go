@@ -118,9 +118,14 @@ func (m *mockQuotaRepo) SetGraceUntil(ctx context.Context, tenantID string, unti
 // (nil/empty) so tests that only exercise one method don't need to
 // stub the others.
 type mockTenantRepo struct {
-	tenantRepoInterface
 	getByIDFunc func(ctx context.Context, id string) (*domain.Tenant, error)
 }
+
+// Compile-time assertion that mockTenantRepo satisfies tenantRepoInterface.
+// SetDisabledAt and ClearDisabledAt are defined on the mock as method
+// receivers further down; the var assertion here replaces an unused
+// interface field embed (which golangci-lint flags as dead code).
+var _ tenantRepoInterface = (*mockTenantRepo)(nil)
 
 func (m *mockTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
 	if m.getByIDFunc != nil {
