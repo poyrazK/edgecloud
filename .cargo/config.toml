@@ -3,23 +3,36 @@
 # Why: each git worktree owns its own working tree, and Cargo's default
 # `target/` lives inside the working tree. With multiple agents running
 # worktrees in parallel, every worktree ends up with a full ~6 GB debug
-# target. This config lifts `target/` to a per-user cache dir so all
+# target. This config lifts `target/` out of the working tree so all
 # worktrees share one target, and wraps rustc with sccache so duplicate
 # compiles across worktrees / cold restarts hit a content-addressed
 # cache instead of recompiling wasmtime, tree-sitter, etc.
+#
+# Path layout (config-relative, OS-portable):
+#   target/        →  ../target-cache/edgecloud   (one shared target dir
+#                     across worktrees, on a fast disk; sibling of the
+#                     workspace, not inside any worktree's working tree)
+#   sccache store  →  $SCCACHE_DIR, defaulting to
+#                     ~/.cache/sccache-edgecloud   (per `SCCACHE_DIR`
+#                     env, which any developer can override per-shell)
+#
+# Cargo does NOT expand $HOME / ${VAR} in build.target-dir — only
+# absolute / relative / config-relative literals are accepted. We use
+# config-relative here so the file is portable across macOS, Linux, and
+# CI runners without a username baked into the path.
 #
 # Setup once per developer machine:
 #   brew install sccache           # macOS
 #   # or: cargo install sccache
 #   echo 'export SCCACHE_DIR="$HOME/.cache/sccache-edgecloud"' >> ~/.zshrc
-#   echo 'export RUSTC_WRAPPER=sccache' >> ~/.zshrc
 # Verify:
 #   sccache --version
 #   cargo build  # should print "Compiling ..." lines via sccache
 #
 # To opt out locally without editing this file, set
-# CARGO_BUILD_RUSTC_WRAPPER="" in your shell.
+# CARGO_BUILD_RUSTC_WRAPPER="" in your shell. To override the target
+# dir on a single run, set CARGO_TARGET_DIR=… in the env.
 
 [build]
-target-dir = "/Users/poyrazk/.cache/edgecloud-cargo"
+target-dir = "../target-cache/edgecloud"
 rustc-wrapper = "sccache"

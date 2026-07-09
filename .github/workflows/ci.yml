@@ -41,6 +41,14 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      # .cargo/config.toml sets build.rustc-wrapper = "sccache", so
+      # every cargo invocation in this job needs the wrapper on PATH.
+      # Install it once per job, then cache its store across runs so
+      # cache-friendly crates (wasmtime, tree-sitter, wit-bindgen)
+      # hit a warm cache instead of recompiling from scratch.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
       - name: Install rustfmt
         run: rustup component add rustfmt
 
@@ -55,6 +63,16 @@ jobs:
 
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
+        env:
+          # cargo-deny-action runs cargo inside a sandboxed Docker
+          # container. The container reads .cargo/config.toml from
+          # the volume mount, which sets build.rustc-wrapper =
+          # "sccache" — but sccache is not installed inside the
+          # container, so cargo aborts with
+          # `could not execute process sccache ... (never executed)`.
+          # Override at step scope (env vars beat config files in
+          # cargo's precedence) to disable the wrapper for this step.
+          CARGO_BUILD_RUSTC_WRAPPER: ""
         with:
           command: check
           manifest-path: Cargo.toml
@@ -91,6 +109,11 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
       - name: Install cargo-nextest
         uses: taiki-e/install-action@cargo-nextest
 
@@ -123,6 +146,11 @@ jobs:
         with:
           workspaces: ". -> target"
 
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
       - name: Install cargo-semver-checks
         uses: taiki-e/install-action@cargo-semver-checks
 
@@ -154,6 +182,31 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      # Note: the nightly toolchain below uses a SEPARATE rustc binary
+      # (via `cargo +nightly`), so it does NOT pick up the wrapper
+      # unless we explicitly point RUSTC_WRAPPER at sccache too. Export
+      # CARGO_BUILD_RUSTC_WRAPPER (the env-var equivalent of
+      # build.rustc-wrapper) so the nightly toolchain also routes
+      # through sccache. The nightly toolchain hash is part of the
+      # sccache cache key, so stable/nightly caches don't trample
+      # each other.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+        with:
+          cache-key-prefix: 'sccache-edgecloud-nightly'
+
+      - name: Force nightly rustc invocations through sccache
+        # CARGO_BUILD_RUSTC_WRAPPER is the documented env-var
+        # override for .cargo/config.toml's build.rustc-wrapper;
+        # the nightly cargo invocation below re-reads config and
+        # would otherwise revert to a non-wrapped rustc.
+        run: |
+          echo "CARGO_BUILD_RUSTC_WRAPPER=$(which sccache)" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=$(which sccache)" >> "$GITHUB_ENV"
+          sccache --version
 
       - name: Install Rust Nightly
         uses: dtolnay/rust-toolchain@nightly

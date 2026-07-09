@@ -1,0 +1,123 @@
+name: 'Install sccache (rustc wrapper)'
+description: 'Download the Mozilla sccache x86_64-unknown-linux-musl prebuilt at v0.16.0 and export SCCACHE_DIR / SCCACHE_CACHE_SIZE so cargo invocations in subsequent steps hit a content-addressed cache. Used by every Rust job because .cargo/config.toml sets build.rustc-wrapper = "sccache" — without this step cargo aborts with `could not execute process ... sccache ... (never executed)`.'
+inputs:
+  sccache-tag:
+    description: 'sccache release tag (with the leading "v", e.g. "v0.16.0"). Used as both the release URL path segment AND the asset filename prefix (mozilla/sccache names assets like sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz).'
+    required: false
+    default: 'v0.16.0'
+  sccache-version:
+    description: 'sccache release version without the leading "v" (e.g. "0.16.0"). Used only for cache-key versioning so a version bump invalidates the sccache store.'
+    required: false
+    default: '0.16.0'
+  cache-dir:
+    description: 'SCCACHE_DIR to export as $GITHUB_ENV. Per-user convention: ~/.cache/sccache-edgecloud.'
+    required: false
+    default: '$HOME/.cache/sccache-edgecloud'
+  cache-size:
+    description: 'SCCACHE_CACHE_SIZE passed to sccache itself (max on-disk size for the sccache store). 10G matches the historical validate-rust claim and leaves headroom for a 9G-workspace cold build.'
+    required: false
+    default: '10G'
+  cache-key-prefix:
+    description: 'Prefix for the actions/cache@v4 key. Append Cargo.lock hash + sccache version in the action so the cache invalidates only when one of those changes — keeps the cache warm across PRs that share a dep tree.'
+    required: false
+    default: 'sccache-edgecloud'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install sccache binary
+      shell: bash
+      env:
+        SCCACHE_TAG: ${{ inputs.sccache-tag }}
+        SCCACHE_VERSION: ${{ inputs.sccache-version }}
+      run: |
+        set -euo pipefail
+
+        # Pin the URL using SCCACHE_TAG (with leading v, e.g. v0.16.0)
+        # for BOTH the release URL path component AND the asset filename
+        # prefix — the mozilla/sccache release assets are named
+        # "sccache-VERSION-..." with the leading v (e.g.
+        # sccache-v0.16.0-x86_64-unknown-linux-musl.tar.gz). The
+        # earlier split (SCCACHE_TAG for path, SCCACHE_VERSION-without-v
+        # for filename) built an asset URL ending in
+        # "sccache-0.16.0-...tar.gz" which 404s. Use plain string
+        # interpolation in bash, NOT GitHub Actions template
+        # expressions — the runner walks the run-block text and
+        # would otherwise misinterpret any template-style sequence
+        # inside a shell comment. See revert 5ee6b4f -> 50e900d for
+        # the prior shape that tripped this. NOTE: keep two-brace
+        # sequences out of any run-block comment below — the runner
+        # parser would see and try to expand them.
+
+        # Asset name on mozilla/sccache releases uses the leading-v
+        # form for both path and filename. Tag and tarball stem match.
+        stem="sccache-${SCCACHE_TAG}-x86_64-unknown-linux-musl"
+        url="https://github.com/mozilla/sccache/releases/download/${SCCACHE_TAG}/${stem}.tar.gz"
+        echo "Downloading ${url}"
+        mkdir -p /tmp/sccache-install
+        # Download to a tmp file first, then extract — piping curl
+        # into tar with -C <dir> is a GNU-tar extension that's not
+        # portable across the runner's tar (some versions ignore
+        # stdin when -C is supplied and silently produce an empty
+        # install dir).
+        tmp_tgz="$(mktemp --suffix=.tgz)"
+        curl -fsSL --retry 3 --retry-delay 5 -o "${tmp_tgz}" "${url}"
+        tar -xz -C /tmp/sccache-install -f "${tmp_tgz}"
+        rm -f "${tmp_tgz}"
+        sudo install -m 0755 "/tmp/sccache-install/${stem}/sccache" /usr/local/bin/sccache
+        rm -rf /tmp/sccache-install
+
+        sccache --version
+
+    - name: Resolve SCCACHE_DIR absolute path
+      id: resolve-dir
+      shell: bash
+      env:
+        CACHE_DIR: ${{ inputs.cache-dir }}
+      run: |
+        # Expand a leading literal "$HOME" to the runner's HOME so the
+        # default cache-dir ($HOME/.cache/sccache-edgecloud) resolves
+        # to a real path. We do this in bash rather than via
+        # GitHub Actions input expansion because env-var expansion in
+        # `inputs` is not supported and would silently leave "$HOME"
+        # as a literal directory name under the runner temp dir.
+        # Plain "case" replacement avoids any template-parser
+        # collisions when this script is processed by the actions
+        # runner — note we do NOT write "two braces" anywhere in this
+        # run-block, because the runner would interpret the sequence
+        # as a (malformed) template expression and fail at parse time.
+        # See revert 5ee6b4f -> 50e900d for the prior shape that
+        # tripped this.
+        resolved="$CACHE_DIR"
+        case "$resolved" in
+          '$HOME'/*) resolved="$HOME${resolved#'$HOME'}" ;;
+        esac
+        echo "dir=${resolved}" >> "$GITHUB_OUTPUT"
+        echo "SCCACHE_DIR=${resolved}" >> "$GITHUB_ENV"
+        mkdir -p "${resolved}"
+        echo "sccache dir: ${resolved}"
+
+    - name: Export sccache cache policy
+      shell: bash
+      env:
+        SCCACHE_CACHE_SIZE: ${{ inputs.cache-size }}
+      run: |
+        # Re-export the size so sccache's local cache eviction policy
+        # is consistent across runs. Size cap only — sccache does its
+        # own LRU inside SCCACHE_DIR, no further action needed.
+        echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" >> "$GITHUB_ENV"
+
+    - name: Cache sccache store
+      uses: actions/cache@v4
+      with:
+        # Cache key prefix + sccache version so a bump invalidates.
+        # The Cargo.lock hash is appended via hashFiles in the next
+        # step (so we can use the lockfile that existed at action
+        # invocation time, not an arbitrary one in the future).
+        path: ${{ steps.resolve-dir.outputs.dir }}
+        key: ${{ inputs.cache-key-prefix }}-${{ inputs.sccache-version }}-${{ hashFiles('**/Cargo.lock') }}
+        # Fall back to a looser match (same prefix + version, ignore
+        # the lockfile hash) so a dep-tree bump that invalidates the
+        # exact-key path still finds SOME recent cache instead of
+        # always cold-starting.
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-${{ inputs.sccache-version }}-
