@@ -21,10 +21,13 @@
 --     operator will delete the old row first; we never carry two
 --     active providers for the same tenant.
 --
---   * provider_customer_id is NOT NULL: every active row has been
---     through at least a CreateCustomer call. The Stripe webhook
---     handler also needs the customer_id to resolve tenant from a
---     subscription.* event.
+--   * provider_customer_id is NULLABLE: a row exists from the
+--     moment StartCheckout is called; the provider fills in the
+--     customer_id asynchronously (first checkout.session.completed
+--     webhook, or a follow-up customer.subscription.updated). Until
+--     that lands the column stays NULL. Migration 024 relaxed the
+--     original NOT NULL constraint; this column being nullable is
+--     now the contract.
 --
 --   * provider_subscription_id is NULLABLE: a row exists from the
 --     moment the tenant clicks "Subscribe" (StartCheckout), before
@@ -50,7 +53,7 @@
 CREATE TABLE IF NOT EXISTS billing_subscriptions (
     tenant_id                VARCHAR(64)  PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
     provider                 VARCHAR(32)  NOT NULL,
-    provider_customer_id     VARCHAR(128) NOT NULL,
+    provider_customer_id     VARCHAR(128),
     provider_subscription_id VARCHAR(128),
     plan                     VARCHAR(32)  NOT NULL,
     status                   VARCHAR(32)  NOT NULL,

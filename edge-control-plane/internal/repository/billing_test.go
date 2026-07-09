@@ -281,3 +281,44 @@ func TestBillingRepository_WithTx(t *testing.T) {
 		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
+
+// TestBillingRepository_Upsert_EmptyCustomerID confirms the
+// StartCheckout seed path: the row exists from the moment
+// StartCheckout is called, BEFORE the provider has filled in the
+// real provider_customer_id. The column is now nullable (migration
+// 024), so the upsert succeeds with an empty string.
+//
+// Issue #419 review follow-up.
+func TestBillingRepository_Upsert_EmptyCustomerID(t *testing.T) {
+	repo, mock, cleanup := newBillingMockRepo(t)
+	defer cleanup()
+
+	sub := &domain.BillingSubscription{
+		TenantID:           "t_1",
+		Provider:           domain.ProviderStripe,
+		ProviderCustomerID: "", // seeded before provider has resolved the id
+		Plan:               "pro",
+		Status:             domain.SubscriptionIncomplete,
+		CancelAtPeriodEnd:  false,
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO billing_subscriptions`)).
+		WithArgs(
+			"t_1",
+			string(domain.ProviderStripe),
+			"",
+			"",
+			"pro",
+			string(domain.SubscriptionIncomplete),
+			nil,
+			false,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.Upsert(context.Background(), sub); err != nil {
+		t.Fatalf("Upsert with empty customer_id: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}

@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 52 // 26 .up.sql + 26 .down.sql on current main (after 023_billing_events, issue #419)
+const splitFileCount = 54 // 27 .up.sql + 27 .down.sql on current main (after 024_billing_subscriptions_relax_customer_id, issue #419 review)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -683,16 +683,15 @@ var wantNotNull = map[string][]string{
 		"created_at",
 		// status_code, completed_at are nullable.
 	},
-	"billing_subscriptions": { // 022 (issue #419)
+	"billing_subscriptions": { // 022 (issue #419); 024 (issue #419 review) relaxed provider_customer_id
 		"tenant_id",
 		"provider",
-		"provider_customer_id",
 		"plan",
 		"status",
 		"cancel_at_period_end",
 		"created_at",
 		"updated_at",
-		// provider_subscription_id, current_period_end are nullable.
+		// provider_customer_id, provider_subscription_id, current_period_end are nullable.
 	},
 	"billing_events": { // 023 (issue #419)
 		"event_id",

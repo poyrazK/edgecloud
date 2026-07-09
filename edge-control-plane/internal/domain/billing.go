@@ -67,7 +67,7 @@ const (
 type BillingSubscription struct {
 	TenantID               string             `db:"tenant_id"                json:"tenant_id"`
 	Provider               BillingProvider    `db:"provider"                 json:"provider"`
-	ProviderCustomerID     string             `db:"provider_customer_id"     json:"provider_customer_id"`
+	ProviderCustomerID     string             `db:"provider_customer_id"     json:"provider_customer_id,omitempty"`
 	ProviderSubscriptionID string             `db:"provider_subscription_id" json:"provider_subscription_id,omitempty"`
 	Plan                   string             `db:"plan"                     json:"plan"`
 	Status                 SubscriptionStatus `db:"status"                   json:"status"`

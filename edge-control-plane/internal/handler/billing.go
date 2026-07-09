@@ -159,7 +159,10 @@ func (h *BillingHandler) GetSubscription(w http.ResponseWriter, r *http.Request)
 // middleware — the provider's VerifyWebhook checks the signature
 // inline. Returns:
 //
-//	200 — successful dispatch OR idempotent replay (already processed)
+//	200 — successful dispatch, idempotent replay, OR unhandled event
+//	      type (we explicitly ignore event classes we don't dispatch on;
+//	      otherwise Stripe would 5xx-retry forever and burn the 3-day
+//	      retry window)
 //	400 — signature verification failed (provider-specific sentinel)
 //	422 — event references a tenant we don't know about
 //	500 — DB error; Stripe will retry
@@ -178,6 +181,13 @@ func (h *BillingHandler) StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		case isSignatureFailure(err):
 			// 400 so the merchant retries.
 			httperror.BadRequestCtx(w, r, "invalid signature")
+		case errors.Is(err, billing.ErrUnknownEvent):
+			// 200 — the merchant sent something we intentionally
+			// ignore. NOT a 4xx (no merchant action) and NOT a 5xx
+			// (we don't want Stripe to retry forever).
+			log.Printf("HandleWebhook: ignoring unknown event: %v", err)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ignored"})
 		case errors.Is(err, billing.ErrTenantUnresolved):
 			// 422 — the event landed but we can't attribute it.
 			httperror.BadRequestCtx(w, r, "tenant unresolved for event")

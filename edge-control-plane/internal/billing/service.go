@@ -40,6 +40,17 @@ var ErrNoSubscription = errors.New("billing: no subscription for tenant")
 // (provider, provider_customer_id) row. Maps to HTTP 422.
 var ErrTenantUnresolved = errors.New("billing: tenant unresolved for event")
 
+// ErrUnknownEvent is returned by HandleWebhook when the provider
+// signature-verified a valid event whose type isn't one the service
+// dispatches on (Stripe emits dozens of event classes — we only
+// handle four). The handler should respond 200 so the merchant
+// doesn't retry — the event is intentionally ignored.
+//
+// Mirrors the noop and stripe providers' ErrUnknownEvent sentinels
+// but lives in this package so the handler can errors.Is against a
+// stable error without importing either provider sub-package.
+var ErrUnknownEvent = errors.New("billing: unknown event type")
+
 // TenantUpdater is the subset of *service.TenantService the billing
 // service depends on. Pulled out as an interface so tests can stub
 // plan changes without a DB.
@@ -180,6 +191,24 @@ func providerSentinelNoSubscription(err error) error {
 	return nil
 }
 
+// providerUnknownEventErr returns err if it carries the provider's
+// "unknown event type" sentinel, otherwise nil. Stripe's is
+// "stripe: unknown event type"; noop's signature-failure message
+// ("noop provider rejects all webhooks…") intentionally doesn't
+// match this helper — noop never returns ErrUnknownEvent because
+// it rejects every webhook before parsing. The string sniff mirrors
+// providerSentinelNoSubscription above and keeps the billing package
+// free of provider-sub-package imports.
+func providerUnknownEventErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if s := err.Error(); strings.Contains(s, "unknown event type") {
+		return err
+	}
+	return nil
+}
+
 // GetSubscription returns the local billing_subscriptions row. The
 // provider is NOT consulted on this read path — the local row is the
 // canonical mirror, updated by webhooks. This is the right call for
@@ -221,6 +250,15 @@ func (s *BillingService) GetSubscription(ctx context.Context, tenantID string) (
 func (s *BillingService) HandleWebhook(ctx context.Context, headers http.Header, body []byte) error {
 	evt, err := s.provider.VerifyWebhook(headers, body)
 	if err != nil {
+		// The provider verified the signature but the event type
+		// isn't one we dispatch on — return our sentinel so the
+		// handler can return 200 (no retry) instead of the
+		// default 500. Critical for production: Stripe will
+		// retry a 5xx forever and burn the 3-day retry window
+		// on event types we never intended to handle.
+		if providerUnknownEventErr(err) != nil {
+			return ErrUnknownEvent
+		}
 		// Signature or parse failure — handler maps to 400.
 		return err
 	}
@@ -232,52 +270,28 @@ func (s *BillingService) HandleWebhook(ctx context.Context, headers http.Header,
 	return repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txRepo := s.repo.WithTx(tx)
 
-		// Step 2: resolve tenant. Done OUTSIDE the tx above so the
-		// lookup reads the committed billing_subscriptions row. We
-		// re-resolve inside the tx for the (provider, customer)
-		// case to read the current row state.
+		// Step 2: resolve tenant. Prefer the event's TenantID (which
+		// checkout.session.completed carries via
+		// client_reference_id). Stripe's customer.subscription.*
+		// events don't embed tenant; we'd need a CustomerID()
+		// method on NormalizedEvent + a (provider, customer_id)
+		// lookup to resolve them — that's a follow-up to the
+		// issue #419 review. Today we record-with-NULL-tenant and
+		// return 422; an operator can backfill the missing
+		// client_reference_id once we add the resolution path.
 		tenantID := evt.TenantID()
 		if tenantID == "" {
-			// Stripe's customer.subscription.* events don't carry
-			// client_reference_id. Fall back to provider_customer_id.
-			// The provider object exposes the customer id when
-			// available; we extract via a small adapter below.
-			custID := customerIDFromEvent(evt)
-			if custID == "" {
-				// Roll forward: still record the event so the
-				// operator can see it landed, but with a NULL
-				// tenant_id. The handler then 422s. Without this
-				// row the event would be lost.
-				_, err := txRepo.TryRecordEvent(ctx, &domain.BillingEvent{
-					EventID:     evt.EventID(),
-					Provider:    evt.Provider(),
-					EventType:   evt.EventType(),
-					TenantID:    nil,
-					PayloadHash: payloadHash,
-				})
-				if err != nil {
-					return fmt.Errorf("billing: record event: %w", err)
-				}
-				return ErrTenantUnresolved
-			}
-			row, err := txRepo.ListByProviderCustomer(ctx, evt.Provider(), custID)
+			_, err := txRepo.TryRecordEvent(ctx, &domain.BillingEvent{
+				EventID:     evt.EventID(),
+				Provider:    evt.Provider(),
+				EventType:   evt.EventType(),
+				TenantID:    nil,
+				PayloadHash: payloadHash,
+			})
 			if err != nil {
-				return fmt.Errorf("billing: lookup by customer: %w", err)
+				return fmt.Errorf("billing: record event: %w", err)
 			}
-			if row == nil {
-				_, err := txRepo.TryRecordEvent(ctx, &domain.BillingEvent{
-					EventID:     evt.EventID(),
-					Provider:    evt.Provider(),
-					EventType:   evt.EventType(),
-					TenantID:    nil,
-					PayloadHash: payloadHash,
-				})
-				if err != nil {
-					return fmt.Errorf("billing: record event: %w", err)
-				}
-				return ErrTenantUnresolved
-			}
-			tenantID = row.TenantID
+			return ErrTenantUnresolved
 		}
 
 		// Step 3: dedup. TryRecordEvent returns (true, nil) the
@@ -386,20 +400,6 @@ func (s *BillingService) dispatch(
 	}
 	return nil
 }
-
-// customerIDFromEvent pulls the provider's customer id out of a
-// NormalizedEvent when the event has one embedded. Today, only
-// Stripe's checkout.session.completed carries it (in the same
-// client_reference_id the tenant id is in, but the customer id is
-// pulled separately). For all other event types / providers we
-// return "" and let the service fall back to the
-// (provider, customer_id) DB lookup — which fails open to 422 if no
-// row matches.
-//
-// Implementations that know how to extract the customer id can wrap
-// NormalizedEvent; today no provider does, so this is a forward
-// extension point.
-func customerIDFromEvent(_ domain.NormalizedEvent) string { return "" }
 
 // sha256Hex returns the lowercase hex SHA-256 of body. Stored on
 // billing_events.payload_hash for forensic comparison in case a

@@ -308,3 +308,26 @@ func TestStripeWebhook_DBError(t *testing.T) {
 		t.Fatalf("status = %d, want 500", rr.Code)
 	}
 }
+
+// TestStripeWebhook_UnknownEvent_200: an unhandled event type
+// (signature verified, but the service doesn't dispatch on it) must
+// return 200, not 500. Returning 5xx makes the merchant retry
+// forever and burn its 3-day retry window on event classes we
+// intentionally ignore (charge.succeeded, customer.created, etc.).
+//
+// Issue #419 review follow-up.
+func TestStripeWebhook_UnknownEvent_200(t *testing.T) {
+	svc := &mockBillingSvc{handleWebhookErr: billing.ErrUnknownEvent}
+	h := NewBillingHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/v1/billing/webhook", bytes.NewReader([]byte(`{"id":"evt_charge_succeeded"}`)))
+	rr := httptest.NewRecorder()
+	h.StripeWebhook(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (must not 5xx on unknown event type)", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "ignored") {
+		t.Errorf("body = %q, want 'ignored' status", rr.Body.String())
+	}
+}

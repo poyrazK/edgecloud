@@ -266,7 +266,10 @@ func stripeEventToNormalized(evt *stripe.Event) (domain.NormalizedEvent, error) 
 	case stripe.EventTypeCheckoutSessionCompleted:
 		obj, _ := evt.Data.Object["client_reference_id"].(string)
 		base.tenant = obj
-		base.plan = planFromCheckoutSession(evt.Data.Object)
+		// plan is recovered on the follow-up customer.subscription.updated
+		// event via planFromSubscription; we don't try to extract it
+		// from the checkout-session payload (cfg isn't in scope here
+		// and line_items parsing is non-trivial).
 		base.status = string(domain.SubscriptionActive)
 		return base, nil
 	case stripe.EventTypeCustomerSubscriptionUpdated:
@@ -325,24 +328,6 @@ func stripeTypeToNormalized(t stripe.EventType) domain.NormalizedEventType {
 	default:
 		return ""
 	}
-}
-
-// planFromCheckoutSession reads the plan out of a checkout session
-// object. The price ID lives in line_items[].price.id; we look it up
-// against cfg.PriceIDs to recover the domain plan name.
-//
-// NOTE: cfg is not in scope here — this helper is given the raw event
-// object map. The reverse lookup happens via cfg in the caller. We
-// return the raw price ID and let the caller map it. Simpler: return
-// the price ID and let the service look it up via cfg. But cfg lives
-// on Provider, not on this free function. So: carry the lookup via
-// Provider.stripeEventToNormalized instead. See stripeEventToNormalized
-// above — the caller does the cfg lookup; this is a stub kept here
-// for clarity that line_items parsing is the right path.
-func planFromCheckoutSession(obj map[string]interface{}) string {
-	// We don't have cfg here, so return empty; the service can
-	// re-resolve via the subscription row it already loaded.
-	return ""
 }
 
 // planFromSubscription reads the plan name from a Subscription's

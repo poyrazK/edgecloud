@@ -1,0 +1,26 @@
+-- +migrate Up
+-- 024_billing_subscriptions_relax_customer_id.up.sql
+-- Issue #419 review follow-up: allow provider_customer_id to be NULL.
+--
+-- 022 declared the column NOT NULL with the rationale "every active
+-- row has been through at least a CreateCustomer call." In practice
+-- StartCheckout upserts the row BEFORE calling the provider's
+-- CreateCheckoutSession, so the row is created with an empty
+-- provider_customer_id. Postgres accepted '' as a valid VARCHAR, so
+-- the constraint didn't trip — but the contract was muddy: a row
+-- could live for an unbounded time with provider_customer_id = ''
+-- (tenant abandons checkout, or CreateCheckoutSession errors out
+-- before backfilling).
+--
+-- Relaxing the column to nullable matches the actual lifecycle:
+-- a row exists from the moment StartCheckout is called; the
+-- provider fills in the customer_id asynchronously (on the first
+-- checkout.session.completed webhook or a follow-up
+-- customer.subscription.updated). Until that lands the column
+-- stays NULL.
+--
+-- The provider_customer_id index (idx_billing_subscriptions_provider_customer)
+-- is unaffected — btree indexes handle NULL fine, and the partial
+-- WHERE tenant_id IS NOT NULL filter on billing_events isn't touched.
+ALTER TABLE billing_subscriptions
+    ALTER COLUMN provider_customer_id DROP NOT NULL;
