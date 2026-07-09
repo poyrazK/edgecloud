@@ -40,18 +40,17 @@ jobs:
       # See samples/hello/README.md for the wasi:http@0.2.1 vs 0.2.4
       # rationale.
       #
-      # Inline PATH export — `$GITHUB_PATH` is supposed to propagate
-      # to subsequent steps but observed a race on Node-24 runners
-      # where the next `shell: bash` step's PATH didn't pick up the
-      # `echo $CARGO_HOME/bin >> $GITHUB_PATH` write from the
-      # preceding step. Inlining the export in the same step that
-      # runs `edge build` is reliable across runner versions
-      # (issue #308, second iteration).
+      # Inline PATH export — `$GITHUB_PATH` propagation has a race
+      # on Node-24 runners (rc=127 'command not found' for `edge`).
+      # Setting `env.PATH:` directly also fails because `${{ env.PATH }}`
+      # resolves to the runner-provided PATH at step-start and the
+      # `env:` block replaces it rather than prepending (the GitHub
+      # docs' documented behaviour, but easy to miss). The fix that
+      # actually works: prepend in the same shell line that runs
+      # `edge build`. No env-block mutation, no PATH-step race.
       - name: Build hello sample
         working-directory: samples/hello
-        env:
-          PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}
-        run: edge build
+        run: PATH="$CARGO_HOME/bin:$PATH" edge build
 
       # Delegate install-cli + edge deploy + URL capture to the
       # reusable composite action. We pass `build: 'false'` because
