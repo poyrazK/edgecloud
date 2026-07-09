@@ -697,6 +697,14 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 					"activation committed but worker notification failed; please retry")
 				return
 			}
+			// Issue #440: tenant was disabled between deploy and
+			// activate (quota-exceeded path in WorkerService). 409
+			// per RFC 9110 §15.5.10; matches the existing
+			// state-conflict mapping for ErrNoLastGood above.
+			if errors.Is(err, service.ErrTenantDisabled) {
+				httperror.ConflictCtx(w, r, "tenant is disabled; re-enable via the admin endpoint and retry")
+				return
+			}
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)
 			return
@@ -785,6 +793,12 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 			return
 		}
+		// Issue #440: tenant disabled mid-rollback. 409 matches
+		// the state-conflict mapping above for ErrNoLastGood.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			http.Error(w, `{"error": "tenant is disabled; re-enable via the admin endpoint and retry"}`, http.StatusConflict)
+			return
+		}
 		if errors.Is(err, service.ErrPublishFailed) {
 			writePublishFailureEnvelope(w, r, err,
 				"rollback committed but worker notification failed; please retry")
@@ -837,6 +851,12 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID); err != nil {
 		if errors.Is(err, service.ErrDeploymentNotFound) {
 			httperror.NotFoundCtx(w, r, "deployment not found")
+			return
+		}
+		// Issue #440: tenant disabled mid-promote. 409 per the same
+		// state-conflict mapping used on activate / rollback.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled; re-enable via the admin endpoint and retry")
 			return
 		}
 		log.Printf("internal error: %v", err)

@@ -78,6 +78,16 @@ func (p *RecordingPublisher) PublishFullSync(region string, msg *nats.TaskMessag
 
 func (p *RecordingPublisher) EnsureStream(nats.StreamConfig) error { return nil }
 
+// expectTenantForUpdateIssue440 mocks the SELECT … FOR UPDATE on
+// tenants.id that activateDeployment now issues inside its active_deployments
+// transaction (issue #440). Returns a row with disabled_at = nil (happy path).
+func expectTenantForUpdateIssue440(mock sqlmock.Sqlmock, tenantID string) {
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Test Tenant", "free", pq.Array([]string{"api.example.com"}), time.Now(), nil))
+}
+
 // activateSvcForTest wires a DeploymentService with sqlmock-backed
 // repositories and the given publisher. `defaultRegion` is what
 // ActivateDeployment should fall back to when the deployment row has
@@ -131,6 +141,7 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	// 2. ActivateDeployment wraps the GetForUpdate + Set in a tx
 	// (so concurrent activate/rollback serialize via FOR UPDATE).
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs(tenantID, appName).
 		WillReturnError(sql.ErrNoRows)
@@ -232,6 +243,7 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, "t_test")
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -293,6 +305,7 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, "t_test")
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -360,6 +373,7 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, "t_test")
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -436,6 +450,7 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, "t_test")
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -504,6 +519,7 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	expectTenantForUpdateIssue440(mock, "t_test")
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)

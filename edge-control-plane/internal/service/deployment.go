@@ -211,6 +211,22 @@ var (
 	// tenant should always be able to manually reverse their own
 	// activation, even if they opted out of auto-rollback.
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
+	// ErrTenantDisabled is returned by ActivateDeployment /
+	// RollbackDeployment / PromoteDeployment when the tenants row
+	// has disabled_at IS NOT NULL at the moment the activate tx takes
+	// its SELECT … FOR UPDATE on (tenants.id) — issue #440. The
+	// row-level lock serializes the activate tx against
+	// WorkerService.disableTenantAtomically, so a racing tenant
+	// disable either blocks the activate (we then read disabled_at
+	// non-nil and abort the publish) or commits ahead of us (the
+	// disable path's post-commit active-deployments diff then sees
+	// our row and skips publishing an empty task_update that would
+	// otherwise kill the just-activated app). Handler maps to
+	// HTTP 409 Conflict (RFC 9110 §15.5.10 — "request can't be
+	// processed in current resource state"); match the conventional
+	// ErrNoLastGood / ErrAlreadyActivated mappings at the top of
+	// handler/deployment.go.
+	ErrTenantDisabled = errors.New("tenant is disabled (issue #440); re-enable via POST /api/v1/admin/tenants/.../enable or wait for the quota-billing cycle to reset")
 )
 
 // PublishError carries the per-region outcome of a fan-out
@@ -863,6 +879,26 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	//     last_good becomes equal to deployment_id (visually a no-op,
 	//     but the row stays consistent).
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// Issue #440: take SELECT ... FOR UPDATE on the tenants row
+		// inside the same tx as the active_deployments FOR UPDATE so
+		// the tenant state is observed under the lock — not after a
+		// post-commit GetByID race. The lock also serializes against
+		// WorkerService.disableTenantAtomically (added in commit 3):
+		// if disable commits ahead, our tx observes disabled_at
+		// non-nil and we abort before publishing; if our tx commits
+		// first, disable's post-commit active-deployments diff sees
+		// the row we just wrote and skips the empty task_update
+		// that would otherwise kill the just-activated app.
+		txTenant, err := s.tenantRepo.WithTx(tx).GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("reading tenant for update: %w", err)
+		}
+		if txTenant == nil {
+			return fmt.Errorf("tenant not found")
+		}
+		if txTenant.IsDisabled() {
+			return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
+		}
 		txActive := s.activeRepo.WithTx(tx)
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
