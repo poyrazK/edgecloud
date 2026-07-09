@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/jmoiron/sqlx"
 	"github.com/nats-io/nats.go"
 )
 
@@ -158,6 +160,14 @@ func (m *mockActiveRepo) ListByTenant(ctx context.Context, tenantID string) ([]d
 		return nil, nil
 	}
 	return m.listByTenantFunc(ctx, tenantID)
+}
+
+// WithTx returns nil because the existing stability-window tests never
+// exercise disableTenantAtomically (which is the only call site that
+// uses WithTx). The dedicated disable-path tests live in
+// deployment_disable_test.go and use a sqlmock-backed harness instead.
+func (m *mockActiveRepo) WithTx(_ *sqlx.Tx) *repository.ActiveDeploymentRepository {
+	return nil
 }
 
 // workerSvcForTest builds a WorkerService with mock dependencies.
@@ -918,6 +928,70 @@ func TestApplyTenantDelta_Requests_ExceedsCap_Logs(t *testing.T) {
 	}
 	if !strings.Contains(out, "exceeds monthly limit 100") {
 		t.Errorf("log output missing limit; got %q", out)
+	}
+}
+
+// TestApplyTenantDelta_Requests_ExceedsCap_PublishesEmpty extends the
+// breach test to assert that an empty task_update is published per
+// region when the tenant has active deployments (issue #440). Without
+// the publish, workers in every region keep running the tenant's apps
+// until the 5-minute reconcile cycle — the very regression this test
+// pins.
+func TestApplyTenantDelta_Requests_ExceedsCap_PublishesEmpty(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	js := &recordingJetStream{}
+	regions := []string{"us-east", "eu-west"}
+	svc := &WorkerService{
+		workerRepo: &mockWorkerRepo{},
+		quotaRepo: &mockQuotaRepo{
+			addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+				return &domain.Quota{
+					MaxRequestsPerMonth: 100,
+					UsedRequestCount:    101, // breach
+				}, nil
+			},
+		},
+		tenantRepo: &mockTenantRepo{},
+		activeRepo: &mockActiveRepo{
+			listByTenantFunc: func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
+				return []domain.ActiveDeployment{
+					{TenantID: "t_a", AppName: "myapp", DeploymentID: "d_1", RegionsPublished: regions},
+				}, nil
+			},
+		},
+		jsForTest: js,
+		nc:        nil,
+	}
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 1, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if len(js.publishes) != len(regions) {
+		t.Fatalf("publish count = %d, want %d (one per region)", len(js.publishes), len(regions))
+	}
+	got := make(map[string][]byte, len(js.publishes))
+	for _, p := range js.publishes {
+		got[p.subject] = p.data
+	}
+	for _, r := range regions {
+		if _, ok := got["edgecloud.tasks."+r]; !ok {
+			t.Errorf("missing publish to edgecloud.tasks.%s; got subjects %v", r, keysOf(got))
+		}
+	}
+	out := buf.String()
+	if !strings.Contains(out, "published empty task_update for disabled tenant t_a") {
+		t.Errorf("missing published-empty log line; got %q", out)
 	}
 }
 

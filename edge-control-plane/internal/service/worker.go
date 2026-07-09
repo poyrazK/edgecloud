@@ -14,6 +14,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
+	"github.com/jmoiron/sqlx"
 	natsio "github.com/nats-io/nats.go"
 )
 
@@ -49,8 +50,10 @@ func (s *WorkerService) heartbeatRecover() {
 // for tenant-level operations (issue #155).
 type tenantRepoInterface interface {
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error)
 	SetDisabledAt(ctx context.Context, tenantID string, at time.Time) error
 	ClearDisabledAt(ctx context.Context, tenantID string) error
+	WithTx(tx *sqlx.Tx) *repository.TenantRepository
 }
 
 // workerRepoInterface defines the repository methods used by WorkerService.
@@ -85,6 +88,7 @@ type activeRepoInterface interface {
 	ClearStableSince(ctx context.Context, tenantID, appName string) error
 	PromoteToLastGood(ctx context.Context, tenantID, appName, deploymentID string) error
 	ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
+	WithTx(tx *sqlx.Tx) *repository.ActiveDeploymentRepository
 }
 
 // defaultStableWindowSeconds is the default for `STABLE_WINDOW_SECONDS`
@@ -114,6 +118,7 @@ type dedupeEntry struct {
 
 // WorkerService handles worker lifecycle business logic.
 type WorkerService struct {
+	db           *sqlx.DB
 	workerRepo   workerRepoInterface
 	quotaRepo    quotaRepoInterface
 	activeRepo   activeRepoInterface
@@ -121,6 +126,12 @@ type WorkerService struct {
 	nc           *natsio.Conn
 	stableWindow time.Duration
 	metricsAgg   *MetricsAggregator
+	// jsForTest overrides the JetStream publisher used by
+	// notifyDisableTenant. nil in production (the function falls back
+	// to nc.JetStream()); non-nil in tests so they can assert that an
+	// empty task_update is published per region without spinning up
+	// nats-server (issue #440).
+	jsForTest jetstreamPublisher
 	// tracker optionally receives liveness updates from the heartbeat
 	// drain. A nil tracker is permitted (existing tests build
 	// WorkerService without one); the drain skips Beat/RecordPanic
@@ -155,6 +166,7 @@ type WorkerService struct {
 // recover helper calls `RecordPanic()` on a recovered panic
 // (review findings #3 and #4).
 func NewWorkerService(
+	db *sqlx.DB,
 	workerRepo *repository.WorkerRepository,
 	quotaRepo *repository.QuotaRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
@@ -168,6 +180,7 @@ func NewWorkerService(
 		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
 	}
 	return &WorkerService{
+		db:           db,
 		workerRepo:   workerRepo,
 		quotaRepo:    quotaRepo,
 		activeRepo:   activeRepo,
@@ -638,16 +651,12 @@ func (s *WorkerService) applyTenantDelta(
 				"quota: tenant %s used %d %s, exceeds monthly limit %d — disabling tenant",
 				tenantID, used, capLabel, cap,
 			)
-			// Disable the tenant so the reconcile loop stops publishing
-			// task updates and new deployments are rejected (issue #155).
-			if err := s.tenantRepo.SetDisabledAt(ctx, tenantID, time.Now()); err != nil {
+			// Disable the tenant atomically (issue #440) so the
+			// disable→empty-task_update publish serializes against
+			// any in-flight ActivateDeployment on the same tenant.
+			if err := s.disableTenantAtomically(ctx, tenantID); err != nil {
 				log.Printf("quota: failed to disable tenant %s: %v", tenantID, err)
-				continue
 			}
-			// Publish empty task_update so workers in every region
-			// stop the tenant's apps immediately instead of waiting
-			// for the next reconcile cycle (5 min).
-			s.notifyDisableTenant(ctx, tenantID)
 		}
 	}
 }
@@ -670,11 +679,164 @@ func (s *WorkerService) dedupeSeen(id string) bool {
 	return false
 }
 
+// disableTenantAtomically stamps `tenants.disabled_at` and then publishes
+// an empty task_update so workers stop the tenant's apps immediately, with
+// row-level serialization against any in-flight ActivateDeployment on the
+// same tenant (issue #440).
+//
+// Sequence under the tenant-row FOR UPDATE lock:
+//
+//  1. BEGIN tx.
+//  2. SELECT … FROM tenants WHERE id = $1 FOR UPDATE  — blocks any
+//     concurrent ActivateDeployment that took the lock just before us.
+//  3. UPDATE tenants SET disabled_at = NOW().
+//  4. SELECT … FROM active_deployments WHERE tenant_id = $1  — snapshot
+//     the set of currently-active (deployment_id, app_name) pairs while
+//     the lock is held. This is the "as-of-disable" baseline.
+//  5. COMMIT — the lock releases.
+//  6. SELECT … FROM active_deployments WHERE tenant_id = $1  — fresh,
+//     non-tx read. Compute the set diff `adsNow − baseline`. If diff is
+//     non-empty, an ActivateDeployment committed in step 2→5 with its own
+//     non-empty task_update on the wire; publishing empty would kill the
+//     just-activated app — the very bug this commit closes — so we skip
+//     the publish and log the skipped pairs.
+//  7. Otherwise publish empty per region via notifyDisableTenant.
+//
+// Callers (the quota-exceeded branch in applyTenantDelta) should treat
+// the returned error as "disable failed, leave tenant in current state"
+// and not retry — the next heartbeat will re-evaluate the quota.
+func (s *WorkerService) disableTenantAtomically(ctx context.Context, tenantID string) error {
+	if s.db == nil {
+		// Tests build a WorkerService without a DB; preserve the
+		// historical two-step behaviour for those call sites by falling
+		// back to the non-tx path. Production always wires `db`.
+		if err := s.tenantRepo.SetDisabledAt(ctx, tenantID, time.Now()); err != nil {
+			return err
+		}
+		s.notifyDisableTenant(ctx, tenantID)
+		return nil
+	}
+
+	var baseline []domain.ActiveDeployment
+	err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txTenant := s.tenantRepo.WithTx(tx)
+		if _, err := txTenant.GetForUpdate(ctx, tenantID); err != nil {
+			return fmt.Errorf("locking tenant for disable: %w", err)
+		}
+		if err := txTenant.SetDisabledAt(ctx, tenantID, time.Now()); err != nil {
+			return fmt.Errorf("stamping disabled_at: %w", err)
+		}
+		// Snapshot the active-deployment set under the tenant-row lock so
+		// the post-commit diff can detect a racing activate. Reading
+		// inside the tx is fine; the lock prevents any other writer
+		// from changing `tenants.disabled_at` until commit, and an
+		// active_deployments INSERT from a racing activate would have
+		// already blocked on the tenant-row lock (commit 2 acquired the
+		// same lock in its tx) — so this read sees the pre-activate
+		// state.
+		ads, err := s.activeRepo.WithTx(tx).ListByTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("snapshotting active deployments: %w", err)
+		}
+		baseline = ads
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Fresh read outside the lock — if a racing activate committed
+	// between our GetForUpdate and this read, its row is in adsNow but
+	// not in baseline. Skip the empty publish in that case: the racing
+	// activate's task_update is on the wire and will be the last state
+	// workers observe.
+	adsNow, err := s.activeRepo.ListByTenant(ctx, tenantID)
+	if err != nil {
+		log.Printf("quota: post-commit active-deployments read for tenant %s: %v", tenantID, err)
+		// Conservative: if we can't determine the diff, fall through to
+		// publishing empty. A racing activate's non-empty task_update
+		// arriving after our empty is the bug we're fixing — but we'd
+		// rather publish empty (and the activate's 409-conflict guard
+		// from commit 2 will keep the activate side safe in the next
+		// window) than skip the publish entirely and leave workers
+		// running an over-quota tenant for the 5-min reconcile cycle.
+		s.notifyDisableTenant(ctx, tenantID)
+		return nil
+	}
+
+	added := diffActiveDeployments(baseline, adsNow)
+	if len(added) > 0 {
+		log.Printf(
+			"quota: tenant %s disabled but %d active row(s) committed mid-tx; skipping empty task_update (issue #440 racing-activate detected): %s",
+			tenantID, len(added), formatActiveDeploymentPairs(added),
+		)
+		return nil
+	}
+
+	s.notifyDisableTenant(ctx, tenantID)
+	return nil
+}
+
+// diffActiveDeployments returns the set of rows in `now` that were not
+// present in `baseline`, keyed by (tenant_id, app_name). A row counts as
+// "the same" only if both keys match; deployment_id changes on a known
+// (tenant, app) are treated as a new row because the racing activate
+// flipped it and we want to know.
+func diffActiveDeployments(baseline, now []domain.ActiveDeployment) []domain.ActiveDeployment {
+	if len(baseline) == 0 {
+		return now
+	}
+	index := make(map[string]struct{}, len(baseline))
+	for _, ad := range baseline {
+		index[ad.TenantID+"\x00"+ad.AppName] = struct{}{}
+	}
+	var added []domain.ActiveDeployment
+	for _, ad := range now {
+		if _, ok := index[ad.TenantID+"\x00"+ad.AppName]; !ok {
+			added = append(added, ad)
+		}
+	}
+	return added
+}
+
+// formatActiveDeploymentPairs renders the (app_name, deployment_id) pairs
+// for the racing-activate skip log line. Bounded — at most a few dozen
+// apps per tenant in practice.
+func formatActiveDeploymentPairs(ads []domain.ActiveDeployment) string {
+	parts := make([]string, 0, len(ads))
+	for _, ad := range ads {
+		parts = append(parts, fmt.Sprintf("%s=%s", ad.AppName, ad.DeploymentID))
+	}
+	return strings.Join(parts, ",")
+}
+
+// jetstreamPublisher is the minimal NATS JetStream surface
+// notifyDisableTenant needs. *natsio.JetStreamContext satisfies it via
+// its embedded JetStream.Publish method (variadic PubOpt for caller
+// headers / msg-headers; the disable path passes none). Defined here so
+// unit tests can substitute a recording fake without spinning up a
+// real JetStream context (issue #440 — the disable-side tests assert
+// that an empty task_update is published per region without requiring
+// nats-server).
+type jetstreamPublisher interface {
+	Publish(subject string, data []byte, opts ...natsio.PubOpt) (*natsio.PubAck, error)
+}
+
+// jetStreamForConn returns the *natsio.Conn's JetStream context wrapped
+// as a jetstreamPublisher. Returns an error when the conn is nil so the
+// caller can log and return.
+func jetStreamForConn(nc *natsio.Conn) (jetstreamPublisher, error) {
+	if nc == nil {
+		return nil, fmt.Errorf("nats conn is nil")
+	}
+	return nc.JetStream()
+}
+
 // notifyDisableTenant publishes a task_update with an empty apps map to
 // every region where the tenant has active deployments. This tells workers
 // to stop the tenant's apps immediately (issue #155).
 func (s *WorkerService) notifyDisableTenant(ctx context.Context, tenantID string) {
-	if s.nc == nil {
+	if s.nc == nil && s.jsForTest == nil {
 		return
 	}
 	ads, err := s.activeRepo.ListByTenant(ctx, tenantID)
@@ -697,10 +859,16 @@ func (s *WorkerService) notifyDisableTenant(ctx context.Context, tenantID string
 	if len(regionSet) == 0 {
 		regionSet["global"] = struct{}{}
 	}
-	js, err := s.nc.JetStream()
-	if err != nil {
-		log.Printf("quota: JetStream context for tenant %s disable notification: %v", tenantID, err)
-		return
+	var js jetstreamPublisher
+	if s.jsForTest != nil {
+		js = s.jsForTest
+	} else {
+		var err error
+		js, err = jetStreamForConn(s.nc)
+		if err != nil {
+			log.Printf("quota: JetStream context for tenant %s disable notification: %v", tenantID, err)
+			return
+		}
 	}
 	for region := range regionSet {
 		msg := struct {

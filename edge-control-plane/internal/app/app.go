@@ -134,7 +134,7 @@ func New(
 	// struct (issue #443 review findings #3 and #4).
 	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
-		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
+		db, workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 		loopHealth,
 	)
