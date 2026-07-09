@@ -577,6 +577,7 @@ mod tests {
             tenant_id: tenant_id.to_string(),
             port,
             ws_port: None,
+            dedupe_id: None,
             observer_metrics: vec![],
         }
     }

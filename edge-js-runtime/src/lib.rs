@@ -2,7 +2,16 @@
 
 mod edge_modules;
 
-// Generate bindings matching the handler world
+// Generate bindings matching the handler world.
+//
+// The `path` points at the repo-root canonical `wit/` (promoted to
+// top-level by PR #414 and consumed by samples/hello, edge-js-runtime,
+// and edge-worker/test fixtures; mirrored into
+// `edge-control-plane/internal/service/wit/` for the Go control plane's
+// embed.FS). The wit-drift-check CI job fails the build if the two
+// copies diverge. The `wasi:cli/command@0.2.1` include + the seven
+// `edge:cloud/*` imports (kv-store, cache, observe, time, scheduling,
+// process, websocket) are declared in that file.
 wit_bindgen::generate!({
     world: "edge-runtime-handler",
     path: "../wit",

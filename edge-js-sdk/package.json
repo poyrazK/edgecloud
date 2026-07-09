@@ -12,7 +12,8 @@
     "./observe": "./src/observe.js",
     "./time": "./src/time.js",
     "./scheduling": "./src/scheduling.js",
-    "./process": "./src/process.js"
+    "./process": "./src/process.js",
+    "./websocket": "./src/websocket.js"
   },
   "files": [
     "src/"

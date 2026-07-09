@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -71,6 +72,23 @@ type activeRepoInterface interface {
 // successful heartbeat isn't enough signal.
 const defaultStableWindowSeconds = 30
 
+// dedupeCacheTTL bounds the in-memory dedupe cache used to skip
+// re-applying metering deltas on JetStream redelivery (issue #418).
+// Set to four heartbeat intervals (4 × 30s = 120s) so the cache
+// comfortably outlives any plausible redelivery window without
+// growing unboundedly. Operators tuning `EDGE_HEARTBEAT_INTERVAL_SECS`
+// below 30s should be aware the cache may overlap with a future
+// legitimate heartbeat; the failure mode is conservative
+// (under-count, not over-count) — see metering_dedupe.rs for the
+// discussion.
+const dedupeCacheTTL = 4 * 30 * time.Second
+
+// dedupeEntry tracks when a heartbeat dedupe ID was first seen so the
+// cache can evict stale entries.
+type dedupeEntry struct {
+	expiresAt time.Time
+}
+
 // WorkerService handles worker lifecycle business logic.
 type WorkerService struct {
 	workerRepo   workerRepoInterface
@@ -80,6 +98,15 @@ type WorkerService struct {
 	nc           *natsio.Conn
 	stableWindow time.Duration
 	metricsAgg   *MetricsAggregator
+	// dedupeCache maps `dedupe_id` → expiry time. Entries are evicted
+	// lazily on read — when a present-but-expired key is touched in
+	// `dedupeSeen`, it is deleted and re-recorded with a fresh TTL.
+	// Bounded by the number of active (worker, deployment) pairs at
+	// any moment. Note: both `checkOutboundQuota` and `checkRequestCount`
+	// call `dedupeSeen` per app on every heartbeat (two goroutines per
+	// delivery), so a redelivered heartbeat does 2× Load + Store per
+	// app — negligible at 30s cadence but worth knowing.
+	dedupeCache sync.Map
 }
 
 // NewWorkerService creates a new WorkerService.
@@ -419,7 +446,14 @@ func (s *WorkerService) ingestMetrics(appsRaw json.RawMessage) {
 // writes the cumulative total to the DB, and logs a quota breach when the
 // monthly cap is exceeded. Used by checkOutboundQuota and checkRequestCount
 // — both pass different selector functions for the field/cap/used labels
-// but share this body. Phase 1 is log-only.
+// but share this body.
+//
+// Idempotency (issue #418): each `AppStatus` may carry a `DedupeID` —
+// a stable token that the worker stamps at heartbeat build time. When
+// present and seen recently in `s.dedupeCache`, the app's contribution
+// to the per-tenant delta is dropped (JetStream redelivery or reconcile
+// replay). Apps without a `DedupeID` (pre-#418 workers) always
+// contribute — the legacy behaviour is preserved.
 //
 // Sentinel: cap <= 0 means "unlimited" (the enterprise tier stores -1 for
 // all max_* columns) or "unset / admin-cleared" — either way we skip the
@@ -446,11 +480,25 @@ func (s *WorkerService) applyTenantDelta(
 	// Sum this heartbeat's delta per tenant. Must aggregate all apps before
 	// checking — an early check on a partial per-tenant total would false-trip
 	// the quota when the tenant's heaviest app appears first in map iteration.
+	//
+	// Per the issue #418 dedupe contract: apps whose DedupeID is already in
+	// the cache are skipped (their delta is considered already applied).
+	// Apps with no DedupeID (legacy workers) always contribute — backward
+	// compatibility with pre-#418 workers.
 	byTenant := make(map[string]uint64)
+	skippedDedupe := 0
 	for _, app := range apps {
-		if app.TenantID != "" {
-			byTenant[app.TenantID] += field(&app)
+		if app.TenantID == "" {
+			continue
 		}
+		if app.DedupeID != "" && s.dedupeSeen(app.DedupeID) {
+			skippedDedupe++
+			continue
+		}
+		byTenant[app.TenantID] += field(&app)
+	}
+	if skippedDedupe > 0 {
+		log.Printf("heartbeat: skipped %d %s app(s) on dedupe (JetStream redelivery / reconcile replay)", skippedDedupe, capLabel)
 	}
 
 	for tenantID, delta := range byTenant {
@@ -490,6 +538,24 @@ func (s *WorkerService) applyTenantDelta(
 			s.notifyDisableTenant(ctx, tenantID)
 		}
 	}
+}
+
+// dedupeSeen reports whether the given dedupe ID has been observed within
+// the cache TTL. On a fresh hit, the ID is recorded so subsequent
+// deliveries (JetStream redelivery, reconcile replay) skip the delta.
+// Lazy eviction: an expired entry is deleted and reported as "not seen".
+func (s *WorkerService) dedupeSeen(id string) bool {
+	now := time.Now()
+	if v, ok := s.dedupeCache.Load(id); ok {
+		entry := v.(dedupeEntry)
+		if now.Before(entry.expiresAt) {
+			return true
+		}
+		// Expired — evict and treat as fresh.
+		s.dedupeCache.Delete(id)
+	}
+	s.dedupeCache.Store(id, dedupeEntry{expiresAt: now.Add(dedupeCacheTTL)})
+	return false
 }
 
 // notifyDisableTenant publishes a task_update with an empty apps map to
@@ -607,9 +673,14 @@ func (s *WorkerGCService) Run(ctx context.Context, interval, maxAge time.Duratio
 }
 
 // checkOutboundQuota accumulates outbound_bytes from this heartbeat into the
-// tenant's running total in the DB (cross-worker, cross-interval), then logs a
-// violation when the cumulative total exceeds the per-month max_outbound_mb cap.
-// Phase 1: log-only. Phase 2 (tracked in issue #120 follow-up): evict apps.
+// tenant's running total in the DB (cross-worker, cross-interval). When the
+// cumulative total exceeds the per-month max_outbound_mb cap, the tenant is
+// disabled (issue #155) and an empty task_update is published to every
+// region where the tenant has active deployments so workers stop the
+// tenant's apps immediately rather than waiting for the 5-minute reconcile
+// cycle. The lazy month rollover in QuotaRepository.addColumn resets the
+// counter when quotas.quota_period_start is in a past UTC calendar month,
+// so this function does not need to manage period boundaries directly.
 func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.RawMessage) {
 	s.applyTenantDelta(ctx, appsRaw,
 		func(a *domain.AppStatus) uint64 { return a.OutboundBytes },
@@ -621,10 +692,13 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 }
 
 // checkRequestCount accumulates request_count from this heartbeat into the
-// tenant's running total in the DB (cross-worker, cross-interval), then logs
-// a violation when the cumulative total exceeds the per-month
-// max_requests_per_month cap. Mirrors checkOutboundQuota but reads
-// app.RequestCount instead of app.OutboundBytes. Phase 1: log-only.
+// tenant's running total in the DB (cross-worker, cross-interval). When
+// the cumulative total exceeds the per-month max_requests_per_month cap,
+// the tenant is disabled (issue #155) and an empty task_update is published
+// to every region where the tenant has active deployments. Mirrors
+// checkOutboundQuota but reads app.RequestCount instead of app.OutboundBytes.
+// The lazy month rollover in QuotaRepository.addColumn handles the period
+// boundary; this function does not need to track it.
 func (s *WorkerService) checkRequestCount(ctx context.Context, appsRaw json.RawMessage) {
 	s.applyTenantDelta(ctx, appsRaw,
 		func(a *domain.AppStatus) uint64 { return a.RequestCount },

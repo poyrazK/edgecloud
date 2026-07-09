@@ -20,10 +20,31 @@
 //!
 //! # Per-request isolation
 //!
-//! Every request gets a fresh `ResourceTable` and a fresh `WasiCtx`
-//! (rebuilt from the stored env `HashMap` through `RuntimeState::clone`).
-//! Per-tenant `KvStore` / `Cache` / `Scheduler` are Arc-shared, so
-//! cheap to clone.
+//! Every request constructs a fresh `RuntimeState` via
+//! `RuntimeState::with_env_and_meter`. The constructor builds a
+//! fresh `ResourceTable` and a fresh `WasiCtx` (rebuilt from the
+//! stored env `HashMap`), so resource handles from one request
+//! don't leak to the next. Per-tenant `KvStore` / `Cache` /
+//! `Scheduler` are pulled from the runtime's global registry
+//! (memoized via `OnceCell`-rooted RwLock reads) so two requests
+//! for the same tenant share the same `Arc<KvStore>` etc.
+//!
+//! The `with_env_and_meter` call also allocates a fresh
+//! `Arc<AtomicU32>` for the `exit_code` flag and wires it into the
+//! per-request `Process` — see `RuntimeState::with_env_and_meter`
+//! at edge-runtime/src/runtime.rs:252-296. After the guest call we
+//! manual-clone that Arc into `exit_code_arc` so we can read the
+//! flag once the `RuntimeState` has been moved into the
+//! `wasmtime::Store`.
+//!
+//! `RuntimeState::clone` (edge-runtime/src/runtime.rs:321-383) is
+//! available as a documented alternative but currently unused —
+//! the WasiCtx inside `RuntimeState` is `!Sync`, which would
+//! force any `Arc<RuntimeState>` field to live on a struct that
+//! does not need `Send`, a constraint that the FaaS dispatcher's
+//! `tokio::spawn` path cannot satisfy without restructuring. The
+//! per-request `with_env_and_meter` is correct and the expensive
+//! parts (registry lookups + observer config) are O(1) amortized.
 //!
 //! # Per-request budget
 //!
@@ -222,19 +243,22 @@ pub struct HandlerConfig {
     /// on the wire. `None` before the app is running (the accumulator
     /// is created in `start_app`).
     pub metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
-    /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
-    /// Threaded into `RuntimeState::with_env_and_meter` on every FaaS
-    /// dispatch — the runtime does NOT read `EDGE_EGRESS_SOCKET_MODE`
-    /// itself; the worker's `Config::from_env` reads it once at
-    /// startup and the supervisor copies it into `HandlerConfig`.
-    pub socket_mode: SocketEgressPolicy,
+    /// Per-app socket-egress mode (issue #412). Resolved from
+    /// `AppSpec.socket_mode` with the worker-wide `Config::socket_mode`
+    /// (set at startup from `EDGE_EGRESS_SOCKET_MODE`) as the default.
+    /// The dispatch site picks this when constructing the per-request
+    /// `RuntimeState`. The compose rule with the worker-wide
+    /// `hostname_pinning_enabled` toggle is enforced at the dispatch
+    /// site (see `dispatch::handle_request`), NOT here.
+    pub socket_mode_for_app: SocketEgressPolicy,
     /// Per-deployment `HostnamePinned` mode toggle (issue #309
     /// follow-up). When `true`, the per-request `RuntimeState` swap in
-    /// `dispatch` uses `SocketEgressPolicy::HostnamePinned` regardless
-    /// of `socket_mode`. Until the upstream wasmtime-wasi patch
-    /// (`docs/upstream-wasmtime-resolve-check.patch`) merges, the
-    /// `HostnamePinning` cache stays empty and `HostnamePinned` denies
-    /// every connect-side call — observable parity with `BlockAll`.
+    /// `dispatch` uses `SocketEgressPolicy::HostnamePinned` **only when
+    /// `socket_mode_for_app == HostnamePinned`** (issue #412 compose
+    /// rule). The worker-wide knob remains a hard gate for the
+    /// dormant `HostnamePinned` mode until the upstream wasmtime-wasi
+    /// patch (`docs/upstream-wasmtime-resolve-check.patch`) merges and
+    /// the cache starts being populated.
     pub hostname_pinning_enabled: bool,
     /// Shared per-app `HostnamePinning` cache. The supervisor
     /// constructs one `Arc<HostnamePinning>` per app instance and
@@ -743,22 +767,28 @@ impl HandlerDispatch {
         // WasiCtx (rebuilt from the stored env HashMap), shared
         // EgressPolicy + LogSink + meter (Arc-clones).
         //
-        // Socket-egress dispatch: when `hostname_pinning_enabled` is
-        // true the per-request `RuntimeState` uses
-        // `SocketEgressPolicy::HostnamePinned` and the app-wide
-        // shared cache; otherwise the worker-wide `socket_mode` is
-        // used and the per-request `HostnamePinning` stays empty
-        // (dormant — see config.rs `socket_mode` doc).
-        let (socket_mode, hostname_pinning) = if self.config.hostname_pinning_enabled {
-            (
+        // Socket-egress dispatch (issue #412 compose rule): the
+        // per-app `socket_mode_for_app` is the per-app selector for
+        // `BlockAll` / `AllowList` / `AllowAll`. The `HostnamePinned`
+        // arm is reachable ONLY when both the per-app field is
+        // `HostnamePinned` AND the worker-wide
+        // `hostname_pinning_enabled` is true — the worker-wide knob
+        // remains the hard gate for the dormant mode (issue #309).
+        // All other modes use the per-app value with a fresh empty
+        // `HostnamePinning` cache (the cache only matters for
+        // `HostnamePinned`).
+        let (socket_mode, hostname_pinning) = match (
+            self.config.socket_mode_for_app,
+            self.config.hostname_pinning_enabled,
+        ) {
+            (edge_runtime::socket_egress::SocketEgressPolicy::HostnamePinned, true) => (
                 edge_runtime::socket_egress::SocketEgressPolicy::HostnamePinned,
                 self.config.hostname_pinning.clone(),
-            )
-        } else {
-            (
-                self.config.socket_mode,
+            ),
+            (mode, _) => (
+                mode,
                 Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
-            )
+            ),
         };
         let request_state = RuntimeState::with_env_and_meter_preview(
             self.config.env.clone(),
@@ -1584,7 +1614,7 @@ mod synthetic_response_tests {
             env: std::collections::HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1650,7 +1680,7 @@ mod synthetic_response_tests {
             env: std::collections::HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1748,7 +1778,7 @@ mod synthetic_response_tests {
             env: std::collections::HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1810,7 +1840,7 @@ mod synthetic_response_tests {
             env: std::collections::HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1875,7 +1905,7 @@ mod synthetic_response_tests {
             env: std::collections::HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),

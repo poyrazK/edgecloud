@@ -187,7 +187,7 @@ impl LayerHarness {
             env: HashMap::new(),
             max_request_body_bytes: 10 * 1024 * 1024,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -372,7 +372,7 @@ async fn l6_request_body_over_cap_returns_413() {
         env: HashMap::new(),
         max_request_body_bytes: 100,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -430,7 +430,7 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None, // 10 MB — generous
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -513,7 +513,7 @@ async fn l7_per_request_timeout_returns_500() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -760,7 +760,7 @@ async fn l11_guest_calls_process_get_env() {
         env: HashMap::from([("KV_KEY".into(), "hello-from-host".into())]),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -815,7 +815,7 @@ async fn l12_guest_calls_time_now() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -874,7 +874,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -957,7 +957,7 @@ async fn l14_guest_calls_cache_round_trip() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -1037,7 +1037,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -1104,7 +1104,7 @@ async fn l16_guest_schedules_task() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -1161,7 +1161,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -1459,7 +1459,7 @@ async fn l27_process_get_all_env() {
         env,
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -1552,7 +1552,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -2021,7 +2021,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
-        socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
         last_request_at: std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -2092,7 +2092,7 @@ async fn l31_socket_egress_block_all_denies_under_default() {
         return;
     }
     let mut cfg = test_config("l31");
-    cfg.socket_mode = SocketEgressPolicy::BlockAll;
+    cfg.socket_mode_for_app = SocketEgressPolicy::BlockAll;
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
     let cl = make_client();
     let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
@@ -2125,7 +2125,7 @@ async fn l32_socket_egress_allowlist_blocks_hard_deny_ip() {
         return;
     }
     let mut cfg = test_config("l32");
-    cfg.socket_mode = SocketEgressPolicy::AllowList;
+    cfg.socket_mode_for_app = SocketEgressPolicy::AllowList;
     cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
 
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
@@ -2163,7 +2163,7 @@ async fn l33_socket_egress_allowlist_permits_public_ip() {
         return;
     }
     let mut cfg = test_config("l33");
-    cfg.socket_mode = SocketEgressPolicy::AllowList;
+    cfg.socket_mode_for_app = SocketEgressPolicy::AllowList;
     cfg.egress = Arc::new(EgressPolicy::new(vec!["api.example.com".to_string()]));
 
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
@@ -2361,7 +2361,7 @@ async fn l51_dns_resolve_and_connect_block_all_denies() {
         return;
     }
     let mut cfg = test_config("l51");
-    cfg.socket_mode = SocketEgressPolicy::BlockAll;
+    cfg.socket_mode_for_app = SocketEgressPolicy::BlockAll;
     cfg.hostname_pinning_enabled = false;
     let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
     let cl = make_client();
@@ -2410,7 +2410,7 @@ async fn l52_dns_resolve_and_connect_hostname_pinned_dormant_denies() {
     }
     let mut cfg = test_config("l52");
     // The new variant — see `edge-runtime/src/socket_egress.rs::SocketEgressPolicy::HostnamePinned`.
-    cfg.socket_mode = SocketEgressPolicy::HostnamePinned;
+    cfg.socket_mode_for_app = SocketEgressPolicy::HostnamePinned;
     // The per-request `RuntimeState` swap in `dispatch.rs::handle_request`
     // consults this toggle: true → HostnamePinned + the app-wide shared
     // cache; false → worker-wide socket_mode + a fresh empty cache.
@@ -2438,6 +2438,115 @@ async fn l52_dns_resolve_and_connect_hostname_pinned_dormant_denies() {
         body.starts_with("deny:access-denied"),
         "HostnamePinned + empty cache must deny the connect side \
          (dormant state; got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l53_socket_mode_per_app_block_all_overrides_worker_allowlist() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    // Per-app selector (issue #412): even though the worker-wide `socket_mode`
+    // is `AllowList`, this app's `AppSpec.socket_mode = BlockAll` must win.
+    // The `allowlist` here is irrelevant — the runtime never consults it once
+    // the per-app mode is `BlockAll`.
+    let mut cfg = test_config("l53");
+    cfg.egress = Arc::new(EgressPolicy::allow_all());
+    cfg.socket_mode_for_app = SocketEgressPolicy::BlockAll;
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/dns-resolve-and-connect?host=127.0.0.1&port=80"))
+        .send()
+        .await
+        .expect("send resolve-and-connect");
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.starts_with("deny:access-denied"),
+        "per-app BlockAll must deny the connect side regardless of the \
+         worker-wide socket_mode (got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l54_socket_mode_per_app_hostname_pinned_requires_worker_knob() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    // Compose rule (issue #412, user-confirmed): the per-app selector is
+    // `AppSpec.socket_mode`, but the worker-wide `hostname_pinning_enabled`
+    // remains a hard gate for `HostnamePinned`. With the knob OFF, the
+    // HostnamePinned arm is unreachable and the request must deny — without
+    // ever touching the empty cache.
+    let mut cfg = test_config("l54");
+    cfg.socket_mode_for_app = SocketEgressPolicy::HostnamePinned;
+    // Explicitly NOT setting `cfg.hostname_pinning_enabled = true` —
+    // this is the load-bearing assertion that the worker-wide knob still
+    // gates the HostnamePinned arm.
+    assert!(
+        !cfg.hostname_pinning_enabled,
+        "l54 explicitly tests the compose rule: HostnamePinned must be \
+         unreachable when the worker-wide knob is off"
+    );
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/dns-resolve-and-connect?host=127.0.0.1&port=80"))
+        .send()
+        .await
+        .expect("send resolve-and-connect");
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.starts_with("deny:access-denied"),
+        "HostnamePinned with worker-wide knob OFF must deny (compose rule; \
+         got: {body:?})"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l55_socket_mode_per_app_hostname_pinned_both_required_lights_up() {
+    if should_skip_layer_tests() {
+        return;
+    }
+    // Compose rule with BOTH gates active: per-app `HostnamePinned` AND
+    // worker-wide `hostname_pinning_enabled = true`. The dispatch site
+    // reaches the HostnamePinned arm and uses the app-wide shared
+    // `HostnamePinning` cache. With an empty cache (dormant today), the
+    // connect-side closure must deny — same shape as l52.
+    let mut cfg = test_config("l55");
+    cfg.socket_mode_for_app = SocketEgressPolicy::HostnamePinned;
+    cfg.hostname_pinning_enabled = true;
+    assert!(
+        cfg.hostname_pinning.snapshot().is_empty(),
+        "l55 explicitly tests the empty-cache dormant state, same as l52"
+    );
+
+    let (port, shutdown_tx) = spawn_handler_with_config(cfg).await;
+    let cl = make_client();
+    let b = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+    let resp = cl
+        .get(b("/sockets/dns-resolve-and-connect?host=127.0.0.1&port=80"))
+        .send()
+        .await
+        .expect("send resolve-and-connect");
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.starts_with("deny:access-denied"),
+        "HostnamePinned + empty cache must deny (per-app + knob both \
+         active; dormant state; got: {body:?})"
     );
 
     let _ = shutdown_tx.send(());

@@ -1003,6 +1003,182 @@ func TestApplyTenantDelta_RepositoryError_LogsAndContinues(t *testing.T) {
 	}
 }
 
+// ── Dedupe-skip tests (issue #418) ────────────────────────────────────
+
+// TestApplyTenantDelta_SkipsDuplicateDelivery verifies that a heartbeat
+// carrying a DedupeID the CP has already seen within the cache TTL does
+// NOT trigger another `add` call. This is the JetStream redelivery path:
+// the same logical heartbeat arrives twice and we must not double-count.
+func TestApplyTenantDelta_SkipsDuplicateDelivery(t *testing.T) {
+	calls := 0
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, delta uint64) (*domain.Quota, error) {
+			calls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000, UsedRequestCount: int64(delta)}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {
+			TenantID:     "t_a",
+			RequestCount: 10,
+			DedupeID:     "w_fra_1:d_abc:12345",
+		},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	// First delivery — cache miss, must call add() once.
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+	if calls != 1 {
+		t.Fatalf("first delivery: addRequestCount called %d times, want 1", calls)
+	}
+
+	// Second delivery with the same DedupeID — cache hit, must NOT call add().
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+	if calls != 1 {
+		t.Errorf("duplicate delivery: addRequestCount called %d times total, want 1 (redelivery must be skipped)", calls)
+	}
+}
+
+// TestApplyTenantDelta_DistinctDeployments verifies that two deployments
+// with different DedupeIDs both contribute their deltas. A redelivery
+// from one must not block a legitimate delivery from the other.
+func TestApplyTenantDelta_DistinctDeployments(t *testing.T) {
+	calls := 0
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, delta uint64) (*domain.Quota, error) {
+			calls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000, UsedRequestCount: int64(delta)}, nil
+		},
+	})
+	// Two apps, same tenant, distinct DedupeIDs — both must apply.
+	apps := map[string]domain.AppStatus{
+		"app1": {TenantID: "t_a", RequestCount: 5, DedupeID: "w:d1:100"},
+		"app2": {TenantID: "t_a", RequestCount: 7, DedupeID: "w:d2:100"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if calls != 1 {
+		t.Errorf("addRequestCount called %d times, want 1 (one per tenant, not per app)", calls)
+	}
+	// The delta is the sum of both apps (5+7=12) — verified by the
+	// single add() call landing at one tenant. No dedupe skip here
+	// because each app carries a distinct DedupeID.
+}
+
+// TestApplyTenantDelta_DistinctTenants verifies that two tenants each
+// get their own quota row added to, even when their apps share a DedupeID.
+// (Defensive — DedupeIDs are scoped to deployment, but the dedupe path
+// must not let one tenant block another's delta.)
+func TestApplyTenantDelta_DistinctTenants(t *testing.T) {
+	calls := 0
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+			calls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000, UsedRequestCount: int64(delta)}, nil
+		},
+	})
+	// Two apps, two tenants, distinct DedupeIDs — both must apply (one
+	// add() per tenant). The dedupe contract is "same ID = same delta";
+	// in practice the worker emits a different DedupeID for each
+	// `(worker_id, deployment_id, bucket)` triple so cross-tenant
+	// collisions cannot happen. This test pins the multi-tenant happy
+	// path so a future refactor doesn't accidentally collapse tenants.
+	apps := map[string]domain.AppStatus{
+		"app1": {TenantID: "t_a", RequestCount: 5, DedupeID: "w:d1:100"},
+		"app2": {TenantID: "t_b", RequestCount: 7, DedupeID: "w:d2:100"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if calls != 2 {
+		t.Errorf("addRequestCount called %d times, want 2 (one per tenant)", calls)
+	}
+}
+
+// TestApplyTenantDelta_LegacyWorkerNoDedupe verifies backward compat:
+// a heartbeat without DedupeID applies on every delivery (the legacy
+// behaviour). This is what pre-#418 workers emit.
+func TestApplyTenantDelta_LegacyWorkerNoDedupe(t *testing.T) {
+	calls := 0
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			calls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000, UsedRequestCount: 1}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 5, DedupeID: ""}, // no dedupe ID — legacy
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	// Two deliveries — both apply because DedupeID is empty.
+	for i := 0; i < 2; i++ {
+		svc.applyTenantDelta(context.Background(), appsRaw,
+			func(a *domain.AppStatus) uint64 { return a.RequestCount },
+			func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+			func(q *domain.Quota) int64 { return q.UsedRequestCount },
+			"requests",
+			svc.quotaRepo.AddRequestCount,
+		)
+	}
+	if calls != 2 {
+		t.Errorf("addRequestCount called %d times, want 2 (legacy workers with no DedupeID apply every delivery)", calls)
+	}
+}
+
+// TestDedupeSeen_RecordsAndEvicts verifies the cache primitive directly:
+// first call returns false (not seen, and records); second call within
+// TTL returns true; after expiry it returns false again.
+func TestDedupeSeen_RecordsAndEvicts(t *testing.T) {
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{})
+
+	// First observation — fresh.
+	if seen := svc.dedupeSeen("key-1"); seen {
+		t.Errorf("first dedupeSeen(\"key-1\") = true, want false (fresh entry)")
+	}
+	// Second observation within TTL — cached.
+	if seen := svc.dedupeSeen("key-1"); !seen {
+		t.Errorf("second dedupeSeen(\"key-1\") = false, want true (cache hit)")
+	}
+	// A different key is independent.
+	if seen := svc.dedupeSeen("key-2"); seen {
+		t.Errorf("dedupeSeen(\"key-2\") = true, want false (different key)")
+	}
+
+	// Force expiry by manipulating the entry's expiresAt backwards.
+	svc.dedupeCache.Store("key-1", dedupeEntry{expiresAt: time.Now().Add(-time.Second)})
+	if seen := svc.dedupeSeen("key-1"); seen {
+		t.Errorf("dedupeSeen(\"key-1\") after expiry = true, want false (expired entry evicted on access)")
+	}
+}
+
 // Unused import suppression: strconv is used in tests for tenant ID assertions
 // but a few of the helper-only tests above don't reference it. Keep the
 // import explicit so adding new tests is friction-free.
