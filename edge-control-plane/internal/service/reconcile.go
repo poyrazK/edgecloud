@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -294,9 +295,19 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 		}
 		v := e.EnvValue
 		if s.envDecrypter != nil {
-			if d, err := s.envDecrypter.Decrypt(e.EnvValue); err == nil {
-				v = d
+			// Issue #441: fail closed. A plaintext or tampered env row
+			// aborts this tenant's reconcile sweep (log-and-return)
+			// — operators see the error in CP logs and re-encrypt the
+			// offending row before the next tick. We don't try to
+			// "continue past the bad row" because that would publish
+			// the rest of the app's env plaintext, which is exactly
+			// the bug being fixed.
+			d, err := s.envDecrypter.Decrypt(e.EnvValue)
+			if err != nil {
+				log.Printf("reconcile: tenant=%s %s/%s: decrypt failed: %v (aborting tenant reconcile; re-encrypt via POST /api/v1/admin/secrets/re-encrypt)", tenantID, e.AppName, e.EnvKey, err)
+				return
 			}
+			v = d
 		}
 		envByApp[e.AppName][e.EnvKey] = v
 	}
@@ -457,9 +468,12 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 		}
 		v := e.EnvValue
 		if s.envDecrypter != nil {
-			if d, err := s.envDecrypter.Decrypt(e.EnvValue); err == nil {
-				v = d
+			// Issue #441: fail closed. Same shape as reconcileTenant.
+			d, err := s.envDecrypter.Decrypt(e.EnvValue)
+			if err != nil {
+				return nil, fmt.Errorf("decrypting env %s/%s: %w", e.AppName, e.EnvKey, err)
 			}
+			v = d
 		}
 		envByApp[e.AppName][e.EnvKey] = v
 	}

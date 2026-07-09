@@ -859,3 +859,40 @@ func keys[V any](m map[string]V) []string {
 	}
 	return out
 }
+
+// TestBuildFullSync_PlaintextEnvRow_ReturnsError (issue #441): a
+// plaintext env row must NOT silently flow into the published AppConfig.
+// BuildFullSync propagates the per-row decrypt error.
+func TestBuildFullSync_PlaintextEnvRow_ReturnsError(t *testing.T) {
+	sec, err := NewSecretEncryptor(testMasterKey)
+	if err != nil {
+		t.Fatalf("NewSecretEncryptor: %v", err)
+	}
+
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a"}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {{TenantID: "t_a", AppName: "hello", DeploymentID: "d_1"}},
+		},
+		map[string]*domain.Deployment{
+			"d_1": {ID: "d_1", Hash: "abc", Regions: []string{"global"}},
+		},
+		map[string][]domain.AppEnv{
+			"t_a/hello": {{TenantID: "t_a", AppName: "hello", EnvKey: "API_KEY", EnvValue: "legacy-plaintext"}},
+		},
+		nil, // no quota
+		&capturingPublisher{},
+	)
+	svc.SetEnvDecrypter(sec)
+
+	apps, err := svc.BuildFullSync(context.Background(), "t_a", "global")
+	if err == nil {
+		t.Fatal("BuildFullSync should error on plaintext env row (issue #441), got nil")
+	}
+	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
+		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed in chain", err)
+	}
+	if apps != nil {
+		t.Errorf("apps should be nil on error, got %v", apps)
+	}
+}
