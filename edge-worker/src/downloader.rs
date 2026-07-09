@@ -1,6 +1,7 @@
 //! Artifact downloader with local file cache.
 
 use anyhow::Context;
+use futures::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -237,7 +238,6 @@ impl Downloader {
         // the stream. `total` is updated BEFORE `extend_from_slice` so
         // we bail before buffering further bytes (the bytes::BytesMut
         // grow path is unchecked).
-        use futures::TryStreamExt;
         let mut stream = response.bytes_stream();
         let mut total: usize = 0;
         let mut buf = bytes::BytesMut::new();
@@ -1415,32 +1415,64 @@ mod tests {
         );
     }
 
-    /// Body of (cap * 4) bytes is sent without a Content-Length override,
-    /// so wiremock sets Content-Length = cap*4 too. The streaming
-    /// accumulator bails when the running total exceeds the cap. This
-    /// covers the threat model where the pre-read Content-Length check
-    /// is bypassed (e.g. a server that omits Content-Length, sends a
-    /// lying CL, or compresses the body so the on-wire CL is smaller
-    /// than the decompressed size). In all three cases the per-chunk
-    /// accumulator is the load-bearing defense — without it, the worker
-    /// would happily buffer the whole body.
+    /// Body of (cap * 4) bytes arrives in a chunked transfer-encoded
+    /// response (no `Content-Length` header). The pre-read cap check is
+    /// therefore skipped (content_length = None), and the streaming
+    /// accumulator is the only thing that can stop an oversize body —
+    /// this is the load-bearing defense for compressed responses and
+    /// for any CP that omits/lying-CLs. We can't use wiremock here
+    /// because its `ResponseTemplate` always auto-derives
+    /// `Content-Length` from the body. And we can't use
+    /// `http_body_util::Full<Bytes>` either — that's a known-length
+    /// body type that hyper 1.x's H1 encoder also auto-derives a
+    /// Content-Length for. A true streaming body type is required to
+    /// force chunked transfer encoding.
     #[tokio::test]
     async fn get_artifact_streaming_chunk_exceeds_cap_aborts() {
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        use hyper::service::service_fn;
+        use hyper::{Response as HyperResponse, StatusCode};
+        use hyper_util::rt::TokioIo;
         use tempfile::TempDir;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use tokio::net::TcpListener;
 
-        let server = MockServer::start().await;
+        // Bind a hyper server that returns 200 with a streaming body of
+        // (TEST_CAP * 4) bytes. The H1 encoder will emit
+        // `Transfer-Encoding: chunked` because StreamBody has unknown
+        // length, and the client will see content_length = None.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
         let body = vec![0u8; (TEST_CAP * 4) as usize];
-        Mock::given(method("GET"))
-            .and(path("/api/internal/download/d_cap_stream"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
-            .mount(&server)
-            .await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                let body = body.clone();
+                async move {
+                    // Build an unknown-length body so the H1 encoder
+                    // uses chunked transfer encoding. We split the
+                    // body into 4 chunks of (TEST_CAP) each so the
+                    // accumulator sees multiple per-chunk bail checks.
+                    let chunks: Vec<std::result::Result<Frame<bytes::Bytes>, std::io::Error>> =
+                        body.chunks(TEST_CAP as usize)
+                            .map(|c| Ok(Frame::data(bytes::Bytes::copy_from_slice(c))))
+                            .collect();
+                    let stream = futures::stream::iter(chunks);
+                    let body = StreamBody::new(stream);
+                    let mut resp = HyperResponse::new(body);
+                    *resp.status_mut() = StatusCode::OK;
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
 
         let tmp = TempDir::new().expect("tempdir");
         let downloader = Downloader::with_max_download_bytes(
-            server.uri(),
+            format!("http://{addr}"),
             tmp.path().to_path_buf(),
             test_signer(),
             None,
@@ -1450,7 +1482,7 @@ mod tests {
         let err = downloader
             .get_artifact("d_cap_stream", &sha256_hex(b"any"), None, None)
             .await
-            .expect_err("4x cap body must abort streaming");
+            .expect_err("4x cap body over chunked encoding must abort streaming");
         let msg = err.to_string();
         assert!(
             msg.contains("exceeded"),
