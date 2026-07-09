@@ -1,0 +1,25 @@
+# Shared build cache across all git worktrees.
+#
+# Why: each git worktree owns its own working tree, and Cargo's default
+# `target/` lives inside the working tree. With multiple agents running
+# worktrees in parallel, every worktree ends up with a full ~6 GB debug
+# target. This config lifts `target/` to a per-user cache dir so all
+# worktrees share one target, and wraps rustc with sccache so duplicate
+# compiles across worktrees / cold restarts hit a content-addressed
+# cache instead of recompiling wasmtime, tree-sitter, etc.
+#
+# Setup once per developer machine:
+#   brew install sccache           # macOS
+#   # or: cargo install sccache
+#   echo 'export SCCACHE_DIR="$HOME/.cache/sccache-edgecloud"' >> ~/.zshrc
+#   echo 'export RUSTC_WRAPPER=sccache' >> ~/.zshrc
+# Verify:
+#   sccache --version
+#   cargo build  # should print "Compiling ..." lines via sccache
+#
+# To opt out locally without editing this file, set
+# CARGO_BUILD_RUSTC_WRAPPER="" in your shell.
+
+[build]
+target-dir = "/Users/poyrazk/.cache/edgecloud-cargo"
+rustc-wrapper = "sccache"

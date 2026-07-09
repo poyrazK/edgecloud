@@ -44,3 +44,18 @@ anyhow = "1"
 tracing = "0.1"
 sha2 = "0.10"
 hex = "0.4"
+
+# Dev profile tuned for local multi-agent worktrees:
+#   - debug = "line-tables-only" keeps file:line info in backtraces
+#     (so `cargo test` failures are still readable) but skips the
+#     variable / type info that bloats .dwp / .dwo files for heavy
+#     crates like wasmtime, tree-sitter, wasmtime-wasi-http.
+#   - incremental = true avoids full rebuilds on small edits.
+#   - opt-level stays at 0 (Cargo default) so unoptimized dev builds
+#     match test expectations; tests can still override per-package.
+# CI is unaffected: each rust-* job sets RUSTFLAGS="-C opt-level=0
+# -C debuginfo=0 -C link-arg=-fuse-ld=mold" which overrides this
+# profile on the runner.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true

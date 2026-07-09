@@ -56,6 +56,24 @@ cd edge-control-plane && go test -tags=integration ./migrations/...   # roundtri
 cd edge-control-plane && gofmt -l . && go vet ./...
 ```
 
+### Local dev: shared target cache
+
+The workspace pulls in heavy crates (wasmtime, tree-sitter, wasmtime-wasi-http). Each `git worktree` owns its own working tree, and Cargo's default `target/` lives inside it — running 5 agents in parallel worktrees can balloon to 20 GB+. To keep local dev light, the repo is wired to share `target/` and wrap `rustc` with `sccache`:
+
+- **`target/` is shared across worktrees.** `.cargo/config.toml` (committed) sets `build.target-dir = "$HOME/.cache/edgecloud-cargo"`. Every worktree compiles into the same dir; content-addressed fingerprinting means only changed sources rebuild.
+- **`rustc` is wrapped with sccache.** Same file sets `build.rustc-wrapper = "sccache"`. Install once: `brew install sccache` (or `cargo install sccache`). sccache itself stores its cache at `~/.cache/sccache-edgecloud` (override with `SCCACHE_DIR`).
+- **Dev profile is trimmed.** `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` so backtraces still resolve file:line but `.dwp`/`.dwo` bloat is dropped.
+
+Verify after a fresh clone:
+
+```bash
+sccache --version                       # ≥ 0.7
+cargo build --workspace                 # cold; observe "Compiling ..." via sccache
+du -sh ~/.cache/edgecloud-cargo         # single shared target
+```
+
+If a build fails with `could not execute wrapper 'sccache'`, install sccache or unset the wrapper locally with `CARGO_BUILD_RUSTC_WRAPPER=""`. CI does not use sccache — `Swatinem/rust-cache@v2` already caches cold builds, and the per-job `RUSTFLAGS` set `-C debuginfo=0` so CI builds stay lean.
+
 ### CI
 
 `.github/workflows/ci.yml` runs on every push to `main` and every PR. There is **no `.gitlab-ci.yml` in this repository** — earlier docs that mentioned GitLab CI were stale.
