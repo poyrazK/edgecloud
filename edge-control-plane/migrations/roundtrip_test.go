@@ -748,7 +748,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
 	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
 	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
-	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},              // 026_idempotency_keys (issue #52)
+	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that

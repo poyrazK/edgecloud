@@ -177,6 +177,14 @@ var (
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
+
+	// ErrIdempotencyKeyMismatch (issue #52) — the caller reused
+	// an Idempotency-Key against a request body whose SHA-256
+	// differs from the one stored alongside the original row.
+	// The handler maps this to 422: the conflict is a client
+	// bug (a key by definition is supposed to identify a
+	// unique request), not a retry on the same request.
+	ErrIdempotencyKeyMismatch = errors.New("idempotency key reused with a different request body")
 	// ErrDeploymentNotFound is returned by PromoteDeployment when the
 	// deployment doesn't exist or belongs to a different tenant.
 	ErrDeploymentNotFound = fmt.Errorf("deployment not found")
@@ -337,6 +345,16 @@ type appEnvRepoForDeploymentSvc interface {
 	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
 }
 
+// idempotencyRepoForDeploymentSvc is the subset of
+// *repository.IdempotencyKeyRepo used by DeploymentService for the
+// Idempotency-Key replay cache (issue #52). Identical surface area
+// to the concrete repo; defined here so service-level tests can
+// substitute a stub without spinning up sqlx.
+type idempotencyRepoForDeploymentSvc interface {
+	Lookup(ctx context.Context, tenantID, key string) (*domain.IdempotencyKey, error)
+	Insert(ctx context.Context, k *domain.IdempotencyKey) error
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -345,11 +363,18 @@ type DeploymentService struct {
 	appEnvRepo     appEnvRepoForDeploymentSvc
 	quotaRepo      quotaRepoForDeploymentSvc
 	tenantRepo     tenantRepoForDeploymentSvc
-	artifactStore  storage.ArtifactStore
-	publisher      nats.Publisher
-	appSvc         *AppService
-	envSvc         *EnvService     // injected for decryption at publish
-	webhookSvc     *WebhookService // injected for webhook events
+	// idempotencyRepo is the (tenant_id, key) -> deployment_id
+	// replay cache (issue #52). Optional — when nil, the replay
+	// check is skipped and every Deploy mints a fresh row. Set
+	// via SetIdempotencyRepo after construction so existing
+	// test harnesses that don't care about the cache don't need
+	// to thread an extra arg.
+	idempotencyRepo idempotencyRepoForDeploymentSvc
+	artifactStore   storage.ArtifactStore
+	publisher       nats.Publisher
+	appSvc          *AppService
+	envSvc          *EnvService     // injected for decryption at publish
+	webhookSvc      *WebhookService // injected for webhook events
 	// cachePusher pushes the activation artifact bytes to a per-region
 	// edge-artifact-cache binary before the NATS TaskMessage publish
 	// (issue #332). Optional; when nil, the cache-push step is skipped
@@ -359,7 +384,7 @@ type DeploymentService struct {
 	cachePusher artifactCachePusher
 	// regionArtifactCaches is the per-region URL map from config. When
 	// a region's URL is unset (or the region is not in the map), the
-	// cache-push step is skipped for that region — the worker continues
+	// cache-push step for that region is skipped — the worker continues
 	// to pull from the CP's /api/internal/download/. Set via
 	// SetRegionArtifactCaches.
 	regionArtifactCaches map[string]string
@@ -448,6 +473,17 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 	s.webhookSvc = webhookSvc
 }
 
+// SetIdempotencyRepo injects the Idempotency-Key replay cache
+// (issue #52). When nil (the default), Deploy short-circuits
+// the replay check and behaves exactly as before — every call
+// mints a fresh deployment_id. Set via a setter (mirroring
+// SetAppService / SetEnvService) so test harnesses that don't
+// care about idempotency don't have to thread an extra
+// constructor arg.
+func (s *DeploymentService) SetIdempotencyRepo(r idempotencyRepoForDeploymentSvc) {
+	s.idempotencyRepo = r
+}
+
 // Deploy creates a new deployment and stores the artifact.
 //
 // `regions` is the list of regions the deployment is targeted at. Pass
@@ -467,10 +503,10 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata, previewOpts *PreviewOpts) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata, previewOpts *PreviewOpts, idempotencyKey string, requestSHA256 [32]byte) (deployment *domain.Deployment, fromCache bool, err error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
-		return nil, fmt.Errorf("invalid app name")
+		return nil, false, fmt.Errorf("invalid app name")
 	}
 
 	// Validate every region before any side effect. An invalid
@@ -486,32 +522,79 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	// the message also embeds the failing region for the operator.
 	for _, r := range regions {
 		if !IsValidRegion(r) {
-			return nil, fmt.Errorf("%w %q: must match [a-z0-9-]{1,64}", ErrInvalidRegion, r)
+			return nil, false, fmt.Errorf("%w %q: must match [a-z0-9-]{1,64}", ErrInvalidRegion, r)
 		}
 	}
 	if len(regions) > MaxRegionsPerDeployment {
-		return nil, fmt.Errorf("%w: %d (max %d)", ErrTooManyRegions, len(regions), MaxRegionsPerDeployment)
+		return nil, false, fmt.Errorf("%w: %d (max %d)", ErrTooManyRegions, len(regions), MaxRegionsPerDeployment)
+	}
+
+	// Idempotency-Key replay check (issue #52). When the caller
+	// supplies a key AND the repo is wired, look up the cache
+	// before doing any of the heavy lifting (artifact hash,
+	// disk I/O, signature, row insert). A non-nil hit
+	// short-circuits the function with the cached row +
+	// fromCache=true; the handler converts that into 200 vs 201.
+	//
+	// The body-hash mismatch path (same key, different body)
+	// returns ErrIdempotencyKeyMismatch so the handler maps it
+	// to 422. This is the "you reused a key by mistake" guard
+	// rail — the table's request_sha256 column is the source
+	// of truth.
+	//
+	// Lookup errors other than sql.ErrNoRows bubble up; the
+	// handler converts them to 500 via the existing
+	// InternalErrorCtx path.
+	if idempotencyKey != "" && s.idempotencyRepo != nil {
+		cached, lookupErr := s.idempotencyRepo.Lookup(ctx, tenantID, idempotencyKey)
+		if lookupErr != nil {
+			return nil, false, fmt.Errorf("idempotency lookup: %w", lookupErr)
+		}
+		if cached != nil {
+			// Verify the request body matches what produced
+			// the cached row. A mismatch means the caller
+			// reused a key against a different artifact —
+			// refuse with 422 rather than silently replaying
+			// a stale row against the wrong body.
+			if cached.RequestSHA256 != requestSHA256 {
+				return nil, false, ErrIdempotencyKeyMismatch
+			}
+			existing, getErr := s.deploymentRepo.GetByID(ctx, cached.DeploymentID)
+			if getErr != nil {
+				return nil, false, fmt.Errorf("idempotency replay fetch: %w", getErr)
+			}
+			if existing == nil {
+				// The deployments row was deleted out from
+				// under us (operator-initiated GC, FK
+				// cascade taking a beat, etc.). Treat as
+				// a miss — caller will write a fresh row
+				// with the same key (ON CONFLICT DO NOTHING).
+				// Falling through is the right behavior.
+			} else {
+				return existing, true, nil
+			}
+		}
 	}
 
 	// Auto-create the app record if it doesn't already exist (backward compatible).
 	if s.appSvc != nil {
 		if err := s.appSvc.CreateIfNotExists(ctx, tenantID, appName); err != nil {
-			return nil, fmt.Errorf("creating app: %w", err)
+			return nil, false, fmt.Errorf("creating app: %w", err)
 		}
 	}
 
 	// Check quota
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {
-		return nil, fmt.Errorf("getting quota: %w", err)
+		return nil, false, fmt.Errorf("getting quota: %w", err)
 	}
 
 	count, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
 	if err != nil {
-		return nil, fmt.Errorf("counting deployments: %w", err)
+		return nil, false, fmt.Errorf("counting deployments: %w", err)
 	}
 	if count >= quota.MaxDeployments {
-		return nil, ErrMaxDeploymentsQuotaExceeded
+		return nil, false, ErrMaxDeploymentsQuotaExceeded
 	}
 
 	// Note: we no longer buffer the entire artifact in memory here.
@@ -533,7 +616,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		effectiveRegions = []string{s.defaultRegion}
 	}
 
-	deployment := &domain.Deployment{
+	deployment = &domain.Deployment{
 		ID:       "d_" + uuid.New().String(),
 		TenantID: tenantID,
 		AppName:  appName,
@@ -662,6 +745,35 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
 				return fmt.Errorf("creating deployment: %w", err)
 			}
+			// Idempotency-Key record (issue #52). Inserted
+			// after the deployments row writes — same tx so
+			// a signing / attestation failure rolls the cache
+			// row back alongside the row it points at.
+			// ON CONFLICT (tenant_id, key) DO NOTHING absorbs
+			// concurrent retries with the same key; the first
+			// writer's deployment_id is the one future
+			// lookups return. The audit-naming asymmetry
+			// ("deployment row first, then cache row") doesn't
+			// matter because the cache FK cascades the row
+			// away if the deployments row is rolled back, and
+			// a successful deployment row is the only signal a
+			// caller will ever see.
+			//
+			// requestSHA256 is the body hash the handler
+			// computed from the multipart body BEFORE parsing
+			// the parts, not the artifact hash from
+			// SaveAndHash — same-key/different-body reuses
+			// compare this against the stored hash.
+			if idempotencyKey != "" && s.idempotencyRepo != nil {
+				if iErr := s.idempotencyRepo.Insert(ctx, &domain.IdempotencyKey{
+					TenantID:      tenantID,
+					Key:           idempotencyKey,
+					DeploymentID:  deployment.ID,
+					RequestSHA256: requestSHA256,
+				}); iErr != nil {
+					return fmt.Errorf("recording idempotency key: %w", iErr)
+				}
+			}
 			return nil
 		})
 		// Apps-row cleanup: CreateIfNotExists above inserted the
@@ -725,12 +837,26 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 					err = fmt.Errorf("attaching build attestation: %w", attachErr)
 				} else if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
 					err = fmt.Errorf("creating deployment: %w", createErr)
+				} else if idempotencyKey != "" && s.idempotencyRepo != nil {
+					// No-tx path (test only): record the
+					// idempotency key after the deployments
+					// row is created. ON CONFLICT DO NOTHING
+					// absorbs concurrent retries with the same
+					// key, mirroring the tx path's behavior.
+					if iErr := s.idempotencyRepo.Insert(ctx, &domain.IdempotencyKey{
+						TenantID:      tenantID,
+						Key:           idempotencyKey,
+						DeploymentID:  deployment.ID,
+						RequestSHA256: requestSHA256,
+					}); iErr != nil {
+						err = fmt.Errorf("recording idempotency key: %w", iErr)
+					}
 				}
 			}
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if s.webhookSvc != nil {
@@ -740,7 +866,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		})
 	}
 
-	return deployment, nil
+	return deployment, false, nil
 }
 
 func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id string) (*domain.Deployment, error) {
