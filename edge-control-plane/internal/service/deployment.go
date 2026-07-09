@@ -173,12 +173,11 @@ var (
 	// ErrPaymentRequired is returned by Deploy when the deploy would
 	// violate a billing boundary (issue #420). The handler maps this
 	// to HTTP 402 PAYMENT_REQUIRED. Reasons are emitted as
-	// `subscription_past_due`, `subscription_canceled`, `free_tier_locked`,
-	// `free_tier_grace`, `quota_will_be_exceeded` — all surface in
-	// the JSON error envelope so the client can route the user to the
-	// right upgrade path. Distinct from ErrMaxDeploymentsQuotaExceeded
-	// (429) which still signals a backoff-and-retry cap on static
-	// deployment counts.
+	// `subscription_past_due`, `subscription_canceled`, `free_tier_exceeded`,
+	// `quota_will_be_exceeded` — all surface in the JSON error envelope
+	// so the client can route the user to the right upgrade path.
+	// Distinct from ErrMaxDeploymentsQuotaExceeded (429) which still
+	// signals a backoff-and-retry cap on static deployment counts.
 	ErrPaymentRequired = errors.New("payment required")
 	// ErrInvalidWasm is returned by Deploy when the artifact's first
 	// ErrInvalidWasm is returned by Deploy when the artifact's first
@@ -687,7 +686,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			// (quota_lock_grace_until) is checked separately below
 			// so the request-time gate can still serve 402 only
 			// after grace expires.
-			return nil, &PaymentRequiredError{Reason: "free_tier_locked"}
+			return nil, &PaymentRequiredError{Reason: "free_tier_exceeded"}
 		}
 		// Pre-check 3: admin overage grace. The grace is a
 		// per-tenant bypass for the cap check only — it does NOT

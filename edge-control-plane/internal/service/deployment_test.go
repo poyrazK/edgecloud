@@ -1007,7 +1007,7 @@ func TestDeploy_SubscriptionPastDue_Returns402(t *testing.T) {
 
 // TestDeploy_FreeTierLockdown_Returns402 covers Pre-check 2:
 // tenants.disabled_at IS NOT NULL → 402 PAYMENT_REQUIRED,
-// reason="free_tier_locked". Subscription is active (so pre-check 1
+// reason="free_tier_exceeded". Subscription is active (so pre-check 1
 // passes), the free-tier disabled flag is the failing condition.
 func TestDeploy_FreeTierLockdown_Returns402(t *testing.T) {
 	db, _, cleanup := newDeploymentMockDB(t)
@@ -1044,8 +1044,8 @@ func TestDeploy_FreeTierLockdown_Returns402(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected PaymentRequiredError, got %v", err)
 	}
-	if reason != "free_tier_locked" {
-		t.Errorf("reason = %q, want %q", reason, "free_tier_locked")
+	if reason != "free_tier_exceeded" {
+		t.Errorf("reason = %q, want %q", reason, "free_tier_exceeded")
 	}
 }
 

@@ -97,13 +97,8 @@ func (h *QuotaHandler) GetQuotaInternal(w http.ResponseWriter, r *http.Request) 
 	// over_cap: derived from max_* vs used_*. Sentinel < 0 means
 	// "unlimited" — never over-cap on the unlimited axis. A nil
 	// grace clock is the same as "no lockdown pending".
-	overCap := false
-	if quota.MaxRequestsPerMonth > 0 && quota.UsedRequestCount >= int64(quota.MaxRequestsPerMonth) {
-		overCap = true
-	}
-	if quota.MaxOutboundMB > 0 && quota.UsedOutboundBytes >= int64(quota.MaxOutboundMB)*1024*1024 {
-		overCap = true
-	}
+	overCap := (quota.MaxRequestsPerMonth > 0 && quota.UsedRequestCount >= int64(quota.MaxRequestsPerMonth)) ||
+		(quota.MaxOutboundMB > 0 && quota.UsedOutboundBytes >= int64(quota.MaxOutboundMB)*1024*1024)
 
 	resp := quotaInternalResponse{
 		Quota:       *quota,

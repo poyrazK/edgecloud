@@ -111,9 +111,23 @@ func (r *QuotaRepository) Update(ctx context.Context, q *domain.Quota) error {
 // accepting the deploy would not push the tenant over the
 // max_requests_per_month or max_outbound_mb cap on the very next request
 // burst. MaxX < 0 is the unlimited sentinel; the WHERE clause treats it as
-// "always passes". Pass 0 for projectedRequests or projectedOutboundBytes
-// to skip that dimension (caller doesn't know, e.g. admin override that
-// only touches the other axis).
+// "always passes".
+//
+// Semantics of the projection parameters:
+//
+//   - Pass the projected delta you want to gate on (e.g. 1 for the
+//     deploy's first inbound call, plus a byte estimate if known).
+//   - Pass 0 to SKIP that dimension entirely. The WHERE short-circuits
+//     to TRUE on `$N = 0` so the dimension is not enforced. This is the
+//     right knob when the caller doesn't know the projection (e.g. an
+//     admin override that wants to test the OTHER axis), and it's the
+//     reason the deploy-time gate can be called with (1, 0) — the
+//     heartbeat pipeline is the real-time enforcement for outbound
+//     bytes, and the request-time 402 at edge-ingress is the
+//     user-facing backstop (see internal/handler/quota.go:GetQuotaInternal).
+//   - Pass -1 to gate the dimension as "no slack" — equivalent to
+//     passing `max_* - used_*` rounded up. Not currently used but
+//     documented for future tests.
 //
 // We mutate the row by adding 0 so the row gets a write-lock without
 // actually moving the counter. The heartbeat path is the only writer of
