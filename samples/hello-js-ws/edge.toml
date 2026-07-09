@@ -14,10 +14,12 @@
 # it from the PortPool and threads it in at
 # `edge-worker/src/supervisor.rs:1217-1218`), builds a QuickJS runtime
 # in-process, evaluates the embedded JS once, and calls the
-# `globalThis.start({ wsPort })` function defined in
-# `src/handler.js`. The shim then loops `runtime.idle()` to keep the
-# long-running world alive (the supervisor's `run_app_loop` re-invokes
-# `_start` on the "blocking returned normally" path).
+# `globalThis.start({ wsPort })` function defined in `src/handler.js`.
+# The synchronous JS `start()` runs inside `ctx.with(...)` and never
+# returns, which is what keeps the world alive — no `runtime.idle()`,
+# no re-invocation from the supervisor; the supervisor's
+# `execute_app` awaits the wasm call and only re-enters the JS
+# bundle if it returns.
 
 [project]
 name = "hello-js-ws"

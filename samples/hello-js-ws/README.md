@@ -7,8 +7,9 @@ Long-running JS sample for the `edge:cloud/websocket` e2e test (issue #448).
 A minimal WebSocket echo server. The Rust shim at `src/lib.rs` is built for
 the long-running `edge-runtime` world; it embeds the esbuild-bundled JS from
 `src/handler.js` via `include_str!` and calls `globalThis.start({ wsPort })`
-once per process boot. The shim then loops `runtime.idle()` to keep the
-long-running world alive.
+once per process boot. The synchronous JS `start()` runs inside
+`ctx.with(...)` and never returns, which is what keeps the world alive — no
+`runtime.idle()`, no re-invocation from the supervisor.
 
 ## How the port is wired
 
@@ -27,7 +28,7 @@ npm install
 npx esbuild src/handler.js --bundle --format=iife --platform=neutral \
   --outfile=.edge/bundle.js
 EDGE_JS_BUNDLE=$PWD/.edge/bundle.js \
-  cargo build --target wasm32-unknown-unknown --release
+  cargo build --target wasm32-wasip1 --release
 ```
 
 Then `edge build` (from the repo root or with
@@ -56,6 +57,8 @@ upgrades (issue #326 #3): the host owns the TCP listener, and the
 per-request JS runtime is destroyed between requests. Adding a
 long-running entry to `edge-js-runtime` is impossible within a single
 `wit_bindgen::generate!` invocation, so this sample pairs a small
-Rust long-running shim with an esbuild-bundled JS file. See
-`/Users/poyrazk/.claude/plans/lets-create-imp-plan-lexical-bird.md`
-for the full plan.
+Rust long-running shim with an esbuild-bundled JS file. See the
+implementation plan that drove this work for the full design (search
+the git history for "Issue #448: JS WebSocket e2e" plan documents,
+or `git log --all --oneline | grep -i "#448"` for the commits that
+landed this PR).

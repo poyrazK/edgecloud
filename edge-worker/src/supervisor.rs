@@ -189,6 +189,17 @@ mod heartbeat_integration_tests {
     }
 
     fn build_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
+        build_supervisor_with_cooldown_secs(state, 1)
+    }
+
+    /// Same as `build_supervisor` but lets the test pick the
+    /// `PortPool`'s cooldown. Used by `stop_app_releases_ws_port`
+    /// (#448 regression) so released ports stay observable in
+    /// `cooling_down` while the test asserts on them.
+    fn build_supervisor_with_cooldown_secs(
+        state: Arc<RwLock<WorkerState>>,
+        cooldown_secs: u64,
+    ) -> Arc<Supervisor> {
         let jwt = WorkerJwtSigner::new(
             String::new(),
             None,
@@ -207,7 +218,7 @@ mod heartbeat_integration_tests {
                 jwt.clone(),
                 None,
             )),
-            port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
+            port_pool: Arc::new(Mutex::new(PortPool::new(10000, cooldown_secs))),
             nats: nats as Arc<dyn NatsClient>,
             log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
             jwt_signer: jwt,
@@ -634,15 +645,19 @@ mod heartbeat_integration_tests {
     /// leaked until the 60s cooldown returned it. Under bursty WS-app
     /// redeploys this exhausted the PortPool in CI.
     ///
-    /// We exercise the structural contract via the public API: install
-    /// an app with both `port` and `ws_port`, call `stop_app`, assert
-    /// the state is cleared (and the call doesn't panic). The
-    /// `ws_port`-release behavior is then observable at the pool
-    /// layer: `release()` always succeeds (no Result), so the test's
-    /// no-panic + state-empty post-condition is what guards against
-    /// the regression. Direct pool-occupancy assertions are guarded
-    /// against cooldown timing in the existing `port_pool` tests
-    /// (port_pool.rs:120-130 — see `release_then_tick_returns_to_available`).
+    /// The regression assertion is structural: install an app with
+    /// both `port` and `ws_port`, call `stop_app`, then assert BOTH
+    /// ports are now in the pool's cooldown set. The cooldown set
+    /// is the only observable signal of a `release()` — released
+    /// ports don't return to `available` until the cooldown
+    /// elapses; with the default 1s-cooldown test pool they re-enter
+    /// `available` immediately, so the test constructs a
+    /// `Supervisor` with a 60s-cooldown pool directly (the
+    /// `build_supervisor` helper hard-codes 1s). The test-only
+    /// `PortPool::is_in_cooldown` accessor
+    /// (`edge-worker/src/port_pool.rs:115-126`) lets the test
+    /// target both ports directly without exposing the internal
+    /// `cooling_down` Vec.
     #[tokio::test]
     async fn stop_app_releases_ws_port() {
         let engine = edge_runtime::create_engine().expect("engine");
@@ -673,18 +688,31 @@ mod heartbeat_integration_tests {
             .apps
             .insert(("t_test".into(), "my-ws-app".into()), app);
 
-        let sup = build_supervisor(state.clone());
-        // The supervisor's port_pool pre-populates 100 ports starting
-        // at `starting_port = 10000` (build_supervisor helper), so
-        // 10001 and 10002 are both in range. `stop_app` calls
-        // `pool.release(port)` and now also `pool.release(ws_port)`;
-        // both go into the cooldown set. The release call itself has
-        // no Result — what we can observe post-stop is that the
-        // pre-condition (port+ws_port both allocated by the app) no
-        // longer holds: the app is gone from state.
+        // Inline-construct with a 60s-cooldown pool so the released
+        // ports stay observable in `cooling_down` for the duration of
+        // this assertion. Mirrors `build_supervisor` (line 191) with a
+        // single field change. We avoid `build_supervisor`'s 1s cooldown
+        // because `reap_cooled_ports` (triggered by `acquire` /
+        // `free_slots`) would otherwise re-empty the cooldown set
+        // between `stop_app` and our assertion.
+        let sup = build_supervisor_with_cooldown_secs(state.clone(), 60);
+
         sup.stop_app("t_test", "my-ws-app")
             .await
             .expect("stop_app with ws_port must not error");
+
+        // Both ports must now be in cooldown — proves `release(port)`
+        // AND `release(ws_port)` ran. Before the fix, `ws_port`
+        // leaked (never re-entered the cooldown set).
+        let pool = sup.port_pool.lock().await;
+        assert!(
+            pool.is_in_cooldown(10001),
+            "primary port 10001 must be in cooldown after stop_app (release(port) regression)"
+        );
+        assert!(
+            pool.is_in_cooldown(10002),
+            "ws_port 10002 must be in cooldown after stop_app (release(ws_port) regression)"
+        );
 
         assert!(
             state.read().await.apps.is_empty(),

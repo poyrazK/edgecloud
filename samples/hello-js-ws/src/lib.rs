@@ -5,9 +5,24 @@
 //! end-to-end against a real `edge-worker`. The shim's `start` entry
 //! reads `EDGE_WS_PORT` from the process env, builds a QuickJS
 //! runtime in-process, registers the seven `edge:cloud/*` namespaces
-//! on `globalThis.EdgeCloud`, evaluates the embedded JS once, calls
-//! `globalThis.start({ wsPort })`, and loops `runtime.idle()` to keep
-//! the long-running world alive.
+//! on `globalThis.EdgeCloud`, evaluates the embedded JS once, and
+//! calls `globalThis.start({ wsPort })`.
+//!
+//! ## Why this stays alive
+//!
+//! The block that runs the user JS is `ctx.with(|ctx| ...)` (see the
+//! `start` impl below). `Context::with` blocks the current thread
+//! for the duration of the closure, and the user bundle's `start()`
+//! is a synchronous `for(;;)` that never returns — so the closure
+//! never returns, which is exactly the long-running shape we want.
+//! After `ctx.with` the trailing `loop { core::hint::spin_loop() }`
+//! is unreachable in practice; it exists only because the `start`
+//! export's signature is `fn start() -> ()` and Rust requires a tail
+//! expression. (rquickjs 0.9 has no `Runtime::idle()`; the legacy JS
+//! binding (#422, edge-js-runtime) does not use one either — the
+//! synchronous bundle is the LR-model norm. A future async-aware
+//! bundle would need an event loop driven by
+//! `ctx.execute_pending_job()`.)
 //!
 //! ## Why use the canonical `edge-runtime` world
 //!
@@ -51,8 +66,8 @@
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_only {
-    use rquickjs::{Context, Ctx, Function, Object, Runtime, TypedArray, Value};
     use edge::cloud::{cache, kv_store, observe, process, scheduling, time, websocket};
+    use rquickjs::{Context, Ctx, Function, Object, Runtime, TypedArray, Value};
 
     wit_bindgen::generate!({
         world: "edge-runtime",
@@ -85,11 +100,7 @@ mod wasm_only {
                     }
                 },
                 None => {
-                    observe::emit_log(
-                        "error",
-                        "hello-js-ws: EDGE_WS_PORT not set in env",
-                        &[],
-                    );
+                    observe::emit_log("error", "hello-js-ws: EDGE_WS_PORT not set in env", &[]);
                     process::exit(2);
                     unreachable!("wit-bindgen's process::exit returns ()")
                 }
@@ -121,18 +132,15 @@ mod wasm_only {
             // closure never returns — which is exactly the long-running
             // shape we want. If a future bundle uses async (Promises,
             // setTimeout), we'll need to drive the event loop with
-            // `ctx.execute_pending_job()` (rquickjs 0.9 has no `idle()`);
-            // for now the synchronous bundle is sufficient.
+            // `ctx.execute_pending_job()`; for now the synchronous
+            // bundle is sufficient.
             let eval_result: Result<(), String> = ctx.with(|ctx| {
                 register_all(&ctx).map_err(|e| format!("register_all: {e}"))?;
                 // Wrap the bundle as an IIFE so `globalThis.start = ...`
                 // assignments land as side effects. We do NOT use the
                 // bytecode cache (that's a FaaS optimization; the LR
                 // path evaluates the bundle once at boot).
-                let wrapped = format!(
-                    "let __user = (function(){{\n{}\n}})();\n",
-                    USER_JS
-                );
+                let wrapped = format!("let __user = (function(){{\n{}\n}})();\n", USER_JS);
                 ctx.eval::<(), _>(wrapped.as_bytes())
                     .map_err(|e| format!("bundle eval: {e}"))?;
                 let start_val: Value = ctx
@@ -169,6 +177,14 @@ mod wasm_only {
             // Unreachable: the synchronous JS `start()` blocks the
             // QuickJS runtime forever inside `ctx.with`. The function
             // is `-> ()` so we still need a tail expression.
+            //
+            // TODO(#448-followup): once the JS bundling path can
+            // produce a bundle whose `start()` resolves (e.g. via a
+            // `Promise`-returning entrypoint driven by QuickJS's
+            // pending-job queue), replace this `loop` with
+            // `ctx.execute_pending_job()`-driven event-loop. Today
+            // the synchronous-bundle contract is the only supported
+            // shape, so a busy-wait is the correct placeholder.
             #[allow(unreachable_code, unused_variables)]
             loop {
                 core::hint::spin_loop();
@@ -283,45 +299,94 @@ mod wasm_only {
 
     fn register_kv_store<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let kv = Object::new(ctx.clone())?;
-        kv.set("get", Function::new(ctx.clone(), |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
-            match kv_store::get(&key) {
-                Some(bytes) => {
-                    let ta = TypedArray::new(ctx, bytes)?;
-                    Ok(ta.into_value())
-                }
-                None => Ok(Value::new_null(ctx)),
-            }
-        }))?;
-        kv.set("set", Function::new(ctx.clone(), |value_val: Value<'js>, key: String, ttl: Option<u32>| -> rquickjs::Result<()> {
-            let value = TypedArray::<'js, u8>::from_value(value_val)?;
-            let bytes: &[u8] = value.as_ref();
-            kv_store::set(&key, bytes, ttl);
-            Ok(())
-        }))?;
-        kv.set("delete", Function::new(ctx.clone(), |key: String| { kv_store::delete(&key); }))?;
-        kv.set("listKeys", Function::new(ctx.clone(), |prefix: String| -> Vec<String> { kv_store::list_keys(&prefix) }))?;
-        kv.set("getMany", Function::new(ctx.clone(), |ctx: Ctx<'js>, keys: Vec<String>| -> rquickjs::Result<Vec<Value<'js>>> {
-            let results = kv_store::get_many(&keys);
-            let mut js_results = Vec::with_capacity(results.len());
-            for opt in results {
-                match opt {
-                    Some(bytes) => {
-                        let ta = TypedArray::new(ctx.clone(), bytes)?;
-                        js_results.push(ta.into_value());
+        kv.set(
+            "get",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
+                    match kv_store::get(&key) {
+                        Some(bytes) => {
+                            let ta = TypedArray::new(ctx, bytes)?;
+                            Ok(ta.into_value())
+                        }
+                        None => Ok(Value::new_null(ctx)),
                     }
-                    None => js_results.push(Value::new_null(ctx.clone())),
-                }
-            }
-            Ok(js_results)
-        }))?;
-        kv.set("setMany", Function::new(ctx.clone(), |items_val: Value<'js>| -> rquickjs::Result<()> {
-            let items = js_to_set_many_items(items_val)?;
-            kv_store::set_many(&items);
-            Ok(())
-        }))?;
-        kv.set("deleteMany", Function::new(ctx.clone(), |keys: Vec<String>| { kv_store::delete_many(&keys); }))?;
-        kv.set("exists", Function::new(ctx.clone(), |key: String| -> bool { kv_store::exists(&key) }))?;
-        kv.set("clear", Function::new(ctx.clone(), || { kv_store::clear(); }))?;
+                },
+            ),
+        )?;
+        kv.set(
+            "set",
+            Function::new(
+                ctx.clone(),
+                |value_val: Value<'js>, key: String, ttl: Option<u32>| -> rquickjs::Result<()> {
+                    let value = TypedArray::<'js, u8>::from_value(value_val)?;
+                    let bytes: &[u8] = value.as_ref();
+                    kv_store::set(&key, bytes, ttl);
+                    Ok(())
+                },
+            ),
+        )?;
+        kv.set(
+            "delete",
+            Function::new(ctx.clone(), |key: String| {
+                kv_store::delete(&key);
+            }),
+        )?;
+        kv.set(
+            "listKeys",
+            Function::new(ctx.clone(), |prefix: String| -> Vec<String> {
+                kv_store::list_keys(&prefix)
+            }),
+        )?;
+        kv.set(
+            "getMany",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, keys: Vec<String>| -> rquickjs::Result<Vec<Value<'js>>> {
+                    let results = kv_store::get_many(&keys);
+                    let mut js_results = Vec::with_capacity(results.len());
+                    for opt in results {
+                        match opt {
+                            Some(bytes) => {
+                                let ta = TypedArray::new(ctx.clone(), bytes)?;
+                                js_results.push(ta.into_value());
+                            }
+                            None => js_results.push(Value::new_null(ctx.clone())),
+                        }
+                    }
+                    Ok(js_results)
+                },
+            ),
+        )?;
+        kv.set(
+            "setMany",
+            Function::new(
+                ctx.clone(),
+                |items_val: Value<'js>| -> rquickjs::Result<()> {
+                    let items = js_to_set_many_items(items_val)?;
+                    kv_store::set_many(&items);
+                    Ok(())
+                },
+            ),
+        )?;
+        kv.set(
+            "deleteMany",
+            Function::new(ctx.clone(), |keys: Vec<String>| {
+                kv_store::delete_many(&keys);
+            }),
+        )?;
+        kv.set(
+            "exists",
+            Function::new(ctx.clone(), |key: String| -> bool {
+                kv_store::exists(&key)
+            }),
+        )?;
+        kv.set(
+            "clear",
+            Function::new(ctx.clone(), || {
+                kv_store::clear();
+            }),
+        )?;
         parent.set("kv", kv)?;
         Ok(())
     }
@@ -330,46 +395,96 @@ mod wasm_only {
 
     fn register_cache<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let c = Object::new(ctx.clone())?;
-        c.set("get", Function::new(ctx.clone(), |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
-            match cache::get(&key) {
-                Some(bytes) => {
-                    let ta = TypedArray::new(ctx, bytes)?;
-                    Ok(ta.into_value())
-                }
-                None => Ok(Value::new_null(ctx)),
-            }
-        }))?;
-        c.set("set", Function::new(ctx.clone(), |value_val: Value<'js>, key: String, ttl: Option<u32>| -> rquickjs::Result<()> {
-            let value = TypedArray::<'js, u8>::from_value(value_val)?;
-            let bytes: &[u8] = value.as_ref();
-            cache::set(&key, bytes, ttl);
-            Ok(())
-        }))?;
-        c.set("delete", Function::new(ctx.clone(), |key: String| { cache::delete(&key); }))?;
-        c.set("clear", Function::new(ctx.clone(), || { cache::clear(); }))?;
-        c.set("size", Function::new(ctx.clone(), || -> u32 { cache::size() }))?;
-        c.set("exists", Function::new(ctx.clone(), |key: String| -> bool { cache::exists(&key) }))?;
-        c.set("listKeys", Function::new(ctx.clone(), |prefix: String| -> Vec<String> { cache::list_keys(&prefix) }))?;
-        c.set("getMany", Function::new(ctx.clone(), |ctx: Ctx<'js>, keys: Vec<String>| -> rquickjs::Result<Vec<Value<'js>>> {
-            let results = cache::get_many(&keys);
-            let mut js_results = Vec::with_capacity(results.len());
-            for opt in results {
-                match opt {
-                    Some(bytes) => {
-                        let ta = TypedArray::new(ctx.clone(), bytes)?;
-                        js_results.push(ta.into_value());
+        c.set(
+            "get",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, key: String| -> rquickjs::Result<Value<'js>> {
+                    match cache::get(&key) {
+                        Some(bytes) => {
+                            let ta = TypedArray::new(ctx, bytes)?;
+                            Ok(ta.into_value())
+                        }
+                        None => Ok(Value::new_null(ctx)),
                     }
-                    None => js_results.push(Value::new_null(ctx.clone())),
-                }
-            }
-            Ok(js_results)
-        }))?;
-        c.set("setMany", Function::new(ctx.clone(), |items_val: Value<'js>| -> rquickjs::Result<()> {
-            let items = js_to_set_many_items(items_val)?;
-            cache::set_many(&items);
-            Ok(())
-        }))?;
-        c.set("deleteMany", Function::new(ctx.clone(), |keys: Vec<String>| { cache::delete_many(&keys); }))?;
+                },
+            ),
+        )?;
+        c.set(
+            "set",
+            Function::new(
+                ctx.clone(),
+                |value_val: Value<'js>, key: String, ttl: Option<u32>| -> rquickjs::Result<()> {
+                    let value = TypedArray::<'js, u8>::from_value(value_val)?;
+                    let bytes: &[u8] = value.as_ref();
+                    cache::set(&key, bytes, ttl);
+                    Ok(())
+                },
+            ),
+        )?;
+        c.set(
+            "delete",
+            Function::new(ctx.clone(), |key: String| {
+                cache::delete(&key);
+            }),
+        )?;
+        c.set(
+            "clear",
+            Function::new(ctx.clone(), || {
+                cache::clear();
+            }),
+        )?;
+        c.set(
+            "size",
+            Function::new(ctx.clone(), || -> u32 { cache::size() }),
+        )?;
+        c.set(
+            "exists",
+            Function::new(ctx.clone(), |key: String| -> bool { cache::exists(&key) }),
+        )?;
+        c.set(
+            "listKeys",
+            Function::new(ctx.clone(), |prefix: String| -> Vec<String> {
+                cache::list_keys(&prefix)
+            }),
+        )?;
+        c.set(
+            "getMany",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, keys: Vec<String>| -> rquickjs::Result<Vec<Value<'js>>> {
+                    let results = cache::get_many(&keys);
+                    let mut js_results = Vec::with_capacity(results.len());
+                    for opt in results {
+                        match opt {
+                            Some(bytes) => {
+                                let ta = TypedArray::new(ctx.clone(), bytes)?;
+                                js_results.push(ta.into_value());
+                            }
+                            None => js_results.push(Value::new_null(ctx.clone())),
+                        }
+                    }
+                    Ok(js_results)
+                },
+            ),
+        )?;
+        c.set(
+            "setMany",
+            Function::new(
+                ctx.clone(),
+                |items_val: Value<'js>| -> rquickjs::Result<()> {
+                    let items = js_to_set_many_items(items_val)?;
+                    cache::set_many(&items);
+                    Ok(())
+                },
+            ),
+        )?;
+        c.set(
+            "deleteMany",
+            Function::new(ctx.clone(), |keys: Vec<String>| {
+                cache::delete_many(&keys);
+            }),
+        )?;
         parent.set("cache", c)?;
         Ok(())
     }
@@ -378,43 +493,77 @@ mod wasm_only {
 
     fn register_observe<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let obs = Object::new(ctx.clone())?;
-        obs.set("incrementCounter", Function::new(ctx.clone(), |name: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
-            let labels = js_to_tuple_vec(labels_val)?;
-            observe::increment_counter(&name, &labels);
-            Ok(())
-        }))?;
-        obs.set("recordGauge", Function::new(ctx.clone(), |name: String, value: f64, labels_val: Value<'js>| -> rquickjs::Result<()> {
-            let labels = js_to_tuple_vec(labels_val)?;
-            observe::record_gauge(&name, value, &labels);
-            Ok(())
-        }))?;
-        obs.set("recordHistogram", Function::new(ctx.clone(), |name: String, value: f64, labels_val: Value<'js>| -> rquickjs::Result<()> {
-            let labels = js_to_tuple_vec(labels_val)?;
-            observe::record_histogram(&name, value, &labels);
-            Ok(())
-        }))?;
-        obs.set("emitLog", Function::new(ctx.clone(), |level: String, message: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
-            let labels = js_to_tuple_vec(labels_val)?;
-            observe::emit_log(&level, &message, &labels);
-            Ok(())
-        }))?;
-        obs.set("emitLogRecord", Function::new(ctx.clone(), |timestamp_ms: u64, level: String, message: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
-            let labels = js_to_tuple_vec(labels_val)?;
-            let lvl = match level.as_str() {
-                "error" => observe::LogLevel::Error,
-                "warn" => observe::LogLevel::Warn,
-                "info" => observe::LogLevel::Info,
-                "debug" => observe::LogLevel::Debug,
-                _ => observe::LogLevel::Trace,
-            };
-            observe::emit_log_record(&observe::LogRecord {
-                timestamp_ms,
-                level: lvl,
-                message,
-                labels,
-            });
-            Ok(())
-        }))?;
+        obs.set(
+            "incrementCounter",
+            Function::new(
+                ctx.clone(),
+                |name: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
+                    let labels = js_to_tuple_vec(labels_val)?;
+                    observe::increment_counter(&name, &labels);
+                    Ok(())
+                },
+            ),
+        )?;
+        obs.set(
+            "recordGauge",
+            Function::new(
+                ctx.clone(),
+                |name: String, value: f64, labels_val: Value<'js>| -> rquickjs::Result<()> {
+                    let labels = js_to_tuple_vec(labels_val)?;
+                    observe::record_gauge(&name, value, &labels);
+                    Ok(())
+                },
+            ),
+        )?;
+        obs.set(
+            "recordHistogram",
+            Function::new(
+                ctx.clone(),
+                |name: String, value: f64, labels_val: Value<'js>| -> rquickjs::Result<()> {
+                    let labels = js_to_tuple_vec(labels_val)?;
+                    observe::record_histogram(&name, value, &labels);
+                    Ok(())
+                },
+            ),
+        )?;
+        obs.set(
+            "emitLog",
+            Function::new(
+                ctx.clone(),
+                |level: String, message: String, labels_val: Value<'js>| -> rquickjs::Result<()> {
+                    let labels = js_to_tuple_vec(labels_val)?;
+                    observe::emit_log(&level, &message, &labels);
+                    Ok(())
+                },
+            ),
+        )?;
+        obs.set(
+            "emitLogRecord",
+            Function::new(
+                ctx.clone(),
+                |timestamp_ms: u64,
+                 level: String,
+                 message: String,
+                 labels_val: Value<'js>|
+                 -> rquickjs::Result<()> {
+                    let labels = js_to_tuple_vec(labels_val)?;
+                    let lvl = match level.as_str() {
+                        "error" => observe::LogLevel::Error,
+                        "warn" => observe::LogLevel::Warn,
+                        "info" => observe::LogLevel::Info,
+                        "debug" => observe::LogLevel::Debug,
+                        _ => observe::LogLevel::Trace,
+                    };
+                    observe::emit_log_record(&observe::LogRecord {
+                        timestamp_ms,
+                        level: lvl,
+                        message,
+                        labels,
+                    });
+                    Ok(())
+                },
+            ),
+        )?;
         parent.set("observe", obs)?;
         Ok(())
     }
@@ -424,8 +573,16 @@ mod wasm_only {
     fn register_time<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let t = Object::new(ctx.clone())?;
         t.set("now", Function::new(ctx.clone(), || -> u64 { time::now() }))?;
-        t.set("sleep", Function::new(ctx.clone(), |duration_ms: u64| { time::sleep(duration_ms); }))?;
-        t.set("resolution", Function::new(ctx.clone(), || -> u64 { time::resolution() }))?;
+        t.set(
+            "sleep",
+            Function::new(ctx.clone(), |duration_ms: u64| {
+                time::sleep(duration_ms);
+            }),
+        )?;
+        t.set(
+            "resolution",
+            Function::new(ctx.clone(), || -> u64 { time::resolution() }),
+        )?;
         parent.set("time", t)?;
         Ok(())
     }
@@ -434,17 +591,34 @@ mod wasm_only {
 
     fn register_scheduling<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let s = Object::new(ctx.clone())?;
-        s.set("scheduleOnce", Function::new(ctx.clone(), |delay_ms: u64, payload_val: Value<'js>| -> rquickjs::Result<String> {
-            let payload = TypedArray::<'js, u8>::from_value(payload_val)?;
-            let bytes: &[u8] = payload.as_ref();
-            Ok(scheduling::schedule_once(delay_ms, bytes))
-        }))?;
-        s.set("scheduleRepeating", Function::new(ctx.clone(), |interval_ms: u64, payload_val: Value<'js>| -> rquickjs::Result<String> {
-            let payload = TypedArray::<'js, u8>::from_value(payload_val)?;
-            let bytes: &[u8] = payload.as_ref();
-            Ok(scheduling::schedule_repeating(interval_ms, bytes))
-        }))?;
-        s.set("cancelScheduled", Function::new(ctx.clone(), |id: String| { scheduling::cancel_scheduled(&id); }))?;
+        s.set(
+            "scheduleOnce",
+            Function::new(
+                ctx.clone(),
+                |delay_ms: u64, payload_val: Value<'js>| -> rquickjs::Result<String> {
+                    let payload = TypedArray::<'js, u8>::from_value(payload_val)?;
+                    let bytes: &[u8] = payload.as_ref();
+                    Ok(scheduling::schedule_once(delay_ms, bytes))
+                },
+            ),
+        )?;
+        s.set(
+            "scheduleRepeating",
+            Function::new(
+                ctx.clone(),
+                |interval_ms: u64, payload_val: Value<'js>| -> rquickjs::Result<String> {
+                    let payload = TypedArray::<'js, u8>::from_value(payload_val)?;
+                    let bytes: &[u8] = payload.as_ref();
+                    Ok(scheduling::schedule_repeating(interval_ms, bytes))
+                },
+            ),
+        )?;
+        s.set(
+            "cancelScheduled",
+            Function::new(ctx.clone(), |id: String| {
+                scheduling::cancel_scheduled(&id);
+            }),
+        )?;
         parent.set("scheduling", s)?;
         Ok(())
     }
@@ -453,27 +627,52 @@ mod wasm_only {
 
     fn register_process<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
         let p = Object::new(ctx.clone())?;
-        p.set("getEnv", Function::new(ctx.clone(), |key: String| -> Option<String> { process::get_env(&key) }))?;
-        p.set("getAllEnv", Function::new(ctx.clone(), |ctx: Ctx<'js>| -> rquickjs::Result<rquickjs::Array<'js>> {
-            let envs = process::get_all_env();
-            tuple_vec_to_js(&ctx, envs)
-        }))?;
-        p.set("getArgs", Function::new(ctx.clone(), || -> Vec<String> { process::get_args() }))?;
-        p.set("getCwd", Function::new(ctx.clone(), |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
-            match process::get_cwd() {
-                Ok(cwd) => {
-                    let obj = Object::new(ctx.clone())?;
-                    obj.set("ok", cwd)?;
-                    Ok(obj.into_value())
-                }
-                Err(err) => {
-                    let obj = Object::new(ctx.clone())?;
-                    obj.set("err", err)?;
-                    Ok(obj.into_value())
-                }
-            }
-        }))?;
-        p.set("exit", Function::new(ctx.clone(), |code: u32| { process::exit(code); }))?;
+        p.set(
+            "getEnv",
+            Function::new(ctx.clone(), |key: String| -> Option<String> {
+                process::get_env(&key)
+            }),
+        )?;
+        p.set(
+            "getAllEnv",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>| -> rquickjs::Result<rquickjs::Array<'js>> {
+                    let envs = process::get_all_env();
+                    tuple_vec_to_js(&ctx, envs)
+                },
+            ),
+        )?;
+        p.set(
+            "getArgs",
+            Function::new(ctx.clone(), || -> Vec<String> { process::get_args() }),
+        )?;
+        p.set(
+            "getCwd",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
+                    match process::get_cwd() {
+                        Ok(cwd) => {
+                            let obj = Object::new(ctx.clone())?;
+                            obj.set("ok", cwd)?;
+                            Ok(obj.into_value())
+                        }
+                        Err(err) => {
+                            let obj = Object::new(ctx.clone())?;
+                            obj.set("err", err)?;
+                            Ok(obj.into_value())
+                        }
+                    }
+                },
+            ),
+        )?;
+        p.set(
+            "exit",
+            Function::new(ctx.clone(), |code: u32| {
+                process::exit(code);
+            }),
+        )?;
         parent.set("process", p)?;
         Ok(())
     }
@@ -507,22 +706,28 @@ mod wasm_only {
 
         ws.set(
             "listen",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, port: u16| -> rquickjs::Result<u32> {
-                websocket::listen(port).map_err(|e| {
-                    let msg = format!("websocket listen failed: {e}");
-                    Exception::throw_message(&ctx, &msg)
-                })
-            }),
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, port: u16| -> rquickjs::Result<u32> {
+                    websocket::listen(port).map_err(|e| {
+                        let msg = format!("websocket listen failed: {e}");
+                        Exception::throw_message(&ctx, &msg)
+                    })
+                },
+            ),
         )?;
 
         ws.set(
             "accept",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, listener: u32| -> rquickjs::Result<u32> {
-                websocket::accept(listener).map_err(|e| {
-                    let msg = format!("websocket accept failed: {e}");
-                    Exception::throw_message(&ctx, &msg)
-                })
-            }),
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, listener: u32| -> rquickjs::Result<u32> {
+                    websocket::accept(listener).map_err(|e| {
+                        let msg = format!("websocket accept failed: {e}");
+                        Exception::throw_message(&ctx, &msg)
+                    })
+                },
+            ),
         )?;
 
         ws.set(
@@ -537,7 +742,9 @@ mod wasm_only {
                     let data = TypedArray::<'js, u8>::from_value(data_val)?;
                     let bytes: &[u8] = data.as_ref();
                     let k = js_to_message_type(&kind).ok_or_else(|| {
-                        let msg = format!("invalid message-type {kind:?}; expected text | binary | ping | pong");
+                        let msg = format!(
+                            "invalid message-type {kind:?}; expected text | binary | ping | pong"
+                        );
                         Exception::throw_message(&ctx, &msg)
                     })?;
                     websocket::send(conn, bytes, k)
@@ -548,25 +755,28 @@ mod wasm_only {
 
         ws.set(
             "receive",
-            Function::new(ctx.clone(), move |ctx: Ctx<'js>, conn: u32| -> rquickjs::Result<Value<'js>> {
-                match websocket::receive(conn) {
-                    Ok((bytes, kind)) => {
-                        let obj = Object::new(ctx.clone())?;
-                        let ta = TypedArray::new(ctx.clone(), bytes)?;
-                        obj.set("data", ta.into_value())?;
-                        obj.set("kind", message_type_to_js(kind))?;
-                        Ok(obj.into_value())
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, conn: u32| -> rquickjs::Result<Value<'js>> {
+                    match websocket::receive(conn) {
+                        Ok((bytes, kind)) => {
+                            let obj = Object::new(ctx.clone())?;
+                            let ta = TypedArray::new(ctx.clone(), bytes)?;
+                            obj.set("data", ta.into_value())?;
+                            obj.set("kind", message_type_to_js(kind))?;
+                            Ok(obj.into_value())
+                        }
+                        Err(ci) => {
+                            let close = Object::new(ctx.clone())?;
+                            close.set("code", ci.code)?;
+                            close.set("reason", ci.reason)?;
+                            let obj = Object::new(ctx.clone())?;
+                            obj.set("close", close)?;
+                            Ok(obj.into_value())
+                        }
                     }
-                    Err(ci) => {
-                        let close = Object::new(ctx.clone())?;
-                        close.set("code", ci.code)?;
-                        close.set("reason", ci.reason)?;
-                        let obj = Object::new(ctx.clone())?;
-                        obj.set("close", close)?;
-                        Ok(obj.into_value())
-                    }
-                }
-            }),
+                },
+            ),
         )?;
 
         ws.set(
@@ -575,7 +785,10 @@ mod wasm_only {
                 ctx.clone(),
                 move |ctx: Ctx<'js>, conn: u32, info: Value<'js>| -> rquickjs::Result<()> {
                     let info_obj = info.as_object().ok_or_else(|| {
-                        Exception::throw_message(&ctx, "close info must be an object {code, reason}")
+                        Exception::throw_message(
+                            &ctx,
+                            "close info must be an object {code, reason}",
+                        )
                     })?;
                     let code: u16 = info_obj.get("code")?;
                     let reason: String = info_obj.get("reason")?;

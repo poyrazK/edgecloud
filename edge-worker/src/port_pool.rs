@@ -101,6 +101,16 @@ impl PortPool {
             }
         });
     }
+
+    /// Whether `port` is currently in the cooldown set (test-only).
+    /// Used by `stop_app_releases_ws_port` (#448 regression) to
+    /// assert that `release(ws_port)` actually ran after a
+    /// `stop_app` — without exposing the internal `cooling_down`
+    /// Vec to the test crate.
+    #[cfg(test)]
+    pub fn is_in_cooldown(&self, port: u16) -> bool {
+        self.cooling_down.iter().any(|(p, _)| *p == port)
+    }
 }
 
 #[cfg(test)]
