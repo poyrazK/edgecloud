@@ -9,9 +9,12 @@ use crate::state::State;
 
 /// Server's default page size when `?limit=` is absent
 /// (`internal/handler/deployment.go::List`). Mirrored here so the
-/// footer math can compute `last = ceil(total / limit)` even
-/// when the wire request carried no `?limit=` (i.e. the user
-/// didn't pass `--limit`).
+/// footer math can compute the total page count via the same
+/// integer-ceiling trick used in `render_footer`
+/// (`(total + effective_limit - 1) / effective_limit`,
+/// written there as `total.saturating_sub(1) / effective_limit + 1`)
+/// even when the wire request carried no `?limit=` — i.e. the
+/// user didn't pass `--limit`.
 const SERVER_DEFAULT_LIMIT: u32 = 20;
 
 /// List deployments for the app, paginated.
