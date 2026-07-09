@@ -70,6 +70,18 @@ use crate::egress::EgressPolicy;
 ///   stays empty. `HostnamePinned` therefore equals `BlockAll`: every
 ///   connect-side call is denied. Once the patch ships, set
 ///   `EDGE_EGRESS_HOSTNAME_PINNING=true` and the mode lights up.
+///
+/// # Per-app selection (issue #412)
+///
+/// The per-app selector is `AppSpec.socket_mode` on the worker
+/// (`edge-worker/src/messages.rs`). Each app's `RuntimeState::socket_mode`
+/// is set from that field, falling back to the worker-wide
+/// `EDGE_EGRESS_SOCKET_MODE` knob when the field is absent. For the
+/// `HostnamePinned` arm specifically, the **compose rule** is that the
+/// mode activates only when **both** the per-app field is `HostnamePinned`
+/// AND the worker-wide `EDGE_EGRESS_HOSTNAME_PINNING=true`. The
+/// worker-wide knob remains a hard gate so the dormant arm can never
+/// be reached without an explicit operator opt-in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SocketEgressPolicy {
     #[default]

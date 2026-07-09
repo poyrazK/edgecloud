@@ -62,6 +62,15 @@ type AppConfig struct {
 	Allowlist    []string          `json:"allowlist"`
 	MaxMemoryMB  int               `json:"max_memory_mb"`
 	CpuBudgetMS  int               `json:"cpu_budget_ms"`
+	// SocketMode is the per-app selector for the worker-side
+	// `SocketEgressPolicy` (issue #412). The CP doesn't interpret the
+	// value — it threads the string through and the worker decides
+	// what to do. Recognised values on the worker: "block-all",
+	// "allowlist", "allow-all", "hostname-pinned". Unknown / absent
+	// values cause the worker to fall back to the worker-wide
+	// `EDGE_EGRESS_SOCKET_MODE` knob (rolling-upgrade contract, see
+	// `deserialize_socket_mode` in edge-worker/src/messages.rs).
+	SocketMode string `json:"socket_mode,omitempty"`
 }
 
 // DeploymentRoute describes one deployment's weight in a canary traffic split.
@@ -178,6 +187,28 @@ func BuildAppConfig(
 	if len(routes) > 0 {
 		cfg.Routes = routes
 	}
+	return cfg
+}
+
+// BuildAppConfigWithSocketMode is the issue #412 sibling of
+// BuildAppConfig — same shape, plus a `socketMode` per-app selector
+// for the worker's `SocketEgressPolicy`. The CP doesn't interpret the
+// value (worker owns the policy); it threads the string through.
+// Empty string is dropped from the wire (omitempty), preserving the
+// pre-#412 rolling-upgrade contract.
+func BuildAppConfigWithSocketMode(
+	deploymentID, deploymentHash, deploymentSignature, signingKeyID string,
+	env map[string]string,
+	allowlist []string,
+	maxMemoryMB int,
+	socketMode string,
+	routes ...DeploymentRoute,
+) AppConfig {
+	cfg := BuildAppConfig(
+		deploymentID, deploymentHash, deploymentSignature, signingKeyID,
+		env, allowlist, maxMemoryMB, routes...,
+	)
+	cfg.SocketMode = socketMode
 	return cfg
 }
 
