@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -28,6 +29,15 @@ func NewEnvHandler(envSvc EnvServiceInterface) *EnvHandler {
 }
 
 type SetEnvRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// envVarResponse is one entry in the array returned by
+// `GET /api/v1/apps/{appName}/env`. Ordered alphabetically by key
+// for deterministic output (the prior `map[string]string` shape
+// relied on Go's randomized map iteration).
+type envVarResponse struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
@@ -66,14 +76,17 @@ func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return as map
-	result := make(map[string]string)
-	for _, e := range envs {
-		result[e.EnvKey] = e.EnvValue
+	// Sort alphabetically so the wire body is deterministic and the
+	// CLI can render a stable table without re-sorting client-side.
+	sort.Slice(envs, func(i, j int) bool { return envs[i].EnvKey < envs[j].EnvKey })
+
+	items := make([]envVarResponse, len(envs))
+	for i, e := range envs {
+		items[i] = envVarResponse{Key: e.EnvKey, Value: e.EnvValue}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(result); err != nil {
+	if err := json.NewEncoder(w).Encode(items); err != nil {
 		log.Printf("List envs: failed to encode response: %v", err)
 	}
 }
