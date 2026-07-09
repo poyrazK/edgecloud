@@ -462,21 +462,35 @@ func (r *ActiveDeploymentRepository) AppendRegionsCacheState(ctx context.Context
 }
 
 // AppendRegionsFailed atomically merges `regions` into the
-// `regions_failed` array on the (tenant, app) active row. Does NOT
-// clear regions_published — a region that succeeded earlier in
-// the loop and then failed later is in BOTH arrays for the rest of
-// the call, but the service layer's union-then-dedup logic on the
-// next activate call treats them as "needs republish" regardless.
+// `regions_failed` array on the (tenant, app) active row AND removes
+// the same regions from `regions_published` — making the two arrays
+// mutually exclusive (issue #435). The two-mutations-in-one-UPDATE
+// shape mirrors AppendRegionsPublished: a region that succeeded in
+// this activation but then failed on a sibling region's transient
+// NATS blip is no longer "published", so publishSwap's
+// `alreadyPublished` skip (service/deployment.go:1083) does NOT
+// mask the failure — the failed region is retried on the next
+// activate. Stamps last_publish_at = NOW() so the operator
+// escape-hatch `SELECT last_publish_at WHERE ...` reflects the
+// failure even when no region succeeded.
 //
-// Stamps last_publish_at = NOW() so the operator escape-hatch
-// `SELECT last_publish_at WHERE ...` reflects the failure even
-// when no region succeeded.
+// Regression note: a region in BOTH arrays before this fix
+// ("published earlier in the loop, failed later") is removed from
+// regions_published on the next failed publish. That is the desired
+// behavior — the region IS broken (a transient NATS blip already
+// failed it after it succeeded), so re-publishing on the next
+// activate is correct, not a regression.
 func (r *ActiveDeploymentRepository) AppendRegionsFailed(ctx context.Context, tenantID, appName string, regions []string, attemptID string, ts time.Time) error {
 	query := `
 		UPDATE active_deployments
 		SET regions_failed = (
 			SELECT COALESCE(array_agg(DISTINCT r), '{}')
 			FROM unnest(regions_failed || $3::text[]) AS r
+		),
+		regions_published = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_published) AS r
+			WHERE r <> ALL($3::text[])
 		),
 		last_publish_at = $4,
 		last_publish_attempt_id = $5
