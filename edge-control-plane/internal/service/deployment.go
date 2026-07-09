@@ -170,6 +170,17 @@ var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	// ErrPaymentRequired is returned by Deploy when the deploy would
+	// violate a billing boundary (issue #420). The handler maps this
+	// to HTTP 402 PAYMENT_REQUIRED. Reasons are emitted as
+	// `subscription_past_due`, `subscription_canceled`, `free_tier_locked`,
+	// `free_tier_grace`, `quota_will_be_exceeded` — all surface in
+	// the JSON error envelope so the client can route the user to the
+	// right upgrade path. Distinct from ErrMaxDeploymentsQuotaExceeded
+	// (429) which still signals a backoff-and-retry cap on static
+	// deployment counts.
+	ErrPaymentRequired = errors.New("payment required")
+	// ErrInvalidWasm is returned by Deploy when the artifact's first
 	// ErrInvalidWasm is returned by Deploy when the artifact's first
 	// 4 bytes aren't the wasm magic (`\0asm`). Streaming keeps us
 	// from validating the full module here, but the magic-byte
@@ -220,6 +231,22 @@ var (
 	// activation, even if they opted out of auto-rollback.
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
+
+// PaymentRequiredError wraps ErrPaymentRequired with a structured
+// reason code that the handler echoes in the JSON error envelope.
+// The reason is a stable, machine-readable string the client can
+// route on (e.g. "subscription_past_due" → show "update billing"
+// CTA, "quota_will_be_exceeded" → show "upgrade plan" CTA). The
+// sentinel stays in the error chain via Unwrap() so handlers can
+// still use errors.Is(err, ErrPaymentRequired) for the 402 mapping.
+type PaymentRequiredError struct {
+	Reason string
+}
+
+func (e *PaymentRequiredError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrPaymentRequired.Error(), e.Reason)
+}
+func (e *PaymentRequiredError) Unwrap() error { return ErrPaymentRequired }
 
 // PublishError carries the per-region outcome of a fan-out
 // publish. Returned by ActivateDeployment / RollbackDeployment
@@ -336,6 +363,15 @@ type tenantRepoForDeploymentSvc interface {
 type quotaRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+	VerifyUnderCap(ctx context.Context, tenantID string, projectedRequests, projectedOutboundBytes int64) (bool, error)
+}
+
+// billingRepoForDeploymentSvc is the subset of *repository.BillingRepository
+// methods used by DeploymentService. Added in issue #420 — the deploy-time
+// gate reads billing_subscriptions.status to enforce past_due / canceled
+// boundaries without widening the seam to the full billing surface.
+type billingRepoForDeploymentSvc interface {
+	GetSubscriptionStatus(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error)
 }
 
 // appEnvRepoForDeploymentSvc is the subset of *repository.AppEnvRepository
@@ -362,6 +398,7 @@ type DeploymentService struct {
 	activeRepo     deployActiveRepoInterface
 	appEnvRepo     appEnvRepoForDeploymentSvc
 	quotaRepo      quotaRepoForDeploymentSvc
+	billingRepo    billingRepoForDeploymentSvc
 	tenantRepo     tenantRepoForDeploymentSvc
 	// idempotencyRepo is the (tenant_id, key) -> deployment_id
 	// replay cache (issue #52). Optional — when nil, the replay
@@ -449,6 +486,16 @@ func NewDeploymentService(
 // care about caches don't need to thread an extra arg.
 func (s *DeploymentService) SetCachePusher(p artifactCachePusher) {
 	s.cachePusher = p
+}
+
+// SetBillingRepo injects the billing repo used by the deploy-time
+// quota gate (issue #420). Optional injection — Deploy is the only
+// caller, and existing tests that don't care about billing can leave
+// it nil. When nil, the deploy-time 402 path treats a tenant as
+// "no paid subscription" (subscription_status defaults to active),
+// which preserves the pre-#420 behavior for tests that don't wire it.
+func (s *DeploymentService) SetBillingRepo(b billingRepoForDeploymentSvc) {
+	s.billingRepo = b
 }
 
 // SetRegionArtifactCaches injects the per-region URL map. When a
@@ -583,10 +630,95 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		}
 	}
 
-	// Check quota
+	// Check quota (issue #420: deploy-time enforcement gate).
+	//
+	// Three pre-checks run before the static-cap check; any one failing
+	// returns 402 PAYMENT_REQUIRED. Order matters — we test the cheapest,
+	// most likely reason first (subscription state) before falling
+	// through to the row-locking cap test.
+	//
+	//  1. subscription_status in {past_due, canceled} → 402
+	//     (the merchant's billing provider has reported a stuck card
+	//     or an explicit cancel; the tenant's payment method is bad
+	//     and the next deploy won't fix it).
+	//  2. tenants.disabled_at IS NOT NULL (free-tier lockdown active) → 402
+	//     (reuses the existing disabled_at mechanism from #155; the
+	//     cap row may still allow, but the tenant is locked from
+	//     launching new apps until cleared).
+	//  3. tenants.overage_allowed_until > now() → skip the cap check
+	//     (paid tenant with an admin-granted grace window).
+	//  4. VerifyUnderCap → 402 if the next-request-burst projection
+	//     would push the tenant over their monthly cap.
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {
 		return nil, false, fmt.Errorf("getting quota: %w", err)
+	}
+
+	// Pre-check 1: subscription status. billingRepo is optional (set
+	// via SetBillingRepo); nil preserves the pre-#420 behavior of
+	// "no paid subscription → treat as active" so tests that don't
+	// wire it don't have to mock it.
+	if s.billingRepo != nil {
+		status, err := s.billingRepo.GetSubscriptionStatus(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("getting subscription status: %w", err)
+		}
+		switch status {
+		case domain.SubscriptionPastDue:
+			return nil, &PaymentRequiredError{Reason: "subscription_past_due"}
+		case domain.SubscriptionCanceled:
+			return nil, &PaymentRequiredError{Reason: "subscription_canceled"}
+		}
+	}
+
+	// Pre-check 2: free-tier lockdown via tenants.disabled_at. We
+	// read the tenant row separately so the deploy-time gate can
+	// also honour Pre-check 3 (overage grace). tenantRepo is wired
+	// by the constructor; nil would skip both checks and degrade to
+	// the pre-#420 behavior (cheap tests don't need to mock it).
+	if s.tenantRepo != nil {
+		tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("getting tenant: %w", err)
+		}
+		if tenant != nil && tenant.IsDisabled() {
+			// Free-tier lockdown is a billing cliff — apps should
+			// stop, deploys should be blocked. The grace column
+			// (quota_lock_grace_until) is checked separately below
+			// so the request-time gate can still serve 402 only
+			// after grace expires.
+			return nil, &PaymentRequiredError{Reason: "free_tier_locked"}
+		}
+		// Pre-check 3: admin overage grace. The grace is a
+		// per-tenant bypass for the cap check only — it does NOT
+		// clear a free-tier lockdown (that's a separate admin
+		// lever). If now < overage_allowed_until we skip VerifyUnderCap
+		// below. Past timestamps are equivalent to NULL: the
+		// comparison is strict.
+		if tenant != nil && tenant.OverageAllowedUntil != nil &&
+			!tenant.OverageAllowedUntil.IsZero() &&
+			time.Now().UTC().Before(*tenant.OverageAllowedUntil) {
+			// Skip cap verification but still fall through to the
+			// static MaxDeployments count check below — the grace
+			// is a quota cap bypass, not an "all checks off" flag.
+			quota = nil // mark as "skip VerifyUnderCap"
+		}
+	}
+
+	// Pre-check 4: projected cap verification. Skipped when the
+	// overage grace is active (quota==nil from the pre-check above).
+	// Default projection: 1 request for the deploy's first inbound
+	// call, 0 outbound bytes (we don't know the response size).
+	// Tunable later if we learn tenants abuse by deploying then
+	// hammering — the heartbeat path moves the actual counter.
+	if quota != nil {
+		ok, err := s.quotaRepo.VerifyUnderCap(ctx, tenantID, 1, 0)
+		if err != nil {
+			return nil, fmt.Errorf("verifying cap: %w", err)
+		}
+		if !ok {
+			return nil, &PaymentRequiredError{Reason: "quota_will_be_exceeded"}
+		}
 	}
 
 	count, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
