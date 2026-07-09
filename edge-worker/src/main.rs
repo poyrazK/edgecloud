@@ -8,6 +8,7 @@ mod dispatch;
 mod downloader;
 mod log_forwarder;
 mod messages;
+mod metering_dedupe;
 mod nats;
 mod port_pool;
 mod state;

@@ -70,6 +70,14 @@ type AppStatus struct {
 	// Guest-emitted metrics from edge:observe. Absent from old workers;
 	// defaults to nil — control plane treats nil as "no metric data this interval".
 	ObserverMetrics []MetricSample `json:"observer_metrics,omitempty"`
+	// DedupeID is the idempotency token the worker stamps on each heartbeat
+	// (issue #418). Stable across redeliveries within the same
+	// `(worker_id, deployment_id, 30s_bucket)` tuple. The metering pipeline
+	// caches recently-seen IDs and skips re-applying the same delta when
+	// JetStream or reconcile replay delivers a duplicate heartbeat. Absent
+	// on pre-#418 workers — control planes that don't see this field fall
+	// back to the historical behaviour (apply every delivery).
+	DedupeID string `json:"dedupe_id,omitempty"`
 }
 
 // AppTarget describes a running app reachable on a worker — what the
