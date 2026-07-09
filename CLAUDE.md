@@ -359,28 +359,6 @@ Per-app, per-deployment:
 - `AutoscaleSvc.Subscribe` — no-op when disabled.
 - `PreviewGC.Run` — issue #308. TTL'd preview deployment GC: every `PREVIEW_GC_INTERVAL` (default 1h), sweep deployments whose `preview_expires_at < NOW()`, delete their artifact blobs FIRST, then delete the rows. Mirror of `LogGC.Run`; same batched-delete + immediate-first-sweep shape.
 
-### Preview environments (issue #308)
-
-End-to-end preview flow for PR-linked deploys. A `preview` deploy stores under a suffixed app name (`myapp--preview-<hash>`), allocates a hex `preview-id` the runtime uses as the per-store scope, and stamps `EDGE_PREVIEW_PR_NUMBER=<N>` into the guest env when a PR context is available.
-
-| Layer | File | What it does |
-|---|---|---|
-| DB | `migrations/021_add_preview_columns.up.sql` | Adds `preview_id` / `preview_pr_number` / `preview_expires_at` columns + partial index on `preview_expires_at` |
-| Domain | `internal/domain/deployment.go` | Adds the three `*string` / `*int` / `*time.Time` fields on `Deployment`, two on `ActiveDeployment` (no expiry on active) |
-| Repository | `internal/repository/deployment.go` | Extended CRUD + new `ListExpiredPreviewBlobs` / `DeleteExpiredPreviewsByIDs` |
-| Service | `internal/service/deployment.go` | New `PreviewOpts` struct, `Deploy(... previewOpts *PreviewOpts)`, `mintPreviewID()` |
-| Service | `internal/service/preview_gc.go` | `PreviewGCService.Run(ctx, interval, _)` — blobs FIRST, rows SECOND |
-| Handler | `internal/handler/deployment.go` | Parses `?preview-id` / `?preview-pr-number` / `?preview-ttl` via `parsePreviewOpts` |
-| NATS | `internal/nats/publisher.go` | `AppConfig.PreviewID` + `AppConfig.PreviewPRNumber` (both `omitempty`) |
-| Worker | `edge-worker/src/messages.rs` | `AppSpec.preview_id` / `AppSpec.preview_pr_number` (both `serde(default)`) |
-| Runtime | `edge-runtime/src/runtime.rs` | New `with_env_and_meter_preview(env, _meter, tenant_id, preview_id, preview_pr_number, ...)`. Composes store key `{tenant_id}` or `{tenant_id}/preview-{id}`. Stamps `EDGE_PREVIEW_PR_NUMBER` into guest env when `Some`. |
-| CLI | `edge-cli/src/api/client.rs` | `PreviewOpts` builder; `deploy(... preview_opts: Option<&PreviewOpts>)` appends the three query params |
-| CLI | `edge-cli/src/main.rs` | `--preview` / `--pr-number=<N>` / `--preview-ttl=<duration>` flags. The composite action forwards `${{ github.event.pull_request.number }}`. |
-| Workflow | `.github/workflows/preview.yml` | Runs on `pull_request` events; the `Expose edge CLI on PATH` step appends `$CARGO_HOME/bin` to `$GITHUB_PATH` so the next bash step can find `edge` (this was the bug behind the previous `if: false` skip) |
-| Composite | `.github/actions/deploy-preview/action.yml` | Same PATH fix inlined so the action is self-contained when called directly |
-
-URL shape: `{tenant}-{app}--preview-{hash}.edgecloud.dev` (existing `domain.IngressHost` already produces this from the suffixed app name — no change). Cleanup: `PreviewGC` deletes expired rows after `PREVIEW_RETENTION` (default 168h / 7d). Per-deploy `?preview-ttl=` overrides win over the env default.
-
 ### Secrets encryption (`edge-control-plane/internal/service/secrets.go`)
 
 - `cfg.Secrets.ActiveKeyID` + `cfg.Secrets.Keys` (keyring, multi-key) — only path; supports rotation via the keyring key IDs.
