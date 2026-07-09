@@ -431,6 +431,7 @@ mod heartbeat_integration_tests {
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
+                socket_mode: None,
                 max_memory_mb: 256,
                 cpu_budget_ms: None,
             },
@@ -560,6 +561,7 @@ mod heartbeat_integration_tests {
                 routes: None,
                 env: HashMap::new(),
                 allowlist: None,
+                socket_mode: None,
                 max_memory_mb: 256,
                 cpu_budget_ms: None,
             },
@@ -794,6 +796,26 @@ pub fn allowlist_to_egress_policy(allowlist: &Option<Vec<String>>) -> Arc<Egress
         None => Arc::new(EgressPolicy::allow_all()),
         Some(list) => Arc::new(EgressPolicy::new(list.clone())),
     }
+}
+
+// ── socket_mode_for_spec ────────────────────────────────────────────
+
+/// Resolve the per-app `SocketEgressPolicy` from an `AppSpec` (issue #412).
+///
+/// `None` on the spec falls back to the worker-wide `Config::socket_mode`
+/// (the historical pre-#412 behavior). `Some(mode)` is returned
+/// unconditionally — **the compose rule with the worker-wide
+/// `hostname_pinning_enabled` toggle is enforced at the FaaS dispatch site
+/// (`edge-worker/src/dispatch.rs::handle_request`), not here.** This keeps
+/// the helper dumb: it does not inspect `hostname_pinning_enabled`. The
+/// LongRunning path uses the return value directly; the FaaS path further
+/// narrows the `HostnamePinned` arm through the compose rule.
+#[allow(dead_code)]
+pub fn socket_mode_for_spec(
+    spec: &AppSpec,
+    worker_default: edge_runtime::socket_egress::SocketEgressPolicy,
+) -> edge_runtime::socket_egress::SocketEgressPolicy {
+    spec.socket_mode.unwrap_or(worker_default)
 }
 
 /// The main supervisor — manages all running apps for this worker node.
@@ -1265,7 +1287,7 @@ impl Supervisor {
                 env: env.clone(),
                 max_request_body_bytes: self.config.handler_max_request_body_bytes,
                 metrics_acc: metrics_acc.clone(),
-                socket_mode: self.config.socket_mode,
+                socket_mode_for_app: socket_mode_for_spec(spec, self.config.socket_mode),
                 hostname_pinning_enabled: self.config.hostname_pinning_enabled,
                 hostname_pinning: hostname_pinning.clone(),
                 last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
@@ -1339,7 +1361,14 @@ impl Supervisor {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             let metrics_acc_for_loop = metrics_acc.clone();
 
-            let socket_mode_for_loop = self.config.socket_mode;
+            // Per-app socket mode (issue #412). The LongRunning path
+            // uses the per-app value directly — it does NOT need the
+            // FaaS compose rule with `hostname_pinning_enabled` because
+            // the `HostnamePinned` arm stays dormant at the connect-side
+            // closure for LongRunning (the upstream wasmtime-wasi resolve
+            // hook that would populate the cache isn't wired here). See
+            // `dispatch::handle_request` for the parallel FaaS rule.
+            let socket_mode_for_loop = socket_mode_for_spec(spec, self.config.socket_mode);
             let handle = tokio::spawn(async move {
                 Self::run_app_loop(
                     instance_pre_clone,
@@ -2228,6 +2257,7 @@ mod tests {
             routes: None,
             env: HashMap::new(),
             allowlist: None,
+            socket_mode: None,
             max_memory_mb: 256,
             cpu_budget_ms: None,
         }
@@ -2565,7 +2595,7 @@ mod tests {
             env: HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(
@@ -2591,7 +2621,7 @@ mod tests {
             env: HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
@@ -2798,6 +2828,51 @@ mod tests {
         assert!(policy.check("https://example.com").is_err());
     }
 
+    // ── socket_mode_for_spec (issue #412) ──────────────────────────────
+
+    use edge_runtime::socket_egress::SocketEgressPolicy;
+
+    /// `spec.socket_mode = Some(AllowList)` overrides the worker-wide
+    /// default. The FaaS dispatch site picks up this value via
+    /// `HandlerConfig::socket_mode_for_app`.
+    #[test]
+    fn socket_mode_for_spec_some_uses_per_app() {
+        let mut spec = make_spec("d_per_app");
+        spec.socket_mode = Some(SocketEgressPolicy::AllowList);
+        let mode = socket_mode_for_spec(&spec, SocketEgressPolicy::BlockAll);
+        assert_eq!(mode, SocketEgressPolicy::AllowList);
+    }
+
+    /// `spec.socket_mode = None` falls back to the worker-wide default.
+    /// This is the pre-#412 behavior; pre-#412 control planes that
+    /// don't emit the field must keep working.
+    #[test]
+    fn socket_mode_for_spec_none_uses_worker_default() {
+        let spec = make_spec("d_default");
+        assert_eq!(spec.socket_mode, None);
+        let mode = socket_mode_for_spec(&spec, SocketEgressPolicy::AllowAll);
+        assert_eq!(mode, SocketEgressPolicy::AllowAll);
+    }
+
+    /// The helper unconditionally returns the per-app value, including
+    /// `HostnamePinned`. The compose rule with the worker-wide
+    /// `hostname_pinning_enabled` toggle is enforced at the FaaS
+    /// dispatch site (`dispatch::handle_request`), not here. This test
+    /// pins that contract so a future refactor doesn't accidentally
+    /// move the compose rule into the helper.
+    #[test]
+    fn socket_mode_for_spec_hostname_pinned_does_not_self_validate() {
+        let mut spec = make_spec("d_pinned");
+        spec.socket_mode = Some(SocketEgressPolicy::HostnamePinned);
+        let mode = socket_mode_for_spec(&spec, SocketEgressPolicy::BlockAll);
+        assert_eq!(
+            mode,
+            SocketEgressPolicy::HostnamePinned,
+            "helper must return HostnamePinned unconditionally; \
+             the FaaS compose rule with hostname_pinning_enabled is a separate concern"
+        );
+    }
+
     fn fixture_pre(
         engine: &wasmtime::Engine,
     ) -> wasmtime::component::InstancePre<edge_runtime::RuntimeState> {
@@ -2962,7 +3037,7 @@ mod tests {
             env: HashMap::new(),
             max_request_body_bytes: 0,
             metrics_acc: None,
-            socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
+            socket_mode_for_app: edge_runtime::socket_egress::SocketEgressPolicy::BlockAll,
             hostname_pinning_enabled: false,
             hostname_pinning: Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),

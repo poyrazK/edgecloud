@@ -285,3 +285,121 @@ func TestHeartbeatMessage_NoClusterHeadroom(t *testing.T) {
 		t.Errorf("nil ClusterHeadroom must be omitted; got: %s", data)
 	}
 }
+
+// TestAppConfig_SocketMode_OmittedStaysEmpty pins the rolling-upgrade
+// contract for issue #412: an AppConfig constructed without
+// SocketMode must serialize without a `socket_mode` field on the wire
+// and must round-trip into an empty string. This is the case the
+// pre-#412 control plane depends on — pre-#412 workers that ignore
+// the field keep working.
+func TestAppConfig_SocketMode_OmittedStaysEmpty(t *testing.T) {
+	cfg := AppConfig{
+		DeploymentID:   "d_legacy",
+		DeploymentHash: "abc",
+		Env:            map[string]string{},
+		Allowlist:      []string{"api.stripe.com"},
+		MaxMemoryMB:    256,
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "socket_mode") {
+		t.Errorf("empty SocketMode must be omitted; got: %s", data)
+	}
+	var decoded AppConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.SocketMode != "" {
+		t.Errorf("decoded.SocketMode = %q, want empty", decoded.SocketMode)
+	}
+}
+
+// TestAppConfig_SocketMode_HostnamePinned_RoundTrips is the wire-shape
+// pin for issue #412. The CP doesn't interpret the value — it just
+// threads it. This test verifies the value the worker needs to see
+// (`hostname-pinned`) survives marshal/unmarshal intact. The worker
+// then enforces the compose rule (per-app field AND worker-wide
+// `EDGE_EGRESS_HOSTNAME_PINNING=true`).
+func TestAppConfig_SocketMode_HostnamePinned_RoundTrips(t *testing.T) {
+	cfg := AppConfig{
+		DeploymentID:   "d_412",
+		DeploymentHash: "abc",
+		Env:            map[string]string{},
+		MaxMemoryMB:    256,
+		SocketMode:     "hostname-pinned",
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"socket_mode":"hostname-pinned"`) {
+		t.Errorf("hostname-pinned must appear on the wire; got: %s", data)
+	}
+	var decoded AppConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.SocketMode != "hostname-pinned" {
+		t.Errorf("decoded.SocketMode = %q, want hostname-pinned", decoded.SocketMode)
+	}
+}
+
+// TestAppConfig_SocketMode_UnknownValue_DoesNotPanic pins the
+// rolling-upgrade contract for unknown values: a future control
+// plane emitting a variant the worker doesn't know yet (e.g.
+// `socket_mode: "experimental-v2"`) must NOT cause `json.Marshal` or
+// `json.Unmarshal` to fail. The CP just threads the string; the
+// worker deserializer (edge-worker/src/messages.rs) maps unknown
+// values back to `None` (= fall back to worker-wide knob). This is
+// the same shape `deserialize_allowlist` already establishes for
+// per-app egress allowlist entries.
+func TestAppConfig_SocketMode_UnknownValue_DoesNotPanic(t *testing.T) {
+	cfg := AppConfig{
+		DeploymentID:   "d_future",
+		DeploymentHash: "abc",
+		Env:            map[string]string{},
+		MaxMemoryMB:    256,
+		SocketMode:     "experimental-v2",
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"socket_mode":"experimental-v2"`) {
+		t.Errorf("unknown value must round-trip verbatim; got: %s", data)
+	}
+	var decoded AppConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.SocketMode != "experimental-v2" {
+		t.Errorf("decoded.SocketMode = %q, want experimental-v2 (passthrough)", decoded.SocketMode)
+	}
+}
+
+// TestBuildAppConfigWithSocketMode_DefaultsToEmpty verifies the
+// issue #412 sibling constructor: passing an empty socketMode must
+// produce an AppConfig indistinguishable from the pre-#412
+// BuildAppConfig output. This locks the rolling-upgrade behavior at
+// the call-site level: callers that opt into the new constructor
+// without actually setting a policy must not surprise downstream
+// workers with a phantom `socket_mode` field.
+func TestBuildAppConfigWithSocketMode_DefaultsToEmpty(t *testing.T) {
+	cfg := BuildAppConfigWithSocketMode(
+		"d_legacy", "abc", "", "",
+		map[string]string{}, []string{}, 256,
+		"", // empty socketMode
+	)
+	if cfg.SocketMode != "" {
+		t.Errorf("SocketMode = %q, want empty (omitempty contract)", cfg.SocketMode)
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "socket_mode") {
+		t.Errorf("empty SocketMode must be omitted; got: %s", data)
+	}
+}

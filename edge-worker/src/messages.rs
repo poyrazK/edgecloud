@@ -19,6 +19,35 @@ where
     Ok(v.filter(|list| !list.is_empty() && !list.iter().all(|e| e == "*")))
 }
 
+/// Deserializes `socket_mode` from the wire string into a
+/// `SocketEgressPolicy`. The wire vocabulary is the same one
+/// `EDGE_EGRESS_SOCKET_MODE` already speaks (see
+/// `edge-runtime/src/socket_egress.rs::SocketEgressPolicy::from_str`):
+/// `"block-all"`, `"allowlist"`, `"allow-all"`, `"hostname-pinned`".
+///
+/// Absent / null / `""` / unknown value → `None`. The permissive shape is
+/// the rolling-upgrade contract: a future control plane emitting a
+/// `socket_mode` value this worker doesn't know (e.g. a variant added in
+/// a later release) must not break message decoding — the field falls
+/// back to `None` and the per-app selector falls back to the worker-wide
+/// `Config::socket_mode`. See issue #412.
+fn deserialize_socket_mode<'de, D>(
+    de: D,
+) -> Result<Option<edge_runtime::socket_egress::SocketEgressPolicy>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use edge_runtime::socket_egress::SocketEgressPolicy;
+    let v: Option<String> = Option::deserialize(de)?;
+    Ok(v.and_then(|s| {
+        if s.is_empty() {
+            None
+        } else {
+            s.parse::<SocketEgressPolicy>().ok()
+        }
+    }))
+}
+
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
 ///
 /// Two variants share the same `apps` payload shape but carry different
@@ -133,6 +162,16 @@ pub struct AppSpec {
     /// control planes). `Some(list)` means only the listed hosts are permitted.
     #[serde(default, deserialize_with = "deserialize_allowlist")]
     pub allowlist: Option<Vec<String>>,
+    /// Per-deployment `wasip2` socket policy. Selects which arm of
+    /// `SocketEgressPolicy` the per-app `RuntimeState::socket_mode`
+    /// uses. `None` falls back to the worker-wide `Config::socket_mode`
+    /// (the historical pre-#412 behavior). See issue #412.
+    ///
+    /// Note: `HostnamePinned` additionally requires the worker-wide
+    /// `EDGE_EGRESS_HOSTNAME_PINNING=true` (see `dispatch.rs::handle_request`).
+    /// That compose rule is enforced at the FaaS dispatch site, not here.
+    #[serde(default, deserialize_with = "deserialize_socket_mode")]
+    pub socket_mode: Option<edge_runtime::socket_egress::SocketEgressPolicy>,
     pub max_memory_mb: u64,
     #[serde(default)]
     pub cpu_budget_ms: Option<u64>,
@@ -502,6 +541,85 @@ mod tests {
                 "api.stripe.com".to_string(),
                 "*.sendgrid.net".to_string()
             ])
+        );
+    }
+
+    // ── deserialize_socket_mode rolling-upgrade contract (issue #412) ─────
+
+    use edge_runtime::socket_egress::SocketEgressPolicy;
+
+    /// Absent `socket_mode` field → `None`. Pre-#412 control planes that
+    /// don't emit the field must continue to work; the per-app selector
+    /// falls back to the worker-wide `Config::socket_mode`.
+    #[test]
+    fn socket_mode_absent_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256}"#,
+        );
+        assert!(
+            spec.socket_mode.is_none(),
+            "absent socket_mode must deserialize to None (fall back to worker-wide)"
+        );
+    }
+
+    /// Explicit `null` → `None`. Same contract as absent.
+    #[test]
+    fn socket_mode_null_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"socket_mode":null}"#,
+        );
+        assert!(
+            spec.socket_mode.is_none(),
+            "null socket_mode must deserialize to None"
+        );
+    }
+
+    /// Empty string → `None`. Some Go zero-value paths may produce `""`
+    /// rather than `null`; treat them as "no override".
+    #[test]
+    fn socket_mode_empty_string_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"socket_mode":""}"#,
+        );
+        assert!(
+            spec.socket_mode.is_none(),
+            "empty-string socket_mode must deserialize to None"
+        );
+    }
+
+    /// Each of the 4 known `SocketEgressPolicy` variants round-trips.
+    #[test]
+    fn socket_mode_known_variants_round_trip() {
+        for (raw, expected) in [
+            (r#""block-all""#, SocketEgressPolicy::BlockAll),
+            (r#""allowlist""#, SocketEgressPolicy::AllowList),
+            (r#""allow-all""#, SocketEgressPolicy::AllowAll),
+            (r#""hostname-pinned""#, SocketEgressPolicy::HostnamePinned),
+        ] {
+            let json = format!(
+                r#"{{"deployment_id":"d_1","deployment_hash":"abc","env":{{}},"max_memory_mb":256,"socket_mode":{raw}}}"#
+            );
+            let spec = app_spec_from_json(&json);
+            assert_eq!(
+                spec.socket_mode,
+                Some(expected),
+                "raw {raw} must round-trip to {expected:?}"
+            );
+        }
+    }
+
+    /// Unknown string → `None`. Rolling-upgrade contract: a future control
+    /// plane emitting a value the worker doesn't recognise must not brick
+    /// message decoding. The unknown value is dropped, the per-app
+    /// selector falls back to worker-wide.
+    #[test]
+    fn socket_mode_unknown_string_deserializes_to_none() {
+        let spec = app_spec_from_json(
+            r#"{"deployment_id":"d_1","deployment_hash":"abc","env":{},"max_memory_mb":256,"socket_mode":"future-mode-v2"}"#,
+        );
+        assert!(
+            spec.socket_mode.is_none(),
+            "unknown socket_mode string must deserialize to None (rolling-upgrade safety)"
         );
     }
 
