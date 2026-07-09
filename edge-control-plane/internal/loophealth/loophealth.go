@@ -185,15 +185,17 @@ func (t *Tracker) Snapshot() []State {
 	return out
 }
 
-// Run wraps a no-return ctx loop. Recovers panics, logs them via logFn
-// with prefix, and bumps the per-loop panic counter. The wrapper writes
-// startedAt once (on first entry), bumps lastBeatAt on every entry, and
-// toggles running across the body.
+// Run wraps a no-return ctx loop in its own goroutine, so callers can't
+// forget the `go` keyword (issue #443 review finding #1 — the
+// pre-fix call sites in (*app.App).RunBackground did). Recovers panics,
+// logs them via logFn with prefix, and bumps the per-loop panic counter.
+// The wrapper writes startedAt once (on first entry), bumps lastBeatAt
+// on every entry, and toggles running across the body.
 //
 // logFn receives fmt.Sprintf-style arguments; pass log.Printf for the
 // stdlib log package or a small adapter for log/slog.
 func (t *Tracker) Run(ctx context.Context, name, prefix string, logFn LogFn, fn func(context.Context)) {
-	t.runInner(ctx, name, prefix, logFn, func(context.Context) error {
+	go t.runInner(ctx, name, prefix, logFn, func(context.Context) error {
 		fn(ctx)
 		return nil
 	})
@@ -203,16 +205,11 @@ func (t *Tracker) Run(ctx context.Context, name, prefix string, logFn LogFn, fn 
 // return is logged via logFn with prefix (same shape as the existing
 // `log.Printf("%ssubscription error: %v", ...)` wrappers in app.go). The
 // loop still exits — only ctx cancellation or a panic changes lifecycle.
+//
+// As with Run, the goroutine is spawned inside the wrapper; callers do
+// not (and must not) prefix the call with `go`.
 func (t *Tracker) RunErr(ctx context.Context, name, prefix string, logFn LogFn, fn func(context.Context) error) {
-	t.runInner(ctx, name, prefix, logFn, fn)
-}
-
-// RunErrWithLog is the same as RunErr but accepts an explicit LogFn so
-// callers using log/slog don't have to adapt. Kept as a separate method
-// (rather than only RunErr) so the common-case Run/RunErr signature stays
-// simple and the slog path is opt-in.
-func (t *Tracker) RunErrWithLog(ctx context.Context, name, prefix string, logFn LogFn, fn func(context.Context) error) {
-	t.runInner(ctx, name, prefix, logFn, fn)
+	go t.runInner(ctx, name, prefix, logFn, fn)
 }
 
 func (t *Tracker) runInner(ctx context.Context, name, prefix string, logFn LogFn, fn func(context.Context) error) {

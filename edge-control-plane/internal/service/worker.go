@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	natsio "github.com/nats-io/nats.go"
 )
@@ -23,23 +24,24 @@ var (
 	ErrQuotaExceeded   = errors.New("max workers reached for tenant")
 )
 
-// heartbeatRecover is a defer helper used by the two inner goroutines
-// spawned inside SubscribeHeartbeats (the channel-depth monitor and the
-// drain that calls handleHeartbeat). The outer loophealth recover in
-// RunBackground cannot catch panics inside these goroutines because
-// SubscribeHeartbeats returns nil as soon as it has launched them —
-// without this, a malformed heartbeat that nil-derefs in handleHeartbeat
-// would silently kill the drain while the outer wrapper still reported
-// the loop as healthy (issue #443).
+// heartbeatRecover is a defer helper used by the inner goroutines
+// spawned inside SubscribeHeartbeats (the channel-depth monitor and
+// the drain that calls handleHeartbeat). The outer loophealth recover
+// in RunBackground cannot catch panics inside those goroutines —
+// SubscribeHeartbeats returns nil once it has launched them.
 //
-// On a recovered panic the drain is NOT restarted: the NATS subscription
-// `sub` and channel `ch` are locals to SubscribeHeartbeats, so a clean
-// restart would require refactoring that method into a supervisor loop
-// (deferred). The /health handler now surfaces the panic via the
-// degraded status, so operators notice.
-func heartbeatRecover(prefix string) {
+// It is a method on *WorkerService so it can also bump the heartbeat
+// loop's panic counter (review finding #4): the outer wrapper's
+// recover runs only inside the SubscribeHeartbeats call itself, so a
+// panic in the inner drain would otherwise leave
+// loops.heartbeat.panics at 0 even though /health still showed the
+// loop as "running".
+func (s *WorkerService) heartbeatRecover() {
 	if r := recover(); r != nil {
-		log.Printf("%spanic recovered in inner goroutine: %v\n%s", prefix, r, debug.Stack())
+		log.Printf("heartbeat: panic recovered in inner goroutine: %v\n%s", r, debug.Stack())
+		if s.tracker != nil {
+			s.tracker.Get("heartbeat").RecordPanic()
+		}
 	}
 }
 
@@ -119,6 +121,13 @@ type WorkerService struct {
 	nc           *natsio.Conn
 	stableWindow time.Duration
 	metricsAgg   *MetricsAggregator
+	// tracker optionally receives liveness updates from the heartbeat
+	// drain. A nil tracker is permitted (existing tests build
+	// WorkerService without one); the drain skips Beat/RecordPanic
+	// calls when it's nil. The tracker is wired by app.New so the
+	// /health endpoint can surface heartbeat panics + freshness
+	// (review findings #3 and #4).
+	tracker *loophealth.Tracker
 	// dedupeCache maps `dedupe_id` → expiry time. Entries are evicted
 	// lazily on read — when a present-but-expired key is touched in
 	// `dedupeSeen`, it is deleted and re-recorded with a fresh TTL.
@@ -138,6 +147,13 @@ type WorkerService struct {
 // the default (30s, configurable via STABLE_WINDOW_SECONDS env). The
 // CLI accepts any non-negative integer; sub-second precision is not
 // supported.
+//
+// `tracker` is optional (pass nil to skip liveness reporting — used
+// in tests that build a WorkerService without a control-plane tracker).
+// When non-nil, the heartbeat drain bumps
+// `tracker.Get("heartbeat").Beat()` on every message and the inner
+// recover helper calls `RecordPanic()` on a recovered panic
+// (review findings #3 and #4).
 func NewWorkerService(
 	workerRepo *repository.WorkerRepository,
 	quotaRepo *repository.QuotaRepository,
@@ -146,6 +162,7 @@ func NewWorkerService(
 	nc *natsio.Conn,
 	stableWindow time.Duration,
 	metricsAgg *MetricsAggregator,
+	tracker *loophealth.Tracker,
 ) *WorkerService {
 	if stableWindow <= 0 {
 		stableWindow = time.Duration(defaultStableWindowSeconds) * time.Second
@@ -158,6 +175,7 @@ func NewWorkerService(
 		nc:           nc,
 		stableWindow: stableWindow,
 		metricsAgg:   metricsAgg,
+		tracker:      tracker,
 	}
 }
 
@@ -234,13 +252,62 @@ func (s *WorkerService) Get(ctx context.Context, workerID string) (*domain.Worke
 	return s.workerRepo.GetByID(ctx, workerID)
 }
 
-// SubscribeHeartbeats starts a background NATS subscription to edgecloud.heartbeats.*
-// and upserts worker status on each message.
+// SubscribeHeartbeats starts a background NATS subscription to
+// edgecloud.heartbeats.* and upserts worker status on each message.
+//
+// Returns nil immediately after launching a single supervisor
+// goroutine (runHeartbeatDrain) that owns the NATS subscription, the
+// channel-depth monitor, and the message drain. The supervisor
+// re-subscribes on a recovered panic from the inner drain
+// (review finding #5) so a malformed heartbeat no longer leaves the
+// subscription dangling.
+//
+// When s.tracker is non-nil, the drain bumps
+// tracker.Get("heartbeat").Beat() per message (review finding #3)
+// and the inner recover helper bumps RecordPanic() on a recovered
+// panic (review finding #4).
 func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 	if s.nc == nil {
 		// No NATS connection — skip subscription (e.g., in tests)
 		return nil
 	}
+	go s.runHeartbeatDrain(ctx)
+	return nil
+}
+
+// runHeartbeatDrain is the supervisor goroutine. It loops over
+// (subscribe → drain) cycles: when the inner drain exits (either
+// because ctx was cancelled or because the inner drain panicked and
+// was recovered), we unsubscribe cleanly, close the channel, and if
+// ctx is still alive, sleep briefly and re-subscribe. This is the
+// fix for review finding #5: the pre-fix code recovered the panic
+// but unwound the goroutine without ever reaching the
+// sub.Unsubscribe / close(ch) cleanup, leaking the subscription
+// until process exit.
+func (s *WorkerService) runHeartbeatDrain(ctx context.Context) {
+	for {
+		if err := s.subscribeAndDrain(ctx); err != nil {
+			log.Printf("heartbeat: subscribe error: %v", err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// Brief backoff so a misconfigured NATS connection at startup
+		// doesn't tight-loop.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// subscribeAndDrain opens one NATS subscription, runs the
+// channel-depth monitor + message drain, and tears them down on
+// either ctx cancellation or a recovered panic in the drain. Returns
+// the (non-fatal) error from the initial subscription attempt; ctx
+// cancellation is silent.
+func (s *WorkerService) subscribeAndDrain(ctx context.Context) error {
 	// Buffer 5000 messages to handle bursts. At 30s/heartbeat per worker,
 	// this accommodates ~150k concurrent workers without overflow.
 	ch := make(chan *natsio.Msg, 5000)
@@ -248,11 +315,14 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("subscribing to heartbeats: %w", err)
 	}
+	log.Printf("heartbeat: subscribed to edgecloud.heartbeats.> (buffer=%d)", cap(ch))
 
 	// Monitor channel depth every minute and log when it's getting full
 	// so operators can tune the buffer before messages are dropped.
+	monitorDone := make(chan struct{})
 	go func() {
-		defer heartbeatRecover("heartbeat: ")
+		defer close(monitorDone)
+		defer s.heartbeatRecover()
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -269,22 +339,41 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 		}
 	}()
 
+	// Drain messages. Two exit paths look identical to the supervisor:
+	//   1. ctx cancellation — clean unsubscribe, close channel,
+	//      wait for the monitor to exit, return.
+	//   2. Recovered panic in handleHeartbeat — heartbeatRecover()
+	//      bumps the tracker (when present) and logs the stack, then
+	//      breaks out of the loop. The deferred unsubscribe/close
+	//      below still runs, so the channel and subscription are
+	//      released before the supervisor re-subscribes.
+	drainDone := make(chan struct{})
 	go func() {
-		defer heartbeatRecover("heartbeat: ")
+		defer close(drainDone)
+		defer s.heartbeatRecover()
 		for {
 			select {
 			case <-ctx.Done():
-				if err := sub.Unsubscribe(); err != nil {
-					log.Printf("SubscribeHeartbeats: failed to unsubscribe: %v", err)
-				}
-				close(ch)
 				return
 			case msg := <-ch:
 				s.handleHeartbeat(ctx, msg)
+				if s.tracker != nil {
+					s.tracker.Get("heartbeat").Beat()
+				}
 			}
 		}
 	}()
-	log.Printf("heartbeat: subscribed to edgecloud.heartbeats.> (buffer=%d)", cap(ch))
+
+	// Wait for the drain to exit, then tear down. The supervisor
+	// re-subscribes unconditionally when ctx is still alive, so a
+	// recovered panic in the drain triggers a fresh NATS subscription
+	// on the next loop iteration.
+	<-drainDone
+	if err := sub.Unsubscribe(); err != nil {
+		log.Printf("heartbeat: failed to unsubscribe: %v", err)
+	}
+	close(ch)
+	<-monitorDone
 	return nil
 }
 

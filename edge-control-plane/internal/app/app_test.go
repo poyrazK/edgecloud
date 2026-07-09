@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/jmoiron/sqlx"
@@ -359,18 +359,22 @@ func TestRunBackground_PanicInLogGCIsRecovered(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Simulate a panicking log_gc run. Use a short-lived background
-	// invocation so the test doesn't block.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		app.loopHealth.Run(ctx, "log_gc", "log_gc: ", func(string, ...any) {
-			// discard — the LogFn path is exercised by loophealth_test.go
-		}, func(c context.Context) {
-			panic("forced panic in log_gc")
-		})
-	}()
-	<-done
+	// Simulate a panicking log_gc run. Run spawns its own goroutine
+	// (review finding #1 fix), so we poll for the panic counter to
+	// bump rather than waiting on a done channel.
+	app.loopHealth.Run(ctx, "log_gc", "log_gc: ", func(string, ...any) {
+		// discard — the LogFn path is exercised by loophealth_test.go
+	}, func(c context.Context) {
+		panic("forced panic in log_gc")
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.loopHealth.Get("log_gc").Panics() == 1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	cancel()
 
 	if got := app.loopHealth.Get("log_gc").Panics(); got != 1 {
 		t.Errorf("log_gc.Panics = %d, want 1", got)
@@ -445,9 +449,24 @@ func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
 
 	app := New(cfg, db, publisher, artifactStore, emptyFS)
 
-	// Manually bump the heartbeat panic counter to simulate a recovered
-	// panic in the inner drain goroutine.
-	app.loopHealth.Get("heartbeat").RecordPanic()
+	// Drive a real recovered panic through the wrapper so the test
+	// exercises the production panic-recovery path (review finding #4
+	// fix: the heartbeat drain now bumps the counter via the tracker
+	// field on WorkerService). Run is now non-blocking — poll for
+	// the counter to bump.
+	app.loopHealth.Run(context.Background(), "heartbeat", "heartbeat: ", func(string, ...any) {}, func(c context.Context) {
+		panic("forced for /health degraded test")
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if app.loopHealth.Get("heartbeat").Panics() == 1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if app.loopHealth.Get("heartbeat").Panics() != 1 {
+		t.Fatalf("heartbeat.Panics = %d, want 1 (recovered panic did not register)", app.loopHealth.Get("heartbeat").Panics())
+	}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -533,12 +552,10 @@ func TestHealth_BackwardCompatibleStatusCode(t *testing.T) {
 }
 
 // errDBPingFailed is a sentinel used to force the sqlmock PingContext
-// to return an error in TestHealth_UnhealthyOnDBPingFailure.
-var errDBPingFailed = &pingErr{"forced ping failure"}
-
-type pingErr struct{ msg string }
-
-func (e *pingErr) Error() string { return e.msg }
+// to return an error in TestHealth_UnhealthyOnDBPingFailure. Plain
+// errors.New matches the repo convention used in api_key_test.go and
+// deployment_regions_test.go:710.
+var errDBPingFailed = errors.New("forced ping failure")
 
 // newMockDBWithMock is a helper that returns the sqlx.DB and the
 // underlying sqlmock so individual tests can configure expectations
@@ -552,13 +569,6 @@ func newMockDBWithMock(t *testing.T) (*sqlx.DB, sqlmock.Sqlmock, func()) {
 	sqlxDB := sqlx.NewDb(mockDB, "postgres")
 	return sqlxDB, mock, func() { _ = sqlxDB.Close() }
 }
-
-// Compile-time check: the loophealth.State type is referenced from
-// /health via the loops map. If its JSON tags ever drift, the test
-// will fail at marshal time.
-var _ = func() loophealth.State {
-	return loophealth.State{Name: "compile-time-check"}
-}()
 
 func TestNewWithSecretsConfig(t *testing.T) {
 	artifactPath := t.TempDir()

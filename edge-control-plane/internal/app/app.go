@@ -122,9 +122,16 @@ func New(
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
 	metricsAgg := service.NewMetricsAggregator()
+	// loopHealth tracks liveness of every background goroutine. It must
+	// be constructed before the services that need to feed it (so the
+	// heartbeat drain and autoscaler can call Beat/RecordPanic), and
+	// the same instance is reused by the /health closure and the App
+	// struct (issue #443 review findings #3 and #4).
+	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
 		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
+		loopHealth,
 	)
 	clusterSvc := service.NewClusterService(workerRepo, autoscaleEventRepo)
 	// Materialize the canonical WIT tree at startup. The MigrationService
@@ -203,6 +210,7 @@ func New(
 			DeployRepo: activeDeploymentRepo,
 			EventRepo:  autoscaleEventRepo,
 			Cloud:      cloud,
+			Tracker:    loopHealth,
 		})
 	}
 
@@ -261,10 +269,9 @@ func New(
 	// heartbeat panic) and degraded_reasons lists the affected loop
 	// names. 503 is reserved for DB/NATS failures, same as before.
 	//
-	// The tracker is built early (before the App literal) so the closure
-	// below can capture it without depending on the App receiver — the
-	// same instance is then passed to the App via loopHealth.
-	loopHealth := newLoopHealth()
+	// The tracker is built once near the top of New() and threaded
+	// into the services that feed it; the closure below captures the
+	// same instance to read liveness for the response body.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		if err := db.PingContext(r.Context()); err != nil {
 			log.Printf("Health check: DB ping failed: %v", err)
@@ -591,11 +598,12 @@ func newLoopHealth() *loophealth.Tracker {
 // RunBackground starts all background goroutines. Call once the HTTP server
 // is running. Cancelling ctx tears all goroutines down cleanly.
 //
-// Every loop is wrapped in loophealth.Tracker.Run / RunErr, which recovers
-// panics, logs the stack via the loop's per-service prefix, and bumps a
-// per-loop counter that the /health handler surfaces. Without this, a
-// panic in the heartbeat consumer (issue #443's most-critical loop) would
-// kill the goroutine silently while /health kept reporting "ok".
+// Every loop is wrapped in loophealth.Tracker.Run / RunErr, which spawns
+// the body in its own goroutine, recovers panics, logs the stack via
+// the loop's per-service prefix, and bumps a per-loop counter that the
+// /health handler surfaces. Without this, a panic in the heartbeat
+// consumer (issue #443's most-critical loop) would kill the goroutine
+// silently while /health kept reporting "ok".
 func (a *App) RunBackground(ctx context.Context) {
 	logPrintf := log.Printf // local alias for the stdlib log adapter
 
@@ -649,7 +657,10 @@ func (a *App) RunBackground(ctx context.Context) {
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately. The autoscale
 	// package uses log/slog rather than stdlib log, so we route the
-	// recovered-panic log through slog.Default().Error to match.
+	// recovered-panic log through slog.Default() with structured attrs.
+	// slog.Logger.Error treats msg as a literal — the panic value and
+	// stack must be pre-formatted and passed as a "err" attr (review
+	// finding #2).
 	if a.AutoscaleSvc != nil {
 		slogErr := func(format string, args ...any) {
 			slog.Default().Error("autoscale: loop panic recovered",

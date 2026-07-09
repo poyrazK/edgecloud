@@ -33,6 +33,24 @@ func discardLog() (LogFn, func() string) {
 	}
 }
 
+// waitForExited polls until the loop's body has returned (running=false).
+// Run / RunErr now spawn their own goroutine, so callers need a way to
+// synchronize on the body finishing before asserting on post-state.
+// waitForExited times out after 2s — generous enough to avoid flakes
+// on busy CI, short enough that a broken test fails fast.
+func waitForExited(t *testing.T, l *Loop) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !l.Running() && !l.StartedAt().IsZero() {
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	t.Fatalf("loop %q did not finish within 2s (running=%v started=%v)",
+		l.Name(), l.Running(), l.StartedAt())
+}
+
 func TestTracker_GetLazyCreates(t *testing.T) {
 	tr := NewTracker()
 	l := tr.Get("heartbeat")
@@ -54,24 +72,40 @@ func TestTracker_GetLazyCreates(t *testing.T) {
 	}
 }
 
+// TestRun_SpawnsGoroutine asserts that Run does not block the caller on
+// the body — the goroutine is spawned inside the wrapper. We use a
+// channel that the body closes on entry; the test would deadlock (and
+// the test runner would kill it) if the wrapper ran synchronously.
+func TestRun_SpawnsGoroutine(t *testing.T) {
+	tr := NewTracker()
+	logFn, _ := discardLog()
+	entered := make(chan struct{})
+	tr.Run(context.Background(), "heartbeat", "heartbeat: ", logFn, func(ctx context.Context) {
+		close(entered)
+		// Hold the body so we can observe Running() == true from the test.
+		<-ctx.Done()
+	})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("body never entered — wrapper ran synchronously")
+	}
+	if !tr.Get("heartbeat").Running() {
+		t.Errorf("expected running=true while body holds")
+	}
+}
+
 func TestRun_BumpsRunningAndPanics(t *testing.T) {
 	tr := NewTracker()
 	logFn, _ := discardLog()
 	done := make(chan struct{})
 	tr.Run(context.Background(), "heartbeat", "heartbeat: ", logFn, func(ctx context.Context) {
 		close(done)
-		// Inside the body, running should be true.
-		if !tr.Get("heartbeat").Running() {
-			t.Errorf("expected running=true inside body")
-		}
 		panic("forced")
 	})
 	<-done
-	// After return, running=false and panics==1.
 	l := tr.Get("heartbeat")
-	if l.Running() {
-		t.Errorf("expected running=false after return")
-	}
+	waitForExited(t, l)
 	if l.Panics() != 1 {
 		t.Errorf("Panics = %d, want 1", l.Panics())
 	}
@@ -90,9 +124,7 @@ func TestRun_NoPanic_KeepsRunningFalse(t *testing.T) {
 		// No panic, no error.
 	})
 	l := tr.Get("log_gc")
-	if l.Running() {
-		t.Errorf("expected running=false after return")
-	}
+	waitForExited(t, l)
 	if l.Panics() != 0 {
 		t.Errorf("Panics = %d, want 0", l.Panics())
 	}
@@ -106,12 +138,11 @@ func TestRun_NoPanic_KeepsRunningFalse(t *testing.T) {
 
 func TestRun_LogsViaPrefix(t *testing.T) {
 	tr := NewTracker()
-	// Capture stdlib log output too — Run/RunErr use the LogFn we pass,
-	// so the prefix is applied through the LogFn (which appends '\n').
 	logFn, read := discardLog()
 	tr.Run(context.Background(), "log_gc", "log_gc: ", logFn, func(ctx context.Context) {
 		panic("forced")
 	})
+	waitForExited(t, tr.Get("log_gc"))
 	got := read()
 	if !strings.Contains(got, "log_gc: ") {
 		t.Errorf("captured log missing prefix 'log_gc: ': %q", got)
@@ -135,9 +166,10 @@ func TestRunErr_RecoversAndSwallowsError(t *testing.T) {
 	tr.RunErr(context.Background(), "heartbeat", "heartbeat: ", logFn, func(ctx context.Context) error {
 		panic("inner panic")
 	})
-	// RunErr with a panicking fn: panic should be recovered and counted.
-	if tr.Get("heartbeat").Panics() != 1 {
-		t.Errorf("Panics = %d, want 1", tr.Get("heartbeat").Panics())
+	hb := tr.Get("heartbeat")
+	waitForExited(t, hb)
+	if hb.Panics() != 1 {
+		t.Errorf("Panics = %d, want 1", hb.Panics())
 	}
 	if !strings.Contains(read(), "panic recovered") {
 		t.Errorf("expected 'panic recovered' in log, got %q", read())
@@ -148,20 +180,24 @@ func TestRunErr_RecoversAndSwallowsError(t *testing.T) {
 	tr.RunErr(context.Background(), "heartbeat2", "heartbeat: ", read2, func(ctx context.Context) error {
 		return sentinel
 	})
-	if tr.Get("heartbeat2").Panics() != 0 {
-		t.Errorf("Panics = %d, want 0 (error return is not a panic)", tr.Get("heartbeat2").Panics())
-	}
-	if tr.Get("heartbeat2").Running() {
-		t.Errorf("expected running=false after fn returns")
+	hb2 := tr.Get("heartbeat2")
+	waitForExited(t, hb2)
+	if hb2.Panics() != 0 {
+		t.Errorf("Panics = %d, want 0 (error return is not a panic)", hb2.Panics())
 	}
 }
 
-func TestRunErr_WithLogFn_ForwardsFormatting(t *testing.T) {
+// TestRunErr_ForwardsLogFn asserts that RunErr applies the configured
+// prefix and forwards the panic value to the supplied LogFn (replaces
+// the deleted TestRunErr_WithLogFn_ForwardsFormatting, which was
+// specifically about the now-removed RunErrWithLog method).
+func TestRunErr_ForwardsLogFn(t *testing.T) {
 	tr := NewTracker()
 	logFn, read := discardLog()
-	tr.RunErrWithLog(context.Background(), "autoscale", "autoscale: ", logFn, func(ctx context.Context) error {
+	tr.RunErr(context.Background(), "autoscale", "autoscale: ", logFn, func(ctx context.Context) error {
 		panic("kaboom")
 	})
+	waitForExited(t, tr.Get("autoscale"))
 	got := read()
 	if !strings.Contains(got, "autoscale: ") {
 		t.Errorf("expected 'autoscale: ' prefix, got %q", got)
@@ -196,15 +232,14 @@ func TestSnapshot_StaleComputed(t *testing.T) {
 		// entry bumps lastBeatAt to now
 	})
 	l := tr.Get("log_gc")
+	waitForExited(t, l)
 	// Immediately after return, snapshot should NOT be stale.
 	for _, s := range tr.Snapshot() {
 		if s.Name == "log_gc" && s.Stale {
 			t.Errorf("expected stale=false immediately after exit, got true")
 		}
 	}
-	// Manually backdate lastBeatAt to 1 hour ago via Beat + time warp.
-	// We can't directly write the atomic, but we can sleep past the
-	// threshold and verify the next snapshot flips stale.
+	// After sleeping past the threshold, the next snapshot flips stale.
 	time.Sleep(80 * time.Millisecond)
 	for _, s := range tr.Snapshot() {
 		if s.Name == "log_gc" && !s.Stale {
@@ -212,13 +247,13 @@ func TestSnapshot_StaleComputed(t *testing.T) {
 				80*time.Millisecond, s.LastBeatAt, time.Now().UTC().Format(time.RFC3339))
 		}
 	}
-	_ = l
 }
 
 func TestSnapshot_RunningFalseAfterExit(t *testing.T) {
 	tr := NewTracker()
 	logFn, _ := discardLog()
 	tr.Run(context.Background(), "log_gc", "log_gc: ", logFn, func(ctx context.Context) {})
+	waitForExited(t, tr.Get("log_gc"))
 	for _, s := range tr.Snapshot() {
 		if s.Name == "log_gc" && s.Running {
 			t.Errorf("expected running=false in snapshot after exit")
@@ -232,6 +267,7 @@ func TestState_RFC3339(t *testing.T) {
 	tr.Run(context.Background(), "log_gc", "log_gc: ", logFn, func(ctx context.Context) {
 		tr.Get("log_gc").Beat()
 	})
+	waitForExited(t, tr.Get("log_gc"))
 	for _, s := range tr.Snapshot() {
 		if s.Name != "log_gc" {
 			continue
@@ -303,6 +339,7 @@ func TestRun_DoesNotInterfereWithStdlibLog(t *testing.T) {
 	tr.Run(context.Background(), "log_gc", "log_gc: ", logFn, func(ctx context.Context) {
 		panic("forced")
 	})
+	waitForExited(t, tr.Get("log_gc"))
 	if buf.Len() != 0 {
 		t.Errorf("stdlib log captured output (expected none): %q", buf.String())
 	}

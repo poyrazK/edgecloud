@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	natsio "github.com/nats-io/nats.go"
 )
@@ -47,7 +48,9 @@ type eventRepoInterface interface {
 }
 
 // Deps is the constructor's parameter bag. All fields are required
-// except Log (defaults to slog.Default()) and Enabled (read from Cfg).
+// except Log (defaults to slog.Default()), Tracker (nil disables
+// liveness reporting — used in tests that build a Service without
+// the control-plane tracker), and Enabled (read from Cfg).
 type Deps struct {
 	Cfg        Config
 	NC         *natsio.Conn
@@ -55,6 +58,7 @@ type Deps struct {
 	EventRepo  eventRepoInterface
 	Cloud      CloudProvider
 	Log        *slog.Logger
+	Tracker    *loophealth.Tracker
 }
 
 // Service subscribes to NATS heartbeats, maintains a per-region fleet
@@ -79,6 +83,12 @@ type Service struct {
 	eventRepo  eventRepoInterface
 	cloud      CloudProvider
 	log        *slog.Logger
+	// tracker optionally receives liveness updates from the run loop.
+	// A nil tracker is permitted (existing tests build Service without
+	// one); the run loop skips Beat() calls when it's nil. Wired by
+	// app.New so /health can surface autoscale freshness (review
+	// finding #3).
+	tracker *loophealth.Tracker
 
 	// mu guards fleets + lastEventByRegion. Uses RWMutex so the admin
 	// endpoint (SnapshotFleet) can read without blocking heartbeat writes.
@@ -113,6 +123,7 @@ func NewService(d Deps) *Service {
 		eventRepo:         d.EventRepo,
 		cloud:             d.Cloud,
 		log:               d.Log,
+		tracker:           d.Tracker,
 		fleets:            make(map[string]map[string]WorkerHeadroom),
 		lastEventByRegion: make(map[string]*domain.AutoscaleEvent),
 	}
@@ -160,8 +171,14 @@ func (s *Service) run(ctx context.Context, sub *natsio.Subscription, ch <-chan *
 				return
 			}
 			s.handleHeartbeat(msg)
+			if s.tracker != nil {
+				s.tracker.Get("autoscale").Beat()
+			}
 		case <-ticker.C:
 			s.evaluateAll(ctx)
+			if s.tracker != nil {
+				s.tracker.Get("autoscale").Beat()
+			}
 		}
 	}
 }
