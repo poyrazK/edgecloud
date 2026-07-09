@@ -662,6 +662,7 @@ impl ApiClient {
         replicas: usize,
         build_metadata: Option<&serde_json::Value>,
         preview_opts: Option<&PreviewOpts>,
+        idempotency_key: &str,
     ) -> Result<DeployResponse> {
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         // Always parse the URL so we can append optional query params
@@ -742,12 +743,21 @@ impl ApiClient {
             form = form.text("build_metadata", raw);
         }
 
-        let resp = self
+        // Issue #52: forward the Idempotency-Key header when the caller
+        // supplied one. Empty string = "auto-mint happened, the
+        // CLI runner already attached it as a real UUID" — so we
+        // skip the conditional when the slice is empty. A pre-#52
+        // CLI built against a #52 server passes "" here too, and
+        // the server then runs the fresh-deploy path identically
+        // to before (no behavior change for the legacy wire).
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .multipart(form)
-            .send()?;
+            .header("Authorization", self.auth_header());
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.multipart(form).send()?;
 
         let resp = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {
