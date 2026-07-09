@@ -367,10 +367,13 @@ fn keys_create(_name: &str, _role: &str) -> Result<()> {
 /// session is annotated with `* (current)` so the user can see which
 /// one would be lost on self-revoke.
 ///
-/// The full table is ~149 chars wide; it wraps under 120-col
-/// terminals. `--no-extras` would be a one-line follow-up if that
-/// becomes a frequent complaint — see the deferred items in
-/// PR #457's body.
+/// The header line is 150 chars wide and the body's fixed columns
+/// (everything before the trailing NOTE) are 145; the divider line
+/// matches the body. The full row can extend past 145 chars when
+/// the NOTE column is populated (e.g. `(current)` adds 9 chars).
+/// Either way the table wraps under 120-col terminals. `--no-extras`
+/// would be a one-line follow-up if that becomes a frequent
+/// complaint — see the deferred items in PR #457's body.
 ///
 /// Timestamps are rendered as absolute RFC3339 (matching every other
 /// timestamp column in the CLI). Relative-time formatting is
@@ -413,7 +416,15 @@ fn keys_list(as_json: bool) -> Result<()> {
         "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE",
         "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     );
-    println!("{}", "-".repeat(149));
+    // Divider matches the fixed-column body width (38+24+12+22+22+22
+    // = 140 + 5 inter-column gaps = 145), NOT the header. The header
+    // is 4 chars wider because of the trailing " NOTE" label. The
+    // NOTE field itself overflows the divider when populated
+    // (`(current)` adds 9 chars past the 145) — that's the same
+    // convention the pre-PR layout used (96+3=99 columns, divider
+    // was 102; both layouts visually demarcated the fixed-column
+    // body, accepting trailing-flex overflow on the NOTE column).
+    println!("{}", "-".repeat(145));
     for k in &keys {
         let is_current = current_id.as_deref() == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
@@ -595,7 +606,9 @@ fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
         "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE\n",
         "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     ));
-    out.push_str(&"-".repeat(149));
+    // Divider matches the fixed-column body width (see production
+    // keys_list for the full rationale).
+    out.push_str(&"-".repeat(145));
     out.push('\n');
     for k in keys {
         let is_current = current_id == Some(k.id.as_str());
