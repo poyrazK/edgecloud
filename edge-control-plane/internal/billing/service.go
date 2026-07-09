@@ -358,13 +358,12 @@ func (s *BillingService) dispatch(
 		row.Status = domain.SubscriptionStatus(st)
 	}
 	// SubscriptionID is only set on the first checkout.completed;
-	// updates and deletes don't change it.
-	if evt.EventType() == domain.EventCheckoutCompleted && row.ProviderSubscriptionID == "" {
-		// The Stripe provider doesn't surface subscription_id from
-		// the checkout.session.completed payload directly; the
-		// follow-up customer.subscription.updated does. We leave
-		// the field empty here and let the next event fill it.
-	}
+	// updates and deletes don't change it. The Stripe provider
+	// doesn't surface subscription_id from the checkout.session.completed
+	// payload directly — the follow-up customer.subscription.updated
+	// does. We leave the field empty here and let the next event
+	// fill it. (Was an empty `if` branch before the PR #419 review;
+	// staticcheck flagged SA9003.)
 
 	row.Provider = evt.Provider()
 	// updated_at is set in the repo via NOW(); we only flip the

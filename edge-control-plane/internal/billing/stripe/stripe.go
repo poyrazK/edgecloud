@@ -233,21 +233,24 @@ func (p *Provider) findOrCreateCustomer(ctx context.Context, tenantID string) (s
 // metadata.tenant_id. Returns nil, nil if no match. Stripe Search API
 // would be cleaner but adds an API surface we don't otherwise need;
 // List with a small limit is enough for v1.
+//
+// Implementation note: we use a single-row fetch (Limit=1) and check
+// the metadata directly. A loop would be unconditionally terminated
+// after one iteration, which staticcheck flags as SA4004 — so we
+// skip the loop and just probe the first row.
 func (p *Provider) findCustomerByTenant(ctx context.Context, tenantID string) (*stripe.Customer, error) {
 	iter := customer.List(&stripe.CustomerListParams{
 		ListParams: stripe.ListParams{Limit: stripe.Int64(1)},
 	})
-	for iter.Next() {
-		c := iter.Customer()
-		if c.Metadata != nil && c.Metadata["tenant_id"] == tenantID {
-			return c, nil
+	if !iter.Next() {
+		if err := iter.Err(); err != nil {
+			return nil, fmt.Errorf("stripe: list customers: %w", err)
 		}
-		// First hit isn't us; in practice with a small limit this
-		// means no match. Break to avoid scanning a long list.
-		break
+		return nil, nil
 	}
-	if err := iter.Err(); err != nil {
-		return nil, fmt.Errorf("stripe: list customers: %w", err)
+	c := iter.Customer()
+	if c.Metadata != nil && c.Metadata["tenant_id"] == tenantID {
+		return c, nil
 	}
 	return nil, nil
 }
