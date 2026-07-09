@@ -87,6 +87,14 @@ jobs:
       # empty string. No secrets leak, no spurious failure.
       - uses: ./.github/actions/deploy-preview
         id: deploy
+        # `edge-cli deploy` reads `./edge.toml` from the cwd to find
+        # the `[project] name` and the wasm artifact path. The hello
+        # sample's edge.toml lives at samples/hello/edge.toml, so the
+        # composite action (which runs in the workflow's default cwd
+        # = repo root) needs to be told to chdir. Without this, the
+        # deploy step fails with
+        # `failed to read ./edge.toml (os error 2)`.
+        working-directory: samples/hello
         with:
           api-key: ${{ secrets.EDGECLOUD_API_KEY }}
           api-url: ${{ secrets.EDGECLOUD_API_URL }}
