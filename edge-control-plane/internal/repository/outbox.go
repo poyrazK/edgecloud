@@ -10,6 +10,11 @@ import (
 	"github.com/lib/pq"
 )
 
+// pqUniqueViolation is the Postgres SQLSTATE for a UNIQUE constraint
+// violation. The outbox catches this on the dedupe_key column to map
+// to a typed sentinel (see ErrDuplicateDedupeKey).
+const pqUniqueViolation = "23505"
+
 // OutboxRow is one durable-publish row (issue #42). The payload is the
 // already-marshaled NATS TaskMessage — the drainer reads it verbatim
 // and unmarshals into a *nats.TaskMessage at publish time. Keeping the
@@ -79,27 +84,34 @@ func (r *OutboxRepository) Enqueue(ctx context.Context, row *OutboxRow) error {
 	return err
 }
 
-// ClaimDue atomically transitions up to `limit` rows from pending → in_flight
-// and returns them. The CTE pattern + FOR UPDATE SKIP LOCKED makes
-// multi-instance draining safe: two drainers racing on the same set
-// of pending rows each claim a disjoint subset.
+// ClaimDue atomically transitions up to `limit` rows that are ready
+// to publish into the `in_flight` state and returns them. The CTE
+// pattern + FOR UPDATE SKIP LOCKED makes multi-instance draining
+// safe: two drainers racing on the same set of pending rows each
+// claim a disjoint subset.
 //
-// `claimed_until` is set to NOW() + 30s as a forward-compatible
-// safety net — if the drainer crashes after claiming a row but
-// before MarkPublished/MarkFailed, the row auto-recovers (the next
-// ClaimDue sees status='in_flight' AND claimed_until <= NOW() and
-// can re-claim it). Single-instance deployments don't strictly need
-// this, but the cost is one extra column + one extra predicate in
-// the WHERE clause — cheap insurance for a future scale-out.
+// A row is "due" when:
+//   - status='pending' AND next_attempt_at <= NOW() — the normal
+//     first-attempt / retry case, OR
+//   - status='in_flight' AND claimed_until <= NOW() — the
+//     crash-recovery case: a previous drainer claimed the row,
+//     didn't MarkPublished/MarkFailed within 30s, and another
+//     drainer can now re-claim it. The FOR UPDATE SKIP LOCKED
+//     inside the CTE makes the re-claim safe under concurrency.
+//     `claimed_until` is set to NOW()+30s on every claim; both
+//     MarkPublished and MarkFailed clear it, so a successfully
+//     processed row is never re-claimed.
 //
-// pending rows that fail the `next_attempt_at <= NOW()` check are
-// skipped (no row lock, no claim). Future rows stay pending.
+// Future rows stay `pending` (no row lock, no claim).
 func (r *OutboxRepository) ClaimDue(ctx context.Context, limit int) ([]OutboxRow, error) {
 	const query = `
 		WITH due AS (
 			SELECT id FROM outbox
-			WHERE status = 'pending'
-			  AND next_attempt_at <= NOW()
+			WHERE next_attempt_at <= NOW()
+			  AND (
+			    status = 'pending'
+			    OR (status = 'in_flight' AND claimed_until IS NOT NULL AND claimed_until <= NOW())
+			  )
 			ORDER BY next_attempt_at
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
@@ -177,31 +189,16 @@ func (r *OutboxRepository) MarkFailed(ctx context.Context, id int64, attemptCoun
 var ErrDuplicateDedupeKey = errors.New("outbox: duplicate dedupe_key")
 
 // isUniqueViolation returns true when err is a Postgres UNIQUE
-// constraint violation. sqlx wraps the underlying pq error so we
-// check by error message — there's no exported sentinel on the pq
-// driver and the integration tests confirm the literal message.
+// constraint violation. We unwrap to *pq.Error and check the SQLSTATE
+// code rather than substring-matching the error message — that's the
+// documented pq API and is stable across Postgres versions.
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	const msg = `duplicate key value violates unique constraint`
-	return errors.Is(err, err) && containsString(err.Error(), msg)
-}
-
-// containsString is a tiny helper so we don't need strings.Contains
-// in the import set of this file (which would otherwise only need
-// it for one call).
-func containsString(haystack, needle string) bool {
-	if len(needle) == 0 {
-		return true
-	}
-	if len(needle) > len(haystack) {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == pqUniqueViolation
 	}
 	return false
 }

@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"math"
 	"time"
@@ -25,12 +24,12 @@ import (
 //
 // Backoff schedule: next_attempt_at = NOW() + min(2^attempt * 5s, 5min).
 // attempt is the NEW attempt_count (i.e. 1 right after the first
-// failure, 2 after the second). After OUTBOX_MAX_ATTEMPTS (default
-// 10) the row's status flips to 'failed' and stays for operator
-// inspection.
+// failure, 2 after the second). The cap is 5 minutes — reached at
+// attempt=6 (2^6 * 5s = 320s > 300s); the schedule is flat after
+// that. After OUTBOX_MAX_ATTEMPTS (default 10) the row's status
+// flips to 'failed' and stays for operator inspection.
 type OutboxDrainer struct {
 	repo        *repository.OutboxRepository
-	activeRepo  *repository.ActiveDeploymentRepository
 	publisher   nats.Publisher
 	interval    time.Duration
 	batchSize   int
@@ -42,7 +41,7 @@ type OutboxDrainer struct {
 // OUTBOX_MAX_ATTEMPTS). batchSize defaults to 50 — enough to drain
 // a single activation's regions in one tick, low enough that a
 // backlog tick doesn't monopolize the DB pool.
-func NewOutboxDrainer(repo *repository.OutboxRepository, activeRepo *repository.ActiveDeploymentRepository, publisher nats.Publisher, interval time.Duration, batchSize, maxAttempts int) *OutboxDrainer {
+func NewOutboxDrainer(repo *repository.OutboxRepository, publisher nats.Publisher, interval time.Duration, batchSize, maxAttempts int) *OutboxDrainer {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
@@ -54,7 +53,6 @@ func NewOutboxDrainer(repo *repository.OutboxRepository, activeRepo *repository.
 	}
 	return &OutboxDrainer{
 		repo:        repo,
-		activeRepo:  activeRepo,
 		publisher:   publisher,
 		interval:    interval,
 		batchSize:   batchSize,
@@ -105,11 +103,14 @@ func (d *OutboxDrainer) Tick(ctx context.Context) {
 //
 // The publish loop mirrors pre-#42 publishSwap semantics: a
 // transient per-region failure does not abort the loop; the row
-// is only marked 'failed' after `maxAttempts` retries. The
-// successful regions are recorded on the active row via
-// AppendRegionsPublished regardless of the overall outcome — the
-// operator escape-hatch `SELECT regions_published WHERE ...`
-// must reflect partial progress.
+// is only marked 'failed' after `maxAttempts` retries. Publish
+// attempts are recorded on the outbox row itself (attempt_count +
+// last_error + published_at) — we no longer call
+// ActiveDeploymentRepository.AppendRegionsPublished here. That
+// helper overloaded the active row's last_publish_attempt_id
+// column with the outbox's dedupe_key, which mixed two different
+// audit trails; the outbox row is the authoritative record of
+// publish attempts post-#42.
 func (d *OutboxDrainer) processRow(ctx context.Context, row *repository.OutboxRow) {
 	var msg nats.TaskMessage
 	if err := json.Unmarshal(row.Payload, &msg); err != nil {
@@ -120,7 +121,6 @@ func (d *OutboxDrainer) processRow(ctx context.Context, row *repository.OutboxRo
 		return
 	}
 
-	var succeeded []string
 	var firstErr error
 	for _, region := range row.Regions {
 		if err := d.publisher.PublishTaskUpdate(region, &msg); err != nil {
@@ -129,21 +129,6 @@ func (d *OutboxDrainer) processRow(ctx context.Context, row *repository.OutboxRo
 				firstErr = err
 			}
 			continue
-		}
-		succeeded = append(succeeded, region)
-	}
-
-	// Always update the active row's regions_published / regions_failed
-	// to reflect partial progress — operator-visible state, not
-	// transactional. Best-effort: a DB error here is logged but does
-	// not change the outbox row's status (the row's status is the
-	// ground truth for whether the message hit NATS).
-	if len(succeeded) > 0 {
-		// Use a fresh attempt_id so the operator sees the row's
-		// last_publish_at / last_publish_attempt_id reflect this
-		// partial success even when the row will retry.
-		if err := d.activeRepo.AppendRegionsPublished(ctx, row.TenantID, row.AppName, succeeded, row.DedupeKey, time.Now()); err != nil {
-			log.Printf("outbox: row %d AppendRegionsPublished failed: %v", row.ID, err)
 		}
 	}
 
@@ -168,8 +153,10 @@ func (d *OutboxDrainer) processRow(ctx context.Context, row *repository.OutboxRo
 }
 
 // backoffFor returns the wait duration for the given attempt number.
-// schedule: 5s, 10s, 20s, 40s, 80s, 160s, 320s, 320s, 320s, 320s (capped
-// at 5 minutes). Math is `min(2^attempt * 5s, 5min)`.
+// Schedule: 5s, 10s, 20s, 40s, 80s, 160s, then capped at 5 minutes
+// (300s) for attempt >= 6 — because 2^6 * 5s = 320s > 300s, the cap
+// kicks in and stays flat for higher attempts. Math is
+// `min(2^attempt * 5s, 5min)`.
 func backoffFor(attempt int) time.Duration {
 	const cap = 5 * time.Minute
 	const base = 5 * time.Second
@@ -189,7 +176,3 @@ func backoffFor(attempt int) time.Duration {
 	}
 	return d
 }
-
-// Sentinel for tests that want to assert on "drainer was constructed
-// with sensible defaults". Not used in production paths.
-var _ = errors.New

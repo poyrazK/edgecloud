@@ -148,7 +148,7 @@ func New(
 	// tick, 50 rows/batch, 10 retries before flipping the row to
 	// status='failed' for operator inspection.
 	outboxDrainer := service.NewOutboxDrainer(
-		outboxRepo, activeDeploymentRepo, publisher,
+		outboxRepo, publisher,
 		parseDurationEnv("OUTBOX_DRAIN_INTERVAL", 2*time.Second),
 		parseIntEnv("OUTBOX_BATCH_SIZE", 50),
 		parseIntEnv("OUTBOX_MAX_ATTEMPTS", 10),

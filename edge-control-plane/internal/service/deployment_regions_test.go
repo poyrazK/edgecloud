@@ -108,7 +108,7 @@ func activateSvcForTest(t *testing.T, pub nats.Publisher, defaultRegion string) 
 		publisher:      pub,
 		defaultRegion:  defaultRegion,
 	}
-	drainer := NewOutboxDrainer(outboxRepo, activeRepo, pub, time.Second, 50, 10)
+	drainer := NewOutboxDrainer(outboxRepo, pub, time.Second, 50, 10)
 	return svc, drainer, mock, func() { _ = mockDB.Close() }
 }
 
@@ -590,14 +590,16 @@ func expectInTxOutboxInsert(mock sqlmock.Sqlmock, tenantID, appName string) {
 
 // expectDrainerTickSuccess mocks the post-commit drainer flow for a
 // single in-flight outbox row: ClaimDue → per-region PublishTaskUpdate
-// (asserted via RecordingPublisher.calls) → AppendRegionsPublished
-// → MarkPublished. Used by tests that exercise a happy-path activate
-// followed by drainer.Tick.
+// (asserted via RecordingPublisher.calls) → MarkPublished. Used by
+// tests that exercise a happy-path activate followed by drainer.Tick.
 //
 // Pre-#42 this work happened inside publishSwap, gated on
 // post-commit read+appendRegionsPublished. Post-#42 the drainer owns
 // it; the helper keeps the test files from re-declaring the same
-// three mocks in every test.
+// ClaimDue + MarkPublished mocks in every test. The drainer no
+// longer AppendRegionsPublished on the active row — the outbox row
+// itself records publish attempts (attempt_count + last_error +
+// published_at).
 //
 // The returned row's payload is built via outboxRowPayload so the
 // unmarshal step inside OutboxDrainer.processRow lands the same
@@ -619,9 +621,9 @@ func expectDrainerTickSuccess(t *testing.T, mock sqlmock.Sqlmock, tenantID, appN
 			0, time.Now(), "in_flight", nil,
 			"dedupe", time.Now(), nil, time.Now().Add(30*time.Second),
 		))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET regions_published = (`)).
-		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Issue #42: the drainer no longer AppendRegionsPublished on the
+	// active row — the outbox row itself records publish attempts
+	// (attempt_count + last_error + published_at). Just MarkPublished.
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE outbox`)).
 		WithArgs(1).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -646,9 +648,8 @@ func expectDrainerTickPartialFailure(t *testing.T, mock sqlmock.Sqlmock, tenantI
 			0, time.Now(), "in_flight", nil,
 			"dedupe", time.Now(), nil, time.Now().Add(30*time.Second),
 		))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET regions_published = (`)).
-		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// See expectDrainerTickSuccess — drainer no longer touches the
+	// active row. MarkFailed on the outbox row only.
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE outbox`)).
 		WithArgs(1, "pending", 1, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))

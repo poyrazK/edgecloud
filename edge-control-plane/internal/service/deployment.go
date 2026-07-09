@@ -1271,13 +1271,19 @@ func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx
 			// envSvc decrypts the ciphertext values stored in
 			// app_env (when secrets encryption is enabled).
 			// Decryption is CPU-only and safe to do inside the tx
-			// closure. On per-key decrypt error we fall through
-			// with the raw value — matches the pre-#42 activate
-			// behavior (log but continue).
-			if plain, derr := s.envSvc.Decrypt(e.EnvValue); derr == nil {
-				envMap[e.EnvKey] = plain
-				continue
+			// closure. A decrypt error is fatal for the publish:
+			// silently falling through with raw ciphertext would
+			// publish a payload the worker can't use and is hard
+			// to diagnose downstream. The pre-#42 rollback path
+			// surfaced this as an error; the activate path used
+			// log-and-continue, but in the outbox world a failed
+			// enqueue is cheaper than publishing a broken message.
+			plain, derr := s.envSvc.Decrypt(e.EnvValue)
+			if derr != nil {
+				return nil, fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
 			}
+			envMap[e.EnvKey] = plain
+			continue
 		}
 		envMap[e.EnvKey] = e.EnvValue
 	}
