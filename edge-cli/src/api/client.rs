@@ -424,18 +424,16 @@ struct AppListResponse {
 /// `offset` are unsigned because pagination offsets are always
 /// non-negative.
 ///
-/// `#[allow(dead_code)]` covers `total`/`limit`/`offset` — they are
-/// accepted but not rendered by `edge deployments` today. The allow
-/// is intentional: when a future `edge deployments --page N` lands,
-/// the deserializer doesn't need a second round-trip. (see project
-/// audit notes; CLI gap #2 deferred from PR #457)
+/// `total`/`limit`/`offset` are consumed by `commands::deployments::run`
+/// to render the page-of-N footer; `items` is the only field read by
+/// callers that don't paginate (currently none — see
+/// [`ApiClient::list_deployments`]).
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct DeploymentListResponse {
-    items: Vec<DeploymentSummary>,
-    total: i64,
-    limit: u32,
-    offset: u32,
+pub struct DeploymentListEnvelope {
+    pub items: Vec<DeploymentSummary>,
+    pub total: i64,
+    pub limit: u32,
+    pub offset: u32,
 }
 
 /// Quota and usage returned by `GET /api/v1/quotas`.
@@ -961,12 +959,53 @@ impl ApiClient {
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
-    /// List all deployments for an app.
+    /// List all deployments for an app. Returns the first page
+    /// only — for paginated traversal use
+    /// [`ApiClient::list_deployments_paginated`].
+    ///
+    /// Today no caller uses this method; it is retained as a
+    /// backward-compatible wrapper so a future "give me the bare
+    /// list" call site doesn't have to fan out to the envelope
+    /// shape. `commands::deployments::run` itself goes through the
+    /// paginated path so it can render the footer.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        let resp: DeploymentListResponse = self.get_json_anyhow("list deployments", |base| {
-            format!("{base}/api/v1/list/{app_name}")
-        })?;
-        Ok(resp.items)
+        let envelope = self.list_deployments_paginated(app_name, 0, 0)?;
+        Ok(envelope.items)
+    }
+
+    /// List deployments for an app with explicit `?limit=` and
+    /// `?offset=` query parameters forwarded to the server.
+    /// `limit=0` and `offset=0` mean "use the server default" /
+    /// "from the start", respectively; in both cases the
+    /// corresponding query param is omitted from the request URL
+    /// to keep the wire shape clean (the server treats absence the
+    /// same as the default — confirmed at
+    /// `internal/handler/deployment.go::List`).
+    ///
+    /// Returns the full [`DeploymentListEnvelope`] so callers can
+    /// decide whether to render a pagination footer without a
+    /// second round-trip.
+    pub fn list_deployments_paginated(
+        &self,
+        app_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<DeploymentListEnvelope> {
+        self.get_json_anyhow("list deployments", |base| {
+            let mut parsed = reqwest::Url::parse(&format!("{base}/api/v1/list/{app_name}"))
+                .expect("hardcoded URL template parses");
+            if limit > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("limit", &limit.to_string());
+            }
+            if offset > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("offset", &offset.to_string());
+            }
+            parsed.to_string()
+        })
     }
 
     /// GET `/api/v1/apps` — list all apps for the authenticated tenant.
