@@ -207,7 +207,8 @@ edgecloud.heartbeats.<region>      # Worker heartbeat aggregation
       "deployment_id": "d_xyz789",
       "deployment_hash": "sha256:abc...",
       "env": { "DATABASE_URL": "postgres://..." },
-      "allowlist": ["api.stripe.com", "db.internal"]
+      "allowlist": ["api.stripe.com", "db.internal"],
+      "socket_mode": "block-all"
     }
   }
 }
@@ -608,7 +609,8 @@ Streams are configured with:
       "deployment_id": "d_xyz789",
       "deployment_hash": "sha256:abc123...",
       "env": { "KEY": "VALUE" },
-      "allowlist": ["api.stripe.com"]
+      "allowlist": ["api.stripe.com"],
+      "socket_mode": "block-all"
     }
   }
 }
