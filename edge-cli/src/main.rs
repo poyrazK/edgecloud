@@ -253,17 +253,28 @@ enum Command {
 
     /// Set an environment variable.
     EnvSet {
+        /// App name. Defaults to `.edge/state.json` when omitted.
+        #[arg(long, default_value = "")]
+        app: String,
         /// Environment variable key.
         key: String,
         /// Environment variable value.
         value: String,
     },
 
-    /// List environment variables.
-    EnvList,
+    /// List environment variables for an app. The app name comes
+    /// from `--app`, or from `.edge/state.json` when omitted.
+    EnvList {
+        /// App name. Defaults to `.edge/state.json` when omitted.
+        #[arg(long, default_value = "")]
+        app: String,
+    },
 
     /// Delete an environment variable.
     EnvDelete {
+        /// App name. Defaults to `.edge/state.json` when omitted.
+        #[arg(long, default_value = "")]
+        app: String,
         /// Environment variable key to delete.
         key: String,
     },
@@ -538,9 +549,11 @@ fn main() -> Result<()> {
             StatusAction::Runtime { app } => commands::status::runtime(&cli.path, &app),
             StatusAction::Deployment => commands::status::run(&cli.path),
         },
-        Command::EnvSet { key, value } => commands::env::set_var(&cli.path, &key, &value),
-        Command::EnvList => commands::env::list_vars(&cli.path),
-        Command::EnvDelete { key } => commands::env::delete_var(&cli.path, &key),
+        Command::EnvSet { app, key, value } => {
+            commands::env::set_var(&cli.path, &app, &key, &value)
+        }
+        Command::EnvList { app } => commands::env::list_vars(&cli.path, &app),
+        Command::EnvDelete { app, key } => commands::env::delete_var(&cli.path, &app, &key),
         Command::Activate {
             deployment_id,
             weight,
