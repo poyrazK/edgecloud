@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,26 @@ var (
 	ErrRegionMismatch  = errors.New("region mismatch between worker_id and request region")
 	ErrQuotaExceeded   = errors.New("max workers reached for tenant")
 )
+
+// heartbeatRecover is a defer helper used by the two inner goroutines
+// spawned inside SubscribeHeartbeats (the channel-depth monitor and the
+// drain that calls handleHeartbeat). The outer loophealth recover in
+// RunBackground cannot catch panics inside these goroutines because
+// SubscribeHeartbeats returns nil as soon as it has launched them —
+// without this, a malformed heartbeat that nil-derefs in handleHeartbeat
+// would silently kill the drain while the outer wrapper still reported
+// the loop as healthy (issue #443).
+//
+// On a recovered panic the drain is NOT restarted: the NATS subscription
+// `sub` and channel `ch` are locals to SubscribeHeartbeats, so a clean
+// restart would require refactoring that method into a supervisor loop
+// (deferred). The /health handler now surfaces the panic via the
+// degraded status, so operators notice.
+func heartbeatRecover(prefix string) {
+	if r := recover(); r != nil {
+		log.Printf("%spanic recovered in inner goroutine: %v\n%s", prefix, r, debug.Stack())
+	}
+}
 
 // tenantRepoInterface defines the repository methods used by WorkerService
 // for tenant-level operations (issue #155).
@@ -231,6 +252,7 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 	// Monitor channel depth every minute and log when it's getting full
 	// so operators can tune the buffer before messages are dropped.
 	go func() {
+		defer heartbeatRecover("heartbeat: ")
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -248,6 +270,7 @@ func (s *WorkerService) SubscribeHeartbeats(ctx context.Context) error {
 	}()
 
 	go func() {
+		defer heartbeatRecover("heartbeat: ")
 		for {
 			select {
 			case <-ctx.Done():
