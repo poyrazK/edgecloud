@@ -32,16 +32,6 @@ jobs:
       - name: Install edge CLI
         run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
 
-      - name: Expose edge CLI on PATH
-        # Required for the next step (`edge build`) to find the
-        # binary — `cargo install --root $CARGO_HOME` doesn't update
-        # $PATH for subsequent steps. `$GITHUB_PATH` is a special
-        # file GitHub Actions reads to extend PATH for every later
-        # step in the job. Pre-#308 the comment block at the top of
-        # this file documented this exact fix; with it landed, the
-        # long block is gone.
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
       # Build the hello sample (samples/hello/) into a deployable
       # wasm component via the CLI. `edge build` runs the proven
       # two-step recipe (cargo under wasm32-unknown-unknown +
@@ -49,8 +39,18 @@ jobs:
       # longer needs to install wasm-tools or stage files manually.
       # See samples/hello/README.md for the wasi:http@0.2.1 vs 0.2.4
       # rationale.
+      #
+      # Inline PATH export — `$GITHUB_PATH` is supposed to propagate
+      # to subsequent steps but observed a race on Node-24 runners
+      # where the next `shell: bash` step's PATH didn't pick up the
+      # `echo $CARGO_HOME/bin >> $GITHUB_PATH` write from the
+      # preceding step. Inlining the export in the same step that
+      # runs `edge build` is reliable across runner versions
+      # (issue #308, second iteration).
       - name: Build hello sample
         working-directory: samples/hello
+        env:
+          PATH: ${{ env.CARGO_HOME }}/bin:${{ env.PATH }}
         run: edge build
 
       # Delegate install-cli + edge deploy + URL capture to the
