@@ -2,6 +2,19 @@ name: Preview
 on:
   pull_request:
     types: [opened, synchronize]
+  # Manual trigger from the Actions UI — useful while the
+  # pull_request auto-trigger is gated behind `if: false` (see the
+  # job below). When `api.edgecloud.dev` is up and you want to
+  # dogfood the deploy on a real PR, you can also remove `if: false`
+  # and rely on `pull_request` instead. The composite accepts the
+  # same `api-url` / `api-key` / `pr-number` inputs via the
+  # workflow_dispatch form.
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: 'GitHub PR number to forward to `edge-cli deploy --pr-number=<N>`. Leave empty for a no-PR-context preview.'
+        required: false
+        default: ''
 
 # Preview workflow (issue #308).
 #
@@ -12,6 +25,26 @@ on:
 # is configured — fork PRs lack it and silently no-op).
 jobs:
   deploy-preview:
+    # Disabled on auto-trigger (issue #308) — the workflow stays
+    # defined and runnable from the Actions UI (workflow_dispatch),
+    # but it does NOT auto-fire on every PR while `api.edgecloud.dev`
+    # is offline. The CI matrix turned red once the workflow reached
+    # the actual network call:
+    #
+    #   Error: request or response body error for url
+    #     (https://api.edgecloud.dev/api/v1/deploy/...)
+    #   Caused by: send failed because receiver is gone
+    #
+    # because `api.edgecloud.dev` is not in DNS yet (the host hasn't
+    # been stood up). When the API is deployed, re-enable by
+    # deleting this `if: false` line and (optionally) also wiring a
+    # `workflow_dispatch` input if you want a manual-run button. The
+    # historical disable/enable cycle on this file was:
+    #   - 96fcc67: disable (pre-existing PATH bug)
+    #   - 9943c39: re-enable (PATH fixed, pr-number wired)
+    #   - ecfb4f9: app-dir input added (composite cwd fix)
+    #   - <this commit>: re-disable (host offline)
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
