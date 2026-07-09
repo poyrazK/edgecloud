@@ -249,11 +249,12 @@ func (sec *SecretEncryptor) ActiveKeyID() string {
 	return sec.activeKeyID
 }
 
-// LooksLikeCipher reports whether value matches the encrypted shape
-// for some key in this keyring: `kid:hex-nonce:hex-ct` with a kid the
-// encryptor recognizes. Used by the startup plaintext-row check (issue
-// #441) to count legacy plaintext rows without attempting to decrypt
-// every row.
+// LooksLikeCipher reports whether value has the three-part shape
+// `<kid>:<nonce>:<ct>` and the leading kid is one this encryptor's
+// keyring recognizes. The nonce and ct contents are NOT validated
+// (decoding them is part of the integrity check at Decrypt time).
+// Used by the startup plaintext-row check (issue #441) to count
+// legacy plaintext rows without attempting to decrypt every row.
 //
 // Note: this is a SHAPE check, not an integrity check. A tampered row
 // with a valid kid prefix returns true here and surfaces as

@@ -2937,7 +2937,11 @@ paths:
                   # Issue #441: count of app_env rows that don't match
                   # the encrypted shape (kid:nonce:ct with a known kid).
                   # Drives the operator migration to /admin/secrets/re-encrypt.
-                  # -1 means the count query errored (see handler).
+                  # 0 = clean. N > 0 = N plaintext rows still need migration.
+                  # -1 = the count query itself errored; the CP logs the
+                  # underlying error and returns the keyring info anyway
+                  # (see handler.ListKeys). The 401 response shape is
+                  # unchanged.
                   plaintext_row_count:
                     type: integer
                     example: 0

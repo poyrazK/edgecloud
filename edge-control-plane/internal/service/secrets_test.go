@@ -206,6 +206,12 @@ func TestDecrypt_OldFormatWithRemovedKey_ReturnsErrPlaintextEnvNotAllowed(t *tes
 	if !errors.Is(err, ErrPlaintextEnvNotAllowed) {
 		t.Errorf("err = %v, want ErrPlaintextEnvNotAllowed", err)
 	}
+	// Mutual exclusion: 2-part no-key-match must NOT be classified as
+	// ErrCiphertextMismatch — the kid was never in the keyring, so this
+	// is observably plaintext-shape, not tamper.
+	if errors.Is(err, ErrCiphertextMismatch) {
+		t.Errorf("2-part no-key-match must NOT be ErrCiphertextMismatch (kid was never in keyring)")
+	}
 }
 
 func TestDecrypt_LegacyPlaintext_ReturnsErrPlaintextEnvNotAllowed(t *testing.T) {

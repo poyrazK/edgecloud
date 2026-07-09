@@ -25,6 +25,10 @@ func NewSecretsAdminHandler(encryptor *service.SecretEncryptor, envSvc *service.
 // Issue #441: includes plaintext_row_count so operators can see at a
 // glance how many legacy plaintext app_env rows still need migration.
 // When encryption is disabled (dev mode), the field is omitted.
+// The -1 sentinel on plaintext_row_count means "count query errored"
+// — see the OpenAPI doc on /api/v1/admin/secrets/keys for the full
+// state machine. We intentionally don't fail the response on a count
+// error so the keyring info still reaches the operator.
 func (h *SecretsAdminHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	ids := h.encryptor.KeyIDs()
 	activeID := h.encryptor.ActiveKeyID()
