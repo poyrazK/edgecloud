@@ -74,6 +74,37 @@ type Deployment struct {
 	// `omitempty` on the wire so pre-PR2 API consumers don't see a
 	// new field in list / status responses.
 	BuildAttestation json.RawMessage `db:"build_attestation" json:"build_attestation,omitempty"`
+
+	// PreviewID, PreviewPRNumber, PreviewExpiresAt (issue #308)
+	// mark a deployments row as a preview and drive auto-cleanup.
+	//
+	// All three are nullable on purpose: a non-preview deployment
+	// has NULL for all three, mirroring the LastGoodDeploymentID
+	// *string pattern on ActiveDeployment (line 97). The pointer
+	// type lets sqlx distinguish NULL from a typed zero value
+	// (e.g., PreviewPRNumber == 0 — a real PR number — must not be
+	// confused with "no PR"). On the wire `omitempty` keeps the
+	// JSON output clean for non-preview rows.
+	//
+	// PreviewID is the hex suffix the CLI mints (or the server
+	// overrides) when ?preview-id=... is set. Used as the
+	// store-scope key by edge-runtime (`<EDGE_KV_STORE_PATH>/{tenant_id}/preview-{id}/`)
+	// and as the SWEEP marker for PreviewGCService. Free-form TEXT
+	// (not a foreign key to anything); the GC sweep uses the
+	// expiry column, not this one.
+	PreviewID *string `db:"preview_id" json:"preview_id,omitempty"`
+	// PreviewPRNumber is the integer GitHub PR number the composite
+	// action forwards via ?preview-pr-number=. Stored so an operator
+	// can correlate a deployment row with the PR that produced it
+	// without parsing the app_name suffix. Optional: non-CI users
+	// (`edge deploy --preview` on a laptop) don't have a PR number.
+	PreviewPRNumber *int `db:"preview_pr_number" json:"preview_pr_number,omitempty"`
+	// PreviewExpiresAt is the TIMESTAMPTZ the PreviewGCService
+	// compares against NOW() on each sweep. Indexed (partial,
+	// migration 021) so the sweep stays cheap. Set to
+	// NOW() + 7d on upload by default; per-deploy overridable via
+	// ?preview-ttl=24h. NULL for non-preview rows.
+	PreviewExpiresAt *time.Time `db:"preview_expires_at" json:"preview_expires_at,omitempty"`
 }
 
 // Deployment status constants.
@@ -190,6 +221,15 @@ type ActiveDeployment struct {
 	// deployment in each region (issue #316). 0 means "no threshold".
 	// Copied from the deployments row at activate time.
 	DesiredReplicas int `db:"desired_replicas"`
+	// PreviewID + PreviewPRNumber (issue #308) are copied from the
+	// deployments row at activate time and propagated onto the
+	// published TaskMessage so the worker can scope per-preview
+	// persistent stores (`<EDGE_KV_STORE_PATH>/{tenant_id}/preview-{id}/`)
+	// and stamp `EDGE_PREVIEW_PR_NUMBER` into the guest env. No
+	// expiry column here — the active row is short-lived; expiry
+	// lives on the deployments row and is the GC's sweep key.
+	PreviewID       *string `db:"preview_id"`
+	PreviewPRNumber *int    `db:"preview_pr_number"`
 }
 
 // AppEnv stores environment variables for an app.

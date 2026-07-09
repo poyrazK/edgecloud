@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 46 // 23 .up.sql + 23 .down.sql on current main (after 020_add_build_attestation)
+const splitFileCount = 48 // 24 .up.sql + 24 .down.sql on current main (after 021_add_preview_columns, issue #308)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -154,6 +154,9 @@ var wantColumns = map[string][]string{
 		"signature",             // 017_add_signature
 		"signing_key_id",        // 017_add_signature
 		"build_attestation",     // 020_add_build_attestation
+		"preview_id",            // 021_add_preview_columns (issue #308)
+		"preview_pr_number",     // 021_add_preview_columns (issue #308)
+		"preview_expires_at",    // 021_add_preview_columns (issue #308)
 	},
 	"active_deployments": {
 		"tenant_id",
@@ -665,6 +668,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                // 014_audit_logs
 	{Table: "webhooks", Name: "idx_webhooks_tenant"},                      // 015_webhooks
 	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"}, // 015_webhooks
+	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},    // 021_add_preview_columns (issue #308)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
