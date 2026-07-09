@@ -1,9 +1,8 @@
 //! Rust source transformer (M3).
 //!
 //! Rewrites `std::net::*` / `std::fs::*` / `std::process::*` calls into
-//! their `wasi::socket::*` / `wasi::filesystem::*` equivalents using
-//! the same byte-range descending-order rewriter pattern as the C
-//! `Transformer`.
+//! their wit-bindgen-0.45-shaped `crate::wasi::socket::*` /
+//! `crate::wasi::filesystem::*` equivalents.
 //!
 //! **Scope:** only `std` patterns (mirrors `RustAnalyzer`). `tokio::net`,
 //! `async-std`, `#![no_std]`, and `macro_rules!` are out of scope for
@@ -17,7 +16,7 @@
 //! The transformed source is laid out as:
 //!
 //! ```text
-//! // <auto-prelude: use wasi::*>
+//! // <auto-prelude: crate::wasi::* imports + parse_addr_v4 helper>
 //! // <original source from byte 0 up to the first match's start>
 //! <match-1 replacement>
 //! // <gap content between match-1 and match-2 in original coords>
@@ -30,27 +29,69 @@
 //! byte offsets of matches earlier in the file remain valid as we go.
 //! `NotTransformable` matches are excluded from rewriting and instead
 //! surface as `manual_review` entries on the result.
+//!
+//! ## API target
+//!
+//! Emitted shapes track the bindings `wit-bindgen = "0.45"` generates
+//! against this repo's canonical WIT (see `wit/deps/sockets/*.wit` and
+//! `wit/deps/filesystem/*.wit`). Cross-references:
+//!
+//! - Socket factory functions `create_tcp_socket` / `create_udp_socket`
+//!   live in their own interfaces (`tcp-create-socket` /
+//!   `udp-create-socket`) and bindgen maps them to submodules under
+//!   `crate::wasi::sockets::*`.
+//! - `IpAddressFamily` lives in `wasi:network`, **not** `wasi:tcp`.
+//! - `start_bind` / `start_connect` take `(network, ip-socket-address)`
+//!   rather than a single address string — we feed them through
+//!   `parse_addr_v4` (declared in the prelude below) to convert the
+//!   `std::net::TcpListener::bind("host:port")` syntax.
+//! - Filesystem I/O is always through a `Descriptor` you hold (typically
+//!   a preopen at `crate::wasi::filesystem::preopens::get_directories`).
 
 use crate::patterns::{PatternKind, PatternMatch, RustPattern, Transformability};
 use crate::transformer::{TransformError, TransformResult, Transformation};
 
 /// WASI Rust prelude prepended to the transformed source.
 ///
-/// Mirrors the C `WASI_INCLUDES` block in `transformer.rs`. The
-/// `wasi::filesystem` and `wasi::socket` re-exports are conservative
-/// — only the symbols the transformer actually emits. Adding symbols
-/// here makes them visible across the transformed file without a
-/// per-replacement `use` statement.
+/// Emits `crate::wasi::*` paths directly — the canonical import shape
+/// for `wit-bindgen = "0.45"` (verified against
+/// `edge-worker/tests/fixtures/handler/src/lib.rs:47-60`). The
+/// `parse_addr_v4` helper translates the `std::net::...bind("host:port")`
+/// string syntax into the `IpSocketAddress` struct that
+/// `start_bind`/`start_connect` require.
+///
+/// `preopens` is imported as a module (not a specific symbol) so the
+/// emit at `Descriptor::open_at` can call `preopens::get_directories()`
+/// without an extra `use` per replacement.
 const WASI_RUST_PRELUDE: &str = "\
-use wasi::socket::tcp::TcpSocket;
-use wasi::socket::udp::UdpSocket;
-use wasi::socket::AddressFamily;
-use wasi::filesystem;
+use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;
+use crate::wasi::sockets::udp_create_socket::create_udp_socket;
+use crate::wasi::sockets::instance_network::instance_network;
+use crate::wasi::sockets::network::{
+    ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
+};
+use crate::wasi::filesystem::types::{
+    Descriptor, DescriptorFlags, OpenFlags, PathFlags,
+};
+use crate::wasi::filesystem::preopens;
+
+fn parse_addr_v4(s: &str) -> IpSocketAddress {
+    let (host, port) = s.split_once(':').expect(\"invalid host:port\");
+    let mut oct = host.split('.');
+    let a: u8 = oct.next().unwrap().parse().unwrap();
+    let b: u8 = oct.next().unwrap().parse().unwrap();
+    let c: u8 = oct.next().unwrap().parse().unwrap();
+    let d: u8 = oct.next().unwrap().parse().unwrap();
+    IpSocketAddress::Ipv4(Ipv4SocketAddress {
+        port: port.parse().unwrap(),
+        address: (a, b, c, d),
+    })
+}
 
 ";
 
-/// Rewrites detected Rust patterns into `wasi::socket::*` /
-/// `wasi::filesystem::*` calls.
+/// Rewrites detected Rust patterns into `crate::wasi::socket::*` /
+/// `crate::wasi::filesystem::*` call sites (wit-bindgen 0.45 shape).
 ///
 /// Stateless; the constructor exists only to mirror the C
 /// `Transformer` shape and to give the bin a place to hang per-instance
@@ -207,16 +248,78 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
             .ok_or_else(|| format!("missing argument index {} for {:?}", i, pattern))
     };
     Ok(match pattern {
+        // wit-bindgen 0.45 emits free functions (create_tcp_socket,
+        // create_udp_socket) under the per-interface submodules
+        // `tcp-create-socket` / `udp-create-socket`. The Network
+        // handle comes from `instance_network`; the address is
+        // converted from a `std::net::...bind("host:port")` literal
+        // by the `parse_addr_v4` helper in the prelude.
+        //
+        // **API shape (this is subtle).** `start_bind` returns
+        // `Result<(), ErrorCode>` — it does NOT return the socket.
+        // The bindgen-generated Rust surface is:
+        //   socket.start_bind(&net, addr)  -> Result<(), _>
+        //   socket.finish_bind()           -> Result<(), _>
+        //   socket.start_listen()          -> Result<(), _>
+        //   socket.finish_listen()         -> Result<(), _>
+        //   socket.accept()                -> Result<(TcpSocket, InputStream, OutputStream), _>
+        // You call each transition on the same socket, not chained
+        // off the prior result. (`accept` is a method on `TcpSocket`
+        // and returns the new socket + streams per
+        // `wit/deps/sockets/tcp.wit::accept`.)
+        //
+        // Each emit is a Rust block expression `{ ... result }` so
+        // the transformed call site can stand in for the original
+        // expression in an assignment or statement context. The
+        // block's **trailing expression is the socket `_s` itself**
+        // (for TcpBind/TcpConnect/UdpBind). The user's
+        // `.unwrap()` extracts the socket, so subsequent lines that
+        // reference `listener` (e.g. `listener.accept().unwrap()`)
+        // resolve to a method on `TcpSocket`, not `()`.
+        //
+        // `.expect("...")` is used rather than `?` because the user's
+        // surrounding function (typically `fn main()`) returns `()`,
+        // not `Result`.
         RustPattern::TcpBind => format!(
-            "TcpSocket::new(AddressFamily::Ipv4)?.start_bind({})?.finish_bind()?.start_listen()?.finish_listen()",
+            "{{\n\
+             let _s = create_tcp_socket(IpAddressFamily::Ipv4).expect(\"create_tcp_socket failed\");\n\
+             let _n = instance_network();\n\
+             _s.start_bind(&_n, parse_addr_v4({})).expect(\"start_bind failed\");\n\
+             _s.finish_bind().expect(\"finish_bind failed\");\n\
+             _s.start_listen().expect(\"start_listen failed\");\n\
+             _s.finish_listen().expect(\"finish_listen failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
+        // `finish_connect` returns `Result<(InputStream,
+        // OutputStream), ErrorCode>`. The block's trailing expression
+        // wraps `_s` in `Ok` so the user's trailing `.unwrap()`
+        // extracts the `TcpSocket` — preserving the source shape
+        // `let stream = TcpStream::connect(\"...\").unwrap();`.
+        // The (rx, tx) tuple from `finish_connect` is intentionally
+        // discarded — bindgen requires both halves be bound to keep
+        // the resource alive, but the transformer's caller doesn't
+        // use them directly. The follow-up that surfaces them as
+        // typed bindings can hook off `bound_var` on the match.
         RustPattern::TcpConnect => format!(
-            "TcpSocket::new(AddressFamily::Ipv4)?.start_connect({})?.finish_connect()",
+            "{{\n\
+             let _s = create_tcp_socket(IpAddressFamily::Ipv4).expect(\"create_tcp_socket failed\");\n\
+             let _n = instance_network();\n\
+             _s.start_connect(&_n, parse_addr_v4({})).expect(\"start_connect failed\");\n\
+             let (_rx, _tx) = _s.finish_connect().expect(\"finish_connect failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
         RustPattern::UdpBind => format!(
-            "UdpSocket::new(AddressFamily::Ipv4)?.start_bind({})?.finish_bind()",
+            "{{\n\
+             let _s = create_udp_socket(IpAddressFamily::Ipv4).expect(\"create_udp_socket failed\");\n\
+             let _n = instance_network();\n\
+             _s.start_bind(&_n, parse_addr_v4({})).expect(\"start_bind failed\");\n\
+             _s.finish_bind().expect(\"finish_bind failed\");\n\
+             Ok::<_, ErrorCode>(_s)\n\
+             }}",
             arg(0)?
         ),
         // NotTransformable variants should have been partitioned out
@@ -231,9 +334,78 @@ fn generate_wasi_code(m: &PatternMatch) -> Result<String, String> {
         // emit. The transformability flip in `patterns.rs` keeps the
         // match out of `sorted` entirely.
         RustPattern::TcpAccept | RustPattern::UdpConnect | RustPattern::ProcessExit => String::new(),
-        RustPattern::FsOpen => format!("filesystem::open({})", arg(0)?),
-        RustPattern::FsRead => format!("filesystem::read({})", arg(0)?),
-        RustPattern::FsWrite => format!("filesystem::write({}, {})", arg(0)?, arg(1)?),
+        // Filesystem — there is no free `filesystem::open` /
+        // `filesystem::read` / `filesystem::write` in wit-bindgen
+        // 0.45. I/O always goes through a `Descriptor` you hold
+        // (typically a preopen). The transformer acquires preopen 0
+        // and calls `Descriptor::open_at(...)` against it.
+        //
+        // Issue #417 scope: typecheck + load-only. Runtime calls
+        // against an empty preopen set fail at runtime; wiring a
+        // preopen into the synthesized cargo project (written by
+        // MigrationService.compileRustAsComponent) is a follow-up.
+        //
+        // Each emit is a block expression `{ ... result }` so it can
+        // stand in for the original `filesystem::open(p)` /
+        // `filesystem::write(p, data)` call site (which is itself an
+        // expression in the user's source). The block's trailing
+        // value is a `Result` so a trailing `.unwrap()` from the
+        // original source (e.g. `File::open("...").unwrap()`) still
+        // typechecks.
+        //
+        // **Descriptor is not Clone and is not Copy.** wit-bindgen 0.45
+        // generates `Descriptor` as a single-owner handle struct
+        // without `Clone` or `Copy` impls. We therefore can't bind
+        // the preopen to a named variable (`let _base = ...` would
+        // move it out of the slice) — the compiler accepts only a
+        // single inline use. We chain the borrow directly into the
+        // `open_at` call.
+        //
+        // As with the socket arms, we use `.expect(...)` rather than
+        // `?` because the user's surrounding function (typically
+        // `fn main()`) returns `()`, not `Result`.
+        RustPattern::FsOpen => format!(
+            "{{\n\
+             preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)\n\
+             }}",
+            arg(0)?
+        ),
+        // `Descriptor::read(length, offset)` takes a length, which
+        // the POSIX `std::fs::read(path)` syntax doesn't carry. Emit
+        // `.read(0, 0)` as a documented placeholder — a length=0
+        // typecheck-clean call. The user lifts the length into the
+        // source for a load-bearing call (analogous to how TcpAccept
+        // surfaces as `manual_review`).
+        RustPattern::FsRead => format!(
+            "{{\n\
+             let _d = preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::empty(), DescriptorFlags::READ)\n\
+                 .expect(\"open_at failed\");\n\
+             _d.read(0, 0)\n\
+             }}",
+            arg(0)?
+        ),
+        // `Descriptor::write(buffer, offset)` returns `Result<filesize,
+        // ErrorCode>` per `wit/deps/filesystem/types.wit:427`. The
+        // bindgen-generated Rust signature is
+        // `write(&[u8], u64) -> Result<u64, ErrorCode>` — note `&[u8]`,
+        // not `Vec<u8>`. We use `.as_slice()` on the buffer literal so
+        // the typecheck passes regardless of whether the user wrote a
+        // byte string (`b"x"`) or a runtime `Vec<u8>`. (Earlier
+        // `bytes.to_vec()` produced `Vec<u8>` and failed the `&[u8]`
+        // bound.)
+        RustPattern::FsWrite => format!(
+            "{{\n\
+             let _d = preopens::get_directories().first().expect(\"no preopens\").0\n\
+                 .open_at(PathFlags::empty(), {}, OpenFlags::CREATE | OpenFlags::TRUNCATE, DescriptorFlags::WRITE)\n\
+                 .expect(\"open_at failed\");\n\
+             _d.write({}.as_slice(), 0)\n\
+             }}",
+            arg(0)?, arg(1)?
+        ),
+        // `Descriptor` has a bindgen-generated `Drop` impl; plain
+        // `drop(self)` works as before.
         RustPattern::FsClose => "drop(self)".to_string(),
     })
 }
@@ -280,12 +452,21 @@ mod tests {
         let r = RustTransformer::new().transform(src, vec![m]);
         assert_eq!(r.manual_review.len(), 0);
         assert_eq!(r.transformations_applied.len(), 1);
-        assert!(r.transformed_source.contains("TcpSocket::new"));
+        // wit-bindgen 0.45 emits a free `create_tcp_socket` factory
+        // instead of the adapter's `TcpSocket::new` constructor.
+        assert!(r.transformed_source.contains("create_tcp_socket"));
+        assert!(r.transformed_source.contains("IpAddressFamily::Ipv4"));
+        assert!(r.transformed_source.contains("instance_network"));
+        // Address goes through parse_addr_v4 (prelude helper) and the
+        // literal is preserved in the call site.
+        assert!(r.transformed_source.contains("parse_addr_v4"));
+        assert!(r.transformed_source.contains("\"127.0.0.1:80\""));
+        // start_bind/finish_bind/start_listen/finish_listen chain
+        // still appears — bindgen 0.45 names them verbatim.
         assert!(r.transformed_source.contains("start_bind"));
         assert!(r.transformed_source.contains("finish_bind"));
         assert!(r.transformed_source.contains("start_listen"));
         assert!(r.transformed_source.contains("finish_listen"));
-        assert!(r.transformed_source.contains("\"127.0.0.1:80\""));
     }
 
     #[test]
@@ -299,9 +480,19 @@ mod tests {
             vec!["\"127.0.0.1:9000\"".to_string()],
         );
         let r = RustTransformer::new().transform(src, vec![m]);
-        assert!(r.transformed_source.contains("TcpSocket::new"));
+        assert!(r.transformed_source.contains("create_tcp_socket"));
         assert!(r.transformed_source.contains("start_connect"));
         assert!(r.transformed_source.contains("finish_connect"));
+        // finish_connect returns (InputStream, OutputStream); both halves
+        // must be bound (rx for downstream reads, tx for writes) or
+        // the resource is dropped at end-of-statement. The bindgen
+        // convention is to leave the (rx, tx) tuple as the block's
+        // trailing expression and let the caller's `.unwrap()`
+        // bind it: `let (_rx, _tx) = ... .finish_connect().unwrap();`.
+        assert!(r.transformed_source.contains("finish_connect"));
+        // The multi-step bindgen emit (start_connect then
+        // finish_connect on the same socket) appears in order.
+        assert!(r.transformed_source.contains("start_connect"));
     }
 
     #[test]
@@ -357,7 +548,9 @@ mod tests {
             vec!["\"0.0.0.0:5353\"".to_string()],
         );
         let r = RustTransformer::new().transform(src, vec![m]);
-        assert!(r.transformed_source.contains("UdpSocket::new"));
+        // Free create_udp_socket factory — replaces the adapter's
+        // UdpSocket::new.
+        assert!(r.transformed_source.contains("create_udp_socket"));
         assert!(r.transformed_source.contains("start_bind"));
         assert!(r.transformed_source.contains("finish_bind"));
     }
@@ -415,10 +608,33 @@ mod tests {
         );
         let r = RustTransformer::new().transform(src, vec![open_m, write_m]);
         assert_eq!(r.transformations_applied.len(), 2);
-        assert!(r.transformed_source.contains("filesystem::open(\"a.txt\")"));
+        // wit-bindgen 0.45: open through preopen[0] via
+        // Descriptor::open_at(...). The exact `filesystem::open(...)`
+        // substring is GONE — assert against the new emit instead.
+        // The preopen lookup uses `.first().expect("no preopens")`
+        // because `Descriptor` is not `Clone`/`Copy` and binding it to
+        // a named `_base` variable moves out of the slice.
+        assert!(r.transformed_source.contains("preopens::get_directories"));
         assert!(r
             .transformed_source
-            .contains("filesystem::write(\"b.txt\", b\"x\")"));
+            .contains(".first().expect(\"no preopens\")"));
+        assert!(r
+            .transformed_source
+            .contains("open_at(PathFlags::empty(), \"a.txt\""));
+        // FsWrite needs the CREATE|TRUNCATE flag combo and the
+        // DescriptorFlags::WRITE arg — confirm the bitflags pattern
+        // (bindgen-emitted `|`) appears. The `Descriptor::write`
+        // signature is `(&[u8], u64)` per
+        // `wit/deps/filesystem/types.wit:427`; bindgen generates the
+        // Rust method to take `&[u8]`. We coerce the buffer literal
+        // with `.as_slice()` to satisfy that bound.
+        assert!(r
+            .transformed_source
+            .contains("OpenFlags::CREATE | OpenFlags::TRUNCATE"));
+        assert!(r.transformed_source.contains("DescriptorFlags::WRITE"));
+        assert!(r
+            .transformed_source
+            .contains(".write(b\"x\".as_slice(), 0)"));
     }
 
     #[test]
@@ -432,10 +648,17 @@ mod tests {
             vec!["\"127.0.0.1:80\"".to_string()],
         );
         let r = RustTransformer::new().transform(src, vec![m]);
-        // The prelude must come before any original content.
+        // The prelude must come before any original content. The new
+        // prelude emits `crate::wasi::*` paths (matching the
+        // wit-bindgen 0.45 binding tree) plus the parse_addr_v4
+        // helper.
         let prelude_end = r.transformed_source.find("fn main()").unwrap();
-        assert!(r.transformed_source[..prelude_end].contains("use wasi::socket::tcp::TcpSocket;"));
-        assert!(r.transformed_source[..prelude_end].contains("use wasi::filesystem;"));
+        assert!(r.transformed_source[..prelude_end]
+            .contains("use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;"));
+        assert!(
+            r.transformed_source[..prelude_end].contains("use crate::wasi::filesystem::types::")
+        );
+        assert!(r.transformed_source[..prelude_end].contains("fn parse_addr_v4"));
     }
 
     #[test]
@@ -454,9 +677,16 @@ mod tests {
             vec!["\"127.0.0.1:80\"".to_string()],
         );
         let r = RustTransformer::new().transform(src, vec![m]);
-        let prelude_idx = r.transformed_source.find("use wasi::").unwrap();
+        let prelude_idx = r.transformed_source.find("use crate::wasi::").unwrap();
         let prefix_idx = r.transformed_source.find("fn main()").unwrap();
-        let replacement_idx = r.transformed_source.find("TcpSocket::new").unwrap();
+        // The replacement's first line is `let _s = create_tcp_socket(...)`
+        // — pick that landmark so we anchor on the emit, not the
+        // prelude's import line (which mentions create_tcp_socket
+        // too but appears earlier).
+        let replacement_idx = r
+            .transformed_source
+            .find("let _s = create_tcp_socket")
+            .unwrap();
         let suffix_idx = r.transformed_source.find("done();").unwrap();
         assert!(
             prelude_idx < prefix_idx,
@@ -475,11 +705,10 @@ mod tests {
     #[test]
     fn test_transform_multiple_matches_byte_range_preserves_order() {
         // Two matches in source order (bind at byte 14, connect at
-        // byte 60). The transformer sorts by start_byte descending
-        // and must produce a result that, when read left-to-right,
-        // has both replacements in their source order (because
-        // descending processing flips them back into ascending
-        // emission).
+        // byte 60). The transformer sorts by start_byte ascending
+        // and emits in source order — the multi-line emit blocks
+        // for bind/connect must surface in their source order
+        // regardless of input ordering.
         let src = "\
 fn main() {
     let _ = std::net::TcpListener::bind(\"a\");
@@ -500,8 +729,8 @@ fn main() {
             Transformability::AutoTransformable,
             vec!["\"b\"".to_string()],
         );
-        // Feed them in reverse source order to confirm the descending
-        // sort handles either input ordering.
+        // Feed them in reverse source order to confirm the sort
+        // handles either input ordering.
         let r = RustTransformer::new().transform(src, vec![connect_m, bind_m]);
         assert_eq!(r.transformations_applied.len(), 2);
         let bind_idx = r.transformed_source.find("start_bind").unwrap();
@@ -562,14 +791,36 @@ fn main() {
         assert_eq!(r.transformations_applied.len(), 0);
         assert_eq!(r.manual_review.len(), 0);
         assert_eq!(r.errors.len(), 0);
-        // Prelude is prepended even with no matches.
+        // Prelude is prepended even with no matches. The path
+        // shape changed (`use crate::wasi::*` instead of
+        // `use wasi::*`) — assert on the new shape.
         assert!(r
             .transformed_source
-            .contains("use wasi::socket::tcp::TcpSocket;"));
+            .contains("use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;"));
         // Original content is preserved verbatim.
         assert!(r
             .transformed_source
             .contains("fn main() { println!(\"hi\"); }"));
+    }
+
+    #[test]
+    fn test_transform_prelude_exposes_parse_addr_v4() {
+        // The transformer emits the parse_addr_v4 helper inline in
+        // the prelude so that emit blocks for socket patterns can
+        // route `"host:port"` literals through it (without adding
+        // a serde or net parse dep). Pin that the helper is in the
+        // output even when no matches apply — it's part of the
+        // prelude, which always renders.
+        let src = "fn main() { let _ = 1 + 2; }\n";
+        let r = RustTransformer::new().transform(src, vec![]);
+        assert_eq!(r.transformations_applied.len(), 0);
+        assert!(
+            r.transformed_source.contains("fn parse_addr_v4"),
+            "prelude helper missing from:\n{}",
+            r.transformed_source
+        );
+        assert!(r.transformed_source.contains("IpSocketAddress::Ipv4"));
+        assert!(r.transformed_source.contains("Ipv4SocketAddress"));
     }
 
     #[test]

@@ -51,7 +51,7 @@ Crate lives under `edgeCloud/edge-migrate/` as its own workspace member. Install
 | Rust | ✅ Full analysis + auto-transform for `std::net`, `std::fs`, `std::process` patterns (M3; gated behind the `rust` Cargo feature and `--language rust`) |
 | Other | Future extension |
 
-Rust patterns detected and auto-transformed include `std::net::TcpListener::bind`, `std::net::TcpStream::connect`, `std::net::UdpSocket::bind`, `std::fs::File::open`, `std::fs::read`, `std::fs::write`, and `file.close()` (best-effort). The Rust transformer emits a `use wasi::socket::tcp::TcpSocket; use wasi::socket::udp::UdpSocket; use wasi::filesystem;` prelude and rewrites each match to the canonical WASI Rust API surface (`TcpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()?...`, etc.). `std::process::exit` and `UdpSocket::connect` are flagged as `NotTransformable` because WASM has no process model and `wasi::socket::udp` has no connect analogue. The full mapping table lives in §4.4.
+Rust patterns detected and auto-transformed include `std::net::TcpListener::bind`, `std::net::TcpStream::connect`, `std::net::UdpSocket::bind`, `std::fs::File::open`, `std::fs::read`, `std::fs::write`, and `file.close()` (best-effort). The Rust transformer emits a `use crate::wasi::sockets::tcp_create_socket::create_tcp_socket; use crate::wasi::sockets::udp_create_socket::create_udp_socket; use crate::wasi::filesystem::types::{Descriptor, PathFlags, OpenFlags, DescriptorFlags}; use crate::wasi::filesystem::preopens;` prelude (matching the wit-bindgen 0.45 binding tree — issue #417) and rewrites each match to the canonical WASI Rust API surface (`create_tcp_socket(IpAddressFamily::Ipv4)?.start_bind(&instance_network(), parse_addr_v4(addr))?.finish_bind()?...`, etc.). `std::process::exit` and `UdpSocket::connect` are flagged as `NotTransformable` because WASM has no process model and `wasi::sockets::udp` has no connect analogue. The full mapping table lives in §4.4.
 
 Safe patterns are defined in §4.
 
@@ -233,18 +233,43 @@ AST and emits `PatternKind::Rust(RustPattern)` matches. The
 Rust API. The C path is unaffected — `language: c` (the default)
 continues to flow through §4.1–§4.3.
 
+**Target API.** Emits target the wit-bindgen 0.45 binding tree
+(wit-bindgen = "0.45"), which generates items under `crate::wasi::*`
+— see PR #416 and issue #417. Imports are emitted as
+`use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;`
+(not `use wasi::socket::tcp::TcpSocket;`). The full
+canonical target shape is in
+`edge-migrate-lib/src/rust_transformer.rs::WASI_RUST_PRELUDE`
+and `::generate_wasi_code`; this table lists the per-pattern
+emit shape as it appears in transformer output.
+
+**`parse_addr_v4` helper.** The prelude ships an inline
+`fn parse_addr_v4(s: &str) -> IpSocketAddress` (no extra deps) so
+the address literal `addr` can be routed through it. Bindgen 0.45
+types `start_bind` / `start_connect`'s second parameter as
+`IpSocketAddress`, not `&str`.
+
 | Rust source | `RustPattern` | `Transformability` | Transformed output |
 |---|---|---|---|
-| `std::net::TcpListener::bind(addr)` | `TcpBind` | `AutoTransformable` | `TcpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()?.start_listen()?.finish_listen()` |
+| `std::net::TcpListener::bind(addr)` | `TcpBind` | `AutoTransformable` | `let _s = create_tcp_socket(IpAddressFamily::Ipv4)?;` `let _n = instance_network();` `_s.start_bind(&_n, parse_addr_v4({addr}))?.finish_bind()?.start_listen()?.finish_listen()?;` |
 | `listener.accept()` | `TcpAccept` | `BestEffort` | `loop { match self.accept() { Ok(s) => break s, Err(_) => std::thread::yield_now() } }` (with `// TODO: replace busy-spin with poll subscription` comment) |
-| `std::net::TcpStream::connect(addr)` | `TcpConnect` | `AutoTransformable` | `TcpSocket::new(AddressFamily::Ipv4)?.start_connect(addr)?.finish_connect()` |
-| `std::net::UdpSocket::bind(addr)` | `UdpBind` | `AutoTransformable` | `UdpSocket::new(AddressFamily::Ipv4)?.start_bind(addr)?.finish_bind()` |
-| `udp.connect(addr)` | `UdpConnect` | `NotTransformable` | No direct `wasi::socket::udp::connect` analogue — flagged for manual review |
+| `std::net::TcpStream::connect(addr)` | `TcpConnect` | `AutoTransformable` | `let _s = create_tcp_socket(IpAddressFamily::Ipv4)?;` `let _n = instance_network();` `let (_rx, _tx) = _s.start_connect(&_n, parse_addr_v4({addr}))?.finish_connect()?;` |
+| `std::net::UdpSocket::bind(addr)` | `UdpBind` | `AutoTransformable` | `let _s = create_udp_socket(IpAddressFamily::Ipv4)?;` `let _n = instance_network();` `_s.start_bind(&_n, parse_addr_v4({addr}))?.finish_bind()?;` |
+| `udp.connect(addr)` | `UdpConnect` | `NotTransformable` | No direct `wasi::sockets::udp` connect analogue — flagged for manual review |
 | `std::process::exit(code)` | `ProcessExit` | `NotTransformable` | WASM has no process model — flagged for manual review |
-| `std::fs::File::open(p)` | `FsOpen` | `AutoTransformable` | `wasi::filesystem::open(p, ...)` |
-| `std::fs::read(p)` / `read_to_string` | `FsRead` | `AutoTransformable` | `wasi::filesystem::read(p)?` / `read_to_string` |
-| `std::fs::write(p, ...)` | `FsWrite` | `AutoTransformable` | `wasi::filesystem::write(p, data)?` |
-| `file.close()` (explicit) | `FsClose` | `AutoTransformable` | `drop(var)` (best-effort shim around the `wasi::filesystem` `Drop` impl) |
+| `std::fs::File::open(p)` | `FsOpen` | `AutoTransformable` | `let _preopens = preopens::get_directories();` `let _base = _preopens.get(0).expect("no preopens").0.clone();` `let _d = _base.open_at(PathFlags::empty(), {p}, OpenFlags::empty(), DescriptorFlags::READ)?;` |
+| `std::fs::read(p)` / `read_to_string` | `FsRead` | `AutoTransformable` | open a `Descriptor` (same shape as `FsOpen`), then `_d.read(0, 0)?`. The `length=0` placeholder is intentional — see scope note below. |
+| `std::fs::write(p, ...)` | `FsWrite` | `AutoTransformable` | `let _d = _base.open_at(PathFlags::empty(), {p}, OpenFlags::CREATE | OpenFlags::TRUNCATE, DescriptorFlags::WRITE)?;` `let _n: u64 = _d.write({data}.to_vec(), 0)?;` |
+| `file.close()` (explicit) | `FsClose` | `AutoTransformable` | `drop(var)` (bindgen generates a `Drop` impl for `Descriptor`) |
+
+**FS scope note (deliberate, typecheck-only).** The synthesized
+cargo project gives the guest zero preopens, so the
+`preopens::get_directories()` call returns an empty list at runtime
+and the subsequent `expect("no preopens")` panics. The transformer
+output typechecks against `wit-bindgen = "0.45"` — the component
+*loads* in the worker (wasmtime 45.0.3) but cannot open files until
+the synthesized Cargo.toml is wired with host preopens. That runtime
+plumbing is follow-up work; the typecheck goal of issue #417 is met.
 
 **Out of scope for v1** (intentional limitations, tracked as
 follow-ups):

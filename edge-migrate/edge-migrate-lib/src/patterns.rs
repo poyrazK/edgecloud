@@ -479,23 +479,37 @@ impl RustPattern {
     pub fn wasi_equivalent(&self) -> &'static str {
         match self {
             RustPattern::TcpBind => {
-                "wasi::socket::tcp::TcpSocket::new + start_bind + finish_bind + \
-                 start_listen + finish_listen"
+                "create_tcp_socket(IpAddressFamily::Ipv4) + start_bind(&network, \
+                 parse_addr_v4(addr)) + finish_bind + start_listen + finish_listen"
             }
             RustPattern::TcpAccept => {
                 "TcpListener::accept() — not transformable in MVP (was: poll loop wrapper; #128)"
             }
             RustPattern::TcpConnect => {
-                "wasi::socket::tcp::TcpSocket::new + start_connect + finish_connect"
+                "create_tcp_socket(IpAddressFamily::Ipv4) + start_connect(&network, \
+                 parse_addr_v4(addr)) + finish_connect — returns (rx, tx); both bound"
             }
-            RustPattern::UdpBind => "wasi::socket::udp::UdpSocket::new + start_bind + finish_bind",
+            RustPattern::UdpBind => {
+                "create_udp_socket(IpAddressFamily::Ipv4) + start_bind(&network, \
+                 parse_addr_v4(addr)) + finish_bind"
+            }
             RustPattern::UdpConnect => {
-                "no WASI equivalent — UdpSocket::connect not in wasi-sockets"
+                "no WASI equivalent — UdpSocket::connect not in wasi::sockets::udp"
             }
-            RustPattern::FsOpen => "wasi::filesystem::open",
-            RustPattern::FsRead => "wasi::filesystem::read",
-            RustPattern::FsWrite => "wasi::filesystem::write",
-            RustPattern::FsClose => "drop shim around wasi::filesystem handle",
+            RustPattern::FsOpen => {
+                "preopens::get_directories()[0] + Descriptor::open_at(PathFlags::empty(), \
+                 path, OpenFlags::empty(), DescriptorFlags::READ) — typecheck-only at runtime"
+            }
+            RustPattern::FsRead => {
+                "Descriptor::open_at(...) + Descriptor::read(length, offset) — \
+                 length=0 placeholder; typecheck-only at runtime"
+            }
+            RustPattern::FsWrite => {
+                "Descriptor::open_at(..., OpenFlags::CREATE | OpenFlags::TRUNCATE, \
+                 DescriptorFlags::WRITE) + Descriptor::write(buffer, 0) — typecheck-only \
+                 at runtime"
+            }
+            RustPattern::FsClose => "drop(var) — bindgen generates a Drop impl for Descriptor",
             RustPattern::ProcessExit => "no WASI equivalent — Wasm has no process model",
         }
     }
