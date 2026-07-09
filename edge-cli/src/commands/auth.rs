@@ -361,10 +361,25 @@ fn keys_create(_name: &str, _role: &str) -> Result<()> {
 
 /// `edge auth keys list [--json]`
 ///
-/// Calls `GET /api/v1/keys` and prints a 5-column table (ID / NAME /
-/// ROLE / CREATED / NOTE) for the current tenant's keys. The key used
-/// to authenticate this CLI session is annotated with `* (current)`
-/// so the user can see which one would be lost on self-revoke.
+/// Calls `GET /api/v1/keys` and prints a 7-column table
+/// (ID / NAME / ROLE / CREATED / LAST USED / EXPIRES / NOTE) for the
+/// current tenant's keys. The key used to authenticate this CLI
+/// session is annotated with `* (current)` so the user can see which
+/// one would be lost on self-revoke.
+///
+/// The header line is 150 chars wide and the body's fixed columns
+/// (everything before the trailing NOTE) are 145; the divider line
+/// matches the body. The full row can extend past 145 chars when
+/// the NOTE column is populated (e.g. `(current)` adds 9 chars).
+/// Either way the table wraps under 120-col terminals. `--no-extras`
+/// would be a one-line follow-up if that becomes a frequent
+/// complaint — see the deferred items in PR #457's body.
+///
+/// Timestamps are rendered as absolute RFC3339 (matching every other
+/// timestamp column in the CLI). Relative-time formatting is
+/// intentionally NOT provided: adding `chrono` just for this one
+/// column would be +~150 KB of binary. Users who want "3m ago"
+/// formatting can pipe `--json` through a 5-line jq filter.
 ///
 /// `--json` emits the raw `Vec<APIKeySummary>` pretty-printed — used
 /// by `edge keys list --json | jq '.[] | select(.role=="owner")'`.
@@ -398,16 +413,26 @@ fn keys_list(as_json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<38} {:<24} {:<12} {:<22} NOTE",
-        "ID", "NAME", "ROLE", "CREATED"
+        "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE",
+        "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     );
-    println!("{}", "-".repeat(102));
+    // Divider matches the fixed-column body width (38+24+12+22+22+22
+    // = 140 + 5 inter-column gaps = 145), NOT the header. The header
+    // is 4 chars wider because of the trailing " NOTE" label. The
+    // NOTE field itself overflows the divider when populated
+    // (`(current)` adds 9 chars past the 145) — that's the same
+    // convention the pre-PR layout used (96+3=99 columns, divider
+    // was 102; both layouts visually demarcated the fixed-column
+    // body, accepting trailing-flex overflow on the NOTE column).
+    println!("{}", "-".repeat(145));
     for k in &keys {
         let is_current = current_id.as_deref() == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
+        let last_used = k.last_used.as_deref().unwrap_or("");
+        let expires_at = k.expires_at.as_deref().unwrap_or("");
         println!(
-            "{:<38} {:<24} {:<12} {:<22} {}",
-            k.id, k.name, k.role, k.created_at, note
+            "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} {}",
+            k.id, k.name, k.role, k.created_at, last_used, expires_at, note
         );
     }
     Ok(())
@@ -565,7 +590,12 @@ fn confirmation_required(yes: bool, is_tty: bool) -> Result<()> {
 }
 
 /// Render a key list table to a string. The `current_id` parameter marks
-/// one row with `* (current)`.
+/// one row with `* (current)`. Mirrors the production `keys_list`
+/// renderer; the test mirror keeps both branches in lockstep.
+///
+/// Columns: ID / NAME / ROLE / CREATED / LAST USED / EXPIRES / NOTE.
+/// Empty `Option`s render as empty strings so a missing timestamp
+/// stays a blank slot rather than a printed "None" or "null".
 #[cfg(test)]
 fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
     if keys.is_empty() {
@@ -573,17 +603,21 @@ fn render_key_list(keys: &[APIKeySummary], current_id: Option<&str>) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<38} {:<24} {:<12} {:<22} NOTE\n",
-        "ID", "NAME", "ROLE", "CREATED"
+        "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} NOTE\n",
+        "ID", "NAME", "ROLE", "CREATED", "LAST USED", "EXPIRES"
     ));
-    out.push_str(&"-".repeat(102));
+    // Divider matches the fixed-column body width (see production
+    // keys_list for the full rationale).
+    out.push_str(&"-".repeat(145));
     out.push('\n');
     for k in keys {
         let is_current = current_id == Some(k.id.as_str());
         let note = if is_current { "(current)" } else { "" };
+        let last_used = k.last_used.as_deref().unwrap_or("");
+        let expires_at = k.expires_at.as_deref().unwrap_or("");
         out.push_str(&format!(
-            "{:<38} {:<24} {:<12} {:<22} {}\n",
-            k.id, k.name, k.role, k.created_at, note
+            "{:<38} {:<24} {:<12} {:<22} {:<22} {:<22} {}\n",
+            k.id, k.name, k.role, k.created_at, last_used, expires_at, note
         ));
     }
     out
@@ -753,6 +787,141 @@ mod tests {
         assert!(
             k_002_line.contains("(current)"),
             "second row must be marked (current)"
+        );
+    }
+
+    // The five tests below pin the LAST USED / EXPIRES columns added
+    // alongside PR #457 (which added the deserialization; this commit
+    // added the rendering). Both columns are RFC3339 strings when
+    // present, empty when absent — `None` must render as a blank
+    // slot, not the literal "None" / "null" / "<unset>" (those would
+    // confuse a user reading the table).
+
+    fn row_for<'a>(rendered: &'a str, id: &str) -> &'a str {
+        rendered
+            .lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no row containing {id:?} in:\n{rendered}"))
+    }
+
+    #[test]
+    fn renders_last_used_when_present() {
+        let keys = vec![APIKeySummary {
+            id: "k_used".into(),
+            name: "n".into(),
+            role: "r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: Some("2026-07-09T11:23:45Z".into()),
+            expires_at: None,
+        }];
+        let rendered = render_key_list(&keys, None);
+        let row = row_for(&rendered, "k_used");
+        assert!(
+            row.contains("2026-07-09T11:23:45Z"),
+            "last_used RFC3339 should appear in the row; got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn renders_expires_at_when_present() {
+        let keys = vec![APIKeySummary {
+            id: "k_exp".into(),
+            name: "n".into(),
+            role: "r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: None,
+            expires_at: Some("2027-01-01T00:00:00Z".into()),
+        }];
+        let rendered = render_key_list(&keys, None);
+        let row = row_for(&rendered, "k_exp");
+        assert!(
+            row.contains("2027-01-01T00:00:00Z"),
+            "expires_at RFC3339 should appear in the row; got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn renders_both_columns_when_both_present() {
+        let keys = vec![APIKeySummary {
+            id: "k_both".into(),
+            name: "n".into(),
+            role: "r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: Some("2026-07-09T11:23:45Z".into()),
+            expires_at: Some("2027-01-01T00:00:00Z".into()),
+        }];
+        let rendered = render_key_list(&keys, None);
+        let row = row_for(&rendered, "k_both");
+        // Positional: last_used comes before expires_at in the
+        // layout, so checking order via indices on the same line.
+        let last_idx = row.find("2026-07-09T11:23:45Z").expect("last_used in row");
+        let expires_idx = row.find("2027-01-01T00:00:00Z").expect("expires_at in row");
+        assert!(
+            last_idx < expires_idx,
+            "last_used should render to the LEFT of expires_at \
+             (column order is LAST USED then EXPIRES); row was: {row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_columns_when_both_absent() {
+        let keys = vec![APIKeySummary {
+            id: "k_empty".into(),
+            name: "n".into(),
+            role: "r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: None,
+            expires_at: None,
+        }];
+        let rendered = render_key_list(&keys, None);
+        // `None` should NOT render as the literal strings "None",
+        // "null", "<unset>", "—" — the columns are just blank. The
+        // negative assertions below defend against a "helpful"
+        // future commit that adds default-value text.
+        //
+        // Note: `"-"` is intentionally NOT in the forbidden list —
+        // it's the character used for the divider line under the
+        // header. (Caught by an earlier draft of this test.)
+        for forbidden in ["None", "null", "<unset>", "—"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "rendered output must not contain {forbidden:?} when \
+                 last_used/expires_at are both None; got:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_header_includes_last_used_and_expires() {
+        let keys = vec![APIKeySummary {
+            id: "k_hdr".into(),
+            name: "n".into(),
+            role: "r".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used: None,
+            expires_at: None,
+        }];
+        let rendered = render_key_list(&keys, None);
+        let header = rendered
+            .lines()
+            .next()
+            .expect("table should have a header line");
+        assert!(
+            header.contains("LAST USED"),
+            "header should declare LAST USED column; got: {header:?}"
+        );
+        assert!(
+            header.contains("EXPIRES"),
+            "header should declare EXPIRES column; got: {header:?}"
+        );
+        // Lock the relative order so a future column-reordering
+        // commit lands with a deliberate change to this test.
+        let last_idx = header.find("LAST USED").expect("LAST USED in header");
+        let expires_idx = header.find("EXPIRES").expect("EXPIRES in header");
+        assert!(
+            last_idx < expires_idx,
+            "LAST USED should appear to the LEFT of EXPIRES in the header; \
+             header was: {header:?}"
         );
     }
 }
