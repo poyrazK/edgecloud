@@ -195,6 +195,8 @@ impl LayerHarness {
             ))),
             max_memory_mb: 256,
             cpu_budget_ms: 1000,
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -378,6 +380,8 @@ async fn l6_request_body_over_cap_returns_413() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -434,6 +438,8 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         ))),
         max_memory_mb: 256, // 10 MB — generous
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -515,6 +521,8 @@ async fn l7_per_request_timeout_returns_500() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 100,
+        preview_id: None,
+        preview_pr_number: None,
     };
 
     let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -760,6 +768,8 @@ async fn l11_guest_calls_process_get_env() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -813,6 +823,8 @@ async fn l12_guest_calls_time_now() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -870,6 +882,8 @@ async fn l13_guest_calls_kv_store_round_trip() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -951,6 +965,8 @@ async fn l14_guest_calls_cache_round_trip() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -1029,6 +1045,8 @@ async fn l15_guest_emit_log_reaches_sink() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -1094,6 +1112,8 @@ async fn l16_guest_schedules_task() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -1149,6 +1169,8 @@ fn test_config(app_name: &str) -> HandlerConfig {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     }
 }
 
@@ -1445,6 +1467,8 @@ async fn l27_process_get_all_env() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
     let cl = make_client();
@@ -1536,6 +1560,8 @@ async fn l45_outbound_metering_counts_response_bytes() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 
@@ -2003,6 +2029,8 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         ))),
         max_memory_mb: 256,
         cpu_budget_ms: 1000,
+        preview_id: None,
+        preview_pr_number: None,
     })
     .await;
 

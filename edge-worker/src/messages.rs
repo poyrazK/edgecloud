@@ -136,6 +136,25 @@ pub struct AppSpec {
     pub max_memory_mb: u64,
     #[serde(default)]
     pub cpu_budget_ms: Option<u64>,
+    /// Hex preview-id stamped by the control plane when this deploy was
+    /// uploaded as a preview (issue #308). The supervisor forwards it to
+    /// `edge_runtime::RuntimeState::with_env_and_meter_preview` so the
+    /// per-tenant persistent stores (KV / cache / scheduler) get a
+    /// `/preview-{id}/` subdirectory — preventing two concurrent previews
+    /// of the same app from trampling each other's keys.
+    ///
+    /// `#[serde(default)]` keeps pre-#308 control-plane messages
+    /// parseable; absent → `None` → production / non-preview behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_id: Option<String>,
+    /// Integer GitHub PR number the composite action forwarded via
+    /// `?preview-pr-number=`. The supervisor stamps
+    /// `EDGE_PREVIEW_PR_NUMBER` into the guest env so the guest can
+    /// render PR-aware UI. `None` → no env var is set (the guest's
+    /// `process.get_environment` simply does not see the key, which is
+    /// the same as the pre-#308 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_pr_number: Option<u32>,
 }
 
 /// ClusterHeadroom carries capacity info for the autoscaler (issue #85).

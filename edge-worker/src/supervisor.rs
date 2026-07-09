@@ -433,6 +433,8 @@ mod heartbeat_integration_tests {
                 allowlist: None,
                 max_memory_mb: 256,
                 cpu_budget_ms: None,
+                preview_id: None,
+                preview_pr_number: None,
             },
         );
         let msg = TaskMessage::TaskUpdate {
@@ -562,6 +564,8 @@ mod heartbeat_integration_tests {
                 allowlist: None,
                 max_memory_mb: 256,
                 cpu_budget_ms: None,
+                preview_id: None,
+                preview_pr_number: None,
             },
         );
         let msg = TaskMessage::TaskUpdate {
@@ -1273,6 +1277,11 @@ impl Supervisor {
                 cpu_budget_ms: spec
                     .cpu_budget_ms
                     .unwrap_or(self.config.handler_request_budget_ms),
+                // issue #308: forward preview metadata from TaskMessage so
+                // the per-request RuntimeState scopes stores under
+                // /preview-{id}/ and stamps EDGE_PREVIEW_PR_NUMBER.
+                preview_id: spec.preview_id.clone(),
+                preview_pr_number: spec.preview_pr_number,
             };
 
             let tls_config =
@@ -1340,6 +1349,8 @@ impl Supervisor {
             let metrics_acc_for_loop = metrics_acc.clone();
 
             let socket_mode_for_loop = self.config.socket_mode;
+            let preview_id_for_loop = spec.preview_id.clone();
+            let preview_pr_number_for_loop = spec.preview_pr_number;
             let handle = tokio::spawn(async move {
                 Self::run_app_loop(
                     instance_pre_clone,
@@ -1357,6 +1368,8 @@ impl Supervisor {
                     log_forwarder,
                     metrics_acc_for_loop,
                     socket_mode_for_loop,
+                    preview_id_for_loop.clone(),
+                    preview_pr_number_for_loop,
                 )
                 .await;
                 tracing::info!(app_name = %app_name_str, "app task exited");
@@ -1605,6 +1618,8 @@ impl Supervisor {
         log_forwarder: Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
+        preview_id: Option<String>,
+        preview_pr_number: Option<u32>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -1648,6 +1663,8 @@ impl Supervisor {
                         &log_forwarder,
                         metrics_acc.clone(),
                         socket_mode,
+                        preview_id.as_deref(),
+                        preview_pr_number,
                     ),
                 ) => {
                     match result {
@@ -1793,6 +1810,8 @@ impl Supervisor {
         log_forwarder: &Arc<LogForwarder>,
         metrics_acc: Option<Arc<edge_runtime::interfaces::observe::MetricsAccumulator>>,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
+        preview_id: Option<&str>,
+        preview_pr_number: Option<u32>,
     ) -> anyhow::Result<bool> {
         let engine = instance_pre.engine();
 
@@ -1819,10 +1838,12 @@ impl Supervisor {
         // (`Config::from_env` → `Config::socket_mode`) and threaded in
         // here from `start_app` — the runtime does NOT read
         // `EDGE_EGRESS_SOCKET_MODE` itself.
-        let runtime_state = edge_runtime::RuntimeState::with_env_and_meter(
+        let runtime_state = edge_runtime::RuntimeState::with_env_and_meter_preview(
             env,
             Some(Arc::clone(meter)),
             tenant_id.to_string(),
+            preview_id,
+            preview_pr_number,
             egress,
             log_forwarder.clone() as Arc<dyn edge_runtime::interfaces::observe::LogSink>,
             app_ctx,
@@ -2230,6 +2251,8 @@ mod tests {
             allowlist: None,
             max_memory_mb: 256,
             cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
         }
     }
 
@@ -2573,6 +2596,9 @@ mod tests {
             ))),
             max_memory_mb: 256,
             cpu_budget_ms: 1000,
+            // issue #308: defaults for unit tests; specific tests override.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let config_b = HandlerConfig {
@@ -2597,6 +2623,9 @@ mod tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(Some(std::time::Instant::now()))),
             max_memory_mb: 256,
             cpu_budget_ms: 1000,
+            // issue #308: defaults for unit tests; specific tests override.
+            preview_id: None,
+            preview_pr_number: None,
         };
 
         let downloader = Arc::new(crate::downloader::Downloader::new(
@@ -2968,6 +2997,9 @@ mod tests {
             last_request_at: Arc::new(tokio::sync::Mutex::new(None)),
             cpu_budget_ms: 1000,
             max_memory_mb: 256,
+            // issue #308: defaults for unit tests; specific tests override.
+            preview_id: None,
+            preview_pr_number: None,
         };
         let dispatch = Arc::new(
             HandlerDispatch::new(

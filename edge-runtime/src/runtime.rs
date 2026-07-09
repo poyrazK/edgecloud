@@ -250,11 +250,79 @@ impl RuntimeState {
         socket_mode: SocketEgressPolicy,
         hostname_pinning: Arc<crate::socket_egress::HostnamePinning>,
     ) -> Self {
+        Self::with_env_and_meter_preview(
+            env,
+            _meter,
+            tenant_id,
+            None,
+            None,
+            egress,
+            log_sink,
+            app_ctx,
+            metrics_acc,
+            socket_mode,
+            hostname_pinning,
+        )
+    }
+
+    /// Production constructor with preview-environment support (issue
+    /// #308). `preview_id`, when `Some`, scopes the per-tenant
+    /// persistent stores (KV / cache / scheduler) under a
+    /// `/preview-{id}/` subdirectory so two concurrent previews of the
+    /// same app don't trample each other's keys. `preview_pr_number`,
+    /// when `Some`, stamps `EDGE_PREVIEW_PR_NUMBER` into the guest env
+    /// so the guest can render PR-aware UI.
+    ///
+    /// Both are optional. A non-preview deploy passes `None, None`
+    /// and gets the same behavior as the legacy `with_env_and_meter`.
+    /// Backwards-compatible — the worker side can keep calling
+    /// `with_env_and_meter` and the public surface stays narrow.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_env_and_meter_preview(
+        mut env: std::collections::HashMap<String, String>,
+        _meter: Option<Arc<RequestMeter>>,
+        tenant_id: String,
+        preview_id: Option<&str>,
+        preview_pr_number: Option<u32>,
+        egress: Arc<EgressPolicy>,
+        log_sink: Arc<dyn observe::LogSink>,
+        app_ctx: observe::AppLogContext,
+        metrics_acc: Option<Arc<observe::MetricsAccumulator>>,
+        socket_mode: SocketEgressPolicy,
+        hostname_pinning: Arc<crate::socket_egress::HostnamePinning>,
+    ) -> Self {
+        // Stamp `EDGE_PREVIEW_PR_NUMBER` into the env map BEFORE we
+        // hand it to `Process` (issue #308). The `Process` interface
+        // already exposes the raw env via `get_environment`, so no
+        // additional plumbing is required — guests that branch on
+        // `EDGE_PREVIEW_PR_NUMBER` see the value transparently.
+        // Non-preview deploys leave the var unset, which matches the
+        // historical "no PR context" behavior.
+        if let Some(pr) = preview_pr_number {
+            env.insert("EDGE_PREVIEW_PR_NUMBER".to_string(), pr.to_string());
+        }
+
+        // Compose the store key. For non-preview deploys the key is
+        // just `{tenant_id}` — identical to the pre-#308 behavior, so
+        // existing on-disk store blobs continue to be picked up
+        // after the worker binary is upgraded. For previews the key
+        // is `{tenant_id}/preview-{id}` so concurrent previews of
+        // the same tenant get isolated KV/cache/scheduler state.
+        // The slash is safe inside the in-process HashMap registry
+        // and inside the on-disk `<EDGE_*_PATH>/<key>/` path because
+        // the worker has already validated both halves via
+        // `is_safe_tenant_id` and the `preview-id` regex in the
+        // control-plane handler.
+        let store_key = match preview_id {
+            Some(id) => format!("{}/preview-{}", tenant_id, id),
+            None => tenant_id.clone(),
+        };
+
         let env = Arc::new(env);
         let exit_code = Arc::new(AtomicU32::new(0));
-        let kv_store = get_or_create_kv_store(&tenant_id);
-        let cache_store = get_or_create_cache(&tenant_id);
-        let scheduling = get_or_create_scheduler(&tenant_id);
+        let kv_store = get_or_create_kv_store(&store_key);
+        let cache_store = get_or_create_cache(&store_key);
+        let scheduling = get_or_create_scheduler(&store_key);
 
         let wasi_ctx =
             build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode, &hostname_pinning);
@@ -1395,6 +1463,112 @@ mod with_env_and_meter_tests {
         assert!(
             !Arc::ptr_eq(&state1.scheduling, &state2.scheduling),
             "different tenants must have different scheduling Arcs"
+        );
+    }
+
+    // ── Preview-environment support (issue #308) ─────────────────────
+
+    /// `state_with_env` doesn't take a preview-id; this helper does.
+    /// Mirrors the production site at supervisor.rs:1822 and
+    /// dispatch.rs:751 which both call `with_env_and_meter_preview`.
+    fn state_with_preview(
+        env: HashMap<String, String>,
+        tenant_id: &str,
+        preview_id: Option<&str>,
+        preview_pr_number: Option<u32>,
+    ) -> RuntimeState {
+        RuntimeState::with_env_and_meter_preview(
+            env,
+            None,
+            tenant_id.to_string(),
+            preview_id,
+            preview_pr_number,
+            Arc::new(EgressPolicy::allow_all()),
+            Arc::new(NoopSink) as Arc<dyn LogSink>,
+            AppLogContext {
+                app_name: "test".to_string(),
+                tenant_id: tenant_id.to_string(),
+                deployment_id: "test".to_string(),
+            },
+            None,
+            crate::socket_egress::SocketEgressPolicy::default(),
+            Arc::new(crate::socket_egress::HostnamePinning::new()),
+        )
+    }
+
+    #[test]
+    fn preview_pr_number_stamped_into_env() {
+        // The composite action forwards the PR number via
+        // `edge deploy --pr-number=<N>`. The control plane stamps it
+        // onto the `TaskMessage`, the worker passes it to the
+        // runtime, and the runtime injects `EDGE_PREVIEW_PR_NUMBER`
+        // into the guest's env map. This is the only path through
+        // which a guest learns its PR context — assert it end-to-end
+        // at the runtime boundary.
+        let state = state_with_preview(HashMap::new(), "preview-pr-test", None, Some(123));
+        let all_env: HashMap<String, String> = state.process.get_all_env().into_iter().collect();
+        assert_eq!(
+            all_env.get("EDGE_PREVIEW_PR_NUMBER").map(String::as_str),
+            Some("123"),
+            "EDGE_PREVIEW_PR_NUMBER must be set in guest env when preview_pr_number is Some"
+        );
+    }
+
+    #[test]
+    fn preview_pr_number_absent_omitted_from_env() {
+        // A non-preview deploy must NOT set EDGE_PREVIEW_PR_NUMBER —
+        // the guest's `process.get_environment` should not see the
+        // key at all, mirroring the pre-#308 behavior. Setting it to
+        // the empty string would be a confusing "PR 0" surface.
+        let state = state_with_preview(HashMap::new(), "no-preview-pr", None, None);
+        let all_env: HashMap<String, String> = state.process.get_all_env().into_iter().collect();
+        assert!(
+            !all_env.contains_key("EDGE_PREVIEW_PR_NUMBER"),
+            "EDGE_PREVIEW_PR_NUMBER must be absent from env when preview_pr_number is None"
+        );
+    }
+
+    #[test]
+    fn preview_id_scopes_persistent_stores() {
+        // Two RuntimeStates for the same tenant but different
+        // preview-ids must NOT share KV/cache/scheduler Arcs — the
+        // whole point of #308 is to keep concurrent previews from
+        // trampling each other's keys.
+        let tenant = format!("preview-scope-{}", uuid::Uuid::new_v4());
+        let state_a = state_with_preview(HashMap::new(), &tenant, Some("hash-aaaa"), None);
+        let state_b = state_with_preview(HashMap::new(), &tenant, Some("hash-bbbb"), None);
+
+        assert!(
+            !Arc::ptr_eq(&state_a.kv_store, &state_b.kv_store),
+            "different preview-ids for the same tenant must get different kv_store Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state_a.cache, &state_b.cache),
+            "different preview-ids for the same tenant must get different cache Arcs"
+        );
+        assert!(
+            !Arc::ptr_eq(&state_a.scheduling, &state_b.scheduling),
+            "different preview-ids for the same tenant must get different scheduling Arcs"
+        );
+    }
+
+    #[test]
+    fn same_preview_id_reuses_persistent_stores() {
+        // Two RuntimeStates for the same (tenant, preview-id) MUST
+        // share KV/cache/scheduler Arcs — the in-process HashMap
+        // registry deduplicates so the on-disk store stays
+        // consistent across requests.
+        let tenant = format!("preview-reuse-{}", uuid::Uuid::new_v4());
+        let state1 = state_with_preview(HashMap::new(), &tenant, Some("hash-cccc"), None);
+        let state2 = state_with_preview(HashMap::new(), &tenant, Some("hash-cccc"), None);
+
+        assert!(
+            Arc::ptr_eq(&state1.kv_store, &state2.kv_store),
+            "same preview-id must reuse kv_store Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&state1.cache, &state2.cache),
+            "same preview-id must reuse cache Arc"
         );
     }
 }
