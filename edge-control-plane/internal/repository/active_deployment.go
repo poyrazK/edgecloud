@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -511,11 +513,22 @@ func (r *ActiveDeploymentRepository) Count(ctx context.Context) (int, error) {
 // are selected — the full row would be a wasted round trip since
 // the sweep will AppendRegionsCacheState / RemoveFromCacheFailed
 // per-row anyway.
+//
+// `RegionCacheRetryCount` is the JSONB map of region name to
+// integer attempt count (migration 028). The sweep consults this
+// to enforce the per-region retry cap
+// (`REGION_CACHE_RETRY_MAX_ATTEMPTS`, default 10) and routes over-cap
+// regions to the `giveUp` partition. The map is read as
+// `json.RawMessage` (raw bytes) so the sweep service does the JSON
+// parsing — the repository stays JSON-agnostic and a future shape
+// change (e.g. {"region": {"count": N, "last_error": "..."}}) only
+// touches the service.
 type CacheFailedRow struct {
-	TenantID           string         `db:"tenant_id"`
-	AppName            string         `db:"app_name"`
-	DeploymentID       string         `db:"deployment_id"`
-	RegionsCacheFailed pq.StringArray `db:"regions_cache_failed"`
+	TenantID              string         `db:"tenant_id"`
+	AppName               string         `db:"app_name"`
+	DeploymentID          string         `db:"deployment_id"`
+	RegionsCacheFailed    pq.StringArray `db:"regions_cache_failed"`
+	RegionCacheRetryCount []byte         `db:"region_cache_retry_count"`
 }
 
 // ListCacheFailed (issue #501) returns up to `batchSize` rows whose
@@ -529,6 +542,12 @@ type CacheFailedRow struct {
 // of millions of rows that have no stranded pushes does not pay a
 // sequential-scan cost on every sweep tick.
 //
+// `region_cache_retry_count` is included in the projection so the
+// sweep can read the per-region attempt counter alongside the
+// stranded regions in the same query (no second round trip per
+// row). The column is JSONB and is decoded as raw bytes in the
+// service layer.
+//
 // ORDER BY (tenant_id, app_name) makes pagination deterministic
 // across runs — a future multi-replica CP deployment could split
 // sweep work by tenant without re-scanning the same rows.
@@ -539,7 +558,7 @@ type CacheFailedRow struct {
 // batch size until ListCacheFailed returns a short result.
 func (r *ActiveDeploymentRepository) ListCacheFailed(ctx context.Context, batchSize int) ([]CacheFailedRow, error) {
 	var rows []CacheFailedRow
-	query := `SELECT tenant_id, app_name, deployment_id, regions_cache_failed
+	query := `SELECT tenant_id, app_name, deployment_id, regions_cache_failed, region_cache_retry_count
               FROM active_deployments
               WHERE regions_cache_failed <> '{}'
               ORDER BY tenant_id, app_name
@@ -579,5 +598,126 @@ func (r *ActiveDeploymentRepository) RemoveFromCacheFailed(ctx context.Context, 
 	`
 	arr := domain.StringArrayFrom(regions)
 	_, err := r.db.ExecContext(ctx, query, tenantID, appName, arr)
+	return err
+}
+
+// IncrementRegionCacheRetryCount (issue #501 retry-cap) atomically
+// increments the per-region attempt counter in
+// `region_cache_retry_count` for every region in `regions`.
+// Used by the cache-retry sweep after a push attempt fails
+// (stillFailing partition): the counter climbs, and once it reaches
+// the configured MaxAttempts the next sweep tick routes the region
+// to the `giveUp` partition (drop from `regions_cache_failed` with
+// a WARN log, no more retries).
+//
+// The increment uses a single SQL statement with a `jsonb` build
+// expression per region (`jsonb || jsonb_build_object(k, COALESCE(...)+1)`),
+// avoiding a read-modify-write cycle in the application. Regions
+// not currently in the JSONB map are initialized to 1. The
+// expression is a no-op for regions whose `regions_cache_failed`
+// no longer contains them (the sweep's read path filters to
+// `regions_cache_failed <> '{}'`, so a stale counter entry has no
+// observable effect — the sweep's next read will see the row but
+// the partition logic will not consult a region that isn't in
+// the failed array).
+//
+// `regions` must be non-empty (callers gate on this). Empty input
+// is a no-op and returns nil without touching the row.
+func (r *ActiveDeploymentRepository) IncrementRegionCacheRetryCount(ctx context.Context, tenantID, appName string, regions []string) error {
+	if len(regions) == 0 {
+		return nil
+	}
+	// Build the increment expression as a chain of `||`s — one
+	// `jsonb_build_object(region, COALESCE(existing, 0) + 1)` per
+	// region, applied to the existing column. Cleaner than
+	// dynamically building the SET expression per region count.
+	//
+	// We use a server-side jsonb path so the UPDATE is a single
+	// statement (row-locked for the duration, atomic against
+	// concurrent publishSwap / sweep updates). The exact shape:
+	//
+	//   UPDATE active_deployments
+	//   SET region_cache_retry_count = (
+	//       region_cache_retry_count
+	//       || jsonb_build_object('fra',
+	//             COALESCE(region_cache_retry_count->>'fra','0')::int + 1)
+	//       || jsonb_build_object('iad', ...)
+	//   )
+	//   WHERE tenant_id = $1 AND app_name = $2
+	//
+	// `unnest($3::text[])` drives the per-row expression, but
+	// composing the expression with array_agg in SQL is awkward;
+	// we instead build the SET expression with the regions inlined
+	// as constants — a fixed query, parameterized by an array.
+	// Safer against injection: the region names come from our own
+	// regionCaches map (operator-controlled), not from a request
+	// payload, so inlining is acceptable.
+	//
+	// We construct the chain in Go because the SET expression's
+	// length depends on len(regions) and we want a single
+	// parameterized query per call. The build is bounded by the
+	// sweep's per-row region count (typically <10) so the SQL
+	// string stays small.
+	parts := make([]string, 0, len(regions))
+	args := make([]any, 0, len(regions)+2)
+	args = append(args, tenantID, appName)
+	for i, region := range regions {
+		// COALESCE((existing)->>'region','0')::int + 1 — handles
+		// the "first failure for this region" case where the key
+		// is not yet in the JSONB map.
+		parts = append(parts, fmt.Sprintf(
+			"jsonb_build_object($%d, COALESCE(region_cache_retry_count->>$%d, '0')::int + 1)",
+			i+3, i+3,
+		))
+		args = append(args, region)
+	}
+	chain := strings.Join(parts, " || ")
+	query := fmt.Sprintf(`
+		UPDATE active_deployments
+		SET region_cache_retry_count = region_cache_retry_count || %s
+		WHERE tenant_id = $1 AND app_name = $2
+	`, chain)
+	_, err := r.db.ExecContext(ctx, query, args...)
+	return err
+}
+
+// RemoveFromCacheRetryCount (issue #501 retry-cap) drops the
+// per-region entries from `region_cache_retry_count` for every
+// region in `regions`. Used by the sweep when a region exits the
+// retry loop — moved to `regions_cached` (success), dropped via
+// `RemoveFromCacheFailed` because the config is gone
+// (configMissing), or given up on after MaxAttempts failures
+// (giveUp). In all three cases the counter entry is no longer
+// needed: the next activation resets the entire map via
+// ResetRegionCacheRetryCount.
+//
+// The SQL is a single UPDATE that uses `jsonb - text[]` to drop
+// the keys. A region that isn't in the map is a no-op (subtract
+// of a missing key is idempotent).
+func (r *ActiveDeploymentRepository) RemoveFromCacheRetryCount(ctx context.Context, tenantID, appName string, regions []string) error {
+	if len(regions) == 0 {
+		return nil
+	}
+	arr := domain.StringArrayFrom(regions)
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE active_deployments
+		SET region_cache_retry_count = region_cache_retry_count - $3::text[]
+		WHERE tenant_id = $1 AND app_name = $2
+	`, tenantID, appName, arr)
+	return err
+}
+
+// ResetRegionCacheRetryCount (issue #501 retry-cap) clears the
+// `region_cache_retry_count` JSONB map for a (tenant, app) row.
+// Called by publishSwap on every activation: a new deployment
+// starts with a fresh counter so the retry cap is per-deployment,
+// not per-tenant-app-lifetime. The semantics match the issue's
+// "reset the counter on new activation" requirement.
+func (r *ActiveDeploymentRepository) ResetRegionCacheRetryCount(ctx context.Context, tenantID, appName string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE active_deployments
+		SET region_cache_retry_count = '{}'::jsonb
+		WHERE tenant_id = $1 AND app_name = $2
+	`, tenantID, appName)
 	return err
 }

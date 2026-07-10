@@ -650,11 +650,11 @@ func TestListCacheFailed_IssuesExpectedStatement(t *testing.T) {
 	repo := NewActiveDeploymentRepository(db)
 
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, regions_cache_failed FROM active_deployments WHERE regions_cache_failed <> '{}' ORDER BY tenant_id, app_name LIMIT $1`,
+		`SELECT tenant_id, app_name, deployment_id, regions_cache_failed, region_cache_retry_count FROM active_deployments WHERE regions_cache_failed <> '{}' ORDER BY tenant_id, app_name LIMIT $1`,
 	)).
 		WithArgs(500).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "regions_cache_failed"}).
-			AddRow("t_test", "myapp", "d_v1", pq.StringArray{"fra", "iad"}))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "regions_cache_failed", "region_cache_retry_count"}).
+			AddRow("t_test", "myapp", "d_v1", pq.StringArray{"fra", "iad"}, []byte(`{"fra":2}`)))
 
 	rows, err := repo.ListCacheFailed(context.Background(), 500)
 	if err != nil {
@@ -723,4 +723,108 @@ func equalStringArray(a, b pq.StringArray) bool {
 		}
 	}
 	return true
+}
+
+// TestIncrementRegionCacheRetryCount_IssuesExpectedStatement
+// (issue #501 retry cap) pins the SQL shape of
+// IncrementRegionCacheRetryCount: a single UPDATE that chains
+// `jsonb_build_object(region, COALESCE(existing, '0')::int + 1)`
+// expressions with `||`, one per region in the input slice, applied
+// to the existing `region_cache_retry_count` column. The
+// COALESCE handles the first-failure case (key not yet in the
+// JSONB map). The expression is server-side atomic against
+// concurrent updates.
+func TestIncrementRegionCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(`jsonb_build_object`).
+		WithArgs("t_test", "myapp", "fra", "iad").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{"fra", "iad"}); err != nil {
+		t.Fatalf("IncrementRegionCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestIncrementRegionCacheRetryCount_EmptyRegions_NoOp verifies the
+// defensive guard: a call with an empty regions slice returns nil
+// without touching the row. The guard is required so the sweep
+// can call IncrementRegionCacheRetryCount unconditionally on a
+// row's `stillFailing` partition (the partition may be empty if
+// every region was configMissing or already over cap).
+func TestIncrementRegionCacheRetryCount_EmptyRegions_NoOp(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", nil); err != nil {
+		t.Errorf("IncrementRegionCacheRetryCount(nil regions) = %v, want nil", err)
+	}
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{}); err != nil {
+		t.Errorf("IncrementRegionCacheRetryCount([]string{}) = %v, want nil", err)
+	}
+	// sqlmock: no expectations were set, so any Exec would fail.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (Exec was called on empty regions): %v", err)
+	}
+}
+
+// TestRemoveFromCacheRetryCount_IssuesExpectedStatement (issue #501
+// retry cap) pins the SQL shape of RemoveFromCacheRetryCount: a
+// single UPDATE that uses `region_cache_retry_count - $3::text[]`
+// to drop the keys. `jsonb - text[]` is a no-op for missing keys
+// so the call is idempotent against regions that aren't currently
+// in the map.
+func TestRemoveFromCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`region_cache_retry_count = region_cache_retry_count - $3::text[]`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.RemoveFromCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{"fra"}); err != nil {
+		t.Fatalf("RemoveFromCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestResetRegionCacheRetryCount_IssuesExpectedStatement (issue #501
+// retry cap) pins the SQL shape of ResetRegionCacheRetryCount: a
+// single UPDATE that sets `region_cache_retry_count = '{}'::jsonb`.
+// Called by publishSwap on every activation so the per-region
+// counter starts at 0 for the new deployment (the cap is
+// per-deployment, not per-tenant-app-lifetime).
+func TestResetRegionCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`region_cache_retry_count = '{}'::jsonb`,
+	)).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.ResetRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp"); err != nil {
+		t.Fatalf("ResetRegionCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
 }
