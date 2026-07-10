@@ -1305,7 +1305,7 @@ func TestRollbackDeployment_TenantNotFound_NoPublish(t *testing.T) {
 // by the drainer (not exercised here).
 func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	pub := newRecordingPublisher()
-	svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+	svc, drainer, mock, cleanup := activateSvcForTest(t, pub, "global")
 	defer cleanup()
 
 	const (
@@ -1386,8 +1386,10 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 			AddRow(tenantID, 100, 50, 10, 256, 1024, 0, time.Now()))
 
 	// Outbox INSERT inside the tx (issue #42): the drainer relays
-	// the marshaled TaskMessage after commit. We don't drain here;
-	// the test only pins the rollback-side state mutation.
+	// the marshaled TaskMessage after commit. The drainer tick
+	// below drives the end-to-end "rollback commits → outbox row
+	// visible → drainer relays to NATS" contract that the gate
+	// exists to protect.
 	expectInTxOutboxInsert(mock, tenantID, appName)
 	mock.ExpectCommit()
 
@@ -1403,10 +1405,136 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	if rolledBackID != lastGoodID {
 		t.Errorf("rolledBackID = %q, want %q", rolledBackID, lastGoodID)
 	}
-	// The drainer has NOT been ticked, so no NATS publish has
-	// happened yet. publishSwap's no-op didn't touch the publisher.
+	// Before the drainer tick: publishSwap's no-op didn't touch
+	// the publisher. (Worker-side dedupe_id stamping on
+	// AppStatus — issue #418 — makes a duplicate harmless even
+	// if the same delta were replayed.)
 	if got := pub.regionsCalled(); len(got) != 0 {
-		t.Errorf("publisher regions = %v, want [] (publishSwap is no-op without cachePusher)", got)
+		t.Errorf("publisher regions before drainer tick = %v, want [] (publishSwap is no-op without cachePusher)", got)
+	}
+
+	// Drive the drainer once. expectDrainerTickSuccess mocks
+	// ClaimDue → per-region PublishTaskUpdate → MarkPublished.
+	// The deployment row's regions = ["us-east"] so the drainer
+	// publishes exactly to that region.
+	expectDrainerTickSuccess(t, mock, tenantID, appName, lastGoodID,
+		[]string{"us-east"}, 256)
+	drainer.Tick(context.Background())
+
+	// End-to-end assertion: the gate passed, the outbox row was
+	// committed, and the drainer relayed the marshaled
+	// TaskMessage to the publisher for ["us-east"]. The
+	// DeploymentID on the published message must equal
+	// rolledBackID — otherwise the rollback would have published
+	// a TaskMessage pointing at the broken deployment, defeating
+	// the rollback entirely.
+	if got := pub.regionsCalled(); !equalStringSlices(got, []string{"us-east"}) {
+		t.Errorf("publisher regions after drainer tick = %v, want [us-east]", got)
+	}
+	if len(pub.calls) != 1 {
+		t.Fatalf("publish calls = %d, want 1", len(pub.calls))
+	}
+	if got := pub.calls[0].msg.Apps["myapp"].DeploymentID; got != lastGoodID {
+		t.Errorf("published DeploymentID = %q, want %q (drainer must relay the rolled-back-to id)", got, lastGoodID)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestActivateDeployment_TenantDisabledMidTx_NoPublish (issue #440)
+// pins the disable-vs-activate gate: when the tenant FOR UPDATE
+// select reads back a row with disabled_at SET, ActivateDeployment
+// must abort with ErrTenantDisabled before the active_deployments
+// read. The tx rolls back (no commit) and the publisher receives no
+// call — the worker never sees a TaskMessage for a disabled tenant
+// via the activate path.
+//
+// The mirrored test for RollbackDeployment is
+// TestRollbackDeployment_TenantDisabledMidTx_NoPublish (below);
+// these two together close the symmetric hole on both write paths.
+func TestActivateDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		tenantID     = "t_activate_disabled"
+		appName      = "myapp"
+		deploymentID = "d_disabled"
+		deployHash   = "h_disabled"
+	)
+
+	// Pre-tx read inside ActivateDeployment — needed before the tx
+	// can enter. Returns a single-region deployment so activate
+	// would otherwise publish to "us-east".
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deployHash, `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	mock.ExpectBegin()
+	expectTenantForUpdateDisabled(mock, tenantID, time.Now().Add(-time.Minute))
+	// Gate fires → tx returns ErrTenantDisabled → repository.Transaction
+	// triggers a Rollback. No active_deployments FOR UPDATE, no outbox
+	// INSERT, no publish.
+	mock.ExpectRollback()
+
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	if err == nil {
+		t.Fatalf("ActivateDeployment: want ErrTenantDisabled, got nil")
+	}
+	if !errors.Is(err, ErrTenantDisabled) {
+		t.Errorf("ActivateDeployment err = %v, want ErrTenantDisabled", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publisher regions = %v, want [] (disabled tenant must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestActivateDeployment_TenantNotFound_NoPublish (issue #440) pins
+// the not-found branch of the disable-vs-activate gate. A tenant
+// that no longer exists (deleted between request issue and the FOR
+// UPDATE) must surface ErrTenantNotFound and roll back without
+// publishing — otherwise the worker could receive a TaskMessage for
+// a tenant the control plane has already forgotten about.
+//
+// Mirrors TestRollbackDeployment_TenantNotFound_NoPublish so both
+// write paths cover the missing-tenant arm.
+func TestActivateDeployment_TenantNotFound_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		tenantID     = "t_activate_missing"
+		appName      = "myapp"
+		deploymentID = "d_missing"
+		deployHash   = "h_missing"
+	)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deployHash, `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	mock.ExpectBegin()
+	expectTenantForUpdateNotFound(mock, tenantID)
+	mock.ExpectRollback()
+
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	if err == nil {
+		t.Fatalf("ActivateDeployment: want ErrTenantNotFound, got nil")
+	}
+	if !errors.Is(err, ErrTenantNotFound) {
+		t.Errorf("ActivateDeployment err = %v, want ErrTenantNotFound", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publisher regions = %v, want [] (missing tenant must not publish)", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
