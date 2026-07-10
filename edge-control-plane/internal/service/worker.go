@@ -24,6 +24,28 @@ var (
 	ErrQuotaExceeded   = errors.New("max workers reached for tenant")
 )
 
+// quotaGraceWindow is the default free-tier grace clock (issue #420).
+// The deploy-time gate returns 402 the moment a free-tier tenant
+// crosses a cap, but the request-time gate at edge-ingress waits for
+// this window to elapse before serving 402 — giving the tenant a
+// clear "your free tier is exhausted, upgrade at /billing" runway
+// instead of being blocked mid-request. Tunable later via config
+// without a schema change.
+const quotaGraceWindow = time.Hour
+
+// isFreeTierTenant returns true when the tenant's plan column is the
+// free tier. Used by applyTenantDelta to decide whether to stamp the
+// grace clock before SetDisabledAt. Returns true on any error so a
+// transient DB read doesn't accidentally grant a paid tenant a free
+// grace window — fail-closed is the safe default for billing.
+func isFreeTierTenant(ctx context.Context, repo tenantRepoInterface, tenantID string) bool {
+	t, err := repo.GetByID(ctx, tenantID)
+	if err != nil || t == nil {
+		return true
+	}
+	return t.Plan == "free"
+}
+
 // heartbeatRecover is a defer helper used by the inner goroutines
 // spawned inside SubscribeHeartbeats (the channel-depth monitor and
 // the drain that calls handleHeartbeat). The outer loophealth recover
@@ -73,6 +95,10 @@ type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	// SetGraceUntil stamps quotas.quota_lock_grace_until on free-tier
+	// first-cross (issue #420). Bounds the request-time 402 window
+	// after deploys are already blocked.
+	SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 // activeRepoInterface defines the active_deployments methods used by
@@ -638,6 +664,23 @@ func (s *WorkerService) applyTenantDelta(
 				"quota: tenant %s used %d %s, exceeds monthly limit %d — disabling tenant",
 				tenantID, used, capLabel, cap,
 			)
+			// Issue #420: on first-cross of a free-tier cap, stamp the
+			// grace clock first so the deploy-time gate can surface a
+			// graceful 402 (with the grace reason) instead of an
+			// immediate lockdown. Paid tenants (active subscription)
+			// skip the grace window — the admin quota-override
+			// endpoint is their escape hatch — and go straight to
+			// SetDisabledAt. The grace length is operator-tunable
+			// later; the 1h default gives the tenant a clear "your
+			// free tier is exhausted, upgrade at /billing" runway
+			// before request-time 402 starts at the edge.
+			if quota.QuotaLockGraceUntil == nil && isFreeTierTenant(ctx, s.tenantRepo, tenantID) {
+				graceUntil := time.Now().Add(quotaGraceWindow)
+				if err := s.quotaRepo.SetGraceUntil(ctx, tenantID, &graceUntil); err != nil {
+					log.Printf("quota: failed to set grace clock for tenant %s: %v", tenantID, err)
+					// Non-fatal — fall through to SetDisabledAt.
+				}
+			}
 			// Disable the tenant so the reconcile loop stops publishing
 			// task updates and new deployments are rejected (issue #155).
 			if err := s.tenantRepo.SetDisabledAt(ctx, tenantID, time.Now()); err != nil {

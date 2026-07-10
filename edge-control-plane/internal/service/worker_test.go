@@ -81,6 +81,7 @@ type mockQuotaRepo struct {
 	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)
 	addOutboundBytesFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addRequestCountFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	setGraceUntilFunc    func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -104,13 +105,36 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 	return &domain.Quota{}, nil
 }
 
+func (m *mockQuotaRepo) SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error {
+	if m.setGraceUntilFunc != nil {
+		return m.setGraceUntilFunc(ctx, tenantID, until)
+	}
+	return nil
+}
+
 // mockActiveRepo implements activeRepoInterface for testing the
 // stability-window evaluator. Each method records its args so tests
 // can assert the wire shape; default funcs return zero values
 // (nil/empty) so tests that only exercise one method don't need to
 // stub the others.
 type mockTenantRepo struct {
-	tenantRepoInterface
+	getByIDFunc func(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
+// Compile-time assertion that mockTenantRepo satisfies tenantRepoInterface.
+// SetDisabledAt and ClearDisabledAt are defined on the mock as method
+// receivers further down; the var assertion here replaces an unused
+// interface field embed (which golangci-lint flags as dead code).
+var _ tenantRepoInterface = (*mockTenantRepo)(nil)
+
+func (m *mockTenantRepo) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
+	if m.getByIDFunc != nil {
+		return m.getByIDFunc(ctx, id)
+	}
+	// Default to a free-tier tenant so applyTenantDelta exercises the
+	// dual-write (SetGraceUntil + SetDisabledAt) path. Tests that
+	// specifically want the paid-tenant shortcut stub getByIDFunc.
+	return &domain.Tenant{ID: id, Plan: "free"}, nil
 }
 
 func (m *mockTenantRepo) SetDisabledAt(_ context.Context, _ string, _ time.Time) error {
@@ -918,6 +942,113 @@ func TestApplyTenantDelta_Requests_ExceedsCap_Logs(t *testing.T) {
 	}
 	if !strings.Contains(out, "exceeds monthly limit 100") {
 		t.Errorf("log output missing limit; got %q", out)
+	}
+}
+
+// TestApplyTenantDelta_Requests_ExceedsCap_FreeTier_SetsGraceClock
+// (issue #420) verifies the dual-write: on first-cross of a free-tier
+// cap, applyTenantDelta must call SetGraceUntil with a future
+// timestamp (the grace window) AND SetDisabledAt. The previous test
+// only checks the log line; this one locks the wire contract by
+// capturing the SetGraceUntil call args via the mock seam.
+func TestApplyTenantDelta_Requests_ExceedsCap_FreeTier_SetsGraceClock(t *testing.T) {
+	var (
+		gotTenantID  string
+		gotGraceAt   *time.Time
+		gotGraceAtOK bool
+	)
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			return &domain.Quota{
+				MaxRequestsPerMonth: 100,
+				UsedRequestCount:    101, // breach
+			}, nil
+		},
+		setGraceUntilFunc: func(_ context.Context, tenantID string, until *time.Time) error {
+			gotTenantID = tenantID
+			gotGraceAt = until
+			gotGraceAtOK = true
+			return nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_free", RequestCount: 1, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	before := time.Now()
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if !gotGraceAtOK {
+		t.Fatal("SetGraceUntil was not called on free-tier first-cross")
+	}
+	if gotTenantID != "t_free" {
+		t.Errorf("SetGraceUntil tenantID = %q, want %q", gotTenantID, "t_free")
+	}
+	if gotGraceAt == nil {
+		t.Fatal("SetGraceUntil received nil timestamp")
+	}
+	// Grace clock must be strictly in the future (operator can rely on
+	// the deploy-time check returning 402 immediately, while request-time
+	// 402 fires only after this clock expires).
+	if !gotGraceAt.After(before) {
+		t.Errorf("grace clock %v is not after test-start %v", gotGraceAt, before)
+	}
+	// And the grace window should be in the expected ballpark (default
+	// 1h — generous so we only assert the lower bound).
+	if gotGraceAt.Sub(before) < 30*time.Minute {
+		t.Errorf("grace window %v < 30m (want ≥ 30m, default 1h)", gotGraceAt.Sub(before))
+	}
+}
+
+// TestApplyTenantDelta_Requests_ExceedsCap_PaidTenant_SkipsGraceClock
+// (issue #420) verifies the shortcut: a paid tenant (plan != "free")
+// crossing the cap goes straight to SetDisabledAt. The grace clock
+// is a free-tier affordance only — paid tenants have the admin
+// quota-override endpoint as their recovery path.
+func TestApplyTenantDelta_Requests_ExceedsCap_PaidTenant_SkipsGraceClock(t *testing.T) {
+	graceCalled := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			return &domain.Quota{
+				MaxRequestsPerMonth: 100,
+				UsedRequestCount:    101, // breach
+			}, nil
+		},
+		setGraceUntilFunc: func(_ context.Context, _ string, _ *time.Time) error {
+			graceCalled = true
+			return nil
+		},
+	})
+	// Override the default free-tier tenant with a paid plan. The
+	// free-tier default exists so other tests don't have to stub it;
+	// here we explicitly want the paid-tenant shortcut.
+	svc.tenantRepo = &mockTenantRepo{
+		getByIDFunc: func(_ context.Context, id string) (*domain.Tenant, error) {
+			return &domain.Tenant{ID: id, Plan: "pro"}, nil
+		},
+	}
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_pro", RequestCount: 1, OutboundBytes: 0},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		svc.quotaRepo.AddRequestCount,
+	)
+
+	if graceCalled {
+		t.Error("SetGraceUntil must NOT be called for paid tenants — paid tenants have the admin override as their recovery path")
 	}
 }
 

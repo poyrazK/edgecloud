@@ -12,6 +12,7 @@ mod domains;
 pub mod heartbeats;
 mod ingress_metrics;
 mod messages;
+mod quota;
 mod ratelimit;
 mod routing;
 pub mod traffic;

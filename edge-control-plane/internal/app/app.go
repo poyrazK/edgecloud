@@ -519,6 +519,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("GET /api/v1/admin/tenants/{tenantID}", tenantHandler.Get)
 	admin.HandleFunc("PUT /api/v1/admin/tenants/{tenantID}", tenantHandler.Update)
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
+	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/quota-override", tenantHandler.QuotaOverride)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
 	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)
@@ -544,6 +545,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// Per-app rate limit overrides for the ingress ratelimit fetcher (issue #305).
 	mux.HandleFunc("GET /api/v1/internal/rate-limits/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetRateLimitsInternal)).ServeHTTP(w, r)
+	})
+
+	// Per-tenant quota state for the ingress Caddy 402 renderer
+	// (issue #420). Polled every QUOTA_FETCH_INTERVAL (default 30s);
+	// the response includes over_cap + locked_until so the ingress
+	// can decide whether to inject a static_response 402 block for
+	// the tenant's apps.
+	mux.HandleFunc("GET /api/v1/internal/quota/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetQuotaInternal)).ServeHTTP(w, r)
 	})
 
 	// Secrets admin endpoints (X-Internal-Token auth).

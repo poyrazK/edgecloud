@@ -3,10 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -26,6 +28,13 @@ type mockQuotaTenantSvc struct {
 }
 
 func (m *mockQuotaTenantSvc) GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.quotaErr != nil {
+		return nil, m.quotaErr
+	}
+	return m.quota, nil
+}
+
+func (m *mockQuotaTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	if m.quotaErr != nil {
 		return nil, m.quotaErr
 	}
@@ -97,5 +106,121 @@ func TestQuotaHandler_GetQuota_NotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetQuotaInternal (issue #420 — edge-ingress polls this every 30s to drive
+// the Caddy 402 injection. Trust model is the X-Internal-Token shared
+// secret, mounted under internalAuth in app.go.)
+// ---------------------------------------------------------------------------
+
+// quotaInternalWire mirrors handler.quotaInternalResponse for decoding.
+// Defined locally so the handler's response shape stays unexported while
+// the test can still assert on over_cap and locked_until.
+type quotaInternalWire struct {
+	domain.Quota
+	OverCap     bool       `json:"over_cap"`
+	LockedUntil *time.Time `json:"locked_until,omitempty"`
+}
+
+// TestQuotaHandler_GetQuotaInternal_Success: under-cap tenant, no grace
+// clock. Response should be 200 with over_cap=false and a nil locked_until.
+func TestQuotaHandler_GetQuotaInternal_Success(t *testing.T) {
+	q, err := domain.QuotaForPlan("free")
+	if err != nil {
+		t.Fatalf("QuotaForPlan(free): %v", err)
+	}
+	q.TenantID = "t_test"
+	q.UsedRequestCount = 50_000 // 50% of 100_000
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_test", nil)
+	req.SetPathValue("tenantID", "t_test")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.OverCap {
+		t.Errorf("over_cap = true at 50%%, want false")
+	}
+	if resp.LockedUntil != nil {
+		t.Errorf("locked_until = %v, want nil (no grace clock set)", resp.LockedUntil)
+	}
+	if resp.MaxRequestsPerMonth != 100_000 {
+		t.Errorf("max_requests_per_month = %d, want 100_000", resp.MaxRequestsPerMonth)
+	}
+}
+
+// TestQuotaHandler_GetQuotaInternal_OverCap_Requests: used_request_count
+// at the cap → over_cap=true. This is the signal edge-ingress uses to
+// inject the Caddy static_response 402 block.
+func TestQuotaHandler_GetQuotaInternal_OverCap_Requests(t *testing.T) {
+	q, err := domain.QuotaForPlan("free")
+	if err != nil {
+		t.Fatalf("QuotaForPlan(free): %v", err)
+	}
+	q.TenantID = "t_over"
+	q.UsedRequestCount = int64(q.MaxRequestsPerMonth) // 100_000 = 100%
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over", nil)
+	req.SetPathValue("tenantID", "t_over")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.OverCap {
+		t.Errorf("over_cap = false at 100%%, want true (used >= cap)")
+	}
+}
+
+// TestQuotaHandler_GetQuotaInternal_NotFound: GetQuotaForInternal
+// returns nil → 404 with a JSON error envelope. Edge-ingress fails
+// open on a missing tenant (no 402 injected); the 404 is the
+// observable signal that the tenant row was missing at fetch time.
+func TestQuotaHandler_GetQuotaInternal_NotFound(t *testing.T) {
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: nil})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_missing", nil)
+	req.SetPathValue("tenantID", "t_missing")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "tenant not found") {
+		t.Errorf("body missing 'tenant not found' envelope: %s", rr.Body.String())
+	}
+}
+
+// TestQuotaHandler_GetQuotaInternal_PathTraversal rejects a tenantID
+// with traversal characters. The handler shares containsPathTraversal
+// with other tenant handlers; we lock the behavior here so future
+// refactors don't accidentally widen the input.
+func TestQuotaHandler_GetQuotaInternal_PathTraversal(t *testing.T) {
+	svc := &mockQuotaTenantSvc{quotaErr: errors.New("service should not be called")}
+	h := NewQuotaHandler(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/..%2Fetc", nil)
+	req.SetPathValue("tenantID", "../etc")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (body=%s)", rr.Code, rr.Body.String())
 	}
 }

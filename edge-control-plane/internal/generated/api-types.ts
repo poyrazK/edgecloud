@@ -759,6 +759,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/tenants/{tenantID}/quota-override": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manually override a tenant's quota or lock state (admin only)
+         * @description Owner-role escape hatch for the billing umbrella. Every field is
+         *     optional; absent fields are untouched. The most common uses are
+         *     to clear a free-tier lockdown (`clear_disabled_at: true`), grant a
+         *     temporary grace window (`set_overage_allowed_until`), or pin a
+         *     per-deployment cap for a paying customer that's about to
+         *     cross the line. Every override is recorded in `audit_logs` with
+         *     action `quota.override`.
+         */
+        post: operations["adminQuotaOverride"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/apps/{appName}": {
         parameters: {
             query?: never;
@@ -930,6 +956,67 @@ export interface paths {
                     content?: never;
                 };
                 /** @description App not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/quota/{tenantID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Per-tenant quota state for the ingress
+         * @description Returns the per-tenant quota row plus the derived `over_cap`
+         *     boolean consumed by the edge-ingress quota fetcher. The fetcher
+         *     polls this endpoint every `QUOTA_FETCH_INTERVAL` seconds
+         *     (default 30s) and keys its Caddy `static_response` 402 block
+         *     off `over_cap`. The `locked_until` field is the
+         *     `quotas.quota_lock_grace_until` value — the request-time 402
+         *     activates after this timestamp passes.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Quota state for the tenant. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Quota"];
+                    };
+                };
+                /** @description Invalid tenant ID */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Tenant not found */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -1755,12 +1842,17 @@ export interface components {
             /**
              * Format: int64
              * @description Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+             *     Drives enforcement: when this value reaches `max_outbound_mb`,
+             *     deploy-time returns 402 PAYMENT_REQUIRED with reason
+             *     `quota_will_be_exceeded` and edge-ingress returns 402 with
+             *     `Retry-After: 3600`.
              * @example 0
              */
             used_outbound_bytes?: number;
             /**
              * Format: int64
              * @description Cumulative request count in the current UTC month. Resets on month rollover.
+             *     Drives enforcement in the same way as `used_outbound_bytes`.
              * @example 0
              */
             used_request_count?: number;
@@ -1771,12 +1863,85 @@ export interface components {
              */
             quota_period_start?: string;
             /**
+             * Format: date-time
+             * @description Set by the heartbeat pipeline when a free-tier tenant first
+             *     crosses cap. Deploy-time 402 is in effect immediately on
+             *     first-cross; the request-time 402 (edge-ingress) only
+             *     activates once this timestamp has passed. Operators can
+             *     clear via the admin override endpoint.
+             * @example 2026-07-15T12:00:00Z
+             */
+            quota_lock_grace_until?: string | null;
+            /**
+             * Format: date-time
+             * @description Per-tenant grace clock for paid tenants that have crossed
+             *     cap. While this timestamp is in the future, the deploy-time
+             *     cap check is skipped (request-time 402 at the edge is
+             *     unaffected). Set by the admin override endpoint.
+             * @example 2026-07-20T00:00:00Z
+             */
+            overage_allowed_until?: string | null;
+            /**
+             * @description Mirrored from `billing_subscriptions.status`. Any value
+             *     other than `active` or `trialing` causes deploy-time to
+             *     return 402 PAYMENT_REQUIRED with reason
+             *     `subscription_past_due`.
+             * @example active
+             * @enum {string}
+             */
+            subscription_status?: "active" | "past_due" | "canceled" | "trialing";
+            /**
+             * @description Derived: true when `used_request_count >= max_requests_per_month`
+             *     OR `used_outbound_bytes / 1MiB >= max_outbound_mb`. The
+             *     edge-ingress fetcher keys its Caddy `static_response` 402
+             *     block off this boolean.
+             * @example false
+             */
+            over_cap?: boolean;
+            /**
              * @description Highest usage percentage across the two monthly caps
              *     (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
              *     expressed as a 0-100 value. null when both caps are unlimited.
              * @example 42.5
              */
             usage_pct?: number | null;
+        };
+        /**
+         * @description Every field is optional. Absent fields are not modified. Setting
+         *     `max_requests_per_month` / `max_outbound_mb` to a positive value
+         *     raises or lowers the cap; setting to -1 marks the cap as
+         *     unlimited. `clear_disabled_at: true` clears the free-tier
+         *     lockdown flag; `clear_grace: true` clears both
+         *     `quotas.quota_lock_grace_until` and
+         *     `tenants.overage_allowed_until`.
+         */
+        QuotaOverrideRequest: {
+            /**
+             * @description New request cap (-1 = unlimited).
+             * @example 5000000
+             */
+            max_requests_per_month?: number;
+            /**
+             * @description New outbound cap in MB (-1 = unlimited).
+             * @example 50000
+             */
+            max_outbound_mb?: number;
+            /**
+             * Format: date-time
+             * @description Timestamp until which paid-tenant over-cap deploys are accepted.
+             * @example 2026-07-20T00:00:00Z
+             */
+            set_overage_allowed_until?: string | null;
+            /**
+             * @description Clear the free-tier `tenants.disabled_at` lockdown flag.
+             * @example false
+             */
+            clear_disabled_at?: boolean;
+            /**
+             * @description Clear both `quota_lock_grace_until` and `overage_allowed_until`.
+             * @example false
+             */
+            clear_grace?: boolean;
         };
         MigrationReport: {
             /**
@@ -2109,6 +2274,30 @@ export interface components {
                  *       "error": {
                  *         "code": "QUOTA_EXCEEDED",
                  *         "message": "max apps quota exceeded"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /**
+         * @description Billing boundary reached — request cannot be fulfilled without
+         *     payment action. Distinct from `QuotaExceeded` (429), which is
+         *     a per-resource throttle with a Retry-After hint. 402 indicates
+         *     a billing condition that will not resolve by waiting:
+         *     `subscription_past_due`, `free_tier_exceeded`,
+         *     `quota_lock_grace_active`, or `quota_will_be_exceeded`.
+         */
+        PaymentRequired: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "PAYMENT_REQUIRED",
+                 *         "message": "quota will be exceeded by this deploy"
                  *       }
                  *     }
                  */
@@ -2457,6 +2646,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            402: components["responses"]["PaymentRequired"];
             /**
              * @description The `Idempotency-Key` was reused against a request whose
              *     artifact SHA-256 differs from the cached row's hash.
@@ -3568,6 +3758,37 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    adminQuotaOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QuotaOverrideRequest"];
+            };
+        };
+        responses: {
+            /** @description Quota / lock state updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Quota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
         };
     };

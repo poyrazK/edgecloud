@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::caddy::{render_routes, CaddyClient};
 use crate::config::Config;
 use crate::messages::HeartbeatMessage;
+use crate::quota::{spawn_quota_fetcher, SharedQuotaCache};
 use crate::ratelimit::SharedRateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry, RoutingTable};
 use crate::traffic::{spawn_fetcher, SharedCache};
@@ -53,6 +54,9 @@ pub async fn run(
     let traffic_cache: SharedCache = Default::default();
     // Rate-limit cache shared between the fetcher and the renderer.
     let rate_limit_cache: SharedRateLimitCache = Default::default();
+    // Quota-state cache shared between the quota fetcher and the renderer.
+    // Issue #420 — driving the Caddy `static_response` 402 inject.
+    let quota_cache: SharedQuotaCache = Default::default();
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -61,6 +65,8 @@ pub async fn run(
     let traffic_cache_for_push = traffic_cache.clone();
     let rate_limit_cache_for_renderer = rate_limit_cache.clone();
     let rate_limit_cache_for_push = rate_limit_cache.clone();
+    let quota_cache_for_renderer = quota_cache.clone();
+    let quota_cache_for_push = quota_cache.clone();
 
     // Spawn background tasks with the shutdown token.
     let fetcher_shutdown = shutdown.clone();
@@ -73,6 +79,11 @@ pub async fn run(
         fetcher_shutdown,
     );
     let rl_fetcher_shutdown = shutdown.clone();
+    // Make a third clone to keep `http_client` alive for the quota
+    // fetcher below (issue #420). The rate-limit fetcher takes
+    // ownership, so we explicitly clone here rather than relying on
+    // the compiler to see through `.clone()` later in the function.
+    let http_client_for_quota = http_client.clone();
     crate::ratelimit::spawn_rate_limit_fetcher(
         http_client,
         cfg.control_plane_api_url.clone(),
@@ -82,6 +93,19 @@ pub async fn run(
         cfg.rate_limit_fetch_interval,
         rl_fetcher_shutdown,
     );
+    // Quota fetcher (issue #420). Polls `GET /api/v1/internal/quota/{tenant}`
+    // every `cfg.quota_fetch_interval` (default 30s) so the renderer can
+    // inject a Caddy `static_response` 402 when any tenant crosses cap.
+    // Disabled when `quota_fetch_interval` is zero — see spawn_quota_fetcher.
+    let quota_fetcher_shutdown = shutdown.clone();
+    spawn_quota_fetcher(
+        http_client_for_quota,
+        cfg.control_plane_api_url.clone(),
+        quota_cache.clone(),
+        cfg.internal_token.clone(),
+        table.clone(),
+        quota_fetcher_shutdown,
+    );
     let renderer_shutdown = shutdown.clone();
     spawn_renderer(
         cfg.clone(),
@@ -89,6 +113,7 @@ pub async fn run(
         caddy.clone(),
         traffic_cache_for_renderer,
         rate_limit_cache_for_renderer,
+        quota_cache_for_renderer,
         render_notify.clone(),
         renderer_shutdown,
     );
@@ -110,6 +135,7 @@ pub async fn run(
         &caddy,
         &traffic_cache_for_push,
         &rate_limit_cache_for_push,
+        &quota_cache_for_push,
         &mut boot_previous,
     )
     .await
@@ -241,12 +267,14 @@ struct PreviousState {
     fqdn_bindings: Vec<FqdnBinding>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_renderer(
     cfg: Config,
     table: Arc<RoutingTable>,
     caddy: Arc<CaddyClient>,
     traffic_cache: SharedCache,
     rate_limit_cache: SharedRateLimitCache,
+    quota_cache: SharedQuotaCache,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
 ) {
@@ -256,7 +284,7 @@ fn spawn_renderer(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("renderer: shutdown signal received; performing final push");
-                    let _ = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache, &mut previous).await;
+                    let _ = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache, &quota_cache, &mut previous).await;
                     break;
                 }
                 _ = notify.notified() => {
@@ -268,6 +296,7 @@ fn spawn_renderer(
                         &caddy,
                         &traffic_cache,
                         &rate_limit_cache,
+                        &quota_cache,
                         &mut previous,
                     )
                     .await
@@ -319,12 +348,14 @@ async fn push_now(
     caddy: &CaddyClient,
     traffic_cache: &SharedCache,
     rate_limit_cache: &SharedRateLimitCache,
+    quota_cache: &SharedQuotaCache,
     previous: &mut Option<PreviousState>,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
     let fqdns = table.fqdn_snapshot().await;
     let traffic_cache_guard = traffic_cache.read().await;
     let rate_limit_cache_guard = rate_limit_cache.read().await;
+    let quota_cache_guard = quota_cache.read().await;
 
     // Set gauges from current state.
     metrics::gauge!("ingress.routes.active").set(snap.len() as f64);
@@ -340,6 +371,7 @@ async fn push_now(
                 cfg,
                 &traffic_cache_guard,
                 &rate_limit_cache_guard,
+                &quota_cache_guard,
             );
             let render_dur = render_start.elapsed();
             metrics::histogram!("ingress.caddy.render_duration_seconds")
@@ -388,6 +420,7 @@ async fn push_now(
                     cfg,
                     &traffic_cache_guard,
                     &rate_limit_cache_guard,
+                    &quota_cache_guard,
                 );
                 let render_dur = render_start.elapsed();
                 metrics::histogram!("ingress.caddy.render_duration_seconds")
@@ -860,6 +893,7 @@ mod tests {
             rate_limit_rps_default: 0,
             rate_limit_burst_default: 0,
             rate_limit_fetch_interval: Duration::from_secs(60),
+            quota_fetch_interval: Duration::from_secs(30),
             stale_timeout: Duration::from_secs(60),
             prune_interval: Duration::from_secs(30),
             health_check_interval: Duration::from_secs(10),
@@ -890,8 +924,9 @@ mod tests {
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
+        let q_cache: SharedQuotaCache = Default::default();
 
-        push_now(&cfg, &table, &caddy, &cache, &rl_cache, &mut None)
+        push_now(&cfg, &table, &caddy, &cache, &rl_cache, &q_cache, &mut None)
             .await
             .expect("push_now should succeed");
     }
@@ -914,8 +949,9 @@ mod tests {
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
+        let q_cache: SharedQuotaCache = Default::default();
 
-        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache, &mut None)
+        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache, &q_cache, &mut None)
             .await
             .expect_err("push_now should fail with 502");
         assert!(
@@ -949,6 +985,7 @@ mod tests {
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
+        let q_cache: SharedQuotaCache = Default::default();
         let notify = Arc::new(Notify::new());
 
         // Notify BEFORE spawn: tokio::sync::Notify stores a pending
@@ -962,6 +999,7 @@ mod tests {
             caddy,
             cache,
             rl_cache,
+            q_cache,
             notify.clone(),
             CancellationToken::new(),
         );

@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 68 // 34 .up.sql + 34 .down.sql on current main (after 026_idempotency_keys, issue #52)
+const splitFileCount = 70 // 35 .up.sql + 35 .down.sql (after 026_idempotency_keys on main and 025_quotas_grace_columns from #420)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -120,6 +120,7 @@ var wantColumns = map[string][]string{
 		"plan",
 		"allowlisted_destinations",
 		"created_at",
+		"overage_allowed_until", // 025_quotas_grace_columns (issue #420)
 	},
 	"quotas": {
 		"tenant_id",
@@ -132,6 +133,7 @@ var wantColumns = map[string][]string{
 		"quota_period_start",     // 009_quotas_used_outbound
 		"max_requests_per_month", // 013
 		"used_request_count",     // 013
+		"quota_lock_grace_until", // 025_quotas_grace_columns (issue #420)
 	},
 	"api_keys": {
 		"id",
@@ -338,6 +340,7 @@ var wantTypes = map[string]map[string]string{
 		"plan":                     "text",
 		"allowlisted_destinations": "_text", // 001 — TEXT[]
 		"created_at":               "timestamptz",
+		"overage_allowed_until":    "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
 	},
 	"quotas": {
 		"tenant_id":              "text",
@@ -350,6 +353,7 @@ var wantTypes = map[string]map[string]string{
 		"quota_period_start":     "timestamptz", // 009_quotas_used_outbound
 		"max_requests_per_month": "int4",        // 013
 		"used_request_count":     "int8",        // 013
+		"quota_lock_grace_until": "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
 	},
 	"api_keys": {
 		"id":             "text",
@@ -748,7 +752,12 @@ var wantIndexes = []IndexExpectation{
 	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
 	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
 	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
+<<<<<<< HEAD
 	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
+=======
+	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                         // 025_quotas_grace_columns (issue #420, partial)
+	{Table: "quotas", Name: "idx_quotas_grace_until"},                                     // 025_quotas_grace_columns (issue #420, partial)
+>>>>>>> 09f5c73 (feat(billing): schema migration 025 — add grace columns for #420)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
