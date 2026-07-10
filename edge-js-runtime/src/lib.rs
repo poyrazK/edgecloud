@@ -365,14 +365,15 @@ mod tests {
     /// every bundle) or `usize::MAX` (defeats the guardrail).
     #[test]
     fn max_bytecode_bytes_is_bounded() {
-        // Clippy 1.93 `assertions_on_constants` would call these out
-        // because both sides are compile-time known — but the whole
-        // point of this test is to catch a future regression where
-        // someone edits `MAX_BYTECODE_BYTES` in `src/lib.rs:321` to a
-        // value that blocks reasonable bundles (`< 1 MiB`) or defeats
-        // the guardrail (`> 100 MiB`). Hide the values behind named
-        // locals so clippy's constant-folding analysis can't fold them,
-        // then assert against the named locals.
+        // Clippy's `assertions_on_constants` / `identity_op` lints fold
+        // compile-time values; if both sides of an `assert!` resolve at
+        // compile time the assertion looks pointless. The point of this
+        // test is to catch a future regression where someone edits
+        // `MAX_BYTECODE_BYTES` in `src/lib.rs:321` to a value that
+        // blocks reasonable bundles (`< 1 MiB`) or defeats the guardrail
+        // (`> 100 MiB`). Hide the values behind named locals so the
+        // constant-folding analysis can't see them, then assert against
+        // the named locals.
         let observed = MAX_BYTECODE_BYTES;
         let min_bytes = 1024 * 1024;
         assert!(
