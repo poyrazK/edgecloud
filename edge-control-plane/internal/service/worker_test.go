@@ -80,10 +80,11 @@ func (m *mockWorkerRepo) DeleteOlderThan(ctx context.Context, age time.Duration)
 
 // mockQuotaRepo implements quotaRepoInterface for testing.
 type mockQuotaRepo struct {
-	getByTenantIDFunc    func(ctx context.Context, tenantID string) (*domain.Quota, error)
-	addOutboundBytesFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
-	addRequestCountFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
-	setGraceUntilFunc    func(ctx context.Context, tenantID string, until *time.Time) error
+	getByTenantIDFunc     func(ctx context.Context, tenantID string) (*domain.Quota, error)
+	addOutboundBytesFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addRequestCountFunc   func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addResidentSecondsFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	setGraceUntilFunc     func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -103,6 +104,17 @@ func (m *mockQuotaRepo) AddOutboundBytes(ctx context.Context, tenantID string, d
 func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	if m.addRequestCountFunc != nil {
 		return m.addRequestCountFunc(ctx, tenantID, delta)
+	}
+	return &domain.Quota{}, nil
+}
+
+// AddResidentSeconds (issue #484 / #485) routes to the test hook when set.
+// Mirrors AddRequestCount / AddOutboundBytes — the nil-func default returns
+// a zero Quota so tests that don't drive the resident-seconds axis don't
+// have to plumb this hook.
+func (m *mockQuotaRepo) AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	if m.addResidentSecondsFunc != nil {
+		return m.addResidentSecondsFunc(ctx, tenantID, delta)
 	}
 	return &domain.Quota{}, nil
 }
@@ -1118,6 +1130,126 @@ func TestApplyTenantDelta_Requests_ExceedsCap_PaidTenant_SkipsGraceClock(t *test
 
 	if graceCalled {
 		t.Error("SetGraceUntil must NOT be called for paid tenants — paid tenants have the admin override as their recovery path")
+	}
+}
+
+// ── Resident-seconds tests (issue #484 / #485) ────────────────────────────
+//
+// The third metered dimension flows through the same applyTenantDelta
+// plumbing as requests / outbound bytes, so the test contract is
+// mechanical: build a JSON payload with ResidentSeconds & TenantID,
+// route it through applyTenantDelta with the same selectors checkResidentSeconds
+// uses in production, and assert the mock's call args. The "absent"
+// (FaaS) and "zero" (just-started LR) cases are the contract pins —
+// they both fold to a 0-delta and must NOT trigger AddResidentSeconds.
+
+// ptrTo is a test-only helper for callers that need to construct a
+// `*uint64` literal — Go can't take the address of a literal in a
+// composite literal, so we route through a local var.
+func ptrTo[T any](v T) *T { return &v }
+
+// TestApplyTenantDelta_ResidentSeconds_AccumulatesPerTenant verifies the
+// happy path: an LR app stamps ResidentSeconds=Some(120), the heartbeat
+// carries TenantID="t_1", and checkResidentSeconds routes
+// AddResidentSeconds(ctx, "t_1", 120).
+func TestApplyTenantDelta_ResidentSeconds_AccumulatesPerTenant(t *testing.T) {
+	var (
+		gotTenantID string
+		gotDelta    uint64
+		gotCalled   bool
+	)
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addResidentSecondsFunc: func(_ context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+			gotTenantID = tenantID
+			gotDelta = delta
+			gotCalled = true
+			return &domain.Quota{MaxResidentSecondsPerMonth: 1_000_000}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_1", ResidentSeconds: ptrTo(uint64(120))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).ResidentSecondsOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
+		"resident seconds",
+		svc.quotaRepo.AddResidentSeconds,
+	)
+
+	if !gotCalled {
+		t.Fatal("AddResidentSeconds was not called for an LR app with ResidentSeconds=120")
+	}
+	if gotTenantID != "t_1" {
+		t.Errorf("AddResidentSeconds tenantID = %q, want %q", gotTenantID, "t_1")
+	}
+	if gotDelta != 120 {
+		t.Errorf("AddResidentSeconds delta = %d, want 120", gotDelta)
+	}
+}
+
+// TestApplyTenantDelta_ResidentSeconds_IgnoresFaaS verifies the FaaS
+// contract: a Handler app stamps ResidentSeconds=nil; applyTenantDelta
+// folds it to 0 via ResidentSecondsOrZero and skips the AddResidentSeconds
+// call (the `delta == 0 → continue` short-circuit at applyTenantDelta's
+// first loop). This is the pivot of the FaaS contract — without it,
+// every Handler-app heartbeat would produce a no-op DB round-trip.
+func TestApplyTenantDelta_ResidentSeconds_IgnoresFaaS(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addResidentSecondsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"faasapp": {TenantID: "t_1", ResidentSeconds: nil},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).ResidentSecondsOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
+		"resident seconds",
+		svc.quotaRepo.AddResidentSeconds,
+	)
+
+	if called {
+		t.Error("AddResidentSeconds called for FaaS app (ResidentSeconds=nil) — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate verifies that
+// Some(0) (an LR app that just started within the heartbeat interval)
+// also folds to a 0-delta and skips the DB write — same short-circuit
+// as the FaaS case. The distinction "just-started LR" vs "FaaS" is
+// captured by the wire shape (Some(0) vs nil), not by the DB path.
+func TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addResidentSecondsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"newlr": {TenantID: "t_1", ResidentSeconds: ptrTo(uint64(0))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).ResidentSecondsOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
+		"resident seconds",
+		svc.quotaRepo.AddResidentSeconds,
+	)
+
+	if called {
+		t.Error("AddResidentSeconds called for Some(0) resident-seconds delta — must be skipped")
 	}
 }
 

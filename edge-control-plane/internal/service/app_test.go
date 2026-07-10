@@ -110,6 +110,13 @@ func (m *mockQuotaRepoForApps) AddRequestCount(_ context.Context, _ string, _ ui
 	return &domain.Quota{}, nil
 }
 
+// AddResidentSeconds (issue #484 / #485) is a no-op for appSvc tests —
+// the deployment-service path doesn't drive the heartbeat metering path
+// so the apps-side handler tests don't need to assert against it.
+func (m *mockQuotaRepoForApps) AddResidentSeconds(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+	return &domain.Quota{}, nil
+}
+
 func (m *mockQuotaRepoForApps) SetGraceUntil(_ context.Context, _ string, _ *time.Time) error {
 	return nil
 }

@@ -49,9 +49,10 @@ func TestQuotaRepository_GetByTenantID(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
 		"quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, 0, periodStart)
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 2_592_000, 0, 0, 0, 0, periodStart)
 
 	mock.ExpectQuery(`SELECT tenant_id.*FROM quotas WHERE`).
 		WithArgs("t_1").
@@ -66,6 +67,9 @@ func TestQuotaRepository_GetByTenantID(t *testing.T) {
 	}
 	if got.MaxRequestsPerMonth != 100_000 {
 		t.Errorf("MaxRequestsPerMonth = %d, want 100000", got.MaxRequestsPerMonth)
+	}
+	if got.MaxResidentSecondsPerMonth != 2_592_000 {
+		t.Errorf("MaxResidentSecondsPerMonth = %d, want 2592000", got.MaxResidentSecondsPerMonth)
 	}
 	if got.UsedMemoryMB != 0 {
 		t.Errorf("UsedMemoryMB = %d, want 0", got.UsedMemoryMB)
@@ -118,9 +122,10 @@ func TestQuotaRepository_AddOutboundBytes(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
 		"quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 42, 0, 0, periodStart)
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 2_592_000, 42, 0, 0, 0, periodStart)
 
 	mock.ExpectQuery(`UPDATE quotas SET`).
 		WithArgs("t_1", int64(42)).
@@ -160,9 +165,10 @@ func TestQuotaRepository_AddRequestCount(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
 		"quota_period_start",
-	}).AddRow("t_1", 50, 20, 10, 512, 10_000, 5_000_000, 0, 17, 0, periodStart)
+	}).AddRow("t_1", 50, 20, 10, 512, 10_000, 5_000_000, 7_776_000, 0, 17, 0, 0, periodStart)
 
 	mock.ExpectQuery(`UPDATE quotas SET`).
 		WithArgs("t_1", int64(17)).
@@ -207,9 +213,10 @@ func TestQuotaRepository_AddMemoryMB_Accumulates(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
 		"quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, 256, time.Time{})
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 2_592_000, 0, 0, 256, 0, time.Time{})
 
 	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb = used_memory_mb \+ \$2`).
 		WithArgs("t_1", int64(256)).
@@ -234,9 +241,10 @@ func TestQuotaRepository_AddMemoryMB_NegativeDelta(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
 		"quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, -512, time.Time{})
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 2_592_000, 0, 0, -512, 0, time.Time{})
 
 	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb = used_memory_mb \+ \$2`).
 		WithArgs("t_1", int64(-512)).
@@ -248,6 +256,57 @@ func TestQuotaRepository_AddMemoryMB_NegativeDelta(t *testing.T) {
 	}
 	if got.UsedMemoryMB != -512 {
 		t.Errorf("UsedMemoryMB = %d, want -512", got.UsedMemoryMB)
+	}
+}
+
+// TestQuotaRepository_AddResidentSeconds (issue #484 / #485, third metered
+// dimension): a LongRunning heartbeat accumulates into used_resident_seconds.
+// Mirrors AddRequestCount — the addColumn routing path is identical so
+// the test exercises the same whitelisted-column contract.
+func TestQuotaRepository_AddResidentSeconds(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	periodStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "max_deployments", "max_apps", "max_workers",
+		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+		"max_resident_seconds_per_month", "used_outbound_bytes",
+		"used_request_count", "used_memory_mb", "used_resident_seconds",
+		"quota_period_start",
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 2_592_000, 0, 0, 0, 90, periodStart)
+
+	mock.ExpectQuery(`UPDATE quotas SET`).
+		WithArgs("t_1", int64(90)).
+		WillReturnRows(rows)
+
+	got, err := repo.AddResidentSeconds(context.Background(), "t_1", 90)
+	if err != nil {
+		t.Fatalf("AddResidentSeconds: %v", err)
+	}
+	if got.UsedResidentSeconds != 90 {
+		t.Errorf("UsedResidentSeconds = %d, want 90", got.UsedResidentSeconds)
+	}
+}
+
+// TestQuotaRepository_AddResidentSeconds_NotFound: a missing tenant
+// returns (nil, nil) like the other addColumn wrappers. Edge-ingress
+// fails open on missing tenants so this path is exercised silently in
+// production.
+func TestQuotaRepository_AddResidentSeconds_NotFound(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`UPDATE quotas SET`).
+		WithArgs("t_missing", int64(60)).
+		WillReturnError(sql.ErrNoRows)
+
+	got, err := repo.AddResidentSeconds(context.Background(), "t_missing", 60)
+	if err != nil {
+		t.Fatalf("expected nil error for sql.ErrNoRows, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil", got)
 	}
 }
 

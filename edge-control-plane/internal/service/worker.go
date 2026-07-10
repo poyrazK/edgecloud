@@ -98,6 +98,11 @@ type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	// AddResidentSeconds accumulates into quotas.used_resident_seconds
+	// (issue #484 / #485, third metered dimension). Mirrors
+	// AddRequestCount but routes through checkResidentSeconds on every
+	// LongRunning heartbeat.
+	AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	// SetGraceUntil stamps quotas.quota_lock_grace_until on free-tier
 	// first-cross (issue #420). Bounds the request-time 402 window
 	// after deploys are already blocked.
@@ -556,9 +561,16 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
 
 	// Same goroutine pattern as checkOutboundQuota above. This is a second
-	// DB round-trip per heartbeat — Phase 2 ticket could batch both writes
-	// into one UPDATE.
+	// DB round-trip per heartbeat — Phase 2 ticket could batch all three
+	// writes into one UPDATE (outbound + request + resident-seconds).
 	go s.checkRequestCount(context.WithoutCancel(ctx), hb.Apps)
+
+	// Third metered dimension (issue #484 / #485): resident-seconds per
+	// LongRunning app. Handler (FaaS) apps stamp ResidentSeconds=null
+	// so ResidentSecondsOrZero() returns 0 and the AddResidentSeconds
+	// wrapper is never called — no quota work for FaaS. Same goroutine
+	// pattern as the other two dimensions above.
+	go s.checkResidentSeconds(context.WithoutCancel(ctx), hb.Apps)
 
 	// Ingest observer metrics into the in-memory aggregator so they are
 	// immediately available at the Prometheus scrape endpoints. Pure
@@ -1131,6 +1143,32 @@ func (s *WorkerService) checkRequestCount(ctx context.Context, appsRaw json.RawM
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
 		s.quotaRepo.AddRequestCount,
+	)
+}
+
+// checkResidentSeconds accumulates resident_seconds from this heartbeat
+// into the tenant's running total in the DB (issue #484 / #485). When the
+// cumulative total exceeds the per-month max_resident_seconds_per_month
+// cap, the tenant is disabled and an empty task_update is published to
+// every region where the tenant has active deployments — same shape as
+// checkOutboundQuota / checkRequestCount but for the third metered
+// dimension. Handler (FaaS) apps stamp ResidentSeconds=nil which
+// ResidentSecondsOrZero() folds to 0, so the AddResidentSeconds wrapper
+// is never invoked for FaaS.
+//
+// The field selector is passed as a method value
+// ((*domain.AppStatus).ResidentSecondsOrZero) rather than a closure —
+// do NOT simplify to `func(a *domain.AppStatus) uint64 { return
+// a.ResidentSecondsOrZero() }`; the method-value form satisfies
+// applyTenantDelta's field parameter type without the extra allocation,
+// and keeps the call sites uniform across the three dimensions.
+func (s *WorkerService) checkResidentSeconds(ctx context.Context, appsRaw json.RawMessage) {
+	s.applyTenantDelta(ctx, appsRaw,
+		(*domain.AppStatus).ResidentSecondsOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
+		"resident seconds",
+		s.quotaRepo.AddResidentSeconds,
 	)
 }
 
