@@ -114,11 +114,16 @@ type CacheRetrySweepSink func(rowsTouched, pushedOK, stillFailing, configMissing
 
 // NewLogGCSink returns a sink that bumps the log_gc families. Passing
 // the returned closure to LogGCService records one tick.
+//
+// The timestamp is captured inside the closure body (not at factory
+// call time) so a long-lived sink — wired once at boot by app.New
+// and called per tick — actually reflects the time of the most
+// recent tick. The closure is the documented surface for the
+// "alert on staleness" rule in CLAUDE.md.
 func (a *MetricsAggregator) NewLogGCSink() LogGCSink {
 	if a == nil {
 		return func(int64, bool) {}
 	}
-	now := time.Now().Unix()
 	return func(rowsDeleted int64, hadError bool) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -127,18 +132,20 @@ func (a *MetricsAggregator) NewLogGCSink() LogGCSink {
 		if hadError {
 			a.logGcErr++
 		}
-		a.logGcTime = now
+		a.logGcTime = time.Now().Unix()
 	}
 }
 
 // NewPreviewGCSink returns a sink that bumps the preview_gc families
 // (per-tick counters). The per-blob failure counter is recorded
 // separately via NewPreviewBlobFailureRecorder.
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent tick.
 func (a *MetricsAggregator) NewPreviewGCSink() PreviewGCSink {
 	if a == nil {
 		return func(int, int, int, bool) {}
 	}
-	now := time.Now().Unix()
 	return func(blobsDeleted, rowsDeleted, batchesSwept int, hadError bool) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -149,7 +156,7 @@ func (a *MetricsAggregator) NewPreviewGCSink() PreviewGCSink {
 		if hadError {
 			a.previewGcErr++
 		}
-		a.previewGcTime = now
+		a.previewGcTime = time.Now().Unix()
 	}
 }
 
@@ -169,11 +176,13 @@ func (a *MetricsAggregator) NewPreviewBlobFailureRecorder() PreviewBlobFailureRe
 
 // NewCacheRetrySweepSink returns a sink that bumps the cache_retry_sweep
 // families.
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent tick.
 func (a *MetricsAggregator) NewCacheRetrySweepSink() CacheRetrySweepSink {
 	if a == nil {
 		return func(int, int, int, int, int, int, bool) {}
 	}
-	now := time.Now().Unix()
 	return func(rowsTouched, pushedOK, stillFailing, configMissing, givenUp, batchesSwept int, hadError bool) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -187,7 +196,7 @@ func (a *MetricsAggregator) NewCacheRetrySweepSink() CacheRetrySweepSink {
 		if hadError {
 			a.cacheRetrySweepErr++
 		}
-		a.cacheRetrySweepTime = now
+		a.cacheRetrySweepTime = time.Now().Unix()
 	}
 }
 
@@ -208,6 +217,8 @@ func (a *MetricsAggregator) RenderTenant(tenantID string) string {
 		collectFamilyLines(&fl, tenantID, apps)
 		fl.emit(&b)
 	}
+	// GC families are emitted separately from familyLines.emit —
+	// keep the two paths in sync if you add a new GC family.
 	emitGCFamilies(&b, a)
 	return b.String()
 }
@@ -228,6 +239,8 @@ func (a *MetricsAggregator) RenderAll() string {
 	}
 	var b strings.Builder
 	fl.emit(&b)
+	// GC families are emitted separately from familyLines.emit —
+	// keep the two paths in sync if you add a new GC family.
 	emitGCFamilies(&b, a)
 	return b.String()
 }

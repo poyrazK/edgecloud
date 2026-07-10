@@ -1,8 +1,10 @@
 package service
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 )
@@ -407,5 +409,50 @@ func TestMetricsAggregator_RenderTenant_IncludesGCFamilies(t *testing.T) {
 	}
 	if !strings.Contains(out, "edge_log_gc_rows_deleted_total 7") {
 		t.Errorf("GC families missing on per-tenant render\ngot:\n%s", out)
+	}
+}
+
+// TestMetricsAggregator_TimestampUpdatesPerTick: the
+// last_tick_timestamp_seconds gauge must reflect the time of the most
+// recent sink call, NOT the time the sink was constructed. This is the
+// documented "alert on staleness" surface in CLAUDE.md; the bug it
+// guards was the review-required fix on PR #588 (capture-at-construction
+// inside New*Sink factories froze the gauge at process start).
+//
+// We sleep 1.1s between two sink calls so the Unix-second boundary
+// is guaranteed to advance — a sub-second gap would be racy on hosts
+// where the test happens to land on the same Unix second twice.
+func TestMetricsAggregator_TimestampUpdatesPerTick(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewLogGCSink()
+
+	before := time.Now().Unix()
+	sink(1, false)
+	firstTickAt := time.Now().Unix()
+	out1 := agg.RenderAll()
+
+	firstOK := strings.Contains(out1, fmt.Sprintf("edge_log_gc_last_tick_timestamp_seconds %d", firstTickAt)) ||
+		strings.Contains(out1, fmt.Sprintf("edge_log_gc_last_tick_timestamp_seconds %d", before))
+	if !firstOK {
+		t.Errorf("first sink: expected timestamp in [%d,%d], got:\n%s", before, firstTickAt, out1)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	sink(1, false)
+	after := time.Now().Unix()
+	out2 := agg.RenderAll()
+
+	// Parse the second-tick timestamp back out and assert it advanced.
+	var got int64
+	for _, line := range strings.Split(out2, "\n") {
+		if strings.HasPrefix(line, "edge_log_gc_last_tick_timestamp_seconds ") {
+			_, _ = fmt.Sscanf(line, "edge_log_gc_last_tick_timestamp_seconds %d", &got)
+		}
+	}
+	if got <= firstTickAt {
+		t.Errorf("second sink: timestamp %d did not advance past %d (capture-at-construction bug regressed)\ngot:\n%s", got, firstTickAt, out2)
+	}
+	if got > after {
+		t.Errorf("second sink: timestamp %d is in the future (after=%d)", got, after)
 	}
 }
