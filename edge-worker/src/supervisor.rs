@@ -251,6 +251,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port,
+            last_error: None,
         }))
     }
 
@@ -627,6 +628,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -681,6 +683,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: Some(10002),
+            last_error: None,
         }));
         state
             .write()
@@ -742,6 +745,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -788,6 +792,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: Some(Arc::new(acc)),
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -858,6 +863,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
 
         // App B: untouched. This is the "other app on the same
@@ -880,6 +886,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
 
         state
@@ -967,6 +974,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -999,6 +1007,7 @@ mod heartbeat_integration_tests {
                 base,
                 max,
                 AppInstanceStatus::Crashed { restart_count: rc },
+                Some("synthetic panic-in-spawn error"),
                 "app crashed (panic-in-spawn)",
             )
             .await;
@@ -1020,6 +1029,7 @@ mod heartbeat_integration_tests {
             base,
             max,
             AppInstanceStatus::Crashed { restart_count: 5 },
+            Some("synthetic panic-in-spawn error"),
             "app crashed (panic-in-spawn)",
         )
         .await;
@@ -1040,6 +1050,89 @@ mod heartbeat_integration_tests {
             inst.status,
             AppInstanceStatus::Crashed { restart_count: 5 },
             "after 5 panics, status must be Crashed {{ restart_count: 5 }}"
+        );
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some("synthetic panic-in-spawn error"),
+            "after 5 panics, last_error must carry the panic payload so the \
+             heartbeat can surface it (issue #45)"
+        );
+    }
+
+    /// `last_error` must be stamped on every restart (not only when
+    /// the cap is reached) so an operator watching the heartbeat sees
+    /// the panic payload within one 30s tick — even if the app later
+    /// recovers or doesn't reach the cap. Without this, the
+    /// structured `tracing::error!` is the only signal and the
+    /// heartbeat stays silent on `status: "running"`.
+    #[tokio::test]
+    async fn handle_app_crash_stamps_last_error_on_every_restart() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        let (_shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d_every".into(),
+            app_name: "every-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18004,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d_every".into())),
+            shutdown_tx: Some(_shutdown_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "every-app".into()), app);
+
+        let sup = build_supervisor(state.clone());
+
+        let base = Duration::from_millis(1);
+        let max = Duration::from_millis(4);
+        // Under the cap — must still stamp last_error.
+        let _ = Supervisor::handle_app_crash(
+            &state,
+            "t_test",
+            "every-app",
+            "d_every",
+            &sup.downloader,
+            1,
+            5,
+            base,
+            max,
+            AppInstanceStatus::Crashed { restart_count: 1 },
+            Some("first panic"),
+            "app crashed (panic-in-spawn)",
+        )
+        .await;
+
+        let snapshot = state.read().await;
+        let inst = snapshot
+            .apps
+            .get(&("t_test".into(), "every-app".into()))
+            .expect("app present")
+            .lock()
+            .await;
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some("first panic"),
+            "last_error must be stamped on the very first restart, not only at the cap"
+        );
+        assert!(
+            matches!(inst.status, AppInstanceStatus::Running),
+            "under cap, status must stay Running so the heartbeat still publishes last_error \
+             against status=running (issue #45 — heartbeat visibility from tick 1)"
         );
     }
 
@@ -1072,6 +1165,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -1094,6 +1188,7 @@ mod heartbeat_integration_tests {
             base,
             max,
             AppInstanceStatus::Hung,
+            None,
             "app hung (health check timeout)",
         )
         .await;
@@ -1110,6 +1205,11 @@ mod heartbeat_integration_tests {
             inst.status,
             AppInstanceStatus::Hung,
             "timeout path must produce Hung, NOT Crashed"
+        );
+        assert!(
+            inst.last_error.is_none(),
+            "Hung arm passed err_for_audit=None, so last_error must stay None \
+             (no panic payload to surface — issue #45)"
         );
     }
 }
@@ -1830,6 +1930,7 @@ impl Supervisor {
             dispatch,
             metrics_acc,
             ws_port,
+            last_error: None,
         }));
 
         self.state.write().await.apps.insert(
@@ -2074,19 +2175,24 @@ impl Supervisor {
         base_backoff: Duration,
         max_backoff: Duration,
         terminal_status: AppInstanceStatus,
+        err_for_audit: Option<&str>,
         log_msg: &'static str,
     ) -> bool {
         if restart_count >= max_restarts {
             tracing::error!(restart_count, "max restarts exceeded, giving up");
-            // Mark the app with the supplied terminal status so the
-            // heartbeat reflects the failure mode (Crashed for traps /
-            // host panics, Hung for health-check timeouts, ...).
+            // Mark the app with the supplied terminal status AND
+            // stamp the last error so the heartbeat can carry it
+            // (issue #45 — operators see *why* the app reached
+            // Crashed without grepping structured logs).
             {
                 let mut s = state.write().await;
                 let crash_key = (tenant_id.to_string(), app_name.to_string());
                 if let Some(inst) = s.apps.get_mut(&crash_key) {
                     let mut inst = inst.lock().await;
                     inst.status = terminal_status;
+                    if let Some(err) = err_for_audit {
+                        inst.last_error = Some(err.to_string());
+                    }
                 }
             }
             // Best-effort auto-rollback: signal the control plane so
@@ -2116,6 +2222,17 @@ impl Supervisor {
             });
             true
         } else {
+            // Stamp last_error on every restart too — operators
+            // watching the heartbeat in real time can see the error
+            // immediately, before the cap is reached.
+            if let Some(err) = err_for_audit {
+                let mut s = state.write().await;
+                let crash_key = (tenant_id.to_string(), app_name.to_string());
+                if let Some(inst) = s.apps.get_mut(&crash_key) {
+                    let mut inst = inst.lock().await;
+                    inst.last_error = Some(err.to_string());
+                }
+            }
             let backoff = std::cmp::min(base_backoff * 2u32.pow(restart_count - 1), max_backoff);
             tracing::warn!(
                 restart_count,
@@ -2253,7 +2370,7 @@ impl Supervisor {
                             tracing::info!("component exited normally");
                             break;
                         }
-                        Ok(Ok(Err(_e))) => {
+                        Ok(Ok(Err(e))) => {
                             // Wasm trap or runtime error — treat as crash.
                             restart_count += 1;
                             let terminal = Self::handle_app_crash(
@@ -2267,6 +2384,7 @@ impl Supervisor {
                                 base_backoff,
                                 max_backoff,
                                 AppInstanceStatus::Crashed { restart_count },
+                                Some(&e.to_string()),
                                 "app crashed (trap)",
                             )
                             .await;
@@ -2312,6 +2430,7 @@ impl Supervisor {
                                 base_backoff,
                                 max_backoff,
                                 AppInstanceStatus::Crashed { restart_count },
+                                Some(&payload),
                                 "app crashed (panic-in-spawn)",
                             )
                             .await;
@@ -2344,6 +2463,7 @@ impl Supervisor {
                                 base_backoff,
                                 max_backoff,
                                 AppInstanceStatus::Hung,
+                                None,
                                 "app hung (health check timeout)",
                             )
                             .await;
@@ -2563,6 +2683,16 @@ impl Supervisor {
                         &inst.deployment_id,
                         now_unix_secs,
                     )),
+                    // Surface the last error stamped by
+                    // `Supervisor::handle_app_crash` on every crash /
+                    // panic-in-spawn / trap (issue #45). Operators see
+                    // *why* the app is `status: "crashed"` without
+                    // grepping structured logs. `None` for healthy
+                    // apps; persists across heartbeats until the next
+                    // `start_app` clears it (currently it does not —
+                    // a redeploy retains the prior error string until
+                    // the first crash, which is the safer default).
+                    last_error: inst.last_error.clone(),
                 },
             );
         }
@@ -3280,6 +3410,7 @@ mod tests {
             dispatch: Some(dispatch_a),
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         };
 
         let app_b = AppInstance {
@@ -3301,6 +3432,7 @@ mod tests {
             dispatch: Some(dispatch_b),
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         };
 
         {
@@ -3567,6 +3699,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -3599,6 +3732,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -3680,6 +3814,7 @@ mod tests {
             dispatch: Some(dispatch),
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -3718,6 +3853,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -3757,6 +3893,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
