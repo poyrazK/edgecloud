@@ -133,16 +133,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "1"
-      # CARGO_HOME defaults to $HOME/.cargo on GitHub-hosted runners
-      # but the env: map is not bash — literal $HOME isn't expanded.
-      # Use ${{ runner.home }}/.cargo (the canonical GitHub Actions
-      # idiom); otherwise cargo install --root "$CARGO_HOME" would
-      # create a literal "$HOME/.cargo" subdir under the workspace and
-      # edge-cli would never make it onto PATH. The build step below
-      # overrides CARGO_HOME with a fresh tmpdir to prove the vendored
-      # adapter is genuinely canonical (not the registry).
-      CARGO_HOME: ${{ runner.home }}/.cargo
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+      # CARGO_HOME is intentionally NOT set at job scope — leaving it
+      # unset lets the runner use its default $HOME/.cargo so the
+      # `cargo install --root "$CARGO_HOME"` + `Expose CLI tools on
+      # PATH` steps land edge-cli + wasm-tools in a known location.
+      # The build step below overrides CARGO_HOME with a fresh tmpdir
+      # to prove the vendored adapter is genuinely canonical (the
+      # registry fallback would only fire if both $EDGE_JS_WASI_ADAPTER
+      # and the vendored file were missing — and they're not).
     steps:
       - uses: actions/checkout@v5
         with:
