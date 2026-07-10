@@ -32,9 +32,18 @@ import (
 // Today it only does marshaling.
 type publishBuilder struct{}
 
-// newPublishBuilder constructs the helper. No deps today.
-func newPublishBuilder() *publishBuilder {
+// NewPublishBuilder constructs the helper. No deps today.
+// Exposed at package level so app.go can wire a single instance
+// shared between DeploymentService and EnvService.
+func NewPublishBuilder() *publishBuilder {
 	return &publishBuilder{}
+}
+
+// newPublishBuilder is the in-package alias kept so existing test
+// harnesses (which use the unexported constructor for fixture
+// simplicity) keep compiling without churn.
+func newPublishBuilder() *publishBuilder {
+	return NewPublishBuilder()
 }
 
 // buildPublishPayload assembles the marshaled TaskMessage that

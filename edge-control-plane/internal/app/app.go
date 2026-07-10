@@ -176,6 +176,16 @@ func New(
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
+	// Issue #560: shared TaskMessage-marshaling helper used by both
+	// DeploymentService (activate / rollback) and EnvService (set /
+	// delete). Constructed once and threaded into both services so
+	// the wire format stays single-source.
+	publishBuilder := service.NewPublishBuilder()
+	deploymentSvc.SetPublishBuilder(publishBuilder)
+	envSvc.SetPublishDeps(
+		db, tenantRepo, activeDeploymentRepo, deploymentRepo,
+		quotaRepo, outboxRepo, appEnvRepo, publishBuilder,
+	)
 	metricsAgg := service.NewMetricsAggregator()
 	// loopHealth tracks liveness of every background goroutine. It must
 	// be constructed before the services that need to feed it (so the
