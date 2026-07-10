@@ -430,7 +430,7 @@ func New(
 	// full payload. A malformed or absent body returns "" — the
 	// handler will 400 and the limiter will see all such requests
 	// bucketed under a single (cheap) "" key, which is the desired
-	// behavior (misformed bodies are upstream noise, not a
+	// behavior (malformed bodies are upstream noise, not a
 	// tenant-scoped signal).
 	//
 	// Body restoration is necessary because rate limiters run
