@@ -50,7 +50,7 @@ func syncHandler(worker *domain.Worker, workerErr error, builder syncPayloadBuil
 	if builder != nil {
 		b = builder
 	}
-	return NewInternalHandler(nil, workerSvc, nil, nil, nil, b, "", "", "")
+	return NewInternalHandler(nil, workerSvc, nil, nil, nil, b, "", "", "", middleware.WorkerJWTConfig{}, 0, "", "", nil)
 }
 
 // withSyncJWT attaches the same context values middleware.WorkerAuth

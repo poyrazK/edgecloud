@@ -4,6 +4,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -360,7 +361,29 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret)
+	//
+	// Issue #491: pass workerJWTConfig + workerTokenTTL + issuer +
+	// activeKID + tenantSvc for the POST /api/internal/worker-token
+	// mint endpoint. The four-value tuple of
+	// {JWTConfig + WorkerTokenTTL + Issuer + ActiveKID} mirrors the
+	// workerJWTConfig literal constructed at app.go:649-654 below;
+	// kept as a local struct literal rather than hoisted so the
+	// InternalHandler dependency stays explicit.
+	internalHandler := handler.NewInternalHandler(
+		deploymentSvc, workerSvc, domainSvc, logEntryRepo,
+		reconcileSvc, reconcileSvc,
+		cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret,
+		middleware.WorkerJWTConfig{
+			Secret:    cfg.JWT.Secret,
+			Issuer:    cfg.JWT.Issuer,
+			ActiveKID: cfg.JWT.ActiveKID,
+			Keys:      cfg.JWT.Keys,
+		},
+		cfg.JWT.WorkerTokenTTL,
+		cfg.JWT.Issuer,
+		cfg.JWT.ActiveKID,
+		tenantSvc,
+	)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -399,6 +422,38 @@ func New(
 	bootstrapLimiter := middleware.NewRateLimiter(2, 5)
 	// Tenant creation limiter: per-IP cap (10 per hour) to prevent DB fill.
 	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
+
+	// workerTokenTenantKey is the per-tenant key-extractor for the
+	// POST /api/internal/worker-token rate limiter (issue #491). It
+	// reads the request body's `tenant_id` JSON field without
+	// consuming the body so the handler's own decode still sees the
+	// full payload. A malformed or absent body returns "" — the
+	// handler will 400 and the limiter will see all such requests
+	// bucketed under a single (cheap) "" key, which is the desired
+	// behavior (misformed bodies are upstream noise, not a
+	// tenant-scoped signal).
+	//
+	// Body restoration is necessary because rate limiters run
+	// before the handler — without it, the handler's
+	// json.NewDecoder would see EOF instead of the original bytes.
+	// We use a buffered peek + TeeReader so the limiter's read does
+	// not steal the body from the downstream handler. The buffer is
+	// tiny (128 bytes is enough to span "tenant_id":"<value>" for
+	// any reasonable ID — anything longer falls through to "" but
+	// the handler still verifies length ≤ 64 chars upstream).
+	workerTokenTenantKey := func(r *http.Request) string {
+		var buf [128]byte
+		n, _ := io.ReadFull(io.LimitReader(r.Body, int64(len(buf))), buf[:])
+		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+		var peek struct {
+			TenantID string `json:"tenant_id"`
+		}
+		if n == 0 {
+			return ""
+		}
+		_ = json.Unmarshal(buf[:n], &peek)
+		return peek.TenantID
+	}
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -678,6 +733,26 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/workers/{workerID}/sync", internalHandler.Sync)
 	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
+	// Per-tenant worker-token mint endpoint (issue #491). Three
+	// rate limiters chain on the route — order matters: per-IP
+	// (cheapest) catches scanner floods first; per-worker is keyed
+	// off the JWT worker_id and bounds runaway clients; per-tenant
+	// is keyed off the request body's tenant_id and bounds a
+	// compromised worker trying to enumerate the tenant space.
+	workerTokenPerIP := middleware.NewRateLimiter(60, 30)
+	workerTokenPerWorker := middleware.NewRateLimiter(10, 5)
+	workerTokenPerTenant := middleware.NewRateLimiter(30, 10)
+	internalMux.Handle("POST /api/internal/worker-token",
+		workerTokenPerIP.Middleware(middleware.ClientIP)(
+			workerTokenPerWorker.Middleware(func(r *http.Request) string {
+				return middleware.GetWorkerID(r.Context())
+			})(
+				workerTokenPerTenant.Middleware(workerTokenTenantKey)(
+					http.HandlerFunc(internalHandler.MintWorkerToken),
+				),
+			),
+		),
+	)
 	// Custom-domain routes (issue #83). All three are gated to RoleIngest ONLY.
 	internalMux.Handle("GET /api/internal/domains", middleware.RequireWorkerRole(
 		middleware.RoleIngest,
