@@ -66,8 +66,13 @@
 //! ```
 //!
 //! Then `wasm-tools component new <core> --adapt
-//! wasi_snapshot_preview1.reactor.wasm -o <out>` wraps the core
-//! module into a component the edge-worker can instantiate.
+//! ../../edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm -o
+//! <out>` wraps the core module into a component the edge-worker can
+//! instantiate. The adapter is vendored in-repo (issue #423; SHA-256
+//! pinned in `edge-cli/adapters/SHA256SUMS` and verified by the
+//! `rust-js-build` CI job) so a fresh clone builds without any extra
+//! `cargo fetch` step. Override with `$EDGE_JS_WASI_ADAPTER` if your
+//! local toolchain needs a different one.
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 

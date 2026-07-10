@@ -29,10 +29,15 @@ const EXPECTED_HANDLER_HASH: &str =
 //   EDGE_JS_BUNDLE=$PWD/.edge/bundle.js \
 //     cargo build --target wasm32-wasip1 --release
 //   wasm-tools component new \
-//     $HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/hello_js_ws.wasm \
+//     <repo>/target-cache/edgecloud/wasm32-wasip1/release/hello_js_ws.wasm \
 //     --adapt \
-//     $HOME/.cargo/registry/src/index.crates.io-*/wasi-preview1-component-adapter-provider-45.0.3/artefacts/wasi_snapshot_preview1.reactor.wasm \
+//     ../../edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm \
 //     -o ../edge-worker/tests/fixtures/js_websocket_handler.wasm
+// (The reactor adapter is vendored at `edge-cli/adapters/` — see
+// `edge-cli/adapters/SHA256SUMS` for the pinned SHA-256; issue #423.
+// The vendored bytes are byte-identical to the prior
+// registry-sourced adapter, so the rebuild preserves this fixture's
+// hash.)
 const EXPECTED_JS_WEBSOCKET_HASH: &str =
     "5f785981710bc687f16b640e62a508f61b9aa00327b66caa2a35db09f9345c6e";
 
