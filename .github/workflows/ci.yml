@@ -229,6 +229,14 @@ jobs:
           # the registry-glob fallback. Proves the vendored file
           # is genuinely the source on a fresh clone.
           CARGO_HOME: ${{ runner.temp }}/edgecloud-js-build-cargo-home
+          # The two `cargo install` steps above used the job-scope
+          # `$CARGO_HOME=$HOME/.cargo`, so `edge-cli` lives at
+          # `$HOME/.cargo/bin/edge-cli` — not in the tempdir we
+          # reassigned CARGO_HOME to. Prepend that explicit path
+          # to PATH so this step can find `edge-cli` AND any nested
+          # `cargo` invocation still uses the tempdir CARGO_HOME
+          # (no polluted registry).
+          PATH: $HOME/.cargo/bin:${{ env.PATH }}
           # Override the job-scope RUSTFLAGS: the wasm32-wasip1
           # target uses rust-lld, which rejects `-fuse-ld=mold`
           # (`unknown argument: -fuse-ld=mold`). The flag only
