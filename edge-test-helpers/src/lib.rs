@@ -80,12 +80,18 @@ pub fn should_skip_integration_tests() -> bool {
 /// stops the container and NATS connections will fail) plus the
 /// `host:port` URL the worker should connect to.
 ///
+/// JetStream is enabled (`nats-server -js`) — the official image
+/// defaults to core-NATS only, and `subscribe_tasks`'s
+/// `ensure_task_stream` then fails with `jetstream request timed out`.
+/// Core-NATS-only tests (heartbeat pub/sub) are unaffected by the flag.
+///
 /// Uses a duration-based ready-condition (5s) rather than the
 /// built-in `WaitFor::Log` matcher — the latter can match stderr output
 /// that arrives before the listener is actually accepting connections,
 /// especially in CI where container I/O can be reordered.
 pub async fn start_nats() -> (ContainerAsync<Nats>, String) {
-    let container: ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
+    let cmd = testcontainers_modules::nats::NatsServerCmd::default().with_jetstream();
+    let container: ContainerAsync<Nats> = ContainerRequest::from(Nats::default().with_cmd(&cmd))
         .with_startup_timeout(Duration::from_secs(30))
         .with_ready_conditions(vec![WaitFor::Duration {
             length: Duration::from_secs(5),
