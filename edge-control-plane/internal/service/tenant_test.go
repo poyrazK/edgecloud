@@ -21,11 +21,12 @@ import (
 // mockTenantSvcRepo mocks tenantRepoForTenantSvc. Note the name is distinct
 // from worker_test.go's mockTenantRepo.
 type mockTenantSvcRepo struct {
-	createFn  func(ctx context.Context, tenant *domain.Tenant) error
-	getByIDFn func(ctx context.Context, id string) (*domain.Tenant, error)
-	listFn    func(ctx context.Context) ([]domain.Tenant, error)
-	updateFn  func(ctx context.Context, tenant *domain.Tenant) error
-	deleteFn  func(ctx context.Context, id string) error
+	createFn          func(ctx context.Context, tenant *domain.Tenant) error
+	getByIDFn         func(ctx context.Context, id string) (*domain.Tenant, error)
+	listFn            func(ctx context.Context) ([]domain.Tenant, error)
+	updateFn          func(ctx context.Context, tenant *domain.Tenant) error
+	deleteFn          func(ctx context.Context, id string) error
+	clearDisabledAtFn func(ctx context.Context, tenantID string) error
 }
 
 var _ tenantRepoForTenantSvc = (*mockTenantSvcRepo)(nil)
@@ -58,6 +59,13 @@ func (m *mockTenantSvcRepo) Update(ctx context.Context, tenant *domain.Tenant) e
 func (m *mockTenantSvcRepo) Delete(ctx context.Context, id string) error {
 	if m.deleteFn != nil {
 		return m.deleteFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *mockTenantSvcRepo) ClearDisabledAt(ctx context.Context, tenantID string) error {
+	if m.clearDisabledAtFn != nil {
+		return m.clearDisabledAtFn(ctx, tenantID)
 	}
 	return nil
 }

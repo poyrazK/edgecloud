@@ -257,3 +257,23 @@ func (h *TenantHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	auditRecord(r, "delete", "tenant", tenantID, "tenant "+tenantID+" deleted", "success")
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// Enable clears tenants.disabled_at for a tenant that the quota
+// path previously stamped (issue #440). Owner-only admin
+// operation. Idempotent: calling on an already-enabled tenant is
+// a 200 with no state change.
+//
+// Path: POST /api/v1/admin/tenants/{tenantID}/enable
+func (h *TenantHandler) Enable(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	if err := h.tenantSvc.EnableTenant(r.Context(), tenantID); err != nil {
+		if errors.Is(err, service.ErrTenantNotFound) {
+			httperror.NotFoundCtx(w, r, "tenant not found")
+			return
+		}
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	auditRecord(r, "enable", "tenant", tenantID, "tenant "+tenantID+" re-enabled", "success")
+	w.WriteHeader(http.StatusOK)
+}

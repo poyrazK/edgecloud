@@ -53,6 +53,10 @@ func (m *mockAuthTenantSvc) GetQuota(ctx context.Context, tenantID string) (*dom
 	panic("not used by Whoami")
 }
 
+func (m *mockAuthTenantSvc) EnableTenant(ctx context.Context, tenantID string) error {
+	panic("not used by Whoami")
+}
+
 // mockAPIKeySvc is a minimal mock for service.APIKeyServiceInterface —
 // just the GetByID method used by Whoami.
 type mockAPIKeySvc struct {

@@ -448,6 +448,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("PUT /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("DELETE /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
+	mux.HandleFunc("POST /api/admin/tenants/{tenantID}/enable", redirectTo("/api/v1/admin/tenants/"+"{tenantID}/enable"))
 	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
 
@@ -510,6 +511,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("GET /api/v1/admin/tenants/{tenantID}", tenantHandler.Get)
 	admin.HandleFunc("PUT /api/v1/admin/tenants/{tenantID}", tenantHandler.Update)
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
+	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/enable", tenantHandler.Enable)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
 	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)

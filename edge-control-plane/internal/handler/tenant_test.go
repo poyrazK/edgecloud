@@ -33,6 +33,9 @@ type mockTenantSvc struct {
 	deleteTenantErr     error
 	getQuotaResp        *domain.Quota
 	getQuotaErr         error
+	enableTenantErr     error
+	enableTenantCalls   int
+	enableTenantLastID  string
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
@@ -84,6 +87,12 @@ func (m *mockTenantSvc) GetQuota(ctx context.Context, tenantID string) (*domain.
 		return nil, m.getQuotaErr
 	}
 	return m.getQuotaResp, nil
+}
+
+func (m *mockTenantSvc) EnableTenant(ctx context.Context, tenantID string) error {
+	m.enableTenantCalls++
+	m.enableTenantLastID = tenantID
+	return m.enableTenantErr
 }
 
 // ---------------------------------------------------------------------------

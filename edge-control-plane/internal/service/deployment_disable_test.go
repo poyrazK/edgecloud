@@ -239,18 +239,27 @@ func TestActivateDeployment_DisabledAtPostCommit_ReturnsErrTenantDisabled(t *tes
 }
 
 // TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty
-// pins the happy path: no racing activate commits between the in-tx
-// snapshot and the post-commit read, so the empty task_update is
-// published per region.
+// pins the happy path: no in-flight activate row has a NULL
+// last_publish_at, so the disable path enters no wait and publishes
+// empty per region.
 func TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty(t *testing.T) {
 	buf, restore := captureLogger(t)
 	defer restore()
 
 	regions := []string{"us-east", "eu-west"}
 	svc, mock, js, cleanup := workerSvcForDisableTest(t, func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
-		// Fresh post-commit read: same rows as the in-tx snapshot.
+		// Post-commit read: one row, last_publish_at non-NULL
+		// (publishSwap completed well before disable arrived).
+		priorPublish := time.Now().Add(-1 * time.Second)
 		return []domain.ActiveDeployment{
-			{TenantID: "t_a", AppName: "app1", DeploymentID: "d_1", RegionsPublished: regions},
+			{
+				TenantID:                   "t_a",
+				AppName:                    "app1",
+				DeploymentID:               "d_1",
+				RegionsPublished:           regions,
+				LastPublishAt:              &priorPublish,
+				ActivationAttemptStartedAt: nil,
+			},
 		}, nil
 	})
 	defer cleanup()
@@ -265,13 +274,6 @@ func TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty(t *testing.
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// In-tx ListByTenant returns the pre-commit snapshot.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}).
-			AddRow(tenantID, "app1", "d_1", nil, false, nil,
-				pq.Array(regions), pq.Array([]string{}), pq.Array([]string{}), pq.Array([]string{}),
-				nil, nil, nil, nil, nil))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
@@ -305,22 +307,42 @@ func TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty(t *testing.
 	}
 }
 
-// TestDisableTenantAtomically_RacingActivateSucceeded_SkipsEmptyPublish
-// pins the diff guard: when the post-commit read returns a fresh
-// active row that wasn't in the in-tx snapshot (a racing activate won
-// the tenant-row lock first and committed in our snapshot window), the
-// empty publish is skipped — the racing activate's task_update is
-// already on the wire and publishing empty would kill the just-started
-// app.
-func TestDisableTenantAtomically_RacingActivateSucceeded_SkipsEmptyPublish(t *testing.T) {
-	buf, restore := captureLogger(t)
+// TestDisableTenantAtomically_RacingActivatePublishCompleted_PublishesEmpty
+// pins the post-redesign behavior (issue #440 fix, commit 3):
+// when the racing activate's publishSwap has already stamped
+// last_publish_at by the time the disable path checks, the disable
+// path enters no wait loop and publishes empty immediately. The
+// activate's task_update is already on the wire; the disable's
+// empty lands after — JetStream per-subject ordering is the
+// de-facto guarantee on the worker side (H5 follow-up adds a
+// generation token).
+//
+// The (rare) case where the racing activate's publish hasn't
+// completed yet — driving the new wait loop — is covered by
+// commit 9's TestDisableTenantAtomically_WaitsForInFlight
+// ActivatePublishes / …WaitTimeoutExitsAndPublishes.
+func TestDisableTenantAtomically_RacingActivatePublishCompleted_PublishesEmpty(t *testing.T) {
+	_, restore := captureLogger(t)
 	defer restore()
 
+	now := time.Now()
+	priorPublish := now.Add(-1 * time.Second)
 	svc, mock, js, cleanup := workerSvcForDisableTest(t, func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
-		// Fresh post-commit read: a NEW (tenant, app) pair that wasn't
-		// in the in-tx snapshot.
+		// Post-commit read: one racing-activate row whose
+		// publishSwap already completed (LastPublishAt set).
+		// Old commit-1's diff guard would have made the disable
+		// path skip the empty publish here; post-redesign we
+		// publish empty anyway — the activate's on-the-wire
+		// message reaches workers before the disable's empty,
+		// guaranteed by JetStream per-subject ordering.
 		return []domain.ActiveDeployment{
-			{TenantID: "t_a", AppName: "fresh", DeploymentID: "d_fresh"},
+			{
+				TenantID:                   "t_a",
+				AppName:                    "fresh",
+				DeploymentID:               "d_fresh",
+				ActivationAttemptStartedAt: &now,
+				LastPublishAt:              &priorPublish,
+			},
 		}, nil
 	})
 	defer cleanup()
@@ -335,28 +357,14 @@ func TestDisableTenantAtomically_RacingActivateSucceeded_SkipsEmptyPublish(t *te
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// In-tx snapshot: empty (no active rows).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
 		t.Fatalf("disableTenantAtomically: %v", err)
 	}
 
-	if len(js.publishes) != 0 {
-		t.Errorf("publish count = %d, want 0 (racing-activate detected)", len(js.publishes))
-		for _, p := range js.publishes {
-			t.Logf("  unexpected publish: subject=%s data=%s", p.subject, string(p.data))
-		}
-	}
-	out := buf.String()
-	if !strings.Contains(out, "racing-activate detected") {
-		t.Errorf("missing skip log line; got %q", out)
-	}
-	if !strings.Contains(out, "fresh=d_fresh") {
-		t.Errorf("skip log missing (app=deployment) pair; got %q", out)
+	if len(js.publishes) == 0 {
+		t.Errorf("publish count = 0, want ≥1 (post-redesign publish empty even when racing activate completed)")
 	}
 }
 
@@ -385,9 +393,6 @@ func TestDisableTenantAtomically_EmptyActiveList_NoPublish(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
@@ -396,64 +401,6 @@ func TestDisableTenantAtomically_EmptyActiveList_NoPublish(t *testing.T) {
 
 	if len(js.publishes) != 0 {
 		t.Errorf("publish count = %d, want 0 (no active rows ⇒ no publish)", len(js.publishes))
-	}
-}
-
-// TestDiffActiveDeployments is a small table-driven check on the diff
-// helper, separate from the SQL-level integration tests above so a
-// regression in the set comparison is easy to localize.
-func TestDiffActiveDeployments(t *testing.T) {
-	cases := []struct {
-		name     string
-		baseline []domain.ActiveDeployment
-		now      []domain.ActiveDeployment
-		want     int
-	}{
-		{
-			name:     "empty baseline returns now verbatim",
-			baseline: nil,
-			now:      []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d"}},
-			want:     1,
-		},
-		{
-			name:     "identical rows return empty",
-			baseline: []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d"}},
-			now:      []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d"}},
-			want:     0,
-		},
-		{
-			// Diff keys on (tenant, app) only — a deployment_id flip
-			// on an existing (tenant, app) does NOT register as new.
-			// This is intentional: the racing-activate guard cares
-			// about brand-new (tenant, app) pairs that the worker
-			// would otherwise kill with the empty task_update. A
-			// swap on a known (tenant, app) means the racing
-			// activate wrote a NEW deployment_id into the SAME row;
-			// both publishes were issued against the same
-			// active_deployments primary key, so the worker still
-			// converges on the latest deployment.
-			name:     "deployment_id swap on existing app does NOT count as new",
-			baseline: []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d1"}},
-			now:      []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d2"}},
-			want:     0,
-		},
-		{
-			name:     "unrelated app added → 1 added",
-			baseline: []domain.ActiveDeployment{{TenantID: "t", AppName: "a", DeploymentID: "d"}},
-			now: []domain.ActiveDeployment{
-				{TenantID: "t", AppName: "a", DeploymentID: "d"},
-				{TenantID: "t", AppName: "b", DeploymentID: "d2"},
-			},
-			want: 1,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := diffActiveDeployments(tc.baseline, tc.now)
-			if len(got) != tc.want {
-				t.Errorf("diff size = %d, want %d", len(got), tc.want)
-			}
-		})
 	}
 }
 

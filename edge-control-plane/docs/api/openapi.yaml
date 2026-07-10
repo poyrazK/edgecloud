@@ -2844,6 +2844,38 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/admin/tenants/{tenantID}/enable:
+    post:
+      operationId: enableTenant
+      summary: Re-enable a tenant disabled by quota-exceeded (admin only)
+      description: |
+        Clears tenants.disabled_at for a tenant that the quota-exceeded
+        path stamped via SetDisabledAt (issue #440). Subsequent
+        activate / rollback / deploy requests proceed without
+        returning 409 tenant_disabled.
+
+        Idempotent: calling on an already-enabled tenant is a 200
+        with no state change.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tenant re-enabled. The disabled_at column has been cleared.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # -------------------------------------------------------------------------
   # Admin: Apps
   # -------------------------------------------------------------------------
