@@ -48,30 +48,6 @@ matching `wasi:http@0.2.1` interface. The `wasm-tools 1.252.x` default
 adapter is what makes the wrap step "just work" — no `--adapt` flag
 required.
 
-### Verifying the CLI's WIT embed (issue #592)
-
-When `edge init --lang=rust` (the equivalent scaffold command)
-materializes a `wit/` tree into a fresh project, the bytes come from
-the CLI binary's compiled-in `WIT_TREE` static — that's how the
-project builds offline. If a developer installs a CLI that was built
-**before** a recent `wit/` edit, the scaffold quietly writes stale
-WIT into the project and the user's linker fails far from the cause.
-
-To catch a stale install at scaffold time, opt into the byte-comparison
-check:
-
-```sh
-EDGE_VERIFY_EMBED=1 edge init my-app --lang=rust
-```
-
-The command exits non-zero if the freshly-written `my-app/wit/`
-drifts from the embedded `WIT_TREE`, and the error message points
-at `cargo install --path edge-cli --locked` to refresh the embed.
-CI merges are already guarded by the
-`wit_embed_matches_canonical_wit_tree` unit test, so this flag is
-only useful on developer machines where the binary is decoupled
-from the source tree.
-
 ## Deploy
 
 ```sh

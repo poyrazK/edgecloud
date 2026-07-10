@@ -25,9 +25,9 @@
 //! (1) ↔ (2) is guarded by `wit-drift-check` CI. (1) ↔ (3) is set at
 //! compile time via the `build.rs` rerun hook — when `wit/` changes,
 //! the CLI rebuilds and the new embed is picked up automatically.
-//! The matching drift test lives at
-//! `wit_embed_matches_canonical_wit_tree` below; it runs as part of
-//! the existing `rust-test` job (no new CI step needed).
+//! `wit_embed_matches_canonical_wit_tree` (below) re-asserts the
+//! (1) ↔ (3) match at every `cargo test` run as part of the existing
+//! `rust-test` job — so a CI merge cannot ship with a stale embed.
 //!
 //! Related memory: `wit-canonical-location`.
 
@@ -101,82 +101,6 @@ fn write_dir(target: &Path, dir: &Dir) -> Result<()> {
                 }
                 std::fs::write(&dest, f.contents())
                     .with_context(|| format!("write {}", dest.display()))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Compare every file in `WIT_TREE` against the on-disk tree rooted
-/// at `disk_root`. Returns `Ok(())` if every file in the embed has a
-/// matching on-disk copy with identical bytes. Returns
-/// `Err(anyhow::Error)` with a drifted-path message and the rebuild
-/// command if any file is missing from disk or has different bytes.
-///
-/// Mirrors `write_dir` directly (same embed-rooted-path gotcha: the
-/// `Dir` arm recurses with the leaf-name, the `File` arm strips the
-/// embed-rooted prefix to land on the leaf-relative relpath).
-///
-/// Issue #592: this lets the `EDGE_VERIFY_EMBED=1` runtime check in
-/// `edge init --lang=rust` catch a stale CLI install on a developer
-/// machine without rebuilding — a situation the `cargo test` unit
-/// test cannot detect (the unit test always rebuilds before running).
-pub(crate) fn verify_embed_matches_disk(disk_root: &Path) -> Result<()> {
-    diff_against_disk(disk_root, &WIT_TREE)
-}
-
-/// Recursive helper used by `verify_embed_matches_disk`. Mirrors
-/// `write_dir` (same embed-rooted-path gotcha: `DirEntry::Dir::path()`
-/// is embed-rooted, so the `Dir` arm recurses with the leaf-name; the
-/// `File` arm `strip_prefix`-es to the leaf-relative relpath). Returns
-/// `Err(anyhow::Error)` on the first drifted file — the unit test
-/// (`wit_embed_matches_canonical_wit_tree`) calls this and `.unwrap()`s
-/// to keep the panic-shaped test failure mode.
-fn diff_against_disk(disk_root: &Path, embed: &Dir) -> Result<()> {
-    use include_dir::DirEntry;
-    for entry in embed.entries() {
-        match entry {
-            DirEntry::Dir(sub) => {
-                // `sub.path()` is embed-rooted; we want only the
-                // leaf segment to walk down `disk_root`.
-                let name = sub.path().file_name().ok_or_else(|| {
-                    anyhow::anyhow!("embed DirEntry::Dir has no leaf name: {:?}", sub.path())
-                })?;
-                diff_against_disk(&disk_root.join(name), sub)?;
-            }
-            DirEntry::File(f) => {
-                // Strip the embed-rooted prefix (e.g. `deps/cli/...`)
-                // back to the leaf relative to `embed` (e.g.
-                // `command.wit`) before joining onto `disk_root`.
-                let rel = f
-                    .path()
-                    .strip_prefix(embed.path())
-                    .unwrap_or(f.path())
-                    .to_path_buf();
-                let on_disk_path = disk_root.join(&rel);
-                // `f.path()` is embed-rooted — the string a developer
-                // would grep against `wit/` to find the file.
-                let canonical_rel = f.path().to_string_lossy().into_owned();
-                let rebuild_hint = "rebuild with `cargo install --path edge-cli --locked` \
-                                    to refresh the embed";
-                let on_disk = std::fs::read(&on_disk_path).map_err(|e| {
-                    anyhow::anyhow!(
-                        "WIT_TREE embed references {canonical_rel:?} (looked at {}) but \
-                         the canonical tree has no matching file (read error: {e}). \
-                         This usually means `wit/` was edited after the CLI was built; \
-                         {rebuild_hint}.",
-                        on_disk_path.display()
-                    )
-                })?;
-                let embedded = f.contents();
-                if on_disk.as_slice() != embedded {
-                    return Err(anyhow::anyhow!(
-                        "WIT_TREE embed of {canonical_rel:?} is stale — the canonical `wit/` \
-                         tree at {} has different bytes than what the CLI binary embedded \
-                         at compile time. {rebuild_hint}.",
-                        on_disk_path.display()
-                    ));
-                }
             }
         }
     }
@@ -320,12 +244,117 @@ mod tests {
     #[test]
     fn wit_embed_matches_canonical_wit_tree() {
         let canonical_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wit");
-        // `.unwrap()` keeps the test's panic-shaped failure mode.
-        // `diff_against_disk` returns `Result` so the
-        // `EDGE_VERIFY_EMBED=1` runtime check (Commit 2) can surface
-        // the same error message as `anyhow::Error` instead of a
-        // panic.
         diff_against_disk(&canonical_root, &WIT_TREE)
             .expect("WIT_TREE embed matches canonical wit/");
+    }
+
+    /// Counterpart to `wit_embed_matches_canonical_wit_tree`: lock the
+    /// negative contract. Materializes the embed to a tempdir via
+    /// `write_wit_tree`, mutates one file, and asserts `diff_against_disk`
+    /// returns `Err` naming the drifted file and the rebuild command.
+    /// Without this, the negative path is "the operator manually edited
+    /// `wit/`" — never exercised in CI.
+    #[test]
+    fn wit_embed_drift_detected_with_tampered_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path();
+
+        // Write the embed to disk so the byte comparison has a real
+        // disk tree to compare against.
+        crate::scaffold::wit::write_wit_tree(project).expect("first write");
+
+        // Tamper one file in place — drop a known-bogus byte in.
+        let target = project.join("wit/edge-cloud.wit");
+        std::fs::write(&target, b"// drifted from canonical\n").expect("tamper");
+
+        let err = diff_against_disk(&project.join("wit"), &WIT_TREE)
+            .expect_err("drifted tree must fail the check");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("edge-cloud.wit") || msg.contains("stale"),
+            "drift error must name the drifted file or its state; got: {msg}"
+        );
+        assert!(
+            msg.contains("cargo install --path edge-cli --locked"),
+            "drift error must point at the rebuild command; got: {msg}"
+        );
+    }
+
+    /// Counterpart to the above: if the embed references a file that
+    /// has been removed from the canonical tree (e.g. a `.wit` got
+    /// renamed and the stale binary still carries it), the diff must
+    /// bail with a clear error rather than silently passing or panicking.
+    #[test]
+    fn wit_embed_missing_on_disk_surfaces_read_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path();
+
+        crate::scaffold::wit::write_wit_tree(project).expect("first write");
+
+        // Delete a file the embed expects — simulates the canonical
+        // tree having moved on while this binary's embed hasn't.
+        let target = project.join("wit/edge-cloud.wit");
+        std::fs::remove_file(&target).expect("remove file");
+
+        let err = diff_against_disk(&project.join("wit"), &WIT_TREE)
+            .expect_err("missing file must fail the check");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("edge-cloud.wit"),
+            "missing-file error must name the absent file; got: {msg}"
+        );
+        assert!(
+            msg.contains("cargo install --path edge-cli --locked"),
+            "missing-file error must point at the rebuild command; got: {msg}"
+        );
+    }
+
+    /// Recursive byte-comparison helper used by the three tests
+    /// above. Mirrors `write_dir` (same embed-rooted-path gotcha:
+    /// `DirEntry::Dir::path()` is embed-rooted, so the `Dir` arm
+    /// recurses with the leaf-name; the `File` arm `strip_prefix`-es
+    /// to the leaf-relative relpath). Returns `Err(anyhow::Error)`
+    /// on the first drifted or missing file.
+    fn diff_against_disk(disk_root: &Path, embed: &Dir) -> Result<()> {
+        for entry in embed.entries() {
+            match entry {
+                DirEntry::Dir(sub) => {
+                    let name = sub.path().file_name().ok_or_else(|| {
+                        anyhow::anyhow!("embed DirEntry::Dir has no leaf name: {:?}", sub.path())
+                    })?;
+                    diff_against_disk(&disk_root.join(name), sub)?;
+                }
+                DirEntry::File(f) => {
+                    let rel = f
+                        .path()
+                        .strip_prefix(embed.path())
+                        .unwrap_or(f.path())
+                        .to_path_buf();
+                    let on_disk_path = disk_root.join(&rel);
+                    let canonical_rel = f.path().to_string_lossy().into_owned();
+                    let rebuild_hint = "rebuild with `cargo install --path edge-cli --locked` \
+                                        to refresh the embed";
+                    let on_disk = std::fs::read(&on_disk_path).map_err(|e| {
+                        anyhow::anyhow!(
+                            "WIT_TREE embed references {canonical_rel:?} (looked at {}) but \
+                             the canonical tree has no matching file (read error: {e}). \
+                             This usually means `wit/` was edited after the CLI was built; \
+                             {rebuild_hint}.",
+                            on_disk_path.display()
+                        )
+                    })?;
+                    let embedded = f.contents();
+                    if on_disk.as_slice() != embedded {
+                        return Err(anyhow::anyhow!(
+                            "WIT_TREE embed of {canonical_rel:?} is stale — the canonical `wit/` \
+                             tree at {} has different bytes than what the CLI binary embedded \
+                             at compile time. {rebuild_hint}.",
+                            on_disk_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

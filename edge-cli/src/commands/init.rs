@@ -25,7 +25,7 @@ use crate::scaffold::templates::{
     EDGE_TOML_RUST_TAIL, GITIGNORE, JS_HANDLER_TEMPLATE, LIB_RS_TEMPLATE, PACKAGE_JSON_TEMPLATE,
 };
 use crate::LangArg;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Scaffold a new edgeCloud project.
 ///
@@ -37,14 +37,6 @@ use anyhow::{Context, Result};
 /// `lang` selects the starter template. `Rust` (the default) writes a
 /// Cargo project; `Js` writes a Javascript project using esbuild and the JS SDK.
 /// The choice is persisted to `[project] language` in `edge.toml`.
-///
-/// Environment variables:
-/// - `EDGE_VERIFY_EMBED=1` — after writing the scaffolded `wit/`
-///   (Rust starter only), byte-compare the freshly-written tree
-///   against the CLI's compiled-in `WIT_TREE` and `bail!` on drift.
-///   Catches a stale CLI install (one built before a recent
-///   `wit/` edit). Off by default; the CI merge-gate guard is the
-///   `wit_embed_matches_canonical_wit_tree` unit test, see #592.
 pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
     let dir = std::path::Path::new(name);
 
@@ -88,15 +80,6 @@ pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
 /// The `src/lib.rs` body wires `wit_bindgen::generate!({ path: "wit" })`
 /// against the vendored tree, so the project builds offline outside the
 /// monorepo. `samples/hello/` is the reference for every line here.
-///
-/// Setting `EDGE_VERIFY_EMBED=1` after `write_wit_tree` runs a
-/// byte-for-byte check between `WIT_TREE` and the freshly-written
-/// `wit/` on disk — surfaces a stale CLI install (one built before
-/// the most recent `wit/` edit) loudly instead of silently shipping
-/// outdated WIT into the scaffolded project. Off by default so the
-/// normal path doesn't pay the recursive-walk cost; CI doesn't set
-/// it (the unit test in `scaffold::wit::tests` already runs in
-/// `rust-test` and provides the merge-gate guard — see #592).
 fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
     write_edge_toml(dir, name, LangArg::Rust, api)?;
 
@@ -111,13 +94,6 @@ fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result
     // the template rewrite lands independently — the e2e test (commit 3)
     // asserts the `wit/` files actually appear after this returns.
     crate::scaffold::wit::write_wit_tree(dir)?;
-
-    if std::env::var_os("EDGE_VERIFY_EMBED").is_some() {
-        let wit_dir = dir.join("wit");
-        crate::scaffold::wit::verify_embed_matches_disk(&wit_dir).context(
-            "EDGE_VERIFY_EMBED=1: the embedded WIT_TREE doesn't match what the CLI just wrote",
-        )?;
-    }
 
     std::fs::write(dir.join(".gitignore"), GITIGNORE)?;
     Ok(())
