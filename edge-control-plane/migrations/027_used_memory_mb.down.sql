@@ -5,4 +5,5 @@
 -- restored (MaxMemoryMB is once again only used as a TaskMessage hint,
 -- no per-tenant aggregate cap).
 
+ALTER TABLE quotas DROP CONSTRAINT IF EXISTS quotas_used_memory_mb_nonneg;
 ALTER TABLE quotas DROP COLUMN IF EXISTS used_memory_mb;

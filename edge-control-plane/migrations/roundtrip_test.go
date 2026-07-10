@@ -141,6 +141,7 @@ var wantColumns = map[string][]string{
 		"max_requests_per_month", // 013
 		"used_request_count",     // 013
 		"quota_lock_grace_until", // 025_quotas_grace_columns (issue #420)
+		"used_memory_mb",         // 027_used_memory_mb (issue #44 part 2)
 	},
 	"api_keys": {
 		"id",
@@ -898,6 +899,7 @@ var wantChecks = map[string]string{
 	"api_keys.api_keys_hash_algorithm_check":             "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",           // 005_api_key_hash_algorithm
 	"app_traffic_splits.app_traffic_splits_weight_check": "CHECK (((weight >= 0) AND (weight <= 100)))",                                        // 009_traffic_splits
 	"autoscale_events.autoscale_events_action_check":     "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))", // 012_autoscale_events
+	"quotas.quotas_used_memory_mb_nonneg":                "CHECK ((used_memory_mb >= 0))",                                                      // 027_used_memory_mb (issue #44 part 2)
 }
 
 // wantDefaults enumerates every public-schema column that has a

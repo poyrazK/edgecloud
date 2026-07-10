@@ -19,3 +19,16 @@
 -- and the next deploy catches the over-cap state.
 
 ALTER TABLE quotas ADD COLUMN used_memory_mb BIGINT NOT NULL DEFAULT 0;
+
+-- Defense-in-depth: used_memory_mb only legitimately moves in one
+-- direction. The activate path increments by +perApp, the rollback
+-- path increments by ±perApp via the active-row swap, and no other
+-- write path touches it. A negative value can only result from a
+-- bug — a stray operator UPDATE, a double-decrement, or a future
+-- refactor that drops the per-tenant scope. The CHECK surfaces such
+-- bugs as constraint violations at write time instead of silent
+-- drift. Idempotent re-apply follows the 005_api_key_hash_algorithm
+-- pattern: DROP IF EXISTS + ADD.
+ALTER TABLE quotas DROP CONSTRAINT IF EXISTS quotas_used_memory_mb_nonneg;
+ALTER TABLE quotas ADD CONSTRAINT quotas_used_memory_mb_nonneg
+    CHECK (used_memory_mb >= 0);
