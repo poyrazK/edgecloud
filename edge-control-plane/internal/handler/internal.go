@@ -761,12 +761,23 @@ type WorkerTokenResponse struct {
 // before constructing outbound paths, so a CP-side match keeps the
 // verifier's failure modes consistent across both ends.
 //
+// The charset ([a-z0-9_-]) is the same shape the `tenants.id` DB
+// column uses in practice (see CLAUDE.md — IDs are prefixed `t_`,
+// lowercase alnum + underscore + dash). A future PR that loosens the
+// column regex MUST also loosen this regex AND revisit the audit-log
+// `Details` strings in MintWorkerToken — the validator is what keeps
+// worker-controlled tenant_id values from smuggling log-injection
+// content into the audit table.
+//
 // The wildcard (`*`) and empty string checks live here, not in
 // IsSharedWorker — the refusal-to-mint guard's job is to shut down a
 // class of misuse upstream, before the verifier sees a token whose
 // `TenantID` is the wildcard. `Download` and `AutoRollback` both treat
 // wildcard as "trusted" (their IsSharedWorker branch escalates access);
-// the mint endpoint must never produce such a token.
+// the mint endpoint must never produce such a token. The regex itself
+// would also reject `*` (the character class doesn't include it), so
+// the explicit check is defense-in-depth for the failure mode where a
+// future PR loosens the charset.
 func isSafeTenantID(s string) error {
 	if s == "" {
 		return errors.New("tenant_id is required")

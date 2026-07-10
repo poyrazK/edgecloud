@@ -35,6 +35,18 @@ func (m *mockTenantGetter) GetByID(_ context.Context, id string) (*domain.Tenant
 	return t, nil
 }
 
+// nilOnMissingTenantGetter mirrors the production
+// repository.TenantRepository.GetByID contract: not-found returns
+// (nil, nil), not a typed error. Used by
+// TestMintWorkerToken_NilTenantDoesNotPanic to regression-pin the
+// service-layer (nil, nil) → ErrTenantNotFound translation that
+// PR #491 review flagged as a handler-side nil-deref foot-gun.
+type nilOnMissingTenantGetter struct{}
+
+func (nilOnMissingTenantGetter) GetByID(_ context.Context, _ string) (*domain.Tenant, error) {
+	return nil, nil
+}
+
 func enabledTenant(id string) *domain.Tenant {
 	return &domain.Tenant{ID: id}
 }
@@ -320,13 +332,18 @@ func TestMintWorkerToken_CustomTTL(t *testing.T) {
 }
 
 // Case 8 (audit log): every success emits an audit-record with
-// action="worker_token_mint" and outcome="success". Wire DefaultAuditor
-// to a *service.Auditor whose repo is nil — Record is then a no-op
-// (no panic), and we assert the handler doesn't blow up with the
-// auditor wired. A full sqlmock capture belongs in an integration test.
-func TestMintWorkerToken_AuditLog(t *testing.T) {
+// action="worker_token_mint" and outcome="success". Wires
+// DefaultAuditor to a custom AuditRecorder spy that captures every
+// Record call so the assertion matches the implementation, not the
+// "no panic" smoke-test the previous version was actually exercising.
+//
+// The spy is in-package (declared below) — the AuditRecorder seam
+// added to audithelper.go lets us substitute without spinning up
+// sqlmock just to assert a single Record call.
+func TestMintWorkerToken_AuditLog_SuccessCaptured(t *testing.T) {
+	spy := &auditSpy{}
 	oldAuditor := DefaultAuditor
-	DefaultAuditor = service.NewAuditor(nil)
+	DefaultAuditor = spy
 	defer func() { DefaultAuditor = oldAuditor }()
 
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
@@ -335,14 +352,73 @@ func TestMintWorkerToken_AuditLog(t *testing.T) {
 	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+		t.Fatalf("expected 200, got %d", w.Code)
 	}
 
-	// Refusal paths must also audit — smoke-test the failure branch.
-	w2, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "*"})
-	if w2.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 on wildcard, got %d", w2.Code)
+	if got := len(spy.events); got != 1 {
+		t.Fatalf("expected 1 audit event, got %d (%+v)", got, spy.events)
 	}
+	ev := spy.events[0]
+	if ev.Action != "worker_token_mint" {
+		t.Errorf("expected Action=worker_token_mint, got %q", ev.Action)
+	}
+	if ev.Outcome != "success" {
+		t.Errorf("expected Outcome=success, got %q", ev.Outcome)
+	}
+	if ev.ResourceID != "t_real" {
+		t.Errorf("expected ResourceID=t_real, got %q", ev.ResourceID)
+	}
+	if !strings.Contains(ev.Details, workerTokenTestBootstrapped) {
+		t.Errorf("expected Details to mention worker_id %q, got %q", workerTokenTestBootstrapped, ev.Details)
+	}
+}
+
+// Case 8b (audit log — failure path): the wildcard refusal still
+// emits an audit record with outcome="failure". Closes the
+// audit-log visibility hole on a class of inputs that 400s upstream
+// of signing.
+func TestMintWorkerToken_AuditLog_FailureCaptured(t *testing.T) {
+	spy := &auditSpy{}
+	oldAuditor := DefaultAuditor
+	DefaultAuditor = spy
+	defer func() { DefaultAuditor = oldAuditor }()
+
+	tg := &mockTenantGetter{}
+	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "*"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+
+	if got := len(spy.events); got != 1 {
+		t.Fatalf("expected 1 audit event, got %d (%+v)", got, spy.events)
+	}
+	if spy.events[0].Outcome != "failure" {
+		t.Errorf("expected Outcome=failure, got %q", spy.events[0].Outcome)
+	}
+}
+
+// auditSpy is the in-package AuditRecorder used by the mint-endpoint
+// audit tests. Append-only; tests assert on the captured slice.
+type auditSpy struct {
+	events []service.AuditInfo
+}
+
+func (s *auditSpy) Record(info service.AuditInfo) {
+	s.events = append(s.events, info)
+}
+
+// TestAuditRecord_NilAuditor pins the no-panic contract from
+// audithelper_test.go:38 — moved here because the new
+// AuditRecorder interface seam (vs. the old *service.Auditor) could
+// regress the nil-check.
+func TestAuditRecord_NilAuditor_AfterSeam(t *testing.T) {
+	oldAuditor := DefaultAuditor
+	DefaultAuditor = nil
+	defer func() { DefaultAuditor = oldAuditor }()
+
+	// Should not panic when auditor is nil.
+	auditRecord(httptest.NewRequest("POST", "/x", nil), "test", "x", "y", "", "success")
 }
 
 // Case 9 (auth gate): the endpoint must reject requests with no
