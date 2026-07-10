@@ -66,7 +66,7 @@ fn edge_js_runtime_wasm_path() -> PathBuf {
         format!("{home}/.cache/edgecloud-cargo")
     });
     PathBuf::from(format!(
-        "{target}/wasm32-wasip2/release/edge_js_runtime.wasm"
+        "{target}/wasm32-wasip2/release/deps/edge_js_runtime.wasm"
     ))
 }
 
@@ -413,9 +413,7 @@ async fn extract_response_picks_content_type() {
             format!("{home}/.cache/edgecloud-cargo")
         });
         let stamp = fixture_path().to_string_lossy().replace('/', "_");
-        PathBuf::from(format!(
-            "{target}/wasm32-wasip2/issue428_{stamp}.wasm"
-        ))
+        PathBuf::from(format!("{target}/wasm32-wasip2/issue428_{stamp}.wasm"))
     }
 
     /// Build (or reuse) the wasm component. Build steps:
@@ -468,12 +466,16 @@ async fn extract_response_picks_content_type() {
             return None;
         }
 
-        // The wasip2 cargo output IS the component. Stage it at the
-        // artifact path so subsequent test runs reuse the same
-        // artifact (the if-exists check at the top of this fn).
+        // The wasip2 cargo output IS the component. Cargo emits
+        // cdylib artifacts under `<target>/<triple>/release/deps/`,
+        // not `<target>/<triple>/release/` directly (the latter is
+        // for non-cdylib libs / bins). Stage it at the artifact
+        // path so subsequent test runs reuse the same artifact
+        // (the if-exists check at the top of this fn).
         let component = target_dir
             .join("wasm32-wasip2")
             .join("release")
+            .join("deps")
             .join("edge_js_runtime.wasm");
         if !component.exists() {
             eprintln!("SKIPPED: component wasm missing after cargo build");
@@ -484,7 +486,11 @@ async fn extract_response_picks_content_type() {
             std::fs::create_dir_all(parent).ok();
         }
         if let Err(e) = std::fs::copy(&component, &artifact) {
-            eprintln!("SKIPPED: failed to stage {} -> {}: {e}", component.display(), artifact.display());
+            eprintln!(
+                "SKIPPED: failed to stage {} -> {}: {e}",
+                component.display(),
+                artifact.display()
+            );
             return None;
         }
         Some(artifact)

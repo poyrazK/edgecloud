@@ -353,13 +353,8 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // canonical artifact layout under `target/javy/` that `edge deploy`
     // reads (see `path_for`'s JS branch above).
     println!("  Staging component...");
-    std::fs::copy(&core_wasm, &artifact).with_context(|| {
-        format!(
-            "copying {} to {}",
-            core_wasm.display(),
-            artifact.display()
-        )
-    })?;
+    std::fs::copy(&core_wasm, &artifact)
+        .with_context(|| format!("copying {} to {}", core_wasm.display(), artifact.display()))?;
 
     println!("✓ Built successfully");
     println!("  Artifact: {}", artifact.display());
@@ -369,15 +364,21 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
 /// Resolve the on-disk path of the wasip2 component that
 /// `cargo build` (above) produced. Probes three locations in order:
 ///
-/// 1. `$CARGO_TARGET_DIR/wasm32-wasip2/release/...` — when set
+/// 1. `$CARGO_TARGET_DIR/wasm32-wasip2/release/deps/...` — when set
 ///    explicitly in the environment (overrides everything).
-/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip2/release/...` —
+/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip2/release/deps/...` —
 ///    the conventional shared cache location. The inner cargo build
 ///    in step 3 explicitly pins `CARGO_TARGET_DIR` to this path when
 ///    unset, so this is the common-case probe on a developer box
 ///    and on CI runners.
-/// 3. `<runtime_dir>/target/wasm32-wasip2/release/...` — the
+/// 3. `<runtime_dir>/target/wasm32-wasip2/release/deps/...` — the
 ///    per-crate default when no `CARGO_TARGET_DIR` is set anywhere.
+///
+/// Cargo emits cdylib artifacts under `<triple>/release/deps/`
+/// (not `<triple>/release/` directly) when the crate's `[lib]`
+/// declares `crate-type = ["cdylib", "rlib"]` — the `release/`
+/// directory holds the rlib and incremental metadata. Probing
+/// `release/deps/` matches cargo's actual layout.
 ///
 /// The repo's `.cargo/config.toml` is *not* read by the child
 /// process directly — `build.target-dir` is a cargo-internal
@@ -386,7 +387,12 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
 /// explicitly.
 fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let name = "edge_js_runtime.wasm";
-    let rel = |base: std::path::PathBuf| base.join("wasm32-wasip2").join("release").join(name);
+    let rel = |base: std::path::PathBuf| {
+        base.join("wasm32-wasip2")
+            .join("release")
+            .join("deps")
+            .join(name)
+    };
 
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
 
@@ -415,7 +421,7 @@ fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path:
     tried.push(default);
 
     anyhow::bail!(
-        "expected core wasm at one of:\n  - {}\n  - <CARGO_TARGET_DIR>/wasm32-wasip2/release/{name}\n\
+        "expected core wasm at one of:\n  - {}\n  - <CARGO_TARGET_DIR>/wasm32-wasip2/release/deps/{name}\n\
          Checked (in order):\n{}",
         tried.first().map(|p| p.display().to_string()).unwrap_or_default(),
         tried
