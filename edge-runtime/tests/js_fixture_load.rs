@@ -18,7 +18,7 @@
 //!    `edge-js-runtime/benches/warm_vs_cold.rs`.
 //!
 //!    Skips if the wasm artifact isn't in the shared cargo target dir
-//!    (CI builds wasm32-wasip1 separately and copies it in).
+//!    (CI builds wasm32-wasip2 separately and copies it in).
 
 use edge_runtime::{
     create_component_linker_handler, create_engine,
@@ -36,27 +36,23 @@ fn js_component_path() -> PathBuf {
 
 /// Resolve the QuickJS-built `edge_js_runtime` artifact.
 ///
-/// The `cargo build --target wasm32-wasip1` step produces a **core
-/// wasm module**, not a component — the host linker rejects it with
-/// `failed to parse WebAssembly module with a component parser`. The
-/// component-wrapped form is produced by a follow-up
-/// `wasm-tools component new --adapt wasi_snapshot_preview1.reactor.wasm`:
+/// The `cargo build --target wasm32-wasip2` step produces a complete
+/// WASI Preview 2 component directly — the `wasm32-wasip2` cargo
+/// target emits the component-model metadata natively (no
+/// `--adapt` / `wasi-preview1` reactor wrap needed). The artifact
+/// lands at:
 ///
 /// ```bash
 /// # CI / local pre-step:
 /// cargo build --manifest-path edge-js-runtime/Cargo.toml \
-///     --target wasm32-wasip1 --release
-/// ADAPTER=$HOME/.cargo/registry/src/index.crates.io-*/wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.reactor.wasm
-/// wasm-tools component new \
-///     $HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/edge_js_runtime.wasm \
-///     --adapt "$ADAPTER" \
-///     -o $HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/edge_js_runtime.component.wasm
+///     --target wasm32-wasip2 --release
+/// # → $CARGO_TARGET_DIR/wasm32-wasip2/release/edge_js_runtime.wasm
 /// ```
 ///
-/// We prefer the `.component.wasm` form when present, fall back to
-/// `.wasm` for ad-hoc invocations, and let the caller produce a
-/// diagnostic if neither exists. Overrides via `EDGE_JS_RUNTIME_WASM`
-/// skip this resolution and point directly at a specific file.
+/// Overrides via `EDGE_JS_RUNTIME_WASM` skip this resolution and
+/// point directly at a specific file (used by the CI job that
+/// copies the artifact to a stable path before invoking cargo
+/// test).
 fn edge_js_runtime_wasm_path() -> PathBuf {
     if let Ok(p) = std::env::var("EDGE_JS_RUNTIME_WASM") {
         return PathBuf::from(p);
@@ -69,12 +65,9 @@ fn edge_js_runtime_wasm_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         format!("{home}/.cache/edgecloud-cargo")
     });
-    let base = format!("{target}/wasm32-wasip1/release/edge_js_runtime");
-    let component = PathBuf::from(format!("{base}.component.wasm"));
-    if component.exists() {
-        return component;
-    }
-    PathBuf::from(format!("{base}.wasm"))
+    PathBuf::from(format!(
+        "{target}/wasm32-wasip2/release/edge_js_runtime.wasm"
+    ))
 }
 
 fn runtime_state() -> RuntimeState {
@@ -150,13 +143,12 @@ async fn edge_js_runtime_instantiates_on_host() {
     let path = edge_js_runtime_wasm_path();
     if !path.exists() {
         eprintln!(
-            "SKIPPED: edge_js_runtime artifact not found at {}. Build it and (if using the core .wasm) wrap it:\n\
+            "SKIPPED: edge_js_runtime artifact not found at {}. Build it:\n\
              \n\
-             cargo build --manifest-path edge-js-runtime/Cargo.toml --target wasm32-wasip1 --release\n\
-             wasm-tools component new <core.wasm> --adapt <adapter.wasm> -o <core.component.wasm>\n\
+             cargo build --manifest-path edge-js-runtime/Cargo.toml --target wasm32-wasip2 --release\n\
              \n\
-             Then set EDGE_JS_RUNTIME_WASM to the .component.wasm path, \
-             or place it at ${{CARGO_TARGET_DIR:-$HOME/.cache/edgecloud-cargo}}/wasm32-wasip1/release/edge_js_runtime.component.wasm.",
+             Then set EDGE_JS_RUNTIME_WASM to the path, \
+             or place it at ${{CARGO_TARGET_DIR:-$HOME/.cache/edgecloud-cargo}}/wasm32-wasip2/release/edge_js_runtime.wasm.",
             path.display()
         );
         return;
@@ -422,21 +414,23 @@ async fn extract_response_picks_content_type() {
         });
         let stamp = fixture_path().to_string_lossy().replace('/', "_");
         PathBuf::from(format!(
-            "{target}/wasm32-wasip1/issue428_{stamp}.component.wasm"
+            "{target}/wasm32-wasip2/issue428_{stamp}.wasm"
         ))
     }
 
     /// Build (or reuse) the wasm component. Build steps:
-    /// 1. `cargo build --target wasm32-wasip1 --release` on
+    /// 1. `cargo build --target wasm32-wasip2 --release` on
     ///    `edge-js-runtime` with `EDGE_JS_BUNDLE=<fixture>` so the
     ///    user's JS gets embedded at compile time.
-    /// 2. `wasm-tools component new <core> --adapt <adapter> -o <out>`
-    ///    to wrap the core module as a WASI Preview 2 component
-    ///    the host linker accepts.
     ///
-    /// Both commands honor `CARGO_TARGET_DIR` (cargo) / operate
-    /// on the absolute paths we pass (wasm-tools), so the build
-    /// does not write into any worktree's `target/`.
+    /// The `wasm32-wasip2` cargo target emits a complete WASI
+    /// Preview 2 component directly (no `wasm-tools component new
+    /// --adapt` wrap needed — the wasi-preview1 reactor adapter
+    /// was dropped when this target was adopted). The output is
+    /// already a component that the host linker can instantiate.
+    ///
+    /// Cargo honors `CARGO_TARGET_DIR`, so the build does not
+    /// write into any worktree's `target/`.
     fn build() -> Option<PathBuf> {
         let fixture = fixture_path();
         if !fixture.exists() {
@@ -462,9 +456,9 @@ async fn extract_response_picks_content_type() {
         });
         let target_dir = PathBuf::from(target_dir);
 
-        // Step 1: cargo build
+        // Step 1: cargo build for wasm32-wasip2.
         let cargo_status = Command::new("cargo")
-            .args(["build", "--target", "wasm32-wasip1", "--release"])
+            .args(["build", "--target", "wasm32-wasip2", "--release"])
             .current_dir(&runtime_dir)
             .env("EDGE_JS_BUNDLE", &fixture)
             .status()
@@ -474,78 +468,23 @@ async fn extract_response_picks_content_type() {
             return None;
         }
 
-        let core = target_dir
-            .join("wasm32-wasip1")
+        // The wasip2 cargo output IS the component. Stage it at the
+        // artifact path so subsequent test runs reuse the same
+        // artifact (the if-exists check at the top of this fn).
+        let component = target_dir
+            .join("wasm32-wasip2")
             .join("release")
             .join("edge_js_runtime.wasm");
-        if !core.exists() {
-            eprintln!("SKIPPED: core wasm missing after cargo build");
+        if !component.exists() {
+            eprintln!("SKIPPED: component wasm missing after cargo build");
             return None;
         }
-
-        // Step 2: locate adapter
-        let cargo_home = match std::env::var("CARGO_HOME") {
-            Ok(s) => s,
-            Err(_) => match std::env::var("HOME") {
-                Ok(h) => format!("{h}/.cargo"),
-                Err(_) => {
-                    eprintln!("SKIPPED: neither CARGO_HOME nor HOME is set");
-                    return None;
-                }
-            },
-        };
-        let mut adapter = None;
-        if let Ok(entries) = std::fs::read_dir(format!("{cargo_home}/registry/src")) {
-            for entry in entries.flatten() {
-                if let Ok(subs) = std::fs::read_dir(entry.path()) {
-                    for sub in subs.flatten() {
-                        if sub
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("wasi-preview1-component-adapter-provider-")
-                        {
-                            let candidate = sub
-                                .path()
-                                .join("artefacts")
-                                .join("wasi_snapshot_preview1.reactor.wasm");
-                            if candidate.exists() {
-                                adapter = Some(candidate);
-                                break;
-                            }
-                        }
-                    }
-                    if adapter.is_some() {
-                        break;
-                    }
-                }
-            }
-        }
-        let adapter = match adapter {
-            Some(p) => p,
-            None => {
-                eprintln!("SKIPPED: wasi-preview1 adapter not found in cargo registry");
-                return None;
-            }
-        };
 
         if let Some(parent) = artifact.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-
-        let wrap_status = Command::new("wasm-tools")
-            .args([
-                "component",
-                "new",
-                &core.to_string_lossy(),
-                "--adapt",
-                &adapter.to_string_lossy(),
-                "-o",
-                &artifact.to_string_lossy(),
-            ])
-            .status()
-            .expect("spawn wasm-tools");
-        if !wrap_status.success() {
-            eprintln!("SKIPPED: wasm-tools wrap failed");
+        if let Err(e) = std::fs::copy(&component, &artifact) {
+            eprintln!("SKIPPED: failed to stage {} -> {}: {e}", component.display(), artifact.display());
             return None;
         }
         Some(artifact)
