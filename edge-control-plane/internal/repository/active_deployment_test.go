@@ -313,6 +313,16 @@ func TestAppendRegionsPublished_IssuesExpectedStatement(t *testing.T) {
 // last_publish_at + last_publish_attempt_id — important for the
 // operator escape hatch ("when did the last attempt fire?")
 // regardless of whether it succeeded or failed.
+//
+// Issue #435: this test ALSO pins that AppendRegionsFailed touches
+// regions_published in the SAME UPDATE (the `WHERE r <> ALL($3)`
+// removal of newly-failed regions from regions_published). Without
+// that, a region that succeeded earlier in the publish loop and
+// then failed later stays in BOTH arrays for the rest of the
+// activation — publishSwap's `alreadyPublished` skip would then
+// mask the failure forever. The regex below would silently allow
+// the bug back in if the SET clause regressed to a single-column
+// `regions_failed = (...)`.
 func TestAppendRegionsFailed_IssuesExpectedStatement(t *testing.T) {
 	db, mock, cleanup := newActiveDeploymentMockDB(t)
 	defer cleanup()
@@ -329,6 +339,39 @@ func TestAppendRegionsFailed_IssuesExpectedStatement(t *testing.T) {
 
 	if err := repo.AppendRegionsFailed(context.Background(), "t_test", "myapp",
 		[]string{"us-east"}, attemptID, ts); err != nil {
+		t.Fatalf("AppendRegionsFailed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestAppendRegionsFailed_AlsoTouchesRegionsPublished (issue #435)
+// explicitly asserts that the new SQL shape clears the failing
+// regions from regions_published in the same UPDATE. This is the
+// regression guard for the bug: before #435, AppendRegionsFailed
+// was a single-column UPDATE on regions_failed, leaving
+// regions_published untouched — so a region that succeeded and
+// then failed was in BOTH arrays and never retried.
+//
+// The test enforces two substrings on the captured SQL: the
+// `regions_published = (` SET clause and the `WHERE r <> ALL($3)`
+// removal predicate. A regression to the single-column shape
+// breaks both substring assertions.
+func TestAppendRegionsFailed_AlsoTouchesRegionsPublished(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	ts := time.Now().Truncate(time.Microsecond)
+	attemptID := "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+
+	mock.ExpectExec(`(?s)UPDATE active_deployments.*?SET regions_failed.*?regions_published = \(.*?WHERE r <> ALL\(\$3`).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg(), ts, attemptID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.AppendRegionsFailed(context.Background(), "t_test", "myapp",
+		[]string{"us-east", "eu-west"}, attemptID, ts); err != nil {
 		t.Fatalf("AppendRegionsFailed: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

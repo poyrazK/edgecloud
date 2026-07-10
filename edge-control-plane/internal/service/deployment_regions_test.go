@@ -131,6 +131,15 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	// 2. ActivateDeployment wraps the GetForUpdate + Set in a tx
 	// (so concurrent activate/rollback serialize via FOR UPDATE).
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs(tenantID, appName).
 		WillReturnError(sql.ErrNoRows)
@@ -232,6 +241,15 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -293,6 +311,15 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -360,6 +387,15 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -436,6 +472,15 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -504,6 +549,15 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
+	// Issue #440: activateDeployment takes a row-level write lock
+	// on the tenant BEFORE the active_deployments row to serialize
+	// against concurrent SetDisabledAt. The mock returns a
+	// non-disabled tenant (disabled_at = NULL) so the test path
+	// proceeds past the gate.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -567,6 +621,28 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+// expectCASGate mocks the issue #439 CAS UPDATE that publishSwap
+// runs after the post-commit read. The activate / rollback tx
+// wrote attemptID onto the row's last_publish_attempt_id column;
+// this UPDATE re-asserts it so the service can detect a concurrent
+// activate / rollback that overwrote the column. RowsAffected=1
+// means publishSwap proceeds; RowsAffected=0 means it lost the race
+// and returns nil silently (the other caller owns this publish
+// cycle). Default RowsAffected=1 here because every test below
+// expects the gate to succeed.
+//
+// attemptID is sqlmock.AnyArg() when the UUID is generated inside
+// the service (ActivateDeployment callers), or a literal UUID
+// when the test calls publishSwap directly and supplies its own.
+// The CAS string is whitespace-tolerant so the same regex matches
+// regardless of whether the production code formats the SQL with
+// a single space or newlines.
+func expectCASGate(mock sqlmock.Sqlmock, tenantID, appName string, attemptID interface{}) {
+	mock.ExpectExec(`UPDATE active_deployments\s+SET\s+last_publish_attempt_id = \$3\s+WHERE\s+tenant_id = \$1\s+AND\s+app_name = \$2\s+AND\s+last_publish_attempt_id = \$3`).
+		WithArgs(tenantID, appName, attemptID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
 // expectPostCommitReadAndAppend mocks the post-tx publish-state
 // read + the append calls that publishSwap issues on a freshly-
 // activated row. The Set upsert inside ActivateDeployment resets
@@ -611,6 +687,15 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 			"{}", "{}", "{}", "{}",
 			nil, nil, nil, nil,
 		))
+
+	// CAS gate (issue #439). The activate / rollback tx wrote
+	// attemptID onto the row; this UPDATE re-asserts it so the
+	// service detects a concurrent activate / rollback that
+	// overwrote it. RowsAffected=1 means publishSwap proceeds.
+	// The attempt id is generated inside the service for
+	// ActivateDeployment calls and supplied by the test for direct
+	// publishSwap calls; sqlmock.AnyArg() covers both cases.
+	expectCASGate(mock, tenantID, appName, sqlmock.AnyArg())
 
 	// AppendRegionsPublished / AppendRegionsFailed fire on a
 	// successful / failed per-region publish respectively;
@@ -689,6 +774,11 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	// The atomic test deliberately uses a known attemptID so the
+	// failing-append path is exercised below.
+	expectCASGate(mock, tenantID, appName, "attempt-atomic")
+
 	pub := &RecordingPublisher{
 		// us-east succeeds, eu-west fails — so published=[us-east],
 		// failed=[eu-west] and BOTH appends run inside the tx.
@@ -721,7 +811,7 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 		TenantID: tenantID,
 		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: "d_atomic"}},
 	}
-	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic", msg, []string{"us-east", "eu-west"})
+	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic", msg, []string{"us-east", "eu-west"}, "attempt-atomic")
 	if err == nil {
 		t.Fatal("publishSwap: want PublishError wrapping ErrPublishFailed, got nil")
 	}
@@ -842,6 +932,9 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-skip")
+
 	pub := &RecordingPublisher{}
 	// Wire the cache pusher so the cache loop runs. Both regions
 	// succeed; `fra` is skipped due to alreadyCached (no push),
@@ -897,7 +990,7 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_skip", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_skip", msg, []string{"fra", "iad"}, "attempt-skip"); err != nil {
 		t.Fatalf("publishSwap: %v", err)
 	}
 
@@ -955,6 +1048,9 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-atomic-cache")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 
@@ -1006,7 +1102,7 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic_cache", msg, []string{"fra"})
+	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic_cache", msg, []string{"fra"}, "attempt-atomic-cache")
 	// The publish itself succeeded (the NATS publish loop is
 	// before the tx) — so the publisher saw the call. The cache
 	// append failure is "best effort" (matches the existing
@@ -1078,6 +1174,9 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-split")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 
@@ -1130,7 +1229,7 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_split", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_split", msg, []string{"fra", "iad"}, "attempt-split"); err != nil {
 		t.Fatalf("publishSwap: want nil (no NATS failures, cache is best-effort), got %v", err)
 	}
 
@@ -1187,6 +1286,9 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-best-effort")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 	cachePusher.failFor["fra"] = errors.New("cache 500")
@@ -1242,7 +1344,7 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_best_effort", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_best_effort", msg, []string{"fra", "iad"}, "attempt-best-effort"); err != nil {
 		t.Fatalf("publishSwap: want nil (cache failures are best-effort), got %v", err)
 	}
 
@@ -1253,6 +1355,316 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 	// Both NATS publishes succeeded.
 	if got := pub.regionsCalled(); !reflect.DeepEqual(got, []string{"fra", "iad"}) {
 		t.Errorf("publisher regions = %v, want [fra iad]", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// --- Issue #440 tenant lock ------------------------------------------
+//
+// Three tests pin the activate-tx tenant lock added in PR #440
+// (disable races). The lock is acquired BEFORE the
+// active_deployments row so a concurrent SetDisabledAt either blocks
+// behind our tx (wins the race, we read disabled_at and abort) or
+// commits before us (we read disabled_at=NULL and proceed). The
+// lock is on the tenants table; no active_deployments row is
+// touched when the gate fires.
+
+func TestActivateDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		deploymentID = "d_disabled"
+	)
+	regionsCol := `{"us-east"}`
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	// The tx begins, takes the tenant FOR UPDATE lock, observes
+	// disabled_at = NOW() (the operator's SetDisabledAt raced in),
+	// and aborts with ErrTenantDisabled. NO active_deployments row
+	// is read, written, or touched. The tx rolls back. No publish.
+	disabledAt := time.Now().Add(-5 * time.Second)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), disabledAt))
+	mock.ExpectRollback()
+
+	err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID)
+	if !errors.Is(err, ErrTenantDisabled) {
+		t.Errorf("ActivateDeployment err = %v, want errors.Is(err, ErrTenantDisabled)", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publish regions = %v, want [] (disabled tenant must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestActivateDeployment_TenantNotFound_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const deploymentID = "d_orphan"
+	regionsCol := `{"us-east"}`
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	// Tenant SELECT returns sql.ErrNoRows — the tenant row is
+	// missing (deleted between deploy and activate). The tx
+	// aborts with ErrTenantNotFound; nothing is published.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+
+	err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID)
+	if !errors.Is(err, ErrTenantNotFound) {
+		t.Errorf("ActivateDeployment err = %v, want errors.Is(err, ErrTenantNotFound)", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publish regions = %v, want [] (missing tenant must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestActivateDeployment_NormalTenant_Proceeds exercises the happy
+// path through the new tenant FOR UPDATE lock — non-disabled tenant
+// means the gate passes and the existing tx body (active FOR UPDATE,
+// Set, ClearStableSince) runs unchanged. This is a regression guard
+// against the tenant lock accidentally short-circuiting normal
+// activations.
+func TestActivateDeployment_NormalTenant_Proceeds(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		deploymentID = "d_happy"
+	)
+	regionsCol := `{"us-east"}`
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+	// The new lock block: Begin → tenants FOR UPDATE (returns
+	// disabled_at=NULL → gate passes) → active_deployments FOR
+	// UPDATE → INSERT → ClearStableSince → Commit.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
+	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
+		WithArgs("t_test", "myapp").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	// Post-commit: env list, tenant GetByID (allowlist), quota.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now()))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 512, 1024, 0, time.Now()))
+
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"us-east"}, nil)
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`,
+	)).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "tenant_id", "region", "ip", "memory_mb", "last_seen", "created_at",
+	}))
+
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+		t.Fatalf("ActivateDeployment: %v", err)
+	}
+	if got := pub.regionsCalled(); !equalStringSlices(got, []string{"us-east"}) {
+		t.Errorf("publish regions = %v, want [us-east]", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// --- Issue #440 follow-up: RollbackDeployment tenant lock -------------
+//
+// Three tests mirror the activate path's gate for RollbackDeployment
+// (PR #440 review follow-up). The disable-vs-rollback race is
+// symmetric to disable-vs-activate: the same tenant FOR UPDATE lock
+// pattern is required, otherwise a concurrent SetDisabledAt could
+// slip a TaskMessage for a now-disabled tenant into the publish
+// loop. The active_deployments row is never touched when the gate
+// fires.
+
+// activeDeploymentColumns is the column list returned by
+// ActiveDeploymentRepository.Get / GetForUpdate. Centralized so
+// the rollback tests below stay readable.
+var activeDeploymentColumns = []string{
+	"tenant_id", "app_name", "deployment_id",
+	"last_good_deployment_id", "auto_rollback_enabled",
+	"stable_since", "regions_published", "regions_failed",
+	"regions_cached", "regions_cache_failed",
+	"last_publish_at", "last_publish_attempt_id",
+	"preview_id", "preview_pr_number",
+}
+
+func TestRollbackDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	mock.ExpectBegin()
+	// Tenant FOR UPDATE returns disabled_at set → gate fires,
+	// tx rolls back. No active_deployments read, no publishSwap.
+	disabledAt := time.Now().Add(-5 * time.Second)
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), disabledAt))
+	mock.ExpectRollback()
+
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, ErrTenantDisabled) {
+		t.Errorf("RollbackDeployment err = %v, want errors.Is(err, ErrTenantDisabled)", err)
+	}
+	if rolledBackID != "" {
+		t.Errorf("rolledBackID = %q, want empty string on abort", rolledBackID)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publish regions = %v, want [] (disabled tenant must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+func TestRollbackDeployment_TenantNotFound_NoPublish(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	mock.ExpectBegin()
+	// Tenant SELECT returns sql.ErrNoRows — the tenant row is
+	// missing. The gate returns ErrTenantNotFound before any
+	// active_deployments read.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), "t_test", "myapp")
+	if !errors.Is(err, ErrTenantNotFound) {
+		t.Errorf("RollbackDeployment err = %v, want errors.Is(err, ErrTenantNotFound)", err)
+	}
+	if rolledBackID != "" {
+		t.Errorf("rolledBackID = %q, want empty string on abort", rolledBackID)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publish regions = %v, want [] (missing tenant must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestRollbackDeployment_NormalTenant_Proceeds exercises the happy
+// path through the new tenant FOR UPDATE lock — non-disabled tenant
+// means the gate passes and the existing rollback tx body (active
+// FOR UPDATE → Set → ClearStableSince → env list → quota) runs
+// unchanged. Regression guard against the tenant lock accidentally
+// short-circuiting normal rollbacks.
+func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		currentDeploymentID = "d_broken"
+		rolledBackTargetID  = "d_good"
+	)
+	regionsCol := `{"us-east"}`
+
+	mock.ExpectBegin()
+	// Gate passes — disabled_at=NULL.
+	mock.ExpectQuery(`SELECT.*tenants.*FOR UPDATE`).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_test", "Test Tenant", "free", `{}`, time.Now(), nil))
+	// Existing active_deployments row with last_good set.
+	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows(activeDeploymentColumns).
+			AddRow("t_test", "myapp", currentDeploymentID, sql.NullString{String: rolledBackTargetID, Valid: true},
+				false, nil, pq.StringArray{}, pq.StringArray{}, pq.StringArray{}, pq.StringArray{},
+				sql.NullTime{}, nil, nil, nil))
+	// Confirm the rolled-back-to target still exists.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(rolledBackTargetID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(rolledBackTargetID, "t_test", "myapp", domain.StatusDeployed, "h_good", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+	// Set upserts with the rolled-back-to deployment_id.
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// Snapshot envs + quota inside the tx (tenant reused from the
+	// gate, so no separate tenant SELECT — that's the dedup the
+	// follow-up also delivers).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
+			AddRow("t_test", 100, 50, 10, 512, 1024, 0, time.Now()))
+	mock.ExpectCommit()
+
+	// Post-commit: publishSwap reads the committed active row, runs
+	// the CAS gate (#439), and fans out to the rolled-back-to
+	// deployment's regions.
+	expectPostCommitReadAndAppend(mock, "t_test", "myapp", []string{"us-east"}, nil)
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`,
+	)).WillReturnRows(sqlmock.NewRows([]string{
+		"id", "tenant_id", "region", "ip", "memory_mb", "last_seen", "created_at",
+	}))
+
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), "t_test", "myapp")
+	if err != nil {
+		t.Fatalf("RollbackDeployment: %v", err)
+	}
+	if rolledBackID != rolledBackTargetID {
+		t.Errorf("rolledBackID = %q, want %q", rolledBackID, rolledBackTargetID)
+	}
+	if got := pub.regionsCalled(); !equalStringSlices(got, []string{"us-east"}) {
+		t.Errorf("publish regions = %v, want [us-east]", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)

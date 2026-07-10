@@ -896,3 +896,70 @@ func TestBuildFullSync_PlaintextEnvRow_ReturnsError(t *testing.T) {
 		t.Errorf("apps should be nil on error, got %v", apps)
 	}
 }
+
+// --- Issue #440 tenant-disable gates ----------------------------------
+//
+// Two tests pin the disabled-tenant short-circuits added in PR #440.
+// reconcileTenant (used by RequestSync) early-returns when the tenant
+// is disabled or missing; BuildFullSync (the HTTP fallback handler)
+// returns an empty (non-nil) payload instead of an error so workers
+// receiving an empty apps map treat it as "stop running the affected
+// app".
+
+// TestReconcile_ReconcileTenant_SkipsDisabled injects a tenant whose
+// DisabledAt is set and asserts that reconcileTenant publishes
+// nothing — even when ListActive would have filtered it out at the
+// sweep level. The path exercised here is RequestSync →
+// reconcileTenant (RequestSync uses GetByID with no filter, so the
+// defensive gate inside reconcileTenant is the only thing that
+// stops a publish).
+func TestReconcile_ReconcileTenant_SkipsDisabled(t *testing.T) {
+	pub := &capturingPublisher{}
+	disabledAt := time.Now().Add(-1 * time.Minute)
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a", DisabledAt: &disabledAt}},
+		map[string][]domain.ActiveDeployment{
+			"t_a": {{TenantID: "t_a", AppName: "myapp", DeploymentID: "d_1"}},
+		},
+		map[string]*domain.Deployment{
+			"d_1": {ID: "d_1", Hash: "h1", Regions: []string{"global"}},
+		},
+		nil, nil, pub)
+
+	// ListActive already filters this tenant out (disabled_at IS
+	// NOT NULL), so RequestSync via the periodic sweep would never
+	// reach reconcileTenant for it. Drive reconcileTenant directly
+	// to pin the defensive gate added in PR #440.
+	svc.reconcileTenant(context.Background(), "t_a", nil, "")
+
+	if got := len(pub.calls); got != 0 {
+		t.Errorf("calls=%d, want 0 (disabled tenant must not publish)", got)
+	}
+}
+
+// TestReconcile_BuildFullSync_SkipsDisabled verifies the HTTP
+// fallback handler's contract: a disabled tenant returns
+// (empty map, nil), NOT an error. The HTTP handler maps that to a
+// 200 response with `{"apps":{}}`, which the worker treats as "no
+// desired apps" → stops running the affected app. We deliberately
+// do NOT return ErrTenantNotFoundInReconcile here because the
+// disabled case isn't a 500 — it's a successful "stop everything"
+// payload.
+func TestReconcile_BuildFullSync_SkipsDisabled(t *testing.T) {
+	pub := &capturingPublisher{}
+	disabledAt := time.Now().Add(-1 * time.Minute)
+	svc := reconcileSvcForTest(t,
+		[]domain.Tenant{{ID: "t_a", DisabledAt: &disabledAt}},
+		nil, nil, nil, nil, pub)
+
+	apps, err := svc.BuildFullSync(context.Background(), "t_a", "global")
+	if err != nil {
+		t.Fatalf("BuildFullSync: %v", err)
+	}
+	if apps == nil {
+		t.Fatal("apps = nil, want empty (non-nil) map")
+	}
+	if len(apps) != 0 {
+		t.Errorf("apps = %v, want empty map", apps)
+	}
+}

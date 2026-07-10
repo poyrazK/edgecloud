@@ -226,6 +226,23 @@ func (s *ReconcileService) RequestSync(ctx context.Context, tenantID, region str
 // 2M+2 — one active list + one quota + M deployment lookups + M env
 // lists. See PR #166 follow-up #1.
 func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string, allowlist []string, regionFilter string) {
+	// Issue #440: gate disabled tenants. The periodic sweep uses
+	// ListActive which already filters by disabled_at IS NULL, so
+	// this branch is a no-op for that path; RequestSync uses
+	// GetByID (no filter) and gets caught here. Building a
+	// defensive check at the lowest-level entry point means future
+	// callers (admin "force sync" endpoint, manual replay tools)
+	// can't accidentally publish for a disabled tenant.
+	tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		log.Printf("reconcile: tenant=%s: get tenant: %v", tenantID, err)
+		return
+	}
+	if tenant == nil || tenant.IsDisabled() {
+		log.Printf("reconcile: tenant=%s: skipping (not found or disabled)", tenantID)
+		return
+	}
+
 	joined, err := s.activeRepo.ListByTenantWithDeployment(ctx, tenantID)
 	if err != nil {
 		log.Printf("reconcile: tenant=%s: list active+deployment: %v", tenantID, err)
@@ -396,6 +413,17 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 	}
 	if tenant == nil {
 		return nil, ErrTenantNotFoundInReconcile
+	}
+	// Issue #440: a disabled tenant must NOT receive a full_sync.
+	// Return an empty (non-nil) payload so the HTTP handler can
+	// still respond 200 with a stable shape — workers treat an
+	// empty apps map as "no desired apps" and stop running the
+	// affected app. This matches the wire contract at
+	// handler/internal_sync_test.go:260 which asserts an empty
+	// payload returns 200, not 4xx.
+	if tenant.IsDisabled() {
+		log.Printf("reconcile: BuildFullSync tenant=%s: tenant is disabled; returning empty payload", tenantID)
+		return map[string]nats.AppConfig{}, nil
 	}
 	allowlist := tenant.AllowlistedDestinations
 
