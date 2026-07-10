@@ -267,12 +267,10 @@ func (e *PaymentRequiredError) Unwrap() error { return ErrPaymentRequired }
 // (handled inside VerifyMemoryUnderCap itself). A zero or negative
 // MaxMemoryMB (legacy / admin-cleared / nil-quota path) falls back to
 // 256 — the pre-#44 buildPublishPayload behavior the runtime expects.
-func (s *DeploymentService) perAppMemoryMB(quota *domain.Quota) int64 {
-	if quota != nil && quota.MaxMemoryMB > 0 {
-		return int64(quota.MaxMemoryMB)
-	}
-	return 256
-}
+// `perAppMemoryMB` itself moved to publish_payload.go (issue #560)
+// when buildPublishPayload was extracted; the function has no
+// receiver state and is now shared by both DeploymentService and
+// EnvService.
 
 // PublishError carries the per-region outcome of a fan-out
 // publish. Returned by ActivateDeployment / RollbackDeployment
@@ -487,6 +485,14 @@ type DeploymentService struct {
 	// the constructor; never nil/empty (the config layer defaults to
 	// "global" when unset).
 	defaultRegion string
+	// publishBuilder is the shared TaskMessage-marshaling helper
+	// (see publish_payload.go). Extracted from a private
+	// (DeploymentService) method when issue #560 added env-write
+	// republish to (EnvService).SetEnv/DeleteEnv — both services
+	// now share one instance constructed in app.go. Optional in
+	// pre-#560 tests that don't wire it; those tests use the legacy
+	// path that did not republish env writes at all.
+	publishBuilder *publishBuilder
 }
 
 // lockTenantForUpdate is the issue #440 disable-vs-write gate. It must
@@ -629,6 +635,16 @@ func (s *DeploymentService) SetAppService(appSvc *AppService) {
 // SetEnvService injects the EnvService used for decrypting env vars at publish.
 func (s *DeploymentService) SetEnvService(envSvc *EnvService) {
 	s.envSvc = envSvc
+}
+
+// SetPublishBuilder injects the shared TaskMessage-marshaling helper
+// (see publish_payload.go). The same instance is shared with
+// EnvService so the wire format stays single-source. Optional in
+// pre-#560 test harnesses — those tests don't exercise the publish
+// path at all and the field's nil-method-call check on
+// publishBuilder is deferred to the helper's runtime guards.
+func (s *DeploymentService) SetPublishBuilder(b *publishBuilder) {
+	s.publishBuilder = b
 }
 
 func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
@@ -846,11 +862,11 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	// Skipped when the overage grace is active (quota==nil) and
 	// when the tenant's MaxMemoryMB is the unlimited sentinel (<0)
 	// or unset (==0); both are honored inside VerifyMemoryUnderCap
-	// itself. perAppMemoryMB is the same value the activate path
+	// itself. deployPerApp is the same value the activate path
 	// will increment the counter by — see perAppMemoryMB() below.
 	if quota != nil {
-		perAppMemoryMB := s.perAppMemoryMB(quota)
-		ok, err := s.quotaRepo.VerifyMemoryUnderCap(ctx, tenantID, perAppMemoryMB)
+		deployPerApp := perAppMemoryMB(quota)
+		ok, err := s.quotaRepo.VerifyMemoryUnderCap(ctx, tenantID, deployPerApp)
 		if err != nil {
 			return nil, false, fmt.Errorf("verifying memory cap: %w", err)
 		}
@@ -1295,7 +1311,15 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// lockTenantForUpdate for the race window + the worker-side
 		// dedupe_id / route-table mechanism that makes the
 		// "disable commits after we read NULL" arm tolerable.
-		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+		// lockTenantForUpdate returns the tenant row AND takes the
+		// tenants-row FOR UPDATE lock that closes the issue #440
+		// disable-vs-activate/disable-vs-rollback race. We capture
+		// it here so the new pure-function buildPublishPayload can
+		// reuse the same row — both reads participate in the same
+		// tx snapshot, so the wire payload's AllowlistedDestinations
+		// is consistent with the active_deployments mutation.
+		tenant, err := s.lockTenantForUpdate(ctx, txTenant, tenantID)
+		if err != nil {
 			return err
 		}
 
@@ -1371,13 +1395,34 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 
 		// Build the TaskMessage payload inside the tx so env /
 		// tenant reads participate in the same atomic snapshot as
-		// the active_deployments mutation. Decryption (CPU-only,
+		// the active_deployments mutation. The shared helper at
+		// publish_payload.go takes pre-resolved typed inputs
+		// (tenant, envMap, quota, deployment) — we do all the
+		// reads here under the same tx so the wire payload is
+		// consistent with the row swap. Decryption (CPU-only,
 		// no DB) is fine inside the closure. The dedupe_key is
 		// `<tenant>:<app>:<attempt_id>` — UNIQUE in the outbox
 		// schema so a buggy re-enqueue surfaces as a constraint
 		// violation rather than a double-publish.
-		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
-			deploymentID, deployment, regions, activateQuota)
+		txAppEnv := s.appEnvRepo.WithTx(tx)
+		envRows, err := txAppEnv.List(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing env vars: %w", err)
+		}
+		envMap := make(map[string]string, len(envRows))
+		for _, e := range envRows {
+			if s.envSvc != nil {
+				plain, derr := s.envSvc.Decrypt(e.EnvValue)
+				if derr != nil {
+					return fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
+				}
+				envMap[e.EnvKey] = plain
+				continue
+			}
+			envMap[e.EnvKey] = e.EnvValue
+		}
+		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
+			deploymentID, deployment, tenant, regions, activateQuota, envMap)
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
@@ -1399,7 +1444,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// Must use WithTx(tx) — calling the outer s.quotaRepo would
 		// open a different connection and break atomicity, leaving
 		// the counter ahead of the active_deployments row set.
-		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, s.perAppMemoryMB(activateQuota))
+		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, perAppMemoryMB(activateQuota))
 		if err != nil {
 			return fmt.Errorf("incrementing memory quota: %w", err)
 		}
@@ -1429,88 +1474,19 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 }
 
 // buildPublishPayload assembles the marshaled TaskMessage that
-// accompanies the active_deployments mutation. Runs INSIDE the
-// caller's tx so env / tenant reads participate in the same snapshot
-// (the on-wire message reflects post-commit state). Decryption is
-// CPU-only and safe inside the closure.
+// accompanies the active_deployments mutation. The function body
+// moved to publish_payload.go in issue #560 when
+// (*DeploymentService).buildPublishPayload was extracted to a
+// shared (*publishBuilder).buildPublishPayload reachable from both
+// DeploymentService.ActivateDeployment and EnvService.SetEnv /
+// DeleteEnv. The activate/rollback call sites in this file
+// pre-resolve the inputs (env, tenant, deployment, quota) under
+// their own *sqlx.Tx (so every read participates in the same
+// atomic snapshot as the active_deployments mutation) and hand
+// the marshaled payload to outboxRepo.Enqueue. See
+// publish_payload.go for the helper and internal/service/env.go
+// for the env-write caller.
 //
-// Takes pre-resolved regions (so the activate path's default-region
-// fallback and the rollback path's deployment-regions resolution
-// aren't duplicated), the deployment row (for hash / signature /
-// signing_key_id / preview linkage), and the quota row the caller
-// already loaded inside the tx (so we don't repeat the SELECT — the
-// caller needs the same row for the per-tenant memory counter
-// increment / decrement on issue #44 part 2). Returns the marshaled
-// JSON payload ready to be stored on the outbox row.
-func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx, tenantID, appName, deploymentID string, deployment *domain.Deployment, regions []string, quota *domain.Quota) ([]byte, error) {
-	envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("listing env vars: %w", err)
-	}
-	envMap := make(map[string]string, len(envsList))
-	for _, e := range envsList {
-		if s.envSvc != nil {
-			// envSvc decrypts the ciphertext values stored in
-			// app_env (when secrets encryption is enabled).
-			// Decryption is CPU-only and safe to do inside the tx
-			// closure. A decrypt error is fatal for the publish:
-			// silently falling through with raw ciphertext would
-			// publish a payload the worker can't use and is hard
-			// to diagnose downstream. The pre-#42 rollback path
-			// surfaced this as an error; the activate path used
-			// log-and-continue, but in the outbox world a failed
-			// enqueue is cheaper than publishing a broken message.
-			plain, derr := s.envSvc.Decrypt(e.EnvValue)
-			if derr != nil {
-				return nil, fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
-			}
-			envMap[e.EnvKey] = plain
-			continue
-		}
-		envMap[e.EnvKey] = e.EnvValue
-	}
-
-	tenant, err := s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("getting tenant: %w", err)
-	}
-	if tenant == nil {
-		return nil, fmt.Errorf("tenant not found")
-	}
-	if tenant.IsDisabled() {
-		// Issue #440 belt-and-braces: the tx-time check above catches
-		// the racing case under the tenants-row FOR UPDATE lock. This
-		// post-commit check covers the (theoretical) case where a
-		// future non-tx activation path skips that lock and observes
-		// the disabled tenant only after its own write commits. Wrap
-		// with ErrTenantDisabled so the handler's `errors.Is` branch
-		// maps it to 409, matching the tx-time path's status.
-		return nil, fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
-	}
-
-	maxMemoryMB := int(s.perAppMemoryMB(quota))
-
-	msg := &nats.TaskMessage{
-		Type:      "task_update",
-		Timestamp: time.Now().UTC(),
-		TenantID:  tenantID,
-		Apps: map[string]nats.AppConfig{
-			appName: nats.BuildAppConfig(
-				deploymentID,
-				deployment.Hash,
-				deployment.Signature,
-				deployment.SigningKeyID, // issue #307 PR1: per-key kid
-				previewIDFromDeployment(deployment),
-				previewPRNumberFromDeployment(deployment),
-				envMap,
-				tenant.AllowlistedDestinations,
-				maxMemoryMB,
-			),
-		},
-	}
-	return json.Marshal(msg)
-}
-
 // publishSwap is the post-commit cache-push step. Pre-#42 this also
 // fanned out the NATS TaskMessage; that responsibility now lives on
 // the OutboxDrainer. publishSwap only handles:
@@ -1688,7 +1664,15 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// for the race window + the worker-side dedupe_id /
 		// route-table mechanism that makes the "disable commits
 		// after we read NULL" arm tolerable.
-		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+		// lockTenantForUpdate returns the tenant row AND takes the
+		// tenants-row FOR UPDATE lock that closes the issue #440
+		// disable-vs-activate/disable-vs-rollback race. We capture
+		// it here so the new pure-function buildPublishPayload can
+		// reuse the same row — both reads participate in the same
+		// tx snapshot, so the wire payload's AllowlistedDestinations
+		// is consistent with the active_deployments mutation.
+		tenant, err := s.lockTenantForUpdate(ctx, txTenant, tenantID)
+		if err != nil {
 			return err
 		}
 
@@ -1751,7 +1735,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		if err != nil {
 			return fmt.Errorf("getting quota: %w", err)
 		}
-		rollbackPerApp := s.perAppMemoryMB(rollbackQuota)
+		rollbackPerApp := perAppMemoryMB(rollbackQuota)
 
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
@@ -1787,7 +1771,10 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// Build the TaskMessage payload inside the tx (issue #42) so
 		// env / tenant / quota reads participate in the same atomic
 		// snapshot as the active_deployments mutation. The drainer
-		// will relay the marshaled payload after commit.
+		// will relay the marshaled payload after commit. Same shape
+		// as the activate path — see the comment there for why the
+		// env load + decrypt happens at the call site rather than
+		// inside the helper.
 		deploymentForPayload := &domain.Deployment{
 			Hash:            deploymentHash,
 			Signature:       deploymentSignature,
@@ -1801,8 +1788,25 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			pr := rollbackPreviewPRNumber
 			deploymentForPayload.PreviewPRNumber = &pr
 		}
-		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
-			rolledBackID, deploymentForPayload, regions, rollbackQuota)
+		txAppEnv := s.appEnvRepo.WithTx(tx)
+		envRows, err := txAppEnv.List(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing env vars: %w", err)
+		}
+		envMap := make(map[string]string, len(envRows))
+		for _, e := range envRows {
+			if s.envSvc != nil {
+				plain, derr := s.envSvc.Decrypt(e.EnvValue)
+				if derr != nil {
+					return fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
+				}
+				envMap[e.EnvKey] = plain
+				continue
+			}
+			envMap[e.EnvKey] = e.EnvValue
+		}
+		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
+			rolledBackID, deploymentForPayload, tenant, regions, rollbackQuota, envMap)
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
@@ -1880,7 +1884,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 	if err != nil {
 		return fmt.Errorf("getting quota: %w", err)
 	}
-	maxMemoryMB := int(s.perAppMemoryMB(quota))
+	maxMemoryMB := int(perAppMemoryMB(quota))
 
 	var failedApps []string
 	for _, ad := range activeList {
