@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // stubActivator is the minimum implementation of deploymentActivator
@@ -182,5 +183,52 @@ func TestActivate_InvalidDeploymentID_Returns400(t *testing.T) {
 		if svc.called {
 			t.Errorf("deploymentID %q: ActivateDeployment must not be called for invalid deploymentID", id)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Activate — 409 (tenant is disabled, issue #440 gate)
+// ---------------------------------------------------------------------------
+//
+// TestActivate_TenantDisabled_Returns409 verifies that
+// service.ErrTenantDisabled bubbles up from ActivateDeployment as a 409
+// Conflict with the canonical httperror envelope (code=CONFLICT). This
+// is the surface contract that lets the CLI / operator tooling
+// distinguish "tenant is locked, retry after the operator un-disables"
+// from a generic 500 — see the issue #440 note in deployment.go's
+// Activate handler header comment.
+//
+// The disabled-vs-activate race window is closed by lockTenantForUpdate
+// at the service layer; the handler's job is just to surface the typed
+// sentinel without leaking it.
+
+func TestActivate_TenantDisabled_Returns409(t *testing.T) {
+	svc := &stubActivator{err: service.ErrTenantDisabled}
+	mux := newActivateMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/activate/d_x", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var got map[string]map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if got["error"]["code"] != "CONFLICT" {
+		t.Errorf("error.code = %q, want CONFLICT; body: %s", got["error"]["code"], rr.Body.String())
+	}
+	if got["error"]["message"] != "tenant is disabled" {
+		t.Errorf("error.message = %q, want %q; body: %s", got["error"]["message"], "tenant is disabled", rr.Body.String())
+	}
+	// Body must not leak the raw sentinel or the underlying DB driver error.
+	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
 	}
 }

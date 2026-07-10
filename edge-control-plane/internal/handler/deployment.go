@@ -710,6 +710,12 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 //
 // Status codes:
 //   - 200: activated; body is {"status": "activated"}.
+//   - 409: tenant is disabled (issue #440 gate). Body carries the
+//     standard httperror envelope with code=CONFLICT, so the CLI can
+//     branch on `error.code` instead of parsing the message. The 409
+//     is paired with tenant-not-disabled error code = "TENANT_DISABLED"
+//     via the "tenant is disabled" sentinel — same wire shape as the
+//     existing ErrNoLastGood 409 on the rollback endpoint.
 //   - 500: anything else (DB error, etc.).
 //
 // Note (issue #42): pre-#42, this handler could return 502 if the
@@ -718,6 +724,13 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 // active_deployments mutation, and the OutboxDrainer relays it after
 // commit. A failed activate can only mean a DB error or a duplicate
 // dedupe_key — both surface as 500.
+//
+// Note (issue #440): the ErrTenantDisabled → 409 mapping was added when
+// the disable-vs-activate race gate landed. The handler previously
+// surfaced any service error as a generic 500, which hid the
+// billing/lockdown boundary from the CLI and from any operator tooling
+// that wanted to differentiate "tenant is locked, don't retry" from
+// "infrastructure broke, alert on-call".
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -757,6 +770,15 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	// canary path is for partial weights only).
 	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+			// Issue #440: surface the disable-vs-activate race gate as a
+			// 409 Conflict so the CLI / operator tooling can distinguish
+			// "tenant is locked, don't retry" from a generic infrastructure
+			// 500. Anything else (db unreachable, lock timeout, …) stays
+			// a 500 with the canonical "internal error" envelope.
+			if errors.Is(err, service.ErrTenantDisabled) {
+				httperror.ConflictCtx(w, r, "tenant is disabled")
+				return
+			}
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)
 			return
@@ -822,12 +844,17 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 //   - 200: rolled back; body is {"deployment_id": "<new active id>"}.
 //   - 404: no active deployment for this app (user never activated).
 //   - 409: app is active but has no last-good pointer (only ever activated
-//     one deployment, so there is nothing to roll back to).
+//     one deployment, so there is nothing to roll back to), OR the tenant
+//     is disabled (issue #440 gate).
 //   - 500: anything else (DB error, etc.).
 //
 // Note (issue #42): pre-#42, this handler could return 502 if the
 // post-commit NATS publish failed. The publish is now durable (see
 // Activate's note above); a failed rollback can only mean a DB error.
+//
+// Note (issue #440): ErrTenantDisabled → 409 mirrors the mapping added
+// to Activate so callers can distinguish "tenant locked, don't retry"
+// from infrastructure errors.
 func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -837,6 +864,10 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 
 	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName)
 	if err != nil {
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
+			return
+		}
 		if errors.Is(err, service.ErrNoLastGood) {
 			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
 			return
@@ -877,6 +908,13 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 // Promote handles POST /api/v1/apps/{appName}/promote/{deploymentID} —
 // activates a deployment under a different app name than it was originally
 // deployed under (preview → production workflow).
+//
+// Status codes:
+//   - 200: promoted; body is {"status": "promoted"}.
+//   - 404: deployment not found, or owned by a different tenant.
+//   - 409: tenant is disabled (issue #440 gate; promotes flow through
+//     the same lockTenantForUpdate helper as Activate).
+//   - 500: anything else (DB error, etc.).
 func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	targetAppName := r.PathValue("appName")
@@ -892,6 +930,13 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID); err != nil {
 		if errors.Is(err, service.ErrDeploymentNotFound) {
 			httperror.NotFoundCtx(w, r, "deployment not found")
+			return
+		}
+		// Issue #440: disable-vs-activate race gate. Promote delegates
+		// to the same activateDeployment inner function as Activate, so
+		// the gate fires identically and the handler maps to 409 here.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
 			return
 		}
 		log.Printf("internal error: %v", err)
