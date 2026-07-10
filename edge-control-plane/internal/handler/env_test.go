@@ -9,7 +9,9 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 type mockEnvSvc struct {
@@ -122,5 +124,61 @@ func TestEnvHandler_Delete(t *testing.T) {
 
 	if rr.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want 204", rr.Code)
+	}
+}
+
+// TestEnvHandler_Set_DisabledTenant: issue #560 — service.SetEnv
+// returns ErrTenantDisabled, the handler must map it to 409 with
+// the canonical CONFLICT envelope (mirrors deployment.go:785).
+func TestEnvHandler_Set_DisabledTenant(t *testing.T) {
+	mux := newEnvMux(&mockEnvSvc{setEnvErr: service.ErrTenantDisabled})
+
+	body := `{"key":"LOG_LEVEL","value":"debug"}`
+	req := httptest.NewRequest(http.MethodPut, "/api/apps/hello/env", strings.NewReader(body))
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rr.Code)
+	}
+	assertConflictEnvelope(t, rr)
+}
+
+// TestEnvHandler_Delete_DisabledTenant: issue #560 — symmetric to
+// the Set path. service.DeleteEnv returns ErrTenantDisabled, the
+// handler must map it to 409.
+func TestEnvHandler_Delete_DisabledTenant(t *testing.T) {
+	mux := newEnvMux(&mockEnvSvc{deleteEnvErr: service.ErrTenantDisabled})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/apps/hello/env/LOG_LEVEL", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rr.Code)
+	}
+	assertConflictEnvelope(t, rr)
+}
+
+// assertConflictEnvelope decodes the canonical httperror envelope
+// and confirms the {code, message} fields match CONFLICT / "tenant
+// is disabled". Fails the test loudly if the envelope is malformed.
+//
+// Mirrors the unmarshal-via-generic-map shape used at
+// deployment_activate_test.go:220 — keeps env_test.go free of any
+// import cycle through httperror's struct types.
+func assertConflictEnvelope(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	var got map[string]map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal envelope: %v (body=%q)", err, rr.Body.String())
+	}
+	if got["error"]["code"] != string(httperror.CodeConflict) {
+		t.Errorf("error.code = %q, want %q; body: %s", got["error"]["code"], httperror.CodeConflict, rr.Body.String())
+	}
+	if got["error"]["message"] != "tenant is disabled" {
+		t.Errorf("error.message = %q, want %q; body: %s", got["error"]["message"], "tenant is disabled", rr.Body.String())
 	}
 }

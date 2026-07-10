@@ -10,6 +10,8 @@ members = [
     "edge-migrate/edge-migrate-lib",
     "edge-migrate/edge-migrate-bin",
     "edge-spool",
+    "edge-js-runtime",
+    "edge-js-runtime-long",
 ]
 
 # Excluded from the workspace:
@@ -20,7 +22,6 @@ members = [
 #     the workspace's resolver-2 defaults.
 exclude = [
     "edge-worker/tests/fixtures/handler",
-    "edge-js-runtime",
 ]
 
 [workspace.package]

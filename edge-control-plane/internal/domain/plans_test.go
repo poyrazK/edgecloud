@@ -10,10 +10,10 @@ func TestQuotaForPlan_KnownPlans(t *testing.T) {
 		plan   string
 		expect Quota
 	}{
-		{"free", Quota{MaxDeployments: 10, MaxApps: 5, MaxWorkers: 3, MaxMemoryMB: 256, MaxOutboundMB: 1000, MaxRequestsPerMonth: 100_000}},
-		{"pro", Quota{MaxDeployments: 50, MaxApps: 20, MaxWorkers: 10, MaxMemoryMB: 512, MaxOutboundMB: 10_000, MaxRequestsPerMonth: 5_000_000}},
-		{"business", Quota{MaxDeployments: 200, MaxApps: 50, MaxWorkers: 30, MaxMemoryMB: 1024, MaxOutboundMB: 100_000, MaxRequestsPerMonth: 50_000_000}},
-		{"enterprise", Quota{MaxDeployments: -1, MaxApps: -1, MaxWorkers: -1, MaxMemoryMB: -1, MaxOutboundMB: -1, MaxRequestsPerMonth: -1}},
+		{"free", Quota{MaxDeployments: 10, MaxApps: 5, MaxWorkers: 3, MaxMemoryMB: 256, MaxOutboundMB: 1000, MaxRequestsPerMonth: 100_000, MaxResidentSecondsPerMonth: 2_592_000}},
+		{"pro", Quota{MaxDeployments: 50, MaxApps: 20, MaxWorkers: 10, MaxMemoryMB: 512, MaxOutboundMB: 10_000, MaxRequestsPerMonth: 5_000_000, MaxResidentSecondsPerMonth: 7_776_000}},
+		{"business", Quota{MaxDeployments: 200, MaxApps: 50, MaxWorkers: 30, MaxMemoryMB: 1024, MaxOutboundMB: 100_000, MaxRequestsPerMonth: 50_000_000, MaxResidentSecondsPerMonth: 31_104_000}},
+		{"enterprise", Quota{MaxDeployments: -1, MaxApps: -1, MaxWorkers: -1, MaxMemoryMB: -1, MaxOutboundMB: -1, MaxRequestsPerMonth: -1, MaxResidentSecondsPerMonth: -1}},
 	}
 	for _, tc := range cases {
 		got, err := QuotaForPlan(tc.plan)
@@ -56,7 +56,8 @@ func TestPlanSentinel_UnlimitedValues(t *testing.T) {
 		t.Fatalf("QuotaForPlan(enterprise): %v", err)
 	}
 	if q.MaxDeployments >= 0 || q.MaxApps >= 0 || q.MaxWorkers >= 0 ||
-		q.MaxMemoryMB >= 0 || q.MaxOutboundMB >= 0 || q.MaxRequestsPerMonth >= 0 {
+		q.MaxMemoryMB >= 0 || q.MaxOutboundMB >= 0 || q.MaxRequestsPerMonth >= 0 ||
+		q.MaxResidentSecondsPerMonth >= 0 {
 		t.Errorf("enterprise tier should have all Max* = -1 (unlimited), got %+v", q)
 	}
 }
@@ -118,5 +119,51 @@ func TestQuota_UsagePct_OneUnlimited(t *testing.T) {
 	}
 	if *pct != 25.0 {
 		t.Errorf("UsagePct() = %v, want 25.0", *pct)
+	}
+}
+
+// TestQuota_UsagePct_ResidentSecondsHighest covers the third metered
+// dimension (issue #485): when resident-seconds is the highest axis,
+// UsagePct picks it. Mirrors TestQuota_UsagePct_PicksMax but exercises
+// the new branch.
+func TestQuota_UsagePct_ResidentSecondsHighest(t *testing.T) {
+	q := Quota{
+		MaxOutboundMB:              100,
+		MaxRequestsPerMonth:        10_000,
+		MaxResidentSecondsPerMonth: 1_000,            // 1000s cap
+		UsedOutboundBytes:          10 * 1024 * 1024, // 10%
+		UsedRequestCount:           2_000,            // 20%
+		UsedResidentSeconds:        900,              // 90%
+	}
+	pct := q.UsagePct()
+	if pct == nil {
+		t.Fatalf("UsagePct() = nil, want 90.0")
+	}
+	if *pct != 90.0 {
+		t.Errorf("UsagePct() = %v, want 90.0 (resident-seconds is the highest axis)", *pct)
+	}
+}
+
+// TestQuota_UsagePct_ResidentSecondsZeroNoCap covers the rollout path:
+// before operator configures a cap, MaxResidentSecondsPerMonth is 0
+// (skip the cap check) — UsagePct should ignore the resident-seconds
+// axis entirely. Without this guard, a tenant with used_resident_seconds=0
+// would contribute a 0% that "ties" against the other axes; 0 must be
+// omitted so UsagePct picks the highest non-zero axis instead.
+func TestQuota_UsagePct_ResidentSecondsZeroNoCap(t *testing.T) {
+	q := Quota{
+		MaxOutboundMB:              100, // operator hasn't set resident cap
+		MaxRequestsPerMonth:        10_000,
+		MaxResidentSecondsPerMonth: 0,
+		UsedOutboundBytes:          50 * 1024 * 1024, // 50%
+		UsedRequestCount:           2_000,            // 20%
+		UsedResidentSeconds:        0,
+	}
+	pct := q.UsagePct()
+	if pct == nil {
+		t.Fatalf("UsagePct() = nil, want 50.0")
+	}
+	if *pct != 50.0 {
+		t.Errorf("UsagePct() = %v, want 50.0 (outbound highest, resident-seconds axis disabled)", *pct)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
@@ -175,15 +173,17 @@ func TestInternalAutoRollback_Disabled_Returns412(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 502 — post-commit NATS publish failed
+// 500 — unexpected service error
 // ---------------------------------------------------------------------------
+//
+// Note: prior versions of this file asserted a 502 path for post-commit
+// NATS publish failures. Issue #42 made that path obsolete: durable
+// publish is now owned by service.OutboxDrainer (see CLAUDE.md schema
+// table). The handler only surfaces pre-flight 4xx and unexpected 5xx
+// errors; NATS unreachability becomes a backlogged `pending` outbox row.
 
-func TestInternalAutoRollback_PublishFailed_Returns502(t *testing.T) {
-	// Same multi-%w wrapping that ActivateDeployment / RollbackDeployment
-	// emit. Handler must distinguish from a 500 because the DB row may
-	// already be swapped — a retry on 500 would re-swap or 409.
-	wrapped := fmt.Errorf("%w: %w", service.ErrPublishFailed, errors.New("nats unreachable"))
-	svc := &stubAutoRollbacker{err: wrapped}
+func TestInternalAutoRollback_ServiceError_Returns500(t *testing.T) {
+	svc := &stubAutoRollbacker{err: errors.New("db unreachable")}
 	mux := newInternalAutoRollbackMux(svc)
 
 	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)
@@ -191,30 +191,11 @@ func TestInternalAutoRollback_PublishFailed_Returns502(t *testing.T) {
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502; body: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), "worker notification failed") {
-		t.Errorf("body should explain 502, got %s", rr.Body.String())
-	}
-	// Typed-envelope assertions (issue #127 follow-ups): the 502
-	// body must conform to httperror.ErrorResponse so clients that
-	// parse the typed envelope work across every status code.
-	var env httperror.ErrorResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
-		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
-	}
-	if env.Error.Code != httperror.CodeBadGateway {
-		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
-	}
-	if !strings.Contains(env.Error.Message, "worker notification failed") {
-		t.Errorf("error.message = %q, want it to mention worker notification", env.Error.Message)
-	}
-	if strings.Contains(rr.Body.String(), "nats unreachable") {
-		t.Errorf("body leaks raw error: %s", rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
-		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	if strings.Contains(rr.Body.String(), "db unreachable") {
+		t.Errorf("body must not leak raw error, got %s", rr.Body.String())
 	}
 }
 
@@ -273,26 +254,5 @@ func TestInternalAutoRollback_PathBodyMismatch_Returns400(t *testing.T) {
 	}
 	if svc.called {
 		t.Error("RollbackDeployment should not have been called on path/body mismatch")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 500 — unexpected service error
-// ---------------------------------------------------------------------------
-
-func TestInternalAutoRollback_ServiceError_Returns500(t *testing.T) {
-	svc := &stubAutoRollbacker{err: errors.New("db unreachable")}
-	mux := newInternalAutoRollbackMux(svc)
-
-	body := strings.NewReader(`{"tenant_id":"t_test","app_name":"myapp"}`)
-	req := httptest.NewRequest("POST", "/api/internal/apps/myapp/auto-rollback", body)
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "db unreachable") {
-		t.Errorf("body must not leak raw error, got %s", rr.Body.String())
 	}
 }

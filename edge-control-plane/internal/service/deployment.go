@@ -22,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // IsValidAppName returns true if the app name is safe for use in paths.
@@ -159,6 +160,14 @@ func mintPreviewID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// ptrToTime returns &t for t, used at call sites that need a
+// *time.Time column write. Issue #440: ActivationAttemptStartedAt on
+// active_deployments takes a non-nil pointer so the disable path's
+// wait loop sees a recent timestamp.
+func ptrToTime(t time.Time) *time.Time {
+	return &t
+}
+
 // Sentinel errors.
 //
 // The handler matches ErrInvalidRegion and ErrTooManyRegions via
@@ -170,6 +179,16 @@ var (
 	ErrMaxDeploymentsQuotaExceeded = fmt.Errorf("max deployments reached for tenant")
 	ErrInvalidRegion               = errors.New("invalid region")
 	ErrTooManyRegions              = errors.New("too many regions")
+	// ErrPaymentRequired is returned by Deploy when the deploy would
+	// violate a billing boundary (issue #420). The handler maps this
+	// to HTTP 402 PAYMENT_REQUIRED. Reasons are emitted as
+	// `subscription_past_due`, `subscription_canceled`, `free_tier_exceeded`,
+	// `quota_will_be_exceeded` — all surface in the JSON error envelope
+	// so the client can route the user to the right upgrade path.
+	// Distinct from ErrMaxDeploymentsQuotaExceeded (429) which still
+	// signals a backoff-and-retry cap on static deployment counts.
+	ErrPaymentRequired = errors.New("payment required")
+	// ErrInvalidWasm is returned by Deploy when the artifact's first
 	// ErrInvalidWasm is returned by Deploy when the artifact's first
 	// 4 bytes aren't the wasm magic (`\0asm`). Streaming keeps us
 	// from validating the full module here, but the magic-byte
@@ -177,6 +196,14 @@ var (
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
+
+	// ErrIdempotencyKeyMismatch (issue #52) — the caller reused
+	// an Idempotency-Key against a request body whose SHA-256
+	// differs from the one stored alongside the original row.
+	// The handler maps this to 422: the conflict is a client
+	// bug (a key by definition is supposed to identify a
+	// unique request), not a retry on the same request.
+	ErrIdempotencyKeyMismatch = errors.New("idempotency key reused with a different request body")
 	// ErrDeploymentNotFound is returned by PromoteDeployment when the
 	// deployment doesn't exist or belongs to a different tenant.
 	ErrDeploymentNotFound = fmt.Errorf("deployment not found")
@@ -212,6 +239,38 @@ var (
 	// activation, even if they opted out of auto-rollback.
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
 )
+
+// PaymentRequiredError wraps ErrPaymentRequired with a structured
+// reason code that the handler echoes in the JSON error envelope.
+// The reason is a stable, machine-readable string the client can
+// route on (e.g. "subscription_past_due" → show "update billing"
+// CTA, "quota_will_be_exceeded" → show "upgrade plan" CTA). The
+// sentinel stays in the error chain via Unwrap() so handlers can
+// still use errors.Is(err, ErrPaymentRequired) for the 402 mapping.
+type PaymentRequiredError struct {
+	Reason string
+}
+
+func (e *PaymentRequiredError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrPaymentRequired.Error(), e.Reason)
+}
+func (e *PaymentRequiredError) Unwrap() error { return ErrPaymentRequired }
+
+// perAppMemoryMB returns the per-app memory footprint (MiB) the runtime
+// will be told to allocate for a new deployment of this tenant (issue
+// #44, part 2). Mirrors the buildPublishPayload ladder so the runtime
+// hint (TaskMessage.MaxMemoryMB) and the quota counter see the same
+// number — diverge and the gate value at Deploy time stops matching
+// the increment value at Activate time.
+//
+// Plan-tier caps: free=256, pro=512, business=1024, enterprise=-1
+// (handled inside VerifyMemoryUnderCap itself). A zero or negative
+// MaxMemoryMB (legacy / admin-cleared / nil-quota path) falls back to
+// 256 — the pre-#44 buildPublishPayload behavior the runtime expects.
+// `perAppMemoryMB` itself moved to publish_payload.go (issue #560)
+// when buildPublishPayload was extracted; the function has no
+// receiver state and is now shared by both DeploymentService and
+// EnvService.
 
 // PublishError carries the per-region outcome of a fan-out
 // publish. Returned by ActivateDeployment / RollbackDeployment
@@ -321,6 +380,10 @@ type deployActiveRepoInterface interface {
 type tenantRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.TenantRepository
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	// GetForUpdate is GetByID with a row-level write lock; used by
+	// the activate / rollback tx to serialize against SetDisabledAt
+	// (issue #440).
+	GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
 // quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
@@ -328,6 +391,22 @@ type tenantRepoForDeploymentSvc interface {
 type quotaRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
+	VerifyUnderCap(ctx context.Context, tenantID string, projectedRequests, projectedOutboundBytes int64) (bool, error)
+	// VerifyMemoryUnderCap is the deploy-time aggregate-memory gate
+	// (issue #44, part 2). See internal/repository/quota.go.
+	VerifyMemoryUnderCap(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error)
+	// AddMemoryMB increments/decrements used_memory_mb. Called via
+	// WithTx(tx) inside activate / rollback / promote so the counter
+	// commits atomically with the active_deployments mutation.
+	AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error)
+}
+
+// billingRepoForDeploymentSvc is the subset of *repository.BillingRepository
+// methods used by DeploymentService. Added in issue #420 — the deploy-time
+// gate reads billing_subscriptions.status to enforce past_due / canceled
+// boundaries without widening the seam to the full billing surface.
+type billingRepoForDeploymentSvc interface {
+	GetSubscriptionStatus(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error)
 }
 
 // appEnvRepoForDeploymentSvc is the subset of *repository.AppEnvRepository
@@ -337,6 +416,23 @@ type appEnvRepoForDeploymentSvc interface {
 	List(ctx context.Context, tenantID, appName string) ([]domain.AppEnv, error)
 }
 
+// idempotencyRepoForDeploymentSvc is the subset of
+// *repository.IdempotencyKeyRepo used by DeploymentService for the
+// Idempotency-Key replay cache (issue #52). Identical surface area
+// to the concrete repo; defined here so service-level tests can
+// substitute a stub without spinning up sqlx.
+type idempotencyRepoForDeploymentSvc interface {
+	Lookup(ctx context.Context, tenantID, key string) (*domain.IdempotencyKey, error)
+	Insert(ctx context.Context, k *domain.IdempotencyKey) error
+}
+
+// outboxRepoForDeploymentSvc is the subset of *repository.OutboxRepository
+// methods used by DeploymentService. The interface exists so tests can
+// inject a sqlmock-backed fake without depending on the tx machinery.
+type outboxRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.OutboxRepository
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -344,12 +440,21 @@ type DeploymentService struct {
 	activeRepo     deployActiveRepoInterface
 	appEnvRepo     appEnvRepoForDeploymentSvc
 	quotaRepo      quotaRepoForDeploymentSvc
+	billingRepo    billingRepoForDeploymentSvc
 	tenantRepo     tenantRepoForDeploymentSvc
-	artifactStore  storage.ArtifactStore
-	publisher      nats.Publisher
-	appSvc         *AppService
-	envSvc         *EnvService     // injected for decryption at publish
-	webhookSvc     *WebhookService // injected for webhook events
+	// idempotencyRepo is the (tenant_id, key) -> deployment_id
+	// replay cache (issue #52). Optional — when nil, the replay
+	// check is skipped and every Deploy mints a fresh row. Set
+	// via SetIdempotencyRepo after construction so existing
+	// test harnesses that don't care about the cache don't need
+	// to thread an extra arg.
+	idempotencyRepo idempotencyRepoForDeploymentSvc
+	outboxRepo      outboxRepoForDeploymentSvc
+	artifactStore   storage.ArtifactStore
+	publisher       nats.Publisher
+	appSvc          *AppService
+	envSvc          *EnvService     // injected for decryption at publish
+	webhookSvc      *WebhookService // injected for webhook events
 	// cachePusher pushes the activation artifact bytes to a per-region
 	// edge-artifact-cache binary before the NATS TaskMessage publish
 	// (issue #332). Optional; when nil, the cache-push step is skipped
@@ -359,7 +464,7 @@ type DeploymentService struct {
 	cachePusher artifactCachePusher
 	// regionArtifactCaches is the per-region URL map from config. When
 	// a region's URL is unset (or the region is not in the map), the
-	// cache-push step is skipped for that region — the worker continues
+	// cache-push step for that region is skipped — the worker continues
 	// to pull from the CP's /api/internal/download/. Set via
 	// SetRegionArtifactCaches.
 	regionArtifactCaches map[string]string
@@ -380,6 +485,62 @@ type DeploymentService struct {
 	// the constructor; never nil/empty (the config layer defaults to
 	// "global" when unset).
 	defaultRegion string
+	// publishBuilder is the shared TaskMessage-marshaling helper
+	// (see publish_payload.go). Extracted from a private
+	// (DeploymentService) method when issue #560 added env-write
+	// republish to (EnvService).SetEnv/DeleteEnv — both services
+	// now share one instance constructed in app.go. Optional in
+	// pre-#560 tests that don't wire it; those tests use the legacy
+	// path that did not republish env writes at all.
+	publishBuilder *publishBuilder
+}
+
+// lockTenantForUpdate is the issue #440 disable-vs-write gate. It must
+// be the first SQL call inside any DeploymentService tx that ends in
+// either an active_deployments mutation OR an outbox INSERT —
+// specifically activateDeployment and RollbackDeployment, which both
+// publish a TaskMessage (directly via the outbox drainer) on commit.
+//
+// Locking the tenant row BEFORE reading active_deployments serializes
+// against concurrent SetDisabledAt / ClearDisabledAt:
+//
+//   - If we read disabled_at = NULL, the disable either commits after
+//     our tx (we hold the row lock until our commit, so the disable
+//     waits; it then sees our freshly-committed active row mutation
+//     and writes disabled_at) — the outbox row we enqueue carries a
+//     TaskMessage the OutboxDrainer will eventually publish, but the
+//     worker side already sees the tenant as disabled via the
+//     heartbeat-driven route-table update (ApplyTenantDelta fires on
+//     disabled_at writes), and the per-region dedupe_id on the message
+//     (issue #418) prevents the worker from re-applying the same
+//     delta on JetStream redelivery. The stale publish is therefore
+//     tolerable.
+//
+//   - If we read disabled_at set, the disable committed first and we
+//     abort with ErrTenantDisabled before touching the active row —
+//     no TaskMessage is enqueued.
+//
+// Lock-order: tenant first, then active_deployments. The two write
+// paths must agree on this order or a disable could commit between
+// one path's tenant read and the other's active read, producing a
+// split-brain state where activate publishes but rollback doesn't (or
+// vice versa).
+//
+// Returns (nil, nil) — i.e. ErrTenantNotFound — when the tenant row
+// does not exist. Callers MUST treat this as a hard error: a tenant
+// the control plane has forgotten about must not receive a publish.
+func (s *DeploymentService) lockTenantForUpdate(ctx context.Context, txTenant *repository.TenantRepository, tenantID string) (*domain.Tenant, error) {
+	tenantRow, err := txTenant.GetForUpdate(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("locking tenant: %w", err)
+	}
+	if tenantRow == nil {
+		return nil, ErrTenantNotFound
+	}
+	if tenantRow.IsDisabled() {
+		return nil, ErrTenantDisabled
+	}
+	return tenantRow, nil
 }
 
 func NewDeploymentService(
@@ -389,6 +550,7 @@ func NewDeploymentService(
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
 	tenantRepo *repository.TenantRepository,
+	outboxRepo *repository.OutboxRepository,
 	artifactStore storage.ArtifactStore,
 	publisher nats.Publisher,
 	defaultRegion string,
@@ -410,6 +572,7 @@ func NewDeploymentService(
 		appEnvRepo:     appEnvRepo,
 		quotaRepo:      quotaRepo,
 		tenantRepo:     tenantRepo,
+		outboxRepo:     outboxRepo,
 		artifactStore:  artifactStore,
 		publisher:      publisher,
 		defaultRegion:  defaultRegion,
@@ -426,12 +589,42 @@ func (s *DeploymentService) SetCachePusher(p artifactCachePusher) {
 	s.cachePusher = p
 }
 
+// GetCachePusher returns the currently-injected cache pusher (may be
+// nil). Used by the cache-retry sweep (issue #501) so it can re-push
+// stranded cache writes without a separate DI seam. Returns the live
+// pointer — operators may rotate the pusher at runtime via
+// SetCachePusher, and the sweep reads the latest value each tick.
+func (s *DeploymentService) GetCachePusher() artifactCachePusher {
+	return s.cachePusher
+}
+
+// SetBillingRepo injects the billing repo used by the deploy-time
+// quota gate (issue #420). Optional injection — Deploy is the only
+// caller, and existing tests that don't care about billing can leave
+// it nil. When nil, the deploy-time 402 path treats a tenant as
+// "no paid subscription" (subscription_status defaults to active),
+// which preserves the pre-#420 behavior for tests that don't wire it.
+func (s *DeploymentService) SetBillingRepo(b billingRepoForDeploymentSvc) {
+	s.billingRepo = b
+}
+
 // SetRegionArtifactCaches injects the per-region URL map. When a
 // region's URL is absent (or empty), the cache-push step for that
 // region is skipped. Combined with SetCachePusher: the pusher must
 // be set AND the region must be in the map for a push to occur.
 func (s *DeploymentService) SetRegionArtifactCaches(m map[string]string) {
 	s.regionArtifactCaches = m
+}
+
+// GetRegionArtifactCaches returns the live per-region URL map. Used by
+// the cache-retry sweep (issue #501) so it consults the current config
+// each sweep tick — operators may rotate the map at runtime via
+// SetRegionArtifactCaches (e.g. on a config hot-reload or a region
+// addition). Returning the live map (not a snapshot) is intentional:
+// the sweep is expected to handle "config disappeared since last
+// activate" by treating those rows as configMissing.
+func (s *DeploymentService) GetRegionArtifactCaches() map[string]string {
+	return s.regionArtifactCaches
 }
 
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
@@ -444,8 +637,29 @@ func (s *DeploymentService) SetEnvService(envSvc *EnvService) {
 	s.envSvc = envSvc
 }
 
+// SetPublishBuilder injects the shared TaskMessage-marshaling helper
+// (see publish_payload.go). The same instance is shared with
+// EnvService so the wire format stays single-source. Optional in
+// pre-#560 test harnesses — those tests don't exercise the publish
+// path at all and the field's nil-method-call check on
+// publishBuilder is deferred to the helper's runtime guards.
+func (s *DeploymentService) SetPublishBuilder(b *publishBuilder) {
+	s.publishBuilder = b
+}
+
 func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 	s.webhookSvc = webhookSvc
+}
+
+// SetIdempotencyRepo injects the Idempotency-Key replay cache
+// (issue #52). When nil (the default), Deploy short-circuits
+// the replay check and behaves exactly as before — every call
+// mints a fresh deployment_id. Set via a setter (mirroring
+// SetAppService / SetEnvService) so test harnesses that don't
+// care about idempotency don't have to thread an extra
+// constructor arg.
+func (s *DeploymentService) SetIdempotencyRepo(r idempotencyRepoForDeploymentSvc) {
+	s.idempotencyRepo = r
 }
 
 // Deploy creates a new deployment and stores the artifact.
@@ -467,10 +681,10 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // After the deployment row is written, the activate path will publish
 // one `TaskMessage` per region to `edgecloud.tasks.<region>`. (See
 // `ActivateDeployment`.)
-func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata, previewOpts *PreviewOpts) (*domain.Deployment, error) {
+func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string, r io.Reader, regions []string, autoRollback bool, desiredReplicas int, buildMeta *provenance.CLISideMetadata, previewOpts *PreviewOpts, idempotencyKey string, requestSHA256 [32]byte) (deployment *domain.Deployment, fromCache bool, err error) {
 	// Validate appName to prevent path traversal (defense-in-depth)
 	if !IsValidAppName(appName) {
-		return nil, fmt.Errorf("invalid app name")
+		return nil, false, fmt.Errorf("invalid app name")
 	}
 
 	// Validate every region before any side effect. An invalid
@@ -486,32 +700,187 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	// the message also embeds the failing region for the operator.
 	for _, r := range regions {
 		if !IsValidRegion(r) {
-			return nil, fmt.Errorf("%w %q: must match [a-z0-9-]{1,64}", ErrInvalidRegion, r)
+			return nil, false, fmt.Errorf("%w %q: must match [a-z0-9-]{1,64}", ErrInvalidRegion, r)
 		}
 	}
 	if len(regions) > MaxRegionsPerDeployment {
-		return nil, fmt.Errorf("%w: %d (max %d)", ErrTooManyRegions, len(regions), MaxRegionsPerDeployment)
+		return nil, false, fmt.Errorf("%w: %d (max %d)", ErrTooManyRegions, len(regions), MaxRegionsPerDeployment)
+	}
+
+	// Idempotency-Key replay check (issue #52). When the caller
+	// supplies a key AND the repo is wired, look up the cache
+	// before doing any of the heavy lifting (artifact hash,
+	// disk I/O, signature, row insert). A non-nil hit
+	// short-circuits the function with the cached row +
+	// fromCache=true; the handler converts that into 200 vs 201.
+	//
+	// The body-hash mismatch path (same key, different body)
+	// returns ErrIdempotencyKeyMismatch so the handler maps it
+	// to 422. This is the "you reused a key by mistake" guard
+	// rail — the table's request_sha256 column is the source
+	// of truth.
+	//
+	// Lookup errors other than sql.ErrNoRows bubble up; the
+	// handler converts them to 500 via the existing
+	// InternalErrorCtx path.
+	if idempotencyKey != "" && s.idempotencyRepo != nil {
+		cached, lookupErr := s.idempotencyRepo.Lookup(ctx, tenantID, idempotencyKey)
+		if lookupErr != nil {
+			return nil, false, fmt.Errorf("idempotency lookup: %w", lookupErr)
+		}
+		if cached != nil {
+			// Verify the request body matches what produced
+			// the cached row. A mismatch means the caller
+			// reused a key against a different artifact —
+			// refuse with 422 rather than silently replaying
+			// a stale row against the wrong body.
+			if cached.RequestSHA256 != requestSHA256 {
+				return nil, false, ErrIdempotencyKeyMismatch
+			}
+			existing, getErr := s.deploymentRepo.GetByID(ctx, cached.DeploymentID)
+			if getErr != nil {
+				return nil, false, fmt.Errorf("idempotency replay fetch: %w", getErr)
+			}
+			if existing == nil {
+				// The deployments row was deleted out from
+				// under us (operator-initiated GC, FK
+				// cascade taking a beat, etc.). Treat as
+				// a miss — caller will write a fresh row
+				// with the same key (ON CONFLICT DO NOTHING).
+				// Falling through is the right behavior.
+			} else {
+				return existing, true, nil
+			}
+		}
 	}
 
 	// Auto-create the app record if it doesn't already exist (backward compatible).
 	if s.appSvc != nil {
 		if err := s.appSvc.CreateIfNotExists(ctx, tenantID, appName); err != nil {
-			return nil, fmt.Errorf("creating app: %w", err)
+			return nil, false, fmt.Errorf("creating app: %w", err)
 		}
 	}
 
-	// Check quota
+	// Check quota (issue #420: deploy-time enforcement gate).
+	//
+	// Three pre-checks run before the static-cap check; any one failing
+	// returns 402 PAYMENT_REQUIRED. Order matters — we test the cheapest,
+	// most likely reason first (subscription state) before falling
+	// through to the row-locking cap test.
+	//
+	//  1. subscription_status in {past_due, canceled} → 402
+	//     (the merchant's billing provider has reported a stuck card
+	//     or an explicit cancel; the tenant's payment method is bad
+	//     and the next deploy won't fix it).
+	//  2. tenants.disabled_at IS NOT NULL (free-tier lockdown active) → 402
+	//     (reuses the existing disabled_at mechanism from #155; the
+	//     cap row may still allow, but the tenant is locked from
+	//     launching new apps until cleared).
+	//  3. tenants.overage_allowed_until > now() → skip the cap check
+	//     (paid tenant with an admin-granted grace window).
+	//  4. VerifyUnderCap → 402 if the next-request-burst projection
+	//     would push the tenant over their monthly cap.
 	quota, err := s.quotaRepo.GetByTenantID(ctx, tenantID)
 	if err != nil {
-		return nil, fmt.Errorf("getting quota: %w", err)
+		return nil, false, fmt.Errorf("getting quota: %w", err)
+	}
+
+	// Pre-check 1: subscription status. billingRepo is optional (set
+	// via SetBillingRepo); nil preserves the pre-#420 behavior of
+	// "no paid subscription → treat as active" so tests that don't
+	// wire it don't have to mock it.
+	if s.billingRepo != nil {
+		status, err := s.billingRepo.GetSubscriptionStatus(ctx, tenantID)
+		if err != nil {
+			return nil, false, fmt.Errorf("getting subscription status: %w", err)
+		}
+		switch status {
+		case domain.SubscriptionPastDue:
+			return nil, false, &PaymentRequiredError{Reason: "subscription_past_due"}
+		case domain.SubscriptionCanceled:
+			return nil, false, &PaymentRequiredError{Reason: "subscription_canceled"}
+		}
+	}
+
+	// Pre-check 2: free-tier lockdown via tenants.disabled_at. We
+	// read the tenant row separately so the deploy-time gate can
+	// also honour Pre-check 3 (overage grace). tenantRepo is wired
+	// by the constructor; nil would skip both checks and degrade to
+	// the pre-#420 behavior (cheap tests don't need to mock it).
+	if s.tenantRepo != nil {
+		tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
+		if err != nil {
+			return nil, false, fmt.Errorf("getting tenant: %w", err)
+		}
+		if tenant != nil && tenant.IsDisabled() {
+			// Free-tier lockdown is a billing cliff — apps should
+			// stop, deploys should be blocked. The grace column
+			// (quota_lock_grace_until) is checked separately below
+			// so the request-time gate can still serve 402 only
+			// after grace expires.
+			return nil, false, &PaymentRequiredError{Reason: "free_tier_exceeded"}
+		}
+		// Pre-check 3: admin overage grace. The grace is a
+		// per-tenant bypass for the cap check only — it does NOT
+		// clear a free-tier lockdown (that's a separate admin
+		// lever). If now < overage_allowed_until we skip VerifyUnderCap
+		// below. Past timestamps are equivalent to NULL: the
+		// comparison is strict.
+		if tenant != nil && tenant.OverageAllowedUntil != nil &&
+			!tenant.OverageAllowedUntil.IsZero() &&
+			time.Now().UTC().Before(*tenant.OverageAllowedUntil) {
+			// Skip cap verification but still fall through to the
+			// static MaxDeployments count check below — the grace
+			// is a quota cap bypass, not an "all checks off" flag.
+			quota = nil // mark as "skip VerifyUnderCap"
+		}
+	}
+
+	// Pre-check 4: projected cap verification. Skipped when the
+	// overage grace is active (quota==nil from the pre-check above).
+	// Default projection: 1 request for the deploy's first inbound
+	// call, 0 outbound bytes (we don't know the response size).
+	// Tunable later if we learn tenants abuse by deploying then
+	// hammering — the heartbeat path moves the actual counter.
+	if quota != nil {
+		ok, err := s.quotaRepo.VerifyUnderCap(ctx, tenantID, 1, 0)
+		if err != nil {
+			return nil, false, fmt.Errorf("verifying cap: %w", err)
+		}
+		if !ok {
+			return nil, false, &PaymentRequiredError{Reason: "quota_will_be_exceeded"}
+		}
+	}
+
+	// Pre-check 5: tenant-aggregate memory gate (issue #44, part 2).
+	// Paired with pre-check 4 (VerifyUnderCap) — both sit under the
+	// same `quota != nil` guard set by the overage-grace bypass at the
+	// top of Deploy. If you ever change that bypass, change both
+	// pre-checks together or the operator UX will diverge between
+	// request-count and memory-cap enforcement.
+	//
+	// Skipped when the overage grace is active (quota==nil) and
+	// when the tenant's MaxMemoryMB is the unlimited sentinel (<0)
+	// or unset (==0); both are honored inside VerifyMemoryUnderCap
+	// itself. deployPerApp is the same value the activate path
+	// will increment the counter by — see perAppMemoryMB() below.
+	if quota != nil {
+		deployPerApp := perAppMemoryMB(quota)
+		ok, err := s.quotaRepo.VerifyMemoryUnderCap(ctx, tenantID, deployPerApp)
+		if err != nil {
+			return nil, false, fmt.Errorf("verifying memory cap: %w", err)
+		}
+		if !ok {
+			return nil, false, &PaymentRequiredError{Reason: "memory_quota_will_be_exceeded"}
+		}
 	}
 
 	count, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
 	if err != nil {
-		return nil, fmt.Errorf("counting deployments: %w", err)
+		return nil, false, fmt.Errorf("counting deployments: %w", err)
 	}
 	if count >= quota.MaxDeployments {
-		return nil, ErrMaxDeploymentsQuotaExceeded
+		return nil, false, ErrMaxDeploymentsQuotaExceeded
 	}
 
 	// Note: we no longer buffer the entire artifact in memory here.
@@ -533,7 +902,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		effectiveRegions = []string{s.defaultRegion}
 	}
 
-	deployment := &domain.Deployment{
+	deployment = &domain.Deployment{
 		ID:       "d_" + uuid.New().String(),
 		TenantID: tenantID,
 		AppName:  appName,
@@ -662,6 +1031,35 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			if err := s.deploymentRepo.WithTx(tx).Create(ctx, deployment); err != nil {
 				return fmt.Errorf("creating deployment: %w", err)
 			}
+			// Idempotency-Key record (issue #52). Inserted
+			// after the deployments row writes — same tx so
+			// a signing / attestation failure rolls the cache
+			// row back alongside the row it points at.
+			// ON CONFLICT (tenant_id, key) DO NOTHING absorbs
+			// concurrent retries with the same key; the first
+			// writer's deployment_id is the one future
+			// lookups return. The audit-naming asymmetry
+			// ("deployment row first, then cache row") doesn't
+			// matter because the cache FK cascades the row
+			// away if the deployments row is rolled back, and
+			// a successful deployment row is the only signal a
+			// caller will ever see.
+			//
+			// requestSHA256 is the body hash the handler
+			// computed from the multipart body BEFORE parsing
+			// the parts, not the artifact hash from
+			// SaveAndHash — same-key/different-body reuses
+			// compare this against the stored hash.
+			if idempotencyKey != "" && s.idempotencyRepo != nil {
+				if iErr := s.idempotencyRepo.Insert(ctx, &domain.IdempotencyKey{
+					TenantID:      tenantID,
+					Key:           idempotencyKey,
+					DeploymentID:  deployment.ID,
+					RequestSHA256: requestSHA256,
+				}); iErr != nil {
+					return fmt.Errorf("recording idempotency key: %w", iErr)
+				}
+			}
 			return nil
 		})
 		// Apps-row cleanup: CreateIfNotExists above inserted the
@@ -725,12 +1123,26 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 					err = fmt.Errorf("attaching build attestation: %w", attachErr)
 				} else if createErr := s.deploymentRepo.Create(ctx, deployment); createErr != nil {
 					err = fmt.Errorf("creating deployment: %w", createErr)
+				} else if idempotencyKey != "" && s.idempotencyRepo != nil {
+					// No-tx path (test only): record the
+					// idempotency key after the deployments
+					// row is created. ON CONFLICT DO NOTHING
+					// absorbs concurrent retries with the same
+					// key, mirroring the tx path's behavior.
+					if iErr := s.idempotencyRepo.Insert(ctx, &domain.IdempotencyKey{
+						TenantID:      tenantID,
+						Key:           idempotencyKey,
+						DeploymentID:  deployment.ID,
+						RequestSHA256: requestSHA256,
+					}); iErr != nil {
+						err = fmt.Errorf("recording idempotency key: %w", iErr)
+					}
 				}
 			}
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if s.webhookSvc != nil {
@@ -740,7 +1152,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		})
 	}
 
-	return deployment, nil
+	return deployment, false, nil
 }
 
 func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id string) (*domain.Deployment, error) {
@@ -849,8 +1261,9 @@ func previewPRNumberFromDeployment(d *domain.Deployment) int {
 }
 
 // activateDeployment is the shared inner logic for ActivateDeployment
-// and PromoteDeployment. It sets the active deployment row and publishes
-// a task update, without checking the deployment's original app name.
+// and PromoteDeployment. It sets the active deployment row and enqueues
+// a durable NATS publish via the transactional outbox (issue #42),
+// without checking the deployment's original app name.
 func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
 
 	// Atomically move the current active id into last_good_deployment_id
@@ -862,8 +1275,54 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	//   - Re-activate the same id: current.deployment_id == newID →
 	//     last_good becomes equal to deployment_id (visually a no-op,
 	//     but the row stays consistent).
+	//
+	// Phase 1 (transactional): the active_deployments upsert +
+	// ClearStableSince + the outbox row are written in a single tx.
+	// The outbox row carries the marshaled TaskMessage so the
+	// background OutboxDrainer can publish it durably after commit;
+	// before #42 this publish ran synchronously here, with a
+	// process/NATS crash between commit and publish leaving the row
+	// active but no worker ever receiving the TaskMessage (until the
+	// reconcile loop's 5-minute FullSync safety net).
+	//
+	// buildPublishPayload reads env / tenant / quota via the same tx
+	// so the payload reflects post-commit state even if another
+	// activate lands before this one drains. The reads happen against
+	// the tx's connection so they see a consistent snapshot.
+	regions := domain.StringArrayTo(deployment.Regions)
+	if len(regions) == 0 {
+		regions = []string{s.defaultRegion}
+	}
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// Issue #440: take SELECT ... FOR UPDATE on the tenants row
+		// inside the same tx as the active_deployments FOR UPDATE so
+		// the tenant state is observed under the lock — not after a
+		// post-commit GetByID race. The lock also serializes against
+		// WorkerService.disableTenantAtomically: if disable commits
+		// ahead, our tx observes disabled_at non-nil and we abort
+		// before publishing; if our tx commits first, disable's
+		// post-commit active-deployments diff sees the row we just
+		// wrote and skips the empty task_update that would
+		// otherwise kill the just-activated app.
+		txTenant := s.tenantRepo.WithTx(tx)
 		txActive := s.activeRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-activate gate — see
+		// lockTenantForUpdate for the race window + the worker-side
+		// dedupe_id / route-table mechanism that makes the
+		// "disable commits after we read NULL" arm tolerable.
+		// lockTenantForUpdate returns the tenant row AND takes the
+		// tenants-row FOR UPDATE lock that closes the issue #440
+		// disable-vs-activate/disable-vs-rollback race. We capture
+		// it here so the new pure-function buildPublishPayload can
+		// reuse the same row — both reads participate in the same
+		// tx snapshot, so the wire payload's AllowlistedDestinations
+		// is consistent with the active_deployments mutation.
+		tenant, err := s.lockTenantForUpdate(ctx, txTenant, tenantID)
+		if err != nil {
+			return err
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -897,6 +1356,15 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			// pre-#308 behavior.
 			PreviewID:       deployment.PreviewID,
 			PreviewPRNumber: deployment.PreviewPRNumber,
+			// Stamp the issue #440 in-flight marker (migration
+			// 026). The disable path observes this column via
+			// waitForActiveRowPublishes (commit 8) and waits
+			// for the matching last_publish_at stamp before
+			// publishing empty — closing the canonical race
+			// where activate wins the tenants FOR UPDATE lock
+			// first and its post-commit publishSwap runs
+			// after the disable's commit.
+			ActivationAttemptStartedAt: ptrToTime(time.Now()),
 		}); err != nil {
 			return fmt.Errorf("setting active deployment: %w", err)
 		}
@@ -913,84 +1381,86 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
+
+		// Issue #44, part 2: read quota inside the tx ONCE so the
+		// per-app memory value used to build the TaskMessage
+		// (below) and the value used to bump the counter (after
+		// the outbox INSERT) provably come from the same snapshot.
+		// The same row is reused by buildPublishPayload (passed
+		// via the new quota arg) so we don't double-SELECT.
+		activateQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota for activate: %w", err)
+		}
+
+		// Build the TaskMessage payload inside the tx so env /
+		// tenant reads participate in the same atomic snapshot as
+		// the active_deployments mutation. The shared helper at
+		// publish_payload.go takes pre-resolved typed inputs
+		// (tenant, envMap, quota, deployment) — we do all the
+		// reads here under the same tx so the wire payload is
+		// consistent with the row swap. Decryption (CPU-only,
+		// no DB) is fine inside the closure. The dedupe_key is
+		// `<tenant>:<app>:<attempt_id>` — UNIQUE in the outbox
+		// schema so a buggy re-enqueue surfaces as a constraint
+		// violation rather than a double-publish.
+		txAppEnv := s.appEnvRepo.WithTx(tx)
+		// Reach through envSvc.GetEncryptor() so the helper sees the
+		// same nil-safe decrypt path the original inlined loop did.
+		// s.envSvc is conventionally non-nil in production wiring
+		// (set by SetEnvService in app.go), but the nil guard
+		// preserves backward-compat for any test that omits it.
+		var encryptor *SecretEncryptor
+		if s.envSvc != nil {
+			encryptor = s.envSvc.GetEncryptor()
+		}
+		envMap, err := loadDecryptedEnvMap(ctx, txAppEnv, encryptor, tenantID, appName)
+		if err != nil {
+			return err
+		}
+		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
+			deploymentID, deployment, tenant, regions, activateQuota, envMap)
+		if err != nil {
+			return fmt.Errorf("building publish payload: %w", err)
+		}
+		attemptID := uuid.NewString()
+		if err := s.outboxRepo.WithTx(tx).Enqueue(ctx, &repository.OutboxRow{
+			TenantID:  tenantID,
+			AppName:   appName,
+			Kind:      "task_update",
+			Payload:   payload,
+			Regions:   pq.StringArray(regions),
+			DedupeKey: tenantID + ":" + appName + ":" + attemptID,
+		}); err != nil {
+			return fmt.Errorf("enqueueing outbox row: %w", err)
+		}
+		// Increment the per-tenant aggregate memory counter inside
+		// the same tx as the active_deployments mutation so a
+		// rollback of any statement above (outbox INSERT, build
+		// payload, ClearStableSince, Set) reverts this counter too.
+		// Must use WithTx(tx) — calling the outer s.quotaRepo would
+		// open a different connection and break atomicity, leaving
+		// the counter ahead of the active_deployments row set.
+		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, perAppMemoryMB(activateQuota))
+		if err != nil {
+			return fmt.Errorf("incrementing memory quota: %w", err)
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
 	}
 
-	// Publish task update
-	var envMap map[string]string
-	var pubErr error
-	if s.envSvc != nil {
-		envMap, pubErr = s.envSvc.DecryptEnvMap(ctx, tenantID, appName)
-		if pubErr != nil {
-			return fmt.Errorf("preparing env vars for publish: %w", pubErr)
-		}
-	} else {
-		var envs []domain.AppEnv
-		envs, pubErr = s.appEnvRepo.List(ctx, tenantID, appName)
-		if pubErr != nil {
-			return fmt.Errorf("listing env vars: %w", pubErr)
-		}
-		envMap = make(map[string]string, len(envs))
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
-		}
-	}
-
-	tenant, pubErr := s.tenantRepo.GetByID(ctx, tenantID)
-	if pubErr != nil {
-		return fmt.Errorf("getting tenant: %w", pubErr)
-	}
-	if tenant == nil {
-		return fmt.Errorf("tenant not found")
-	}
-	if tenant.IsDisabled() {
-		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
-	}
-
-	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
-	if pubErr != nil {
-		return fmt.Errorf("getting quota: %w", pubErr)
-	}
-	maxMemoryMB := 256
-	if quota != nil && quota.MaxMemoryMB > 0 {
-		maxMemoryMB = quota.MaxMemoryMB
-	}
-
-	msg := &nats.TaskMessage{
-		Type:      "task_update",
-		Timestamp: time.Now().UTC(),
-		TenantID:  tenantID,
-		Apps: map[string]nats.AppConfig{
-			appName: nats.BuildAppConfig(
-				deploymentID,
-				deployment.Hash,
-				deployment.Signature,
-				deployment.SigningKeyID, // issue #307 PR1: per-key kid
-				previewIDFromDeployment(deployment),
-				previewPRNumberFromDeployment(deployment),
-				envMap,
-				tenant.AllowlistedDestinations,
-				maxMemoryMB,
-			),
-		},
-	}
-
-	// Resolve the effective regions list to publish to via the
-	// shared helper. publishSwap is also used by RollbackDeployment,
-	// which previously published to "global" only — a silent
-	// multi-region regression. Keeping both paths through one helper
-	// guarantees they fan out identically.
-	//
-	// deployment.Regions is pq.StringArray on this branch; convert to
-	// []string so publishSwap can iterate it directly.
-	regions := domain.StringArrayTo(deployment.Regions)
-	if len(regions) == 0 {
-		regions = []string{s.defaultRegion}
-	}
-	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
-		return err
+	// Phase 2 (post-tx, fire-and-forget): the optional per-region
+	// artifact cache push. Cache failures are best-effort (logged,
+	// not returned) — the worker falls back to /api/internal/download
+	// when the cache misses. The NATS TaskMessage is durably queued
+	// in the outbox; the OutboxDrainer will publish it independently
+	// of this handler.
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, regions); err != nil {
+		// publishSwap returns nil on cache-push errors today
+		// (best-effort), but defensive: a future regression that
+		// returns an error here should not break activate.
+		log.Printf("activate: cache-push post-state failed for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
 	}
 	if s.webhookSvc != nil {
 		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "activate", map[string]string{
@@ -1000,356 +1470,153 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	return nil
 }
 
-// publishSwap fans a TaskMessage out to every region in `regions`,
-// skipping regions that have already been published for this
-// (tenant, app) activation and always retrying regions in
-// regions_failed. Used by ActivateDeployment and RollbackDeployment
-// so they cannot drift in their region-fanout behavior (the prior
-// Rollback path published to "global" only, leaving multi-region
-// deployments stuck on the broken version until the next heartbeat).
+// buildPublishPayload assembles the marshaled TaskMessage that
+// accompanies the active_deployments mutation. The function body
+// moved to publish_payload.go in issue #560 when
+// (*DeploymentService).buildPublishPayload was extracted to a
+// shared (*publishBuilder).buildPublishPayload reachable from both
+// DeploymentService.ActivateDeployment and EnvService.SetEnv /
+// DeleteEnv. The activate/rollback call sites in this file
+// pre-resolve the inputs (env, tenant, deployment, quota) under
+// their own *sqlx.Tx (so every read participates in the same
+// atomic snapshot as the active_deployments mutation) and hand
+// the marshaled payload to outboxRepo.Enqueue. See
+// publish_payload.go for the helper and internal/service/env.go
+// for the env-write caller.
 //
-// Idempotency (issue #127 step 6):
-//   - Reads the committed active_deployments row to discover
-//     regions_published (skip — already on the wire) and
-//     regions_failed (always retry — never let a stale
-//     regions_published mask a real failure; see Risk 3 in the
-//     issue #127 plan).
-//   - The publish set is (regions ∪ regions_failed) − regions_published.
-//   - If empty (every region already published), returns nil
-//     without touching the publisher or the DB.
+// publishSwap is the post-commit cache-push step. Pre-#42 this also
+// fanned out the NATS TaskMessage; that responsibility now lives on
+// the OutboxDrainer. publishSwap only handles:
 //
-// Failures in a single region are logged and accumulated into the
-// returned *PublishError — we keep publishing to the remaining
-// regions rather than aborting on the first failure, so a
-// transient NATS blip in one region doesn't starve the others.
+//   - reading the committed active row to discover regions_published
+//     (skip — already on the wire) and regions_cached (skip — push
+//     already happened, the cache-skip-on-activation optimization
+//     from issue #332 Layer 3),
+//   - pushing the artifact bytes to per-region edge-artifact-cache
+//     binaries,
+//   - persisting the cache-state outcome via AppendRegionsCacheState.
 //
-// On success, persists the per-region outcome via
-// activeRepo.AppendRegionsPublished / AppendRegionsFailed so the
-// next retry call can short-circuit. The append is best-effort:
-// a DB write failure is logged but does not change the returned
-// error — the publish itself already succeeded and the operator
-// would rather see the per-region 502 envelope than a misleading
-// 500.
-//
-// The DB tx has already committed by the time we get here, so
-// workers may still be serving the prior deployment; the caller
-// surfaces this as a transient 502 to the client.
-//
-// Returns nil on full success, or *PublishError{Published, Failed}
-// wrapping ErrPublishFailed on any per-region failure.
-// errors.Is(err, ErrPublishFailed) matches via the *PublishError's
-// Unwrap, preserving the contract the pre-step-6 handler relied on.
-func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string) error {
-	// Read the committed row's publish state. The Set upsert at the
-	// start of Activate / Rollback wipes regions_published and
-	// regions_failed to empty (see ActiveDeploymentRepository.Set's
-	// DO UPDATE clause), so on a first attempt the toPublish set
-	// equals `regions`; on a retry of a partially-failed
-	// activation, prior successes are skipped and prior failures
-	// are included.
+// The function never returns an error today: cache-push failures are
+// best-effort (logged, not returned). The signature keeps the
+// `error` return so a future regression that surfaces a cache error
+// doesn't break the caller — log-and-continue stays the default.
+func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, regions []string) error {
+	// Cache push only — pre-#42 this function also fanned out the
+	// NATS TaskMessage via s.publisher.PublishTaskUpdate. That
+	// responsibility now lives on the OutboxDrainer
+	// (internal/service/outbox_drainer.go). The handler-side
+	// activate/rollback no longer publishes NATS directly; the
+	// outbox row carries the TaskMessage and the drainer relays
+	// it. publishSwap is now strictly cache-push + cache-state
+	// post-write.
+	//
+	// Best-effort: a cache push error does NOT bubble up as a 502
+	// to the client (the activation succeeded — the worker will
+	// pull from /api/internal/download when its cache miss is
+	// detected). The error is logged and the per-region state is
+	// persisted to regions_cache_failed for operator visibility.
+	//
+	// Skip conditions:
+	//   - s.cachePusher is nil (cache feature disabled at runtime)
+	//   - s.regionArtifactCaches[region] is unset or empty
+	//   - region is in alreadyCached (issue #332, Layer 3): a Set
+	//     with the same deployment_id preserves RegionsCached via
+	//     the CASE WHEN in the DO UPDATE clause, so this branch
+	//     fires on a re-activation of the same deployment where
+	//     the cache is still warm from a prior activation.
+	if s.cachePusher == nil || len(s.regionArtifactCaches) == 0 {
+		return nil
+	}
+
+	// Read the committed row's cache state so the alreadyCached
+	// skip-on-activation optimization fires correctly.
 	current, err := s.activeRepo.Get(ctx, tenantID, appName)
 	if err != nil {
-		return fmt.Errorf("reading publish state: %w", err)
+		return fmt.Errorf("reading cache state: %w", err)
 	}
-	alreadyPublished := make(map[string]struct{}, len(current.RegionsPublished))
-	for _, r := range current.RegionsPublished {
-		alreadyPublished[r] = struct{}{}
-	}
-	mustRetry := make(map[string]struct{}, len(current.RegionsFailed))
-	for _, r := range current.RegionsFailed {
-		mustRetry[r] = struct{}{}
-	}
-	// alreadyCached (issue #332, Layer 3): regions whose
-	// edge-artifact-cache binary already holds the artifact bytes
-	// from a prior activation. The cache-push loop below skips
-	// these regions (no PUT); the NATS publish loop still runs
-	// for them, since the worker may not have received the prior
-	// TaskMessage (NATS workqueue dedupes by message id, but the
-	// two messages are different so the worker will get a refresh).
-	// The skipped regions are recorded in `cached` for the 502
-	// envelope; on a future re-activation with the same row, both
-	// `alreadyPublished` AND `alreadyCached` keep re-publishing /
-	// skipping respectively — until a new Set wipes them.
 	alreadyCached := make(map[string]struct{}, len(current.RegionsCached))
 	for _, r := range current.RegionsCached {
 		alreadyCached[r] = struct{}{}
 	}
 
-	// toPublish = (regions ∪ regions_failed) − regions_published
-	// Preserves input order for log determinism.
+	// Build the per-region toPush set, deduping against the
+	// alreadyCached map.
 	seen := make(map[string]struct{}, len(regions))
-	toPublish := make([]string, 0, len(regions)+len(mustRetry))
-	for _, r := range regions {
-		if _, ok := alreadyPublished[r]; ok {
-			continue
-		}
-		if _, dup := seen[r]; dup {
-			continue
-		}
-		seen[r] = struct{}{}
-		toPublish = append(toPublish, r)
-	}
-	for r := range mustRetry {
-		if _, ok := alreadyPublished[r]; ok {
-			continue
-		}
-		if _, dup := seen[r]; dup {
-			continue
-		}
-		seen[r] = struct{}{}
-		toPublish = append(toPublish, r)
-	}
-	if len(toPublish) == 0 {
-		// All requested regions already published. Short-circuit;
-		// do not bump last_publish_at since nothing happened.
-		return nil
-	}
-
-	attemptID := uuid.NewString()
-	now := time.Now()
-
-	// Per-region artifact-cache push (issue #332, Layer 3). Runs
-	// BEFORE the NATS publish so the worker has the artifact in
-	// the local cache by the time it receives the TaskMessage.
-	//
-	// Cache push failures are best-effort: a push failure does NOT
-	// add the region to `failed` (the NATS publish still happens
-	// and the worker falls back to pulling the artifact from the
-	// control plane's /api/internal/download/). The failure is
-	// recorded separately in `cacheFailed` and persisted via
-	// AppendRegionsCacheState so an operator can see which regions
-	// are currently failing in the row's regions_cache_failed
-	// column — but the activation return value is NOT shaped by
-	// cache failures. The 502 envelope is reserved for NATS publish
-	// failures (worker was never notified).
-	//
-	// Skip conditions (region in `toPublish` is NOT pushed when):
-	//   - s.cachePusher is nil (cache feature disabled at runtime)
-	//   - s.regionArtifactCaches[region] is unset or empty
-	//   - region is in `alreadyCached`: a Set with the same
-	//     deployment_id preserves RegionsCached via the CASE WHEN
-	//     in the DO UPDATE clause (PR 2 follow-up), so this branch
-	//     fires on a re-activation of the same deployment where the
-	//     cache is still warm from a prior activation. The cache
-	//     bytes are identical, so a redundant push is wasted work.
-	//
-	// The third condition means cache push is best-effort +
-	// idempotent: a successful push on activation A leaves
-	// RegionsCached populated; activation B (same id) sees the
-	// region in alreadyCached and skips — no network traffic for
-	// regions whose cache already has the bytes. If the cache
-	// between activations is wiped, the next activation re-pushes
-	// (because the cache pusher's Push call returns an error and
-	// the region ends up in cacheFailed, NOT cachedSucceeded, so
-	// the row's RegionsCached is NOT updated for that region).
 	var cachedSucceeded []string
 	var cachedSkipped []string
 	var cacheFailed []string
-	if s.cachePusher != nil && len(s.regionArtifactCaches) > 0 {
-		for _, region := range toPublish {
-			if _, ok := alreadyCached[region]; ok {
-				// Already cached from a prior activation. Record as
-				// skipped so the row reflects "no push was needed";
-				// don't attempt a redundant push. Persisted via
-				// AppendRegionsCacheState alongside the success
-				// slice below.
-				cachedSkipped = append(cachedSkipped, region)
-				continue
-			}
-			cacheURL, ok := s.regionArtifactCaches[region]
-			if !ok || cacheURL == "" {
-				// No cache configured for this region; the worker
-				// will pull from the CP as today.
-				continue
-			}
-			if err := s.cachePusher.Push(ctx, cacheURL, tenantID, appName, deploymentID); err != nil {
-				log.Printf("artifact cache push failed for region %q (deployment %s): %v", region, deploymentID, err)
-				cacheFailed = append(cacheFailed, region)
-				continue
-			}
-			cachedSucceeded = append(cachedSucceeded, region)
-		}
-	}
-
-	var published []string
-	var failed []string
-	for _, region := range toPublish {
-		if err := s.publisher.PublishTaskUpdate(region, msg); err != nil {
-			log.Printf("publishing task update failed for region %q (deployment %s): %v", region, deploymentID, err)
-			failed = append(failed, region)
+	for _, region := range regions {
+		if _, ok := alreadyCached[region]; ok {
+			cachedSkipped = append(cachedSkipped, region)
 			continue
 		}
-		published = append(published, region)
+		if _, dup := seen[region]; dup {
+			continue
+		}
+		seen[region] = struct{}{}
+		cacheURL, ok := s.regionArtifactCaches[region]
+		if !ok || cacheURL == "" {
+			// No cache configured for this region; the worker
+			// will pull from the CP as today.
+			continue
+		}
+		if err := s.cachePusher.Push(ctx, cacheURL, tenantID, appName, deploymentID); err != nil {
+			log.Printf("artifact cache push failed for region %q (deployment %s): %v", region, deploymentID, err)
+			cacheFailed = append(cacheFailed, region)
+			continue
+		}
+		cachedSucceeded = append(cachedSucceeded, region)
 	}
 
-	// Best-effort persistence. Failures here are logged but do
-	// not change the returned error — the publish itself already
-	// happened, and the operator would rather see the structured
-	// 502 envelope than a misleading 500 caused by an audit-log
-	// write failing.
+	// Persist cache-state outcome AND reset the per-region retry
+	// counter (issue #501 retry cap). Best-effort — a DB error is
+	// logged but does not change the function's return value.
 	//
-	// All four appends (regions_published, regions_failed,
-	// regions_cached, regions_cache_failed) share one tx so the
-	// row's per-region state stays consistent even if the process
-	// crashes mid-write. Within the closure, returning the first
-	// error aborts the tx and Rollback discards every append — the
-	// desired atomicity. PR 2 (issue #332) added `regions_cached`
-	// to this same tx; PR 2 follow-up replaced it with the
-	// `AppendRegionsCacheState` helper that updates both
-	// regions_cached (succeeded+skipped) and regions_cache_failed
-	// in a single statement.
-	if len(published) > 0 || len(failed) > 0 || len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
-		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
-			txRepo := s.activeRepo.WithTx(tx)
-			if len(published) > 0 {
-				if err := txRepo.AppendRegionsPublished(ctx, tenantID, appName, published, attemptID, now); err != nil {
-					return fmt.Errorf("append regions_published: %w", err)
-				}
+	// The counter reset is per-deployment: a new activation
+	// re-arms the retry path so a healthy deployment isn't
+	// penalized by stale failure history from a prior
+	// deployment. The reset MUST run inside the same transaction
+	// as the AppendRegionsCacheState so the sweep can't observe
+	// "no regions cached" with a stale counter (or vice versa).
+	//
+	// The reset runs unconditionally (not gated on
+	// len(cachedSucceeded|Skipped|Failed) > 0): a re-activation
+	// of the same deployment where every region is in
+	// alreadyCached still needs to clear the counter because
+	// the sweep's giveUp partition may have left a non-empty
+	// counter from a prior deployment. We always go through the
+	// transaction.
+	now := time.Now()
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txRepo := s.activeRepo.WithTx(tx)
+		mergedSucceeded := append([]string{}, cachedSucceeded...)
+		mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
+		if len(mergedSucceeded) > 0 || len(cacheFailed) > 0 {
+			if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
+				return fmt.Errorf("append regions_cache_state: %w", err)
 			}
-			if len(failed) > 0 {
-				if err := txRepo.AppendRegionsFailed(ctx, tenantID, appName, failed, attemptID, now); err != nil {
-					return fmt.Errorf("append regions_failed: %w", err)
-				}
-			}
-			// AppendRegionsCacheState is invoked whenever the
-			// cache loop ran. `succeeded` is the deduped union of
-			// cachedSucceeded (real push returned 2xx) and
-			// cachedSkipped (already cached from a prior
-			// activation, no push attempted) — both go into
-			// regions_cached so the next activation's alreadyCached
-			// check fires. `failed` goes into regions_cache_failed.
-			// In the no-op case (cache disabled or no region has a
-			// cache URL) we skip the tx entirely via the outer
-			// guard.
-			if len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
-				mergedSucceeded := append([]string{}, cachedSucceeded...)
-				mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
-				if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
-					return fmt.Errorf("append regions_cache_state: %w", err)
-				}
-			}
-			return nil
-		}); err != nil {
-			log.Printf("warning: persisting publish state for %s/%s attempt %s: %v", tenantID, appName, attemptID, err)
 		}
-	}
-
-	// Only NATS publish failures trigger the 502 envelope. Cache
-	// push failures are best-effort — see the comment above the
-	// cache loop — and are persisted in the row's
-	// regions_cache_failed column for operator visibility. The
-	// worker still receives the TaskMessage for those regions
-	// (the NATS publish succeeded) and will fall back to the
-	// control plane's download endpoint.
-	if len(failed) > 0 {
-		return &PublishError{
-			Published:       published,
-			Failed:          failed,
-			CachedSucceeded: cachedSucceeded,
-			CachedSkipped:   cachedSkipped,
-			CacheFailed:     cacheFailed,
-			Err:             ErrPublishFailed,
+		// Counter reset fires on EVERY activation (including
+		// re-activations of the same deployment where every
+		// region is already cached). The sweep's
+		// `MaxAttempts` cap is therefore per-deployment, not
+		// per-tenant-app-lifetime — matching the issue's "reset
+		// the counter on new activation" requirement.
+		if err := txRepo.ResetRegionCacheRetryCount(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("reset region_cache_retry_count: %w", err)
 		}
+		return nil
+	}); err != nil {
+		log.Printf("warning: persisting cache state for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
 	}
-
-	// Block until active workers confirm they have started the deployment (issue #331, Layer 3).
-	if err := s.waitForWorkers(ctx, tenantID, appName, deploymentID, regions); err != nil {
-		log.Printf("waitForWorkers failed/timeout: %v", err)
-		return &PublishError{
-			Published:       published,
-			Failed:          regions,
-			CachedSucceeded: cachedSucceeded,
-			CachedSkipped:   cachedSkipped,
-			CacheFailed:     cacheFailed,
-			Err:             ErrPublishFailed,
-		}
-	}
-
 	return nil
 }
 
-func (s *DeploymentService) waitForWorkers(ctx context.Context, tenantID, appName, deploymentID string, regions []string) error {
-	workerRepo := repository.NewWorkerRepository(s.db)
-
-	workers, err := workerRepo.List(ctx)
-	if err != nil {
-		return fmt.Errorf("listing workers: %w", err)
-	}
-
-	targetRegions := make(map[string]struct{}, len(regions))
-	for _, r := range regions {
-		targetRegions[r] = struct{}{}
-	}
-
-	var targetWorkers []string
-	now := time.Now()
-	for _, w := range workers {
-		if _, exists := targetRegions[w.Region]; exists {
-			// A worker is active if it sent a heartbeat within the last 90 seconds.
-			if now.Sub(w.LastSeen) <= 90*time.Second {
-				targetWorkers = append(targetWorkers, w.ID)
-			}
-		}
-	}
-
-	if len(targetWorkers) == 0 {
-		// No active workers in the target regions. Nothing to wait for.
-		return nil
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		statuses, err := workerRepo.GetLatestStatuses(ctx, targetWorkers)
-		if err != nil {
-			return fmt.Errorf("getting worker statuses: %w", err)
-		}
-
-		allConfirmed := true
-		for _, wID := range targetWorkers {
-			ws, ok := statuses[wID]
-			if !ok {
-				allConfirmed = false
-				break
-			}
-
-			var apps map[string]domain.AppStatus
-			if err := json.Unmarshal(ws.Apps, &apps); err != nil {
-				allConfirmed = false
-				break
-			}
-
-			confirmed := false
-			for rawKey, app := range apps {
-				currAppName := rawKey
-				if i := strings.IndexByte(rawKey, ':'); i >= 0 {
-					currAppName = rawKey[:i]
-				}
-
-				if currAppName == appName && app.DeploymentID == deploymentID && app.Status == "running" {
-					confirmed = true
-					break
-				}
-			}
-
-			if !confirmed {
-				allConfirmed = false
-				break
-			}
-		}
-
-		if allConfirmed {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-
-	return fmt.Errorf("timeout waiting for workers in regions %v to confirm deployment %s", regions, deploymentID)
-}
+// Issue #42 removed (*DeploymentService).waitForWorkers. The
+// synchronous worker-confirmation wait is redundant now that the
+// outbox makes publish durable — workers pick up the new active
+// deployment on their next heartbeat-driven reconcile, and
+// publishSwap's only post-tx work is the per-region cache push.
 
 // RollbackDeployment atomically swaps the active deployment back to the
 // stored last_good_deployment_id and republishes a TaskMessage so workers
@@ -1373,12 +1640,39 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	var rollbackPreviewID string
 	var rollbackPreviewPRNumber int
 	var regions []string
-	var tenant *domain.Tenant
-	var envs []domain.AppEnv
-	var maxMemoryMB int
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// Issue #440: take the tenants row FOR UPDATE inside the
+		// same tx as the active_deployments lock so the rollback
+		// observes disabled_at under the lock, not after a
+		// post-commit GetByID race. Without this guard, the
+		// disable path could commit + publish empty AFTER the
+		// rollback's tx commits but BEFORE the rollback's
+		// publishSwap, killing the just-rolled-back app. The
+		// handler's existing `errors.Is(err, ErrTenantDisabled)`
+		// mapping at handler/deployment.go:798 was previously
+		// dead code for the rollback path — this guard makes
+		// it reachable.
+		txTenant := s.tenantRepo.WithTx(tx)
 		txActive := s.activeRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-rollback gate — symmetric with the
+		// activateDeployment call above. See lockTenantForUpdate
+		// for the race window + the worker-side dedupe_id /
+		// route-table mechanism that makes the "disable commits
+		// after we read NULL" arm tolerable.
+		// lockTenantForUpdate returns the tenant row AND takes the
+		// tenants-row FOR UPDATE lock that closes the issue #440
+		// disable-vs-activate/disable-vs-rollback race. We capture
+		// it here so the new pure-function buildPublishPayload can
+		// reuse the same row — both reads participate in the same
+		// tx snapshot, so the wire payload's AllowlistedDestinations
+		// is consistent with the active_deployments mutation.
+		tenant, err := s.lockTenantForUpdate(ctx, txTenant, tenantID)
+		if err != nil {
+			return err
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1426,6 +1720,20 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			regions = []string{s.defaultRegion}
 		}
 
+		// Issue #44, part 2: capture the per-app memory footprints of
+		// the deployment LEAVING the active set (current.DeploymentID)
+		// and ENTERING it (rolledBackID) before the Set rewrites
+		// active_deployments. Both deltas are applied inside the
+		// rollback tx via QuotaRepository.WithTx(tx).AddMemoryMB so
+		// the counter mutates atomically with the active row swap —
+		// a tx failure rolls back both the row mutation and the
+		// counter increment/decrement.
+		rollbackQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		rollbackPerApp := perAppMemoryMB(rollbackQuota)
+
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
 		// that requires an N-step history table, out of scope for the
@@ -1444,6 +1752,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			// it's a tenant preference, not a property of any single
 			// deployment, so it should survive a swap.
 			AutoRollbackEnabled: current.AutoRollbackEnabled,
+			// Issue #440 in-flight marker (migration 026). Same
+			// rationale as ActivateDeployment: a rollback is an
+			// activation event for this row, so the disable path
+			// must see the row's marker stamp and wait for
+			// publishSwap before publishing empty.
+			ActivationAttemptStartedAt: ptrToTime(time.Now()),
 		}); err != nil {
 			return fmt.Errorf("swapping active deployment: %w", err)
 		}
@@ -1451,72 +1765,84 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
 
-		// Snapshot the publish inputs inside the tx so the message
-		// reflects post-rollback state even if another activate lands
-		// between commit and publish (which would itself race with this
-		// publish; see plan §"Risk register"). All four reads below use
-		// WithTx(tx) so they participate in the same atomic transaction
-		// as the active_deployments Set above — without the wrapper the
-		// reads would happen on the main connection pool and could
-		// observe a different snapshot than the one we're about to
-		// commit.
-		envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
+		// Build the TaskMessage payload inside the tx (issue #42) so
+		// env / tenant / quota reads participate in the same atomic
+		// snapshot as the active_deployments mutation. The drainer
+		// will relay the marshaled payload after commit. Same shape
+		// as the activate path — see the comment there for why the
+		// env load + decrypt happens at the call site rather than
+		// inside the helper.
+		deploymentForPayload := &domain.Deployment{
+			Hash:            deploymentHash,
+			Signature:       deploymentSignature,
+			SigningKeyID:    deploymentSigningKeyID,
+			PreviewID:       nil,
+			PreviewPRNumber: nil,
+		}
+		if rollbackPreviewID != "" {
+			pid := rollbackPreviewID
+			deploymentForPayload.PreviewID = &pid
+			pr := rollbackPreviewPRNumber
+			deploymentForPayload.PreviewPRNumber = &pr
+		}
+		txAppEnv := s.appEnvRepo.WithTx(tx)
+		// Reach through envSvc.GetEncryptor() so the helper sees the
+		// same nil-safe decrypt path the original inlined loop did.
+		// s.envSvc is conventionally non-nil in production wiring
+		// (set by SetEnvService in app.go), but the nil guard
+		// preserves backward-compat for any test that omits it.
+		var encryptor *SecretEncryptor
+		if s.envSvc != nil {
+			encryptor = s.envSvc.GetEncryptor()
+		}
+		envMap, err := loadDecryptedEnvMap(ctx, txAppEnv, encryptor, tenantID, appName)
 		if err != nil {
-			return fmt.Errorf("listing env vars: %w", err)
+			return err
 		}
-		envs = envsList
-		tenant, err = s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
-		if err != nil || tenant == nil {
-			return fmt.Errorf("getting tenant: %w", err)
-		}
-		quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
+			rolledBackID, deploymentForPayload, tenant, regions, rollbackQuota, envMap)
 		if err != nil {
-			return fmt.Errorf("getting quota: %w", err)
+			return fmt.Errorf("building publish payload: %w", err)
 		}
-		maxMemoryMB = 256
-		if quota != nil && quota.MaxMemoryMB > 0 {
-			maxMemoryMB = quota.MaxMemoryMB
+		attemptID := uuid.NewString()
+		if err := s.outboxRepo.WithTx(tx).Enqueue(ctx, &repository.OutboxRow{
+			TenantID:  tenantID,
+			AppName:   appName,
+			Kind:      "task_update",
+			Payload:   payload,
+			Regions:   pq.StringArray(regions),
+			DedupeKey: tenantID + ":" + appName + ":" + attemptID,
+		}); err != nil {
+			return fmt.Errorf("enqueueing outbox row: %w", err)
+		}
+		// Issue #44, part 2: apply the per-tenant memory delta for the
+		// active-row swap. Both sides are accounted for because the
+		// rolled-back-FROM deployment leaves the active set (so its
+		// footprint goes down) AND the rolled-back-TO deployment enters
+		// it (so its footprint comes back up). For the typical case
+		// where both are the same plan tier — which is the common case
+		// since activate and rollback both consume the same quota
+		// footprint — the two deltas cancel and the counter ends where
+		// it started. For tier migrations (tenant upgraded plan between
+		// activate and rollback) the net delta is non-zero and the
+		// counter follows the active row's actual memory footprint.
+		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, rollbackPerApp); err != nil {
+			return fmt.Errorf("adding memory quota for rolled-back-to deployment: %w", err)
+		}
+		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, -rollbackPerApp); err != nil {
+			return fmt.Errorf("subtracting memory quota for rolled-back-from deployment: %w", err)
 		}
 		return nil
 	}); err != nil {
 		return "", err
 	}
 
-	envMap := make(map[string]string, len(envs))
-	if s.envSvc != nil {
-		for _, e := range envs {
-			v, err := s.envSvc.Decrypt(e.EnvValue)
-			if err != nil {
-				return "", fmt.Errorf("rollback: decrypting env %s: %w", e.EnvKey, err)
-			}
-			envMap[e.EnvKey] = v
-		}
-	} else {
-		for _, e := range envs {
-			envMap[e.EnvKey] = e.EnvValue
-		}
-	}
-
-	msg := &nats.TaskMessage{
-		Type:      "task_update",
-		Timestamp: time.Now().UTC(),
-		TenantID:  tenantID,
-		Apps: map[string]nats.AppConfig{
-			appName: nats.BuildAppConfig(
-				rolledBackID,
-				deploymentHash,
-				deploymentSignature,
-				deploymentSigningKeyID, // issue #307 PR1: per-key kid
-				rollbackPreviewID,      // issue #308: preserved across rollback
-				rollbackPreviewPRNumber,
-				envMap,
-				tenant.AllowlistedDestinations,
-				maxMemoryMB,
-			),
-		},
-	}
-	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
-		return "", err
+	// Post-tx: cache push only (the outbox row above carries the
+	// TaskMessage; the drainer relays it). publishSwap never errors
+	// for the rollback path today — log defensively if a future
+	// regression surfaces a cache error.
+	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, regions); err != nil {
+		log.Printf("rollback: cache-push post-state failed for %s/%s/%s: %v", tenantID, appName, rolledBackID, err)
 	}
 
 	if s.webhookSvc != nil {
@@ -1552,10 +1878,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 	if err != nil {
 		return fmt.Errorf("getting quota: %w", err)
 	}
-	maxMemoryMB := 256
-	if quota != nil && quota.MaxMemoryMB > 0 {
-		maxMemoryMB = quota.MaxMemoryMB
-	}
+	maxMemoryMB := int(perAppMemoryMB(quota))
 
 	var failedApps []string
 	for _, ad := range activeList {

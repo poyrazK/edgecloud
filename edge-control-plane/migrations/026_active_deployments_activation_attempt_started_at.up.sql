@@ -1,0 +1,31 @@
+-- +migrate Up
+-- Issue #440: full close — bounded wait for in-flight activate
+-- publishes on the disable path.
+--
+-- The disable path publishes an empty task_update per region to tell
+-- workers to stop a tenant's apps. PR #468 added a tenants-row
+-- FOR UPDATE + an in-tx snapshot of active_deployments + a
+-- post-commit diff that skips the empty publish if a new active row
+-- committed under the lock. That closed the "disable wins the lock
+-- first" ordering.
+--
+-- The remaining ordering — "activate wins the lock first, disable
+-- commits afterward, but the activate's publishSwap runs AFTER its
+-- tx commits so the disable's empty publish can hit workers BEFORE
+-- the activate's non-empty publish" — is closed by having the
+-- disable path wait briefly for the activate's publishSwap to
+-- complete before publishing empty.
+--
+-- ActivationAttemptStartedAt is the "an activate wrote this row in
+-- the recent past" marker. Stamped to NOW() inside the activate /
+-- rollback / promote tx; the disable path reads it to identify
+-- in-flight rows; last_publish_at (already stamped post-publish by
+-- AppendRegionsPublished/Failed) is the "publish completed" fence
+-- the disable path polls.
+--
+-- No index needed: the disable path filters on tenant_id which is
+-- already part of the active_deployments primary key
+-- (tenant_id, app_name).
+
+ALTER TABLE active_deployments
+    ADD COLUMN IF NOT EXISTS activation_attempt_started_at TIMESTAMPTZ;

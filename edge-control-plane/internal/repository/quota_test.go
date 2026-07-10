@@ -49,8 +49,9 @@ func TestQuotaRepository_GetByTenantID(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, periodStart)
+		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"quota_period_start",
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, 0, periodStart)
 
 	mock.ExpectQuery(`SELECT tenant_id.*FROM quotas WHERE`).
 		WithArgs("t_1").
@@ -65,6 +66,9 @@ func TestQuotaRepository_GetByTenantID(t *testing.T) {
 	}
 	if got.MaxRequestsPerMonth != 100_000 {
 		t.Errorf("MaxRequestsPerMonth = %d, want 100000", got.MaxRequestsPerMonth)
+	}
+	if got.UsedMemoryMB != 0 {
+		t.Errorf("UsedMemoryMB = %d, want 0", got.UsedMemoryMB)
 	}
 }
 
@@ -114,8 +118,9 @@ func TestQuotaRepository_AddOutboundBytes(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "quota_period_start",
-	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 42, 0, periodStart)
+		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"quota_period_start",
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 42, 0, 0, periodStart)
 
 	mock.ExpectQuery(`UPDATE quotas SET`).
 		WithArgs("t_1", int64(42)).
@@ -155,8 +160,9 @@ func TestQuotaRepository_AddRequestCount(t *testing.T) {
 	rows := sqlmock.NewRows([]string{
 		"tenant_id", "max_deployments", "max_apps", "max_workers",
 		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-		"used_outbound_bytes", "used_request_count", "quota_period_start",
-	}).AddRow("t_1", 50, 20, 10, 512, 10_000, 5_000_000, 0, 17, periodStart)
+		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"quota_period_start",
+	}).AddRow("t_1", 50, 20, 10, 512, 10_000, 5_000_000, 0, 17, 0, periodStart)
 
 	mock.ExpectQuery(`UPDATE quotas SET`).
 		WithArgs("t_1", int64(17)).
@@ -188,5 +194,143 @@ func TestQuotaRepository_AddRequestCount_NotFound(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("got %+v, want nil", got)
+	}
+}
+
+// TestQuotaRepository_AddMemoryMB_Accumulates (issue #44, part 2):
+// a positive delta increments used_memory_mb. This is the activate
+// path's tx-scoped counter write.
+func TestQuotaRepository_AddMemoryMB_Accumulates(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "max_deployments", "max_apps", "max_workers",
+		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"quota_period_start",
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, 256, time.Time{})
+
+	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb = used_memory_mb \+ \$2`).
+		WithArgs("t_1", int64(256)).
+		WillReturnRows(rows)
+
+	got, err := repo.AddMemoryMB(context.Background(), "t_1", 256)
+	if err != nil {
+		t.Fatalf("AddMemoryMB: %v", err)
+	}
+	if got.UsedMemoryMB != 256 {
+		t.Errorf("UsedMemoryMB = %d, want 256", got.UsedMemoryMB)
+	}
+}
+
+// TestQuotaRepository_AddMemoryMB_NegativeDelta (issue #44, part 2):
+// the rollback path passes a negative delta. The repo method is
+// int64-signed so negative inputs flow through unchanged.
+func TestQuotaRepository_AddMemoryMB_NegativeDelta(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "max_deployments", "max_apps", "max_workers",
+		"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+		"used_outbound_bytes", "used_request_count", "used_memory_mb",
+		"quota_period_start",
+	}).AddRow("t_1", 10, 5, 3, 256, 1000, 100_000, 0, 0, -512, time.Time{})
+
+	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb = used_memory_mb \+ \$2`).
+		WithArgs("t_1", int64(-512)).
+		WillReturnRows(rows)
+
+	got, err := repo.AddMemoryMB(context.Background(), "t_1", -512)
+	if err != nil {
+		t.Fatalf("AddMemoryMB: %v", err)
+	}
+	if got.UsedMemoryMB != -512 {
+		t.Errorf("UsedMemoryMB = %d, want -512", got.UsedMemoryMB)
+	}
+}
+
+// TestQuotaRepository_AddMemoryMB_NoRows: a missing tenant returns
+// (nil, nil) like the other addColumn-based wrappers.
+func TestQuotaRepository_AddMemoryMB_NoRows(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb`).
+		WithArgs("t_missing", int64(256)).
+		WillReturnError(sql.ErrNoRows)
+
+	got, err := repo.AddMemoryMB(context.Background(), "t_missing", 256)
+	if err != nil {
+		t.Fatalf("expected nil error for sql.ErrNoRows, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want nil", got)
+	}
+}
+
+// TestQuotaRepository_VerifyMemoryUnderCap_Accepts: cap not yet hit,
+// the verifying UPDATE returns the tenant_id row (allowing the deploy).
+func TestQuotaRepository_VerifyMemoryUnderCap_Accepts(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_1")
+
+	mock.ExpectQuery(`UPDATE quotas\s+SET used_memory_mb = used_memory_mb \+ 0`).
+		WithArgs("t_1", int64(256)).
+		WillReturnRows(rows)
+
+	ok, err := repo.VerifyMemoryUnderCap(context.Background(), "t_1", 256)
+	if err != nil {
+		t.Fatalf("VerifyMemoryUnderCap: %v", err)
+	}
+	if !ok {
+		t.Errorf("got false, want true (within cap)")
+	}
+}
+
+// TestQuotaRepository_VerifyMemoryUnderCap_Rejects: cap would be
+// exceeded; the WHERE short-circuits to false and the query returns
+// no rows, which sqlmock surfaces as ErrNoRows we translate to
+// (false, nil).
+func TestQuotaRepository_VerifyMemoryUnderCap_Rejects(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`UPDATE quotas\s+SET used_memory_mb = used_memory_mb \+ 0`).
+		WithArgs("t_1", int64(256)).
+		WillReturnError(sql.ErrNoRows)
+
+	ok, err := repo.VerifyMemoryUnderCap(context.Background(), "t_1", 256)
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if ok {
+		t.Errorf("got true, want false (over cap)")
+	}
+}
+
+// TestQuotaRepository_VerifyMemoryUnderCap_Unlimited: max_memory_mb=-1
+// is the enterprise sentinel — guard against a buggy < vs <= or
+// against a future migration to a different sentinel breaking this.
+func TestQuotaRepository_VerifyMemoryUnderCap_Unlimited(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	// Even an absurd perAppMemoryMB must still pass; the SQL has
+	// max_memory_mb = -1 OR used_memory_mb + $N <= max_memory_mb,
+	// and -1 OR true short-circuits to true.
+	mock.ExpectQuery(`UPDATE quotas`).
+		WithArgs("t_ent", int64(10_000_000)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}).AddRow("t_ent"))
+
+	ok, err := repo.VerifyMemoryUnderCap(context.Background(), "t_ent", 10_000_000)
+	if err != nil {
+		t.Fatalf("VerifyMemoryUnderCap: %v", err)
+	}
+	if !ok {
+		t.Errorf("got false, want true (unlimited sentinel)")
 	}
 }

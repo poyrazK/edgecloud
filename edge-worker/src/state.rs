@@ -86,6 +86,13 @@ pub struct AppInstance {
     /// If EDGE_WS_PORT was requested, holds the allocated port number.
     /// Reported in heartbeats so the ingress can route WS traffic.
     pub ws_port: Option<u16>,
+    /// Last error message from a crash, panic-in-spawn, or wasm trap
+    /// (issue #45). Stamped onto the instance by
+    /// `Supervisor::stamp_last_error` from the panic-in-spawn arm and
+    /// surfaced on the heartbeat so operators can see *why* the app
+    /// reached `Crashed` without grepping the worker's structured
+    /// logs. `None` for healthy apps.
+    pub last_error: Option<String>,
 }
 
 /// Shared worker state — protected by a tokio RwLock.

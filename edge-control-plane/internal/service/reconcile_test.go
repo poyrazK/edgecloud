@@ -645,15 +645,25 @@ func TestRun_FiresImmediatelyThenRespectsCancellation(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for the immediate-first-sweep to publish.
+	// Wait for the immediate-first-sweep to publish. We hold pub.mu
+	// across the length read (capturingPublisher.PublishFullSync writes
+	// p.calls at reconcile_test.go:171-174 under p.mu) so go test
+	// -race doesn't flag the closure goroutine vs. this loop as a
+	// data race. Same idiom as the preview_gc fix in
+	// preview_gc_test.go:138-145 (issue #582).
 	deadline := time.Now().Add(2 * time.Second)
+	pub.mu.Lock()
 	for time.Now().Before(deadline) {
 		if len(pub.calls) >= 1 {
 			break
 		}
+		pub.mu.Unlock()
 		time.Sleep(5 * time.Millisecond)
+		pub.mu.Lock()
 	}
-	if got := len(pub.calls); got != 1 {
+	got := len(pub.calls)
+	pub.mu.Unlock()
+	if got != 1 {
 		t.Fatalf("after immediate sweep: calls=%d, want 1", got)
 	}
 

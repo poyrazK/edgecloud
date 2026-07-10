@@ -179,6 +179,127 @@ jobs:
             -E 'kind(test) & (package(edge-worker) | package(edge-ingress))'
 
   # ============================================================
+  # RUST-JS-BUILD — Issue #423: exercise `edge build --lang=js`
+  # end-to-end on a fresh ubuntu-latest. Verifies the vendored
+  # WASI Preview 1 reactor adapter's SHA-256 and confirms
+  # `edge-cli build --lang=js` resolves the adapter and core
+  # wasm paths against a fresh CARGO_HOME (so any adapter
+  # resolution via the registry fallback is impossible, proving
+  # the vendored file is genuinely the canonical source).
+  # ============================================================
+  rust-js-build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+      # CARGO_HOME is set explicitly here because GitHub-hosted
+      # runners do NOT preset it, so an unset $CARGO_HOME would
+      # expand to "" and `cargo install --root ""` would silently
+      # land binaries under ./bin/ (the pre-fix `edge-cli: command
+      # not found` symptom). GitHub Actions does NOT expand $HOME
+      # inside `env:` blocks at YAML-parse time, so this resolves
+      # to the literal string "$HOME/.cargo" — which cargo itself
+      # then honors because cargo treats "$HOME/.cargo" as the
+      # default when CARGO_HOME is unset; with it set, cargo uses
+      # the literal value verbatim. To work around the literal-
+      # string trap, the install steps explicitly pass
+      # `--root "$HOME/.cargo"` (bash expands $HOME at run-time).
+      CARGO_HOME: $HOME/.cargo
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # clang + mold are needed by edge-js-runtime's rquickjs-sys
+      # (auto-stages wasi-sdk on first build) and the linker arg.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
+      - name: Add wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      # Node 24 is the runner default; per CLAUDE.md we omit
+      # node-version so CI tracks upstream. npm ci against the
+      # committed samples/hello-js-ws/package-lock.json (issue
+      # #423) makes this hermetic.
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          cache: npm
+          cache-dependency-path: samples/hello-js-ws/package-lock.json
+
+      - name: Install JS dependencies
+        working-directory: samples/hello-js-ws
+        run: npm ci
+
+      - name: Install edge CLI
+        # Pass --root explicitly with bash-expanded $HOME because
+        # GH Actions does NOT expand $HOME inside `env:` blocks —
+        # see the comment on the job's `env:` section above.
+        run: cargo install --path ./edge-cli --locked --root "$HOME/.cargo"
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.252.0 --locked --root "$HOME/.cargo"
+
+      - name: Expose CLI tools on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # SHA-256 check on the vendored adapter BEFORE the build —
+      # a missing or drifted file fails fast, before the slow
+      # rquickjs-sys wasi-sdk staging step.
+      - name: Verify vendored WASI adapter checksum
+        working-directory: edge-cli/adapters
+        run: sha256sum -c SHA256SUMS
+
+      # SHA-256 check on the component-model fixtures consumed by
+      # edge-worker tests. These are committed binaries (gitignored
+      # exception) without per-file SHA pinning — the sidecar here
+      # mirrors the edge-cli/adapters/SHA256SUMS pattern (F1 review
+      # follow-up) so drift surfaces here in <1s instead of as a
+      # confusing later test failure.
+      - name: Verify test fixture checksums
+        working-directory: edge-worker/tests/fixtures
+        run: sha256sum -c SHA256SUMS
+
+      # Prove the vendored adapter is the canonical source. The
+      # vendored adapter at edge-cli/adapters/ is the priority-2
+      # probe in resolve_wasi_adapter (priority-1 being the
+      # EDGE_JS_WASI_ADAPTER override, which is unset). The registry
+      # fallback (priority-3) won't fire for any honest workspace
+      # because the vendored file is present — so even if the
+      # earlier `cargo install wasm-tools` step populated the
+      # registry with a `wasi-preview1-component-adapter-provider`
+      # crate, the vendored file wins. We deliberately do NOT
+      # override CARGO_HOME here (the original implementation
+      # pointed CARGO_HOME at a fresh tmpdir to add belt-and-
+      # suspenders, but that breaks PATH resolution in subtle
+      # ways because GH Actions `env:` does not expand `$HOME`).
+      # Override the job-scope RUSTFLAGS: the wasm32-wasip1 target
+      # uses rust-lld, which rejects `-fuse-ld=mold` (`unknown
+      # argument: -fuse-ld=mold`). The flag only affects the
+      # native-toolchain jobs (rust-test, etc.).
+      - name: Build JS sample with vendored adapter
+        working-directory: samples/hello-js-ws
+        env:
+          RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
+        run: edge build --lang=js
+
+  # ============================================================
   # RUST-SEMVER — Run cargo-semver-checks
   # ============================================================
   rust-semver:
@@ -407,7 +528,7 @@ jobs:
           key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
 
       - name: Run go test
-        run: go test -coverprofile=cover.out -covermode=atomic ./...
+        run: go test -race -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Coverage summary
         run: go tool cover -func=cover.out
@@ -546,3 +667,167 @@ jobs:
         with:
           name: lcov-rust
           path: lcov-rust.info
+
+  # ============================================================
+  # CLI-JS-SMOKE — end-to-end build of the JS sample
+  # (issue #423 / #424). Skipped on PRs that don't touch the JS
+  # pipeline (edge-cli/, edge-js-runtime/, edge-js-runtime-long/,
+  # edge-js-sdk/, wit/, this workflow) so the cost (~5-10 min for
+  # `cargo install wasm-tools` on a cold cache) is only paid when
+  # relevant. Wired via
+  # `dorny/paths-filter` so the skip is real, not a comment-only
+  # claim.
+  # ============================================================
+  cli-js-smoke:
+    runs-on: ubuntu-latest
+    # `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"`.
+    # sccache is not installed on a fresh runner, so the `cargo
+    # install` / `cargo build` invocations would fail with
+    # `could not execute process \`sccache ...\`` (the same
+    # failure mode that `cargo-deny-action` works around in
+    # `rust-lint`). Set the env override at job scope — env vars
+    # beat config files in cargo's precedence. We don't need
+    # sccache here because this job only does two `cargo install`
+    # invocations + one edge-cli build; `Swatinem/rust-cache` is
+    # for the larger `rust-test` / `rust-lint` runs.
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Path filter: only run the smoke job when the change touches
+      # the JS surface. The `filter` step below evaluates the changed
+      # file list against these globs and exports `changes == 'true'`
+      # when at least one matches. `dorny/paths-filter` defaults to
+      # "any match" semantics for OR-style filtering. We list the
+      # workflow file itself (`**.yml`) so edits here re-trigger the
+      # smoke job — otherwise a future fix to this file would be
+      # unverified.
+      #
+      # Must run AFTER `actions/checkout` — on `push` events the
+      # dorny action's internal `git branch --show-current` runs in
+      # `${{ github.workspace }}`, which is an empty dir until
+      # checkout populates it. On PR events this is masked because
+      # the workspace is pre-checked by the Actions runtime, but on
+      # `push` (e.g., a main merge) the job fails with rc=128
+      # `fatal: not a git repository` (observed on 2026-07-10
+      # post-PR-#498).
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            changes:
+              - 'edge-cli/**'
+              - 'edge-js-runtime/**'
+              - 'edge-js-runtime-long/**'
+              - 'edge-js-sdk/**'
+              - 'wit/**'
+              - 'samples/hello-js/**'
+              - '.github/workflows/ci.yml'
+
+      # Skip the rest of the job when the diff doesn't touch JS.
+      # `if:` on every subsequent step would be more verbose; the
+      # early-exit step surfaces a clear "skipped (no JS changes)"
+      # message in the run summary and is the pattern used elsewhere
+      # in this workflow.
+      - name: Skip — no JS-surface changes
+        if: steps.changes.outputs.changes != 'true'
+        run: |
+          echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-runtime-long/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
+          exit 0
+
+      - name: Install Rust toolchain (wasm32-wasip1, wasm32-wasip2)
+        uses: dtolnay/rust-toolchain@stable
+        # Issue #423: `edge build --lang=js` compiles the JS runtime
+        # crate (`edge-js-runtime/`) for `wasm32-wasip1` and then
+        # wraps it into a component via `wasm-tools component new
+        # --adapt` against the vendored adapter. The legacy
+        # `wasm32-wasip2` toolchain install is kept because
+        # `edge-migrate`'s Rust migration output also targets wasip2
+        # (compile path is separate; this smoke job doesn't exercise
+        # it but the target is small and the install is cached).
+        with:
+          targets: wasm32-wasip1, wasm32-wasip2
+
+      - name: Install Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install wasm-tools 1.252.x
+        # Pin to ^1.252 to match the version scripts/dev-install.sh
+        # and .github/workflows/preview.yml use. wasm-tools is
+        # required by the Rust guest pipeline (`edge build --lang=rust`'s
+        # wrap step), `edge-migrate`, the worker fixture build, and
+        # the Go control plane's `wrapAsComponent` — NOT by the JS
+        # pipeline anymore (the wasip2 cargo target emits a complete
+        # component, no wrap). `cargo install --locked` pins the
+        # dependency graph; the `target-dir` override keeps the
+        # install out of the project's target/ tree.
+        run: |
+          cargo install wasm-tools --locked --version '^1.252' \
+            --root "$HOME/.cargo"
+
+      - name: Build + install edge
+        # Build from source rather than relying on a published binary
+        # so the smoke tests the exact CLI the next dev will get when
+        # they pull the branch. The `edge-cli` package declares a
+        # `[[bin]] name = "edge"` (see edge-cli/Cargo.toml), so
+        # `cargo install` produces `$root/bin/edge`. That dir is NOT
+        # on `$PATH` by default in CI; append it to `$GITHUB_PATH`
+        # (the same trick `.github/actions/deploy-preview` uses, per
+        # CLAUDE.md).
+        run: |
+          cargo install --path edge-cli --locked --root "$HOME/.cargo"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build samples/hello-js
+        # The full happy-path the user takes: `npm install` resolves
+        # `@edgecloud/sdk` from npm via the `^0.2.0` pin in
+        # samples/hello-js/package.json, then `edge build --lang=js`
+        # bundles src/handler.js and builds edge-js-runtime directly
+        # for `wasm32-wasip1`, then `wasm-tools component new
+        # --adapt edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`
+        # wraps it into a WASI Preview 2 component the host linker
+        # accepts. Issue #423. The end-to-end build is the
+        # regression check — the unit tests in
+        # edge-cli/src/commands/init.rs only cover the template
+        # shape, not the build itself.
+        #
+        # The SDK isn't on the public npm registry yet, so this job
+        # exercises the install path against a local tarball via
+        # `npm pack edge-js-sdk/`. That validates the *exact* bytes
+        # an end user would receive when the release manager runs
+        # `npm publish --access public` from edge-js-sdk/, without
+        # requiring CI to own npm credentials. When the package is
+        # published, swap the tarball install for a plain `npm
+        # install` (the `^0.2.0` pin resolves the same way either
+        # way).
+        run: |
+          # Build the in-tree SDK into a tarball the npm install path
+          # can consume. `npm pack` resolves the workspace's
+          # `edge-js-sdk/package.json` and writes a
+          # `edgecloud-sdk-0.2.0.tgz` file. Tarball shape is exactly
+          # what `npm publish` would upload.
+          echo "Packing @edgecloud/sdk from edge-js-sdk/…"
+          (cd edge-js-sdk && npm pack --silent)
+          sdk_tarball="$(ls edge-js-sdk/edgecloud-sdk-*.tgz | head -1)"
+          test -n "$sdk_tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
+          echo "  SDK tarball: $sdk_tarball"
+
+          # Install in samples/hello-js/ with the tarball swapped in
+          # for the npm registry. The `package.json` `^0.2.0` pin is
+          # preserved (this only redirects the resolution source).
+          (cd samples/hello-js && npm install --no-save --no-audit --no-fund "$GITHUB_WORKSPACE/$sdk_tarball")
+          (cd samples/hello-js && npm ls @edgecloud/sdk)
+
+          (cd samples/hello-js && edge build --lang=js)
+          # The CLI's path_for("js") returns target/javy/<name>.wasm
+          # (see edge-cli/src/commands/build.rs:89-104). The artifact
+          # is the user-visible deliverable; assert it exists.
+          test -f samples/hello-js/target/javy/hello-js.wasm
+          # And that it's a valid wasm32 component (wasm-tools can
+          # extract the WIT to verify).
+          wasm-tools component wit samples/hello-js/target/javy/hello-js.wasm | grep -q 'wasi:http/incoming-handler@0.2.1'

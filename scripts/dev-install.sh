@@ -81,7 +81,8 @@ else
   source "$HOME/.cargo/env"
 fi
 
-# wasm32-wasip2 target — required to build samples/hello and any Rust
+# wasm32-wasip2 target — required to build samples/hello, edge-js-runtime
+# (the QuickJS host crate now targets wasip2 directly), and any Rust
 # guest that uses the edge:cloud WIT world.
 if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip2$'; then
   log "rustup target wasm32-wasip2 already installed"
@@ -90,11 +91,25 @@ else
   rustup target add wasm32-wasip2
 fi
 
+# wasm-tools — required by the Rust guest pipeline
+# (`edge build --lang=rust`'s `wasm-tools component new` wrap step,
+# `edge-migrate`'s build, the worker fixture build, and the Go control
+# plane's `wrapAsComponent`). The JS pipeline no longer needs it (the
+# wasip2 cargo target emits a complete component), but the other
+# pipelines do. Pin to ^1.252 to match the version CI uses
+# (.github/workflows/preview.yml:80-81).
+if command -v wasm-tools >/dev/null 2>&1; then
+  log "wasm-tools already installed"
+else
+  log "installing wasm-tools (1.252.x) — first build only, ~3-5 min"
+  cargo install wasm-tools --locked --version "^1.252"
+fi
+
 # ── 4. Final check ──────────────────────────────────────────────────────
 
 log "verifying installation..."
 MISSING=()
-for bin in go cargo rustc rustup docker openssl jq; do
+for bin in go cargo rustc rustup docker openssl jq wasm-tools; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     MISSING+=("$bin")
   fi

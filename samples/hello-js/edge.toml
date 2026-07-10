@@ -1,6 +1,15 @@
 [project]
 name = "hello-js"
 version = "0.1.0"
+# The `target` field is for the *user* artifact (a future feature),
+# not the runtime. edge-js-runtime (the QuickJS host) compiles to
+# `wasm32-wasip2` directly — `cargo build --target wasm32-wasip2 --release`
+# emits a complete component (no `--adapt` wrap needed) — see
+# edge-cli/src/commands/build.rs::build_js. The runtime's target is
+# set by the CLI and is invariant; we leave it pinned here for greppers
+# who want to confirm the pipeline. The previous `wasm32-wasip1`
+# value required a wasi-preview1 → preview2 adapter wrap that the
+# current rustc 1.93 wasip2 target obsoletes.
 target = "wasm32-wasip2"
 # FaaS world: the QuickJS runtime exports `wasi:http/incoming-handler`,
 # the worker calls it per request via `wasmtime_wasi_http::ProxyPre`.

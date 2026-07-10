@@ -20,6 +20,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/noop"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/stripe"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/cache"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
@@ -58,12 +59,27 @@ type App struct {
 	// invalid interval/retention — PreviewGCService.Run refuses
 	// to start with non-positive values.
 	PreviewGC *service.PreviewGCService
+	// CacheRetrySweep (issue #501) re-attempts per-region
+	// artifact-cache pushes for deployments whose previous push
+	// attempt landed in regions_cache_failed. Tunable via env
+	// REGION_CACHE_RETRY_INTERVAL (default 5m). Disabled by an
+	// invalid interval — CacheRetrySweepService.Run refuses to
+	// start on a non-positive value (matches PreviewGC's safety
+	// check). Reads the live pusher + region map on every sweep
+	// tick via getter closures, so operator-set config is honored
+	// at runtime.
+	CacheRetrySweep *service.CacheRetrySweepService
 	// DeploymentSvc is exposed so main.go can inject the per-region
 	// artifact-cache pusher (issue #332) after construction. Optional
 	// post-New wiring — when not set, the deployment service runs
 	// without cache push (existing behavior).
 	DeploymentSvc *service.DeploymentService
 	AutoscaleSvc  *autoscale.Service
+	// OutboxDrainer (issue #42) relays durable-publish rows from the
+	// `outbox` table to NATS. Activated by RunBackground alongside the
+	// reconcile loop. Multi-instance safe via FOR UPDATE SKIP LOCKED +
+	// a 30s claimed_until window on each claimed row.
+	OutboxDrainer *service.OutboxDrainer
 
 	// loopHealth tracks liveness of every background goroutine spawned
 	// by RunBackground (heartbeat, log_gc, reconcile, worker_gc,
@@ -72,6 +88,16 @@ type App struct {
 	// logs. See internal/loophealth for the package contract. Related
 	// to issue #443.
 	loopHealth *loophealth.Tracker
+
+	// cacheRetryIntervalS is the cache-retry sweep's tick interval
+	// in seconds, captured from cfg.CacheRetry.IntervalS at
+	// construction time. Stored as a field so RunBackground
+	// doesn't need the original *config.Config after New returns
+	// (matches the "post-New wiring" pattern documented in the
+	// CacheRetrySweep doc — only the pusher and region map are
+	// late-bound getters, the interval is fixed for process
+	// lifetime). Issue #501.
+	cacheRetryIntervalS int
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -99,6 +125,19 @@ func New(
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 	// Billing (issue #419): billing_subscriptions + billing_events.
 	billingRepo := repository.NewBillingRepository(db)
+	// Idempotency-Key replay cache (issue #52). The repo is
+	// optional from the service's perspective — when not
+	// injected, Deploy behaves exactly as it did pre-#52
+	// (always mints a fresh deployment_id). We always wire
+	// it here so production gets the replay cache by default
+	// and only test harnesses that explicitly want the
+	// pre-#52 behavior omit it.
+	idempotencyRepo := repository.NewIdempotencyKeyRepo(db)
+	// Outbox (issue #42): durable-publish queue for `task_update`
+	// NATS messages. Rows are written in the same tx as the
+	// active_deployments mutation; the OutboxDrainer (below) relays
+	// them after commit.
+	outboxRepo := repository.NewOutboxRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -122,10 +161,31 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, keyring,
+		quotaRepo, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
+	)
+	// OutboxDrainer (issue #42): the SOLE caller of
+	// Publisher.PublishTaskUpdate for `task_update` messages. Tunable
+	// via OUTBOX_DRAIN_INTERVAL / OUTBOX_MAX_ATTEMPTS. Defaults: 2s
+	// tick, 50 rows/batch, 10 retries before flipping the row to
+	// status='failed' for operator inspection.
+	outboxDrainer := service.NewOutboxDrainer(
+		outboxRepo, publisher,
+		parseDurationEnv("OUTBOX_DRAIN_INTERVAL", 2*time.Second),
+		parseIntEnv("OUTBOX_BATCH_SIZE", 50),
+		parseIntEnv("OUTBOX_MAX_ATTEMPTS", 10),
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
+	// Issue #560: shared TaskMessage-marshaling helper used by both
+	// DeploymentService (activate / rollback) and EnvService (set /
+	// delete). Constructed once and threaded into both services so
+	// the wire format stays single-source.
+	publishBuilder := service.NewPublishBuilder()
+	deploymentSvc.SetPublishBuilder(publishBuilder)
+	envSvc.SetPublishDeps(
+		db, tenantRepo, activeDeploymentRepo, deploymentRepo,
+		quotaRepo, outboxRepo, appEnvRepo, publishBuilder,
+	)
 	metricsAgg := service.NewMetricsAggregator()
 	// loopHealth tracks liveness of every background goroutine. It must
 	// be constructed before the services that need to feed it (so the
@@ -134,7 +194,7 @@ func New(
 	// struct (issue #443 review findings #3 and #4).
 	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
-		workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
+		db, workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 		loopHealth,
 	)
@@ -211,6 +271,7 @@ func New(
 	webhookRepo := repository.NewWebhookRepository(db)
 	webhookSvc := service.NewWebhookService(webhookRepo)
 	deploymentSvc.SetWebhookService(webhookSvc)
+	deploymentSvc.SetIdempotencyRepo(idempotencyRepo)
 	webhookHandler := handler.NewWebhookHandler(webhookSvc)
 
 	// Billing service (issue #419). The provider is selected by
@@ -271,6 +332,22 @@ func New(
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+
+	// Usage handler (issue #421): the tenant-facing usage dashboard.
+	// Composes quota + billing reads with a 10s SWR cache so dashboard
+	// refresh doesn't hammer the DB. upgrade_options is hardcoded
+	// here as the single source of truth for the dashboard pricing
+	// display; derive from a BillingProvider.ListPlans() call when
+	// the pricing source-of-truth moves off the static plan table.
+	usageCache := cache.NewUsageCache(10*time.Second, 60*time.Second)
+	usageSvc := service.NewUsageServiceFromBillingProvider(
+		quotaRepo,
+		billingRepo,
+		billingProvider,
+		usageCache,
+		service.UsageServiceConfig{},
+	)
+	usageHandler := handler.NewUsageHandler(usageSvc)
 	trafficHandler := handler.NewTrafficHandler(trafficSvc, appRepo)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
@@ -442,12 +519,14 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/list/{appName}", redirectTo("/api/v1/list/"+"{appName}"))
 	mux.HandleFunc("GET /api/auth/whoami", redirectTo("/api/v1/auth/whoami"))
 	mux.HandleFunc("GET /api/quotas", redirectTo("/api/v1/quotas"))
+	mux.HandleFunc("GET /api/usage", redirectTo("/api/v1/usage"))
 	mux.HandleFunc("POST /api/migrate", redirectTo("/api/v1/migrate"))
 	mux.HandleFunc("GET /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
 	mux.HandleFunc("POST /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
 	mux.HandleFunc("GET /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("PUT /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
 	mux.HandleFunc("DELETE /api/admin/tenants/{tenantID}", redirectTo("/api/v1/admin/tenants/"+"{tenantID}"))
+	mux.HandleFunc("POST /api/admin/tenants/{tenantID}/enable", redirectTo("/api/v1/admin/tenants/"+"{tenantID}/enable"))
 	mux.HandleFunc("DELETE /api/admin/apps/{appName}", redirectTo("/api/v1/admin/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/admin/cluster", redirectTo("/api/v1/admin/cluster"))
 
@@ -468,6 +547,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/env", envHandler.List)
 	api.HandleFunc("DELETE /api/v1/apps/{appName}/env/{key}", envHandler.Delete)
 	api.HandleFunc("GET /api/v1/quotas", quotaHandler.GetQuota)
+	api.HandleFunc("GET /api/v1/usage", usageHandler.GetUsage)
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)
@@ -510,6 +590,8 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("GET /api/v1/admin/tenants/{tenantID}", tenantHandler.Get)
 	admin.HandleFunc("PUT /api/v1/admin/tenants/{tenantID}", tenantHandler.Update)
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
+	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/enable", tenantHandler.Enable)
+	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/quota-override", tenantHandler.QuotaOverride)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
 	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)
@@ -535,6 +617,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// Per-app rate limit overrides for the ingress ratelimit fetcher (issue #305).
 	mux.HandleFunc("GET /api/v1/internal/rate-limits/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(trafficHandler.GetRateLimitsInternal)).ServeHTTP(w, r)
+	})
+
+	// Per-tenant quota state for the ingress Caddy 402 renderer
+	// (issue #420). Polled every QUOTA_FETCH_INTERVAL (default 30s);
+	// the response includes over_cap + locked_until so the ingress
+	// can decide whether to inject a static_response 402 block for
+	// the tenant's apps.
+	mux.HandleFunc("GET /api/v1/internal/quota/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetQuotaInternal)).ServeHTTP(w, r)
 	})
 
 	// Secrets admin endpoints (X-Internal-Token auth).
@@ -621,7 +712,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ArtifactPath:    cfg.Storage.ArtifactPath,
 		WorkerSvc:       workerSvc,
 		ReconcileSvc:    reconcileSvc,
-		LogGC:           service.NewLogGCService(logEntryRepo),
+		LogGC:           service.NewLogGCService(logEntryRepo, metricsAgg.NewLogGCSink()),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
 		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
 		// Preview GC (issue #308). Wired with the deployment
@@ -629,10 +720,32 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// DeleteExpiredPreviewsByIDs) and the artifact store
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
-		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
+		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore, metricsAgg.NewPreviewGCSink(), metricsAgg.NewPreviewBlobFailureRecorder()),
+		// Cache-retry sweep (issue #501). Re-attempts cache pushes
+		// that landed in regions_cache_failed. The three getters
+		// read the live pusher + regionArtifactCaches map +
+		// MaxAttempts on every tick so the sweep honors operator-
+		// set config at runtime (cmd/api/main.go calls
+		// SetCachePusher and SetRegionArtifactCaches AFTER app.New
+		// returns — the getter closures defer the read to the
+		// first sweep tick). MaxAttempts is read directly from
+		// the typed config because it's loaded once at startup
+		// (no post-New setter).
+		CacheRetrySweep: service.NewCacheRetrySweepService(
+			activeDeploymentRepo,
+			deploymentSvc.GetCachePusher,
+			deploymentSvc.GetRegionArtifactCaches,
+			func() int { return cfg.CacheRetry.MaxAttempts },
+			metricsAgg.NewCacheRetrySweepSink(),
+		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
+		OutboxDrainer: outboxDrainer,
 		loopHealth:    loopHealth,
+
+		// Captured at construction; see the field doc for why we
+		// don't use a getter closure like the pusher / region map.
+		cacheRetryIntervalS: cfg.CacheRetry.IntervalS,
 	}
 }
 
@@ -706,6 +819,53 @@ func (a *App) RunBackground(ctx context.Context) {
 	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
 
+	// Cache-retry sweep (issue #501). Re-attempts per-region
+	// artifact-cache pushes stranded in regions_cache_failed.
+	// Uses the same raw-goroutine shape as PreviewGC: the sweep
+	// is "best-effort" — a transient DB blip logs and returns,
+	// the next tick re-attempts — and is not on the loopHealth
+	// critical path (the worker still serves requests by pulling
+	// from /api/internal/download, so a stuck sweep is an
+	// observability hit but not a service-level outage).
+	//
+	// DB-load note: the sweep makes up to 3 DB calls per row
+	// (AppendRegionsCacheState for success + AppendRegionsCacheState
+	// for still-failing + RemoveFromCacheFailed for configMissing).
+	// At gcBatchSize=10_000 rows per batch and gcMaxBatches=1000
+	// per tick (10M rows worst-case), lowering the interval
+	// proportionally multiplies the per-minute DB load — the
+	// default 5m keeps a worst-case tick under the row cap; an
+	// operator who lowers the interval during an incident should
+	// expect ~interval/5m × default DB pressure.
+	// Use the typed config (issue #501 acceptance item: "config in
+	// internal/config/config.go"). The interval is integer seconds
+	// in the config (CacheRetry.IntervalS) — converted to a
+	// time.Duration for the Run signature. parseDurationEnv is
+	// intentionally NOT used here so the config struct is the
+	// single source of truth (callers in cmd/api/main.go can
+	// override via REGION_CACHE_RETRY_INTERVAL env var, which
+	// config.Load translates to CacheRetry.IntervalS).
+	//
+	// We capture the interval at construction (via the App's
+	// stored interval) so RunBackground doesn't need to read
+	// the config struct post-construction. The interval is
+	// fixed for the process lifetime — same as
+	// previewGCInterval / logGCInterval, which are also captured
+	// into locals at RunBackground time.
+	cacheRetryInterval := time.Duration(a.cacheRetryIntervalS) * time.Second
+	go a.CacheRetrySweep.Run(ctx, cacheRetryInterval)
+
+	// Outbox drainer (issue #42). The drainer is the sole owner of
+	// `task_update` NATS publishes for activate / rollback. Its tick
+	// interval + batch size + max attempts are tunable via env (see
+	// OUTBOX_DRAIN_INTERVAL / OUTBOX_BATCH_SIZE / OUTBOX_MAX_ATTEMPTS
+	// in NewApp). The drainer is multi-instance safe via FOR UPDATE
+	// SKIP LOCKED + a 30s claimed_until window, so spinning up extra
+	// replicas just for the drainer is fine.
+	a.loopHealth.Run(ctx, "outbox_drainer", "outbox_drainer: ", logPrintf, func(c context.Context) {
+		a.OutboxDrainer.Run(c)
+	})
+
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately. The autoscale
 	// package uses log/slog rather than stdlib log, so we route the
@@ -753,6 +913,23 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// parseIntEnv reads a positive integer-valued env var or returns the
+// default. Mirrors parseDurationEnv's contract: empty / unparseable /
+// non-positive values fall back to `def` with a log line. Used by
+// OUTBOX_BATCH_SIZE and OUTBOX_MAX_ATTEMPTS in app.go (issue #42).
+func parseIntEnv(envName string, def int) int {
+	v := os.Getenv(envName)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("%s=%q is not a valid positive integer; using default %d", envName, v, def)
+		return def
+	}
+	return n
 }
 
 // loadKeyring constructs a *signing.Keyring from the validated config.

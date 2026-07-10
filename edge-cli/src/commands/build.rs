@@ -290,11 +290,38 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // 3. Build the JS runtime crate with the bundled JS embedded.
     let runtime_dir = resolve_runtime_dir()?;
 
+    // The runtime crate (`edge-js-runtime/Cargo.toml`) declares its own
+    // `[workspace]` root, so the parent monorepo's `.cargo/config.toml`
+    // — which pins `build.target-dir` to a shared location — is NOT
+    // inherited by this cargo invocation. Pin `CARGO_TARGET_DIR`
+    // explicitly to `<runtime_dir>/target` so the inner build writes
+    // to a deterministic location the resolver below probes first
+    // (`$CARGO_TARGET_DIR/...`, then the shared-target-cache fallback,
+    // then the legacy `~/.cache/edgecloud-cargo` cache, then the
+    // per-crate default). Without this pin the artifact lands in
+    // different places across Cargo versions on different platforms
+    // and the resolver probes become order-dependent on toolchain
+    // behavior — issue #423's "Cannot find core wasm" failure mode.
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .unwrap_or_else(|_| runtime_dir.join("target").to_string_lossy().into_owned());
+
     println!("  Compiling JS runtime...");
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip1", "--release"])
         .current_dir(&runtime_dir)
+        // Pin the target-dir to <runtime_dir>/target so the artifact
+        // is in a known place. The repo's `.cargo/config.toml:37`
+        // would otherwise set `../target-cache/edgecloud` (relative
+        // to the config file's dir), but `edge-js-runtime` declares
+        // `[workspace]` (a separate workspace root), so cargo's
+        // inheritance of the parent's `.cargo/config.toml` is
+        // ambiguous across Cargo versions and platforms. Pinning
+        // here removes the ambiguity; the artifact lands at
+        // `<runtime_dir>/target/wasm32-wasip1/release/edge_js_runtime.wasm`,
+        // which is exactly probe (4) in `resolve_runtime_core_wasm`.
+        .env("CARGO_TARGET_DIR", runtime_dir.join("target"))
         .env("EDGE_JS_BUNDLE", bundle_path.canonicalize()?)
+        .env("CARGO_TARGET_DIR", &target_dir)
         .spawn()?
         .wait()?;
 
@@ -305,14 +332,12 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // 4. Componentize with wasm-tools
     //
     // The runtime's `cargo build --target wasm32-wasip1 --release`
-    // honors `CARGO_TARGET_DIR` (and the repo's `.cargo/config.toml`
-    // sets it to `$HOME/.cache/edgecloud-cargo` for shared builds
-    // across worktrees). Don't hardcode `<runtime_dir>/target/...`
-    // — that's the default only when no `CARGO_TARGET_DIR` is set;
-    // in the dev loop the artifact lives under
-    // `$CARGO_TARGET_DIR/wasm32-wasip1/release/`.
-    let core_wasm = resolve_runtime_core_wasm(&runtime_dir)?;
-    let adapter = resolve_wasi_adapter()?;
+    // above explicitly pins `CARGO_TARGET_DIR` to
+    // `<runtime_dir>/target` so the artifact is at a known location
+    // (probe (4) in `resolve_runtime_core_wasm`). The shared
+    // `build.target-dir = "../target-cache/edgecloud"` in
+    // `.cargo/config.toml:37` is overridden by the explicit env var.
+    let (core_wasm, adapter) = resolve_js_build_artifacts(&runtime_dir)?;
 
     let artifact = path_for(path, project_name, "js").context("resolving JS artifact path")?;
     if let Some(parent) = artifact.parent() {
@@ -334,7 +359,17 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
         .wait()?;
 
     if !status.success() {
-        anyhow::bail!("wasm-tools component new failed");
+        anyhow::bail!(
+            "wasm-tools component new failed (exit {exit}). \
+             If the error mentions a missing `wasi_snapshot_preview1.reactor.wasm`, \
+             run `sha256sum -c edge-cli/adapters/SHA256SUMS` to verify the vendored adapter is intact, \
+             or set $EDGE_JS_WASI_ADAPTER to a custom adapter path. \
+             See resolve_wasi_adapter for the lookup path.",
+            exit = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".to_string()),
+        );
     }
 
     println!("✓ Built successfully");
@@ -342,28 +377,57 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Combined resolve of both the JS runtime core wasm and the WASI
+/// Preview 1 reactor adapter in one call. Used by `build_js` (which
+/// always needs both); the integration test in
+/// `resolve_js_build_artifacts_returns_both_paths_from_temp_workspace`
+/// exercises the combined path so a regression that fixes one
+/// resolver but breaks the other surfaces here.
+///
+/// Extracted from `build_js` so the integration test doesn't have to
+/// construct a fake `Command::new("cargo")` invocation just to call
+/// the resolvers.
+fn resolve_js_build_artifacts(
+    runtime_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let core_wasm = resolve_runtime_core_wasm(runtime_dir)?;
+    let adapter = resolve_wasi_adapter()?;
+    Ok((core_wasm, adapter))
+}
+
 /// Resolve the on-disk path of the wasm32-wasip1 core module that
-/// `cargo build` (above) produced. Probes three locations in order:
+/// `cargo build` (above) produced. Probes four locations in order:
 ///
 /// 1. `$CARGO_TARGET_DIR/wasm32-wasip1/release/...` — set explicitly
-///    by the parent (rare for a CLI invocation).
-/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/...` —
-///    the shared target dir pinned by the repo's
-///    `.cargo/config.toml` (`build.target-dir`).
-/// 3. `<runtime_dir>/target/wasm32-wasip1/release/...` — the
-///    per-crate default when no `CARGO_TARGET_DIR` is set.
+///    by the parent (rare for a CLI invocation; wins over everything).
+/// 2. `<workspace>/target-cache/edgecloud/wasm32-wasip1/release/...`
+///    — the `build.target-dir = "../target-cache/edgecloud"` setting
+///    from `.cargo/config.toml:37`, resolved relative to `runtime_dir`'s
+///    parent (cargo was invoked from inside `runtime_dir`, but
+///    `build.target-dir` is relative to the CWD at cargo-invocation
+///    time, which is `runtime_dir`, so the actual target lands at
+///    `<runtime_dir>/../target-cache/edgecloud/...` = `<workspace>/target-cache/edgecloud/...`).
+///    Issue #423: the prior probe `$HOME/.cache/edgecloud-cargo/...`
+///    missed this directory on fresh clones where the committed
+///    `.cargo/config.toml` is in effect.
+/// 3. `$HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/...` —
+///    legacy local convention kept for dev machines with an older
+///    unsynced config; ONE `exists()` call, costs nothing.
+/// 4. `<runtime_dir>/target/wasm32-wasip1/release/...` — cargo's
+///    own default with no `CARGO_TARGET_DIR` (e.g. a CI run that
+///    doesn't pick up `.cargo/config.toml`).
 ///
-/// The repo's `.cargo/config.toml` is *not* read by the child
+/// The repo's `.cargo/config.toml` is *not* read by this CLI
 /// process directly — `build.target-dir` is a cargo-internal
-/// setting that's applied only when cargo runs. The shared target
-/// dir is the common case for the dev loop, so we probe it
-/// explicitly.
+/// setting that's applied only when cargo runs. We probe each
+/// of the plausible on-disk layouts.
 fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let name = "edge_js_runtime.wasm";
     let rel = |base: std::path::PathBuf| base.join("wasm32-wasip1").join("release").join(name);
 
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
 
+    // (1) $CARGO_TARGET_DIR — explicit override wins.
     if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
         let candidate = rel(std::path::PathBuf::from(t));
         if candidate.exists() {
@@ -372,6 +436,19 @@ fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path:
         tried.push(candidate);
     }
 
+    // (2) <workspace>/target-cache/edgecloud/... — matches the committed
+    // `.cargo/config.toml` build.target-dir, resolved relative to the
+    // workspace root (which is `runtime_dir`'s parent).
+    if let Some(parent) = runtime_dir.parent() {
+        let candidate = rel(parent.join("target-cache").join("edgecloud"));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    // (3) Legacy $HOME/.cache/edgecloud-cargo — kept for dev machines
+    // with an older unsynced config.
     if let Ok(home) = std::env::var("HOME") {
         let candidate = rel(std::path::PathBuf::from(format!(
             "{home}/.cache/edgecloud-cargo"
@@ -382,6 +459,7 @@ fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path:
         tried.push(candidate);
     }
 
+    // (4) <runtime_dir>/target/... — cargo's own default.
     let default = rel(runtime_dir.join("target"));
     if default.exists() {
         return Ok(default);
@@ -389,15 +467,44 @@ fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path:
     tried.push(default);
 
     anyhow::bail!(
-        "expected core wasm at one of:\n  - {}\n  - <CARGO_TARGET_DIR>/wasm32-wasip1/release/{name}\n\
+        "expected core wasm at one of:\n  - $CARGO_TARGET_DIR/wasm32-wasip1/release/{name}\n\
+         \n\
          Checked (in order):\n{}",
-        tried.first().map(|p| p.display().to_string()).unwrap_or_default(),
         tried
             .iter()
-            .map(|p| format!("  - {}", p.display()))
+            .map(|p| format!("  - {} (missing)", p.display()))
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// Walk `<base>/wasm32-wasip2/release/**/<name>` and return the
+/// first match. `read_dir` is recursive enough for cargo's output
+/// layout (`release/` → `deps/`, `examples/`, `build/`, etc.).
+///
+/// Kept for the future wasip2 path (currently the `edge-js-runtime`
+/// target emits `wasm32-wasip1` + `wasm-tools component new` instead).
+/// Issue #423 ships against the wasip1 path; the wasip2 path will
+/// pick this helper back up when the migration lands.
+#[allow(dead_code)]
+fn find_runtime_wasm(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let release = base.join("wasm32-wasip2").join("release");
+    let name = "edge_js_runtime.wasm";
+    let mut stack = vec![release];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().map(|f| f == name).unwrap_or(false) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the edge-js-runtime crate directory.
@@ -424,18 +531,54 @@ fn resolve_runtime_dir() -> Result<std::path::PathBuf> {
     )
 }
 
+/// On-disk path of the vendored WASI Preview 1 reactor adapter.
+///
+/// The adapter is committed at `<repo>/edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`
+/// (tracked past the root `.gitignore`'s `*.wasm` rule via an explicit
+/// exception there) and pinned via the SHA256SUMS sidecar. The bytes
+/// are byte-identical to the `v45.0.3` wasmtime release asset — see
+/// `edge-cli/adapters/SHA256SUMS` and the `rust-js-build` CI job in
+/// `.github/workflows/ci.yml` for the CI-side verification.
+///
+/// Why vendored, not pulled from the cargo registry: the
+/// `wasi-preview1-component-adapter-provider` crate is not a declared
+/// dependency anywhere in the workspace, so on a fresh clone the cargo
+/// registry cache doesn't contain its artefacts and the prior
+/// `resolve_wasi_adapter` glob returned nothing. Issue #423.
+///
+/// Updating this constant (or moving the vendored file) requires a
+/// corresponding `edge build` semantic bump — the wasm-component-tools
+/// `--adapt` step will refuse a future-format adapter against an
+/// older core module. Track both via the wasmtime pin in
+/// `edge-runtime/Cargo.toml`.
+fn vendored_wasi_adapter_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("adapters")
+        .join("wasi_snapshot_preview1.reactor.wasm")
+}
+
 /// Locate the `wasi_snapshot_preview1.reactor.wasm` adapter that
 /// `wasm-tools component new --adapt <path>` needs to wrap a
-/// `wasm32-wasip1` core module as a WASI Preview 2 component. The
-/// adapter is shipped by the
-/// `wasi-preview1-component-adapter-provider` crate, but it lives
-/// inside the cargo registry cache (under
-/// `$CARGO_HOME/registry/src/...`), not next to `edge-js-runtime`.
+/// `wasm32-wasip1` core module as a WASI Preview 2 component. Probes
+/// three sources in priority order:
 ///
-/// `EDGE_JS_WASI_ADAPTER` overrides the search; the default is to
-/// glob `$CARGO_HOME/registry/src/index.crates.io-*/wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.reactor.wasm`
-/// and return the first match.
+/// 1. `EDGE_JS_WASI_ADAPTER` env override (existing; wins over all).
+/// 2. **Vendored** adapter at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`
+///    relative to this crate's manifest dir. This is the canonical
+///    source on a fresh clone; the SHA-256 is checked by the
+///    `rust-js-build` CI job.
+/// 3. Cargo registry cache: `$CARGO_HOME/registry/src/*/wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.reactor.wasm`.
+///    Kept as a fallback for developers who happen to have the crate
+///    cached locally from another project (no network is attempted).
 fn resolve_wasi_adapter() -> Result<std::path::PathBuf> {
+    resolve_wasi_adapter_with_vendored(&vendored_wasi_adapter_path())
+}
+
+/// Testable inner resolver. `vendored` is the absolute path to probe
+/// in priority 2; tests pass a `tempdir` path instead of relying on
+/// the in-tree vendored file existing.
+fn resolve_wasi_adapter_with_vendored(vendored: &std::path::Path) -> Result<std::path::PathBuf> {
+    // (1) Env override.
     if let Ok(p) = std::env::var("EDGE_JS_WASI_ADAPTER") {
         let path = std::path::PathBuf::from(&p);
         if path.exists() {
@@ -444,13 +587,23 @@ fn resolve_wasi_adapter() -> Result<std::path::PathBuf> {
         anyhow::bail!("EDGE_JS_WASI_ADAPTER points at {p}, but that file does not exist");
     }
 
+    // (2) Vendored adapter (canonical, fresh-clone-safe).
+    if vendored.exists() {
+        return Ok(vendored.to_path_buf());
+    }
+
+    // (3) Cargo registry cache fallback.
+    //
     // `CARGO_HOME` if set, else `$HOME/.cargo` (the conventional
     // default; `cargo` itself uses this when the env var is unset).
     let cargo_home = match std::env::var("CARGO_HOME") {
         Ok(s) => s,
         Err(_) => match std::env::var("HOME") {
             Ok(h) => format!("{h}/.cargo"),
-            Err(_) => anyhow::bail!("neither CARGO_HOME nor HOME is set"),
+            Err(_) => anyhow::bail!(
+                "neither CARGO_HOME nor HOME is set, and no vendored adapter at {}",
+                vendored.display()
+            ),
         },
     };
     let registry = std::path::Path::new(&cargo_home)
@@ -461,43 +614,57 @@ fn resolve_wasi_adapter() -> Result<std::path::PathBuf> {
     // `index.crates.io-1949cf8c6b5b557f`); walk one level deep,
     // then look for the `wasi-preview1-component-adapter-provider-*`
     // crate (matches all semver patch versions) and check for the
-    // artefact.
-    let entries = std::fs::read_dir(&registry).context(format!(
-        "reading cargo registry at {} (is the host's cache set up?)",
-        registry.display()
-    ))?;
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let Ok(subs) = std::fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for sub in subs {
-            let Ok(sub) = sub else { continue };
-            let name = sub.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("wasi-preview1-component-adapter-provider-") {
-                let candidate = sub
-                    .path()
-                    .join("artefacts")
-                    .join("wasi_snapshot_preview1.reactor.wasm");
-                if candidate.exists() {
-                    return Ok(candidate);
+    // artefact. Missing registry dir is non-fatal — the vendored
+    // adapter is the canonical source; this is just a dev-machine
+    // shortcut.
+    if let Ok(entries) = std::fs::read_dir(&registry) {
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Ok(subs) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for sub in subs {
+                let Ok(sub) = sub else { continue };
+                let name = sub.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("wasi-preview1-component-adapter-provider-") {
+                    let candidate = sub
+                        .path()
+                        .join("artefacts")
+                        .join("wasi_snapshot_preview1.reactor.wasm");
+                    if candidate.exists() {
+                        return Ok(candidate);
+                    }
                 }
             }
         }
     }
 
     anyhow::bail!(
-        "Cannot find the wasi-preview1 adapter in {}. \
-         Run `cargo fetch` first, or set EDGE_JS_WASI_ADAPTER to the \
-         absolute path of wasi_snapshot_preview1.reactor.wasm.",
-        registry.display()
+        "Cannot find the wasi-preview1 adapter. Checked (in priority order):\n  \
+         1. $EDGE_JS_WASI_ADAPTER (not set)\n  \
+         2. vendored at {vendored} (missing)\n  \
+         3. cargo registry at {registry} (no wasi-preview1-component-adapter-provider-* crate cached)\n\n\
+         The vendored adapter should ship with this repo. If it's missing, \
+         run `cd edge-cli/adapters && sha256sum -c SHA256SUMS` to verify the file is intact. \
+         To use a custom adapter, set EDGE_JS_WASI_ADAPTER to its absolute path.\n\
+         Hint: each source above is annotated `(not set)` / `(missing)` / `(no ... cached)` — \
+         that tells you whether the override was empty, the file was deleted, or the registry \
+         hasn't been populated by a `cargo install wasm-tools` or `cargo fetch` step.",
+        vendored = vendored.display(),
+        registry = registry.display(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex serializing the adapter-resolver tests so env-var
+    /// mutations (`EDGE_JS_WASI_ADAPTER`, `CARGO_HOME`, `HOME`) don't
+    /// race across parallel test threads.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn path_for_returns_rust_component_wasm() {
@@ -551,6 +718,274 @@ mod tests {
         assert!(
             format!("{err:#}").contains("unsupported language"),
             "expected unsupported-language error, got: {err:#}"
+        );
+    }
+
+    // ---- Issue #423: vendored-adapter resolver tests ----
+    //
+    // These tests pin the priority order documented on
+    // `resolve_wasi_adapter_with_vendored` (1: env, 2: vendored,
+    // 3: registry cache). The shared `ENV_LOCK` mutex serializes
+    // them so env-var mutations don't race across parallel test
+    // threads.
+
+    /// RAII guard that snapshots process env on construction and
+    /// restores every captured variable on drop. Used by the
+    /// `resolve_wasi_adapter_with_vendored` tests below so we don't
+    /// leak env mutations to other tests in the same process.
+    struct EnvGuard {
+        snapshot: Vec<(String, Option<String>)>,
+    }
+    impl EnvGuard {
+        fn new(keys: &[&str]) -> Self {
+            let snapshot = keys
+                .iter()
+                .map(|k| (k.to_string(), std::env::var(k).ok()))
+                .collect();
+            EnvGuard { snapshot }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.snapshot.drain(..) {
+                match v {
+                    Some(s) => std::env::set_var(k, s),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_wasi_adapter_prefers_env_override_over_vendored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["EDGE_JS_WASI_ADAPTER", "CARGO_HOME", "HOME"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("custom-adapter.wasm");
+        let vendored = dir.path().join("vendored.wasm");
+        std::fs::write(&env_path, b"\0asm\x01\0\0\0env").unwrap();
+        std::fs::write(&vendored, b"\0asm\x01\0\0\0vdr").unwrap();
+
+        std::env::set_var("EDGE_JS_WASI_ADAPTER", &env_path);
+
+        let got = resolve_wasi_adapter_with_vendored(&vendored).expect("env override should win");
+        assert_eq!(got, env_path, "env override must beat vendored adapter");
+    }
+
+    #[test]
+    fn resolve_wasi_adapter_prefers_vendored_over_registry() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["EDGE_JS_WASI_ADAPTER", "CARGO_HOME", "HOME"]);
+
+        // No env override → vendored wins over registry.
+        std::env::remove_var("EDGE_JS_WASI_ADAPTER");
+
+        let dir = tempfile::tempdir().unwrap();
+        let vendored = dir.path().join("vendored.wasm");
+        std::fs::write(&vendored, b"\0asm\x01\0\0\0vdr").unwrap();
+
+        // Point CARGO_HOME at a directory that does NOT contain the
+        // registry glob target, so the only way the resolver can
+        // succeed is via the vendored path.
+        let cargo_home = dir.path().join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::env::set_var("CARGO_HOME", &cargo_home);
+        std::env::set_var("HOME", dir.path());
+
+        let got = resolve_wasi_adapter_with_vendored(&vendored)
+            .expect("vendored adapter should be returned when registry is empty");
+        assert_eq!(
+            got, vendored,
+            "vendored adapter must beat registry fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_wasi_adapter_falls_back_to_registry_when_vendored_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["EDGE_JS_WASI_ADAPTER", "CARGO_HOME", "HOME"]);
+
+        std::env::remove_var("EDGE_JS_WASI_ADAPTER");
+
+        let dir = tempfile::tempdir().unwrap();
+        let vendored = dir.path().join("does-not-exist.wasm"); // absent
+        assert!(!vendored.exists());
+
+        // Stage a fake registry containing the crate +
+        // `wasi_snapshot_preview1.reactor.wasm` artefact.
+        let cargo_home = dir.path().join("cargo-home");
+        let registry_index = cargo_home
+            .join("registry")
+            .join("src")
+            .join("index.crates.io-abc");
+        let crate_dir = registry_index.join("wasi-preview1-component-adapter-provider-45.0.3.0");
+        let artefacts = crate_dir.join("artefacts");
+        std::fs::create_dir_all(&artefacts).unwrap();
+        let adapter = artefacts.join("wasi_snapshot_preview1.reactor.wasm");
+        std::fs::write(&adapter, b"\0asm\x01\0\0\0reg").unwrap();
+        std::env::set_var("CARGO_HOME", &cargo_home);
+        std::env::set_var("HOME", dir.path());
+
+        let got = resolve_wasi_adapter_with_vendored(&vendored)
+            .expect("registry cache must be used as fallback when vendored is absent");
+        assert_eq!(
+            got, adapter,
+            "registry adapter must be returned when vendored is absent"
+        );
+    }
+
+    #[test]
+    fn resolve_wasi_adapter_reports_vendored_path_when_all_probes_miss() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["EDGE_JS_WASI_ADAPTER", "CARGO_HOME", "HOME"]);
+
+        std::env::remove_var("EDGE_JS_WASI_ADAPTER");
+
+        let dir = tempfile::tempdir().unwrap();
+        let vendored = dir.path().join("missing-vendored.wasm");
+
+        let cargo_home = dir.path().join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::env::set_var("CARGO_HOME", &cargo_home);
+        std::env::set_var("HOME", dir.path());
+
+        let err = resolve_wasi_adapter_with_vendored(&vendored)
+            .expect_err("all probes miss should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Cannot find the wasi-preview1 adapter"),
+            "error should announce the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains(&vendored.display().to_string()),
+            "error should mention the vendored path the resolver looked at, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_core_wasm_probes_configured_target_cache() {
+        // Build a fake workspace layout:
+        //   <temp>/edge-js-runtime/                       (runtime_dir)
+        //   <temp>/target-cache/edgecloud/wasm32-wasip1/release/edge_js_runtime.wasm
+        // and assert the configured target-cache path wins over the
+        // legacy $HOME probe (which is empty here) and the
+        // per-crate default (which is also empty).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["CARGO_TARGET_DIR", "HOME"]);
+
+        std::env::remove_var("CARGO_TARGET_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("edge-js-runtime");
+        let cache = dir
+            .path()
+            .join("target-cache")
+            .join("edgecloud")
+            .join("wasm32-wasip1")
+            .join("release");
+        std::fs::create_dir_all(&cache).unwrap();
+        let core = cache.join("edge_js_runtime.wasm");
+        std::fs::write(&core, b"\0asm\x01\0\0\0core").unwrap();
+
+        let got = resolve_runtime_core_wasm(&runtime_dir)
+            .expect("configured target-cache path should win");
+        assert_eq!(
+            got, core,
+            "expected the configured target-cache probe to succeed"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_core_wasm_marks_probed_paths_missing_on_bail() {
+        // F3 review follow-up: each probed path in the bail message
+        // is annotated with `(missing)` so operators can distinguish
+        // "the file got deleted" from "the file is the wrong shape".
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["CARGO_TARGET_DIR", "HOME"]);
+
+        std::env::remove_var("CARGO_TARGET_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("edge-js-runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let err = resolve_runtime_core_wasm(&runtime_dir).expect_err("no probe hits should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("(missing)"),
+            "error should annotate each probed path with `(missing)`, got: {msg}"
+        );
+        // Sanity check: bail message should still list the configured
+        // target-cache path (probe (2)) so an operator can see whether
+        // the cargo config got picked up.
+        let expected_cache = dir.path().join("target-cache").join("edgecloud");
+        assert!(
+            msg.contains(&expected_cache.display().to_string()),
+            "error should mention the configured target-cache probe path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_js_build_artifacts_returns_both_paths_from_temp_workspace() {
+        // F2 review follow-up: integration test that exercises the
+        // combined resolve path `build_js` uses. Stages a fake
+        // workspace with BOTH (a) the runtime core wasm at the
+        // configured target-cache path AND (b) the vendored adapter
+        // at `<temp>/edge-cli/adapters/...`, then asserts both come
+        // back from the combined resolver. Catches the class of
+        // regression where one resolver's priority order is fixed
+        // but the other is re-broken by a later refactor.
+        //
+        // We override `CARGO_MANIFEST_DIR`-style resolution by
+        // constructing a vendored path inside the tempdir and then
+        // patching env so `resolve_wasi_adapter_with_vendored` finds
+        // it; the simpler version of the same trick is to rely on
+        // `resolve_wasi_adapter_with_vendored` directly via a temp
+        // helper, but `build_js` calls `resolve_wasi_adapter` (the
+        // manifest-dir-relative one). For this test we stage the
+        // vendored file at the *real* manifest path and let the
+        // resolver find it; the integration under test is therefore
+        // "both resolvers return non-error on a coherent workspace
+        // layout", which is the actual regression mode we care
+        // about.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::new(&["CARGO_TARGET_DIR", "HOME"]);
+
+        std::env::remove_var("CARGO_TARGET_DIR");
+
+        // Stage a fake workspace layout: `<temp>/edge-js-runtime/`
+        // + `<temp>/target-cache/edgecloud/wasm32-wasip1/release/edge_js_runtime.wasm`.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path().join("edge-js-runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let cache = dir
+            .path()
+            .join("target-cache")
+            .join("edgecloud")
+            .join("wasm32-wasip1")
+            .join("release");
+        std::fs::create_dir_all(&cache).unwrap();
+        let core = cache.join("edge_js_runtime.wasm");
+        std::fs::write(&core, b"\0asm\x01\0\0\0core").unwrap();
+
+        // The combined resolver needs `resolve_wasi_adapter` to
+        // find the vendored file at the manifest-relative path —
+        // which is exactly the file the in-tree vendoring committed
+        // (sha256 49fafb…5bea). So a coherent workspace always
+        // finds both pieces via the *real* vendored file. Assert
+        // the core-wasm resolves to the staged tempdir file and
+        // the adapter resolves to the in-tree vendored file.
+        let (resolved_core, resolved_adapter) =
+            resolve_js_build_artifacts(&runtime_dir).expect("combined resolve should succeed");
+        assert_eq!(
+            resolved_core, core,
+            "core wasm should resolve to the staged target-cache file"
+        );
+        assert_eq!(
+            resolved_adapter,
+            vendored_wasi_adapter_path(),
+            "adapter should resolve to the in-tree vendored file"
         );
     }
 }

@@ -6,6 +6,16 @@ rust-version = "1.85"
 publish = false
 description = "edgeCloud developer CLI toolchain"
 
+# `cargo install --path edge-cli` installs the binary as `edge` (not
+# `edge-cli`) — the binary is the user-facing CLI and every doc,
+# sample, scaffold, and CI smoke job references it as `edge`. The
+# crate name stays `edge-cli` to keep the workspace's
+# `cargo test -p edge-cli` and the `cargo install --path edge-cli`
+# ergonomics intact. See PR #498 review for the rename rationale.
+[[bin]]
+name = "edge"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
@@ -37,6 +47,18 @@ ctrlc = "3"
 # `edge auth login --no-echo` is used (issue #108). Default login
 # path (stdin paste, echo on) is preserved for CI/pipe ergonomics.
 rpassword = "7"
+# Used by `edge deploy` to mint a per-run UUID v4 Idempotency-Key
+# (issue #52). When the user supplies `--idempotency-key <UUID>`
+# (CI override), that value is forwarded verbatim; otherwise the
+# runner auto-mints so a CLI retry on a transient network error
+# replays the original deployment instead of creating a duplicate.
+uuid = { version = "1.10", features = ["v4"] }
+# Vendors the canonical WIT tree (repo-root `wit/`) into the CLI
+# binary at compile time, so `edge init --lang=rust` can materialize
+# a self-contained, offline-buildable project (issue #576). The
+# build.rs rerun-if-changed=../wit hook refreshes the embed when any
+# `.wit` file changes.
+include_dir = "^0.7"
 edge-config = { path = "../edge-config" }
 
 [features]

@@ -61,13 +61,28 @@ type previewBlobDeleter interface {
 // rows but `DeleteExpiredPreviewsByIDs` is idempotent (the
 // `WHERE preview_expires_at < NOW()` predicate filters rows
 // that are no longer expired), so the worst case is wasted work.
+//
+// Metrics (issue #581): the optional `sink` records one tick
+// outcome (blobs/rows/batches/errors), and `blobFailureRecorder`
+// bumps the per-blob failure counter. Both are nil-guarded to
+// no-op closures so tests can pass nil without panicking. The
+// sink is NOT called when the run is refused-to-run or when the
+// context is pre-cancelled — same rationale as LogGCService.
 type PreviewGCService struct {
-	repo  previewRepoForGC
-	blobs previewBlobDeleter
+	repo                previewRepoForGC
+	blobs               previewBlobDeleter
+	sink                PreviewGCSink
+	blobFailureRecorder PreviewBlobFailureRecorder
 }
 
-func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter) *PreviewGCService {
-	return &PreviewGCService{repo: repo, blobs: blobs}
+func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter, sink PreviewGCSink, blobFailureRecorder PreviewBlobFailureRecorder) *PreviewGCService {
+	if sink == nil {
+		sink = func(int, int, int, bool) {}
+	}
+	if blobFailureRecorder == nil {
+		blobFailureRecorder = func() {}
+	}
+	return &PreviewGCService{repo: repo, blobs: blobs, sink: sink, blobFailureRecorder: blobFailureRecorder}
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires
@@ -142,6 +157,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 					return
 				}
 				log.Printf("preview_gc: list expired blobs failed: %v", err)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			if len(refs) == 0 {
@@ -157,6 +173,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 			for _, ref := range refs {
 				if delErr := s.blobs.Delete(ctx, ref.TenantID, ref.AppName, ref.ID); delErr != nil {
 					log.Printf("preview_gc: deleting artifact blob %s/%s/%s failed: %v", ref.TenantID, ref.AppName, ref.ID, delErr)
+					s.blobFailureRecorder() // issue #581 — per-blob failure
 					continue
 				}
 				totalBlobsDeleted++
@@ -168,6 +185,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 				// log line per batch rather than a tight
 				// retry loop.
 				log.Printf("preview_gc: all %d blob deletes failed in batch %d; skipping row deletes", len(refs), batch)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			// Step 3: delete the DB rows (and let
@@ -179,6 +197,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 					return
 				}
 				log.Printf("preview_gc: deleting expired preview rows failed (batch %d): %v", batch, err)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			totalRowsDeleted += len(deleted)
@@ -192,6 +211,11 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 		if totalBatchesSwept > 0 {
 			log.Printf("preview_gc: sweep complete: %d rows + %d blobs deleted across %d batches", totalRowsDeleted, totalBlobsDeleted, totalBatchesSwept)
 		}
+		// Record per-tick metrics. Issue #581 — one sink call per
+		// sweep, regardless of whether any rows were touched. The
+		// error flag is false here because every error path above
+		// returns BEFORE this point.
+		s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, false)
 	}
 
 	runOnce()

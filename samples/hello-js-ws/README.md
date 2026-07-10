@@ -34,7 +34,12 @@ EDGE_JS_BUNDLE=$PWD/.edge/bundle.js \
 Then `edge build` (from the repo root or with
 `edge build --manifest-path samples/hello-js-ws/edge.toml`) wraps the
 core module with `wasm-tools component new --adapt <wasi adapter> -o
-target/javy/hello-js-ws.wasm`.
+target/javy/hello-js-ws.wasm`. The wasi adapter ships in the repo at
+`edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm` (issue #423)
+— the same bytes as the wasmtime `v45.0.3` release asset; SHA-256
+pinned in `edge-cli/adapters/SHA256SUMS` and checked by the
+`rust-js-build` CI job. Override with `$EDGE_JS_WASI_ADAPTER` if your
+local toolchain needs a different one.
 
 ## How to test end-to-end
 

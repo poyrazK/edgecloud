@@ -88,6 +88,11 @@ pub struct Config {
     /// How often to poll the control plane for per-app rate limit overrides.
     /// Default 60s. 0 = disabled. Override with `RATE_LIMIT_FETCH_INTERVAL`.
     pub rate_limit_fetch_interval: Duration,
+    /// How often to poll the control plane for per-tenant quota state
+    /// (issue #420). Default 30s. 0 = disabled. Override with
+    /// `QUOTA_FETCH_INTERVAL`. When 0, the quota fetcher is not
+    /// spawned and the ingress never injects Caddy 402 blocks.
+    pub quota_fetch_interval: Duration,
     // ── Failure detection (issue #fast-failure-detection) ────────────
     /// How long without a heartbeat before a worker's routes are pruned.
     /// Default 60s (2 missed beats at 30s interval). Override with
@@ -208,6 +213,10 @@ impl Config {
                 .ok()
                 .and_then(|v| humantime::parse_duration(&v).ok())
                 .unwrap_or(Duration::from_secs(60)),
+            quota_fetch_interval: std::env::var("QUOTA_FETCH_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(crate::quota::QUOTA_FETCH_INTERVAL),
             stale_timeout: std::env::var("STALE_TIMEOUT")
                 .ok()
                 .and_then(|v| humantime::parse_duration(&v).ok())

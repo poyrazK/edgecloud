@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,19 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
+
+// idempotencyKeyFormat (issue #52) is the byte-shape the
+// Idempotency-Key header must match. [a-fA-F0-9-]{8,128} admits
+// UUID v4 (8-4-4-4-12 = 36 chars with hyphens) while staying
+// narrow enough to keep the lookup index selective — a 128-char
+// upper bound gives callers room to use any future ID scheme
+// (ULID, KSUID, etc.) without re-asking the server.
+//
+// Rejecting malformed keys with 400 is the right move: the
+// value can't be reshaped into something useful, and a
+// degenerate key in the replay cache would invite either an
+// infinite cache or a hash-collision surface.
+var idempotencyKeyFormat = regexp.MustCompile(`^[a-fA-F0-9-]{8,128}$`)
 
 // DeploymentHandler handles deployment HTTP requests.
 type DeploymentHandler struct {
@@ -190,6 +205,24 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotency-Key (issue #52). Optional header that pins a
+	// retry to the original deployment_id (200 + same body)
+	// instead of minting a fresh row (201). Format is
+	// [a-fA-F0-9-]{8,128} — narrow enough to keep the index
+	// selective, wide enough to admit UUID v4 and any user
+	// JID. An empty header means "no idempotency" and falls
+	// through to fresh-deploy semantics, so a pre-#52 CLI on
+	// a #52 server sees no behavior change.
+	//
+	// 400 (not 422) for a malformed key: the value can't be
+	// reshaped into something useful; "go away and re-decide
+	// whether you want idempotency" is the right message.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" && !idempotencyKeyFormat.MatchString(idemKey) {
+		http.Error(w, `{"error":"invalid Idempotency-Key format (must match [a-fA-F0-9-]{8,128})"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Parse `?regions=us-east,eu-west`. Split on `,`, trim whitespace,
 	// drop empties, dedupe (preserving first-seen order so the response
 	// is stable). Invalid regions are caught at the service layer
@@ -299,6 +332,47 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = filePart.Close() }()
 
+	// Idempotency-Key artifact hash (issue #52). Read the
+	// extracted filePart into a tee-buffer that mirrors
+	// every byte to a SHA-256 hasher, then hand the service
+	// an io.Reader over that buffer so its own streaming
+	// SaveAndHash can re-read the bytes. The digest is the
+	// "same key, different body" guard:
+	//
+	//   * Hashing the artifact (not the multipart envelope)
+	//     keeps the contract stable across CLIs that vary
+	//     the boundary string, swap build_metadata order,
+	//     or stamp a fresh build time while rebuilding the
+	//     same WASM. The unit of identity for a deploy is
+	//     the artifact, not the wire envelope.
+	//
+	//   * Teeing into a buffer trades the streaming win
+	//     for a bounded memory cost. MaxArtifactSize caps
+	//     the body at 100 MiB; the buffer is bounded by
+	//     the same MaxBytesReader cap on `r.Body`, so the
+	//     worst case is one full-artifact buffer per
+	//     in-flight deploy. Acceptable for the size class.
+	var artifactBuf bytes.Buffer
+	var artifactSHA [32]byte
+	{
+		hasher := sha256.New()
+		mw := io.MultiWriter(&artifactBuf, hasher)
+		written, copyErr := io.Copy(mw, filePart)
+		if copyErr != nil {
+			// Mid-stream read failure → 413 (the
+			// MaxBytesReader cap surfaces here as
+			// *http.MaxBytesError, but anything else is
+			// also a bad-body 413 from the operator's POV).
+			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		if written == 0 {
+			http.Error(w, `{"error":"deploy requires a non-empty file part"}`, http.StatusBadRequest)
+			return
+		}
+		copy(artifactSHA[:], hasher.Sum(nil))
+	}
+
 	// Decode the optional `build_metadata` form field into a
 	// CLISideMetadata struct. A missing or malformed value is
 	// best-effort: the service builds an envelope with "unknown"
@@ -315,7 +389,12 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, filePart, regions, autoRollback, desiredReplicas, cliMeta, previewOpts)
+	// The service contract accepts an io.Reader over the
+	// artifact bytes; the teeBuffer satisfies that. The
+	// streaming win (no extra copy beyond what
+	// extractDeployParts already does) is traded for the
+	// replay-cache requirement to know the SHA-256 up front.
+	deployment, fromCache, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, &artifactBuf, regions, autoRollback, desiredReplicas, cliMeta, previewOpts, idemKey, artifactSHA)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -327,6 +406,17 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrMaxDeploymentsQuotaExceeded) {
 			httperror.QuotaExceededCtx(w, r, "max deployments quota exceeded")
+			return
+		}
+		// Issue #420: deploy-time 402 PAYMENT_REQUIRED. The typed
+		// PaymentRequiredError carries a stable reason code
+		// (subscription_past_due, quota_will_be_exceeded, etc.) that
+		// the client can route on; we surface it as the message so
+		// the response shape stays aligned with the rest of the
+		// httperror envelope (no extra top-level field).
+		var prErr *service.PaymentRequiredError
+		if errors.As(err, &prErr) {
+			httperror.PaymentRequiredCtx(w, r, "deployment blocked: "+prErr.Reason)
 			return
 		}
 		if errors.Is(err, service.ErrMaxAppsQuotaExceeded) {
@@ -349,13 +439,34 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "invalid wasm artifact: missing magic bytes"}`, http.StatusBadRequest)
 			return
 		}
+		// ErrIdempotencyKeyMismatch (issue #52) — the caller reused
+		// a key against a request body whose artifact hash differs
+		// from the one stored on the cached row. 422 (Unprocessable
+		// Entity): the wire shape is well-formed, but a semantic
+		// conflict between the key and the body means we can't
+		// safely replay. The CLI should either pick a different
+		// key or accept that the artifact changed.
+		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
+	// 200 vs 201 selection (issue #52). A replay returns 200 OK
+	// with the original deployment row; a fresh deploy returns
+	// 201 Created. The response body is byte-equivalent in both
+	// cases (same deployResponse shape) so a CLI that ignores
+	// the status code still parses the row identically across
+	// fresh / replay / idempotent retry.
+	status := http.StatusCreated
+	if fromCache {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
 	// Build the response with preview fields populated only when
 	// the deploy was a preview (issue #308). The three omitempty
 	// tags keep the non-preview wire shape byte-identical to the
@@ -595,64 +706,38 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writePublishFailureEnvelope writes the 502 Bad Gateway response for
-// a partially-failed Activate / Rollback / AutoRollback publish. The
-// body carries the per-region breakdown so the operator can see
-// exactly which regions got the message and which are pending retry.
-//
-// Used by all three 502 sites in this file + handler/internal.go.
-// If err is not a *service.PublishError (e.g. a future regression
-// that bypasses the typed wrapper), the body falls back to an
-// empty arrays + the static error message — the 502 contract
-// holds regardless. errors.Is(err, service.ErrPublishFailed) is
-// still matched by the caller before this helper is reached, so
-// callers don't need to repeat the sentinel check.
-//
-// Issue #332: the envelope additionally surfaces the per-region
-// artifact-cache push outcome (`regions_cached_succeeded`,
-// `regions_cached_skipped`, `regions_cache_failed`) so operators
-// can distinguish "NATS publish failed" from "cache push failed"
-// from the same 502 body. Pre-#332 clients parsing
-// `regions_published` / `regions_failed` see no change. The
-// `regions_cached` key is preserved as the union of
-// `regions_cached_succeeded` + `regions_cached_skipped` for
-// backward-compat with PR-2 clients that read it.
-func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
-	details := map[string]any{
-		"regions_published":        []string{},
-		"regions_failed":           []string{},
-		"regions_cached_succeeded": []string{},
-		"regions_cached_skipped":   []string{},
-		"regions_cached":           []string{},
-		"regions_cache_failed":     []string{},
-	}
-	var pubErr *service.PublishError
-	if errors.As(err, &pubErr) {
-		details["regions_published"] = pubErr.Published
-		details["regions_failed"] = pubErr.Failed
-		details["regions_cached_succeeded"] = pubErr.CachedSucceeded
-		details["regions_cached_skipped"] = pubErr.CachedSkipped
-		// Backward-compat: union the two Cached slices into the
-		// pre-PR-2-follow-up `regions_cached` key.
-		merged := make([]string, 0, len(pubErr.CachedSucceeded)+len(pubErr.CachedSkipped))
-		merged = append(merged, pubErr.CachedSucceeded...)
-		merged = append(merged, pubErr.CachedSkipped...)
-		details["regions_cached"] = merged
-		details["regions_cache_failed"] = pubErr.CacheFailed
-	}
-	httperror.BadGatewayCtx(w, r, staticMessage, details)
-}
-
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
 //
 // Status codes:
-//   - 200: activated; body is {"status": "activated"}
-//   - 502: activation committed but the post-commit NATS publish of
-//     the TaskMessage failed — workers may still be serving the prior
-//     deployment. Client should re-activate the desired deployment
-//     (a plain retry will 409 because the row is already in the
-//     desired state, or 404 if the deploy was deleted).
+//   - 200: activated; body is {"status": "activated"}.
+//   - 409: tenant is disabled (issue #440 gate). The body is the
+//     standard httperror envelope with `error.code = "CONFLICT"` and
+//     `error.message = "tenant is disabled"`, identical to the same
+//     409 already returned for `ErrNoLastGood` on the rollback
+//     endpoint. CLI / operator tooling can branch on
+//     `error.code = "CONFLICT"` plus a `error.message` starting with
+//     "tenant is disabled" to distinguish the lockdown case from
+//     any other 409 (e.g. no-last-good on rollback).
 //   - 500: anything else (DB error, etc.).
+//
+// Note (issue #42): pre-#42, this handler could return 502 if the
+// post-commit NATS publish failed. The publish is now durable: the
+// outbox row is written in the same transaction as the
+// active_deployments mutation, and the OutboxDrainer relays it after
+// commit. A failed activate can only mean a DB error or a duplicate
+// dedupe_key — both surface as 500.
+//
+// Note (issue #440): the ErrTenantDisabled → 409 mapping was added when
+// the disable-vs-activate race gate landed. The handler previously
+// surfaced any service error as a generic 500, which hid the
+// billing/lockdown boundary from the CLI and from any operator tooling
+// that wanted to differentiate "tenant is locked, don't retry" from
+// "infrastructure broke, alert on-call". Note that this 409 is only
+// reachable on the atomic path (weight == 100, the default): the
+// canary branch (weight < 100 → trafficSvc.SetTraffic) is not gated
+// by lockTenantForUpdate and so cannot return ErrTenantDisabled. If
+// disable-vs-canary enforcement becomes a requirement, thread the
+// gate through SetTraffic and add a sibling mapping here.
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -692,9 +777,13 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	// canary path is for partial weights only).
 	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
-			if errors.Is(err, service.ErrPublishFailed) {
-				writePublishFailureEnvelope(w, r, err,
-					"activation committed but worker notification failed; please retry")
+			// Issue #440: surface the disable-vs-activate race gate as a
+			// 409 Conflict so the CLI / operator tooling can distinguish
+			// "tenant is locked, don't retry" from a generic infrastructure
+			// 500. Anything else (db unreachable, lock timeout, …) stays
+			// a 500 with the canonical "internal error" envelope.
+			if errors.Is(err, service.ErrTenantDisabled) {
+				httperror.ConflictCtx(w, r, "tenant is disabled")
 				return
 			}
 			log.Printf("internal error: %v", err)
@@ -759,15 +848,29 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 // TaskMessage so workers reconcile.
 //
 // Status codes:
-//   - 200: rolled back; body is {"deployment_id": "<new active id>"}
-//   - 404: no active deployment for this app (user never activated)
-//   - 409: app is active but has no last-good pointer (only ever activated
-//     one deployment, so there is nothing to roll back to)
-//   - 502: rollback committed but the post-commit NATS publish failed —
-//     workers may still be serving the prior deployment. Client should
-//     re-activate the desired deployment; a plain retry will 409
-//     because last_good was cleared on this attempt.
+//   - 200: rolled back; body is {"deployment_id": "<new active id>"}.
+//   - 404: no active deployment for this app (user never activated).
+//   - 409: one of two conditions:
+//     1. NoLastGood: app is active but has no last-good pointer
+//     (only ever activated one deployment, so there is nothing to
+//     roll back to). Body uses the older raw `http.Error` shape
+//     `{"error": "no previous deployment to roll back to"}`.
+//     2. Tenant is disabled (issue #440 gate). Body uses the canonical
+//     httperror envelope with `error.code = "CONFLICT"` and
+//     `error.message = "tenant is disabled"`.
+//     Both cases share the same status code and the same
+//     `error.code = "CONFLICT"` envelope; callers must inspect
+//     `error.message` to disambiguate (or branch on the raw legacy
+//     body in case 1 — envelope migration is a separate cleanup).
 //   - 500: anything else (DB error, etc.).
+//
+// Note (issue #42): pre-#42, this handler could return 502 if the
+// post-commit NATS publish failed. The publish is now durable (see
+// Activate's note above); a failed rollback can only mean a DB error.
+//
+// Note (issue #440): ErrTenantDisabled → 409 mirrors the mapping added
+// to Activate so callers can distinguish "tenant locked, don't retry"
+// from infrastructure errors.
 func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -777,6 +880,10 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 
 	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName)
 	if err != nil {
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
+			return
+		}
 		if errors.Is(err, service.ErrNoLastGood) {
 			http.Error(w, `{"error": "no previous deployment to roll back to"}`, http.StatusConflict)
 			return
@@ -785,9 +892,10 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 			return
 		}
-		if errors.Is(err, service.ErrPublishFailed) {
-			writePublishFailureEnvelope(w, r, err,
-				"rollback committed but worker notification failed; please retry")
+		// Issue #440: tenant disabled mid-rollback. 409 matches
+		// the state-conflict mapping above for ErrNoLastGood.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			http.Error(w, `{"error": "tenant is disabled; re-enable via the admin endpoint and retry"}`, http.StatusConflict)
 			return
 		}
 		log.Printf("internal error: %v", err)
@@ -822,6 +930,13 @@ func (h *DeploymentHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 // Promote handles POST /api/v1/apps/{appName}/promote/{deploymentID} —
 // activates a deployment under a different app name than it was originally
 // deployed under (preview → production workflow).
+//
+// Status codes:
+//   - 200: promoted; body is {"status": "promoted"}.
+//   - 404: deployment not found, or owned by a different tenant.
+//   - 409: tenant is disabled (issue #440 gate; promotes flow through
+//     the same lockTenantForUpdate helper as Activate).
+//   - 500: anything else (DB error, etc.).
 func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	targetAppName := r.PathValue("appName")
@@ -837,6 +952,13 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID); err != nil {
 		if errors.Is(err, service.ErrDeploymentNotFound) {
 			httperror.NotFoundCtx(w, r, "deployment not found")
+			return
+		}
+		// Issue #440: disable-vs-activate race gate. Promote delegates
+		// to the same activateDeployment inner function as Activate, so
+		// the gate fires identically and the handler maps to 409 here.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
 			return
 		}
 		log.Printf("internal error: %v", err)
@@ -951,6 +1073,15 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 // Parts other than `file` and `build_metadata` are silently drained
 // and discarded, so the request body's bytes don't leak through to
 // the file part stream.
+//
+// Stop scanning as soon as both the file part AND the optional
+// build_metadata part have been collected. mime/multipart's NextPart
+// consumes a part's body to find the next boundary, so iterating
+// past the file part would drain the artifact bytes the caller
+// wants to read. Concretely: a file-only multipart body hits
+// NextPart three times — build_metadata absent, file collected,
+// NextPart drains the file body to find the closing boundary, then
+// returns io.EOF. The file body would be unreadable on return.
 func extractDeployParts(mr *multipart.Reader) (*multipart.Part, []byte, error) {
 	var (
 		filePart       *multipart.Part
@@ -1001,6 +1132,21 @@ func extractDeployParts(mr *multipart.Reader) (*multipart.Part, []byte, error) {
 			// `file` part's bytes remain contiguous.
 			_, _ = io.Copy(io.Discard, p)
 			_ = p.Close()
+		}
+		// Stop once we have the file part. Continuing to scan
+		// would drain the file part's body via NextPart (see
+		// function comment); the caller is responsible for
+		// closing filePart and reading it to EOF. The
+		// build_metadata part must appear BEFORE the file part
+		// in the multipart envelope — the CLI's PR2 envelope
+		// builder writes fields in that order; if a future
+		// caller reverses the order, this code returns the
+		// file part first and never scans the metadata. The
+		// handler treats missing metadata as "unknown" tooling,
+		// so a reversed-order caller just loses the provenance
+		// stamp, not the deploy.
+		if filePart != nil {
+			break
 		}
 	}
 	if filePart == nil {

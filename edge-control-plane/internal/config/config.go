@@ -36,6 +36,14 @@ type Config struct {
 	// fleet has multiple workers and the cloud-provider integration
 	// (NoopCloudProvider today; Hetzner in a follow-up) is ready.
 	Autoscale AutoscaleConfig `yaml:"autoscale"`
+	// CacheRetry configures the cache-retry sweep (issue #501).
+	// The sweep re-attempts per-region artifact-cache pushes for
+	// deployments whose previous push landed in regions_cache_failed,
+	// with a per-region attempt cap (MaxAttempts) that routes
+	// over-cap regions to a `giveUp` partition (drop with a WARN
+	// log, no more retries until a new activation resets the
+	// counter). The counter is per-deployment, not per-tenant-app.
+	CacheRetry CacheRetryConfig `yaml:"cache_retry"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
 	// multi-region — preserves today's "publish one TaskMessage to a
@@ -220,6 +228,35 @@ type AutoscaleConfig struct {
 	ScaleDownCooldownS int    `yaml:"scale_down_cooldown_s"`
 	DecisionIntervalS  int    `yaml:"decision_interval_s"`
 	ProviderKind       string `yaml:"provider_kind"`
+}
+
+// CacheRetryConfig configures the cache-retry sweep (issue #501).
+// Tunable via env REGION_CACHE_RETRY_INTERVAL and
+// REGION_CACHE_RETRY_MAX_ATTEMPTS. Mirrors the convention of
+// AutoscaleConfig — integer seconds for portability, applied at
+// sweep start and on every config reload.
+//
+// The MaxAttempts escape hatch (`max_attempts: 0` or negative)
+// disables the cap entirely: every region is treated as
+// stillFailing or success, never giveUp. This matches the
+// operator intent of "I want retries forever" — a single
+// config-line flip is the documented escape hatch for an
+// environment that needs unbounded retry, without removing the
+// cap for the production fleet.
+type CacheRetryConfig struct {
+	// IntervalS is the seconds between sweep ticks. Default 300
+	// (5 minutes). Mirrors the original `parseDurationEnv`
+	// default from PR #553. The sweep fires an immediate
+	// first-tick on startup, then ticks at IntervalS.
+	IntervalS int `yaml:"interval_s"`
+	// MaxAttempts is the per-region attempt cap. Default 10.
+	// When a region's attempt counter reaches MaxAttempts, the
+	// sweep routes the region to the `giveUp` partition
+	// (RemoveFromCacheFailed + WARN log) instead of retrying
+	// the push. A new activation (publishSwap) resets the
+	// counter to 0 for the new deployment.
+	// Set to 0 (or negative) to disable the cap entirely.
+	MaxAttempts int `yaml:"max_attempts"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -508,6 +545,26 @@ func Load(path string) (*Config, error) {
 		cfg.Autoscale.ProviderKind = v
 	}
 
+	// Override with cache-retry sweep env vars (issue #501).
+	// Mirrors the AUTOSCALE_* pattern: integer seconds, fail-closed
+	// on a malformed value (the caller of Load surfaces the error
+	// at startup). Defaults below are set in `applyDefaults` so an
+	// unconfigured env still produces a working sweep.
+	if v := os.Getenv("REGION_CACHE_RETRY_INTERVAL"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("REGION_CACHE_RETRY_INTERVAL must be a valid integer (seconds): %w", err)
+		}
+		cfg.CacheRetry.IntervalS = n
+	}
+	if v := os.Getenv("REGION_CACHE_RETRY_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("REGION_CACHE_RETRY_MAX_ATTEMPTS must be a valid integer: %w", err)
+		}
+		cfg.CacheRetry.MaxAttempts = n
+	}
+
 	// Override with migration config env vars
 	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
 		cfg.Migration.EdgeMigratePath = v
@@ -572,6 +629,21 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.RateLimit.IPBurst == 0 {
 		cfg.RateLimit.IPBurst = 40
+	}
+
+	// Defaults for cache-retry sweep (issue #501). 5m interval /
+	// 10 attempts matches the operational goal: a transient cache
+	// blip recovers within ~1h of sweep ticks; a permanently
+	// dead region is given up on within ~50m of consecutive
+	// failures. The operator can override either via env
+	// (REGION_CACHE_RETRY_INTERVAL / REGION_CACHE_RETRY_MAX_ATTEMPTS)
+	// or by setting cache_retry.interval_s / max_attempts in the
+	// config YAML.
+	if cfg.CacheRetry.IntervalS == 0 {
+		cfg.CacheRetry.IntervalS = 300 // 5 minutes
+	}
+	if cfg.CacheRetry.MaxAttempts == 0 {
+		cfg.CacheRetry.MaxAttempts = 10
 	}
 
 	// Reject insecure JWT secrets. Operators frequently ship with the

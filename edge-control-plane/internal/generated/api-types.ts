@@ -161,6 +161,33 @@ export interface paths {
          * @description Stores the artifact, registers a new deployment, and auto-creates
          *     the app record if it does not already exist. The artifact is
          *     validated as a WebAssembly binary before storage.
+         *
+         *     ## Idempotency-Key (issue #52)
+         *
+         *     A retry on a transient network error (504, dropped TCP) should
+         *     not produce a duplicate `deployments` row. Send an
+         *     `Idempotency-Key` header on the retry to pin the call to the
+         *     original deployment:
+         *
+         *     * Header is optional. Omitting it gives fresh-deploy semantics —
+         *       same behavior as pre-#52.
+         *     * Header value must match `^[a-fA-F0-9-]{8,128}$` (UUID v4 fits
+         *       unmodified; ULIDs and similar IDs also fit). Malformed → 400.
+         *     * Header is **tenant-scoped**: lookup is keyed on
+         *       `(tenant_id, key)`, never on the key alone. Two tenants
+         *       sending the same key each get independent rows.
+         *     * Replay returns the cached `deployment_id` with status **200**.
+         *       The response body is byte-equivalent to the 201 fresh path.
+         *     * Replaying a key against a different artifact body returns
+         *       **422 Unprocessable Entity** — this is the "you reused a
+         *       key by mistake" guard rail. The error message identifies the
+         *       sentinel `idempotency key reused with a different request body`.
+         *     * Lookup TTL is 24h. Rows older than the cutoff are treated
+         *       as fresh-deploy.
+         *
+         *     The CLI auto-mints a UUID v4 per invocation; pass
+         *     `--idempotency-key <UUID>` to pin a key explicitly (CI uses
+         *     this to dedupe retried jobs).
          */
         post: operations["deploy"];
         delete?: never;
@@ -505,6 +532,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the authenticated tenant's usage dashboard payload
+         * @description Composes current-period counters, a windowed subscription-event
+         *     timeline, and per-tenant upgrade options + billing portal URL.
+         *     Cached for 10s in-process (stale-while-revalidate) so dashboard
+         *     refresh doesn't hammer the DB. Free-tier tenants see the
+         *     `upgrade_options` array; paid tenants see the billing portal
+         *     URL instead.
+         */
+        get: operations["getUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/keys/{keyID}": {
         parameters: {
             query?: never;
@@ -732,6 +784,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/tenants/{tenantID}/quota-override": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Manually override a tenant's quota or lock state (admin only)
+         * @description Owner-role escape hatch for the billing umbrella. Every field is
+         *     optional; absent fields are untouched. The most common uses are
+         *     to clear a free-tier lockdown (`clear_disabled_at: true`), grant a
+         *     temporary grace window (`set_overage_allowed_until`), or pin a
+         *     per-deployment cap for a paying customer that's about to
+         *     cross the line. Every override is recorded in `audit_logs` with
+         *     action `quota.override`.
+         */
+        post: operations["adminQuotaOverride"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/tenants/{tenantID}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-enable a tenant disabled by quota-exceeded (admin only)
+         * @description Clears tenants.disabled_at for a tenant that the quota-exceeded
+         *     path stamped via SetDisabledAt (issue #440). Subsequent
+         *     activate / rollback / deploy requests proceed without
+         *     returning 409 tenant_disabled.
+         *
+         *     Idempotent: calling on an already-enabled tenant is a 200
+         *     with no state change.
+         */
+        post: operations["enableTenant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/apps/{appName}": {
         parameters: {
             query?: never;
@@ -903,6 +1007,67 @@ export interface paths {
                     content?: never;
                 };
                 /** @description App not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/quota/{tenantID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Per-tenant quota state for the ingress
+         * @description Returns the per-tenant quota row plus the derived `over_cap`
+         *     boolean consumed by the edge-ingress quota fetcher. The fetcher
+         *     polls this endpoint every `QUOTA_FETCH_INTERVAL` seconds
+         *     (default 30s) and keys its Caddy `static_response` 402 block
+         *     off `over_cap`. The `locked_until` field is the
+         *     `quotas.quota_lock_grace_until` value — the request-time 402
+         *     activates after this timestamp passes.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Quota state for the tenant. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Quota"];
+                    };
+                };
+                /** @description Invalid tenant ID */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Tenant not found */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -1726,17 +1891,59 @@ export interface components {
              */
             max_requests_per_month?: number;
             /**
+             * @description LongRunning-app resident-time cap per calendar month (UTC), in
+             *     seconds. -1 = unlimited (enterprise). 0 = unset / admin-cleared
+             *     (cap check skipped). Default value depends on the tenant's plan:
+             *     free=2592000 (30 days of 1 LR app), pro=7776000 (90 days),
+             *     business=31104000 (360 days), enterprise=unlimited.
+             *     Handler (FaaS) apps do not contribute resident time.
+             *     Resident-seconds is the third metered dimension added in #485.
+             * @example 2592000
+             */
+            max_resident_seconds_per_month?: number;
+            /**
              * Format: int64
              * @description Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+             *     Drives enforcement: when this value reaches `max_outbound_mb`,
+             *     deploy-time returns 402 PAYMENT_REQUIRED with reason
+             *     `quota_will_be_exceeded` and edge-ingress returns 402 with
+             *     `Retry-After: 3600`.
              * @example 0
              */
             used_outbound_bytes?: number;
             /**
              * Format: int64
              * @description Cumulative request count in the current UTC month. Resets on month rollover.
+             *     Drives enforcement in the same way as `used_outbound_bytes`.
              * @example 0
              */
             used_request_count?: number;
+            /**
+             * Format: int64
+             * @description Aggregate memory (MiB) held by the tenant's active deployments (issue #44, part 2).
+             *     Incremented on activate / promote, decremented on rollback. Unlike
+             *     `used_outbound_bytes` and `used_request_count`, this counter is NOT
+             *     month-bounded: the cap is per-tenant-aggregate, not per-month. Drives
+             *     deploy-time enforcement — when `used_memory_mb + per_app_memory >
+             *     max_memory_mb`, deploy-time returns 402 PAYMENT_REQUIRED with reason
+             *     `memory_quota_will_be_exceeded`. Enterprise plan uses max_memory_mb=-1
+             *     to bypass the check.
+             * @example 0
+             */
+            used_memory_mb?: number;
+            /**
+             * Format: int64
+             * @description Cumulative LongRunning-app resident time in the current UTC month,
+             *     in seconds. Resets on month rollover. Handler (FaaS) apps do
+             *     not contribute (the worker stamps `resident_seconds=null`,
+             *     the CP translates that to 0). Drives enforcement the same way
+             *     as `used_outbound_bytes` and `used_request_count` — when this
+             *     value reaches `max_resident_seconds_per_month`, deploy-time
+             *     returns 402 PAYMENT_REQUIRED with reason `quota_will_be_exceeded`
+             *     and edge-ingress returns 402.
+             * @example 0
+             */
+            used_resident_seconds?: number;
             /**
              * Format: date-time
              * @description UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
@@ -1744,12 +1951,255 @@ export interface components {
              */
             quota_period_start?: string;
             /**
-             * @description Highest usage percentage across the two monthly caps
-             *     (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
-             *     expressed as a 0-100 value. null when both caps are unlimited.
+             * Format: date-time
+             * @description Set by the heartbeat pipeline when a free-tier tenant first
+             *     crosses cap. Deploy-time 402 is in effect immediately on
+             *     first-cross; the request-time 402 (edge-ingress) only
+             *     activates once this timestamp has passed. Operators can
+             *     clear via the admin override endpoint.
+             * @example 2026-07-15T12:00:00Z
+             */
+            quota_lock_grace_until?: string | null;
+            /**
+             * Format: date-time
+             * @description Per-tenant grace clock for paid tenants that have crossed
+             *     cap. While this timestamp is in the future, the deploy-time
+             *     cap check is skipped (request-time 402 at the edge is
+             *     unaffected). Set by the admin override endpoint.
+             * @example 2026-07-20T00:00:00Z
+             */
+            overage_allowed_until?: string | null;
+            /**
+             * @description Mirrored from `billing_subscriptions.status`. Any value
+             *     other than `active` or `trialing` causes deploy-time to
+             *     return 402 PAYMENT_REQUIRED with reason
+             *     `subscription_past_due`.
+             * @example active
+             * @enum {string}
+             */
+            subscription_status?: "active" | "past_due" | "canceled" | "trialing";
+            /**
+             * @description Derived: true when `used_request_count >= max_requests_per_month`
+             *     OR `used_outbound_bytes / 1MiB >= max_outbound_mb`
+             *     OR (when `max_resident_seconds_per_month > 0`)
+             *     `used_resident_seconds >= max_resident_seconds_per_month`.
+             *     The edge-ingress fetcher keys its Caddy `static_response` 402
+             *     block off this boolean. Resident-seconds is the third metered
+             *     dimension added in #485; Handler (FaaS) apps do not contribute
+             *     (the worker stamps `resident_seconds=null`, the CP translates
+             *     that to a 0 contribution).
+             * @example false
+             */
+            over_cap?: boolean;
+            /**
+             * @description Highest usage percentage across the three monthly caps
+             *     (outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+             *     and used_resident_seconds / max_resident_seconds_per_month),
+             *     expressed as a 0-100 value. null when all caps are unlimited
+             *     (sentinel -1). Caps set to 0 (unset) are skipped.
              * @example 42.5
              */
             usage_pct?: number | null;
+        };
+        /**
+         * @description Current billing-period usage for the authenticated tenant.
+         *     Derived from the single `quotas` row; the dashboard polls
+         *     this every few seconds and renders the percentage + remaining
+         *     capacity from these numbers.
+         */
+        CurrentPeriodUsage: {
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the current usage period began.
+             * @example 2026-07-01T00:00:00Z
+             */
+            period_start?: string;
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the current usage period ends (next month boundary).
+             * @example 2026-08-01T00:00:00Z
+             */
+            period_end?: string;
+            /**
+             * Format: int64
+             * @description Cumulative requests in the current period. Drives deploy-time 402 once it reaches `requests_cap`.
+             * @example 312
+             */
+            requests_used?: number;
+            /**
+             * Format: int64
+             * @description Per-period request cap for the tenant's plan. -1 = unlimited.
+             * @example 100000
+             */
+            requests_cap?: number;
+            /**
+             * Format: int64
+             * @description Cumulative outbound bytes in the current period. Drives deploy-time 402 once it reaches `outbound_bytes_cap`.
+             * @example 89432
+             */
+            outbound_bytes_used?: number;
+            /**
+             * Format: int64
+             * @description Per-period outbound cap in BYTES (not MiB) so the dashboard can render without conversion. -1 = unlimited.
+             * @example 1073741824
+             */
+            outbound_bytes_cap?: number;
+            /**
+             * @description Highest usage percentage across the three monthly caps (0-100):
+             *     outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+             *     and used_resident_seconds / max_resident_seconds_per_month.
+             *     null when all caps are unlimited (sentinel -1). Same semantics as
+             *     `Quota.usage_pct`; duplicated here so the dashboard can
+             *     subscribe to this endpoint alone.
+             * @example 31.2
+             */
+            usage_pct?: number | null;
+        };
+        /**
+         * @description One row from the `billing_events` table, projected to the
+         *     response shape. `payload_hash` (internal dedup key) is
+         *     intentionally omitted.
+         */
+        BillingEventTimelineEntry: {
+            /**
+             * @description Merchant event ID (Stripe evt_… etc). Stable per webhook delivery.
+             * @example evt_1Hxxxxxx
+             */
+            event_id?: string;
+            /**
+             * @description Normalized event class — merchant-agnostic.
+             * @example subscription.updated
+             * @enum {string}
+             */
+            event_type?: "checkout.completed" | "subscription.updated" | "subscription.deleted" | "payment.failed";
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the webhook arrived at the control plane.
+             * @example 2026-07-09T14:23:01Z
+             */
+            received_at?: string;
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the dispatcher finished applying the event. NULL = received but not yet processed.
+             * @example 2026-07-09T14:23:02Z
+             */
+            processed_at?: string | null;
+        };
+        /**
+         * @description One row in the `upgrade_options` array. Empty array when the
+         *     tenant is on a paid plan (the dashboard hides the upgrade
+         *     CTA — the tenant manages their plan via the billing portal
+         *     link instead).
+         */
+        UpgradeOption: {
+            /**
+             * @description Plan tier name (matches `PlanSpec.Name` in domain/plans.go).
+             * @example pro
+             */
+            plan?: string;
+            /**
+             * @description Per-month price in US dollars (not cents). 0 if free.
+             * @example 29
+             */
+            monthly_price_usd?: number;
+        };
+        /**
+         * @description Response envelope for GET /api/v1/usage (issue #421). Composes
+         *     the current-period counters, a windowed subscription-event
+         *     timeline, and per-tenant upgrade options + billing portal
+         *     URL. Cached for 10s in-process (stale-while-revalidate) so
+         *     dashboard refresh doesn't hammer the DB.
+         */
+        TenantUsage: {
+            /** @example t_abc123 */
+            tenant_id: string;
+            /**
+             * @description Customer-facing billing status. `active` covers both
+             *     healthy subscriptions and the no-subscription-row case
+             *     (free-tier tenants that haven't started checkout).
+             *     `action_required` covers `past_due` and `canceled`
+             *     subscriptions — the dashboard surfaces a banner and
+             *     surfaces the billing portal link.
+             * @example active
+             * @enum {string}
+             */
+            billing_status: "active" | "action_required";
+            current_period: components["schemas"]["CurrentPeriodUsage"];
+            /**
+             * @description Subscription lifecycle events received in the requested
+             *     `[from, to]` window, ordered by `received_at` DESC.
+             *     Capped at the `limit` query param (default 50, max 200).
+             */
+            events: components["schemas"]["BillingEventTimelineEntry"][];
+            /**
+             * Format: date-time
+             * @description Echoed start of the requested window (defaults to now-30d).
+             * @example 2026-06-10T00:00:00Z
+             */
+            from: string;
+            /**
+             * Format: date-time
+             * @description Echoed end of the requested window (defaults to now).
+             * @example 2026-07-10T00:00:00Z
+             */
+            to: string;
+            /**
+             * @description Opaque cursor for fetching the next page of events.
+             *     Reserved for future pagination — issue #421 returns
+             *     single-page reads (capped at the `limit` query param).
+             * @example null
+             */
+            next_offset?: string | null;
+            /**
+             * @description Paid tiers the tenant can upgrade to. Empty when the
+             *     tenant is already on a paid plan.
+             */
+            upgrade_options: components["schemas"]["UpgradeOption"][];
+            /**
+             * Format: uri
+             * @description Hosted billing portal URL (Stripe Customer Portal today).
+             *     Omitted when the tenant has no Stripe customer row
+             *     (e.g. a free-tier tenant that has never started checkout).
+             * @example https://billing.stripe.com/c/p/portal_abc
+             */
+            billing_portal_url?: string | null;
+        };
+        /**
+         * @description Every field is optional. Absent fields are not modified. Setting
+         *     `max_requests_per_month` / `max_outbound_mb` to a positive value
+         *     raises or lowers the cap; setting to -1 marks the cap as
+         *     unlimited. `clear_disabled_at: true` clears the free-tier
+         *     lockdown flag; `clear_grace: true` clears both
+         *     `quotas.quota_lock_grace_until` and
+         *     `tenants.overage_allowed_until`.
+         */
+        QuotaOverrideRequest: {
+            /**
+             * @description New request cap (-1 = unlimited).
+             * @example 5000000
+             */
+            max_requests_per_month?: number;
+            /**
+             * @description New outbound cap in MB (-1 = unlimited).
+             * @example 50000
+             */
+            max_outbound_mb?: number;
+            /**
+             * Format: date-time
+             * @description Timestamp until which paid-tenant over-cap deploys are accepted.
+             * @example 2026-07-20T00:00:00Z
+             */
+            set_overage_allowed_until?: string | null;
+            /**
+             * @description Clear the free-tier `tenants.disabled_at` lockdown flag.
+             * @example false
+             */
+            clear_disabled_at?: boolean;
+            /**
+             * @description Clear both `quota_lock_grace_until` and `overage_allowed_until`.
+             * @example false
+             */
+            clear_grace?: boolean;
         };
         MigrationReport: {
             /**
@@ -2088,6 +2538,33 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /**
+         * @description Billing boundary reached — request cannot be fulfilled without
+         *     payment action. Distinct from `QuotaExceeded` (429), which is
+         *     a per-resource throttle with a Retry-After hint. 402 indicates
+         *     a billing condition that will not resolve by waiting:
+         *     `subscription_past_due`, `subscription_canceled`,
+         *     `free_tier_exceeded`, `quota_lock_grace_active`,
+         *     `quota_will_be_exceeded`, or `memory_quota_will_be_exceeded`
+         *     (issue #44, part 2 — the tenant's aggregate active-deployment
+         *     memory would exceed `max_memory_mb`).
+         */
+        PaymentRequired: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "error": {
+                 *         "code": "PAYMENT_REQUIRED",
+                 *         "message": "memory quota will be exceeded by this deploy"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
         /** @description Internal server error. */
         InternalError: {
             headers: {
@@ -2384,7 +2861,14 @@ export interface operations {
     deploy: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Optional key that pins a retry to the original
+                 *     `deployment_id`. See the operation description for the
+                 *     full contract (replay, TTL, body-mismatch guard).
+                 */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Unique name of the app within the tenant. */
                 appName: string;
@@ -2398,6 +2882,20 @@ export interface operations {
             };
         };
         responses: {
+            /**
+             * @description Idempotent replay — the `Idempotency-Key` matched a row
+             *     in the replay cache. The response body is the original
+             *     `deployResponse`; the `id` field is the cached
+             *     `deployment_id`.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeployResponse"];
+                };
+            };
             /** @description Deployment created. */
             201: {
                 headers: {
@@ -2409,6 +2907,24 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            402: components["responses"]["PaymentRequired"];
+            /**
+             * @description The `Idempotency-Key` was reused against a request whose
+             *     artifact SHA-256 differs from the cached row's hash.
+             *     The client should pick a different key or accept that the
+             *     artifact has changed.
+             */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example idempotency key reused with a different request body */
+                        error?: string;
+                    };
+                };
+            };
             429: components["responses"]["QuotaExceeded"];
             500: components["responses"]["InternalError"];
         };
@@ -2497,6 +3013,39 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Returned when the caller's tenant row has
+             *     `disabled_at IS NOT NULL` at the moment the request reaches
+             *     the service layer (issue #440 disable-vs-activate race gate).
+             *     The response body is the standard error envelope with
+             *     `error.code = "CONFLICT"` and `error.message = "tenant is disabled"`.
+             *     The CLI / operator tooling can branch on `error.code` to
+             *     distinguish this from a generic infrastructure 500 — the
+             *     tenant will not auto-re-enable, retrying without operator
+             *     action is futile.
+             *
+             *     Scope note: this 409 is only reachable on the atomic path
+             *     (`?weight=100`, the default). Canary activation
+             *     (`?weight` < 100, which routes through traffic split) is
+             *     not gated by the disable check and so cannot surface this
+             *     response.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2528,6 +3077,29 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Promote delegates to the same
+             *     `activateDeployment` path as the activate endpoint, so the
+             *     issue #440 disable-vs-activate race gate fires identically
+             *     here. Body shape and `error.code` are identical to the
+             *     activate endpoint's 409.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2555,9 +3127,14 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             /**
-             * @description No prior `last_good_deployment_id` is recorded for this app,
-             *     so there is nothing to roll back to. Returned when the app
-             *     has only ever had one deployment.
+             * @description Either no `last_good_deployment_id` is recorded for this app
+             *     (only one deployment has ever been activated, so there is
+             *     nothing to roll back to), or the caller's tenant is
+             *     disabled (issue #440 disable-vs-activate race gate).
+             *     The message field distinguishes the two: `"no previous
+             *     deployment to roll back to"` for the first, `"tenant is
+             *     disabled"` for the second. The status code and
+             *     `error.code = "CONFLICT"` are the same in both cases.
              */
             409: {
                 headers: {
@@ -2568,20 +3145,6 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalError"];
-            /**
-             * @description The post-commit NATS publish of the task update failed for
-             *     every region the deployment is replicated to. The control
-             *     plane has already committed the new active deployment, but
-             *     workers may not converge until the publish is retried.
-             */
-            502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
-                };
-            };
         };
     };
     getActiveDeployment: {
@@ -3002,6 +3565,37 @@ export interface operations {
                     "application/json": components["schemas"]["Quota"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getUsage: {
+        parameters: {
+            query?: {
+                /** @description Start of the event window (RFC3339). Defaults to `to - 30d`. */
+                from?: string;
+                /** @description End of the event window (RFC3339). Defaults to now. Must be >= `from`. */
+                to?: string;
+                /** @description Maximum number of events to return. Clamped to 200. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage dashboard payload. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantUsage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
@@ -3503,6 +4097,61 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    adminQuotaOverride: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QuotaOverrideRequest"];
+            };
+        };
+        responses: {
+            /** @description Quota / lock state updated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Quota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    enableTenant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tenant re-enabled. The disabled_at column has been cleared. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];
         };
     };
