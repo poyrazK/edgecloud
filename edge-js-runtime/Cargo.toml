@@ -53,3 +53,13 @@ required-features = ["bench"]
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# `cargo +nightly udeps --workspace --all-targets` reports false
+# positives for `wit-bindgen` and `criterion` because both are only
+# reachable from wasm32 / `--features bench` modules — the host-target
+# udeps scan never sees their use sites. Both deps are real for the
+# wasm32-wasip2 cdylib that ships to workers. Issue #510 surfaced
+# this when the crate moved into the workspace.
+[package.metadata.cargo-udeps.ignore]
+normal = ["wit-bindgen"]
+development = ["criterion"]
