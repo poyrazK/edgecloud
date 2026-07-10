@@ -2762,6 +2762,12 @@ export interface operations {
              *     distinguish this from a generic infrastructure 500 — the
              *     tenant will not auto-re-enable, retrying without operator
              *     action is futile.
+             *
+             *     Scope note: this 409 is only reachable on the atomic path
+             *     (`?weight=100`, the default). Canary activation
+             *     (`?weight` < 100, which routes through traffic split) is
+             *     not gated by the disable check and so cannot surface this
+             *     response.
              */
             409: {
                 headers: {
