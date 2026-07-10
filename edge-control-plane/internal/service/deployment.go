@@ -1484,6 +1484,37 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440 follow-up: mirror the activate path's tenant
+		// FOR UPDATE lock into RollbackDeployment. Without this
+		// gate a concurrent SetDisabledAt could land between our
+		// active_deployments FOR UPDATE release and the post-tx
+		// publishSwap, and the worker would receive a TaskMessage
+		// for a tenant the operator just disabled. Same lock-order
+		// rationale as activate: tenant first, then active_deployments.
+		// Either we read disabled_at=NULL (disable then blocks on
+		// our tx and commits after us — publish proceeds) or the
+		// disable committed first (we read disabled_at set and
+		// abort with ErrTenantDisabled before touching the active
+		// row).
+		//
+		// The tenant row is reused below for the allowlist read
+		// (was previously re-fetched post-commit via s.tenantRepo
+		// — now we capture it inside the tx and skip the second
+		// round-trip, mirroring the activate path's pattern of
+		// capturing the allowlist-bearing fields pre-commit).
+		tenant, err := txTenant.GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("locking tenant: %w", err)
+		}
+		if tenant == nil {
+			return ErrTenantNotFound
+		}
+		if tenant.IsDisabled() {
+			return ErrTenantDisabled
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1578,10 +1609,10 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("listing env vars: %w", err)
 		}
 		envs = envsList
-		tenant, err = s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
-		if err != nil || tenant == nil {
-			return fmt.Errorf("getting tenant: %w", err)
-		}
+		// `tenant` was already fetched and validated by the FOR
+		// UPDATE gate at the top of this closure (issue #440
+		// follow-up). Reusing it avoids a redundant SELECT against
+		// the same row we already hold the lock on.
 		quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
 		if err != nil {
 			return fmt.Errorf("getting quota: %w", err)
