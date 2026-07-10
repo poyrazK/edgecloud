@@ -34,40 +34,134 @@ fn js_component_path() -> PathBuf {
     PathBuf::from("../samples/hello-js/target/javy/hello-js.wasm")
 }
 
+/// Repo root: `edge-runtime`'s `Cargo.toml` parent dir.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("edge-runtime has a parent (the repo root)")
+        .to_path_buf()
+}
+
+/// The committed WASI Preview 1 reactor adapter (issue #423). Located
+/// at `<repo>/edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`;
+/// byte-identical to the wasmtime `v45.0.3` release asset; SHA-256
+/// verified by the `rust-js-build` CI job against the sidecar at
+/// `edge-cli/adapters/SHA256SUMS`.
+fn vendored_wasi_adapter_path() -> PathBuf {
+    repo_root()
+        .join("edge-cli")
+        .join("adapters")
+        .join("wasi_snapshot_preview1.reactor.wasm")
+}
+
+/// The cargo target dir the repo's `.cargo/config.toml` configures:
+/// `build.target-dir = "../target-cache/edgecloud"` (relative to the
+/// CWD at cargo-invocation time, which here is `edge-js-runtime/`, so
+/// the resolved path is `<repo>/target-cache/edgecloud/`). Honors an
+/// explicit `$CARGO_TARGET_DIR` override, then the committed config
+/// target, then legacy `$HOME/.cache/edgecloud-cargo` (kept for dev
+/// machines with an older unsynced config).
+fn edgecloud_target_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir);
+    }
+    let configured = repo_root().join("target-cache").join("edgecloud");
+    if configured.exists() {
+        return configured;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(format!("{home}/.cache/edgecloud-cargo"))
+}
+
+/// Locate the WASI Preview 1 reactor adapter. Three sources in
+/// priority order (mirror of `edge-cli::resolve_wasi_adapter`, kept as
+/// a local copy so this test crate doesn't need a dep on
+/// `edge-cli`):
+///
+/// 1. `$EDGE_JS_WASI_ADAPTER` env override (existing).
+/// 2. Vendored adapter at `vendored_wasi_adapter_path()` — canonical,
+///    SHA-256-checked by CI.
+/// 3. Cargo registry cache glob (`wasi-preview1-component-adapter-provider-*`),
+///    retained as a fallback for developers with the crate cached
+///    locally from another project.
+fn resolve_wasi_adapter_for_test() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("EDGE_JS_WASI_ADAPTER") {
+        let path = PathBuf::from(&p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let vendored = vendored_wasi_adapter_path();
+    if vendored.exists() {
+        return Some(vendored);
+    }
+    let cargo_home = match std::env::var("CARGO_HOME") {
+        Ok(s) => s,
+        Err(_) => match std::env::var("HOME") {
+            Ok(h) => format!("{h}/.cargo"),
+            Err(_) => return None,
+        },
+    };
+    let registry = PathBuf::from(&cargo_home).join("registry").join("src");
+    let entries = std::fs::read_dir(&registry).ok()?;
+    for entry in entries.flatten() {
+        let subs = std::fs::read_dir(entry.path()).ok()?;
+        for sub in subs.flatten() {
+            if sub
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wasi-preview1-component-adapter-provider-")
+            {
+                let candidate = sub
+                    .path()
+                    .join("artefacts")
+                    .join("wasi_snapshot_preview1.reactor.wasm");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the QuickJS-built `edge_js_runtime` artifact.
 ///
-/// The `cargo build --target wasm32-wasip2` step produces a complete
-/// WASI Preview 2 component directly — the `wasm32-wasip2` cargo
-/// target emits the component-model metadata natively (no
-/// `--adapt` / `wasi-preview1` reactor wrap needed). The artifact
-/// lands at:
+/// The `cargo build --target wasm32-wasip1` step produces a **core
+/// wasm module**, not a component — the host linker rejects it with
+/// `failed to parse WebAssembly module with a component parser`. The
+/// component-wrapped form is produced by a follow-up
+/// `wasm-tools component new --adapt <adapter>`:
 ///
 /// ```bash
 /// # CI / local pre-step:
 /// cargo build --manifest-path edge-js-runtime/Cargo.toml \
-///     --target wasm32-wasip2 --release
-/// # → $CARGO_TARGET_DIR/wasm32-wasip2/release/edge_js_runtime.wasm
+///     --target wasm32-wasip1 --release
+/// wasm-tools component new \
+///     <edgecloud_target_dir>/wasm32-wasip1/release/edge_js_runtime.wasm \
+///     --adapt edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm \
+///     -o <edgecloud_target_dir>/wasm32-wasip1/release/edge_js_runtime.component.wasm
 /// ```
 ///
-/// Overrides via `EDGE_JS_RUNTIME_WASM` skip this resolution and
-/// point directly at a specific file (used by the CI job that
-/// copies the artifact to a stable path before invoking cargo
-/// test).
+/// `edgecloud_target_dir()` resolves the cargo target the same way
+/// `edge build --lang=js` does (issue #423): `$CARGO_TARGET_DIR` →
+/// `<repo>/target-cache/edgecloud/` → legacy `$HOME/.cache/edgecloud-cargo/`.
+///
+/// We prefer the `.component.wasm` form when present, fall back to
+/// `.wasm` for ad-hoc invocations, and let the caller produce a
+/// diagnostic if neither exists. Overrides via `EDGE_JS_RUNTIME_WASM`
+/// skip this resolution and point directly at a specific file.
 fn edge_js_runtime_wasm_path() -> PathBuf {
     if let Ok(p) = std::env::var("EDGE_JS_RUNTIME_WASM") {
         return PathBuf::from(p);
     }
-    let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-        // Fall back to the shared `~/.cache/edgecloud-cargo` target
-        // wired by `.cargo/config.toml`. Use the user's home dir when
-        // `$HOME` is unset (CI runners typically set it, but be
-        // defensive).
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{home}/.cache/edgecloud-cargo")
-    });
-    PathBuf::from(format!(
-        "{target}/wasm32-wasip2/release/deps/edge_js_runtime.wasm"
-    ))
+    let target = edgecloud_target_dir();
+    let base = format!("{}/wasm32-wasip1/release/edge_js_runtime", target.display());
+    let component = PathBuf::from(format!("{base}.component.wasm"));
+    if component.exists() {
+        return component;
+    }
+    PathBuf::from(format!("{base}.wasm"))
 }
 
 fn runtime_state() -> RuntimeState {
@@ -147,8 +241,9 @@ async fn edge_js_runtime_instantiates_on_host() {
              \n\
              cargo build --manifest-path edge-js-runtime/Cargo.toml --target wasm32-wasip2 --release\n\
              \n\
-             Then set EDGE_JS_RUNTIME_WASM to the path, \
-             or place it at ${{CARGO_TARGET_DIR:-$HOME/.cache/edgecloud-cargo}}/wasm32-wasip2/release/edge_js_runtime.wasm.",
+             <adapter.wasm> defaults to the vendored file at edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm.\n\
+             Then set EDGE_JS_RUNTIME_WASM to the .component.wasm path, \
+             or place it at ${{CARGO_TARGET_DIR:-<repo>/target-cache/edgecloud}}/wasm32-wasip1/release/edge_js_runtime.component.wasm.",
             path.display()
         );
         return;
@@ -408,12 +503,12 @@ async fn extract_response_picks_content_type() {
     /// is keyed by source path (so two tests using different
     /// fixtures don't clobber each other).
     fn artifact_path() -> PathBuf {
-        let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.cache/edgecloud-cargo")
-        });
+        let target = edgecloud_target_dir();
         let stamp = fixture_path().to_string_lossy().replace('/', "_");
-        PathBuf::from(format!("{target}/wasm32-wasip2/issue428_{stamp}.wasm"))
+        PathBuf::from(format!(
+            "{}/wasm32-wasip1/issue428_{stamp}.component.wasm",
+            target.display()
+        ))
     }
 
     /// Build (or reuse) the wasm component. Build steps:
@@ -448,11 +543,7 @@ async fn extract_response_picks_content_type() {
             .expect("edge-runtime has a parent")
             .join("edge-js-runtime");
 
-        let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{home}/.cache/edgecloud-cargo")
-        });
-        let target_dir = PathBuf::from(target_dir);
+        let target_dir = edgecloud_target_dir();
 
         // Step 1: cargo build for wasm32-wasip2.
         let cargo_status = Command::new("cargo")
@@ -466,32 +557,51 @@ async fn extract_response_picks_content_type() {
             return None;
         }
 
-        // The wasip2 cargo output IS the component. Walk
-        // `<target>/wasm32-wasip2/release/**/edge_js_runtime.wasm`
-        // and pick the first match — cargo emits cdylib artifacts
-        // under `<triple>/release/deps/` for crates with
-        // `[lib] crate-type = ["cdylib", "rlib"]`, but a future
-        // cargo layout tweak should not turn into a SKIP. Stage
-        // the discovered path to the artifact location so subsequent
-        // test runs reuse the same artifact (the if-exists check
-        // at the top of this fn).
-        let component = match find_runtime_wasm(&target_dir) {
+        let core = target_dir
+            .join("wasm32-wasip1")
+            .join("release")
+            .join("edge_js_runtime.wasm");
+        if !core.exists() {
+            eprintln!("SKIPPED: core wasm missing after cargo build");
+            return None;
+        }
+
+        // Step 2: locate adapter (priority: env override → vendored
+        // at edge-cli/adapters/ → cargo registry glob; see
+        // `resolve_wasi_adapter_for_test` above and
+        // `edge-cli/src/commands/build.rs::resolve_wasi_adapter` for
+        // the canonical priority order. Issue #423: vendored is the
+        // fresh-clone-safe source; the registry glob is a dev-machine
+        // fallback only.)
+        let adapter = match resolve_wasi_adapter_for_test() {
             Some(p) => p,
             None => {
-                eprintln!("SKIPPED: component wasm missing after cargo build");
+                eprintln!(
+                    "SKIPPED: wasi-preview1 adapter not found — checked $EDGE_JS_WASI_ADAPTER, \
+                     the vendored path at {}, and the cargo registry. \
+                     Run `cd edge-cli/adapters && sha256sum -c SHA256SUMS` \
+                     to verify the vendored file is intact.",
+                    vendored_wasi_adapter_path().display()
+                );
                 return None;
             }
         };
 
-        if let Some(parent) = artifact.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        if let Err(e) = std::fs::copy(&component, &artifact) {
-            eprintln!(
-                "SKIPPED: failed to stage {} -> {}: {e}",
-                component.display(),
-                artifact.display()
-            );
+        // Step 3: wrap core → component via `wasm-tools component new`.
+        let wrap_status = Command::new("wasm-tools")
+            .args([
+                "component",
+                "new",
+                &core.to_string_lossy(),
+                "--adapt",
+                &adapter.to_string_lossy(),
+                "-o",
+                &artifact.to_string_lossy(),
+            ])
+            .status()
+            .expect("spawn wasm-tools");
+        if !wrap_status.success() {
+            eprintln!("SKIPPED: wasm-tools wrap failed");
             return None;
         }
         Some(artifact)
@@ -612,6 +722,11 @@ async fn extract_response_picks_content_type() {
 /// kept as a local copy here because integration tests can't pull
 /// private items from the CLI crate (it's an
 /// `assert_cmd::cargo_bin!("edge")`-driven binary, not a library).
+///
+/// Dormant under the post-#423 wasip1 path (cargo emits a flat
+/// `<triple>/release/<name>.wasm`, no glob walk needed); the wasip2
+/// migration will pick this helper back up.
+#[allow(dead_code)]
 fn find_runtime_wasm(base: &std::path::Path) -> Option<std::path::PathBuf> {
     let release = base.join("wasm32-wasip2").join("release");
     let name = "edge_js_runtime.wasm";
