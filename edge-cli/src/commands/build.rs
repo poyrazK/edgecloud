@@ -309,6 +309,17 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip1", "--release"])
         .current_dir(&runtime_dir)
+        // Pin the target-dir to <runtime_dir>/target so the artifact
+        // is in a known place. The repo's `.cargo/config.toml:37`
+        // would otherwise set `../target-cache/edgecloud` (relative
+        // to the config file's dir), but `edge-js-runtime` declares
+        // `[workspace]` (a separate workspace root), so cargo's
+        // inheritance of the parent's `.cargo/config.toml` is
+        // ambiguous across Cargo versions and platforms. Pinning
+        // here removes the ambiguity; the artifact lands at
+        // `<runtime_dir>/target/wasm32-wasip1/release/edge_js_runtime.wasm`,
+        // which is exactly probe (4) in `resolve_runtime_core_wasm`.
+        .env("CARGO_TARGET_DIR", runtime_dir.join("target"))
         .env("EDGE_JS_BUNDLE", bundle_path.canonicalize()?)
         .env("CARGO_TARGET_DIR", &target_dir)
         .spawn()?
@@ -321,9 +332,9 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // 4. Componentize with wasm-tools
     //
     // The runtime's `cargo build --target wasm32-wasip1 --release`
-    // above explicitly pins `CARGO_TARGET_DIR` to `<runtime_dir>/target`
-    // so the artifact is at a known location (probe (4) in
-    // `resolve_runtime_core_wasm`). The shared
+    // above explicitly pins `CARGO_TARGET_DIR` to
+    // `<runtime_dir>/target` so the artifact is at a known location
+    // (probe (4) in `resolve_runtime_core_wasm`). The shared
     // `build.target-dir = "../target-cache/edgecloud"` in
     // `.cargo/config.toml:37` is overridden by the explicit env var.
     let (core_wasm, adapter) = resolve_js_build_artifacts(&runtime_dir)?;
