@@ -133,6 +133,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "1"
+      # CARGO_HOME defaults to $HOME/.cargo on GitHub-hosted runners
+      # but is unset in the env map, so cargo install --root "$CARGO_HOME"
+      # and the Expose CLI tools on PATH step would otherwise expand to
+      # --root "" and append /bin. Set it explicitly at job scope so
+      # edge-cli + wasm-tools land in a known location; the build step
+      # below overrides CARGO_HOME with a fresh tmpdir to prove the
+      # vendored adapter is genuinely canonical (not the registry).
+      CARGO_HOME: $HOME/.cargo
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
