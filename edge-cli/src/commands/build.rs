@@ -290,11 +290,28 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // 3. Build the JS runtime crate with the bundled JS embedded.
     let runtime_dir = resolve_runtime_dir()?;
 
+    // The runtime crate (`edge-js-runtime/Cargo.toml`) declares its own
+    // `[workspace]` root, so the parent monorepo's `.cargo/config.toml`
+    // — which pins `build.target-dir` to a shared location — is NOT
+    // inherited by this cargo invocation. Pin `CARGO_TARGET_DIR`
+    // explicitly so the inner build writes to the same location the
+    // resolver below probes first (`$CARGO_TARGET_DIR/...`, then the
+    // conventional `~/.cache/edgecloud-cargo/...` fallback, then the
+    // per-crate default). Without this, the build succeeds but the
+    // artifact lands at `edge-js-runtime/target/...` and the resolver
+    // can't find it.
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.cache/edgecloud-cargo"))
+            .unwrap_or_else(|_| "target".to_string())
+    });
+
     println!("  Compiling JS runtime...");
     let status = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip1", "--release"])
         .current_dir(&runtime_dir)
         .env("EDGE_JS_BUNDLE", bundle_path.canonicalize()?)
+        .env("CARGO_TARGET_DIR", &target_dir)
         .spawn()?
         .wait()?;
 
@@ -305,12 +322,15 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     // 4. Componentize with wasm-tools
     //
     // The runtime's `cargo build --target wasm32-wasip1 --release`
-    // honors `CARGO_TARGET_DIR` (and the repo's `.cargo/config.toml`
-    // sets it to `$HOME/.cache/edgecloud-cargo` for shared builds
-    // across worktrees). Don't hardcode `<runtime_dir>/target/...`
-    // — that's the default only when no `CARGO_TARGET_DIR` is set;
-    // in the dev loop the artifact lives under
-    // `$CARGO_TARGET_DIR/wasm32-wasip1/release/`.
+    // honors `CARGO_TARGET_DIR` — set explicitly above to
+    // `$HOME/.cache/edgecloud-cargo` when the env is unset (the
+    // conventional shared cache location, also pinned by the parent
+    // monorepo's `.cargo/config.toml` for its own workspace members;
+    // the runtime crate is its own `[workspace]` root so the config
+    // is not inherited). The resolver below probes that path first;
+    // without the explicit `CARGO_TARGET_DIR` on the inner invocation
+    // the artifact would land at `edge-js-runtime/target/...` and
+    // the resolver would have to fall back to the per-crate default.
     let core_wasm = resolve_runtime_core_wasm(&runtime_dir)?;
     let adapter = resolve_wasi_adapter()?;
 
@@ -361,13 +381,15 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
 /// Resolve the on-disk path of the wasm32-wasip1 core module that
 /// `cargo build` (above) produced. Probes three locations in order:
 ///
-/// 1. `$CARGO_TARGET_DIR/wasm32-wasip1/release/...` — set explicitly
-///    by the parent (rare for a CLI invocation).
+/// 1. `$CARGO_TARGET_DIR/wasm32-wasip1/release/...` — when set
+///    explicitly in the environment (overrides everything).
 /// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip1/release/...` —
-///    the shared target dir pinned by the repo's
-///    `.cargo/config.toml` (`build.target-dir`).
+///    the conventional shared cache location. The inner cargo build
+///    in step 3 explicitly pins `CARGO_TARGET_DIR` to this path when
+///    unset, so this is the common-case probe on a developer box
+///    and on CI runners.
 /// 3. `<runtime_dir>/target/wasm32-wasip1/release/...` — the
-///    per-crate default when no `CARGO_TARGET_DIR` is set.
+///    per-crate default when no `CARGO_TARGET_DIR` is set anywhere.
 ///
 /// The repo's `.cargo/config.toml` is *not* read by the child
 /// process directly — `build.target-dir` is a cargo-internal
