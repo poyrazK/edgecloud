@@ -1,0 +1,50 @@
+[package]
+name = "edge-js-runtime-long"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "edgeCloud long-running JS runtime — QuickJS + edge:cloud WIT bindings for the `edge-runtime` (long-running) world. Issue #426."
+
+# Isolated workspace: parallel to `edge-js-runtime`'s workspace block.
+# Without this, cargo would walk up to the parent edgeCloud workspace
+# and try to resolve `edge-js-runtime-long` against the host repo's
+# members (edge-runtime, edge-cli, edge-worker, …). Those are host-only
+# crates that can't be cross-compiled to wasm32-wasip1.
+[workspace]
+
+[lib]
+# rlib only. The cdylib shape (a self-contained wasm component
+# running QuickJS in-process) is produced by the shim
+# (`samples/hello-js-ws/`, or any future `edge init --world=edge-runtime`
+# scaffold). The shim is what calls `wit_bindgen::generate!` to
+# produce its own import surface; this crate just supplies the
+# per-namespace registrars + `compile_user_bundle` + `USER_BYTECODE`
+# once, shared by every shim.
+#
+# Why rlib and not cdylib: a cdylib with a `start` symbol can't
+# coexist with another cdylib that also exports `start` (link
+# error: "Linking globals named 'start': symbol multiply defined").
+# The shim MUST own its own `start` (it's the canonical world
+# entry point the worker calls). If this crate also produced a
+# cdylib, both cdylibs would land in the same `wasm32-wasip1` link
+# and clash. rlib keeps the bindgen-generated exports and the
+# `register_all` helpers accessible to the shim without polluting
+# the final link with conflicting `start` symbols.
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Same wit-bindgen major as `edge-js-runtime/Cargo.toml` and
+# `edge-worker/tests/fixtures/handler/Cargo.toml`. wasmtime 45.0.3 (the
+# runtime version this repo ships) expects a wasi:http@0.2.1 component,
+# which wit-bindgen 0.45 emits.
+wit-bindgen = "0.45"
+# rquickjs 0.9 with the bindgen feature, matching `edge-js-runtime`.
+rquickjs = { version = "0.9.0", features = ["bindgen"] }
+# `OnceCell` for the cached bytecode blob (issue #425 reuse).
+once_cell = "1.19"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
