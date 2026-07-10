@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::nats::Nats;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -91,7 +91,8 @@ pub fn should_skip_integration_tests() -> bool {
 /// especially in CI where container I/O can be reordered.
 pub async fn start_nats() -> (ContainerAsync<Nats>, String) {
     let cmd = testcontainers_modules::nats::NatsServerCmd::default().with_jetstream();
-    let container: ContainerAsync<Nats> = ContainerRequest::from(Nats::default().with_cmd(&cmd))
+    let container: ContainerAsync<Nats> = Nats::default()
+        .with_cmd(&cmd)
         .with_startup_timeout(Duration::from_secs(30))
         .with_ready_conditions(vec![WaitFor::Duration {
             length: Duration::from_secs(5),
