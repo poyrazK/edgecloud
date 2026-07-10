@@ -513,6 +513,10 @@ jobs:
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       # Path filter: only run the smoke job when the change touches
       # the JS surface. The `filter` step below evaluates the changed
       # file list against these globs and exports `changes == 'true'`
@@ -521,6 +525,15 @@ jobs:
       # workflow file itself (`**.yml`) so edits here re-trigger the
       # smoke job — otherwise a future fix to this file would be
       # unverified.
+      #
+      # Must run AFTER `actions/checkout` — on `push` events the
+      # dorny action's internal `git branch --show-current` runs in
+      # `${{ github.workspace }}`, which is an empty dir until
+      # checkout populates it. On PR events this is masked because
+      # the workspace is pre-checked by the Actions runtime, but on
+      # `push` (e.g., a main merge) the job fails with rc=128
+      # `fatal: not a git repository` (observed on 2026-07-10
+      # post-PR-#498).
       - uses: dorny/paths-filter@v3
         id: changes
         with:
@@ -532,9 +545,6 @@ jobs:
               - 'wit/**'
               - 'samples/hello-js/**'
               - '.github/workflows/ci.yml'
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       # Skip the rest of the job when the diff doesn't touch JS.
       # `if:` on every subsequent step would be more verbose; the
