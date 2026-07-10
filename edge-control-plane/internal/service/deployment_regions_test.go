@@ -262,7 +262,7 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	expectTenantForUpdateIssue440(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
@@ -393,7 +393,7 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	expectTenantForUpdateIssue440(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
@@ -460,7 +460,7 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	expectTenantForUpdateIssue440(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
@@ -519,7 +519,7 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	expectTenantForUpdateIssue440(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
