@@ -78,6 +78,14 @@ func (p *RecordingPublisher) PublishFullSync(region string, msg *nats.TaskMessag
 
 func (p *RecordingPublisher) EnsureStream(nats.StreamConfig) error { return nil }
 
+// PublishPurge is the issue #569 entry point — recorded for parity with
+// PublishTaskUpdate / PublishFullSync. fan-out tests don't exercise it
+// (ActivateDeployment never calls it), but RecordingPublisher must still
+// satisfy nats.Publisher.
+func (p *RecordingPublisher) PublishPurge(region string, msg *nats.PurgePayload) error {
+	return nil
+}
+
 // activateSvcForTest wires a DeploymentService with sqlmock-backed
 // repositories and the given publisher. `defaultRegion` is what
 // ActivateDeployment should fall back to when the deployment row has

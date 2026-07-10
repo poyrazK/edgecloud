@@ -1565,6 +1565,9 @@ async fn test_fetch_sync_happy_path_inner() -> anyhow::Result<()> {
         TaskMessage::TaskUpdate { .. } => {
             panic!("fetch_sync returned TaskUpdate; expected FullSync")
         }
+        TaskMessage::TaskPurge { .. } => {
+            panic!("fetch_sync returned TaskPurge; expected FullSync")
+        }
     }
     Ok(())
 }

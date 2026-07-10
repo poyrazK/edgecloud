@@ -25,8 +25,26 @@ type Publisher interface {
 	// and on worker registration so cold-start is instant.
 	PublishFullSync(region string, msg *TaskMessage) error
 	PublishHeartbeat(region string, msg *HeartbeatMessage) error
+	// PublishPurge issues a per-tenant (and optionally per-app) tombstone
+	// that instructs the worker to remove its KV / cache / scheduler
+	// persistent state (issue #569). The signal is explicit — stop /
+	// crash / rebalance must NOT delete state — so it travels as a
+	// distinct wire variant (`task_purge`) on the same
+	// edgecloud.tasks.<region> subject. The OutboxDrainer
+	// (internal/service/outbox_drainer.go) dispatches this method when
+	// the outbox row carries Kind="task_purge".
+	PublishPurge(region string, msg *PurgePayload) error
 	EnsureStream(cfg StreamConfig) error
 }
+
+// TaskMessageKind names the wire `type` discriminator. Centralized as
+// constants so the publisher, the OutboxRepository, and the OutboxDrainer
+// share one source of truth (issue #569).
+const (
+	TaskMessageKindTaskUpdate = "task_update"
+	TaskMessageKindFullSync   = "full_sync"
+	TaskMessageKindTaskPurge  = "task_purge"
+)
 
 // TaskMessage is published to edgecloud.tasks.<region> when app set changes.
 type TaskMessage struct {
@@ -35,6 +53,43 @@ type TaskMessage struct {
 	TenantID  string               `json:"tenant_id"`
 	Apps      map[string]AppConfig `json:"apps"`
 }
+
+// PurgePayload is the issue #569 tombstone. Carried on the same
+// edgecloud.tasks.<region> subject as TaskMessage but with a
+// distinctly-shaped payload (no `apps` field — the worker's purge
+// handler derives the set of apps to stop from its own in-memory
+// state at receipt time). Subject reuse avoids a new NATS
+// subscription; payload shape divergence keeps the worker's
+// deserialize-or-error invariant (see unknown_type_field_fails_to_deserialize
+// in edge-worker/src/messages.rs) safe.
+//
+// AppName semantics:
+//   - non-empty: per-app purge — stop `AppName` if running, then purge
+//     the per-tenant dirs. Idempotent if the app isn't running.
+//   - empty ("" or omitted via omitempty): tenant-wide — the worker
+//     enumerates its current apps for TenantID and stops each before
+//     purging. Today the CP enqueues per-app rows from
+//     `AppService.Delete` and from `TenantService.DeleteTenant` (one
+//     row per app); the empty form is kept for forward-compat with
+//     a future "single tenant-wide publish" optimization.
+//
+// Reason is an audit-only discriminator; the worker logs it but
+// doesn't change behavior between the two cases.
+type PurgePayload struct {
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	TenantID  string    `json:"tenant_id"`
+	AppName   string    `json:"app_name,omitempty"`
+	Reason    string    `json:"reason"`
+}
+
+// Purge reason constants (issue #569). Strings, not typed enums, to
+// match the wire format and the worker-side `PurgeReason`
+// (`#[serde(rename_all = "snake_case")]` in edge-worker/src/messages.rs).
+const (
+	PurgeReasonAppDeleted       = "app_deleted"
+	PurgeReasonTenantOffboarded = "tenant_offboarded"
+)
 
 // AppConfig describes an app's deployment configuration.
 type AppConfig struct {
@@ -259,6 +314,17 @@ func (p *MockPublisher) PublishHeartbeat(region string, msg *HeartbeatMessage) e
 	return nil
 }
 
+// PublishPurge emits a task_purge tombstone. The MockPublisher prints
+// the marshaled payload rather than going through applyTypeOverride —
+// the purge payload already carries `type:"task_purge"` because the
+// caller set it when building PurgePayload, and applyTypeOverride
+// only operates on *TaskMessage (which has no purge equivalent).
+func (p *MockPublisher) PublishPurge(region string, msg *PurgePayload) error {
+	data, _ := json.Marshal(msg)
+	fmt.Printf("[NATS MOCK] Publish to edgecloud.tasks.%s (purge): %s\n", region, string(data))
+	return nil
+}
+
 func (p *MockPublisher) EnsureStream(_ StreamConfig) error {
 	return nil
 }
@@ -369,6 +435,30 @@ func (p *NATSPublisher) PublishTaskUpdate(region string, msg *TaskMessage) error
 func (p *NATSPublisher) PublishFullSync(region string, msg *TaskMessage) error {
 	subject := "edgecloud.tasks." + region
 	return p.publishTaskMessage(subject, msg, "full_sync")
+}
+
+// PublishPurge issues a task_purge tombstone to edgecloud.tasks.<region>
+// (issue #569). The wire shape is a PurgePayload (NOT a TaskMessage)
+// because the worker's purge handler doesn't carry per-app config — it
+// derives the apps-to-stop set from its own in-memory state. Subject
+// reuse (vs a new edgecloud.purges.<region>) avoids adding a NATS
+// subscription the worker would need to bind.
+//
+// We deliberately bypass applyTypeOverride here — that helper only
+// knows how to snapshot a *TaskMessage and force its `type` field, and
+// PurgePayload is a different shape. The caller (OutboxDrainer) sets
+// PurgePayload.Type to TaskMessageKindTaskPurge at construction time,
+// so the marshaled payload already carries the right discriminator.
+func (p *NATSPublisher) PublishPurge(region string, msg *PurgePayload) error {
+	subject := "edgecloud.tasks." + region
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshaling purge payload: %w", err)
+	}
+	if _, err := p.js.Publish(subject, data); err != nil {
+		return fmt.Errorf("publishing purge to %s: %w", subject, err)
+	}
+	return nil
 }
 
 // publishTaskMessage marshals and publishes a TaskMessage, overriding the

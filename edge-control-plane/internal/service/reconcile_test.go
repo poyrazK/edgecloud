@@ -176,6 +176,7 @@ func (p *capturingPublisher) PublishFullSync(region string, msg *nats.TaskMessag
 
 func (p *capturingPublisher) PublishTaskUpdate(string, *nats.TaskMessage) error     { return nil }
 func (p *capturingPublisher) PublishHeartbeat(string, *nats.HeartbeatMessage) error { return nil }
+func (p *capturingPublisher) PublishPurge(string, *nats.PurgePayload) error         { return nil }
 func (p *capturingPublisher) EnsureStream(nats.StreamConfig) error                  { return nil }
 
 func (p *capturingPublisher) callsByRegion() map[string]*nats.TaskMessage {
@@ -684,6 +685,14 @@ type errPublisher struct {
 }
 
 func (p *errPublisher) PublishFullSync(string, *nats.TaskMessage) error {
+	return errors.New("simulated NATS outage")
+}
+
+// PublishPurge is required for interface compliance with nats.Publisher
+// (issue #569). errPublisher only needs to fail PublishFullSync for the
+// reconcile test path; purge calls aren't exercised here, but we still
+// have to provide the method so the type satisfies the interface.
+func (p *errPublisher) PublishPurge(string, *nats.PurgePayload) error {
 	return errors.New("simulated NATS outage")
 }
 

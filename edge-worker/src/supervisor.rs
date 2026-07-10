@@ -969,6 +969,21 @@ impl Supervisor {
     /// in the desired set never causes us to stop another tenant's app
     /// that happens to share the same name.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
+        // Issue #569: `task_purge` tombstones are a distinct wire shape
+        // — no `apps` field, derived from the worker's in-memory state.
+        // We dispatch them to `handle_purge` (Commit 3) before the
+        // task_update / full_sync diff path. Today the supervisor
+        // doesn't implement handle_purge yet (Commit 3); wire Commit 1
+        // logs a placeholder so the build is green and the message is
+        // ack'd without rolling the diff state.
+        if let TaskMessage::TaskPurge { tenant_id, .. } = &msg {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                "task_purge received but handle_purge is not implemented yet (issue #569 commit 3)"
+            );
+            return Ok(());
+        }
+
         let (tenant_id, desired_apps) = match msg {
             TaskMessage::TaskUpdate {
                 tenant_id, apps, ..
@@ -976,6 +991,8 @@ impl Supervisor {
             TaskMessage::FullSync {
                 tenant_id, apps, ..
             } => (tenant_id, apps),
+            // Exhaustiveness: the `task_purge` arm was handled above.
+            TaskMessage::TaskPurge { .. } => unreachable!("task_purge handled above"),
         };
 
         // Snapshot this tenant's running apps.
