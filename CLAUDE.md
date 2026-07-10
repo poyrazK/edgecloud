@@ -380,6 +380,8 @@ Per-app, per-deployment:
 - `WorkerGC.Run` — evicts workers that haven't heartbeated in `WORKER_MAX_AGE` (default 15 min).
 - `AutoscaleSvc.Subscribe` — no-op when disabled.
 - `PreviewGC.Run` — issue #308. TTL'd preview deployment GC: every `PREVIEW_GC_INTERVAL` (default 1h), sweep deployments whose `preview_expires_at < NOW()`, delete their artifact blobs FIRST, then delete the rows. Mirror of `LogGC.Run`; same batched-delete + immediate-first-sweep shape.
+- `DeploymentGC.Run` — TTL'd deployment-row GC (older than `DEPLOYMENT_GC_MAX_AGE`, default 30 days; not preview deployments — those are `PreviewGC`).
+- `CacheRetrySweep.Run` — issue #501. Background sweep that re-attempts per-region artifact-cache pushes for deployments whose previous push landed in `regions_cache_failed`. Tick interval `cfg.CacheRetry.IntervalS` (env `REGION_CACHE_RETRY_INTERVAL`, default 5m). Per-region attempt cap `cfg.CacheRetry.MaxAttempts` (env `REGION_CACHE_RETRY_MAX_ATTEMPTS`, default 10): over-cap regions are routed to a `giveUp` partition (drop from `regions_cache_failed` with a WARN log). The per-region counter is reset on every activation (`publishSwap` calls `ResetRegionCacheRetryCount` inside the cache-state transaction), so the cap is per-deployment, not per-tenant-app-lifetime. Set `MaxAttempts<=0` to disable the cap entirely (escape hatch for environments that want unbounded retries).
 
 ### Secrets encryption (`edge-control-plane/internal/service/secrets.go`)
 

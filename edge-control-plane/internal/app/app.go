@@ -88,6 +88,16 @@ type App struct {
 	// logs. See internal/loophealth for the package contract. Related
 	// to issue #443.
 	loopHealth *loophealth.Tracker
+
+	// cacheRetryIntervalS is the cache-retry sweep's tick interval
+	// in seconds, captured from cfg.CacheRetry.IntervalS at
+	// construction time. Stored as a field so RunBackground
+	// doesn't need the original *config.Config after New returns
+	// (matches the "post-New wiring" pattern documented in the
+	// CacheRetrySweep doc — only the pusher and region map are
+	// late-bound getters, the interval is fixed for process
+	// lifetime). Issue #501.
+	cacheRetryIntervalS int
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -702,21 +712,29 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// the run loop and ordering invariants.
 		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore),
 		// Cache-retry sweep (issue #501). Re-attempts cache pushes
-		// that landed in regions_cache_failed. The two getters
-		// read the live pusher + regionArtifactCaches map on every
-		// tick so the sweep honors operator-set config at runtime
-		// (cmd/api/main.go calls SetCachePusher and
-		// SetRegionArtifactCaches AFTER app.New returns — the
-		// getter closures defer the read to the first sweep tick).
+		// that landed in regions_cache_failed. The three getters
+		// read the live pusher + regionArtifactCaches map +
+		// MaxAttempts on every tick so the sweep honors operator-
+		// set config at runtime (cmd/api/main.go calls
+		// SetCachePusher and SetRegionArtifactCaches AFTER app.New
+		// returns — the getter closures defer the read to the
+		// first sweep tick). MaxAttempts is read directly from
+		// the typed config because it's loaded once at startup
+		// (no post-New setter).
 		CacheRetrySweep: service.NewCacheRetrySweepService(
 			activeDeploymentRepo,
 			deploymentSvc.GetCachePusher,
 			deploymentSvc.GetRegionArtifactCaches,
+			func() int { return cfg.CacheRetry.MaxAttempts },
 		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
 		OutboxDrainer: outboxDrainer,
 		loopHealth:    loopHealth,
+
+		// Captured at construction; see the field doc for why we
+		// don't use a getter closure like the pusher / region map.
+		cacheRetryIntervalS: cfg.CacheRetry.IntervalS,
 	}
 }
 
@@ -808,7 +826,22 @@ func (a *App) RunBackground(ctx context.Context) {
 	// default 5m keeps a worst-case tick under the row cap; an
 	// operator who lowers the interval during an incident should
 	// expect ~interval/5m × default DB pressure.
-	cacheRetryInterval := parseDurationEnv("REGION_CACHE_RETRY_INTERVAL", 5*time.Minute)
+	// Use the typed config (issue #501 acceptance item: "config in
+	// internal/config/config.go"). The interval is integer seconds
+	// in the config (CacheRetry.IntervalS) — converted to a
+	// time.Duration for the Run signature. parseDurationEnv is
+	// intentionally NOT used here so the config struct is the
+	// single source of truth (callers in cmd/api/main.go can
+	// override via REGION_CACHE_RETRY_INTERVAL env var, which
+	// config.Load translates to CacheRetry.IntervalS).
+	//
+	// We capture the interval at construction (via the App's
+	// stored interval) so RunBackground doesn't need to read
+	// the config struct post-construction. The interval is
+	// fixed for the process lifetime — same as
+	// previewGCInterval / logGCInterval, which are also captured
+	// into locals at RunBackground time.
+	cacheRetryInterval := time.Duration(a.cacheRetryIntervalS) * time.Second
 	go a.CacheRetrySweep.Run(ctx, cacheRetryInterval)
 
 	// Outbox drainer (issue #42). The drainer is the sole owner of
