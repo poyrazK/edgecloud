@@ -427,11 +427,17 @@ func New(
 	// POST /api/internal/worker-token rate limiter (issue #491). It
 	// reads the request body's `tenant_id` JSON field without
 	// consuming the body so the handler's own decode still sees the
-	// full payload. A malformed or absent body returns "" — the
-	// handler will 400 and the limiter will see all such requests
-	// bucketed under a single (cheap) "" key, which is the desired
-	// behavior (malformed bodies are upstream noise, not a
-	// tenant-scoped signal).
+	// full payload.
+	//
+	// Fallback (PR #491 review): if the body is empty / malformed /
+	// missing tenant_id / >128 bytes, fall back to the worker_id
+	// from the JWT context instead of returning "". The
+	// RateLimiter.Middleware treats "" as "skip limiting" (see
+	// middleware/ratelimit.go:135-139), which would let a worker
+	// flood malformed bodies past the per-tenant bucket. Falling
+	// back to worker_id routes those requests into the per-worker
+	// bucket (10/5), which is tight enough to bound the blast while
+	// letting genuine malformed bodies through at a sensible rate.
 	//
 	// Body restoration is necessary because rate limiters run
 	// before the handler — without it, the handler's
@@ -439,21 +445,10 @@ func New(
 	// We use a buffered peek + TeeReader so the limiter's read does
 	// not steal the body from the downstream handler. The buffer is
 	// tiny (128 bytes is enough to span "tenant_id":"<value>" for
-	// any reasonable ID — anything longer falls through to "" but
-	// the handler still verifies length ≤ 64 chars upstream).
-	workerTokenTenantKey := func(r *http.Request) string {
-		var buf [128]byte
-		n, _ := io.ReadFull(io.LimitReader(r.Body, int64(len(buf))), buf[:])
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
-		var peek struct {
-			TenantID string `json:"tenant_id"`
-		}
-		if n == 0 {
-			return ""
-		}
-		_ = json.Unmarshal(buf[:n], &peek)
-		return peek.TenantID
-	}
+	// any reasonable ID — anything longer falls through to the
+	// worker_id fallback but the handler still verifies length
+	// ≤ 64 chars upstream).
+	workerTokenTenantKey := workerTokenTenantKeyFromBody
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -1149,4 +1144,44 @@ func newMeteringProvider(cfg config.BillingConfig) billing.MeteringProvider {
 		// "noop" or empty (no production gate — metering is opt-in).
 		return noop.NewMetering()
 	}
+
+// workerTokenTenantKeyFromBody is the package-level helper extracted
+// from the inline closure at the route mount (issue #491 + PR
+// review). It serves two roles:
+//
+//  1. Production use: bound to POST /api/internal/worker-token as
+//     the key-extractor for the per-tenant RateLimiter.
+//  2. Test use: exercised directly by
+//     TestWorkerTokenTenantKeyFromBody in app_test.go so the
+//     malformed-body / missing-field / oversize-body / nested-shape
+//     edge cases are pinned without standing up the full
+//     WorkerAuth + InternalHandler chain.
+//
+// Buffer size (128 bytes) covers `"tenant_id":"<value>"` for any
+// legal tenant_id (up to 64 chars + 16 chars of JSON syntax +
+// margin). Anything larger is truncated at the peek; the handler's
+// own validator rejects tenant_id > 64 chars upstream, so a
+// truncated peek that misses a >64-char value still falls through
+// to the worker_id fallback (which is the safe behavior).
+//
+// Fallback path: when the body peek cannot produce a tenant_id
+// (empty body / malformed JSON / missing field / oversize), we
+// return the worker_id from the JWT context. This routes
+// malformed-body floods into the per-worker (10/5) bucket instead
+// of the empty-key pass-through in RateLimiter.Middleware
+// (middleware/ratelimit.go:135-139).
+func workerTokenTenantKeyFromBody(r *http.Request) string {
+	var buf [128]byte
+	n, _ := io.ReadFull(io.LimitReader(r.Body, int64(len(buf))), buf[:])
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+	var peek struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if n == 0 {
+		return middleware.GetWorkerID(r.Context())
+	}
+	if err := json.Unmarshal(buf[:n], &peek); err != nil || peek.TenantID == "" {
+		return middleware.GetWorkerID(r.Context())
+	}
+	return peek.TenantID
 }
