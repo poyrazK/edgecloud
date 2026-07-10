@@ -99,6 +99,10 @@ func main() {
 		log.Printf("APP_REGION not set; skipping ingress service token mint (default-only mode)")
 	}
 
+	// ── Per-tenant worker-token TTL (issue #491) ──────────────────
+	log.Printf("worker-token mint: enabled at POST /api/internal/worker-token (TTL=%s, issuer=%q, active_kid=%q)",
+		cfg.JWT.WorkerTokenTTL, cfg.JWT.Issuer, cfg.JWT.ActiveKID)
+
 	// ── HTTP Server ───────────────────────────────────────────────
 	addr := fmt.Sprintf("%s:%d", cfg.App.Host, cfg.App.Port)
 	srv := &http.Server{Addr: addr, Handler: application.Handler}

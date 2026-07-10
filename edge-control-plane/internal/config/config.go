@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -185,8 +186,20 @@ type JWTConfig struct {
 	// When only Secret is set, ActiveKID defaults to "default".
 	ActiveKID string            `yaml:"active_kid"`
 	Keys      map[string]string `yaml:"keys"`
-	TTL       int               `yaml:"ttl_hours"`
-	Issuer    string            `yaml:"issuer"`
+	// TTL is integer hours. DEPRECATED — the field is dead in production
+	// (no caller reads it). Retained for backward compatibility with
+	// existing config files; a follow-up cleanup PR removes it.
+	TTL    int    `yaml:"ttl_hours"`
+	Issuer string `yaml:"issuer"`
+	// WorkerTokenTTL is the validity period for per-tenant worker tokens
+	// minted by POST /api/internal/worker-token (issues #491 + #492).
+	// Shorter than the legacy 24h operator-JWT TTL on purpose: a leaked
+	// worker credential must be useful for at most WorkerTokenTTL.
+	// Format: Go duration string (e.g. "15m", "1h"). Set via
+	// WORKER_TOKEN_TTL env var or jwt.worker_token_ttl in YAML.
+	// Default: 15m. A non-positive value (or unparseable string) fails
+	// startup — short TTLs are the migration's whole point.
+	WorkerTokenTTL time.Duration `yaml:"worker_token_ttl"`
 }
 
 // SecretsConfig configures envelope encryption with a keyring.
@@ -361,6 +374,18 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("JWT_ISSUER"); v != "" {
 		cfg.JWT.Issuer = v
+	}
+	// WORKER_TOKEN_TTL — issue #491. Per-tenant worker JWT TTL.
+	// Parsed as a Go duration string. Operators are warned by the
+	// validator below on a non-positive result; an unparseable string
+	// fails startup with a clear message so a typo (e.g. "15") doesn't
+	// silently fall back to the 24h operator JWT.
+	if v := os.Getenv("WORKER_TOKEN_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("WORKER_TOKEN_TTL must be a valid Go duration (e.g. \"15m\", \"1h\"): %w", err)
+		}
+		cfg.JWT.WorkerTokenTTL = d
 	}
 	if v := os.Getenv("CONTROL_PLANE_REGION"); v != "" {
 		cfg.Region = v
@@ -600,6 +625,19 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.JWT.TTL == 0 {
 		cfg.JWT.TTL = 24
+	}
+	// Default for per-tenant worker-token TTL (issue #491). 15m is
+	// short enough to bound the blast radius of a leaked credential
+	// (1 tenant × 15 min instead of 1 tenant × 24h) and long enough
+	// that a healthy worker mints ~once per tenant per tick rather
+	// than per request. A non-positive value is rejected here so a
+	// stray environment override like "WORKER_TOKEN_TTL=0" can't
+	// silently mint immortal tokens — fail-closed.
+	if cfg.JWT.WorkerTokenTTL == 0 {
+		cfg.JWT.WorkerTokenTTL = 15 * time.Minute
+	}
+	if cfg.JWT.WorkerTokenTTL <= 0 {
+		return nil, fmt.Errorf("jwt.worker_token_ttl must be a positive Go duration (got %s); per-tenant worker tokens may not be immortal", cfg.JWT.WorkerTokenTTL)
 	}
 
 	// Default for the control plane's own region. `"global"` matches the
