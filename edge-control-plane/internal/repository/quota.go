@@ -46,7 +46,7 @@ func (r *QuotaRepository) addColumn(ctx context.Context, tenantID string, delta 
 				ELSE quota_period_start
 			END
 		WHERE tenant_id = $1
-		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start, quota_lock_grace_until`, col, col)
+		RETURNING tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until`, col, col)
 	err := r.db.GetContext(ctx, &q, query, tenantID, delta)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -76,7 +76,7 @@ func (r *QuotaRepository) Create(ctx context.Context, q *domain.Quota) error {
 
 func (r *QuotaRepository) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	var q domain.Quota
-	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id = $1`
+	query := `SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id = $1`
 	err := r.db.GetContext(ctx, &q, query, tenantID)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -101,7 +101,45 @@ func (r *QuotaRepository) AddRequestCount(ctx context.Context, tenantID string, 
 	return r.addColumn(ctx, tenantID, int64(delta), "used_request_count")
 }
 
+// AddMemoryMB atomically accumulates a signed delta into used_memory_mb and
+// returns the updated quota row (issue #44, part 2). Positive delta =
+// activate / promote; negative delta = rollback. Unlike AddOutboundBytes /
+// AddRequestCount this counter is NOT month-bounded — the cap is
+// per-tenant-aggregate, not per-month, so the lazy-rollover CASE against
+// quota_period_start would be wrong. Implemented as a direct UPDATE
+// rather than routed through addColumn for the same reason.
+//
+// Caller MUST wrap via QuotaRepository.WithTx(tx). Calling the outer
+// repo opens a different connection and breaks atomicity — the counter
+// would commit before/after the active_deployments row mutation in the
+// caller's tx, leaving the counter ahead of the row set on tx abort.
+// This requirement is unenforced at the type level (Go has no way to
+// require it without a context key trick); the convention is documented
+// here and at every call site.
+func (r *QuotaRepository) AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error) {
+	var q domain.Quota
+	err := r.db.GetContext(ctx, &q, `
+		UPDATE quotas SET used_memory_mb = used_memory_mb + $2
+		WHERE tenant_id = $1
+		RETURNING tenant_id, max_deployments, max_apps, max_workers,
+		          max_memory_mb, max_outbound_mb, max_requests_per_month,
+		          used_outbound_bytes, used_request_count, used_memory_mb,
+		          quota_period_start, quota_lock_grace_until`,
+		tenantID, delta)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &q, err
+}
+
 func (r *QuotaRepository) Update(ctx context.Context, q *domain.Quota) error {
+	// Operator-driven update of the cap columns. The `used_*`
+	// counters are intentionally NOT in the SET clause: they are
+	// the platform's view of current consumption and must never be
+	// drift-corrected by an operator writing through this path.
+	// Use the dedicated AddOutboundBytes / AddRequestCount /
+	// AddMemoryMB paths (or, in an emergency, a hand-written
+	// UPDATE on the row) to nudge a counter — never this method.
 	query := `UPDATE quotas SET max_deployments = $2, max_apps = $3, max_workers = $4, max_memory_mb = $5, max_outbound_mb = $6, max_requests_per_month = $7 WHERE tenant_id = $1`
 	_, err := r.db.ExecContext(ctx, query, q.TenantID, q.MaxDeployments, q.MaxApps, q.MaxWorkers, q.MaxMemoryMB, q.MaxOutboundMB, q.MaxRequestsPerMonth)
 	return err
@@ -148,6 +186,39 @@ func (r *QuotaRepository) VerifyUnderCap(ctx context.Context, tenantID string, p
 		                  OR used_outbound_bytes + $3 <= max_outbound_mb)
 		RETURNING tenant_id`
 	err := r.db.GetContext(ctx, &tenant, query, tenantID, projectedRequests, projectedOutboundBytes)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// VerifyMemoryUnderCap is the deploy-time gate for the
+// MaxMemoryMB / aggregate-used_memory_mb cap (issue #44, part 2).
+// Returns true iff accepting a deploy whose per-app memory footprint is
+// perAppMemoryMB would not push the tenant over quota.MaxMemoryMB.
+// max_memory_mb < 0 is the unlimited sentinel (enterprise plan) and
+// short-circuits to TRUE; max_memory_mb == 0 / unset / admin-cleared
+// falls through (the caller computes the per-app hint via the same
+// buildPublishPayload ladder and picks up the default 256 fallback).
+//
+// Like VerifyUnderCap, mutates the row by +0 so a concurrent heartbeat
+// that bumps the counter can't slip in between our SELECT and our
+// UPDATE. A concurrent deploy that lands between our verify-return and
+// the activate-time increment may over-accept at the gate; the next
+// deploy catches the over-cap state. The request-time 402 at
+// edge-ingress is the user-facing backstop.
+func (r *QuotaRepository) VerifyMemoryUnderCap(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error) {
+	var tenant string
+	query := `
+		UPDATE quotas
+		SET used_memory_mb = used_memory_mb + 0
+		WHERE tenant_id = $1
+		  AND (max_memory_mb = -1 OR used_memory_mb + $2 <= max_memory_mb)
+		RETURNING tenant_id`
+	err := r.db.GetContext(ctx, &tenant, query, tenantID, perAppMemoryMB)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
