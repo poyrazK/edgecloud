@@ -52,18 +52,27 @@ type PortalSession struct {
 
 // StripeConfig is the per-provider configuration block in
 // cfg.Billing.Stripe. The factory in internal/app/app.go passes this
-// through to stripe.NewProvider.
+// through to stripe.NewProvider (BillingProvider) and stripe.NewMetering
+// (MeteringProvider).
 //
 // PriceIDs is a plan→price_id map so the same operator can run free /
 // pro / business through different Stripe products without changing
 // code. ValidateBillingConfig enforces that every domain.Plans()
 // entry has a matching PriceIDs entry when provider == "stripe".
+//
+// MeterSubscriptionItemIDs is the metering-side companion: a two-level
+// map (tenant → kind → subscription_item_id). Each dimension
+// (resident_seconds / request_count / outbound_bytes) maps to its own
+// Stripe price item — different meters, different prices — so a flat
+// per-tenant single-id wouldn't model this. Empty / nil = the metering
+// path no-ops (matches the zero-rate default in BillingMeteringConfig).
 type StripeConfig struct {
-	SecretKey      string
-	WebhookSecret  string
-	PublishableKey string
-	PriceIDs       map[string]string
-	APIBase        string // override for stripe-mock testing; empty → default
+	SecretKey                string
+	WebhookSecret            string
+	PublishableKey           string
+	PriceIDs                 map[string]string
+	APIBase                  string                       // override for stripe-mock testing; empty → default
+	MeterSubscriptionItemIDs map[string]map[string]string // tenant → kind → subscription_item_id
 }
 
 // BillingProvider is the seam. Every method must be safe to call
