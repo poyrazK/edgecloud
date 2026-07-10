@@ -44,6 +44,19 @@ rpassword = "7"
 # replays the original deployment instead of creating a duplicate.
 uuid = { version = "1.10", features = ["v4"] }
 edge-config = { path = "../edge-config" }
+# `edge build --lang=js` wraps the JS runtime (a `wasm32-wasip1` core
+# module) into a Preview 2 component via `wasm-tools component new
+# --adapt wasi_snapshot_preview1.reactor.wasm`. The adapter file is
+# shipped as a build-script artefact of this crate and extracted
+# into `$CARGO_HOME/registry/src/.../wasi-preview1-component-adapter-provider-*/
+# artefacts/` whenever this crate is compiled. The CLI's
+# `resolve_wasi_adapter` then globs that path.
+#
+# Pinned to 45.0.3 to match the wasmtime line used by edge-runtime
+# (Cargo.toml: `wasmtime = "=45.0.3"`). The version MUST stay in
+# sync — a 46.x adapter requires wasmtime 46.x, and wasmtime 45.x
+# rejects the 46.x adapter as an ABI mismatch.
+wasi-preview1-component-adapter-provider = "=45.0.3"
 
 [features]
 default = ["network"]
@@ -55,3 +68,12 @@ assert_cmd = "2.0"
 tempfile = "3.10"
 predicates = "3.0"
 tokio = { version = "1", features = ["macros", "rt"] }
+
+# `cargo-udeps` only sees Rust use-sites, not the `resolve_wasi_adapter`
+# glob in `src/commands/build.rs` that reads the adapter file from disk.
+# The crate is a "data dependency" — its only purpose is to make cargo
+# extract `wasi_snapshot_preview1.reactor.wasm` into
+# `$CARGO_HOME/registry/src/.../wasi-preview1-component-adapter-provider-*/artefacts/`
+# so the CLI's glob can find it.
+[package.metadata.cargo-udeps.ignore]
+normal = ["wasi-preview1-component-adapter-provider"]
