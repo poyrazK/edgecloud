@@ -5,13 +5,12 @@ edition = "2021"
 publish = false
 description = "edgeCloud JavaScript runtime — QuickJS + edge:cloud WIT bindings"
 
-[workspace]
-
 [lib]
 # Both cdylib (the wasm-time-loaded QuickJS runtime) and rlib (so the
 # `cargo test --manifest-path edge-js-runtime/Cargo.toml` command can
-# resolve `use crate::...` paths and run the in-crate unit tests added
-# in commit "wire register_websocket + tests"). The cdylib is what
+# resolve `use crate::...` paths, and the same crate is also picked up
+# by `cargo test --workspace` now that it's a workspace member
+# (issue #510). The cdylib is what
 # gets shipped to the worker; the rlib is purely a test-time artifact.
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"

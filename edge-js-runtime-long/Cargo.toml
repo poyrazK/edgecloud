@@ -5,12 +5,10 @@ edition = "2021"
 publish = false
 description = "edgeCloud long-running JS runtime — QuickJS + edge:cloud WIT bindings for the `edge-runtime` (long-running) world. Issue #426."
 
-# Isolated workspace: parallel to `edge-js-runtime`'s workspace block.
-# Without this, cargo would walk up to the parent edgeCloud workspace
-# and try to resolve `edge-js-runtime-long` against the host repo's
-# members (edge-runtime, edge-cli, edge-worker, …). Those are host-only
-# crates that can't be cross-compiled to wasm32-wasip1.
-[workspace]
+# rlib-only ratchet: issue #426 explained why this crate must NOT
+# produce a cdylib (a second `start` export would collide with the
+# shim's). Adding it as a workspace member (issue #510) does not
+# change that — the crate-type list below stays `["rlib"]`.
 
 [lib]
 # rlib only. The cdylib shape (a self-contained wasm component
