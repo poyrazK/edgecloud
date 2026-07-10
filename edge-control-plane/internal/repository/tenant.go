@@ -45,6 +45,28 @@ func (r *TenantRepository) GetByID(ctx context.Context, id string) (*domain.Tena
 	return &t, err
 }
 
+// GetForUpdate is GetByID with a row-level write lock (SELECT ... FOR
+// UPDATE). Used by DeploymentService.activateDeployment /
+// RollbackDeployment to serialize against concurrent SetDisabledAt /
+// ClearDisabledAt — without the lock a disable could land between our
+// active_deployments read and the post-commit publishSwap, and the
+// worker would receive a TaskMessage for a now-disabled tenant
+// (issue #440).
+//
+// Returns (nil, nil) for sql.ErrNoRows — the same shape as GetByID so
+// callers can branch on tenant == nil to distinguish "missing" from
+// "real error". The lock is released when the surrounding tx commits
+// or rolls back.
+func (r *TenantRepository) GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error) {
+	var t domain.Tenant
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = $1 FOR UPDATE`
+	err := r.db.GetContext(ctx, &t, query, id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
 func (r *TenantRepository) List(ctx context.Context) ([]domain.Tenant, error) {
 	var tenants []domain.Tenant
 	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants ORDER BY created_at DESC`

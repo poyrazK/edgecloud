@@ -356,6 +356,10 @@ type deployActiveRepoInterface interface {
 type tenantRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.TenantRepository
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	// GetForUpdate is GetByID with a row-level write lock; used by
+	// the activate / rollback tx to serialize against SetDisabledAt
+	// (issue #440).
+	GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
 // quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
@@ -1151,6 +1155,35 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	}
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-activate gate. Lock the tenant row
+		// BEFORE reading the active_deployments row so a concurrent
+		// SetDisabledAt either blocks behind our tx (we read
+		// disabled_at=NULL, the disable then commits after our
+		// active row mutation, the outbox row we enqueue below
+		// carries a TaskMessage the OutboxDrainer will eventually
+		// publish — but the worker side already sees the tenant as
+		// disabled via the heartbeat-driven route-table update, so
+		// a stale publish is a tolerable race) or commits first
+		// (we read disabled_at set and abort with ErrTenantDisabled
+		// before touching the active row).
+		//
+		// Mirrors the RollbackDeployment gate at the top of its
+		// tx so the two write paths can never disagree on whether
+		// a TaskMessage is allowed to be enqueued for a disabled
+		// tenant.
+		tenantRow, err := txTenant.GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("locking tenant: %w", err)
+		}
+		if tenantRow == nil {
+			return ErrTenantNotFound
+		}
+		if tenantRow.IsDisabled() {
+			return ErrTenantDisabled
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1463,6 +1496,37 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-rollback gate. Lock the tenant row
+		// BEFORE reading the active_deployments row so a concurrent
+		// SetDisabledAt either blocks behind our tx (we read
+		// disabled_at=NULL, the disable then commits after our
+		// active row mutation, the outbox row we enqueued below
+		// carries a TaskMessage the OutboxDrainer will eventually
+		// publish — but by that time the worker side will already
+		// see the tenant as disabled via the heartbeat-driven
+		// route-table update, so a stale publish is a tolerable
+		// race) or commits first (we read disabled_at set and
+		// abort with ErrTenantDisabled before touching the active
+		// row).
+		//
+		// Same lock-order rationale as activateDeployment: tenant
+		// first, then active_deployments. Symmetric gate so the
+		// two write paths can never disagree on whether a
+		// TaskMessage is allowed to be enqueued for a disabled
+		// tenant.
+		tenantRow, err := txTenant.GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("locking tenant: %w", err)
+		}
+		if tenantRow == nil {
+			return ErrTenantNotFound
+		}
+		if tenantRow.IsDisabled() {
+			return ErrTenantDisabled
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)

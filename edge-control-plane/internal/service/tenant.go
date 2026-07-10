@@ -25,6 +25,12 @@ import (
 var (
 	ErrTenantNotFound = errors.New("tenant not found")
 	ErrQuotaNotFound  = errors.New("quota not found for tenant")
+	// ErrTenantDisabled is returned by ActivateDeployment /
+	// RollbackDeployment when the tenant row's disabled_at is set
+	// inside the FOR UPDATE gate (issue #440). The handler maps
+	// this to HTTP 409 / 423 — the activate / rollback is
+	// intentionally aborted rather than published.
+	ErrTenantDisabled = errors.New("tenant is disabled")
 )
 
 // MaxEgressAllowlistEntries is the maximum number of entries a tenant may specify.

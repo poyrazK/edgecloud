@@ -159,6 +159,14 @@ func (m *mockDeployTenantRepo) GetByID(ctx context.Context, id string) (*domain.
 	return &domain.Tenant{ID: id, Plan: "free"}, nil
 }
 
+// GetForUpdate mirrors GetByID — the existing tests don't care about
+// the disable-vs-activate race; they just need the gate to pass.
+// (The dedicated *_TenantGate_* tests in deployment_regions_test.go
+// exercise the disabled / not-found arms directly via sqlmock.)
+func (m *mockDeployTenantRepo) GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error) {
+	return m.GetByID(ctx, id)
+}
+
 // mockDeployBillingRepo satisfies billingRepoForDeploymentSvc.
 type mockDeployBillingRepo struct {
 	getSubscriptionStatusFn func(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error)
