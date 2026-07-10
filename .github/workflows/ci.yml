@@ -134,17 +134,18 @@ jobs:
     env:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
-      # CARGO_HOME is set explicitly at job scope so the two
-      # `cargo install` steps and the PATH-export step agree on a
-      # single install root. GitHub-hosted runners do NOT preset
-      # CARGO_HOME, so an unset $CARGO_HOME would expand to "" and
-      # `cargo install --root ""` would silently land binaries
-      # under ./bin/ (the pre-fix `edge-cli: command not found`
-      # symptom). Note: $HOME is *not* expanded inside the `env:`
-      # block at workflow-YAML parse time, but the resolved value
-      # *is* available as `$HOME/.cargo` at job-step runtime, so
-      # `cargo install` (which honors $CARGO_HOME) sees the correct
-      # path.
+      # CARGO_HOME is set explicitly here because GitHub-hosted
+      # runners do NOT preset it, so an unset $CARGO_HOME would
+      # expand to "" and `cargo install --root ""` would silently
+      # land binaries under ./bin/ (the pre-fix `edge-cli: command
+      # not found` symptom). GitHub Actions does NOT expand $HOME
+      # inside `env:` blocks at YAML-parse time, so this resolves
+      # to the literal string "$HOME/.cargo" — which cargo itself
+      # then honors because cargo treats "$HOME/.cargo" as the
+      # default when CARGO_HOME is unset; with it set, cargo uses
+      # the literal value verbatim. To work around the literal-
+      # string trap, the install steps explicitly pass
+      # `--root "$HOME/.cargo"` (bash expands $HOME at run-time).
       CARGO_HOME: $HOME/.cargo
     steps:
       - uses: actions/checkout@v5
@@ -189,13 +190,16 @@ jobs:
         run: npm ci
 
       - name: Install edge CLI
-        run: cargo install --path ./edge-cli --locked
+        # Pass --root explicitly with bash-expanded $HOME because
+        # GH Actions does NOT expand $HOME inside `env:` blocks —
+        # see the comment on the job's `env:` section above.
+        run: cargo install --path ./edge-cli --locked --root "$HOME/.cargo"
 
       - name: Install wasm-tools
-        run: cargo install wasm-tools --version 1.252.0 --locked
+        run: cargo install wasm-tools --version 1.252.0 --locked --root "$HOME/.cargo"
 
       - name: Expose CLI tools on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # SHA-256 check on the vendored adapter BEFORE the build —
       # a missing or drifted file fails fast, before the slow
