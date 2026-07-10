@@ -214,7 +214,18 @@ jobs:
       - name: Build JS sample with vendored adapter
         working-directory: samples/hello-js-ws
         env:
+          # CARGO_HOME overridden to a fresh tmpdir so the `cargo
+          # install wasm-tools` step above can't have populated the
+          # registry with a `wasi-preview1-component-adapter-provider-*`
+          # crate that would mask a missing vendored adapter via
+          # the registry-glob fallback. Proves the vendored file
+          # is genuinely the source on a fresh clone.
           CARGO_HOME: ${{ runner.temp }}/edgecloud-js-build-cargo-home
+          # Override the job-scope RUSTFLAGS: the wasm32-wasip1
+          # target uses rust-lld, which rejects `-fuse-ld=mold`
+          # (`unknown argument: -fuse-ld=mold`). The flag only
+          # affects the native-toolchain jobs (rust-test, etc.).
+          RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
         run: |
           mkdir -p "$CARGO_HOME"
           edge-cli build --lang=js
