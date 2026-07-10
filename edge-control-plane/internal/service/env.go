@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -101,18 +102,20 @@ func (s *EnvService) SetPublishDeps(
 // SetEnv writes the env row and, if the app has an active deployment,
 // publishes a task_update so the running worker picks up the new env
 // (issue #560). Apps with no active deployment silently skip the
-// publish — there's no worker to notify yet.
-//
-// Returns ErrTenantDisabled (mapped to 409 by the handler) if the
-// tenant row is currently disabled; mirrors DeploymentService's
-// pre-check at deployment.go and closes the issue #440 disable-vs-
-// mutate race window for the env-write path.
+// publish — there's no worker to notify yet. Apps whose tenant is
+// currently disabled (issue #440) or whose active row points at a
+// deleted deployment also skip silently (review finding on PR #595) —
+// the env DB write commits, no outbox row is enqueued, no 409 is
+// returned. Disabled tenants are gated at deploy / activate / ingress
+// request-time; an `edge env set` on a disabled tenant is treated as
+// legitimate cleanup, not a mutation that should be rejected.
 //
 // Tx lifecycle: the env write, the active-row read, the deployment /
 // tenant / quota reads, and the outbox enqueue all run inside ONE
-// sqlx tx. A failure at any step rolls back the env write too — a
-// 5xx from `edge env set` therefore leaves the env row unchanged,
-// matching the pre-#560 contract for activate's outbox path.
+// sqlx tx. A hard failure (DB error, payload build error) at any
+// step rolls back the env write too — a 5xx from `edge env set`
+// therefore leaves the env row unchanged, matching the pre-#560
+// contract for activate's outbox path.
 func (s *EnvService) SetEnv(ctx context.Context, tenantID, appName, key, value string) error {
 	encrypted, err := s.encryptor.Encrypt(value)
 	if err != nil {
@@ -183,9 +186,16 @@ func (s *EnvService) withPublishTx(ctx context.Context, fn func(tx *sqlx.Tx) err
 // publishBuilder, and enqueues an outbox row (issue #42) — the
 // drainer publishes it after commit.
 //
-// Returns ErrTenantDisabled (mapped to 409) when the tenant is
-// currently disabled; the env write that preceded this call rolls
-// back with the rest of the tx.
+// Two additional paths (review findings on PR #595) also return nil
+// silently rather than failing the env write:
+//
+//   - Dangling active row (deployment row was deleted): log + nil
+//     so the reconcile loop can GC the orphan on its next tick
+//     without the operator seeing a 500 from `edge env set`.
+//   - Disabled tenant (issue #440 race surface): log + nil so env
+//     writes remain idempotent for cleanup use cases. Disabled-
+//     tenant rejection is enforced at the deploy / activate /
+//     ingress request-time layers, not on env writes.
 func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantID, appName string) error {
 	active, err := s.activeRepo.WithTx(tx).Get(ctx, tenantID, appName)
 	if err != nil {
@@ -202,10 +212,15 @@ func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantI
 		return fmt.Errorf("loading deployment: %w", err)
 	}
 	if deployment == nil {
-		// Active row points at a deleted deployment — fail loud so
-		// the env write rolls back. The reconcile loop will GC the
-		// orphaned active row on its next tick.
-		return fmt.Errorf("active row references missing deployment %s", active.DeploymentID)
+		// Active row points at a deleted deployment (review finding
+		// on PR #595). Don't fail loud and roll back the env write
+		// the caller already persisted — the operator just changed
+		// env, they shouldn't see a 500. Log so reconcile-loop
+		// debuggers and on-call engineers have something to grep;
+		// the reconcile loop will GC the orphan active row on its
+		// next tick.
+		log.Printf("env publish skipped: dangling active row %s/%s → %s (deployment row missing)", tenantID, appName, active.DeploymentID)
+		return nil
 	}
 
 	tenant, err := s.tenantRepo.WithTx(tx).GetByID(ctx, tenantID)
@@ -216,7 +231,21 @@ func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantI
 		return ErrTenantNotFound
 	}
 	if tenant.IsDisabled() {
-		return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
+		// Tenant was disabled between the env write and the publish
+		// attempt (issue #440 race surface). Match the no-active-
+		// deployment skip semantic — no TaskMessage can be delivered
+		// right now, and the env DB write has already committed so we
+		// can't fail the user-facing request. The next activate will
+		// re-evaluate the disabled state.
+		//
+		// Diverges from the activate path (which returns 409 for a
+		// disabled tenant) because env writes must not be visible as
+		// 409s: a developer running `edge env set` on a disabled
+		// tenant is doing cleanup, not mutation, and a 409 would
+		// mask the underlying env state. Disabled status is enforced
+		// at the deploy / activate / request-time ingress layers.
+		log.Printf("env publish skipped: tenant %s disabled (issue #440)", tenantID)
+		return nil
 	}
 
 	quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
@@ -314,9 +343,10 @@ func (s *EnvService) ListEnv(ctx context.Context, tenantID, appName string) ([]d
 // DeleteEnv deletes the env row and, if the app has an active
 // deployment, publishes a task_update so the running worker picks
 // up the absence of the env var (issue #560). Same shape as SetEnv:
-// silent skip when there's no active deployment; ErrTenantDisabled
-// (409) when the tenant is disabled; the env delete and the publish
-// run inside ONE tx so a 5xx leaves the row in place.
+// silent skip when there's no active deployment, when the tenant is
+// disabled (issue #440), or when the active row points at a deleted
+// deployment; the env delete and the publish run inside ONE tx so a
+// hard failure (DB error, payload build error) leaves the row in place.
 func (s *EnvService) DeleteEnv(ctx context.Context, tenantID, appName, key string) error {
 	if s.publishDepsReady() {
 		return s.withPublishTx(ctx, func(tx *sqlx.Tx) error {

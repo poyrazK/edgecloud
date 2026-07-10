@@ -20,7 +20,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"regexp"
 	"testing"
 	"time"
@@ -169,10 +168,16 @@ func TestEnvService_SetEnv_NoActiveDeployment(t *testing.T) {
 	}
 }
 
-// TestEnvService_SetEnv_DisabledTenant: tenant has disabled_at set
-// → SetEnv returns ErrTenantDisabled (handler maps to 409) and the
-// env write rolls back with the rest of the tx.
-func TestEnvService_SetEnv_DisabledTenant(t *testing.T) {
+// TestEnvService_SetEnv_DisabledTenant_CommitsSkipsOutbox (review
+// finding on PR #595): tenant has disabled_at set → SetEnv returns
+// nil, the env write COMMITS, and no outbox row is enqueued. Disabled
+// tenants are gated at deploy / activate / ingress request-time, not
+// on env writes; an `edge env set` on a disabled tenant is legitimate
+// cleanup, not a mutation to be rejected. The reviewer's reasoning:
+// the env DB write has already committed, the user-facing request
+// must not fail, and surfacing a 409 here would mask the env state
+// the operator was trying to inspect or clean up.
+func TestEnvService_SetEnv_DisabledTenant_CommitsSkipsOutbox(t *testing.T) {
 	db, mock, cleanup := newEnvMockDB(t)
 	defer cleanup()
 
@@ -203,16 +208,56 @@ func TestEnvService_SetEnv_DisabledTenant(t *testing.T) {
 			"id", "name", "plan", "allowlisted_destinations",
 			"disabled_at",
 		}).AddRow(tenantID, "Test Tenant", "pro", `{}`, now.Add(-time.Hour)))
-	// Expect rollback (no commit).
-	mock.ExpectRollback()
+	// No outbox INSERT expected — tx commits clean.
+	mock.ExpectCommit()
 
 	svc := newEnvSvcForPublish(t, db)
-	err := svc.SetEnv(context.Background(), tenantID, appName, "LOG_LEVEL", "debug")
-	if err == nil {
-		t.Fatal("SetEnv on disabled tenant: expected error, got nil")
+	if err := svc.SetEnv(context.Background(), tenantID, appName, "LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("SetEnv on disabled tenant: got err %v, want nil (env write must commit, publish silently skipped)", err)
 	}
-	if !errors.Is(err, ErrTenantDisabled) {
-		t.Errorf("err = %v, want ErrTenantDisabled in chain", err)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock expectations: %v", err)
+	}
+}
+
+// TestEnvService_SetEnv_DanglingActiveRow_CommitsSkipsOutbox (review
+// finding on PR #595): active row points at a deployment_id whose
+// deployments row was deleted. The tx opens, the env write succeeds,
+// the active lookup finds the orphan row, the deployment lookup
+// returns no rows, publishIfActiveTx logs + returns nil, and the tx
+// COMMITS clean — no outbox INSERT. The reconcile loop GCs the
+// orphan active row on its next tick; the env write was already a
+// legitimate operator action.
+func TestEnvService_SetEnv_DanglingActiveRow_CommitsSkipsOutbox(t *testing.T) {
+	db, mock, cleanup := newEnvMockDB(t)
+	defer cleanup()
+
+	tenantID, appName := "t_acme", "shop"
+	deploymentID := "d_deleted"
+
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO app_env`)).
+		WithArgs(tenantID, appName, "LOG_LEVEL", "debug").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id",
+			"last_good_deployment_id", "auto_rollback_enabled",
+		}).AddRow(tenantID, appName, deploymentID, nil, false))
+	// Deployment lookup returns no rows — dangling active row.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
+			"auto_rollback_enabled", "signature", "signing_key_id",
+		})) // no AddRow → sql.ErrNoRows → repo returns (nil, nil)
+	// No outbox INSERT expected — tx commits clean.
+	mock.ExpectCommit()
+
+	svc := newEnvSvcForPublish(t, db)
+	if err := svc.SetEnv(context.Background(), tenantID, appName, "LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("SetEnv with dangling active row: got err %v, want nil (env write must commit, publish silently skipped)", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sqlmock expectations: %v", err)
