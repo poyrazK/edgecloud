@@ -912,7 +912,7 @@ components:
             Cumulative request count in the current UTC month. Resets on month rollover.
             Drives enforcement in the same way as `used_outbound_bytes`.
           example: 0
-used_memory_mb:
+        used_memory_mb:
           type: integer
           format: int64
           description: |
@@ -937,7 +937,6 @@ used_memory_mb:
             value reaches `max_resident_seconds_per_month`, deploy-time
             returns 402 PAYMENT_REQUIRED with reason `quota_will_be_exceeded`
             and edge-ingress returns 402.
-          example: 0
           example: 0
         quota_period_start:
           type: string
