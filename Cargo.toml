@@ -21,6 +21,7 @@ members = [
 exclude = [
     "edge-worker/tests/fixtures/handler",
     "edge-js-runtime",
+    "edge-js-runtime-long",
 ]
 
 [workspace.package]

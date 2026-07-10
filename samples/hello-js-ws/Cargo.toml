@@ -23,6 +23,15 @@ path = "src/lib.rs"
 wit-bindgen = "0.45"
 # rquickjs 0.9 with the bindgen feature, matching `edge-js-runtime`.
 rquickjs = { version = "0.9.0", features = ["bindgen"] }
+# The long-running QuickJS runtime. Issue #426: the shim used to
+# duplicate ~570 lines of `register_*` helpers from
+# `edge-js-runtime/src/lib.rs`; with the LR cdylib landing, the
+# shim just `use`s `edge_js_runtime_long::register::register_all`.
+# The shim still owns its `wit_bindgen::generate!` (it has to — the
+# bindgen output is what defines the component's import surface),
+# but the per-namespace registrars live next to the bindgen output
+# in `edge-js-runtime-long` and are shared via path.
+edge-js-runtime-long = { path = "../../edge-js-runtime-long" }
 
 [profile.release]
 opt-level = "s"
