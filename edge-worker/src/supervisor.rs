@@ -807,6 +807,126 @@ mod heartbeat_integration_tests {
             "empty accumulator should produce empty observer_metrics"
         );
     }
+
+    /// Issue #45 — `stop_app` MUST NOT re-raise a panic from a
+    /// panicking per-app task. Re-raising via `panic::resume_unwind`
+    /// unwinds out of `stop_app` into `handle_task_message` /
+    /// `run_consume_loop` and tears down the worker process,
+    /// killing every other app on the same node. The fix logs
+    /// the panic payload at `error!` and lets the stop sequence
+    /// complete normally.
+    ///
+    /// The test:
+    ///   1. Installs two AppInstances. App "panic-app" has a
+    ///      handle that runs `panic!()` immediately. App
+    ///      "survivor-app" has no handle (long-running) so it
+    ///      stays in `WorkerState::apps` until redeployed.
+    ///   2. Calls `sup.stop_app("t_test", "panic-app")` and
+    ///      asserts the call returns `Ok(())` — i.e. did NOT
+    ///      unwind through `resume_unwind`.
+    ///   3. Asserts "panic-app" is removed from the state and
+    ///      "survivor-app" is still present — the headline
+    ///      guarantee that a single bad app does not impact any
+    ///      other app on the same worker.
+    #[tokio::test]
+    async fn stop_app_does_not_re_panic_when_handle_panics() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        // App A: handle will panic.
+        let (panic_tx, _) = tokio::sync::oneshot::channel::<()>();
+        let panicking_handle = tokio::spawn(async {
+            // Yield once so the supervisor's join awaits a
+            // Ready-panic rather than a synchronous trap.
+            tokio::task::yield_now().await;
+            panic!("synthetic guest panic for issue #45 test");
+        });
+        let panic_app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d_panic".into(),
+            app_name: "panic-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18000,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d_panic".into())),
+            shutdown_tx: Some(panic_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre: instance_pre.clone(),
+            handle: Some(Arc::new(panicking_handle)),
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+
+        // App B: untouched. This is the "other app on the same
+        // worker" the issue body requires the supervisor to keep
+        // running.
+        let (survivor_tx, _) = tokio::sync::oneshot::channel::<()>();
+        let survivor_app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d_survivor".into(),
+            app_name: "survivor-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d_survivor".into())),
+            shutdown_tx: Some(survivor_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "panic-app".into()), panic_app);
+        state.write().await.apps.insert(
+            ("t_test".into(), "survivor-app".into()),
+            survivor_app.clone(),
+        );
+
+        let sup = build_supervisor(state.clone());
+
+        // The headline assertion: this call MUST return Ok(())
+        // without unwinding. Before the fix, the
+        // `panic::resume_unwind(panic_payload)` inside `stop_app`
+        // unwound out of the test function too, failing the test
+        // with a panic message rather than an assertion error.
+        let result = sup.stop_app("t_test", "panic-app").await;
+        assert!(
+            result.is_ok(),
+            "stop_app must not propagate the app-task panic: {result:?}"
+        );
+
+        // App A torn down; App B still alive.
+        let snapshot = state.read().await;
+        assert!(
+            !snapshot
+                .apps
+                .contains_key(&("t_test".into(), "panic-app".into())),
+            "panic-app should be removed after stop_app"
+        );
+        assert!(
+            snapshot
+                .apps
+                .contains_key(&("t_test".into(), "survivor-app".into())),
+            "survivor-app must remain running — supervisor must not tear down unrelated apps"
+        );
+        let survivor_inst = snapshot
+            .apps
+            .get(&("t_test".into(), "survivor-app".into()))
+            .expect("survivor-app present")
+            .lock()
+            .await;
+        assert_eq!(survivor_inst.status, AppInstanceStatus::Running);
+    }
 }
 
 // ── extracted pure functions tests ──────────────────────────────────────
@@ -1654,7 +1774,8 @@ impl Supervisor {
             t.abort();
         }
 
-        // Propagate any panic from the app task. Two failure modes to
+        // Surface any panic from the app task in a structured log, but
+        // do NOT re-raise (issue #45). Two failure modes to
         // distinguish:
         //
         //   * `JoinError::Cancelled` — `handle.abort()` was called on a
@@ -1668,10 +1789,13 @@ impl Supervisor {
         //     abort → JoinError::Cancelled → panic_any), and break the
         //     NATS consume loop.
         //   * Real panic payload — the guest trapped with a non-zero
-        //     exit, or the host task failed. We re-raise via
-        //     `panic::resume_unwind` so the supervisor task surfaces a
-        //     real Rust panic (which is observable by crash-reporting
-        //     infrastructure), rather than swallowing it.
+        //     exit, or the host task failed. We previously re-raised
+        //     via `panic::resume_unwind`, but that unwound out of
+        //     `stop_app` into `handle_task_message` /
+        //     `run_consume_loop` and tore down the worker process,
+        //     killing every other app on the same node. Now we log
+        //     the panic payload at `error!` level and let the
+        //     supervisor keep running.
         if let Some(handle) = handle {
             // try_unwrap extracts the JoinHandle from the Arc; if there
             // are other Arcs (shouldn't happen here), we skip the await
@@ -1706,13 +1830,23 @@ impl Supervisor {
                     tracing::debug!("app task cancelled cleanly");
                 }
                 Err(join_err) => {
-                    // Real panic. `try_into_panic()` returns the
-                    // original Box<dyn Any + Send> payload; we resume
-                    // the unwind so the supervisor task crashes with
-                    // the original panic message rather than wrapping
-                    // it in a generic JoinError.
+                    // Real panic (issue #45). `try_into_panic()`
+                    // returns the original `Box<dyn Any + Send>`
+                    // payload; we LOG it (Debug form, since the
+                    // payload type is unknown) and continue the
+                    // stop sequence. Re-raising via
+                    // `panic::resume_unwind` would unwind out of
+                    // `stop_app` into `handle_task_message` /
+                    // `run_consume_loop` and crash the worker
+                    // process — taking every other app on this
+                    // worker with it.
                     if let Ok(panic_payload) = join_err.try_into_panic() {
-                        std::panic::resume_unwind(panic_payload);
+                        tracing::error!(
+                            tenant_id = %tenant_id,
+                            app_name = %app_name,
+                            panic_payload = ?panic_payload,
+                            "app task panicked during stop; supervisor continuing"
+                        );
                     }
                 }
             }
@@ -1720,6 +1854,90 @@ impl Supervisor {
 
         tracing::info!(tenant_id, app_name, "app stopped");
         Ok(())
+    }
+
+    /// Shared trap-handling arm for `run_app_loop` (issue #45).
+    ///
+    /// Called from BOTH the `Ok(Ok(Err(e)))` arm (wasm trap from the
+    /// guest) and the `Ok(Err(join_err))` arm (panic inside the
+    /// spawned `execute_app` task) after `restart_count` has been
+    /// incremented. Returns `true` iff the supervisor has hit the
+    /// restart cap and the caller should `break` out of `run_app_loop`:
+    /// the app is marked `Crashed { restart_count }`, an auto-rollback
+    /// POST is fired (best-effort), and the loop terminates. Returns
+    /// `false` when a restart is allowed — the caller sleeps the
+    /// computed backoff and loops.
+    ///
+    /// Splitting this out keeps the two arms in `run_app_loop`
+    /// legible and prevents the auto-rollback POST + status flip
+    /// from drifting between the trap and panic code paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_app_crash(
+        state: &Arc<RwLock<WorkerState>>,
+        tenant_id: &str,
+        app_name: &str,
+        current_deployment_id: &str,
+        downloader: &Arc<Downloader>,
+        restart_count: u32,
+        max_restarts: u32,
+        base_backoff: Duration,
+        max_backoff: Duration,
+        err: anyhow::Error,
+        log_msg: &'static str,
+    ) -> bool {
+        if restart_count >= max_restarts {
+            tracing::error!(
+                restart_count,
+                err = %err,
+                "max restarts exceeded, giving up"
+            );
+            // Mark the app as crashed so the heartbeat reflects the
+            // failure.
+            {
+                let mut s = state.write().await;
+                let crash_key = (tenant_id.to_string(), app_name.to_string());
+                if let Some(inst) = s.apps.get_mut(&crash_key) {
+                    let mut inst = inst.lock().await;
+                    inst.status = AppInstanceStatus::Crashed { restart_count };
+                }
+            }
+            // Best-effort auto-rollback: signal the control plane so
+            // it can swap the active deployment back to last_good. We
+            // do NOT block the per-app task on this — `spawn`
+            // detaches the POST so the loop can return immediately.
+            // The user's manual `edge rollback` covers the failure
+            // mode if the POST fails.
+            let dl = downloader.clone();
+            let tenant = tenant_id.to_string();
+            let name = app_name.to_string();
+            let dep = current_deployment_id.to_string();
+            tokio::spawn(async move {
+                if let Err(err) = dl
+                    .post_auto_rollback(&tenant, &name, &dep, restart_count)
+                    .await
+                {
+                    tracing::warn!(
+                        tenant_id = %tenant,
+                        app_name = %name,
+                        current_deployment_id = %dep,
+                        restart_count,
+                        err = %err,
+                        "auto-rollback POST failed; user must run `edge rollback` manually"
+                    );
+                }
+            });
+            true
+        } else {
+            let backoff = std::cmp::min(base_backoff * 2u32.pow(restart_count - 1), max_backoff);
+            tracing::warn!(
+                err = %err,
+                restart_count,
+                "{}; restarting in {:?}",
+                log_msg,
+                backoff
+            );
+            false
+        }
     }
 
     /// Per-app task loop for LongRunning components.
@@ -1769,6 +1987,50 @@ impl Supervisor {
         let current_deployment_id = meter.deployment_id.clone();
 
         loop {
+            // Issue #45: spawn the host task OUTSIDE the select! so a
+            // panic inside execute_app surfaces as a `JoinError`
+            // rather than unwinding out of `run_app_loop` (which
+            // would crash the worker process via `stop_app`'s
+            // `panic::resume_unwind`). The select! body below
+            // matches on `JoinError` and routes panics through the
+            // same restart-or-Crashed path as a wasm trap.
+            //
+            // `tokio::spawn` requires `'static`, so we clone every
+            // borrow into an owned form. `instance_pre` is already
+            // `Clone`-able (it's a wasmtime `Component`-derived
+            // pre-instance) and `meter` is wrapped in `Arc`, so the
+            // cost is one Arc bump per restart. `env`, `allowlist`,
+            // and `metrics_acc` are owned (no borrow), so we move
+            // them into the async block.
+            let app_task = tokio::spawn({
+                let instance_pre = instance_pre.clone();
+                let meter = Arc::clone(&meter);
+                let tenant_id = tenant_id.clone();
+                let app_name = app_name.clone();
+                let log_forwarder = Arc::clone(&log_forwarder);
+                let preview_id = preview_id.clone();
+                let env = env.clone();
+                let allowlist = allowlist.clone();
+                let metrics_acc = metrics_acc.clone();
+                async move {
+                    Self::execute_app(
+                        &instance_pre,
+                        &meter,
+                        env,
+                        max_memory_mb,
+                        epoch_deadline_ticks,
+                        &tenant_id,
+                        allowlist,
+                        &app_name,
+                        &log_forwarder,
+                        metrics_acc,
+                        socket_mode,
+                        preview_id.as_deref(),
+                        preview_pr_number,
+                    )
+                    .await
+                }
+            });
             tokio::select! {
                 // Graceful shutdown signal from supervisor
                 _ = &mut shutdown_rx => {
@@ -1786,89 +2048,88 @@ impl Supervisor {
                 //      Hung and restarts after backoff.
                 result = tokio::time::timeout(
                     Duration::from_secs(health_check_timeout_secs),
-                    Self::execute_app(
-                        &instance_pre,
-                        &meter,
-                        env.clone(),
-                        max_memory_mb,
-                        epoch_deadline_ticks,
-                        &tenant_id,
-                        allowlist.clone(),
-                        &app_name,
-                        &log_forwarder,
-                        metrics_acc.clone(),
-                        socket_mode,
-                        preview_id.as_deref(),
-                        preview_pr_number,
-                    ),
+                    app_task,
                 ) => {
                     match result {
-                        Ok(Ok(true)) => {
+                        Ok(Ok(Ok(true))) => {
                             // Component wants to keep running (blocking call returned normally).
                             // Loop back and re-execute — this supports long-running HTTP servers.
                             continue;
                         }
-                        Ok(Ok(false)) => {
+                        Ok(Ok(Ok(false))) => {
                             // Guest explicitly called process.exit — clean exit.
                             tracing::info!("component exited normally");
                             break;
                         }
-                        Ok(Err(e)) => {
+                        Ok(Ok(Err(e))) => {
                             // Wasm trap or runtime error — treat as crash.
                             restart_count += 1;
-                            if restart_count >= max_restarts {
-                                tracing::error!(
-                                    restart_count,
-                                    err = %e,
-                                    "max restarts exceeded, giving up"
-                                );
-                                // Mark the app as crashed so the heartbeat reflects the failure.
-                                {
-                                    let mut s = state.write().await;
-                                    let crash_key = (tenant_id.clone(), app_name.clone());
-                                    if let Some(inst) = s.apps.get_mut(&crash_key) {
-                                        let mut inst = inst.lock().await;
-                                        inst.status = AppInstanceStatus::Crashed { restart_count };
-                                    }
-                                }
-                                // Best-effort auto-rollback: signal the
-                                // control plane so it can swap the active
-                                // deployment back to last_good. We do NOT
-                                // block the per-app task on this — `spawn`
-                                // detaches the POST so the loop can return
-                                // immediately. The user's manual
-                                // `edge rollback` covers the failure mode.
-                                let dl = downloader.clone();
-                                let tenant = tenant_id.clone();
-                                let name = app_name.clone();
-                                let dep = current_deployment_id.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = dl
-                                        .post_auto_rollback(&tenant, &name, &dep, restart_count)
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            tenant_id = %tenant,
-                                            app_name = %name,
-                                            current_deployment_id = %dep,
-                                            restart_count,
-                                            err = %err,
-                                            "auto-rollback POST failed; user must run `edge rollback` manually"
-                                        );
-                                    }
-                                });
+                            let terminal = Self::handle_app_crash(
+                                &state,
+                                &tenant_id,
+                                &app_name,
+                                &current_deployment_id,
+                                &downloader,
+                                restart_count,
+                                max_restarts,
+                                base_backoff,
+                                max_backoff,
+                                e,
+                                "app crashed",
+                            )
+                            .await;
+                            if terminal {
                                 break;
                             }
-
                             let backoff = std::cmp::min(
                                 base_backoff * 2u32.pow(restart_count - 1),
                                 max_backoff,
                             );
-                            tracing::warn!(
-                                err = %e,
+                            sleep(backoff).await;
+                        }
+                        Ok(Err(join_err)) => {
+                            // Issue #45: execute_app panicked inside
+                            // the spawned task. Convert to a synthetic
+                            // trap-shaped error so the existing
+                            // restart / Crashed arm applies uniformly.
+                            // `join_err.is_panic()` disambiguates a
+                            // host panic from cancellation; both
+                            // routes land on the same restart counter
+                            // and `Crashed` status when the cap is
+                            // exceeded.
+                            let payload = if join_err.is_panic() {
+                                format!("app task panicked: {join_err}")
+                            } else {
+                                format!("app task aborted: {join_err}")
+                            };
+                            tracing::error!(
+                                tenant_id = %tenant_id,
+                                app_name = %app_name,
+                                panic_payload = %payload,
+                                "app task panicked inside run_app_loop; routing through restart/Crashed"
+                            );
+                            let e = anyhow::anyhow!(payload);
+                            restart_count += 1;
+                            let terminal = Self::handle_app_crash(
+                                &state,
+                                &tenant_id,
+                                &app_name,
+                                &current_deployment_id,
+                                &downloader,
                                 restart_count,
-                                "app crashed, restarting in {:?}",
-                                backoff
+                                max_restarts,
+                                base_backoff,
+                                max_backoff,
+                                e,
+                                "app crashed (panic-in-spawn)",
+                            )
+                            .await;
+                            if terminal {
+                                break;
+                            }
+                            let backoff = std::cmp::min(
+                                base_backoff * 2u32.pow(restart_count - 1),
+                                max_backoff,
                             );
                             sleep(backoff).await;
                         }
