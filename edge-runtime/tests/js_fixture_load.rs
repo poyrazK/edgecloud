@@ -466,21 +466,22 @@ async fn extract_response_picks_content_type() {
             return None;
         }
 
-        // The wasip2 cargo output IS the component. Cargo emits
-        // cdylib artifacts under `<target>/<triple>/release/deps/`,
-        // not `<target>/<triple>/release/` directly (the latter is
-        // for non-cdylib libs / bins). Stage it at the artifact
-        // path so subsequent test runs reuse the same artifact
-        // (the if-exists check at the top of this fn).
-        let component = target_dir
-            .join("wasm32-wasip2")
-            .join("release")
-            .join("deps")
-            .join("edge_js_runtime.wasm");
-        if !component.exists() {
-            eprintln!("SKIPPED: component wasm missing after cargo build");
-            return None;
-        }
+        // The wasip2 cargo output IS the component. Walk
+        // `<target>/wasm32-wasip2/release/**/edge_js_runtime.wasm`
+        // and pick the first match — cargo emits cdylib artifacts
+        // under `<triple>/release/deps/` for crates with
+        // `[lib] crate-type = ["cdylib", "rlib"]`, but a future
+        // cargo layout tweak should not turn into a SKIP. Stage
+        // the discovered path to the artifact location so subsequent
+        // test runs reuse the same artifact (the if-exists check
+        // at the top of this fn).
+        let component = match find_runtime_wasm(&target_dir) {
+            Some(p) => p,
+            None => {
+                eprintln!("SKIPPED: component wasm missing after cargo build");
+                return None;
+            }
+        };
 
         if let Some(parent) = artifact.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -603,4 +604,30 @@ async fn extract_response_picks_content_type() {
     );
 
     println!("✓ issue #428: extract_response picks the right Content-Type for all three shapes");
+}
+
+/// Walk `<base>/wasm32-wasip2/release/**/edge_js_runtime.wasm` and
+/// return the first match. Mirrors `find_runtime_wasm` in
+/// `edge-cli/src/commands/build.rs::resolve_runtime_core_wasm` —
+/// kept as a local copy here because integration tests can't pull
+/// private items from the CLI crate (it's an
+/// `assert_cmd::cargo_bin!("edge")`-driven binary, not a library).
+fn find_runtime_wasm(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let release = base.join("wasm32-wasip2").join("release");
+    let name = "edge_js_runtime.wasm";
+    let mut stack = vec![release];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().map(|f| f == name).unwrap_or(false) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }

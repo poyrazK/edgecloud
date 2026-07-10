@@ -364,21 +364,24 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
 /// Resolve the on-disk path of the wasip2 component that
 /// `cargo build` (above) produced. Probes three locations in order:
 ///
-/// 1. `$CARGO_TARGET_DIR/wasm32-wasip2/release/deps/...` — when set
-///    explicitly in the environment (overrides everything).
-/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip2/release/deps/...` —
-///    the conventional shared cache location. The inner cargo build
+/// 1. `$CARGO_TARGET_DIR/wasm32-wasip2/...` — when `CARGO_TARGET_DIR`
+///    is set explicitly in the environment.
+/// 2. `$HOME/.cache/edgecloud-cargo/wasm32-wasip2/...` — the
+///    conventional shared cache location. The inner cargo build
 ///    in step 3 explicitly pins `CARGO_TARGET_DIR` to this path when
 ///    unset, so this is the common-case probe on a developer box
 ///    and on CI runners.
-/// 3. `<runtime_dir>/target/wasm32-wasip2/release/deps/...` — the
-///    per-crate default when no `CARGO_TARGET_DIR` is set anywhere.
+/// 3. `<runtime_dir>/target/wasm32-wasip2/...` — the per-crate
+///    default when no `CARGO_TARGET_DIR` is set anywhere.
 ///
+/// Within each target directory, the resolver walks
+/// `<triple>/release/**/<name>` rather than probing a fixed path.
 /// Cargo emits cdylib artifacts under `<triple>/release/deps/`
 /// (not `<triple>/release/` directly) when the crate's `[lib]`
 /// declares `crate-type = ["cdylib", "rlib"]` — the `release/`
-/// directory holds the rlib and incremental metadata. Probing
-/// `release/deps/` matches cargo's actual layout.
+/// directory holds the rlib and incremental metadata. Walking
+/// `release/**` keeps the resolver correct across cargo layout
+/// tweaks without pinning to `deps/` literally.
 ///
 /// The repo's `.cargo/config.toml` is *not* read by the child
 /// process directly — `build.target-dir` is a cargo-internal
@@ -386,50 +389,65 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
 /// dir is the common case for the dev loop, so we probe it
 /// explicitly.
 fn resolve_runtime_core_wasm(runtime_dir: &std::path::Path) -> Result<std::path::PathBuf> {
-    let name = "edge_js_runtime.wasm";
-    let rel = |base: std::path::PathBuf| {
-        base.join("wasm32-wasip2")
-            .join("release")
-            .join("deps")
-            .join(name)
-    };
-
     let mut tried: Vec<std::path::PathBuf> = Vec::new();
 
     if let Ok(t) = std::env::var("CARGO_TARGET_DIR") {
-        let candidate = rel(std::path::PathBuf::from(t));
-        if candidate.exists() {
-            return Ok(candidate);
+        let base = std::path::PathBuf::from(t);
+        if let Some(p) = find_runtime_wasm(&base) {
+            return Ok(p);
         }
-        tried.push(candidate);
+        tried.push(base.join("wasm32-wasip2"));
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        let candidate = rel(std::path::PathBuf::from(format!(
-            "{home}/.cache/edgecloud-cargo"
-        )));
-        if candidate.exists() {
-            return Ok(candidate);
+        let base = std::path::PathBuf::from(format!("{home}/.cache/edgecloud-cargo"));
+        if let Some(p) = find_runtime_wasm(&base) {
+            return Ok(p);
         }
-        tried.push(candidate);
+        tried.push(base.join("wasm32-wasip2"));
     }
 
-    let default = rel(runtime_dir.join("target"));
-    if default.exists() {
-        return Ok(default);
+    let default = runtime_dir.join("target");
+    if let Some(p) = find_runtime_wasm(&default) {
+        return Ok(p);
     }
-    tried.push(default);
+    tried.push(default.join("wasm32-wasip2"));
 
     anyhow::bail!(
-        "expected core wasm at one of:\n  - {}\n  - <CARGO_TARGET_DIR>/wasm32-wasip2/release/deps/{name}\n\
-         Checked (in order):\n{}",
-        tried.first().map(|p| p.display().to_string()).unwrap_or_default(),
+        "expected `edge_js_runtime.wasm` under one of:\n\
+         - <CARGO_TARGET_DIR>/wasm32-wasip2/release/\n\
+         - $HOME/.cache/edgecloud-cargo/wasm32-wasip2/release/\n\
+         - <runtime_dir>/target/wasm32-wasip2/release/\n\
+         Checked (first 200 chars of each):\n{}",
         tried
             .iter()
             .map(|p| format!("  - {}", p.display()))
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// Walk `<base>/wasm32-wasip2/release/**/<name>` and return the
+/// first match. `read_dir` is recursive enough for cargo's output
+/// layout (`release/` → `deps/`, `examples/`, `build/`, etc.).
+fn find_runtime_wasm(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let release = base.join("wasm32-wasip2").join("release");
+    let name = "edge_js_runtime.wasm";
+    let mut stack = vec![release];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().map(|f| f == name).unwrap_or(false) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the edge-js-runtime crate directory.
