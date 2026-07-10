@@ -24,13 +24,6 @@ use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
 
-/// Cadence of the per-app resident-seconds ticker (issue #484).
-/// Mirrors the default `Config::heartbeat_interval_secs` (30) so
-/// each heartbeat interval carries a single accumulated delta
-/// without fractional remains — finer granularity would 30× the
-/// atomic-op load with no new billing-grade signal.
-const RESIDENT_TICK_SECS: u64 = 30;
-
 /// A pool of pre-warmed wasmtime::Engine instances.
 pub struct StandbyPool {
     pool: Mutex<tokio::sync::mpsc::Receiver<wasmtime::Engine>>,
@@ -1845,10 +1838,19 @@ impl Supervisor {
         // gone).
         let resident_ticker = if execution_model == ExecutionModel::LongRunning {
             let resident_meter = meter.clone();
+            // TODO(metering): collapse 3 goroutines when drainer ships.
+            // The resident-seconds ticker below is the third parallel
+            // goroutine on the heartbeat path (alongside the existing
+            // checkOutboundQuota / checkRequestCount goroutines in the
+            // control plane, edge-control-plane/internal/service/worker.go).
+            // Once the metering-ledger drainer replaces the per-axis
+            // UPDATE path, this whole ticker can fold into the existing
+            // per-app heart-beat handle.
+            let resident_tick_secs = self.config.heartbeat_interval_secs;
             Some(tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(RESIDENT_TICK_SECS)).await;
-                    resident_meter.record_resident_seconds(RESIDENT_TICK_SECS);
+                    tokio::time::sleep(Duration::from_secs(resident_tick_secs)).await;
+                    resident_meter.record_resident_seconds(resident_tick_secs);
                 }
             }))
         } else {
@@ -4141,7 +4143,7 @@ mod tests {
         meter.record_outbound_bytes(100);
         // LongRunning apps accumulate resident time via the per-app
         // ticker. Manually pre-load the counter here to simulate the
-        // ticker having fired twice (2 × RESIDENT_TICK_SECS = 60).
+        // ticker having fired twice (2 × heartbeat_interval_secs = 60).
         meter.record_resident_seconds(60);
 
         let app = Arc::new(Mutex::new(AppInstance {
