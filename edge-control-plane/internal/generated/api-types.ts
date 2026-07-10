@@ -2752,6 +2752,33 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Returned when the caller's tenant row has
+             *     `disabled_at IS NOT NULL` at the moment the request reaches
+             *     the service layer (issue #440 disable-vs-activate race gate).
+             *     The response body is the standard error envelope with
+             *     `error.code = "CONFLICT"` and `error.message = "tenant is disabled"`.
+             *     The CLI / operator tooling can branch on `error.code` to
+             *     distinguish this from a generic infrastructure 500 — the
+             *     tenant will not auto-re-enable, retrying without operator
+             *     action is futile.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2783,6 +2810,29 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Promote delegates to the same
+             *     `activateDeployment` path as the activate endpoint, so the
+             *     issue #440 disable-vs-activate race gate fires identically
+             *     here. Body shape and `error.code` are identical to the
+             *     activate endpoint's 409.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2810,9 +2860,14 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             /**
-             * @description No prior `last_good_deployment_id` is recorded for this app,
-             *     so there is nothing to roll back to. Returned when the app
-             *     has only ever had one deployment.
+             * @description Either no `last_good_deployment_id` is recorded for this app
+             *     (only one deployment has ever been activated, so there is
+             *     nothing to roll back to), or the caller's tenant is
+             *     disabled (issue #440 disable-vs-activate race gate).
+             *     The message field distinguishes the two: `"no previous
+             *     deployment to roll back to"` for the first, `"tenant is
+             *     disabled"` for the second. The status code and
+             *     `error.code = "CONFLICT"` are the same in both cases.
              */
             409: {
                 headers: {
