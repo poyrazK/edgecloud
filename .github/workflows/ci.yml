@@ -13,6 +13,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml redirects build.target-dir to ../target-cache/
+  # (outside the repo — a local-dev choice so git worktrees share one
+  # target dir). On CI that breaks Swatinem/rust-cache, whose
+  # `workspaces: ". -> target"` mapping caches ./target — an empty dir —
+  # so every job recompiled the workspace from source on every run.
+  # CARGO_TARGET_DIR (env beats config file in cargo's precedence) puts
+  # build output back inside the workspace where rust-cache looks.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
   # ============================================================
@@ -21,7 +29,7 @@ jobs:
   rust-lint:
     runs-on: ubuntu-latest
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
@@ -89,7 +97,7 @@ jobs:
   rust-test:
     runs-on: ubuntu-latest
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
@@ -108,6 +116,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # rust-test and rust-test-integration build the same test
+          # profile with identical env/RUSTFLAGS — share one cache so the
+          # integration job restores rust-test's artifacts instead of
+          # compiling the workspace a second time.
+          shared-key: "rust-tests"
 
       # See rust-lint for the why; sccache is needed because
       # .cargo/config.toml wraps rustc with it unconditionally.
@@ -137,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
       # Opt back in to the container-backed tests that self-skip under CI.
       RUN_INTEGRATION_TESTS: "1"
@@ -158,6 +171,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # rust-test and rust-test-integration build the same test
+          # profile with identical env/RUSTFLAGS — share one cache so the
+          # integration job restores rust-test's artifacts instead of
+          # compiling the workspace a second time.
+          shared-key: "rust-tests"
 
       # See rust-lint for the why; sccache is needed because
       # .cargo/config.toml wraps rustc with it unconditionally.
@@ -190,7 +208,7 @@ jobs:
   rust-js-build:
     runs-on: ubuntu-latest
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
       # CARGO_HOME is set explicitly here because GitHub-hosted
       # runners do NOT preset it, so an unset $CARGO_HOME would
@@ -305,7 +323,7 @@ jobs:
   rust-semver:
     runs-on: ubuntu-latest
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
@@ -342,7 +360,7 @@ jobs:
   rust-nightly:
     runs-on: ubuntu-latest
     env:
-      CARGO_INCREMENTAL: "1"
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v5
