@@ -50,6 +50,42 @@ type Loop struct {
 	lastBeatAt atomic.Int64 // unix nanos; bumped on entry and via Beat()
 	panics     atomic.Int64 // count of recovered panics
 	running    atomic.Bool  // true while inside the wrapper body
+
+	// done is closed when the loop's wrapper body has fully returned —
+	// including any panic-recovery logging via the caller-supplied
+	// LogFn. waitForExited blocks on this channel so callers can
+	// observe the wrapper's post-state (e.g. log output, panics
+	// counter) without racing the goroutine on memory visibility.
+	//
+	// doneInit guards the lazy initialization of done. The wrapper
+	// body is expected to run at most once per loop name (per
+	// (Tracker).Run / RunErr convention in app.RunBackground), so a
+	// single sync.Once is sufficient — a second invocation would need
+	// a new channel, which is the caller's responsibility, not ours.
+	doneOnce sync.Once
+	done     chan struct{}
+}
+
+// Done returns a channel that is closed when the wrapper body has
+// fully exited (including panic-recovery logging). Safe for
+// concurrent use; returns the same channel across calls because
+// Loop is single-shot per name.
+func (l *Loop) Done() <-chan struct{} {
+	ch := l.initDone()
+	return ch
+}
+
+// initDone lazily creates the done channel and returns it (send-end)
+// so the wrapper body can close it via defer. Callers outside the
+// package should use Done() instead. The wrapper body is expected
+// to run at most once per loop name (per (*Tracker).Run / RunErr
+// convention in app.RunBackground); a second invocation would need
+// a fresh channel, which is the caller's responsibility.
+func (l *Loop) initDone() chan struct{} {
+	l.doneOnce.Do(func() {
+		l.done = make(chan struct{})
+	})
+	return l.done
 }
 
 // Name returns the loop's registered name.
@@ -214,6 +250,10 @@ func (t *Tracker) RunErr(ctx context.Context, name, prefix string, logFn LogFn, 
 
 func (t *Tracker) runInner(ctx context.Context, name, prefix string, logFn LogFn, fn func(context.Context) error) {
 	loop := t.Get(name)
+	// Initialize the done channel before marking the loop as running
+	// so a caller polling Done() + Running() can't observe Running=true
+	// with a nil done channel (which would block forever).
+	doneCh := loop.initDone()
 	now := time.Now().UnixNano()
 	loop.startedAt.CompareAndSwap(0, now)
 	loop.lastBeatAt.Store(now)
@@ -224,6 +264,14 @@ func (t *Tracker) runInner(ctx context.Context, name, prefix string, logFn LogFn
 			loop.panics.Add(1)
 			logFn("%spanic recovered: %v\n%s", prefix, r, debug.Stack())
 		}
+		// Close done last so anything the deferred logFn writes
+		// happens-before a receiver on Done(). Channel close is a
+		// release fence; without this, waitForExited-style callers
+		// can observe Running()==false (atomic) while the panic
+		// log is still pending in the goroutine — go test -race
+		// flags this as a memory-ordering race even though the
+		// log buffer itself is mutex-protected.
+		close(doneCh)
 	}()
 	if err := fn(ctx); err != nil {
 		logFn("%sloop returned error: %v", prefix, err)
