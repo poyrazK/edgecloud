@@ -56,16 +56,26 @@ func (t *Tenant) IsDisabled() bool {
 // keys (no json tags); the rename to snake_case is part of the billing v0
 // wire-shape change.
 type Quota struct {
-	TenantID            string    `db:"tenant_id"              json:"tenant_id"`
-	MaxDeployments      int       `db:"max_deployments"        json:"max_deployments"`
-	MaxApps             int       `db:"max_apps"               json:"max_apps"`
-	MaxWorkers          int       `db:"max_workers"            json:"max_workers"`
-	MaxMemoryMB         int       `db:"max_memory_mb"          json:"max_memory_mb"`
-	MaxOutboundMB       int       `db:"max_outbound_mb"        json:"max_outbound_mb"`
-	MaxRequestsPerMonth int       `db:"max_requests_per_month" json:"max_requests_per_month"`
-	UsedOutboundBytes   int64     `db:"used_outbound_bytes"    json:"used_outbound_bytes"`
-	UsedRequestCount    int64     `db:"used_request_count"     json:"used_request_count"`
-	QuotaPeriodStart    time.Time `db:"quota_period_start"     json:"quota_period_start"`
+	TenantID            string `db:"tenant_id"              json:"tenant_id"`
+	MaxDeployments      int    `db:"max_deployments"        json:"max_deployments"`
+	MaxApps             int    `db:"max_apps"               json:"max_apps"`
+	MaxWorkers          int    `db:"max_workers"            json:"max_workers"`
+	MaxMemoryMB         int    `db:"max_memory_mb"          json:"max_memory_mb"`
+	MaxOutboundMB       int    `db:"max_outbound_mb"        json:"max_outbound_mb"`
+	MaxRequestsPerMonth int    `db:"max_requests_per_month" json:"max_requests_per_month"`
+	UsedOutboundBytes   int64  `db:"used_outbound_bytes"    json:"used_outbound_bytes"`
+	UsedRequestCount    int64  `db:"used_request_count"     json:"used_request_count"`
+	// UsedMemoryMB is the aggregate memory (MiB) currently consumed
+	// by the tenant's active deployments (issue #44, part 2).
+	// Incremented on activate / promote, decremented on rollback.
+	// Unlike UsedOutboundBytes / UsedRequestCount, this counter is
+	// NOT month-bounded — the cap is per-tenant-aggregate, not
+	// per-month, so the lazy-rollover CASE against QuotaPeriodStart
+	// would be wrong. The deploy-time gate rejects a new deploy when
+	// UsedMemoryMB + perAppMemory > MaxMemoryMB (with MaxMemoryMB == 0
+	// or < 0 falling through to the per-instance hint path).
+	UsedMemoryMB     int64     `db:"used_memory_mb"         json:"used_memory_mb"`
+	QuotaPeriodStart time.Time `db:"quota_period_start"     json:"quota_period_start"`
 	// QuotaLockGraceUntil is set by applyTenantDelta on free-tier
 	// first-cross of a monthly cap (issue #420). It bounds the
 	// request-time 402 — deploys are blocked immediately, but the

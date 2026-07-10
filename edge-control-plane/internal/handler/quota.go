@@ -97,8 +97,19 @@ func (h *QuotaHandler) GetQuotaInternal(w http.ResponseWriter, r *http.Request) 
 	// over_cap: derived from max_* vs used_*. Sentinel < 0 means
 	// "unlimited" — never over-cap on the unlimited axis. A nil
 	// grace clock is the same as "no lockdown pending".
+	//
+	// Memory axis (issue #44 part 2): used_memory_mb is the per-tenant
+	// aggregate held by active deployments. Unlike used_outbound_bytes /
+	// used_request_count, it does not roll over at month boundary — the
+	// cap is enforced continuously by the deploy-time gate and now also
+	// surfaces here so edge-ingress can flip a serving tenant to 402
+	// while they sort out a rollback. Note that a counter that crosses
+	// the cap from below does NOT itself disable the tenant — that is
+	// the heartbeat applyTenantDelta path's job (issue #420) and is not
+	// duplicated here. Over_cap is purely the read-side signal.
 	overCap := (quota.MaxRequestsPerMonth > 0 && quota.UsedRequestCount >= int64(quota.MaxRequestsPerMonth)) ||
-		(quota.MaxOutboundMB > 0 && quota.UsedOutboundBytes >= int64(quota.MaxOutboundMB)*1024*1024)
+		(quota.MaxOutboundMB > 0 && quota.UsedOutboundBytes >= int64(quota.MaxOutboundMB)*1024*1024) ||
+		(quota.MaxMemoryMB > 0 && quota.UsedMemoryMB >= int64(quota.MaxMemoryMB))
 
 	resp := quotaInternalResponse{
 		Quota:       *quota,

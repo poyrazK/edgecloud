@@ -70,7 +70,7 @@ import (
 // 35 .up.sql + 35 .down.sql = 70 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*), so this is the
 // on-disk file count, not a strict 2× the migration number.
-const splitFileCount = 70 // 35 .up.sql + 35 .down.sql after rebase of #42 + #52 + #420
+const splitFileCount = 72 // +2 from 027_used_memory_mb (issue #44 part 2)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -141,6 +141,7 @@ var wantColumns = map[string][]string{
 		"max_requests_per_month", // 013
 		"used_request_count",     // 013
 		"quota_lock_grace_until", // 025_quotas_grace_columns (issue #420)
+		"used_memory_mb",         // 027_used_memory_mb (issue #44 part 2)
 	},
 	"api_keys": {
 		"id",
@@ -377,6 +378,7 @@ var wantTypes = map[string]map[string]string{
 		"max_requests_per_month": "int4",        // 013
 		"used_request_count":     "int8",        // 013
 		"quota_lock_grace_until": "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
+		"used_memory_mb":         "int8",        // 027_used_memory_mb (issue #44 part 2)
 	},
 	"api_keys": {
 		"id":             "text",
@@ -594,6 +596,7 @@ var wantNotNull = map[string][]string{
 		"quota_period_start",     // 009_quotas_used_outbound
 		"max_requests_per_month", // 013
 		"used_request_count",     // 013
+		"used_memory_mb",         // 027_used_memory_mb (issue #44 part 2)
 	},
 	"api_keys": {
 		"id",
@@ -896,6 +899,7 @@ var wantChecks = map[string]string{
 	"api_keys.api_keys_hash_algorithm_check":             "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",           // 005_api_key_hash_algorithm
 	"app_traffic_splits.app_traffic_splits_weight_check": "CHECK (((weight >= 0) AND (weight <= 100)))",                                        // 009_traffic_splits
 	"autoscale_events.autoscale_events_action_check":     "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))", // 012_autoscale_events
+	"quotas.quotas_used_memory_mb_nonneg":                "CHECK ((used_memory_mb >= 0))",                                                      // 027_used_memory_mb (issue #44 part 2)
 }
 
 // wantDefaults enumerates every public-schema column that has a
@@ -964,6 +968,7 @@ var wantDefaults = map[string]map[string]string{
 		"quota_period_start":     "date_trunc('month'::text, (now() AT TIME ZONE 'UTC'::text))", // 009
 		"used_outbound_bytes":    "0",                                                           // 009
 		"used_request_count":     "0",                                                           // 013
+		"used_memory_mb":         "0",                                                           // 027_used_memory_mb (issue #44 part 2)
 	},
 	"tenants": {
 		"allowlisted_destinations": "'{}'::text[]", // 001
