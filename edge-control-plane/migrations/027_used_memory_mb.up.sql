@@ -1,0 +1,21 @@
+-- +migrate Up
+-- 027_used_memory_mb.up.sql
+--
+-- Issue #44 (part 2): enforce MaxMemoryMB as a deploy-time quota cap.
+--
+-- Adds the per-tenant aggregate memory counter paired with
+-- quota.MaxMemoryMB. The deploy-time gate rejects a new deploy when
+-- used_memory_mb + per_app_memory > MaxMemoryMB. The counter is
+-- mutated transactionally by the activate / rollback / promote paths
+-- in internal/service/deployment.go, mirroring how used_outbound_bytes
+-- and used_request_count move on every heartbeat.
+--
+-- default 0 preserves all existing rows. NOT NULL keeps the
+-- WHERE-clause math (used_memory_mb + $N <= max_memory_mb) simple —
+-- no NULL-coalesce needed in the gate. No backfill is bundled here:
+-- on a hot upgrade, tenants with pre-existing active deployments will
+-- under-report until those apps are next activate / rollback'd. The
+-- deploy-time gate may over-accept on the first deploy after upgrade,
+-- and the next deploy catches the over-cap state.
+
+ALTER TABLE quotas ADD COLUMN used_memory_mb BIGINT NOT NULL DEFAULT 0;

@@ -248,6 +248,24 @@ func (e *PaymentRequiredError) Error() string {
 }
 func (e *PaymentRequiredError) Unwrap() error { return ErrPaymentRequired }
 
+// perAppMemoryMB returns the per-app memory footprint (MiB) the runtime
+// will be told to allocate for a new deployment of this tenant (issue
+// #44, part 2). Mirrors the buildPublishPayload ladder so the runtime
+// hint (TaskMessage.MaxMemoryMB) and the quota counter see the same
+// number — diverge and the gate value at Deploy time stops matching
+// the increment value at Activate time.
+//
+// Plan-tier caps: free=256, pro=512, business=1024, enterprise=-1
+// (handled inside VerifyMemoryUnderCap itself). A zero or negative
+// MaxMemoryMB (legacy / admin-cleared / nil-quota path) falls back to
+// 256 — the pre-#44 buildPublishPayload behavior the runtime expects.
+func (s *DeploymentService) perAppMemoryMB(quota *domain.Quota) int {
+	if quota != nil && quota.MaxMemoryMB > 0 {
+		return quota.MaxMemoryMB
+	}
+	return 256
+}
+
 // PublishError carries the per-region outcome of a fan-out
 // publish. Returned by ActivateDeployment / RollbackDeployment
 // when at least one region's NATS publish failed; the wrapped
@@ -368,6 +386,13 @@ type quotaRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	VerifyUnderCap(ctx context.Context, tenantID string, projectedRequests, projectedOutboundBytes int64) (bool, error)
+	// VerifyMemoryUnderCap is the deploy-time aggregate-memory gate
+	// (issue #44, part 2). See internal/repository/quota.go.
+	VerifyMemoryUnderCap(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error)
+	// AddMemoryMB increments/decrements used_memory_mb. Called via
+	// WithTx(tx) inside activate / rollback / promote so the counter
+	// commits atomically with the active_deployments mutation.
+	AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error)
 }
 
 // billingRepoForDeploymentSvc is the subset of *repository.BillingRepository
@@ -780,6 +805,23 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		}
 		if !ok {
 			return nil, false, &PaymentRequiredError{Reason: "quota_will_be_exceeded"}
+		}
+	}
+
+	// Pre-check 5: tenant-aggregate memory gate (issue #44, part 2).
+	// Skipped when the overage grace is active (quota==nil) and
+	// when the tenant's MaxMemoryMB is the unlimited sentinel (<0)
+	// or unset (==0); both are honored inside VerifyMemoryUnderCap
+	// itself. perAppMemoryMB is the same value the activate path
+	// will increment the counter by — see perAppMemoryMB() below.
+	if quota != nil {
+		perAppMemoryMB := int64(s.perAppMemoryMB(quota))
+		ok, err := s.quotaRepo.VerifyMemoryUnderCap(ctx, tenantID, perAppMemoryMB)
+		if err != nil {
+			return nil, false, fmt.Errorf("verifying memory cap: %w", err)
+		}
+		if !ok {
+			return nil, false, &PaymentRequiredError{Reason: "memory_quota_will_be_exceeded"}
 		}
 	}
 
@@ -1286,6 +1328,26 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		}); err != nil {
 			return fmt.Errorf("enqueueing outbox row: %w", err)
 		}
+		// Issue #44, part 2: read quota inside the tx so the
+		// per-app memory value used to build the TaskMessage
+		// (above) and the value used to bump the counter
+		// (below) provably come from the same snapshot. Then
+		// increment the per-tenant aggregate memory counter
+		// inside the same tx as the active_deployments mutation
+		// so a rollback of any statement above (outbox INSERT,
+		// build payload, ClearStableSince, Set) reverts this
+		// counter too. Must use WithTx(tx) — calling the outer
+		// s.quotaRepo would open a different connection and
+		// break atomicity, leaving the counter ahead of the
+		// active_deployments row set.
+		activateQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota for activate: %w", err)
+		}
+		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, int64(s.perAppMemoryMB(activateQuota)))
+		if err != nil {
+			return fmt.Errorf("incrementing memory quota: %w", err)
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("setting active deployment: %w", err)
@@ -1365,10 +1427,7 @@ func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx
 	if err != nil {
 		return nil, fmt.Errorf("getting quota: %w", err)
 	}
-	maxMemoryMB := 256
-	if quota != nil && quota.MaxMemoryMB > 0 {
-		maxMemoryMB = quota.MaxMemoryMB
-	}
+	maxMemoryMB := s.perAppMemoryMB(quota)
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
@@ -1583,6 +1642,20 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			regions = []string{s.defaultRegion}
 		}
 
+		// Issue #44, part 2: capture the per-app memory footprints of
+		// the deployment LEAVING the active set (current.DeploymentID)
+		// and ENTERING it (rolledBackID) before the Set rewrites
+		// active_deployments. Both deltas are applied inside the
+		// rollback tx via QuotaRepository.WithTx(tx).AddMemoryMB so
+		// the counter mutates atomically with the active row swap —
+		// a tx failure rolls back both the row mutation and the
+		// counter increment/decrement.
+		rollbackQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota: %w", err)
+		}
+		rollbackPerApp := int64(s.perAppMemoryMB(rollbackQuota))
+
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
 		// that requires an N-step history table, out of scope for the
@@ -1641,6 +1714,23 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		}); err != nil {
 			return fmt.Errorf("enqueueing outbox row: %w", err)
 		}
+		// Issue #44, part 2: apply the per-tenant memory delta for the
+		// active-row swap. Both sides are accounted for because the
+		// rolled-back-FROM deployment leaves the active set (so its
+		// footprint goes down) AND the rolled-back-TO deployment enters
+		// it (so its footprint comes back up). For the typical case
+		// where both are the same plan tier — which is the common case
+		// since activate and rollback both consume the same quota
+		// footprint — the two deltas cancel and the counter ends where
+		// it started. For tier migrations (tenant upgraded plan between
+		// activate and rollback) the net delta is non-zero and the
+		// counter follows the active row's actual memory footprint.
+		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, rollbackPerApp); err != nil {
+			return fmt.Errorf("adding memory quota for rolled-back-to deployment: %w", err)
+		}
+		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, -rollbackPerApp); err != nil {
+			return fmt.Errorf("subtracting memory quota for rolled-back-from deployment: %w", err)
+		}
 		return nil
 	}); err != nil {
 		return "", err
@@ -1687,10 +1777,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 	if err != nil {
 		return fmt.Errorf("getting quota: %w", err)
 	}
-	maxMemoryMB := 256
-	if quota != nil && quota.MaxMemoryMB > 0 {
-		maxMemoryMB = quota.MaxMemoryMB
-	}
+	maxMemoryMB := s.perAppMemoryMB(quota)
 
 	var failedApps []string
 	for _, ad := range activeList {
