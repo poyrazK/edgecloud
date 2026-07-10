@@ -645,15 +645,24 @@ func TestRun_FiresImmediatelyThenRespectsCancellation(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for the immediate-first-sweep to publish.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(pub.calls) >= 1 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Wait deterministically for the immediate-first-sweep to finish
+	// publishing (issue #586). FirstPublishDone() closes at the end
+	// of the first runOnce — by which point every PublishFullSync
+	// call inside the sweep has completed AND the publisher's mu
+	// has been released, so reading pub.calls without holding the
+	// lock is safe. The prior time.Sleep + len(pub.calls) polling
+	// was racy under -race -count=20 because it read pub.calls
+	// outside the publisher's mu.
+	select {
+	case <-svc.FirstPublishDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("FirstPublishDone did not fire within 2s")
 	}
-	if got := len(pub.calls); got != 1 {
+
+	pub.mu.Lock()
+	callsAfterFirst := len(pub.calls)
+	pub.mu.Unlock()
+	if got := callsAfterFirst; got != 1 {
 		t.Fatalf("after immediate sweep: calls=%d, want 1", got)
 	}
 

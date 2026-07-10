@@ -124,10 +124,18 @@ func TestPreviewGC_FirstSweep_FiresImmediately(t *testing.T) {
 		close(done)
 	}()
 
-	// Immediate sweep runs synchronously before Run returns to the
-	// select, so a tiny yield is enough to make the assertions
-	// deterministic on busy CI.
-	time.Sleep(20 * time.Millisecond)
+	// Wait deterministically for the immediate-first-sweep to finish
+	// (issue #586). FirstSweepDone() closes at the end of the first
+	// runOnce, after both blob deletes AND row deletes have run —
+	// so by the time we read repo.listCalled / repo.deleteCalled /
+	// blobs.calls, all the writes are visible. The 2s ceiling is
+	// generous enough for busy CI but short enough that a broken
+	// service fails the test fast.
+	select {
+	case <-svc.FirstSweepDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("FirstSweepDone did not fire within 2s")
+	}
 
 	if !repo.listCalled {
 		t.Error("ListExpiredPreviewBlobs was not called on first sweep")
@@ -174,12 +182,16 @@ func TestPreviewGC_BlobDeleteFails_StillDeletesOthers(t *testing.T) {
 	go func() {
 		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	// Wait for the immediate-first-sweep to complete (issue #586).
+	// We can't assert on deletedIDs before the sweep ran — without
+	// this handshake the prior version had to time.Sleep(20ms) and
+	// hope the goroutine had scheduled.
+	select {
+	case <-svc.FirstSweepDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("FirstSweepDone did not fire within 2s")
+	}
 	cancel()
-	// Give the goroutine a moment to exit; it's already inside
-	// runOnce when we cancel so the loop bails at the next
-	// ctx.Err() check.
-	time.Sleep(20 * time.Millisecond)
 
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
@@ -206,9 +218,15 @@ func TestPreviewGC_ListError_LoopContinues(t *testing.T) {
 	defer cancel()
 
 	go svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
-	time.Sleep(20 * time.Millisecond)
+	// Wait for the immediate-first-sweep to finish, then cancel and
+	// check the blob store has zero deletes (issue #586). The prior
+	// time.Sleep(20ms) version was racy under -race -count=20.
+	select {
+	case <-svc.FirstSweepDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("FirstSweepDone did not fire within 2s")
+	}
 	cancel()
-	time.Sleep(20 * time.Millisecond)
 
 	blobs.mu.Lock()
 	defer blobs.mu.Unlock()

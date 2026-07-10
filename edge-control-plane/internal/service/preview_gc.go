@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -64,10 +65,40 @@ type previewBlobDeleter interface {
 type PreviewGCService struct {
 	repo  previewRepoForGC
 	blobs previewBlobDeleter
+	// firstSweepDone is closed at the end of the first runOnce()
+	// inside Run. Tests wait on this channel instead of
+	// time.Sleep(N) to synchronize on the immediate-first-sweep
+	// (issue #586 — replaces the liveness-racy time.Sleep pattern
+	// with a deterministic done-channel handshake, mirroring the
+	// Loop.Done() pattern from the loophealth PR #585 fix). The
+	// channel is allocated in NewPreviewGCService so tests can
+	// grab a reference to it BEFORE calling Run in a goroutine
+	// and start the wait immediately — no race on "has Run
+	// started yet". Never closed if Run is never called.
+	firstSweepDone chan struct{}
 }
 
 func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter) *PreviewGCService {
-	return &PreviewGCService{repo: repo, blobs: blobs}
+	return &PreviewGCService{
+		repo:           repo,
+		blobs:          blobs,
+		firstSweepDone: make(chan struct{}),
+	}
+}
+
+// FirstSweepDone returns a channel that closes at the end of the
+// first runOnce inside Run. Tests use it to synchronize on the
+// immediate-first-sweep without racing on time.Sleep(N) (issue
+// #586). Always returns the same channel; never closes if Run
+// isn't called.
+//
+// Receivers are free to wait on the returned channel even before
+// Run is invoked — the channel is allocated at construction time
+// so the goroutine that calls Run in the background and the test
+// goroutine that waits on the channel can be scheduled in either
+// order without liveness races.
+func (s *PreviewGCService) FirstSweepDone() <-chan struct{} {
+	return s.firstSweepDone
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires
@@ -194,7 +225,28 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 		}
 	}
 
+	// firstSweepOnce closes firstSweepDone exactly once, after the
+	// first runOnce returns. Tests wait on FirstSweepDone() instead
+	// of time.Sleep(N) to synchronize on the immediate-first-sweep
+	// (issue #586). We close it regardless of whether the sweep did
+	// any work — "we ran the first sweep" is the contract; "the
+	// sweep deleted at least one row" is a separate signal the
+	// tests can assert on top. The defer sits BEFORE the first
+	// runOnce() call so even a panicking first sweep still signals
+	// "the goroutine completed" to any test waiting on the channel
+	// — matching the memory-rule close(chan) inside the goroutine,
+	// never after.
+	var firstSweepOnce sync.Once
+	defer func() {
+		firstSweepOnce.Do(func() {
+			close(s.firstSweepDone)
+		})
+	}()
+
 	runOnce()
+	firstSweepOnce.Do(func() {
+		close(s.firstSweepDone)
+	})
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
