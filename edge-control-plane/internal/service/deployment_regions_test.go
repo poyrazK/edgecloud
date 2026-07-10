@@ -925,6 +925,14 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	)).
 		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Issue #501 retry-cap: publishSwap unconditionally resets
+	// region_cache_retry_count inside the same tx so the sweep
+	// counter is per-deployment.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET region_cache_retry_count = '{}'::jsonb`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	svc := &DeploymentService{
@@ -1117,6 +1125,14 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 	)).
 		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Issue #501 retry-cap: publishSwap unconditionally resets
+	// region_cache_retry_count inside the same tx so the sweep
+	// counter is per-deployment.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET region_cache_retry_count = '{}'::jsonb`,
+	)).
+		WithArgs(tenantID, appName).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	svc := &DeploymentService{
@@ -1206,6 +1222,14 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 		`UPDATE active_deployments SET regions_cached = (`,
 	)).
 		WithArgs(tenantID, appName, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Issue #501 retry-cap: publishSwap unconditionally resets
+	// region_cache_retry_count inside the same tx so the sweep
+	// counter is per-deployment.
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET region_cache_retry_count = '{}'::jsonb`,
+	)).
+		WithArgs(tenantID, appName).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
