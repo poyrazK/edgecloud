@@ -726,6 +726,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 			deploymentSvc.GetCachePusher,
 			deploymentSvc.GetRegionArtifactCaches,
 			func() int { return cfg.CacheRetry.MaxAttempts },
+			metricsAgg.NewCacheRetrySweepSink(),
 		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
