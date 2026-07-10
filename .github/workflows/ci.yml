@@ -349,7 +349,7 @@ jobs:
           key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
 
       - name: Run go test
-        run: go test -coverprofile=cover.out -covermode=atomic ./...
+        run: go test -race -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Coverage summary
         run: go tool cover -func=cover.out
