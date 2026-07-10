@@ -31,7 +31,7 @@ reactor adapter). The wrapped component is what `edge build` emits to
 
 ```sh
 cd samples/hello-js
-npm install                    # resolves @edgecloud/sdk from local edge-js-sdk
+npm install                    # resolves @edgecloud/sdk from npm (^0.2.0)
 edge build --lang=js           # bundles src/handler.js, builds edge-js-runtime, wraps with adapter
 ```
 
@@ -48,7 +48,7 @@ edge deploy
 ```
 samples/hello-js/
 ├── edge.toml         # [project] name = "hello-js", language = "js"
-├── package.json      # @edgecloud/sdk from local edge-js-sdk (file:../../edge-js-sdk)
+├── package.json      # @edgecloud/sdk from npm (^0.2.0)
 ├── src/
 │   └── handler.js    # globalThis.handleRequest(req) → {status, body, contentType}
 └── README.md         # this file
