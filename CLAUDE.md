@@ -27,8 +27,8 @@ This is a **Cargo workspace** at the repo root (`Cargo.toml`, `[workspace] resol
 
 **Excluded from the workspace** (`Cargo.toml [workspace.exclude]`):
 - `edge-worker/tests/fixtures/handler` — built separately by the Phase E fixture-build script. Uses `wasm32-unknown-unknown` and an older `wit-bindgen` pin.
-- `edge-js-runtime` — QuickJS runtime for the JS/QuickJS pilot (issue #317). Exports the `edge-runtime-handler` (FaaS) world (`wasi:http/incoming-handler@0.2.1`). The `register_*` namespace helpers are factored into `edge-js-runtime/src/register.rs` and reused by the LR sibling.
-- `edge-js-runtime-long` — QuickJS runtime rlib for the long-running `edge-runtime` world (issue #426). rlib-only (NOT cdylib) because the canonical world requires `start: func()` as an export, and a cdylib in this crate would land a second `start` symbol in the shim's final link and clash. The cdylib is produced by the shim (`samples/hello-js-ws/`); this crate just supplies the per-namespace registrars + `compile_user_bundle` + `USER_BYTECODE` once, shared by every shim.
+
+`edge-js-runtime` (QuickJS runtime for the FaaS / `edge-runtime-handler` world, issue #317) and `edge-js-runtime-long` (rlib for the long-running / `edge-runtime` world, issue #426) are also workspace members (issue #510). The `register_*` namespace helpers are factored into `edge-js-runtime/src/register.rs` and reused (via duplication) by the LR sibling; the LR crate is rlib-only (NOT cdylib) because the canonical world requires `start: func()` as an export, and a cdylib in this crate would land a second `start` symbol in the shim's final link and clash.
 
 **Documentation map:**
 - `whitepaper.md` is the broad design doc (2026-06-14). Per-tool design docs (e.g. `edge-migrate/docs/design.md`) are scoped to one tool and may be newer — **when the two conflict, trust the per-tool design doc**. Treat any design doc as the source of intent, but always verify against the actual code.
@@ -433,7 +433,7 @@ The `ArtifactStore` interface (`storage/artifact.go`) covers `Save`/`Open`/`Dele
 
 ## Conventions & Gotchas
 
-- **Cargo workspace at the root.** `[workspace]` is in `/Cargo.toml`; 9 members listed under `[workspace.members]`. `cargo --workspace` is the default; use `--manifest-path` only for surgical single-crate work. Adding a new crate: edit `[workspace.members]` and (if it can't share resolver-2 defaults) add to `[workspace.exclude]`.
+- **Cargo workspace at the root.** `[workspace]` is in `/Cargo.toml`; 11 crates listed under `[workspace.members]` (9 host crates + 2 JS runtime crates, issue #510). `cargo --workspace` is the default; use `--manifest-path` only for surgical single-crate work. Adding a new crate: edit `[workspace.members]` and (if it can't share resolver-2 defaults) add to `[workspace.exclude]`. `edge-test-helpers/` is a path-dep pulled into workspace builds by `edge-worker`/`edge-ingress`'s `[dev-dependencies]` but is not an explicit member (kept off `[workspace.members]` so its `testcontainers` + `async-nats` transitive closure doesn't widen the workspace build for every member).
 - **`edge-runtime` engine is meant to be shared.** Create one engine per worker process via `edge_runtime::create_engine()`. Per-app `StandbyPool` reuses it across instances.
 - **Bridge sync → async.** The WIT trait impls in `runtime.rs` are sync; async work (`http_client.fetch()`, `http_server` accept loops, `egress_transport::spawn_send_request_handler`) is bridged via `tokio::runtime::Handle::current().block_on(...)`. Don't move async work outside that bridge — the historical foot-gun was a blocking reqwest runtime panic when dropped in an async context.
 - **Guest exit vs. wasm trap.** Always check `RuntimeState::exit_requested()` after a guest call returns `Err` — a clean `process.exit` looks like a trap to wasmtime.

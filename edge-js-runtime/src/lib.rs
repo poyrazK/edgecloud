@@ -42,11 +42,11 @@ pub mod edge_modules;
 // `edge-js-runtime-long/` can share the bodies (it has its own
 // `register` with the same body but bound to its own bindgen-generated
 // `edge::cloud::*`). See `register.rs` header for the full duplication
-// rationale. The sibling crate is added to the workspace's `exclude`
-// list (parallel to `edge-js-runtime` itself) because it intentionally
-// uses the same `wit-bindgen 0.45` + `rquickjs 0.9` pins — normalizing
-// these into a single workspace member would force `wit-bindgen`
-// versions across the rest of the workspace.
+// rationale. Both crates are now workspace members (issue #510); the
+// shared `wit-bindgen 0.45` + `rquickjs 0.9` pins stay inline in each
+// `Cargo.toml` (see decision in #510: hoisting them to
+// `[workspace.dependencies]` would only matter if a third host member
+// adopted them, which the current roadmap does not anticipate).
 #[cfg(target_arch = "wasm32")]
 pub mod register;
 
