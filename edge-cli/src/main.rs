@@ -5,6 +5,7 @@ mod commands;
 pub mod config;
 mod migrate;
 mod output;
+mod scaffold;
 mod state;
 
 use anyhow::{Context, Result};
