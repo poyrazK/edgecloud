@@ -111,19 +111,79 @@ func (d *OutboxDrainer) Tick(ctx context.Context) {
 // column with the outbox's dedupe_key, which mixed two different
 // audit trails; the outbox row is the authoritative record of
 // publish attempts post-#42.
+//
+// Issue #569: dispatch switches on row.Kind:
+//   - "task_update" | "full_sync"   → unmarshal as nats.TaskMessage,
+//                                    call PublishTaskUpdate per region.
+//   - "task_purge"                 → unmarshal as nats.PurgePayload,
+//                                    call PublishPurge per region.
+//   - anything else                → terminal failure (unknown kind)
+//                                    so a future kind lands in a
+//                                    controlled failure row rather
+//                                    than silently dropping.
+//
+// Ordering invariant: a `task_update` for tenant T may already be
+// claimed (in_flight, not yet published) when `task_purge` for the
+// same tenant is enqueued. The drainer's claim window + JetStream
+// order ensure the older row lands first; we don't add a
+// tenant-scoped lock here.
 func (d *OutboxDrainer) processRow(ctx context.Context, row *repository.OutboxRow) {
+	// Decode + per-region publish are kind-specific; per-kind errors
+	// (decode failure, unknown kind) are terminal-marked at the
+	// boundary so the row can be inspected.
+	switch row.Kind {
+	case nats.TaskMessageKindTaskUpdate, nats.TaskMessageKindFullSync:
+		d.processTaskRow(ctx, row)
+	case nats.TaskMessageKindTaskPurge:
+		d.processPurgeRow(ctx, row)
+	default:
+		log.Printf("outbox: row %d unknown kind=%q — terminal", row.ID, row.Kind)
+		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
+			"unknown kind: "+row.Kind, d.maxAttempts, time.Now())
+	}
+}
+
+// processTaskRow handles the task_update / full_sync branch — the
+// pre-#569 dispatch path. Extracted so processRow can fan out per-kind
+// without growing the function body further.
+func (d *OutboxDrainer) processTaskRow(ctx context.Context, row *repository.OutboxRow) {
 	var msg nats.TaskMessage
 	if err := json.Unmarshal(row.Payload, &msg); err != nil {
-		// Malformed payload is unrecoverable — mark failed at max attempts
-		// with a clear error so an operator can inspect the row.
 		log.Printf("outbox: row %d payload unmarshal failed: %v", row.ID, err)
-		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts, "payload unmarshal: "+err.Error(), d.maxAttempts, time.Now())
+		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
+			"payload unmarshal: "+err.Error(), d.maxAttempts, time.Now())
 		return
 	}
+	d.fanOutAndMark(ctx, row, func(region string) error {
+		return d.publisher.PublishTaskUpdate(region, &msg)
+	})
+}
 
+// processPurgeRow handles the task_purge branch (issue #569). The
+// payload is a PurgePayload (distinct struct from TaskMessage — see
+// nats.PurgePayload for the rationale). Per-region failures follow
+// the same retry ladder as processTaskRow.
+func (d *OutboxDrainer) processPurgeRow(ctx context.Context, row *repository.OutboxRow) {
+	var msg nats.PurgePayload
+	if err := json.Unmarshal(row.Payload, &msg); err != nil {
+		log.Printf("outbox: row %d purge payload unmarshal failed: %v", row.ID, err)
+		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
+			"purge payload unmarshal: "+err.Error(), d.maxAttempts, time.Now())
+		return
+	}
+	d.fanOutAndMark(ctx, row, func(region string) error {
+		return d.publisher.PublishPurge(region, &msg)
+	})
+}
+
+// fanOutAndMark invokes publish for each region in row.Regions and
+// either MarkPublished (all OK) or MarkFailed (any failure; backoff
+// per backoffFor). Extracted from the pre-#569 inline loop so both
+// processTaskRow and processPurgeRow share the retry ladder.
+func (d *OutboxDrainer) fanOutAndMark(ctx context.Context, row *repository.OutboxRow, publish func(region string) error) {
 	var firstErr error
 	for _, region := range row.Regions {
-		if err := d.publisher.PublishTaskUpdate(region, &msg); err != nil {
+		if err := publish(region); err != nil {
 			log.Printf("outbox: row %d publish to %q failed: %v", row.ID, region, err)
 			if firstErr == nil {
 				firstErr = err
