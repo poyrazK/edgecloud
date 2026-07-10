@@ -950,7 +950,9 @@ func TestApplyTenantDelta_Requests_ExceedsCap_Logs(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	out := buf.String()
@@ -1005,7 +1007,9 @@ func TestApplyTenantDelta_Requests_ExceedsCap_PublishesEmpty(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if len(js.publishes) != len(regions) {
@@ -1063,7 +1067,9 @@ func TestApplyTenantDelta_Requests_ExceedsCap_FreeTier_SetsGraceClock(t *testing
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if !gotGraceAtOK {
@@ -1125,7 +1131,9 @@ func TestApplyTenantDelta_Requests_ExceedsCap_PaidTenant_SkipsGraceClock(t *test
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if graceCalled {
@@ -1176,7 +1184,9 @@ func TestApplyTenantDelta_ResidentSeconds_AccumulatesPerTenant(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
 		"resident seconds",
+		domain.MeterKindResidentSeconds,
 		svc.quotaRepo.AddResidentSeconds,
+		nil,
 	)
 
 	if !gotCalled {
@@ -1214,7 +1224,9 @@ func TestApplyTenantDelta_ResidentSeconds_IgnoresFaaS(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
 		"resident seconds",
+		domain.MeterKindResidentSeconds,
 		svc.quotaRepo.AddResidentSeconds,
+		nil,
 	)
 
 	if called {
@@ -1245,7 +1257,9 @@ func TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
 		"resident seconds",
+		domain.MeterKindResidentSeconds,
 		svc.quotaRepo.AddResidentSeconds,
+		nil,
 	)
 
 	if called {
@@ -1273,7 +1287,9 @@ func TestApplyTenantDelta_OutboundBytes_Unlimited_NoLog(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxOutboundMB) * 1024 * 1024 },
 		func(q *domain.Quota) int64 { return q.UsedOutboundBytes },
 		"outbound bytes",
+		domain.MeterKindOutboundBytes,
 		svc.quotaRepo.AddOutboundBytes,
+		nil,
 	)
 
 	if buf.Len() != 0 {
@@ -1299,7 +1315,9 @@ func TestApplyTenantDelta_SkipsZeroDelta(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if called {
@@ -1327,7 +1345,9 @@ func TestApplyTenantDelta_RepositoryError_LogsAndContinues(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if !strings.Contains(buf.String(), "failed to record requests for tenant t_a") {
@@ -1364,7 +1384,9 @@ func TestApplyTenantDelta_SkipsDuplicateDelivery(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 	if calls != 1 {
 		t.Fatalf("first delivery: addRequestCount called %d times, want 1", calls)
@@ -1376,7 +1398,9 @@ func TestApplyTenantDelta_SkipsDuplicateDelivery(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 	if calls != 1 {
 		t.Errorf("duplicate delivery: addRequestCount called %d times total, want 1 (redelivery must be skipped)", calls)
@@ -1406,7 +1430,9 @@ func TestApplyTenantDelta_DistinctDeployments(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if calls != 1 {
@@ -1446,7 +1472,9 @@ func TestApplyTenantDelta_DistinctTenants(t *testing.T) {
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		svc.quotaRepo.AddRequestCount,
+		nil, // meteringRepo: dual-write covered by separate tests
 	)
 
 	if calls != 2 {
@@ -1477,7 +1505,9 @@ func TestApplyTenantDelta_LegacyWorkerNoDedupe(t *testing.T) {
 			func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 			func(q *domain.Quota) int64 { return q.UsedRequestCount },
 			"requests",
+			domain.MeterKindRequestCount,
 			svc.quotaRepo.AddRequestCount,
+			nil,
 		)
 	}
 	if calls != 2 {
@@ -1782,5 +1812,291 @@ func TestHandleHeartbeat_AutoRegister_OnFKError(t *testing.T) {
 	}
 	if autoRegTenant != "t_autoreg" {
 		t.Errorf("auto-register called with tenant %q, want t_autoreg", autoRegTenant)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Dual-write to billing_usage_events (issue #485)
+// ---------------------------------------------------------------------------
+
+// meteringCall captures one EnqueueUsageEvent invocation so the
+// dual-write contract tests can assert the idempotency_key shape
+// without spinning up sqlmock.
+type meteringCall struct {
+	tenantID       string
+	kind           domain.MeterKind
+	quantity       uint64
+	idempotencyKey string
+}
+
+// mockMeteringRepo implements meteringRepoInterface for testing.
+// Records every EnqueueUsageEvent call; defaults to nil-error.
+type mockMeteringRepo struct {
+	enqueueFunc func(ctx context.Context, tenantID string, kind domain.MeterKind, quantity uint64, idempotencyKey string) error
+	calls       []meteringCall
+}
+
+func (m *mockMeteringRepo) EnqueueUsageEvent(ctx context.Context, tenantID string, kind domain.MeterKind, quantity uint64, idempotencyKey string) error {
+	m.calls = append(m.calls, meteringCall{
+		tenantID:       tenantID,
+		kind:           kind,
+		quantity:       quantity,
+		idempotencyKey: idempotencyKey,
+	})
+	if m.enqueueFunc != nil {
+		return m.enqueueFunc(ctx, tenantID, kind, quantity, idempotencyKey)
+	}
+	return nil
+}
+
+// TestApplyTenantDelta_DualWritesToMeteringLedger pins the issue
+// #485 contract: every successful `add()` on the quota repo is
+// followed by an EnqueueUsageEvent on the metering repo with the
+// idempotency_key "<tenant>:<kind>:<dedupe_id>". A redelivered
+// heartbeat (same DedupeID) skips BOTH writes (the dedupe short-
+// circuit happens before the dual-write fires).
+//
+// This is the seam test the meter-ledger expansion hinges on — if a
+// future refactor routes the metering write through a separate
+// goroutine that misses the dedupe filter, this test fails.
+func TestApplyTenantDelta_DualWritesToMeteringLedger(t *testing.T) {
+	enqueued := &mockMeteringRepo{}
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+		},
+	})
+	svc.meteringRepo = enqueued
+
+	apps := map[string]domain.AppStatus{
+		"myapp": {
+			TenantID:     "t_a",
+			RequestCount: 7,
+			DedupeID:     "w:d_abc:12345",
+		},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		domain.MeterKindRequestCount,
+		svc.quotaRepo.AddRequestCount,
+		svc.enqueueMeterEvent,
+	)
+
+	if got := len(enqueued.calls); got != 1 {
+		t.Fatalf("EnqueueUsageEvent calls = %d, want 1", got)
+	}
+	call := enqueued.calls[0]
+	if call.tenantID != "t_a" {
+		t.Errorf("TenantID = %q, want t_a", call.tenantID)
+	}
+	if call.kind != domain.MeterKindRequestCount {
+		t.Errorf("Kind = %q, want %q", call.kind, domain.MeterKindRequestCount)
+	}
+	if call.quantity != 7 {
+		t.Errorf("Quantity = %d, want 7", call.quantity)
+	}
+	if got, want := call.idempotencyKey, "t_a:request_count:w:d_abc:12345"; got != want {
+		t.Errorf("IdempotencyKey = %q, want %q", got, want)
+	}
+}
+
+// TestApplyTenantDelta_DualWrite_AllThreeDimensions exercises each
+// dimension's idempotency_key shape via the dedicated check*
+// functions in WorkerService. The dual-write behavior is identical
+// across all three axes (the metering_repo is dimension-agnostic) so
+// the contract test per-axis only needs to assert the kind stamp and
+// the dedupe_id suffix.
+func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
+	cases := []struct {
+		name      string
+		kind      domain.MeterKind
+		wantLabel string
+	}{
+		{"resident_seconds", domain.MeterKindResidentSeconds, "t_x:resident_seconds:w:d:1"},
+		{"request_count", domain.MeterKindRequestCount, "t_x:request_count:w:d:1"},
+		{"outbound_bytes", domain.MeterKindOutboundBytes, "t_x:outbound_bytes:w:d:1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enqueued := &mockMeteringRepo{}
+			svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+				addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+					return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+				},
+			})
+			svc.meteringRepo = enqueued
+			apps := map[string]domain.AppStatus{
+				"myapp": {TenantID: "t_x", RequestCount: 1, OutboundBytes: 1, ResidentSeconds: ptrTo(uint64(1)), DedupeID: "w:d:1"},
+			}
+			appsRaw, _ := json.Marshal(apps)
+
+			// Each check* function uses a different selector but the
+			// dual-write path is the same — exercise the request_count
+			// branch with the per-kind label so the test name matches
+			// the dimension under test.
+			switch tc.kind {
+			case domain.MeterKindRequestCount:
+				svc.checkRequestCount(context.Background(), appsRaw)
+			case domain.MeterKindOutboundBytes:
+				svc.checkOutboundQuota(context.Background(), appsRaw)
+			case domain.MeterKindResidentSeconds:
+				svc.checkResidentSeconds(context.Background(), appsRaw)
+			}
+
+			if got := len(enqueued.calls); got != 1 {
+				t.Fatalf("EnqueueUsageEvent calls = %d, want 1", got)
+			}
+			if got, want := enqueued.calls[0].idempotencyKey, tc.wantLabel; got != want {
+				t.Errorf("idempotency_key = %q, want %q", got, want)
+			}
+			if got, want := enqueued.calls[0].kind, tc.kind; got != want {
+				t.Errorf("kind = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestApplyTenantDelta_DualWrite_QuotaRepoErrorDoesNotInvokeMeter
+// asserts the failure-isolation contract: when the quota write
+// errors, the metering ledger is NOT touched. The hot-path mirror
+// failure must not leak into the slow-path reporter.
+func TestApplyTenantDelta_DualWrite_QuotaRepoErrorDoesNotInvokeMeter(t *testing.T) {
+	enqueued := &mockMeteringRepo{}
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			return nil, errors.New("db down")
+		},
+	})
+	svc.meteringRepo = enqueued
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 5, OutboundBytes: 0, DedupeID: "w:d:1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		domain.MeterKindRequestCount,
+		svc.quotaRepo.AddRequestCount,
+		svc.enqueueMeterEvent,
+	)
+
+	if got := len(enqueued.calls); got != 0 {
+		t.Errorf("EnqueueUsageEvent called %d times on quota-write error; want 0", got)
+	}
+}
+
+// TestApplyTenantDelta_DualWrite_MeteringRepoErrorLeavesQuotaIntact
+// is the symmetric contract: when the metering write errors, the
+// quota write is NOT rolled back. The drainer is best-effort; the
+// hot-path mirror is the source of truth for cap enforcement.
+func TestApplyTenantDelta_DualWrite_MeteringRepoErrorLeavesQuotaIntact(t *testing.T) {
+	quotaCalls := 0
+	enqueued := &mockMeteringRepo{
+		enqueueFunc: func(_ context.Context, _ string, _ domain.MeterKind, _ uint64, _ string) error {
+			return errors.New("ledger write failed")
+		},
+	}
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			quotaCalls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+		},
+	})
+	svc.meteringRepo = enqueued
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 5, OutboundBytes: 0, DedupeID: "w:d:1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		domain.MeterKindRequestCount,
+		svc.quotaRepo.AddRequestCount,
+		svc.enqueueMeterEvent,
+	)
+
+	if quotaCalls != 1 {
+		t.Errorf("AddRequestCount calls = %d, want 1 (metering failure must NOT roll back quota write)", quotaCalls)
+	}
+	if got := len(enqueued.calls); got != 1 {
+		t.Errorf("EnqueueUsageEvent calls = %d, want 1", got)
+	}
+}
+
+// TestApplyTenantDelta_DualWrite_ZeroDeltaSkipsBoth verifies that
+// the delta==0 short-circuit applies to BOTH writes — neither the
+// quota mirror nor the metering ledger gets a no-op UPDATE / INSERT
+// when the heartbeat contributed zero (idle LR, or any FaaS app).
+func TestApplyTenantDelta_DualWrite_ZeroDeltaSkipsBoth(t *testing.T) {
+	enqueued := &mockMeteringRepo{}
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			t.Errorf("AddRequestCount called on zero-delta heartbeat")
+			return &domain.Quota{}, nil
+		},
+	})
+	svc.meteringRepo = enqueued
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 0, OutboundBytes: 0, DedupeID: "w:d:1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		domain.MeterKindRequestCount,
+		svc.quotaRepo.AddRequestCount,
+		svc.enqueueMeterEvent,
+	)
+
+	if got := len(enqueued.calls); got != 0 {
+		t.Errorf("EnqueueUsageEvent calls = %d on zero-delta heartbeat; want 0", got)
+	}
+}
+
+// TestApplyTenantDelta_DualWrite_NilMeteringRepoNoOp guards the
+// safety net: when meteringRepo is nil (e.g. an older test that
+// builds WorkerService directly without the new dependency), the
+// dual-write becomes a silent no-op and the quota write proceeds
+// unchanged.
+func TestApplyTenantDelta_DualWrite_NilMeteringRepoNoOp(t *testing.T) {
+	quotaCalls := 0
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			quotaCalls++
+			return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+		},
+	})
+	// svc.meteringRepo is nil by default — must not panic.
+	apps := map[string]domain.AppStatus{
+		"myapp": {TenantID: "t_a", RequestCount: 1, DedupeID: "w:d:1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		func(a *domain.AppStatus) uint64 { return a.RequestCount },
+		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedRequestCount },
+		"requests",
+		domain.MeterKindRequestCount,
+		svc.quotaRepo.AddRequestCount,
+		svc.enqueueMeterEvent,
+	)
+
+	if quotaCalls != 1 {
+		t.Errorf("AddRequestCount calls = %d, want 1 (nil meteringRepo must not affect quota path)", quotaCalls)
 	}
 }

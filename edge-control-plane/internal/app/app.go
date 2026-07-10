@@ -148,6 +148,11 @@ func New(
 	// active_deployments mutation; the OutboxDrainer (below) relays
 	// them after commit.
 	outboxRepo := repository.NewOutboxRepository(db)
+	// BillingUsageRepository (issue #485): the metering ledger the
+	// heartbeat pipeline dual-writes into. The MeteringDrainer
+	// (constructed further down) reads from this repo via the same
+	// *sqlx.DB instance.
+	meteringRepo := repository.NewBillingUsageRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -204,7 +209,7 @@ func New(
 	// struct (issue #443 review findings #3 and #4).
 	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
-		db, workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
+		db, workerRepo, quotaRepo, meteringRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 		loopHealth,
 	)
@@ -305,7 +310,6 @@ func New(
 	// fresh install with no METERING_RATE_* env vars is fully
 	// billing-neutral out of the box.
 	meteringProvider := newMeteringProvider(cfg.Billing)
-	meteringRepo := repository.NewBillingUsageRepository(db)
 	meteringDrainer := service.NewMeteringDrainer(
 		meteringRepo, meteringProvider,
 		time.Duration(cfg.Billing.Metering.IntervalS)*time.Second,

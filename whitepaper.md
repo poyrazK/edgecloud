@@ -627,11 +627,23 @@ Streams are configured with:
     "my-service": {
       "deployment_id": "d_xyz789",
       "status": "running",
-      "exit_code": 0
+      "exit_code": 0,
+      "request_count": 12,
+      "outbound_bytes": 4096,
+      "resident_seconds": 30,
+      "dedupe_id": "w_fra_abc123:d_xyz789:1750000800",
+      "last_error": null
     }
   }
 }
 ```
+
+**Field notes** (issues #418, #484, #485):
+
+- `request_count` and `outbound_bytes` — per-interval deltas for the request-count and outbound-bytes metered dimensions (issue #419/#420 quota hot path).
+- `resident_seconds` — `null` for Handler (FaaS) apps; an integer for LongRunning apps representing seconds resident in the last heartbeat interval (issue #484). `Some(0)` and `null` are distinct on the wire: the former means "an LR app that started within the current interval"; the latter means "an FaaS app, which contributes nothing to this dimension."
+- `dedupe_id` — stable `(worker_id, deployment_id, 30s_bucket)` token the control plane uses to skip re-applying the same delta on JetStream redelivery or reconcile replay (issue #418).
+- `last_error` — string if the app transitioned to `Crashed`/`Errored` in the last interval; `null` for `running`.
 
 ---
 

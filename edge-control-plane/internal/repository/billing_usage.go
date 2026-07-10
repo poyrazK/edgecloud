@@ -80,6 +80,39 @@ func (r *BillingUsageRepository) Enqueue(ctx context.Context, row *domain.MeterU
 	return err
 }
 
+// EnqueueUsageEvent is the heartbeat-pipeline-friendly form of
+// Enqueue. The caller passes the per-app fields; the method stamps
+// provider="" so the row waits for the drainer to decide which
+// merchant receives it (one row may be dispatched through stripe on
+// the next tick and the operator's choice of merchant at that
+// point). Idempotency_key format is "<dedupe_id>:<kind>" — the
+// dedupe_id is the AppStatus.DedupeID stamped by the worker (issue
+// #418); the kind suffix distinguishes the rows within one
+// heartbeat that contribute to multiple dimensions.
+//
+// Returns nil on ErrDuplicateIdempotencyKey (silent dedup), since
+// the heartbeat pipeline is the right place to absorb the
+// duplicate — a redelivered AppStatus should not error out.
+func (r *BillingUsageRepository) EnqueueUsageEvent(
+	ctx context.Context,
+	tenantID string,
+	kind domain.MeterKind,
+	quantity uint64,
+	idempotencyKey string,
+) error {
+	err := r.Enqueue(ctx, &domain.MeterUsageEvent{
+		TenantID:       tenantID,
+		Kind:           kind,
+		Quantity:       int64(quantity),
+		IdempotencyKey: idempotencyKey,
+		Provider:       "", // drainer fills at dispatch time
+	})
+	if errors.Is(err, ErrDuplicateIdempotencyKey) {
+		return nil
+	}
+	return err
+}
+
 // ClaimDue atomically transitions up to `limit` unprocessed rows
 // to processed_at = NOW() and returns them. Uses the partial
 // index idx_billing_usage_events_unprocessed (migration 030:85-87)
