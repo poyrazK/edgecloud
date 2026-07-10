@@ -706,64 +706,18 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writePublishFailureEnvelope writes the 502 Bad Gateway response for
-// a partially-failed Activate / Rollback / AutoRollback publish. The
-// body carries the per-region breakdown so the operator can see
-// exactly which regions got the message and which are pending retry.
-//
-// Used by all three 502 sites in this file + handler/internal.go.
-// If err is not a *service.PublishError (e.g. a future regression
-// that bypasses the typed wrapper), the body falls back to an
-// empty arrays + the static error message — the 502 contract
-// holds regardless. errors.Is(err, service.ErrPublishFailed) is
-// still matched by the caller before this helper is reached, so
-// callers don't need to repeat the sentinel check.
-//
-// Issue #332: the envelope additionally surfaces the per-region
-// artifact-cache push outcome (`regions_cached_succeeded`,
-// `regions_cached_skipped`, `regions_cache_failed`) so operators
-// can distinguish "NATS publish failed" from "cache push failed"
-// from the same 502 body. Pre-#332 clients parsing
-// `regions_published` / `regions_failed` see no change. The
-// `regions_cached` key is preserved as the union of
-// `regions_cached_succeeded` + `regions_cached_skipped` for
-// backward-compat with PR-2 clients that read it.
-func writePublishFailureEnvelope(w http.ResponseWriter, r *http.Request, err error, staticMessage string) {
-	details := map[string]any{
-		"regions_published":        []string{},
-		"regions_failed":           []string{},
-		"regions_cached_succeeded": []string{},
-		"regions_cached_skipped":   []string{},
-		"regions_cached":           []string{},
-		"regions_cache_failed":     []string{},
-	}
-	var pubErr *service.PublishError
-	if errors.As(err, &pubErr) {
-		details["regions_published"] = pubErr.Published
-		details["regions_failed"] = pubErr.Failed
-		details["regions_cached_succeeded"] = pubErr.CachedSucceeded
-		details["regions_cached_skipped"] = pubErr.CachedSkipped
-		// Backward-compat: union the two Cached slices into the
-		// pre-PR-2-follow-up `regions_cached` key.
-		merged := make([]string, 0, len(pubErr.CachedSucceeded)+len(pubErr.CachedSkipped))
-		merged = append(merged, pubErr.CachedSucceeded...)
-		merged = append(merged, pubErr.CachedSkipped...)
-		details["regions_cached"] = merged
-		details["regions_cache_failed"] = pubErr.CacheFailed
-	}
-	httperror.BadGatewayCtx(w, r, staticMessage, details)
-}
-
 // Activate handles POST /api/apps/{appName}/activate/{deploymentID}.
 //
 // Status codes:
-//   - 200: activated; body is {"status": "activated"}
-//   - 502: activation committed but the post-commit NATS publish of
-//     the TaskMessage failed — workers may still be serving the prior
-//     deployment. Client should re-activate the desired deployment
-//     (a plain retry will 409 because the row is already in the
-//     desired state, or 404 if the deploy was deleted).
+//   - 200: activated; body is {"status": "activated"}.
 //   - 500: anything else (DB error, etc.).
+//
+// Note (issue #42): pre-#42, this handler could return 502 if the
+// post-commit NATS publish failed. The publish is now durable: the
+// outbox row is written in the same transaction as the
+// active_deployments mutation, and the OutboxDrainer relays it after
+// commit. A failed activate can only mean a DB error or a duplicate
+// dedupe_key — both surface as 500.
 func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -803,11 +757,6 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	// canary path is for partial weights only).
 	if weight == 100 {
 		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
-			if errors.Is(err, service.ErrPublishFailed) {
-				writePublishFailureEnvelope(w, r, err,
-					"activation committed but worker notification failed; please retry")
-				return
-			}
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)
 			return
@@ -870,15 +819,15 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 // TaskMessage so workers reconcile.
 //
 // Status codes:
-//   - 200: rolled back; body is {"deployment_id": "<new active id>"}
-//   - 404: no active deployment for this app (user never activated)
+//   - 200: rolled back; body is {"deployment_id": "<new active id>"}.
+//   - 404: no active deployment for this app (user never activated).
 //   - 409: app is active but has no last-good pointer (only ever activated
-//     one deployment, so there is nothing to roll back to)
-//   - 502: rollback committed but the post-commit NATS publish failed —
-//     workers may still be serving the prior deployment. Client should
-//     re-activate the desired deployment; a plain retry will 409
-//     because last_good was cleared on this attempt.
+//     one deployment, so there is nothing to roll back to).
 //   - 500: anything else (DB error, etc.).
+//
+// Note (issue #42): pre-#42, this handler could return 502 if the
+// post-commit NATS publish failed. The publish is now durable (see
+// Activate's note above); a failed rollback can only mean a DB error.
 func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
@@ -894,11 +843,6 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, service.ErrNoActiveDeployment) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
-			return
-		}
-		if errors.Is(err, service.ErrPublishFailed) {
-			writePublishFailureEnvelope(w, r, err,
-				"rollback committed but worker notification failed; please retry")
 			return
 		}
 		log.Printf("internal error: %v", err)

@@ -64,7 +64,13 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 70 // 35 .up.sql + 35 .down.sql (after 026_idempotency_keys on main and 025_quotas_grace_columns from #420)
+// On current main after rebase of PR #466 (#42) onto PR #469 (#52)
+// and PR #420 (quota grace columns, which became 025_quotas_grace_columns
+// and pushed the next migration to 026):
+// 35 .up.sql + 35 .down.sql = 70 split files. Some numeric prefixes
+// collide (005_*, 009_*, 010_*, 017_*, 018_*), so this is the
+// on-disk file count, not a strict 2× the migration number.
+const splitFileCount = 70 // 35 .up.sql + 35 .down.sql after rebase of #42 + #52 + #420
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -89,6 +95,7 @@ var wantTables = []string{
 	"webhook_deliveries",
 	"billing_subscriptions", // 022 (issue #419)
 	"billing_events",        // 023 (issue #419)
+	"outbox",                // 025 (issue #42)
 	"idempotency_keys",      // 026 (issue #52)
 }
 
@@ -302,6 +309,22 @@ var wantColumns = map[string][]string{
 		"received_at",
 		"processed_at",
 		"payload_hash",
+	},
+	"outbox": { // 025 (issue #42)
+		"id",
+		"tenant_id",
+		"app_name",
+		"kind",
+		"payload",
+		"regions",
+		"attempt_count",
+		"next_attempt_at",
+		"status",
+		"last_error",
+		"dedupe_key",
+		"created_at",
+		"published_at",
+		"claimed_until",
 	},
 }
 
@@ -519,6 +542,20 @@ var wantTypes = map[string]map[string]string{
 		"processed_at": "timestamptz", // nullable
 		"payload_hash": "varchar",     // VARCHAR(128)
 	},
+	"outbox": { // 025 (issue #42)
+		"id":              "int8",
+		"tenant_id":       "text",
+		"app_name":        "text",
+		"kind":            "text",
+		"payload":         "jsonb",
+		"regions":         "_text",
+		"attempt_count":   "int4",
+		"next_attempt_at": "timestamptz",
+		"status":          "text",
+		"dedupe_key":      "text",
+		"created_at":      "timestamptz",
+		// last_error, published_at, claimed_until are nullable (see wantNotNull).
+	},
 	"idempotency_keys": { // 026 (issue #52)
 		"tenant_id":      "text",        // TEXT (PK)
 		"key":            "text",        // TEXT (PK)
@@ -713,6 +750,20 @@ var wantNotNull = map[string][]string{
 		"payload_hash",
 		// tenant_id, processed_at are nullable.
 	},
+	"outbox": { // 025 (issue #42)
+		"id",
+		"tenant_id",
+		"app_name",
+		"kind",
+		"payload",
+		"regions",
+		"attempt_count",
+		"next_attempt_at",
+		"status",
+		"dedupe_key",
+		"created_at",
+		// last_error, published_at, claimed_until are nullable.
+	},
 	"idempotency_keys": { // 026 (issue #52)
 		"tenant_id",
 		"key",
@@ -752,12 +803,12 @@ var wantIndexes = []IndexExpectation{
 	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
 	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
 	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
-<<<<<<< HEAD
+	{Table: "outbox", Name: "outbox_due_idx"},                                             // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_tenant_app_idx"},                                      // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_failed_idx"},                                          // 025_outbox (issue #42)
 	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
-=======
 	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                         // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "quotas", Name: "idx_quotas_grace_until"},                                     // 025_quotas_grace_columns (issue #420, partial)
->>>>>>> 09f5c73 (feat(billing): schema migration 025 — add grace columns for #420)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that

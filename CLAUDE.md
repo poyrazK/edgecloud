@@ -171,6 +171,7 @@ A request flows through the system like this:
 | `logs` | Worker-ingested log entries (TTL'd via `log_gc`). |
 | `audit_logs` | Admin/owner action audit trail. |
 | `autoscale_events` | Scale up/down events. |
+| `outbox` | Durable-publish queue for `task_update` NATS messages (issue #42). The row is written in the same transaction as the `active_deployments` mutation it accompanies, and relayed by `service.OutboxDrainer` (`edge-control-plane/internal/service/outbox_drainer.go`). Rows transition `pending` → `in_flight` → `published` (or `failed` after `OUTBOX_MAX_ATTEMPTS` retries). `FullSync` messages from the reconcile loop are NOT outboxed. |
 
 IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<region>_`.
 
@@ -358,9 +359,9 @@ Per-app, per-deployment:
 `DeploymentService` (`edge-control-plane/internal/service/deployment.go`) owns the state machine:
 
 - **Deploy** — SaveAndHash (atomic temp-rename), Ed25519 sign, DB row insert, blob store. Manual rollback (DeleteByID + blob Delete) on failure. Note: Deploy and Activate are NOT in a single DB transaction by default; partial failures are compensated, not atomic.
-- **Activate** — flips `active_deployments`, runs `precompile.PrecompileCwasm` (best-effort, logs and continues on failure), invokes `publishSwap` which iterates regions: cache-push each, then publish to NATS. `regions_cached` / `regions_cache_failed` track per-region outcome; the next activate uses `regions_cached` for incremental caching.
-- **Rollback** — restores `last_good_deployment_id` (set by `005_add_last_good` migration).
-- **Promote** — explicit move of a deployment into active status (used in canary workflows).
+- **Activate** — flips `active_deployments`, runs `precompile.PrecompileCwasm` (best-effort, logs and continues on failure), **enqueues a `task_update` `outbox` row inside the same transaction as the `active_deployments` mutation**, then `publishSwap` (now cache-only) runs the per-region cache-push best-effort. NATS publish is owned by `service.OutboxDrainer` (issue #42): `FOR UPDATE SKIP LOCKED` claim + exponential backoff, `pending` → `in_flight` → `published` (or `failed` after `OUTBOX_MAX_ATTEMPTS`). `regions_cached` / `regions_cache_failed` track per-region outcome; the next activate uses `regions_cached` for incremental caching.
+- **Rollback** — restores `last_good_deployment_id` (set by `005_add_last_good` migration); enqueues its `task_update` `outbox` row inside the same tx.
+- **Promote** — explicit move of a deployment into active status (used in canary workflows); delegates to `activateDeployment` and inherits its outbox behavior.
 
 ### Reconcile (`edge-control-plane/internal/service/reconcile.go`)
 

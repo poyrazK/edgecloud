@@ -64,6 +64,11 @@ type App struct {
 	// without cache push (existing behavior).
 	DeploymentSvc *service.DeploymentService
 	AutoscaleSvc  *autoscale.Service
+	// OutboxDrainer (issue #42) relays durable-publish rows from the
+	// `outbox` table to NATS. Activated by RunBackground alongside the
+	// reconcile loop. Multi-instance safe via FOR UPDATE SKIP LOCKED +
+	// a 30s claimed_until window on each claimed row.
+	OutboxDrainer *service.OutboxDrainer
 
 	// loopHealth tracks liveness of every background goroutine spawned
 	// by RunBackground (heartbeat, log_gc, reconcile, worker_gc,
@@ -107,6 +112,11 @@ func New(
 	// and only test harnesses that explicitly want the
 	// pre-#52 behavior omit it.
 	idempotencyRepo := repository.NewIdempotencyKeyRepo(db)
+	// Outbox (issue #42): durable-publish queue for `task_update`
+	// NATS messages. Rows are written in the same tx as the
+	// active_deployments mutation; the OutboxDrainer (below) relays
+	// them after commit.
+	outboxRepo := repository.NewOutboxRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -130,7 +140,18 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, artifactStore, publisher, cfg.Region, keyring,
+		quotaRepo, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
+	)
+	// OutboxDrainer (issue #42): the SOLE caller of
+	// Publisher.PublishTaskUpdate for `task_update` messages. Tunable
+	// via OUTBOX_DRAIN_INTERVAL / OUTBOX_MAX_ATTEMPTS. Defaults: 2s
+	// tick, 50 rows/batch, 10 retries before flipping the row to
+	// status='failed' for operator inspection.
+	outboxDrainer := service.NewOutboxDrainer(
+		outboxRepo, publisher,
+		parseDurationEnv("OUTBOX_DRAIN_INTERVAL", 2*time.Second),
+		parseIntEnv("OUTBOX_BATCH_SIZE", 50),
+		parseIntEnv("OUTBOX_MAX_ATTEMPTS", 10),
 	)
 	deploymentSvc.SetAppService(appSvc)
 	envSvc := service.NewEnvService(appEnvRepo)
@@ -651,6 +672,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
+		OutboxDrainer: outboxDrainer,
 		loopHealth:    loopHealth,
 	}
 }
@@ -725,6 +747,17 @@ func (a *App) RunBackground(ctx context.Context) {
 	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
 
+	// Outbox drainer (issue #42). The drainer is the sole owner of
+	// `task_update` NATS publishes for activate / rollback. Its tick
+	// interval + batch size + max attempts are tunable via env (see
+	// OUTBOX_DRAIN_INTERVAL / OUTBOX_BATCH_SIZE / OUTBOX_MAX_ATTEMPTS
+	// in NewApp). The drainer is multi-instance safe via FOR UPDATE
+	// SKIP LOCKED + a 30s claimed_until window, so spinning up extra
+	// replicas just for the drainer is fine.
+	a.loopHealth.Run(ctx, "outbox_drainer", "outbox_drainer: ", logPrintf, func(c context.Context) {
+		a.OutboxDrainer.Run(c)
+	})
+
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
 	// is false — Subscribe returns nil immediately. The autoscale
 	// package uses log/slog rather than stdlib log, so we route the
@@ -772,6 +805,23 @@ func parseDurationEnv(envName string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// parseIntEnv reads a positive integer-valued env var or returns the
+// default. Mirrors parseDurationEnv's contract: empty / unparseable /
+// non-positive values fall back to `def` with a log line. Used by
+// OUTBOX_BATCH_SIZE and OUTBOX_MAX_ATTEMPTS in app.go (issue #42).
+func parseIntEnv(envName string, def int) int {
+	v := os.Getenv(envName)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("%s=%q is not a valid positive integer; using default %d", envName, v, def)
+		return def
+	}
+	return n
 }
 
 // loadKeyring constructs a *signing.Keyring from the validated config.

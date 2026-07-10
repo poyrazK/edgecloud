@@ -2823,20 +2823,6 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalError"];
-            /**
-             * @description The post-commit NATS publish of the task update failed for
-             *     every region the deployment is replicated to. The control
-             *     plane has already committed the new active deployment, but
-             *     workers may not converge until the publish is retried.
-             */
-            502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
-                };
-            };
         };
     };
     getActiveDeployment: {

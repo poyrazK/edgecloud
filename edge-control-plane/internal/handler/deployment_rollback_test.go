@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
@@ -146,6 +144,13 @@ func TestRollback_AppNotFound_Returns404(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Rollback — 500 (unexpected service error)
 // ---------------------------------------------------------------------------
+//
+// Note: prior versions of this file asserted a 502 path for post-commit
+// NATS publish failures. Issue #42 made that path obsolete: durable
+// publish is now owned by service.OutboxDrainer (see CLAUDE.md schema
+// table). RollbackDeployment enqueues the task_update inside the same
+// transaction as the active_deployments mutation; NATS unreachability
+// surfaces as a backlogged `pending` outbox row, never as a 502.
 
 func TestRollback_ServiceError_Returns500(t *testing.T) {
 	svc := &stubRollbacker{err: errors.New("db unreachable")}
@@ -161,53 +166,6 @@ func TestRollback_ServiceError_Returns500(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "db unreachable") {
 		t.Errorf("body must not leak raw error, got %s", rr.Body.String())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Rollback — 502 (post-commit NATS publish failed)
-// ---------------------------------------------------------------------------
-
-func TestRollback_PublishFailed_Returns502(t *testing.T) {
-	// Service returns the wrapped ErrPublishFailed sentinel that
-	// RollbackDeployment emits when PublishTaskUpdate fails after the
-	// DB transaction has committed. Handler must surface this as 502
-	// (not 500) so the client knows the DB write may have succeeded
-	// and to treat it as an upstream-dependency failure.
-	wrapped := fmt.Errorf("%w: %w", service.ErrPublishFailed, errors.New("nats unreachable"))
-	svc := &stubRollbacker{err: wrapped}
-	mux := newRollbackMux(svc)
-
-	req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
-	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502; body: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "worker notification failed") {
-		t.Errorf("body should explain 502, got %s", rr.Body.String())
-	}
-	// Typed-envelope assertions (issue #127 follow-ups): the 502
-	// body must conform to httperror.ErrorResponse so clients that
-	// parse the typed envelope work across every status code.
-	var env httperror.ErrorResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
-		t.Fatalf("body is not typed envelope: %v; body: %s", err, rr.Body.String())
-	}
-	if env.Error.Code != httperror.CodeBadGateway {
-		t.Errorf("error.code = %q, want BAD_GATEWAY", env.Error.Code)
-	}
-	if !strings.Contains(env.Error.Message, "worker notification failed") {
-		t.Errorf("error.message = %q, want it to mention worker notification", env.Error.Message)
-	}
-	// Body must not leak the sentinel or the raw NATS error.
-	if strings.Contains(rr.Body.String(), "nats unreachable") {
-		t.Errorf("body leaks raw error: %s", rr.Body.String())
-	}
-	if strings.Contains(rr.Body.String(), "ErrPublishFailed") {
-		t.Errorf("body leaks sentinel: %s", rr.Body.String())
 	}
 }
 
