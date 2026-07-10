@@ -505,3 +505,79 @@ func (r *ActiveDeploymentRepository) Count(ctx context.Context) (int, error) {
 	err := r.db.GetContext(ctx, &count, `SELECT COUNT(*) FROM active_deployments`)
 	return count, err
 }
+
+// CacheFailedRow is the projection ListCacheFailed returns for the
+// cache-retry sweep (issue #501). Only the fields the sweep needs
+// are selected — the full row would be a wasted round trip since
+// the sweep will AppendRegionsCacheState / RemoveFromCacheFailed
+// per-row anyway.
+type CacheFailedRow struct {
+	TenantID           string         `db:"tenant_id"`
+	AppName            string         `db:"app_name"`
+	DeploymentID       string         `db:"deployment_id"`
+	RegionsCacheFailed pq.StringArray `db:"regions_cache_failed"`
+}
+
+// ListCacheFailed (issue #501) returns up to `batchSize` rows whose
+// `regions_cache_failed` array is non-empty — i.e. rows that have at
+// least one stranded cache push from a prior activation. Used by the
+// background cache-retry sweep to drive re-push attempts.
+//
+// The partial index `idx_active_deployments_regions_cache_failed_nonempty`
+// (migration 027) keeps this SELECT cheap: the planner scans only
+// rows matching `regions_cache_failed <> '{}'`, so a healthy fleet
+// of millions of rows that have no stranded pushes does not pay a
+// sequential-scan cost on every sweep tick.
+//
+// ORDER BY (tenant_id, app_name) makes pagination deterministic
+// across runs — a future multi-replica CP deployment could split
+// sweep work by tenant without re-scanning the same rows.
+//
+// LIMIT $1 caps the per-call row count so a fleet-wide outage that
+// strands millions of cache pushes cannot saturate the sweep loop
+// in a single iteration. The sweep service loops with the same
+// batch size until ListCacheFailed returns a short result.
+func (r *ActiveDeploymentRepository) ListCacheFailed(ctx context.Context, batchSize int) ([]CacheFailedRow, error) {
+	var rows []CacheFailedRow
+	query := `SELECT tenant_id, app_name, deployment_id, regions_cache_failed
+              FROM active_deployments
+              WHERE regions_cache_failed <> '{}'
+              ORDER BY tenant_id, app_name
+              LIMIT $1`
+	if err := r.db.SelectContext(ctx, &rows, query, batchSize); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// RemoveFromCacheFailed (issue #501) drops `regions` from the
+// `regions_cache_failed` array WITHOUT adding them to
+// `regions_cached`. Used by the cache-retry sweep when a region's
+// cache configuration is missing — the bytes never made it, so the
+// region must not appear in `regions_cached` (which the cache-skip-
+// on-activation logic in publishSwap consults to skip pushes). A
+// region that was stranded only because of a missing config must
+// remain eligible for a fresh push on the next activation, so we do
+// not move it into the "succeeded" column.
+//
+// `unnest()` + `array_agg(DISTINCT r) WHERE r <> ALL($3::text[])`
+// collapses duplicates server-side and produces a stable
+// deterministic order, matching the dedup-merge shape of
+// AppendRegionsCacheState. A no-op call (region not present in the
+// column) is harmless: the WHERE filter drops every r, the COALESCE
+// yields '{}', and the UPDATE touches the row with an identical
+// value (no audit-trail bump because no audit column is updated).
+func (r *ActiveDeploymentRepository) RemoveFromCacheFailed(ctx context.Context, tenantID, appName string, regions []string) error {
+	query := `
+		UPDATE active_deployments
+		SET regions_cache_failed = (
+			SELECT COALESCE(array_agg(DISTINCT r), '{}')
+			FROM unnest(regions_cache_failed) AS r
+			WHERE r <> ALL($3::text[])
+		)
+		WHERE tenant_id = $1 AND app_name = $2
+	`
+	arr := domain.StringArrayFrom(regions)
+	_, err := r.db.ExecContext(ctx, query, tenantID, appName, arr)
+	return err
+}

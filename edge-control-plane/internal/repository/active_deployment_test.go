@@ -632,3 +632,95 @@ func TestListByTenantWithDeployment_OrphanPassesThrough(t *testing.T) {
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
+
+// TestListCacheFailed_IssuesExpectedStatement (issue #501) pins the
+// SQL shape of ListCacheFailed: SELECT the (tenant_id, app_name,
+// deployment_id, regions_cache_failed) projection filtered to
+// non-empty `regions_cache_failed`, ORDER BY (tenant_id, app_name)
+// for deterministic pagination, LIMIT $1 for batch sizing.
+//
+// sqlmock's QueryMatcherRegexp catches any future refactor that
+// drops the partial-index predicate, the ORDER BY, or the LIMIT —
+// the partial index `idx_active_deployments_regions_cache_failed_nonempty`
+// (migration 027) relies on the exact `regions_cache_failed <> '{}'`
+// predicate to remain planner-friendly.
+func TestListCacheFailed_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, regions_cache_failed FROM active_deployments WHERE regions_cache_failed <> '{}' ORDER BY tenant_id, app_name LIMIT $1`,
+	)).
+		WithArgs(500).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "regions_cache_failed"}).
+			AddRow("t_test", "myapp", "d_v1", pq.StringArray{"fra", "iad"}))
+
+	rows, err := repo.ListCacheFailed(context.Background(), 500)
+	if err != nil {
+		t.Fatalf("ListCacheFailed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	want := CacheFailedRow{
+		TenantID:           "t_test",
+		AppName:            "myapp",
+		DeploymentID:       "d_v1",
+		RegionsCacheFailed: pq.StringArray{"fra", "iad"},
+	}
+	if rows[0].TenantID != want.TenantID ||
+		rows[0].AppName != want.AppName ||
+		rows[0].DeploymentID != want.DeploymentID ||
+		!equalStringArray(rows[0].RegionsCacheFailed, want.RegionsCacheFailed) {
+		t.Errorf("rows[0] = %+v, want %+v", rows[0], want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestRemoveFromCacheFailed_IssuesExpectedStatement (issue #501)
+// pins the SQL shape of RemoveFromCacheFailed: a single UPDATE that
+// re-derives `regions_cache_failed` via unnest() + array_agg(DISTINCT
+// r) WHERE r <> ALL($3::text[]), filtering out the regions the caller
+// asked to drop. The dedup-merge keeps the column deterministic and
+// safe under concurrent callers — neither append nor remove mutates
+// last_publish_at / last_publish_attempt_id, so a refresh sweep does
+// not flap those audit-trail columns.
+func TestRemoveFromCacheFailed_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_cache_failed = (`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.RemoveFromCacheFailed(context.Background(), "t_test", "myapp",
+		[]string{"fra"}); err != nil {
+		t.Fatalf("RemoveFromCacheFailed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// equalStringArray compares two pq.StringArray values for equality,
+// tolerating nil as equivalent to an empty slice. Used by the
+// ListCacheFailed test to assert the projected column shape end-to-end
+// without depending on pq.StringArray's nil-vs-empty semantics at the
+// sqlmock boundary.
+func equalStringArray(a, b pq.StringArray) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
