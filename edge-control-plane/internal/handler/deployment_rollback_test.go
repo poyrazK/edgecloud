@@ -203,3 +203,46 @@ func TestRollback_PathTraversal_Returns400(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Rollback — 409 (tenant is disabled, issue #440 gate)
+// ---------------------------------------------------------------------------
+//
+// TestRollback_TenantDisabled_Returns409 mirrors the activate-side test.
+// The rollback path goes through the same lockTenantForUpdate gate as
+// activate (PR #524), so the typed ErrTenantDisabled sentinel reaches
+// the handler and must be mapped to 409 Conflict via httperror so the
+// CLI can branch on the envelope instead of probing the request.
+
+func TestRollback_TenantDisabled_Returns409(t *testing.T) {
+	svc := &stubRollbacker{err: service.ErrTenantDisabled}
+	mux := newRollbackMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body: %s", rr.Code, rr.Body.String())
+	}
+	var got map[string]map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if got["error"]["code"] != "CONFLICT" {
+		t.Errorf("error.code = %q, want CONFLICT; body: %s", got["error"]["code"], rr.Body.String())
+	}
+	if got["error"]["message"] != "tenant is disabled" {
+		t.Errorf("error.message = %q, want %q; body: %s", got["error"]["message"], "tenant is disabled", rr.Body.String())
+	}
+	// The service must have been called before the gate fired — the
+	// mapping only matters if the request actually reaches the
+	// tenant-locking tx.
+	if !svc.called {
+		t.Error("RollbackDeployment was not called")
+	}
+	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
+}

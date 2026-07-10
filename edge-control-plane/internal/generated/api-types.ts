@@ -532,6 +532,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the authenticated tenant's usage dashboard payload
+         * @description Composes current-period counters, a windowed subscription-event
+         *     timeline, and per-tenant upgrade options + billing portal URL.
+         *     Cached for 10s in-process (stale-while-revalidate) so dashboard
+         *     refresh doesn't hammer the DB. Free-tier tenants see the
+         *     `upgrade_options` array; paid tenants see the billing portal
+         *     URL instead.
+         */
+        get: operations["getUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/keys/{keyID}": {
         parameters: {
             query?: never;
@@ -1933,6 +1958,167 @@ export interface components {
             usage_pct?: number | null;
         };
         /**
+         * @description Current billing-period usage for the authenticated tenant.
+         *     Derived from the single `quotas` row; the dashboard polls
+         *     this every few seconds and renders the percentage + remaining
+         *     capacity from these numbers.
+         */
+        CurrentPeriodUsage: {
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the current usage period began.
+             * @example 2026-07-01T00:00:00Z
+             */
+            period_start?: string;
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the current usage period ends (next month boundary).
+             * @example 2026-08-01T00:00:00Z
+             */
+            period_end?: string;
+            /**
+             * Format: int64
+             * @description Cumulative requests in the current period. Drives deploy-time 402 once it reaches `requests_cap`.
+             * @example 312
+             */
+            requests_used?: number;
+            /**
+             * Format: int64
+             * @description Per-period request cap for the tenant's plan. -1 = unlimited.
+             * @example 100000
+             */
+            requests_cap?: number;
+            /**
+             * Format: int64
+             * @description Cumulative outbound bytes in the current period. Drives deploy-time 402 once it reaches `outbound_bytes_cap`.
+             * @example 89432
+             */
+            outbound_bytes_used?: number;
+            /**
+             * Format: int64
+             * @description Per-period outbound cap in BYTES (not MiB) so the dashboard can render without conversion. -1 = unlimited.
+             * @example 1073741824
+             */
+            outbound_bytes_cap?: number;
+            /**
+             * @description Highest usage percentage across the two monthly caps (0-100).
+             *     null when both caps are unlimited. Same semantics as
+             *     `Quota.usage_pct`; duplicated here so the dashboard can
+             *     subscribe to this endpoint alone.
+             * @example 31.2
+             */
+            usage_pct?: number | null;
+        };
+        /**
+         * @description One row from the `billing_events` table, projected to the
+         *     response shape. `payload_hash` (internal dedup key) is
+         *     intentionally omitted.
+         */
+        BillingEventTimelineEntry: {
+            /**
+             * @description Merchant event ID (Stripe evt_… etc). Stable per webhook delivery.
+             * @example evt_1Hxxxxxx
+             */
+            event_id?: string;
+            /**
+             * @description Normalized event class — merchant-agnostic.
+             * @example subscription.updated
+             * @enum {string}
+             */
+            event_type?: "checkout.completed" | "subscription.updated" | "subscription.deleted" | "payment.failed";
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the webhook arrived at the control plane.
+             * @example 2026-07-09T14:23:01Z
+             */
+            received_at?: string;
+            /**
+             * Format: date-time
+             * @description UTC timestamp at which the dispatcher finished applying the event. NULL = received but not yet processed.
+             * @example 2026-07-09T14:23:02Z
+             */
+            processed_at?: string | null;
+        };
+        /**
+         * @description One row in the `upgrade_options` array. Empty array when the
+         *     tenant is on a paid plan (the dashboard hides the upgrade
+         *     CTA — the tenant manages their plan via the billing portal
+         *     link instead).
+         */
+        UpgradeOption: {
+            /**
+             * @description Plan tier name (matches `PlanSpec.Name` in domain/plans.go).
+             * @example pro
+             */
+            plan?: string;
+            /**
+             * @description Per-month price in US dollars (not cents). 0 if free.
+             * @example 29
+             */
+            monthly_price_usd?: number;
+        };
+        /**
+         * @description Response envelope for GET /api/v1/usage (issue #421). Composes
+         *     the current-period counters, a windowed subscription-event
+         *     timeline, and per-tenant upgrade options + billing portal
+         *     URL. Cached for 10s in-process (stale-while-revalidate) so
+         *     dashboard refresh doesn't hammer the DB.
+         */
+        TenantUsage: {
+            /** @example t_abc123 */
+            tenant_id: string;
+            /**
+             * @description Customer-facing billing status. `active` covers both
+             *     healthy subscriptions and the no-subscription-row case
+             *     (free-tier tenants that haven't started checkout).
+             *     `action_required` covers `past_due` and `canceled`
+             *     subscriptions — the dashboard surfaces a banner and
+             *     surfaces the billing portal link.
+             * @example active
+             * @enum {string}
+             */
+            billing_status: "active" | "action_required";
+            current_period: components["schemas"]["CurrentPeriodUsage"];
+            /**
+             * @description Subscription lifecycle events received in the requested
+             *     `[from, to]` window, ordered by `received_at` DESC.
+             *     Capped at the `limit` query param (default 50, max 200).
+             */
+            events: components["schemas"]["BillingEventTimelineEntry"][];
+            /**
+             * Format: date-time
+             * @description Echoed start of the requested window (defaults to now-30d).
+             * @example 2026-06-10T00:00:00Z
+             */
+            from: string;
+            /**
+             * Format: date-time
+             * @description Echoed end of the requested window (defaults to now).
+             * @example 2026-07-10T00:00:00Z
+             */
+            to: string;
+            /**
+             * @description Opaque cursor for fetching the next page of events.
+             *     Reserved for future pagination — issue #421 returns
+             *     single-page reads (capped at the `limit` query param).
+             * @example null
+             */
+            next_offset?: string | null;
+            /**
+             * @description Paid tiers the tenant can upgrade to. Empty when the
+             *     tenant is already on a paid plan.
+             */
+            upgrade_options: components["schemas"]["UpgradeOption"][];
+            /**
+             * Format: uri
+             * @description Hosted billing portal URL (Stripe Customer Portal today).
+             *     Omitted when the tenant has no Stripe customer row
+             *     (e.g. a free-tier tenant that has never started checkout).
+             * @example https://billing.stripe.com/c/p/portal_abc
+             */
+            billing_portal_url?: string | null;
+        };
+        /**
          * @description Every field is optional. Absent fields are not modified. Setting
          *     `max_requests_per_month` / `max_outbound_mb` to a positive value
          *     raises or lowers the cap; setting to -1 marks the cap as
@@ -2778,6 +2964,39 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Returned when the caller's tenant row has
+             *     `disabled_at IS NOT NULL` at the moment the request reaches
+             *     the service layer (issue #440 disable-vs-activate race gate).
+             *     The response body is the standard error envelope with
+             *     `error.code = "CONFLICT"` and `error.message = "tenant is disabled"`.
+             *     The CLI / operator tooling can branch on `error.code` to
+             *     distinguish this from a generic infrastructure 500 — the
+             *     tenant will not auto-re-enable, retrying without operator
+             *     action is futile.
+             *
+             *     Scope note: this 409 is only reachable on the atomic path
+             *     (`?weight=100`, the default). Canary activation
+             *     (`?weight` < 100, which routes through traffic split) is
+             *     not gated by the disable check and so cannot surface this
+             *     response.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2809,6 +3028,29 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            /**
+             * @description Tenant is disabled. Promote delegates to the same
+             *     `activateDeployment` path as the activate endpoint, so the
+             *     issue #440 disable-vs-activate race gate fires identically
+             *     here. Body shape and `error.code` are identical to the
+             *     activate endpoint's 409.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "CONFLICT",
+                     *         "message": "tenant is disabled"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -2836,9 +3078,14 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             /**
-             * @description No prior `last_good_deployment_id` is recorded for this app,
-             *     so there is nothing to roll back to. Returned when the app
-             *     has only ever had one deployment.
+             * @description Either no `last_good_deployment_id` is recorded for this app
+             *     (only one deployment has ever been activated, so there is
+             *     nothing to roll back to), or the caller's tenant is
+             *     disabled (issue #440 disable-vs-activate race gate).
+             *     The message field distinguishes the two: `"no previous
+             *     deployment to roll back to"` for the first, `"tenant is
+             *     disabled"` for the second. The status code and
+             *     `error.code = "CONFLICT"` are the same in both cases.
              */
             409: {
                 headers: {
@@ -3269,6 +3516,37 @@ export interface operations {
                     "application/json": components["schemas"]["Quota"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getUsage: {
+        parameters: {
+            query?: {
+                /** @description Start of the event window (RFC3339). Defaults to `to - 30d`. */
+                from?: string;
+                /** @description End of the event window (RFC3339). Defaults to now. Must be >= `from`. */
+                to?: string;
+                /** @description Maximum number of events to return. Clamped to 200. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Usage dashboard payload. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantUsage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];

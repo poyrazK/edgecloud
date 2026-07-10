@@ -322,3 +322,75 @@ func TestBillingRepository_Upsert_EmptyCustomerID(t *testing.T) {
 		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
+
+// TestBillingRepository_ListEventsByTenant exercises the GET /api/v1/usage
+// timeline query (issue #421). The query filters on tenant_id AND a
+// [from, to] window over received_at, orders DESC, and applies a limit.
+// The partial index idx_billing_events_tenant_received covers the WHERE
+// + ORDER BY for non-null tenant rows.
+func TestBillingRepository_ListEventsByTenant(t *testing.T) {
+	repo, mock, cleanup := newBillingMockRepo(t)
+	defer cleanup()
+
+	tenantID := "t_1"
+	from := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+
+	rows := sqlmock.NewRows([]string{
+		"event_id", "provider", "event_type", "tenant_id", "received_at", "processed_at", "payload_hash",
+	}).
+		AddRow("evt_1", "stripe", "checkout.completed", &tenantID, from.Add(48*time.Hour), from.Add(48*time.Hour), "h1").
+		AddRow("evt_2", "stripe", "subscription.updated", &tenantID, from.Add(24*time.Hour), nil, "h2")
+
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_events`)).
+		WithArgs(tenantID, from, to, 50).
+		WillReturnRows(rows)
+
+	got, err := repo.ListEventsByTenant(context.Background(), tenantID, from, to, 50)
+	if err != nil {
+		t.Fatalf("ListEventsByTenant: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].EventID != "evt_1" || got[0].EventType != domain.EventCheckoutCompleted {
+		t.Errorf("got[0] = %+v, want evt_1 checkout.completed", got[0])
+	}
+	if got[1].ProcessedAt != nil {
+		t.Errorf("got[1].ProcessedAt = %v, want nil (event not yet dispatched)", got[1].ProcessedAt)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestBillingRepository_ListEventsByTenant_EmptyRange confirms the
+// (nil, nil) contract when no events fall in the requested window. The
+// handler renders an empty array on the wire; an empty slice here would
+// still marshal as [] but we keep the contract explicit so sqlmock's
+// empty result set behaves predictably.
+func TestBillingRepository_ListEventsByTenant_EmptyRange(t *testing.T) {
+	repo, mock, cleanup := newBillingMockRepo(t)
+	defer cleanup()
+
+	tenantID := "t_quiet"
+	from := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_events`)).
+		WithArgs(tenantID, from, to, 50).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"event_id", "provider", "event_type", "tenant_id", "received_at", "processed_at", "payload_hash",
+		}))
+
+	got, err := repo.ListEventsByTenant(context.Background(), tenantID, from, to, 50)
+	if err != nil {
+		t.Fatalf("ListEventsByTenant: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len = %d, want 0", len(got))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}

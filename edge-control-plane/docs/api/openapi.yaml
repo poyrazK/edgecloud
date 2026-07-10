@@ -953,6 +953,171 @@ components:
             expressed as a 0-100 value. null when both caps are unlimited.
           example: 42.5
 
+    # -------------------------------------------------------------------------
+    # Usage dashboard (issue #421)
+    # -------------------------------------------------------------------------
+    CurrentPeriodUsage:
+      type: object
+      description: |
+        Current billing-period usage for the authenticated tenant.
+        Derived from the single `quotas` row; the dashboard polls
+        this every few seconds and renders the percentage + remaining
+        capacity from these numbers.
+      properties:
+        period_start:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the current usage period began.
+          example: 2026-07-01T00:00:00Z
+        period_end:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the current usage period ends (next month boundary).
+          example: 2026-08-01T00:00:00Z
+        requests_used:
+          type: integer
+          format: int64
+          description: Cumulative requests in the current period. Drives deploy-time 402 once it reaches `requests_cap`.
+          example: 312
+        requests_cap:
+          type: integer
+          format: int64
+          description: Per-period request cap for the tenant's plan. -1 = unlimited.
+          example: 100000
+        outbound_bytes_used:
+          type: integer
+          format: int64
+          description: Cumulative outbound bytes in the current period. Drives deploy-time 402 once it reaches `outbound_bytes_cap`.
+          example: 89432
+        outbound_bytes_cap:
+          type: integer
+          format: int64
+          description: Per-period outbound cap in BYTES (not MiB) so the dashboard can render without conversion. -1 = unlimited.
+          example: 1073741824
+        usage_pct:
+          type: number
+          nullable: true
+          description: |
+            Highest usage percentage across the two monthly caps (0-100).
+            null when both caps are unlimited. Same semantics as
+            `Quota.usage_pct`; duplicated here so the dashboard can
+            subscribe to this endpoint alone.
+          example: 31.2
+
+    BillingEventTimelineEntry:
+      type: object
+      description: |
+        One row from the `billing_events` table, projected to the
+        response shape. `payload_hash` (internal dedup key) is
+        intentionally omitted.
+      properties:
+        event_id:
+          type: string
+          description: Merchant event ID (Stripe evt_… etc). Stable per webhook delivery.
+          example: evt_1Hxxxxxx
+        event_type:
+          type: string
+          enum: [checkout.completed, subscription.updated, subscription.deleted, payment.failed]
+          description: Normalized event class — merchant-agnostic.
+          example: subscription.updated
+        received_at:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the webhook arrived at the control plane.
+          example: 2026-07-09T14:23:01Z
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp at which the dispatcher finished applying the event. NULL = received but not yet processed.
+          example: 2026-07-09T14:23:02Z
+
+    UpgradeOption:
+      type: object
+      description: |
+        One row in the `upgrade_options` array. Empty array when the
+        tenant is on a paid plan (the dashboard hides the upgrade
+        CTA — the tenant manages their plan via the billing portal
+        link instead).
+      properties:
+        plan:
+          type: string
+          description: Plan tier name (matches `PlanSpec.Name` in domain/plans.go).
+          example: pro
+        monthly_price_usd:
+          type: integer
+          description: Per-month price in US dollars (not cents). 0 if free.
+          example: 29
+
+    TenantUsage:
+      type: object
+      description: |
+        Response envelope for GET /api/v1/usage (issue #421). Composes
+        the current-period counters, a windowed subscription-event
+        timeline, and per-tenant upgrade options + billing portal
+        URL. Cached for 10s in-process (stale-while-revalidate) so
+        dashboard refresh doesn't hammer the DB.
+      required: [tenant_id, billing_status, current_period, events, from, to, upgrade_options]
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        billing_status:
+          type: string
+          enum: [active, action_required]
+          description: |
+            Customer-facing billing status. `active` covers both
+            healthy subscriptions and the no-subscription-row case
+            (free-tier tenants that haven't started checkout).
+            `action_required` covers `past_due` and `canceled`
+            subscriptions — the dashboard surfaces a banner and
+            surfaces the billing portal link.
+          example: active
+        current_period:
+          $ref: '#/components/schemas/CurrentPeriodUsage'
+        events:
+          type: array
+          description: |
+            Subscription lifecycle events received in the requested
+            `[from, to]` window, ordered by `received_at` DESC.
+            Capped at the `limit` query param (default 50, max 200).
+          items:
+            $ref: '#/components/schemas/BillingEventTimelineEntry'
+        from:
+          type: string
+          format: date-time
+          description: Echoed start of the requested window (defaults to now-30d).
+          example: 2026-06-10T00:00:00Z
+        to:
+          type: string
+          format: date-time
+          description: Echoed end of the requested window (defaults to now).
+          example: 2026-07-10T00:00:00Z
+        next_offset:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for fetching the next page of events.
+            Reserved for future pagination — issue #421 returns
+            single-page reads (capped at the `limit` query param).
+          example: null
+        upgrade_options:
+          type: array
+          description: |
+            Paid tiers the tenant can upgrade to. Empty when the
+            tenant is already on a paid plan.
+          items:
+            $ref: '#/components/schemas/UpgradeOption'
+        billing_portal_url:
+          type: string
+          nullable: true
+          format: uri
+          description: |
+            Hosted billing portal URL (Stripe Customer Portal today).
+            Omitted when the tenant has no Stripe customer row
+            (e.g. a free-tier tenant that has never started checkout).
+          example: https://billing.stripe.com/c/p/portal_abc
+
     QuotaOverrideRequest:
       type: object
       description: |
@@ -1955,6 +2120,31 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Tenant is disabled. Returned when the caller's tenant row has
+            `disabled_at IS NOT NULL` at the moment the request reaches
+            the service layer (issue #440 disable-vs-activate race gate).
+            The response body is the standard error envelope with
+            `error.code = "CONFLICT"` and `error.message = "tenant is disabled"`.
+            The CLI / operator tooling can branch on `error.code` to
+            distinguish this from a generic infrastructure 500 — the
+            tenant will not auto-re-enable, retrying without operator
+            action is futile.
+
+            Scope note: this 409 is only reachable on the atomic path
+            (`?weight=100`, the default). Canary activation
+            (`?weight` < 100, which routes through traffic split) is
+            not gated by the disable check and so cannot surface this
+            response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFLICT
+                  message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1995,6 +2185,21 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Tenant is disabled. Promote delegates to the same
+            `activateDeployment` path as the activate endpoint, so the
+            issue #440 disable-vs-activate race gate fires identically
+            here. Body shape and `error.code` are identical to the
+            activate endpoint's 409.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFLICT
+                  message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2030,13 +2235,31 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: |
-            No prior `last_good_deployment_id` is recorded for this app,
-            so there is nothing to roll back to. Returned when the app
-            has only ever had one deployment.
+            Either no `last_good_deployment_id` is recorded for this app
+            (only one deployment has ever been activated, so there is
+            nothing to roll back to), or the caller's tenant is
+            disabled (issue #440 disable-vs-activate race gate).
+            The message field distinguishes the two: `"no previous
+            deployment to roll back to"` for the first, `"tenant is
+            disabled"` for the second. The status code and
+            `error.code = "CONFLICT"` are the same in both cases.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                no_last_good:
+                  summary: No last-good pointer
+                  value:
+                    error:
+                      code: CONFLICT
+                      message: no previous deployment to roll back to
+                tenant_disabled:
+                  summary: Tenant disabled (issue #440)
+                  value:
+                    error:
+                      code: CONFLICT
+                      message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2504,6 +2727,57 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Quota'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/usage:
+    get:
+      operationId: getUsage
+      summary: Get the authenticated tenant's usage dashboard payload
+      description: |
+        Composes current-period counters, a windowed subscription-event
+        timeline, and per-tenant upgrade options + billing portal URL.
+        Cached for 10s in-process (stale-while-revalidate) so dashboard
+        refresh doesn't hammer the DB. Free-tier tenants see the
+        `upgrade_options` array; paid tenants see the billing portal
+        URL instead.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Start of the event window (RFC3339). Defaults to `to - 30d`.
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: End of the event window (RFC3339). Defaults to now. Must be >= `from`.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of events to return. Clamped to 200.
+      responses:
+        '200':
+          description: Usage dashboard payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantUsage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':

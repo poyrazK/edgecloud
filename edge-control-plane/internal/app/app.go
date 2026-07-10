@@ -20,6 +20,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/noop"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/stripe"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/cache"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
@@ -301,6 +302,22 @@ func New(
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
 	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+
+	// Usage handler (issue #421): the tenant-facing usage dashboard.
+	// Composes quota + billing reads with a 10s SWR cache so dashboard
+	// refresh doesn't hammer the DB. upgrade_options is hardcoded
+	// here as the single source of truth for the dashboard pricing
+	// display; derive from a BillingProvider.ListPlans() call when
+	// the pricing source-of-truth moves off the static plan table.
+	usageCache := cache.NewUsageCache(10*time.Second, 60*time.Second)
+	usageSvc := service.NewUsageServiceFromBillingProvider(
+		quotaRepo,
+		billingRepo,
+		billingProvider,
+		usageCache,
+		service.UsageServiceConfig{},
+	)
+	usageHandler := handler.NewUsageHandler(usageSvc)
 	trafficHandler := handler.NewTrafficHandler(trafficSvc, appRepo)
 	egressHandler := handler.NewEgressHandler(tenantSvc, deploymentSvc)
 	logHandler := handler.NewLogHandler(logSvc)
@@ -472,6 +489,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("GET /api/list/{appName}", redirectTo("/api/v1/list/"+"{appName}"))
 	mux.HandleFunc("GET /api/auth/whoami", redirectTo("/api/v1/auth/whoami"))
 	mux.HandleFunc("GET /api/quotas", redirectTo("/api/v1/quotas"))
+	mux.HandleFunc("GET /api/usage", redirectTo("/api/v1/usage"))
 	mux.HandleFunc("POST /api/migrate", redirectTo("/api/v1/migrate"))
 	mux.HandleFunc("GET /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
 	mux.HandleFunc("POST /api/admin/tenants", redirectTo("/api/v1/admin/tenants"))
@@ -499,6 +517,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/apps/{appName}/env", envHandler.List)
 	api.HandleFunc("DELETE /api/v1/apps/{appName}/env/{key}", envHandler.Delete)
 	api.HandleFunc("GET /api/v1/quotas", quotaHandler.GetQuota)
+	api.HandleFunc("GET /api/v1/usage", usageHandler.GetUsage)
 	api.HandleFunc("POST /api/v1/apps/{appName}", appHandler.Create)
 	api.HandleFunc("GET /api/v1/apps", appHandler.List)
 	api.HandleFunc("GET /api/v1/apps/{appName}", appHandler.Get)

@@ -143,3 +143,32 @@ func (r *BillingRepository) GetSubscriptionStatus(ctx context.Context, tenantID 
 	}
 	return domain.SubscriptionStatus(status), err
 }
+
+// ListEventsByTenant returns the billing_events rows for a tenant whose
+// received_at falls within [from, to], ordered by received_at DESC, capped
+// at limit. Backs the GET /api/v1/usage subscription-event timeline
+// (issue #421).
+//
+// The query uses the partial index idx_billing_events_tenant_received
+// (tenant_id, received_at DESC) WHERE tenant_id IS NOT NULL (migration
+// 023:62-63) — the planner picks it because we filter on tenant_id and
+// order by received_at.
+//
+// limit must be > 0; callers clamp before reaching the repository (the
+// service layer caps at 200). An empty result is (nil, nil), NOT
+// ([]BillingEvent{}, nil) — sqlx's SelectContext already returns a nil
+// slice for zero rows, so callers should len()-check rather than nil-check
+// if they need to distinguish "no events" from "db error".
+func (r *BillingRepository) ListEventsByTenant(ctx context.Context, tenantID string, from, to time.Time, limit int) ([]domain.BillingEvent, error) {
+	const q = `SELECT event_id, provider, event_type, tenant_id, received_at, processed_at, payload_hash
+	             FROM billing_events
+	            WHERE tenant_id = $1
+	              AND received_at >= $2 AND received_at <= $3
+	            ORDER BY received_at DESC
+	            LIMIT $4`
+	var out []domain.BillingEvent
+	if err := r.db.SelectContext(ctx, &out, q, tenantID, from, to, limit); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

@@ -1,4 +1,12 @@
 //! `edge init` — scaffold a new project.
+//!
+//! The JS starter (`scaffold_js`) writes a `package.json` that
+//! pulls `@edgecloud/sdk` from the npm registry (issue #424).
+//! Earlier versions walked up from CWD looking for an in-tree
+//! `edge-js-sdk/` and referenced it via `file:...` — that path
+//! only worked for monorepo devs and produced a broken
+//! `package.json` for everyone else. See `PACKAGE_JSON_TEMPLATE`
+//! for the npm contract.
 
 use crate::output;
 use crate::LangArg;
@@ -50,6 +58,13 @@ fn main() {
 }
 "#;
 
+// `package.json` for the JS starter. The SDK is pulled from npm
+// (issue #424) — `edge-js-sdk/package.json` already declares
+// `"name": "@edgecloud/sdk"` and `"version": "0.2.0"`, so the
+// `^0.2.0` range below is the contract. The single `{name}`
+// placeholder is the project name; the SDK version is fixed.
+// Bumping the SDK to 0.3.0 requires a coordinated CLI template
+// change + a new SDK release — see `edge-js-sdk/README.md`.
 const PACKAGE_JSON_TEMPLATE: &str = r#"{
   "name": "{name}",
   "version": "0.1.0",
@@ -59,7 +74,7 @@ const PACKAGE_JSON_TEMPLATE: &str = r#"{
     "build": "edge build"
   },
   "dependencies": {
-    "@edgecloud/sdk": "{sdk_path}"
+    "@edgecloud/sdk": "^0.2.0"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"
@@ -91,39 +106,11 @@ function handleRequest(req) {
 globalThis.handleRequest = handleRequest;
 "#;
 
-/// JS starter for `edge init --lang=js`. Exports `handle(request)`
-/// in the shape Javy v3.x expects for a wasi:http/incoming-handler
-/// component. Uses the canonical `Request`/`Response` globals
-/// (Deno-style, which Javy's QuickJS ships with).
-///
-/// The `{name}` placeholder is the only substitution; JS uses single
-/// braces for object literals, so the surrounding `{ ... }` are
-/// written as plain single braces here (NOT `{{` / `}}` — this is a
-/// raw string, not a `format!` invocation, so brace escaping is
-/// unnecessary and would render literally in the output).
-#[allow(dead_code)]
-const INDEX_JS_TEMPLATE: &str = r#"// {name} — built with edgeCloud (JavaScript via Javy).
-//
-// The runtime hands you a Fetch-style Request and expects a Response
-// back. The `handle` named export is what `wasi:http/incoming-handler`
-// calls per inbound request.
-//
-// This starter uses ONLY `wasi:http` — there is no edge:cloud/* SDK
-// for JavaScript in v0.2. To use kv-store, cache, scheduling, etc.
-// from JS, see the follow-up SDK work for issue #317.
-
-export async function handle(request) {
-  const url = new URL(request.url);
-  return new Response(JSON.stringify({
-    hello: "js",
-    path: url.pathname,
-    method: request.method,
-  }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
-}
-"#;
+// Active JS starter is `JS_HANDLER_TEMPLATE` above. The
+// previous Javy-era `index.js` scaffold (Fetch-style
+// `export async function handle(request) → Response`) was removed
+// in the QuickJS pilot migration; the runtime contract is now
+// `globalThis.handleRequest(req) → {status, body, contentType}`.
 
 const GITIGNORE: &str = r#"/target/
 /.wasm/
@@ -181,24 +168,6 @@ pub fn run(name: &str, api: Option<&str>, lang: LangArg) -> Result<()> {
     Ok(())
 }
 
-fn resolve_sdk_path() -> String {
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = cwd;
-        for _ in 0..5 {
-            let sdk_dir = dir.join("edge-js-sdk");
-            if sdk_dir.join("package.json").exists() {
-                if let Ok(abs_sdk) = sdk_dir.canonicalize() {
-                    return format!("file:{}", abs_sdk.to_string_lossy());
-                }
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-    }
-    "file:../edge-js-sdk".to_string()
-}
-
 /// Rust starter: edge.toml + Cargo.toml + src/main.rs + .gitignore.
 fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
     write_edge_toml(dir, name, LangArg::Rust, api)?;
@@ -218,10 +187,12 @@ fn scaffold_rust(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result
 fn scaffold_js(dir: &std::path::Path, name: &str, api: Option<&str>) -> Result<()> {
     write_edge_toml(dir, name, LangArg::Js, api)?;
 
-    let sdk_path = resolve_sdk_path();
-    let package_json = PACKAGE_JSON_TEMPLATE
-        .replace("{name}", name)
-        .replace("{sdk_path}", &sdk_path);
+    // The `package.json` references `@edgecloud/sdk` from npm;
+    // see the doc comment on `PACKAGE_JSON_TEMPLATE`. Monorepo
+    // devs who want to test a local SDK change should use
+    // `npm link edge-js-sdk/` after the scaffold — that's the
+    // standard npm workflow and is not encoded here.
+    let package_json = PACKAGE_JSON_TEMPLATE.replace("{name}", name);
     std::fs::write(dir.join("package.json"), package_json)?;
 
     std::fs::create_dir_all(dir.join("src"))?;
@@ -350,30 +321,68 @@ mod tests {
         assert_eq!(parsed["project"]["target"].as_str(), Some("wasm32-wasip2"));
     }
 
+    // ── package.json scaffold (issue #424) ─────────────────────────
+    //
+    // Three pin tests on `PACKAGE_JSON_TEMPLATE`:
+    //
+    // 1. The npm version is `^0.2.0` and the literal `"file:"` is
+    //    NOT anywhere in the template. Catches a future regression
+    //    that re-introduces the path-walk fallback.
+    // 2. The substituted template parses as valid JSON and the
+    //    parsed `dependencies` map contains the npm reference.
+    // 3. The active `JS_HANDLER_TEMPLATE` does NOT mention
+    //    `wasi:http` or `Javy` — the dead `INDEX_JS_TEMPLATE`
+    //    did, and any future template that re-introduces those
+    //    would be a Javy-era regression.
+
     #[test]
-    fn index_js_template_substitution() {
-        let result = super::INDEX_JS_TEMPLATE.replace("{name}", "myapp");
-        // The header comment should name the project so devs know
-        // which scaffold they got when they revisit a repo later.
-        assert!(result.contains("myapp"));
-        // Must export `handle` — the wasi:http/incoming-handler contract.
+    fn package_json_template_pins_npm_version_and_no_file_path() {
+        // The template must reference the SDK via a semver range, not
+        // a `file:...` path (the `file:` form is what broke for
+        // outside-monorepo users — see issue #424).
         assert!(
-            result.contains("export async function handle"),
-            "expected `export async function handle` in: {result}"
+            super::PACKAGE_JSON_TEMPLATE.contains(r#""@edgecloud/sdk": "^0.2.0""#),
+            "expected pinned npm version ^0.2.0 in PACKAGE_JSON_TEMPLATE; got: {}",
+            super::PACKAGE_JSON_TEMPLATE
+        );
+        assert!(
+            !super::PACKAGE_JSON_TEMPLATE.contains("file:"),
+            "PACKAGE_JSON_TEMPLATE must not reference the SDK via a file: path (issue #424); got: {}",
+            super::PACKAGE_JSON_TEMPLATE
         );
     }
 
     #[test]
-    fn index_js_template_is_valid_js_shape() {
-        // We can't parse ES modules with vanilla tools, but we can
-        // assert the template produces non-empty output and that the
-        // brace balance is even — a basic sanity check.
-        let result = super::INDEX_JS_TEMPLATE.replace("{name}", "myapp");
-        let opens = result.matches('{').count();
-        let closes = result.matches('}').count();
+    fn package_json_template_round_trips_through_parser() {
+        let result = super::PACKAGE_JSON_TEMPLATE.replace("{name}", "myapp");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("PACKAGE_JSON_TEMPLATE must be valid JSON");
+        assert_eq!(parsed["name"], "myapp");
         assert_eq!(
-            opens, closes,
-            "unbalanced braces in index.js template: {opens} open vs {closes} close"
+            parsed["dependencies"]["@edgecloud/sdk"], "^0.2.0",
+            "expected npm version range in parsed dependencies"
+        );
+        // `serde_json` is already in scope via other CLI code paths;
+        // the test surface keeps the dependency visible to anyone
+        // touching this template.
+    }
+
+    #[test]
+    fn js_handler_template_does_not_import_javy_runtime() {
+        // The active scaffold is the QuickJS contract
+        // (`globalThis.handleRequest(req) → {status, body, contentType}`).
+        // It must NOT mention `wasi:http` directly (that's the
+        // host-side binding the runtime injects), and it must NOT
+        // mention Javy (the previous runtime the JS pilot replaced).
+        assert!(
+            !super::JS_HANDLER_TEMPLATE.contains("wasi:http"),
+            "JS_HANDLER_TEMPLATE must not reference wasi:http directly; got: {}",
+            super::JS_HANDLER_TEMPLATE
+        );
+        assert!(
+            !super::JS_HANDLER_TEMPLATE.contains("Javy"),
+            "JS_HANDLER_TEMPLATE must not mention Javy; got: {}",
+            super::JS_HANDLER_TEMPLATE
         );
     }
 }

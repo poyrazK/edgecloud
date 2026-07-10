@@ -64,7 +64,7 @@ async fn list_returns_empty_message() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).args(["env-list"]);
@@ -94,7 +94,7 @@ async fn list_renders_array_shape() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).args(["env-list"]);
@@ -132,7 +132,7 @@ async fn list_rejects_pre_fix_map_shape() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).args(["env-list"]);
@@ -178,7 +178,7 @@ async fn list_resolves_app_from_positional_when_state_missing() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -212,7 +212,7 @@ async fn list_resolves_app_from_state_when_positional_empty() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).args(["env-list"]);
@@ -246,7 +246,7 @@ async fn set_resolves_app_from_positional_when_state_missing() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).args([
@@ -278,7 +278,7 @@ async fn delete_resolves_app_from_positional_when_state_missing() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())

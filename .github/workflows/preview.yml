@@ -97,7 +97,7 @@ jobs:
       # wasi:http@0.2.1 vs 0.2.4 rationale.
       - name: Build hello sample
         working-directory: samples/hello
-        run: edge-cli build
+        run: edge build
 
       # Delegate install-cli + edge-cli deploy + URL capture to the
       # reusable composite action. We pass `build: 'false'` because

@@ -69,7 +69,7 @@ async fn list_returns_empty_message() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
@@ -114,7 +114,7 @@ async fn list_renders_envelope_items_table() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
@@ -160,7 +160,7 @@ async fn list_rejects_pre_fix_bare_array_shape() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
@@ -211,7 +211,7 @@ async fn forwards_limit_and_offset_query_params() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -258,7 +258,7 @@ async fn omits_query_params_when_no_flags() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
@@ -304,7 +304,7 @@ async fn renders_footer_when_total_exceeds_limit() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -352,7 +352,7 @@ async fn silent_when_total_within_one_page() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
@@ -386,7 +386,7 @@ async fn rejects_zero_page_with_exit_one() {
     // a connection-refused failure, distinct from the
     // --page=0 bail we want to pin.
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     // Point at the mock so the test stays portable even if a

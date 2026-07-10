@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@edgecloud/sdk": "file:../../edge-js-sdk"
+    "@edgecloud/sdk": "^0.2.0"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"
