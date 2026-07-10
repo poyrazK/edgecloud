@@ -54,7 +54,6 @@ type RecordingPublisher struct {
 	purgeCalls []recordedPurge
 	failFor    map[string]error
 }
-}
 
 type recordedPublish struct {
 	region string
