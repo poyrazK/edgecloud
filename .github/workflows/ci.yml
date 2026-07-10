@@ -584,43 +584,47 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build samples/hello-js
-        # The full happy-path the user takes: npm install (resolves
-        # @edgecloud/sdk from npm via the `^0.2.0` pin in
-        # samples/hello-js/package.json — note: in CI that pin
-        # resolves to the published npm version; the in-tree SDK at
-        # edge-js-sdk/ is *not* used unless someone `npm link`s it),
-        # then `edge build --lang=js` (which bundles src/handler.js,
-        # builds edge-js-runtime for wasm32-wasip1, and wraps with
-        # `wasm-tools component new --adapt`). The end-to-end build
-        # is the regression check — the unit tests in
-        # edge-cli/src/commands/init.rs only cover the template
-        # shape, not the build itself.
-        working-directory: samples/hello-js
+        # The full happy-path the user takes: `npm install` resolves
+        # `@edgecloud/sdk` from npm via the `^0.2.0` pin in
+        # samples/hello-js/package.json, then `edge build --lang=js`
+        # bundles src/handler.js, builds edge-js-runtime for
+        # wasm32-wasip1, and wraps with `wasm-tools component new
+        # --adapt`. The end-to-end build is the regression check —
+        # the unit tests in edge-cli/src/commands/init.rs only cover
+        # the template shape, not the build itself.
+        #
+        # The SDK isn't on the public npm registry yet, so this job
+        # exercises the install path against a local tarball via
+        # `npm pack edge-js-sdk/`. That validates the *exact* bytes
+        # an end user would receive when the release manager runs
+        # `npm publish --access public` from edge-js-sdk/, without
+        # requiring CI to own npm credentials. When the package is
+        # published, swap the tarball install for a plain `npm
+        # install` (the `^0.2.0` pin resolves the same way either
+        # way).
         run: |
-          # Pre-flight: confirm `@edgecloud/sdk` is published and the
-          # `^0.2.0` pin in samples/hello-js/package.json is
-          # satisfiable. Without this, `npm install` would happily
-          # succeed locally (via the in-tree file: resolution if
-          # anyone `npm link`s it) or fail with a 404 in CI without
-          # making the publish gap obvious. `npm view` exits 0 when
-          # the package + version range are reachable.
-          echo "Resolving @edgecloud/sdk from npm…"
-          npm view '@edgecloud/sdk' version >/dev/null || {
-            echo "::error::@edgecloud/sdk is not published to npm. Run: cd edge-js-sdk && npm publish --access public"
-            exit 1
-          }
-          npm install
-          # Confirm the npm resolution actually produced the SDK at
-          # the pinned version (catches a future drift to a 0.2.x
-          # with breaking changes — the `^0.2.0` pin allows any
-          # 0.2.x, so this is a stronger assertion than just "npm
-          # install succeeded").
-          npm ls @edgecloud/sdk
-          edge build --lang=js
+          # Build the in-tree SDK into a tarball the npm install path
+          # can consume. `npm pack` resolves the workspace's
+          # `edge-js-sdk/package.json` and writes a
+          # `edgecloud-sdk-0.2.0.tgz` file. Tarball shape is exactly
+          # what `npm publish` would upload.
+          echo "Packing @edgecloud/sdk from edge-js-sdk/…"
+          (cd edge-js-sdk && npm pack --silent)
+          sdk_tarball="$(ls edge-js-sdk/edgecloud-sdk-*.tgz | head -1)"
+          test -n "$sdk_tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
+          echo "  SDK tarball: $sdk_tarball"
+
+          # Install in samples/hello-js/ with the tarball swapped in
+          # for the npm registry. The `package.json` `^0.2.0` pin is
+          # preserved (this only redirects the resolution source).
+          (cd samples/hello-js && npm install --no-save --no-audit --no-fund "$GITHUB_WORKSPACE/$sdk_tarball")
+          (cd samples/hello-js && npm ls @edgecloud/sdk)
+
+          (cd samples/hello-js && edge build --lang=js)
           # The CLI's path_for("js") returns target/javy/<name>.wasm
           # (see edge-cli/src/commands/build.rs:89-104). The artifact
           # is the user-visible deliverable; assert it exists.
-          test -f target/javy/hello-js.wasm
+          test -f samples/hello-js/target/javy/hello-js.wasm
           # And that it's a valid wasm32 component (wasm-tools can
           # extract the WIT to verify).
-          wasm-tools component wit target/javy/hello-js.wasm | grep -q 'wasi:http/incoming-handler@0.2.1'
+          wasm-tools component wit samples/hello-js/target/javy/hello-js.wasm | grep -q 'wasi:http/incoming-handler@0.2.1'

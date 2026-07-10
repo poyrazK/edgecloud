@@ -88,7 +88,7 @@ async fn activate_persists_returned_deployment_id_to_state_json() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -127,7 +127,7 @@ async fn activate_server_error_does_not_overwrite_state() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
