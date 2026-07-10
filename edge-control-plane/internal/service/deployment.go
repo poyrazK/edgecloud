@@ -159,6 +159,14 @@ func mintPreviewID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// ptrToTime returns &t for t, used at call sites that need a
+// *time.Time column write. Issue #440: ActivationAttemptStartedAt on
+// active_deployments takes a non-nil pointer so the disable path's
+// wait loop sees a recent timestamp.
+func ptrToTime(t time.Time) *time.Time {
+	return &t
+}
+
 // Sentinel errors.
 //
 // The handler matches ErrInvalidRegion and ErrTooManyRegions via
@@ -933,6 +941,15 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			// pre-#308 behavior.
 			PreviewID:       deployment.PreviewID,
 			PreviewPRNumber: deployment.PreviewPRNumber,
+			// Stamp the issue #440 in-flight marker (migration
+			// 026). The disable path observes this column via
+			// waitForActiveRowPublishes (commit 8) and waits
+			// for the matching last_publish_at stamp before
+			// publishing empty — closing the canonical race
+			// where activate wins the tenants FOR UPDATE lock
+			// first and its post-commit publishSwap runs
+			// after the disable's commit.
+			ActivationAttemptStartedAt: ptrToTime(time.Now()),
 		}); err != nil {
 			return fmt.Errorf("setting active deployment: %w", err)
 		}
@@ -1421,6 +1438,28 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	var maxMemoryMB int
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// Issue #440: take the tenants row FOR UPDATE inside the
+		// same tx as the active_deployments lock so the rollback
+		// observes disabled_at under the lock, not after a
+		// post-commit GetByID race. Without this guard, the
+		// disable path could commit + publish empty AFTER the
+		// rollback's tx commits but BEFORE the rollback's
+		// publishSwap, killing the just-rolled-back app. The
+		// handler's existing `errors.Is(err, ErrTenantDisabled)`
+		// mapping at handler/deployment.go:798 was previously
+		// dead code for the rollback path — this guard makes
+		// it reachable.
+		txTenant, err := s.tenantRepo.WithTx(tx).GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("reading tenant for rollback: %w", err)
+		}
+		if txTenant == nil {
+			return fmt.Errorf("tenant not found")
+		}
+		if txTenant.IsDisabled() {
+			return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
+		}
+
 		txActive := s.activeRepo.WithTx(tx)
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
@@ -1487,6 +1526,12 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			// it's a tenant preference, not a property of any single
 			// deployment, so it should survive a swap.
 			AutoRollbackEnabled: current.AutoRollbackEnabled,
+			// Issue #440 in-flight marker (migration 026). Same
+			// rationale as ActivateDeployment: a rollback is an
+			// activation event for this row, so the disable path
+			// must see the row's marker stamp and wait for
+			// publishSwap before publishing empty.
+			ActivationAttemptStartedAt: ptrToTime(time.Now()),
 		}); err != nil {
 			return fmt.Errorf("swapping active deployment: %w", err)
 		}
