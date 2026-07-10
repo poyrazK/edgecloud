@@ -129,12 +129,20 @@ func TestPreviewGC_FirstSweep_FiresImmediately(t *testing.T) {
 	// deterministic on busy CI.
 	time.Sleep(20 * time.Millisecond)
 
+	// Issue #582: lock repo.mu while reading the booleans the closure
+	// goroutine writes (mockPreviewGCRepo.ListExpiredPreviewBlobs sets
+	// listCalled at preview_gc_test.go:42-44 and
+	// DeleteExpiredPreviewsByIDs sets deleteCalled at :56-59, both
+	// under repo.mu). Without this lock, go test -race flags the
+	// pair as a data race.
+	repo.mu.Lock()
 	if !repo.listCalled {
 		t.Error("ListExpiredPreviewBlobs was not called on first sweep")
 	}
 	if !repo.deleteCalled {
 		t.Error("DeleteExpiredPreviewsByIDs was not called on first sweep")
 	}
+	repo.mu.Unlock()
 
 	blobs.mu.Lock()
 	defer blobs.mu.Unlock()
