@@ -583,6 +583,15 @@ func (s *DeploymentService) SetCachePusher(p artifactCachePusher) {
 	s.cachePusher = p
 }
 
+// GetCachePusher returns the currently-injected cache pusher (may be
+// nil). Used by the cache-retry sweep (issue #501) so it can re-push
+// stranded cache writes without a separate DI seam. Returns the live
+// pointer — operators may rotate the pusher at runtime via
+// SetCachePusher, and the sweep reads the latest value each tick.
+func (s *DeploymentService) GetCachePusher() artifactCachePusher {
+	return s.cachePusher
+}
+
 // SetBillingRepo injects the billing repo used by the deploy-time
 // quota gate (issue #420). Optional injection — Deploy is the only
 // caller, and existing tests that don't care about billing can leave
@@ -599,6 +608,17 @@ func (s *DeploymentService) SetBillingRepo(b billingRepoForDeploymentSvc) {
 // be set AND the region must be in the map for a push to occur.
 func (s *DeploymentService) SetRegionArtifactCaches(m map[string]string) {
 	s.regionArtifactCaches = m
+}
+
+// GetRegionArtifactCaches returns the live per-region URL map. Used by
+// the cache-retry sweep (issue #501) so it consults the current config
+// each sweep tick — operators may rotate the map at runtime via
+// SetRegionArtifactCaches (e.g. on a config hot-reload or a region
+// addition). Returning the live map (not a snapshot) is intentional:
+// the sweep is expected to handle "config disappeared since last
+// activate" by treating those rows as configMissing.
+func (s *DeploymentService) GetRegionArtifactCaches() map[string]string {
+	return s.regionArtifactCaches
 }
 
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
