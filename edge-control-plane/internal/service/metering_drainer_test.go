@@ -194,7 +194,6 @@ func TestBackoffForMetering_caps_at_5_minutes(t *testing.T) {
 // tests only need to verify the drainer's control flow.
 type fakeRepo struct {
 	rows            []repository.BillingUsageEventWithID
-	claimedAt       time.Time
 	markedProcessed int64
 }
 
