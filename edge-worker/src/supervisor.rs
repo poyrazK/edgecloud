@@ -1179,8 +1179,22 @@ impl Supervisor {
     /// calls `edge_runtime::runtime::purge_tenant` to remove the
     /// per-tenant dirs and in-memory registry entries.
     ///
-    /// Order matters: stopping apps drains in-flight requests so no
-    /// KV/cache/scheduler read or write is racing the dir removal.
+    /// **Order matters, do not reorder.** Stopping apps first
+    /// achieves two things:
+    ///
+    /// 1. Drains in-flight requests so no KV / cache / scheduler
+    ///    read or write is racing the dir removal.
+    /// 2. Drops every `Arc<KvStore>` / `Arc<Cache>` / `Arc<Scheduler>`
+    ///    clone held by the app, so `purge_tenant`'s
+    ///    `Arc::get_mut` inside `runtime.rs` succeeds and the
+    ///    in-memory registries clear. If a still-running app holds
+    ///    a clone when `purge_tenant` runs, `Arc::get_mut` returns
+    ///    `None` and the registry entry silently survives — the
+    ///    next `start_app` for the tenant then races against a
+    ///    `KvStore` whose on-disk dir has already been `rm`'d,
+    ///    splitting state across two instances until the old `Arc`
+    ///    drops.
+    ///
     /// The diff-and-reconcile path takes over from the next
     /// task_update / full_sync — a subsequent activate for the same
     /// tenant will see no apps (correct) and recreate the dirs

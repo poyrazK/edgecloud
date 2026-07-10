@@ -367,7 +367,7 @@ func TestBackoffFor_OverflowCap(t *testing.T) {
 // claimedPurgeRow builds a ClaimDue result row carrying a
 // task_purge payload. Mirrors claimedRow but uses Kind="task_purge"
 // and a PurgePayload bytes instead of TaskMessage.
-func claimedPurgeRow(id int64, tenantID, appName, reason string, regions []string, attempt int) *sqlmock.Rows {
+func claimedPurgeRow(id int64, tenantID, appName string, reason nats.PurgeReason, regions []string, attempt int) *sqlmock.Rows {
 	now := time.Now()
 	payload, err := json.Marshal(&nats.PurgePayload{
 		Type:      nats.TaskMessageKindTaskPurge,
@@ -550,9 +550,53 @@ func TestOutboxDrainer_MixedBatchHandlesBothKinds(t *testing.T) {
 	}
 }
 
+// TestOutboxDrainer_KindPayloadMismatchIsTerminal (issue #569 review
+// finding #1): a row whose `Kind` does not match the JSON `type`
+// field in its payload must NOT be dispatched to either publisher.
+// Without this guard, a kind='task_update' row carrying a
+// PurgePayload body would unmarshal as a TaskMessage with
+// type="task_purge" and an empty apps map — the worker would silently
+// receive a phantom task_update with no apps. The cross-check in
+// processTaskRow / processPurgeRow rejects the row at the dispatcher
+// boundary and MarkFailed's it for operator inspection.
+func TestOutboxDrainer_KindPayloadMismatchIsTerminal(t *testing.T) {
+	pub := newRecordingPublisher()
+	drainer, mock, cleanup := newDrainerForTest(t, pub, 50, 10)
+	defer cleanup()
+
+	now := time.Now()
+	// Row claims kind='task_update' but its payload is a
+	// PurgePayload (type='task_purge'). The cross-check must
+	// catch this and MarkFailed the row.
+	mock.ExpectQuery(regexp.QuoteMeta(`WITH due AS (`)).
+		WithArgs(50).
+		WillReturnRows(sqlmock.NewRows(outboxColumns).AddRow(
+			1, "t_mismatch", "myapp", nats.TaskMessageKindTaskUpdate,
+			mustPurgePayload("t_mismatch", "myapp", nats.PurgeReasonAppDeleted, []string{"us-east"}),
+			pq.Array([]string{"us-east"}),
+			0, now, "in_flight", nil,
+			"mismatch:1", now, nil, now.Add(30*time.Second),
+		))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE outbox`)).
+		WithArgs(int64(1), "failed", 10, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	drainer.Tick(context.Background())
+
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("publisher task_update regions = %v, want [] (kind/payload mismatch must not publish)", got)
+	}
+	if got := pub.purgeRegionsCalled(); len(got) != 0 {
+		t.Errorf("publisher purge regions = %v, want [] (kind/payload mismatch must not publish)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
 // mustPurgePayload marshals a PurgePayload — used by the mixed-batch
 // test to build a row inline.
-func mustPurgePayload(tenantID, appName, reason string, regions []string) []byte {
+func mustPurgePayload(tenantID, appName string, reason nats.PurgeReason, regions []string) []byte {
 	b, err := json.Marshal(&nats.PurgePayload{
 		Type:      nats.TaskMessageKindTaskPurge,
 		Timestamp: time.Now().UTC(),

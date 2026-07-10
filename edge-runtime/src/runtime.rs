@@ -1015,6 +1015,14 @@ pub fn purge_tenant(tenant_id: &str) -> std::io::Result<()> {
 /// across the three optional env-var bases. Returns the directories
 /// that are configured (an env var absent ⇒ no persistence for that
 /// store, so no path is returned).
+///
+/// NOTE — `EDGE_FS_PATH` is intentionally NOT scanned here (issue #569,
+/// follow-up). The per-app preopen path (issue #558) is
+/// `{EDGE_FS_PATH}/{tenant_id}/{app_name}/`, NOT a per-tenant dir, so
+/// a single tenant-wide `task_purge` cannot tell which app dirs to
+/// remove. The CP-side `AppService.Delete` doesn't emit an
+/// `EDGE_FS_PATH` cleanup either — preopen dirs persist until the
+/// operator runs a `find … -rm` sweep. Filing as a separate issue.
 fn resolve_tenant_purge_paths(tenant_id: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for var in [

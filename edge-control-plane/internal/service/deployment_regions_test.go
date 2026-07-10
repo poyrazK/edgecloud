@@ -673,6 +673,7 @@ func equalStringSlices(a, b []string) bool {
 func outboxRowPayload(t *testing.T, tenantID, appName, deploymentID string, maxMemoryMB int) []byte {
 	t.Helper()
 	payload, err := json.Marshal(&nats.TaskMessage{
+		Type:     nats.TaskMessageKindTaskUpdate, // matches Kind='task_update' in the row (issue #569 drainer cross-check)
 		TenantID: tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {

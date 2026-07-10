@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"time"
@@ -154,6 +155,19 @@ func (d *OutboxDrainer) processTaskRow(ctx context.Context, row *repository.Outb
 			"payload unmarshal: "+err.Error(), d.maxAttempts, time.Now())
 		return
 	}
+	// kind/payload cross-check (issue #569 review #1): the JSON
+	// `type` field must agree with the row's Kind. A
+	// kind='task_update' row carrying a PurgePayload body would
+	// unmarshal as a TaskMessage with `type="task_purge"` and an
+	// empty apps map — the worker would silently receive a
+	// phantom task_update with no apps. Refuse instead.
+	if msg.Type != row.Kind {
+		log.Printf("outbox: row %d kind/payload mismatch: kind=%q payload.type=%q", row.ID, row.Kind, msg.Type)
+		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
+			fmt.Sprintf("kind/payload mismatch: kind=%q payload.type=%q", row.Kind, msg.Type),
+			d.maxAttempts, time.Now())
+		return
+	}
 	d.fanOutAndMark(ctx, row, func(region string) error {
 		return d.publisher.PublishTaskUpdate(region, &msg)
 	})
@@ -169,6 +183,14 @@ func (d *OutboxDrainer) processPurgeRow(ctx context.Context, row *repository.Out
 		log.Printf("outbox: row %d purge payload unmarshal failed: %v", row.ID, err)
 		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
 			"purge payload unmarshal: "+err.Error(), d.maxAttempts, time.Now())
+		return
+	}
+	// kind/payload cross-check — same rationale as processTaskRow.
+	if msg.Type != row.Kind {
+		log.Printf("outbox: row %d kind/payload mismatch: kind=%q payload.type=%q", row.ID, row.Kind, msg.Type)
+		_ = d.repo.MarkFailed(ctx, row.ID, d.maxAttempts,
+			fmt.Sprintf("kind/payload mismatch: kind=%q payload.type=%q", row.Kind, msg.Type),
+			d.maxAttempts, time.Now())
 		return
 	}
 	d.fanOutAndMark(ctx, row, func(region string) error {

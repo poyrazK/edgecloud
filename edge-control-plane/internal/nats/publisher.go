@@ -76,19 +76,28 @@ type TaskMessage struct {
 // Reason is an audit-only discriminator; the worker logs it but
 // doesn't change behavior between the two cases.
 type PurgePayload struct {
-	Type      string    `json:"type"`
-	Timestamp time.Time `json:"timestamp"`
-	TenantID  string    `json:"tenant_id"`
-	AppName   string    `json:"app_name,omitempty"`
-	Reason    string    `json:"reason"`
+	Type      string      `json:"type"`
+	Timestamp time.Time   `json:"timestamp"`
+	TenantID  string      `json:"tenant_id"`
+	AppName   string      `json:"app_name,omitempty"`
+	Reason    PurgeReason `json:"reason"`
 }
 
-// Purge reason constants (issue #569). Strings, not typed enums, to
-// match the wire format and the worker-side `PurgeReason`
-// (`#[serde(rename_all = "snake_case")]` in edge-worker/src/messages.rs).
+// PurgeReason is the typed `reason` field on PurgePayload. Backed
+// by a string so the JSON wire shape stays "app_deleted" /
+// "tenant_offboarded" (matching the worker-side `PurgeReason`
+// `#[serde(rename_all = "snake_case")]` in
+// edge-worker/src/messages.rs), but the typed wrapper gives
+// compile-time safety at the CP call sites — AppService.Delete
+// and TenantService.DeleteTenant cannot accidentally pass
+// `Reason: "wrong_value"` to the field.
+type PurgeReason string
+
+// Purge reason constants (issue #569). The string values are the
+// wire format; do not rename without also updating the worker.
 const (
-	PurgeReasonAppDeleted       = "app_deleted"
-	PurgeReasonTenantOffboarded = "tenant_offboarded"
+	PurgeReasonAppDeleted       PurgeReason = "app_deleted"
+	PurgeReasonTenantOffboarded PurgeReason = "tenant_offboarded"
 )
 
 // AppConfig describes an app's deployment configuration.
