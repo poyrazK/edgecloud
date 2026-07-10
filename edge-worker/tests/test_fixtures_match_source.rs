@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 const EXPECTED_HANDLER_HASH: &str =
-    "f039dc033db3dec5f0c365ae1c9ead16702879b760b2ef5eb11ff72ea25e508a";
+    "200c4e49ea1956660e97f4d68aee51d316bb2173db63523175389546591185b7";
 
 // Issue #448: `samples/hello-js-ws` is the long-running JS shim
 // (`world = "edge-runtime"`, `export start: func()`) wrapped via

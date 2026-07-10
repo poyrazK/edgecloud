@@ -65,6 +65,18 @@ use crate::wasi::sockets::ip_name_lookup::{
 // stream's `Pollable`, then call `poll::poll` (which blocks) on the
 // list, then re-call `resolve_next_address`."
 use crate::wasi::io::poll;
+// `wasi:filesystem` — exercised by `/fs/write` and `/fs/read`
+// (issue #558 cross-component isolation test). The runtime mounts
+// `EDGE_FS_PATH/{tenant_id}/{app_name}/` at `/` (per-app preopen,
+// per issue #558), so `preopens::get-directories` returns `[("/",
+// descriptor)]`. We then `open-at("/", "sentinel")` to touch files
+// inside the app's per-app subdirectory and prove the preopen scope
+// keeps app-a's writes invisible to app-b (see
+// `edge-runtime/tests/preopen_cross_component_isolation.rs`).
+use crate::wasi::filesystem::preopens::get_directories;
+use crate::wasi::filesystem::types::{
+    Descriptor, DescriptorFlags, OpenFlags, PathFlags,
+};
 
 // Edge cloud interface imports — available via generate_all.
 use crate::edge::cloud::kv_store;
@@ -330,6 +342,43 @@ impl Guest for Component {
                 scheduling::cancel_scheduled(id);
                 return_text(out, 200, b"ok");
             }
+            // ── wasi:filesystem (issue #558 cross-component test) ──
+            //
+            // Two routes exercise `wasi:filesystem` against the
+            // runtime-mounted per-app preopen:
+            //
+            //   GET /fs/write?path=sentinel&body=hello
+            //       → opens `/<path>` under the mounted preopen root,
+            //         writes the body bytes, closes. 200 "ok" /
+            //         500 "err:<code>".
+            //
+            //   GET /fs/read?path=sentinel
+            //       → opens `/<path>` for read, drains the stream,
+            //         returns the body as the response body.
+            //         200 with body, 404 "not found", or 500
+            //         "err:<code>" on failure.
+            //
+            // Both routes are intended to be exercised by
+            // `edge-runtime/tests/preopen_cross_component_isolation.rs`
+            // against two separate RuntimeStates (same tenant_id,
+            // different app_name) so app-a's `/fs/write` lands in
+            // `base/{tenant}/app-a/<path>` and is invisible from
+            // app-b's preopen at `base/{tenant}/app-b/`.
+            "/fs/write" => {
+                let path = get_query_param(query, "path").unwrap_or("sentinel");
+                let body = get_query_param(query, "body").unwrap_or("hello").as_bytes();
+                return_text(out, 200, fs_write_string(path, body).as_bytes());
+            }
+            "/fs/read" => {
+                let path = get_query_param(query, "path").unwrap_or("sentinel");
+                match fs_read_bytes(path) {
+                    Ok(bytes) => return_bytes(out, 200, &bytes),
+                    Err(msg) if msg == "not_found" => {
+                        return_text(out, 404, b"not found");
+                    }
+                    Err(msg) => return_text(out, 500, msg.as_bytes()),
+                }
+            }
             // ── SSE / streaming ────────────────────────────────────
             "/sse" => {
                 let count: usize = get_query_param(query, "count")
@@ -484,6 +533,98 @@ fn split_csv(s: &str) -> Vec<String> {
     } else {
         s.split(',').map(|p| p.to_string()).collect()
     }
+}
+
+/// Look up the preopen root the runtime mounted at "/" — the runtime
+/// (post-#558) mounts `{EDGE_FS_PATH}/{tenant_id}/{app_name}/` at `/`,
+/// so this should always return exactly one entry with `path == "/"`.
+/// Returns `None` if the runtime didn't mount a preopen (e.g. unsafe
+/// app_name filter tripped, see `is_safe_app_name`).
+fn root_descriptor() -> Option<Descriptor> {
+    get_directories().into_iter().next().map(|(d, _path)| d)
+}
+
+/// `/fs/write` helper — open `/<path>` for writing (creating if
+/// absent), write `body` at offset 0, close the stream.
+///
+/// Returns a stable string for the response body:
+///   * `"ok"` on success.
+///   * `"err:no-preopen"` if no `/` preopen was mounted (the runtime
+///     refused to mount, see `runtime.rs::build_wasi_ctx_for_tenant`).
+///   * `"err:open:<error-code>"` if `open-at` failed.
+///   * `"err:write-stream:<error-code>"` if `write-via-stream` failed.
+fn fs_write_string(path: &str, body: &[u8]) -> String {
+    let Some(root) = root_descriptor() else {
+        return "err:no-preopen".to_string();
+    };
+    let open_flags = OpenFlags::CREATE | OpenFlags::TRUNCATE;
+    let desc_flags = DescriptorFlags::WRITE;
+    let file = match root.open_at(PathFlags::empty(), path, open_flags, desc_flags) {
+        Ok(d) => d,
+        Err(e) => return format!("err:open:{}", fs_error_code_name(&e)),
+    };
+    let stream = match file.write_via_stream(0) {
+        Ok(s) => s,
+        Err(e) => return format!("err:write-stream:{}", fs_error_code_name(&e)),
+    };
+    if let Err(e) = stream.blocking_write_and_flush(body) {
+        return format!("err:write:{}", e);
+    }
+    "ok".to_string()
+}
+
+/// `/fs/read` helper — open `/<path>` for reading, drain into a Vec.
+///
+/// Returns:
+///   * `Ok(bytes)` on a successful read.
+///   * `Err("not_found")` if the file does not exist (open-at
+///     returned `no-entry`).
+///   * `Err("err:<stage>:<code>")` for any other failure mode.
+fn fs_read_bytes(path: &str) -> Result<Vec<u8>, String> {
+    let Some(root) = root_descriptor() else {
+        return Err("err:no-preopen".to_string());
+    };
+    let desc_flags = DescriptorFlags::READ;
+    let file = match root.open_at(PathFlags::empty(), path, OpenFlags::empty(), desc_flags) {
+        Ok(d) => d,
+        Err(e) if fs_error_code_is_not_found(&e) => return Err("not_found".to_string()),
+        Err(e) => return Err(format!("err:open:{}", fs_error_code_name(&e))),
+    };
+    let stream = file
+        .read_via_stream(0)
+        .map_err(|e| format!("err:read-stream:{}", fs_error_code_name(&e)))?;
+    let mut out = Vec::new();
+    // Drain in 4 KiB chunks. `blocking_read` returns when at least
+    // one byte is available or end-of-stream.
+    loop {
+        match stream.blocking_read(4096) {
+            Ok(chunk) => {
+                if chunk.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Best-effort error-code → string conversion for `wasi:filesystem`
+/// `ErrorCode`. wit-bindgen 0.45 emits the enum with a `Debug` impl;
+/// we print the variant name (e.g. `NoEntry`) so the test can assert
+/// against stable strings without depending on the exact type
+/// identity. Renamed from the more generic `error_code_name` to avoid
+/// colliding with the wasi:sockets error-code helper below.
+fn fs_error_code_name(code: &crate::wasi::filesystem::types::ErrorCode) -> String {
+    format!("{:?}", code)
+}
+
+/// True iff `code` is the variant signaling "path does not exist".
+/// Avoids string-matching `fs_error_code_name` so we don't depend on
+/// the Debug-format choice.
+fn fs_error_code_is_not_found(code: &crate::wasi::filesystem::types::ErrorCode) -> bool {
+    matches!(code, crate::wasi::filesystem::types::ErrorCode::NoEntry)
 }
 
 /// Busy loop — calibrated to exceed ~5s of Wasm execution at default
