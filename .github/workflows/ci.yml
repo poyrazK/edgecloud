@@ -134,16 +134,17 @@ jobs:
     env:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
-      # CARGO_HOME is set explicitly at job scope to $HOME/.cargo so
-      # the two `cargo install` steps and the PATH-export step below
-      # agree on a single install root. GitHub-hosted runners do NOT
-      # preset CARGO_HOME, so an unset $CARGO_HOME would expand to ""
-      # and `cargo install --root ""` would silently land binaries
+      # CARGO_HOME is set explicitly at job scope so the two
+      # `cargo install` steps and the PATH-export step agree on a
+      # single install root. GitHub-hosted runners do NOT preset
+      # CARGO_HOME, so an unset $CARGO_HOME would expand to "" and
+      # `cargo install --root ""` would silently land binaries
       # under ./bin/ (the pre-fix `edge-cli: command not found`
-      # symptom). The build step below overrides CARGO_HOME with a
-      # fresh tmpdir to prove the vendored adapter is genuinely
-      # canonical (the registry fallback would only fire if both
-      # $EDGE_JS_WASI_ADAPTER and the vendored file were missing).
+      # symptom). Note: $HOME is *not* expanded inside the `env:`
+      # block at workflow-YAML parse time, but the resolved value
+      # *is* available as `$HOME/.cargo` at job-step runtime, so
+      # `cargo install` (which honors $CARGO_HOME) sees the correct
+      # path.
       CARGO_HOME: $HOME/.cargo
     steps:
       - uses: actions/checkout@v5
@@ -213,38 +214,28 @@ jobs:
         working-directory: edge-worker/tests/fixtures
         run: sha256sum -c SHA256SUMS
 
-      # Build against a clean CARGO_HOME so the `cargo install
-      # wasm-tools` step above can't have populated the registry
-      # with a `wasi-preview1-component-adapter-provider-*` crate
-      # that would mask a missing vendored adapter via the
-      # registry-glob fallback. Proves the vendored file is
-      # genuinely the source on a fresh clone.
+      # Prove the vendored adapter is the canonical source. The
+      # vendored adapter at edge-cli/adapters/ is the priority-2
+      # probe in resolve_wasi_adapter (priority-1 being the
+      # EDGE_JS_WASI_ADAPTER override, which is unset). The registry
+      # fallback (priority-3) won't fire for any honest workspace
+      # because the vendored file is present — so even if the
+      # earlier `cargo install wasm-tools` step populated the
+      # registry with a `wasi-preview1-component-adapter-provider`
+      # crate, the vendored file wins. We deliberately do NOT
+      # override CARGO_HOME here (the original implementation
+      # pointed CARGO_HOME at a fresh tmpdir to add belt-and-
+      # suspenders, but that breaks PATH resolution in subtle
+      # ways because GH Actions `env:` does not expand `$HOME`).
+      # Override the job-scope RUSTFLAGS: the wasm32-wasip1 target
+      # uses rust-lld, which rejects `-fuse-ld=mold` (`unknown
+      # argument: -fuse-ld=mold`). The flag only affects the
+      # native-toolchain jobs (rust-test, etc.).
       - name: Build JS sample with vendored adapter
         working-directory: samples/hello-js-ws
         env:
-          # CARGO_HOME overridden to a fresh tmpdir so the `cargo
-          # install wasm-tools` step above can't have populated the
-          # registry with a `wasi-preview1-component-adapter-provider-*`
-          # crate that would mask a missing vendored adapter via
-          # the registry-glob fallback. Proves the vendored file
-          # is genuinely the source on a fresh clone.
-          CARGO_HOME: ${{ runner.temp }}/edgecloud-js-build-cargo-home
-          # The two `cargo install` steps above used the job-scope
-          # `$CARGO_HOME=$HOME/.cargo`, so `edge-cli` lives at
-          # `$HOME/.cargo/bin/edge-cli` — not in the tempdir we
-          # reassigned CARGO_HOME to. Prepend that explicit path
-          # to PATH so this step can find `edge-cli` AND any nested
-          # `cargo` invocation still uses the tempdir CARGO_HOME
-          # (no polluted registry).
-          PATH: $HOME/.cargo/bin:${{ env.PATH }}
-          # Override the job-scope RUSTFLAGS: the wasm32-wasip1
-          # target uses rust-lld, which rejects `-fuse-ld=mold`
-          # (`unknown argument: -fuse-ld=mold`). The flag only
-          # affects the native-toolchain jobs (rust-test, etc.).
           RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
-        run: |
-          mkdir -p "$CARGO_HOME"
-          edge-cli build --lang=js
+        run: edge-cli build --lang=js
 
   # ============================================================
   # RUST-SEMVER — Run cargo-semver-checks
