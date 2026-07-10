@@ -159,6 +159,21 @@ func mintPreviewID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// tenantAllowlist returns the allowlist slice for TaskMessage
+// construction, treating a nil tenant as "no allowlist" (fail
+// closed at the worker's egress policy). Issue #440 made this
+// defensible: the activate tx already gates disabled_at, but the
+// post-commit tenant read can still race a tenant deletion
+// (operator removes the row between our tx commit and this read);
+// rather than crashing the publish path we publish with an empty
+// allowlist and the worker enforces deny-by-default.
+func tenantAllowlist(t *domain.Tenant) []string {
+	if t == nil {
+		return nil
+	}
+	return t.AllowlistedDestinations
+}
+
 // Sentinel errors.
 //
 // The handler matches ErrInvalidRegion and ErrTooManyRegions via
@@ -872,6 +887,32 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	//     but the row stays consistent).
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440: lock the tenant FIRST, before reading /
+		// writing the active_deployments row. Order matters — if
+		// we took active_deployments first, a concurrent disable
+		// (SetDisabledAt) could land between our active read and
+		// our tx commit, and the worker would receive a
+		// TaskMessage for a tenant the operator just disabled.
+		// SELECT ... FOR UPDATE serializes us with the disable
+		// path: either we read disabled_at=NULL, commit, and the
+		// disable's subsequent SetDisabledAt blocks on our lock
+		// and wins the race; or the disable committed first, we
+		// read disabled_at=NOW(), and abort with
+		// ErrTenantDisabled. The active_deployments row never
+		// gets touched in the second case.
+		tenant, err := txTenant.GetForUpdate(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("locking tenant: %w", err)
+		}
+		if tenant == nil {
+			return ErrTenantNotFound
+		}
+		if tenant.IsDisabled() {
+			return ErrTenantDisabled
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -957,11 +998,14 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	if pubErr != nil {
 		return fmt.Errorf("getting tenant: %w", pubErr)
 	}
+	// The activate tx above already locked the tenant row and
+	// gated disabled_at; this post-commit read is purely for the
+	// allowlist. A nil return here means the tenant was deleted
+	// between our tx commit and this read — an extreme race we
+	// log and continue past (no allowlist = no egress, fail
+	// closed by the worker's egress policy).
 	if tenant == nil {
-		return fmt.Errorf("tenant not found")
-	}
-	if tenant.IsDisabled() {
-		return fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
+		log.Printf("activate: tenant %s vanished between tx commit and post-commit read; publishing with no allowlist", tenantID)
 	}
 
 	quota, pubErr := s.quotaRepo.GetByTenantID(ctx, tenantID)
@@ -986,7 +1030,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 				previewIDFromDeployment(deployment),
 				previewPRNumberFromDeployment(deployment),
 				envMap,
-				tenant.AllowlistedDestinations,
+				tenantAllowlist(tenant),
 				maxMemoryMB,
 			),
 		},
@@ -1579,7 +1623,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 				rollbackPreviewID,      // issue #308: preserved across rollback
 				rollbackPreviewPRNumber,
 				envMap,
-				tenant.AllowlistedDestinations,
+				tenantAllowlist(tenant),
 				maxMemoryMB,
 			),
 		},
@@ -1668,7 +1712,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 					previewIDFromDeployment(deployment),       // issue #308
 					previewPRNumberFromDeployment(deployment), // issue #308
 					envMap,
-					tenant.AllowlistedDestinations,
+					tenantAllowlist(tenant),
 					maxMemoryMB,
 				),
 			},

@@ -24,6 +24,7 @@ import (
 var (
 	ErrTenantNotFound = errors.New("tenant not found")
 	ErrQuotaNotFound  = errors.New("quota not found for tenant")
+	ErrTenantDisabled = errors.New("tenant is disabled")
 )
 
 // MaxEgressAllowlistEntries is the maximum number of entries a tenant may specify.

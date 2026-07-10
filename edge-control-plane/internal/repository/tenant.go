@@ -45,6 +45,28 @@ func (r *TenantRepository) GetByID(ctx context.Context, id string) (*domain.Tena
 	return &t, err
 }
 
+// GetForUpdate reads a tenant row inside an open transaction with a
+// row-level write lock (SELECT ... FOR UPDATE). Used by
+// DeploymentService.activateDeployment to serialize concurrent
+// activate / disable operations on the same tenant (issue #440):
+// the activate tx takes the lock first, reads disabled_at, and
+// only commits the Set if the tenant is not disabled. A disable
+// that races with activate blocks until the activate commits, then
+// observes the freshly-set active_deployments row when it runs.
+//
+// Returns (nil, nil) when the tenant does not exist — same shape
+// as GetByID so the service code can errors-check the
+// ErrTenantNotFound sentinel uniformly. Pair with WithTx.
+func (r *TenantRepository) GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error) {
+	var t domain.Tenant
+	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = $1 FOR UPDATE`
+	err := r.db.GetContext(ctx, &t, query, id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &t, err
+}
+
 func (r *TenantRepository) List(ctx context.Context) ([]domain.Tenant, error) {
 	var tenants []domain.Tenant
 	query := `SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants ORDER BY created_at DESC`
