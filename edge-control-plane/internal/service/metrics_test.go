@@ -73,7 +73,8 @@ func TestMetricsAggregator_IngestAndRenderTenant(t *testing.T) {
 
 	out := agg.RenderTenant("t_abc")
 
-	// All five families present (request_count, outbound_bytes, counter, gauge, histogram).
+	// Per-tenant families present (5) plus the global background-GC
+	// families (issue #581 — exposed on both /metrics and /api/v1/metrics).
 	for _, want := range []string{
 		"# TYPE edge_request_count gauge",
 		"# TYPE edge_outbound_bytes gauge",
@@ -88,15 +89,35 @@ func TestMetricsAggregator_IngestAndRenderTenant(t *testing.T) {
 		`metric="mem"} 512`,
 		`edge_histogram_sample{`,
 		`metric="latency"} 12.5`,
+		// GC families — zero-valued because no Record* has been called yet.
+		"edge_log_gc_ticks_total 0",
+		"edge_preview_gc_ticks_total 0",
+		"edge_cache_retry_sweep_ticks_total 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("RenderTenant output missing %q\ngot:\n%s", want, out)
 		}
 	}
 
-	// Unknown tenant returns empty.
-	if agg.RenderTenant("t_unknown") != "" {
-		t.Error("unknown tenant should return empty string")
+	// Unknown tenant still gets the global background-GC families
+	// (issue #581 decision: expose on both /metrics AND /api/v1/metrics)
+	// but no per-tenant series. We assert the GC families are present
+	// and the per-tenant series are absent.
+	outUnknown := agg.RenderTenant("t_unknown")
+	if strings.Contains(outUnknown, `tenant_id="t_unknown"`) {
+		t.Error("RenderTenant for unknown tenant must not include any per-tenant series")
+	}
+	for _, want := range []string{
+		"# TYPE edge_log_gc_ticks_total counter",
+		"edge_log_gc_ticks_total 0",
+		"# TYPE edge_preview_gc_ticks_total counter",
+		"edge_preview_gc_ticks_total 0",
+		"# TYPE edge_cache_retry_sweep_ticks_total counter",
+		"edge_cache_retry_sweep_ticks_total 0",
+	} {
+		if !strings.Contains(outUnknown, want) {
+			t.Errorf("RenderTenant (unknown) missing %q\ngot:\n%s", want, outUnknown)
+		}
 	}
 }
 
@@ -181,5 +202,210 @@ func TestPromQuoteLabelValue_ControlCharsPassThrough(t *testing.T) {
 	}
 	if !strings.Contains(got, "\t") {
 		t.Errorf("promQuoteLabelValue must preserve literal tab; got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Background-GC metrics (issue #581).
+//
+// The aggregator's emitGCFamilies writes 20 families at every render,
+// reading counter state directly off the aggregator struct. Each
+// *Sink closure bumps the relevant fields under a.mu.Lock(). nil-
+// receiver guards make the closures safe to call on a nil aggregator
+// so unit tests can wire `nil` into the GC constructors without
+// panicking.
+// ---------------------------------------------------------------------------
+
+// TestMetricsAggregator_RenderAll_IncludesGCFamilies: a fresh aggregator
+// (no Record* calls) emits all 20 GC families with zero values, both on
+// RenderAll and RenderTenant. Operators can alert on a family that never
+// moves (e.g. last_tick_timestamp_seconds older than 2× interval).
+func TestMetricsAggregator_RenderAll_IncludesGCFamilies(t *testing.T) {
+	agg := NewMetricsAggregator()
+
+	all := agg.RenderAll()
+	for _, want := range []string{
+		"# TYPE edge_log_gc_ticks_total counter",
+		"edge_log_gc_ticks_total 0",
+		"# TYPE edge_log_gc_rows_deleted_total counter",
+		"edge_log_gc_rows_deleted_total 0",
+		"# TYPE edge_log_gc_errors_total counter",
+		"edge_log_gc_errors_total 0",
+		"# TYPE edge_log_gc_last_tick_timestamp_seconds gauge",
+		"edge_log_gc_last_tick_timestamp_seconds 0",
+		"# TYPE edge_preview_gc_ticks_total counter",
+		"edge_preview_gc_ticks_total 0",
+		"# TYPE edge_preview_gc_blobs_deleted_total counter",
+		"edge_preview_gc_blobs_deleted_total 0",
+		"# TYPE edge_preview_gc_rows_deleted_total counter",
+		"edge_preview_gc_rows_deleted_total 0",
+		"# TYPE edge_preview_gc_batches_swept_total counter",
+		"edge_preview_gc_batches_swept_total 0",
+		"# TYPE edge_preview_gc_errors_total counter",
+		"edge_preview_gc_errors_total 0",
+		"# TYPE edge_preview_gc_blob_delete_failures_total counter",
+		"edge_preview_gc_blob_delete_failures_total 0",
+		"# TYPE edge_preview_gc_last_tick_timestamp_seconds gauge",
+		"edge_preview_gc_last_tick_timestamp_seconds 0",
+		"# TYPE edge_cache_retry_sweep_ticks_total counter",
+		"edge_cache_retry_sweep_ticks_total 0",
+		"# TYPE edge_cache_retry_sweep_batches_swept_total counter",
+		"edge_cache_retry_sweep_batches_swept_total 0",
+		"# TYPE edge_cache_retry_sweep_rows_touched_total counter",
+		"edge_cache_retry_sweep_rows_touched_total 0",
+		"# TYPE edge_cache_retry_sweep_pushed_ok_total counter",
+		"edge_cache_retry_sweep_pushed_ok_total 0",
+		"# TYPE edge_cache_retry_sweep_still_failing_total counter",
+		"edge_cache_retry_sweep_still_failing_total 0",
+		"# TYPE edge_cache_retry_sweep_config_missing_total counter",
+		"edge_cache_retry_sweep_config_missing_total 0",
+		"# TYPE edge_cache_retry_sweep_given_up_total counter",
+		"edge_cache_retry_sweep_given_up_total 0",
+		"# TYPE edge_cache_retry_sweep_errors_total counter",
+		"edge_cache_retry_sweep_errors_total 0",
+		"# TYPE edge_cache_retry_sweep_last_tick_timestamp_seconds gauge",
+		"edge_cache_retry_sweep_last_tick_timestamp_seconds 0",
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("RenderAll missing %q\ngot:\n%s", want, all)
+		}
+	}
+}
+
+// TestMetricsAggregator_RecordLogGC: a sequence of sink calls is reflected
+// in the rendered output. Three ticks: (5 deleted, ok), (0 deleted, error),
+// (3 deleted, ok). ticks_total=3, rows_deleted_total=8, errors_total=1.
+func TestMetricsAggregator_RecordLogGC(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewLogGCSink()
+	sink(5, false)
+	sink(0, true)
+	sink(3, false)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_log_gc_ticks_total 3",
+		"edge_log_gc_rows_deleted_total 8",
+		"edge_log_gc_errors_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q after sink calls\ngot:\n%s", want, out)
+		}
+	}
+	// last_tick_timestamp_seconds must be non-zero (we just called it).
+	if strings.Contains(out, "edge_log_gc_last_tick_timestamp_seconds 0") {
+		t.Error("edge_log_gc_last_tick_timestamp_seconds must be > 0 after a sink call")
+	}
+}
+
+// TestMetricsAggregator_RecordPreviewGC: a sequence of sink calls accumulates
+// per-tick counters (blobs/rows/batches/errors) correctly.
+func TestMetricsAggregator_RecordPreviewGC(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewPreviewGCSink()
+	sink(4, 4, 1, false)
+	sink(2, 2, 1, true)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_preview_gc_ticks_total 2",
+		"edge_preview_gc_blobs_deleted_total 6",
+		"edge_preview_gc_rows_deleted_total 6",
+		"edge_preview_gc_batches_swept_total 2",
+		"edge_preview_gc_errors_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestMetricsAggregator_RecordPreviewGC_BlobFailures: the per-blob
+// failure recorder is independent from the per-tick sink. Three calls
+// bumps the blob_delete_failures_total counter, and the per-tick
+// counters are not touched.
+func TestMetricsAggregator_RecordPreviewGC_BlobFailures(t *testing.T) {
+	agg := NewMetricsAggregator()
+	rec := agg.NewPreviewBlobFailureRecorder()
+	rec()
+	rec()
+	rec()
+
+	out := agg.RenderAll()
+	if !strings.Contains(out, "edge_preview_gc_blob_delete_failures_total 3") {
+		t.Errorf("RenderAll missing edge_preview_gc_blob_delete_failures_total 3\ngot:\n%s", out)
+	}
+	// Per-tick counters must stay zero (no per-tick sink was called).
+	if !strings.Contains(out, "edge_preview_gc_ticks_total 0") {
+		t.Error("blob-failure recorder must not bump ticks_total")
+	}
+}
+
+// TestMetricsAggregator_RecordCacheRetrySweep: the most complex sink —
+// six int counters plus an error flag plus a timestamp.
+func TestMetricsAggregator_RecordCacheRetrySweep(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewCacheRetrySweepSink()
+	// rowsTouched, pushedOK, stillFailing, configMissing, givenUp, batchesSwept
+	sink(10, 5, 3, 1, 1, 2, false)
+	sink(0, 0, 0, 0, 0, 0, true)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_cache_retry_sweep_ticks_total 2",
+		"edge_cache_retry_sweep_rows_touched_total 10",
+		"edge_cache_retry_sweep_pushed_ok_total 5",
+		"edge_cache_retry_sweep_still_failing_total 3",
+		"edge_cache_retry_sweep_config_missing_total 1",
+		"edge_cache_retry_sweep_given_up_total 1",
+		"edge_cache_retry_sweep_batches_swept_total 2",
+		"edge_cache_retry_sweep_errors_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestMetricsAggregator_NilSinkIsNoop: nil-aggregator sinks must not panic.
+// This is the contract that lets unit tests pass `nil` as the sink arg
+// to the GC constructors.
+func TestMetricsAggregator_NilSinkIsNoop(t *testing.T) {
+	var nilAgg *MetricsAggregator
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil-aggregator sink panicked: %v", r)
+		}
+	}()
+
+	nilAgg.NewLogGCSink()(5, false)
+	nilAgg.NewPreviewGCSink()(1, 2, 3, false)
+	nilAgg.NewPreviewBlobFailureRecorder()()
+	nilAgg.NewCacheRetrySweepSink()(1, 2, 3, 4, 5, 6, false)
+}
+
+// TestMetricsAggregator_RenderTenant_IncludesGCFamilies: per the user
+// decision on issue #581, the GC families appear on /api/v1/metrics
+// (per-tenant) as well as on /metrics (operator). Verify by ingesting
+// a tenant then asserting the rendered output contains both the
+// per-tenant series and the global GC families.
+func TestMetricsAggregator_RenderTenant_IncludesGCFamilies(t *testing.T) {
+	agg := NewMetricsAggregator()
+	agg.Ingest("t_1", "app-a", 1, 0, nil)
+	sink := agg.NewLogGCSink()
+	sink(7, false)
+
+	out := agg.RenderTenant("t_1")
+	// Per-tenant series still present.
+	if !strings.Contains(out, `edge_request_count{tenant_id="t_1",app="app-a"} 1`) {
+		t.Errorf("per-tenant series missing\ngot:\n%s", out)
+	}
+	// GC families included too.
+	if !strings.Contains(out, "edge_log_gc_ticks_total 1") {
+		t.Errorf("GC families missing on per-tenant render\ngot:\n%s", out)
+	}
+	if !strings.Contains(out, "edge_log_gc_rows_deleted_total 7") {
+		t.Errorf("GC families missing on per-tenant render\ngot:\n%s", out)
 	}
 }
