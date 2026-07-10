@@ -81,7 +81,8 @@ else
   source "$HOME/.cargo/env"
 fi
 
-# wasm32-wasip2 target — required to build samples/hello and any Rust
+# wasm32-wasip2 target — required to build samples/hello, edge-js-runtime
+# (the QuickJS host crate now targets wasip2 directly), and any Rust
 # guest that uses the edge:cloud WIT world.
 if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip2$'; then
   log "rustup target wasm32-wasip2 already installed"
@@ -90,25 +91,12 @@ else
   rustup target add wasm32-wasip2
 fi
 
-# wasm32-wasip1 target — required for edge-js-runtime (the QuickJS host
-# crate). Distinct from wasm32-wasip2: the JS pipeline still targets
-# preview-1 (the runtime is wrapped into a preview-2 component via
-# `wasm-tools component new --adapt` using the wasi-preview1 reactor
-# adapter). See issue #317 / #423.
-if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
-  log "rustup target wasm32-wasip1 already installed"
-else
-  log "adding rustup target wasm32-wasip1"
-  rustup target add wasm32-wasip1
-fi
-
-# wasm-tools — required for the JS build pipeline's
-# `wasm-tools component new --adapt` step (issue #423). The CLI globs
-# $CARGO_HOME/registry/... for the wasi-preview1 reactor adapter, and
-# that artifact is a transitive dep of `wasi-preview1-component-adapter-provider`
-# — which `wasm-tools` pulls in. So installing wasm-tools once is the
-# only host-side setup needed; the CLI handles the adapter lookup.
-# Pin to ^1.252 to match the version CI uses
+# wasm-tools — required by the Rust guest pipeline
+# (`edge build --lang=rust`'s `wasm-tools component new` wrap step,
+# `edge-migrate`'s build, the worker fixture build, and the Go control
+# plane's `wrapAsComponent`). The JS pipeline no longer needs it (the
+# wasip2 cargo target emits a complete component), but the other
+# pipelines do. Pin to ^1.252 to match the version CI uses
 # (.github/workflows/preview.yml:80-81).
 if command -v wasm-tools >/dev/null 2>&1; then
   log "wasm-tools already installed"

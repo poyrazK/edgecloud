@@ -4,7 +4,7 @@
 //! bind to the `wit_bindgen`-generated `edge:cloud/*` modules) live
 //! in `lib.rs::wasm_only`. They can't be compiled on the host target
 //! because the bindgen output only exists when targeting
-//! `wasm32-wasip1`. This file mirrors the same `globalThis.EdgeCloud`
+//! `wasm32-wasip2`. This file mirrors the same `globalThis.EdgeCloud`
 //! shape (one `Object` per namespace, each with `Function::new`
 //! closures) with no-op bodies, so the bench's per-iter `register`
 //! cost approximates the real one.

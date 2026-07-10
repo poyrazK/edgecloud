@@ -8,22 +8,22 @@ and returns a small JSON document:
 {"hello":"world","path":"/the/request/path","method":"GET"}
 ```
 
-The QuickJS host in `edge-js-runtime` (issue #317) compiles the user's
-JS to a `wasm32-wasip1` core module and wraps it into a Preview 2
-component via `wasm-tools component new --adapt` (the wasi-preview1
-reactor adapter). The wrapped component is what `edge build` emits to
+The QuickJS host in `edge-js-runtime` (issue #317) is built directly
+for `wasm32-wasip2` — the cargo target emits a complete WASI
+Preview 2 component natively, so no `wasm-tools component new
+--adapt` wrap step (or wasi-preview1 reactor adapter) is needed.
+The component is what `edge build` emits to
 `target/javy/hello-js.wasm`.
 
 ## Requirements
 
-- Rust toolchain with `wasm32-wasip1` target:
-  `rustup target add wasm32-wasip1`
+- Rust toolchain with `wasm32-wasip2` target:
+  `rustup target add wasm32-wasip2`
 - `wasm-tools` 1.252.x on `PATH`:
   `cargo install wasm-tools --locked --version "^1.252"`
-  The CLI's `edge build` globs `$CARGO_HOME/registry/.../wasi-preview1-component-adapter-provider-*/artefacts/wasi_snapshot_preview1.reactor.wasm`
-  to find the wasi-preview1 reactor adapter; this glob is populated
-  when `wasm-tools` is installed (the adapter is a transitive
-  dep of `wasi-preview1-component-adapter-provider`).
+  (`wasm-tools` is required by the Rust guest pipeline — `edge build
+  --lang=rust`, `edge-migrate`, the worker fixture build — NOT by
+  the JS pipeline anymore.)
 - Node 20+ (for `npm install` and the esbuild bundling step).
 - `edge` CLI on `PATH` (`cargo install --path edge-cli`).
 
@@ -32,10 +32,10 @@ reactor adapter). The wrapped component is what `edge build` emits to
 ```sh
 cd samples/hello-js
 npm install                    # resolves @edgecloud/sdk from npm (^0.2.0)
-edge build --lang=js           # bundles src/handler.js, builds edge-js-runtime, wraps with adapter
+edge build --lang=js           # bundles src/handler.js, builds edge-js-runtime for wasm32-wasip2
 ```
 
-`edge build` writes the wrapped component to `target/javy/hello-js.wasm`.
+`edge build` writes the component to `target/javy/hello-js.wasm`.
 
 ## Deploy
 

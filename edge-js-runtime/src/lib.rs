@@ -7,9 +7,12 @@
 //! skipping QuickJS lex+parse entirely. See `USER_BYTECODE` below.
 //!
 //! **Build targets:**
-//! - `wasm32-wasip1` — the deployed `.wasm` artifact. WASI bindings
+//! - `wasm32-wasip2` — the deployed `.wasm` artifact. WASI bindings
 //!   (`wit_bindgen::generate!`, `export!(JsHandler)`, `Guest::handle`)
-//!   are compiled into the component.
+//!   are compiled into the component. The `wasm32-wasip2` cargo target
+//!   emits a complete WASI Preview 2 component directly (no
+//!   `--adapt` / `wasi-preview1` wrap needed — the adapter
+//!   dependency was dropped when this target was adopted).
 //! - Host (rlib) — only the host-safe items at the bottom of the file
 //!   are compiled. Used by the `warm_vs_cold` bench.
 //!
