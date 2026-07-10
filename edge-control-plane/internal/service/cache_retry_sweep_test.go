@@ -373,17 +373,14 @@ func TestCacheRetrySweep_MixedRowOutcomes(t *testing.T) {
 		}},
 	}
 	// Only `iad` errors; `fra` succeeds; `sin` is missing from the
-	// regionCaches map (config gap).
-	pusher := &mockArtifactCachePusher{err: errors.New("503 for iad")} // see CustomErrFor test below
+	// regionCaches map (config gap). Default mockArtifactCachePusher
+	// applies the same err to every call, so we use a per-URL
+	// regionRoutingPusher to vary the outcome by region.
 	regionCaches := map[string]string{
 		"fra": "http://cache.fra",
 		"iad": "http://cache.iad",
 		// sin deliberately absent
 	}
-
-	// Wrap the pusher so only iad errors; fra succeeds. Default
-	// mock pusher applies err to every call; we need per-region
-	// routing. Use a custom mock instead.
 	customPusher := &regionRoutingPusher{results: map[string]error{
 		"http://cache.fra": nil,
 		"http://cache.iad": errors.New("503 Service Unavailable"),
@@ -429,7 +426,11 @@ func TestCacheRetrySweep_MixedRowOutcomes(t *testing.T) {
 	if !reflect.DeepEqual(repo.removeCalls[0].Regions, []string{"sin"}) {
 		t.Errorf("removeCalls[0].Regions = %v, want [sin]", repo.removeCalls[0].Regions)
 	}
-	_ = pusher // silence unused in this case
+	customPusher.mu.Lock()
+	defer customPusher.mu.Unlock()
+	if len(customPusher.calls) != 2 {
+		t.Errorf("pusher.calls = %d, want 2 (fra + iad; sin must NOT be pushed)", len(customPusher.calls))
+	}
 }
 
 // regionRoutingPusher is a per-region mock pusher that returns a
@@ -637,5 +638,16 @@ func TestCacheRetrySweep_ConcurrentPublishSwap_AppendRegionsCacheStateCalled(t *
 	}
 	if totalAppends != 2 {
 		t.Errorf("totalAppends (sweep + concurrent) = %d, want 2", totalAppends)
+	}
+	// Sweep's pusher call for "fra" must still have been made —
+	// a regression that drops the sweep's pusher call under
+	// concurrent repo pressure should be caught here.
+	pusher.mu.Lock()
+	defer pusher.mu.Unlock()
+	if len(pusher.calls) != 1 {
+		t.Errorf("pusher.calls = %d, want 1 (sweep's push for fra; concurrent caller is repo-only)", len(pusher.calls))
+	}
+	if pusher.calls[0].CacheURL != "http://cache.fra" {
+		t.Errorf("pusher.calls[0].CacheURL = %q, want %q", pusher.calls[0].CacheURL, "http://cache.fra")
 	}
 }

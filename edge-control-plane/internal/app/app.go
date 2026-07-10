@@ -798,6 +798,16 @@ func (a *App) RunBackground(ctx context.Context) {
 	// critical path (the worker still serves requests by pulling
 	// from /api/internal/download, so a stuck sweep is an
 	// observability hit but not a service-level outage).
+	//
+	// DB-load note: the sweep makes up to 3 DB calls per row
+	// (AppendRegionsCacheState for success + AppendRegionsCacheState
+	// for still-failing + RemoveFromCacheFailed for configMissing).
+	// At gcBatchSize=10_000 rows per batch and gcMaxBatches=1000
+	// per tick (10M rows worst-case), lowering the interval
+	// proportionally multiplies the per-minute DB load — the
+	// default 5m keeps a worst-case tick under the row cap; an
+	// operator who lowers the interval during an incident should
+	// expect ~interval/5m × default DB pressure.
 	cacheRetryInterval := parseDurationEnv("REGION_CACHE_RETRY_INTERVAL", 5*time.Minute)
 	go a.CacheRetrySweep.Run(ctx, cacheRetryInterval)
 
