@@ -239,7 +239,7 @@ jobs:
         working-directory: samples/hello-js-ws
         env:
           RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
-        run: edge-cli build --lang=js
+        run: edge build --lang=js
 
   # ============================================================
   # RUST-SEMVER — Run cargo-semver-checks

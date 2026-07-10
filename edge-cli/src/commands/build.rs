@@ -507,24 +507,6 @@ fn find_runtime_wasm(base: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Combined resolve of both the JS runtime core wasm and the WASI
-/// Preview 1 reactor adapter in one call. Used by `build_js` (which
-/// always needs both); the integration test in
-/// `resolve_js_build_artifacts_returns_both_paths_from_temp_workspace`
-/// exercises the combined path so a regression that fixes one
-/// resolver but breaks the other surfaces here.
-///
-/// Extracted from `build_js` so the integration test doesn't have to
-/// construct a fake `Command::new("cargo")` invocation just to call
-/// the resolvers.
-fn resolve_js_build_artifacts(
-    runtime_dir: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let core_wasm = resolve_runtime_core_wasm(runtime_dir)?;
-    let adapter = resolve_wasi_adapter()?;
-    Ok((core_wasm, adapter))
-}
-
 /// Resolve the edge-js-runtime crate directory.
 fn resolve_runtime_dir() -> Result<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("EDGE_JS_RUNTIME_DIR") {
