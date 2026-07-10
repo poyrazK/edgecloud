@@ -19,6 +19,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // InternalDomainServiceInterface is the slice of *service.DomainService
@@ -67,6 +68,14 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // `bootstrapSecret` is the HMAC secret for the bootstrap handshake
 // (issue #104). When empty, the bootstrap endpoint returns 501
 // (not configured). Set via `BOOTSTRAP_SECRET` env var.
+//
+// The trailing mintWorkerToken fields (workerJWTConfig / workerTokenTTL /
+// issuer / activeKID / tenantSvc) are issue #491 — they power
+// POST /api/internal/worker-token, the per-tenant JWT mint endpoint.
+// `workerJWTConfig` is the resolver for signing keys (keyring-aware —
+// issue #307 follow-up). `tenantSvc` is held as a narrow interface
+// so handler tests can swap in a mock without dragging in the full
+// *service.TenantService (DB + tenant repo + quota repo + api key repo).
 type InternalHandler struct {
 	deploymentSvc   autoRollbacker
 	workerSvc       workerRegisterer
@@ -78,6 +87,12 @@ type InternalHandler struct {
 	bootstrapSecret string
 	// jwtSecret is the JWT_SECRET the bootstrap handshake delivers to workers.
 	jwtSecret string
+	// Issue #491 — per-tenant mint endpoint.
+	workerJWTConfig middleware.WorkerJWTConfig
+	workerTokenTTL  time.Duration
+	issuer          string
+	activeKID       string
+	tenantSvc       tenantGetter
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -129,6 +144,19 @@ type syncPayloadBuilder interface {
 	BuildFullSync(ctx context.Context, tenantID, region string) (map[string]nats.AppConfig, error)
 }
 
+// tenantGetter is the narrow contract the per-tenant worker-token mint
+// endpoint needs (issue #491). The handler only needs to know whether
+// a tenant exists and whether it is disabled — listing / pagination /
+// quota math are out of scope here. Holding the concrete
+// *service.TenantService would force every handler test to construct
+// a DB, tenant repo, quota repo, and api-key repo just to assert that
+// a "tenant not found" returns 404. *service.TenantService satisfies
+// this (it has GetByID at service/tenant.go:129), so the production
+// call site in app.go compiles unchanged.
+type tenantGetter interface {
+	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+}
+
 func NewInternalHandler(
 	deploymentSvc autoRollbacker,
 	workerSvc workerRegisterer,
@@ -139,6 +167,11 @@ func NewInternalHandler(
 	cpRegion string,
 	bootstrapSecret string,
 	jwtSecret string,
+	workerJWTConfig middleware.WorkerJWTConfig,
+	workerTokenTTL time.Duration,
+	issuer string,
+	activeKID string,
+	tenantSvc tenantGetter,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc:   deploymentSvc,
@@ -150,6 +183,11 @@ func NewInternalHandler(
 		cpRegion:        cpRegion,
 		bootstrapSecret: bootstrapSecret,
 		jwtSecret:       jwtSecret,
+		workerJWTConfig: workerJWTConfig,
+		workerTokenTTL:  workerTokenTTL,
+		issuer:          issuer,
+		activeKID:       activeKID,
+		tenantSvc:       tenantSvc,
 	}
 }
 
@@ -687,5 +725,195 @@ func (h *InternalHandler) WorkerSecret(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"secret": h.jwtSecret,
+	})
+}
+
+// WorkerTokenRequest is the body shape for POST /api/internal/worker-token
+// (issue #491). The worker presents its existing (wildcard or scoped)
+// bearer JWT to authenticate, supplies the tenant_id it wants a token
+// for, and receives a freshly-signed JWT whose TenantID claim is bound
+// to that tenant. The wildcard (`*`) and empty string are refused
+// upstream — see MintWorkerToken for the rationale.
+type WorkerTokenRequest struct {
+	TenantID string `json:"tenant_id"`
+}
+
+// WorkerTokenResponse is the success shape. The CP echoes the bound
+// tenant_id alongside the signed token so the worker can detect a
+// silent re-scope (defense in depth — the worker's own scope is
+// carried in the JWT itself, but a mismatch in the response body is
+// the easier diagnostic when things go wrong).
+//
+// `expires_at` is Unix seconds (matches how JWT `exp` is encoded by
+// the golang-jwt library) so the worker can decide locally whether to
+// adopt or re-mint without parsing the token.
+type WorkerTokenResponse struct {
+	Token     string `json:"token"`
+	ExpiresAt int64  `json:"expires_at"`
+	TenantID  string `json:"tenant_id"`
+}
+
+// isSafeTenantID gates tenant_id values on POST /api/internal/worker-token.
+// Returns nil when the value is a legal EdgeCloud tenant identifier and
+// a descriptive error otherwise. Mirrors `supervisor.rs::is_safe_tenant_id`
+// — same regex spirit (`^[a-z0-9_-]{1,64}$`, no path-traversal chars),
+// same defense-in-depth rationale: the worker enforces this same check
+// before constructing outbound paths, so a CP-side match keeps the
+// verifier's failure modes consistent across both ends.
+//
+// The wildcard (`*`) and empty string checks live here, not in
+// IsSharedWorker — the refusal-to-mint guard's job is to shut down a
+// class of misuse upstream, before the verifier sees a token whose
+// `TenantID` is the wildcard. `Download` and `AutoRollback` both treat
+// wildcard as "trusted" (their IsSharedWorker branch escalates access);
+// the mint endpoint must never produce such a token.
+func isSafeTenantID(s string) error {
+	if s == "" {
+		return errors.New("tenant_id is required")
+	}
+	if s == "*" {
+		return errors.New("tenant_id \"*\" is refused: wildcard tokens would grant cross-tenant access")
+	}
+	if len(s) > 64 {
+		return fmt.Errorf("tenant_id must be at most 64 characters (got %d)", len(s))
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !ok {
+			return fmt.Errorf("tenant_id must match ^[a-z0-9_-]+$ (got %q)", s)
+		}
+	}
+	return nil
+}
+
+// MintWorkerToken handles POST /api/internal/worker-token (issue #491).
+//
+// The worker presents an existing valid bearer JWT (the bootstrap-derived
+// 24h JWT today, or any previously-minted scoped token later) and asks
+// for a fresh token bound to a specific tenant. The CP mints an HS256
+// JWT with the same `kid` header used for the bootstrap / ingress
+// tokens so a single keyring verifies every token in the fleet.
+//
+// Refusal-to-mint-wildcard: `tenant_id == "*"` (and `""`, and any value
+// that fails isSafeTenantID) is rejected with 400. The wildcard would
+// pass VerifyWorkerJWT (its TenantID claim is a normal string), but
+// `IsSharedWorker` (middleware/worker.go:251-254) treats it as a
+// "trusted shared worker" — Download and AutoRollback both escalate
+// cross-tenant access for shared workers. The CP must not mint the
+// (very effective) attack primitive that the worker already has the
+// ability to construct locally, but might still issue by mistake.
+//
+// Request:
+//
+//	POST /api/internal/worker-token
+//	Authorization: Bearer <bootstrap or previously-minted scoped JWT>
+//	Content-Type: application/json
+//	{"tenant_id": "t_abc123"}
+//
+// Response (200):
+//
+//	{"token": "<signed JWT>", "expires_at": 1749400000, "tenant_id": "t_abc123"}
+//
+// Status codes:
+//
+//	200 — token issued
+//	400 — malformed body / missing or invalid tenant_id
+//	401 — caller has no / expired bearer (set by WorkerAuth middleware)
+//	404 — tenant_id does not exist in the tenants table
+//	500 — signing key resolution or signature construction failure
+func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request) {
+	workerID := middleware.GetWorkerID(r.Context())
+
+	var req WorkerTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+	if err := isSafeTenantID(req.TenantID); err != nil {
+		auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+			fmt.Sprintf("worker %s refused tenant_id: %v", workerID, err), "failure")
+		httperror.BadRequestCtx(w, r, err.Error())
+		return
+	}
+
+	// Tenant-existence check. A worker asking for "t_typo" must not
+	// get a valid token issued — even if the verifier would later 404
+	// the request anyway, minting a token for a non-existent tenant
+	// wastes a slot in the CP's mint-rate limiter and produces audit
+	// spam. Failing fast here also closes a (hypothetical) side
+	// channel via audit-log observation.
+	tenant, err := h.tenantSvc.GetByID(r.Context(), req.TenantID)
+	if err != nil {
+		if errors.Is(err, service.ErrTenantNotFound) {
+			auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+				fmt.Sprintf("worker %s requested token for missing tenant %s", workerID, req.TenantID), "failure")
+			httperror.NotFoundCtx(w, r, "tenant not found")
+			return
+		}
+		log.Printf("worker-token: tenant lookup for %s failed: %v", req.TenantID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	// Disabled tenants get the same treatment as missing ones — the
+	// token would technically verify, but issuing it costs the CP
+	// nothing useful and lets the worker downstream 402-storm on
+	// every per-tenant call instead of failing fast at mint time.
+	// Issue #440 already prevents a deployment against a disabled
+	// tenant; this guard extends the same protection to per-tenant
+	// JWT mint.
+	if tenant.IsDisabled() {
+		auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+			fmt.Sprintf("worker %s requested token for disabled tenant %s", workerID, req.TenantID), "failure")
+		httperror.NotFoundCtx(w, r, "tenant not found")
+		return
+	}
+
+	signingKey, err := h.workerJWTConfig.ResolveSigningKey()
+	if err != nil {
+		log.Printf("worker-token: failed to resolve signing key for worker %s: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	now := time.Now()
+	exp := now.Add(h.workerTokenTTL)
+	claims := middleware.WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    h.issuer,
+			Subject:   workerID,
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(exp),
+			NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Minute)),
+		},
+		WorkerID: workerID,
+		TenantID: req.TenantID,
+		Role:     middleware.RoleWorker,
+		// Apps stays empty — per-app scoping is out of scope for this
+		// issue; a follow-up PR extends the claim shape.
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	if h.activeKID != "" {
+		token.Header["kid"] = h.activeKID
+	}
+	signed, err := token.SignedString(signingKey)
+	if err != nil {
+		log.Printf("worker-token: failed to sign token for worker %s tenant=%s: %v", workerID, req.TenantID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+		fmt.Sprintf("worker %s minted scoped token for tenant %s (ttl=%s)", workerID, req.TenantID, h.workerTokenTTL),
+		"success")
+
+	log.Printf("worker-token: minted token for worker %s tenant=%s ttl=%s", workerID, req.TenantID, h.workerTokenTTL)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(WorkerTokenResponse{
+		Token:     signed,
+		ExpiresAt: exp.Unix(),
+		TenantID:  req.TenantID,
 	})
 }

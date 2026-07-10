@@ -457,6 +457,18 @@ func (s *TenantService) EnableTenant(ctx context.Context, tenantID string) error
 	return s.tenantRepo.ClearDisabledAt(ctx, tenantID)
 }
 
+// GetByID is the thin pass-through that satisfies the narrow
+// `handler.tenantGetter` contract used by POST /api/internal/worker-token
+// (issue #491). No business logic — the JWT-mint handler only needs
+// the raw row so it can detect "tenant not found" / "tenant disabled"
+// upstream of the heavy per-request signing path. Keeps TenantService
+// the single interface for tenant row reads; the alternative
+// (exposing the underlying tenantRepo at the app composition layer)
+// would duplicate the wiring in two places.
+func (s *TenantService) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
+	return s.tenantRepo.GetByID(ctx, id)
+}
+
 // OverrideTenantQuota is the manual recovery path for issue #420.
 // Operator-only; the handler is mounted under RequireRole("owner")
 // and audit-logs every call. Each non-nil field is applied; nil
