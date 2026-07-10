@@ -335,6 +335,36 @@ func TestPreviewGC_FirstSweep_PanicStillClosesDone(t *testing.T) {
 	}
 }
 
+// waitFirstSweep blocks until PreviewGCService.FirstSweepDone
+// closes or `t`'s deadline elapses, whichever is sooner. Used
+// by every metrics-recording test below instead of the liveness-
+// racy `time.Sleep(20ms)` pattern that PR #598 / issue #586
+// fixed for TestPreviewGC_FirstSweep_FiresImmediately (see also
+// the project-wide CLAUDE.md note about goroutine-exit timing).
+//
+// t.Helper() ensures the failure line points at the caller, not
+// this helper. A 2s ceiling is generous: FirstSweepDone closes
+// effectively instantly after runOnce returns, and runOnce
+// returns within ms on the happy path. If the ceiling fires the
+// sweep is genuinely stuck (bug, not flakiness) and a t.Fatal
+// from this line is the right thing to happen.
+//
+// The timer uses NewTimer + defer Stop (per atomic-load-no-fence-
+// rule from memory): NewTimer is GC-released automatically when
+// unstopped, but calling Stop on a fired timer drops the channel
+// read we don't need and prevents leaking into the test's reported
+// alloc count.
+func waitFirstSweep(t *testing.T, svc *PreviewGCService) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-svc.FirstSweepDone():
+	case <-timer.C:
+		t.Fatal("PreviewGCService.FirstSweepDone did not close within 2s")
+	}
+}
+
 // containsString reports whether `needle` is present in `haystack`.
 // A separate helper from the package-local `contains` (used by
 // deployment_cache_push_test.go), which has a rune-based signature
@@ -417,9 +447,12 @@ func TestPreviewGC_RecordsMetrics_HappyPath(t *testing.T) {
 	go func() {
 		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFirstSweep(t, svc)
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	// No waitRunExit: the metrics sink was populated by the
+	// first sweep (which FirstSweepDone just confirmed), and the
+	// second sweep won't fire for ~10s (interval we set above).
+	// Reading rec immediately is safe.
 
 	if got := rec.sinkCallCount(); got != 1 {
 		t.Fatalf("sink call count = %d, want 1", got)
@@ -454,9 +487,12 @@ func TestPreviewGC_RecordsMetrics_BlobFailureCountedSeparately(t *testing.T) {
 	go func() {
 		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFirstSweep(t, svc)
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	// No waitRunExit: the metrics sink was populated by the
+	// first sweep (which FirstSweepDone just confirmed), and the
+	// second sweep won't fire for ~10s (interval we set above).
+	// Reading rec immediately is safe.
 
 	if got := rec.sinkCallCount(); got != 1 {
 		t.Fatalf("sink call count = %d, want 1", got)
@@ -489,9 +525,12 @@ func TestPreviewGC_RecordsMetrics_AllBlobsFailed_IncrementsErrors(t *testing.T) 
 	go func() {
 		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFirstSweep(t, svc)
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	// No waitRunExit: the metrics sink was populated by the
+	// first sweep (which FirstSweepDone just confirmed), and the
+	// second sweep won't fire for ~10s (interval we set above).
+	// Reading rec immediately is safe.
 
 	if got := rec.sinkCallCount(); got != 1 {
 		t.Fatalf("sink call count = %d, want 1", got)
@@ -518,9 +557,12 @@ func TestPreviewGC_RecordsMetrics_ListError_IncrementsErrors(t *testing.T) {
 	go func() {
 		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFirstSweep(t, svc)
 	cancel()
-	time.Sleep(20 * time.Millisecond)
+	// No waitRunExit: the metrics sink was populated by the
+	// first sweep (which FirstSweepDone just confirmed), and the
+	// second sweep won't fire for ~10s (interval we set above).
+	// Reading rec immediately is safe.
 
 	if got := rec.sinkCallCount(); got != 1 {
 		t.Fatalf("sink call count = %d, want 1", got)
@@ -578,7 +620,7 @@ func TestPreviewGC_NilSink_NoPanic(t *testing.T) {
 		svc.Run(ctx, 30*time.Millisecond, 7*24*time.Hour)
 		close(done)
 	}()
-	time.Sleep(60 * time.Millisecond)
+	waitFirstSweep(t, svc)
 	cancel()
 	select {
 	case <-done:
