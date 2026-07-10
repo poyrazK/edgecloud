@@ -1433,8 +1433,9 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 		WithArgs(tenantID, appName).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// In-tx reads inside buildPublishPayload: env / tenant. Quota
-	// was SELECTed above (hoisted) so it's not re-SELECTed.
+	// In-tx reads inside buildPublishPayload: env / tenant. The
+	// quota row was loaded above (hoisted), so the payload build
+	// skips the SELECT and reuses the in-memory snapshot.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
