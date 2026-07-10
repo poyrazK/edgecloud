@@ -113,3 +113,32 @@ for `wit-bindgen` (with package decls and a `wasi:http/outgoing-handler`
 import on the handler world), so the sample points at it instead of
 duplicating 33 files. The historical
 `edge-worker/tests/fixtures/wit/` path is now a symlink to `wit/`.
+
+## Scaffolding parity (issue #576)
+
+`edge init my-app --lang=rust` (issue #576) produces a project that
+is byte-for-byte the same shape as this sample — same `[workspace]`
++ `[lib] crate-type = ["cdylib"]` Cargo.toml, same
+`wit_bindgen::generate!({ world: "edge-runtime-handler", path: "wit" })`
+in `src/lib.rs`, same `target = "wasm32-unknown-unknown"` in
+`edge.toml`. The scaffold differs from this sample in two ways:
+
+1. **WIT is vendored, not referenced.** The scaffold copies the
+   canonical `wit/` tree into `<project>/wit/` at scaffold time
+   (via `include_dir!` in `edge-cli/src/scaffold/wit.rs`), so the
+   scaffolded project builds offline outside the monorepo. This
+   sample, being inside the monorepo, points at the shared `wit/`
+   tree via `path: "../../wit"`.
+2. **`wit-bindgen = "0.45"` is pinned exact** in the scaffolded
+   `Cargo.toml` (not a caret range) — the runtime pins wasmtime
+   45.0.3, which expects `wasi:http@0.2.1`. A caret would silently
+   pull 0.46+ once published and re-break the linker. When the
+   runtime's wasmtime line is bumped, the scaffold's exact pin
+   must be bumped in lockstep.
+
+If a future change to `samples/hello/` is intended to be the new
+canonical starter shape, mirror the change into
+`edge-cli/src/commands/init.rs::LIB_RS_TEMPLATE` and
+`CARGO_TOML_TEMPLATE` — the e2e test
+`edge-cli/tests/scaffold_rust_builds.rs` pins the scaffold's
+behavior, so a drift in either direction fails CI.

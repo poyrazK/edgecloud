@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -61,13 +62,60 @@ type previewBlobDeleter interface {
 // rows but `DeleteExpiredPreviewsByIDs` is idempotent (the
 // `WHERE preview_expires_at < NOW()` predicate filters rows
 // that are no longer expired), so the worst case is wasted work.
+//
+// Metrics (issue #581): the optional `sink` records one tick
+// outcome (blobs/rows/batches/errors), and `blobFailureRecorder`
+// bumps the per-blob failure counter. Both are nil-guarded to
+// no-op closures so tests can pass nil without panicking. The
+// sink is NOT called when the run is refused-to-run or when the
+// context is pre-cancelled — same rationale as LogGCService.
 type PreviewGCService struct {
-	repo  previewRepoForGC
-	blobs previewBlobDeleter
+	repo                previewRepoForGC
+	blobs               previewBlobDeleter
+	sink                PreviewGCSink
+	blobFailureRecorder PreviewBlobFailureRecorder
+	// firstSweepDone is closed at the end of the first runOnce()
+	// inside Run. Tests wait on this channel instead of
+	// time.Sleep(N) to synchronize on the immediate-first-sweep
+	// (issue #586 — replaces the liveness-racy time.Sleep pattern
+	// with a deterministic done-channel handshake, mirroring the
+	// Loop.Done() pattern from the loophealth PR #585 fix). The
+	// channel is allocated in NewPreviewGCService so tests can
+	// grab a reference to it BEFORE calling Run in a goroutine
+	// and start the wait immediately — no race on "has Run
+	// started yet". Never closed if Run is never called.
+	firstSweepDone chan struct{}
 }
 
-func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter) *PreviewGCService {
-	return &PreviewGCService{repo: repo, blobs: blobs}
+func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter, sink PreviewGCSink, blobFailureRecorder PreviewBlobFailureRecorder) *PreviewGCService {
+	if sink == nil {
+		sink = func(int, int, int, bool) {}
+	}
+	if blobFailureRecorder == nil {
+		blobFailureRecorder = func() {}
+	}
+	return &PreviewGCService{
+		repo:                repo,
+		blobs:               blobs,
+		sink:                sink,
+		blobFailureRecorder: blobFailureRecorder,
+		firstSweepDone:      make(chan struct{}),
+	}
+}
+
+// FirstSweepDone returns a channel that closes at the end of the
+// first runOnce inside Run. Tests use it to synchronize on the
+// immediate-first-sweep without racing on time.Sleep(N) (issue
+// #586). Always returns the same channel; never closes if Run
+// isn't called.
+//
+// Receivers are free to wait on the returned channel even before
+// Run is invoked — the channel is allocated at construction time
+// so the goroutine that calls Run in the background and the test
+// goroutine that waits on the channel can be scheduled in either
+// order without liveness races.
+func (s *PreviewGCService) FirstSweepDone() <-chan struct{} {
+	return s.firstSweepDone
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires
@@ -142,6 +190,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 					return
 				}
 				log.Printf("preview_gc: list expired blobs failed: %v", err)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			if len(refs) == 0 {
@@ -157,6 +206,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 			for _, ref := range refs {
 				if delErr := s.blobs.Delete(ctx, ref.TenantID, ref.AppName, ref.ID); delErr != nil {
 					log.Printf("preview_gc: deleting artifact blob %s/%s/%s failed: %v", ref.TenantID, ref.AppName, ref.ID, delErr)
+					s.blobFailureRecorder() // issue #581 — per-blob failure
 					continue
 				}
 				totalBlobsDeleted++
@@ -168,6 +218,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 				// log line per batch rather than a tight
 				// retry loop.
 				log.Printf("preview_gc: all %d blob deletes failed in batch %d; skipping row deletes", len(refs), batch)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			// Step 3: delete the DB rows (and let
@@ -179,6 +230,7 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 					return
 				}
 				log.Printf("preview_gc: deleting expired preview rows failed (batch %d): %v", batch, err)
+				s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, true) // issue #581
 				return
 			}
 			totalRowsDeleted += len(deleted)
@@ -192,9 +244,29 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 		if totalBatchesSwept > 0 {
 			log.Printf("preview_gc: sweep complete: %d rows + %d blobs deleted across %d batches", totalRowsDeleted, totalBlobsDeleted, totalBatchesSwept)
 		}
+		// Record per-tick metrics. Issue #581 — one sink call per
+		// sweep, regardless of whether any rows were touched. The
+		// error flag is false here because every error path above
+		// returns BEFORE this point.
+		s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, false)
 	}
 
+	// Signal "first runOnce completed" to FirstSweepDone() waiters.
+	// The defer-before-runOnce placement guarantees the channel closes
+	// even if the first sweep panics; the explicit close after runOnce
+	// is redundant with the defer but keeps the happy path obvious.
+	// See the firstSweepDone field doc on the struct for rationale.
+	var firstSweepOnce sync.Once
+	defer func() {
+		firstSweepOnce.Do(func() {
+			close(s.firstSweepDone)
+		})
+	}()
+
 	runOnce()
+	firstSweepOnce.Do(func() {
+		close(s.firstSweepDone)
+	})
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

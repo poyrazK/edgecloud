@@ -612,6 +612,7 @@ mod tests {
             ws_port: None,
             dedupe_id: None,
             observer_metrics: vec![],
+            last_error: None,
         }
     }
 

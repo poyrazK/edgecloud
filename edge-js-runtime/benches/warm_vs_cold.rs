@@ -8,7 +8,7 @@
 //!
 //! 2. `warm_bytecode_load` — `Runtime::new + Context::full + register_all_stub +
 //!    Module::load(&cached_bytecode) + module.eval()`. **Post-#425 shape,
- //!    no handler call yet.** `cached_bytecode` is pre-built once outside
+//!    no handler call yet.** `cached_bytecode` is pre-built once outside
 //!    the timed region via `edge_js_runtime::compile_user_bundle`.
 //!
 //! 3. `warm_bytecode_call` — same as (2) plus `ctx.eval("globalThis.handleRequest(__req)")`.
@@ -75,10 +75,9 @@ fn bench_init_paths(c: &mut Criterion) {
                 // SAFETY: `cached_bc` was produced by `Module::write_le` on
                 // the same QuickJS engine version, so the bytes are
                 // well-formed for `Module::load`.
-                let module = unsafe {
-                    rquickjs::module::Module::load(ctx.clone(), black_box(&cached_bc))
-                }
-                .unwrap();
+                let module =
+                    unsafe { rquickjs::module::Module::load(ctx.clone(), black_box(&cached_bc)) }
+                        .unwrap();
                 let (_m, promise) = module.eval().unwrap();
                 // Drop the resolved promise.
                 drop(promise);
@@ -92,10 +91,9 @@ fn bench_init_paths(c: &mut Criterion) {
             let ctx = black_box(Context::full(&rt).unwrap());
             ctx.with(|ctx| {
                 register_all_stub(&ctx).unwrap();
-                let module = unsafe {
-                    rquickjs::module::Module::load(ctx.clone(), black_box(&cached_bc))
-                }
-                .unwrap();
+                let module =
+                    unsafe { rquickjs::module::Module::load(ctx.clone(), black_box(&cached_bc)) }
+                        .unwrap();
                 let (_m, promise) = module.eval().unwrap();
                 drop(promise);
                 // Build a tiny req object so `globalThis.handleRequest(req)`
@@ -103,7 +101,9 @@ fn bench_init_paths(c: &mut Criterion) {
                 let js_req = rquickjs::Object::new(ctx.clone()).unwrap();
                 js_req.set("method", "GET").unwrap();
                 js_req.set("path", "/").unwrap();
-                js_req.set("headers", rquickjs::Object::new(ctx.clone()).unwrap()).unwrap();
+                js_req
+                    .set("headers", rquickjs::Object::new(ctx.clone()).unwrap())
+                    .unwrap();
                 js_req.set("body", "").unwrap();
                 ctx.globals().set("__req", js_req).unwrap();
                 let result: rquickjs::Value = black_box(

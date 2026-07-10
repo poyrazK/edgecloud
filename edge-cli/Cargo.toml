@@ -18,6 +18,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+# Static shell-completion script generator (issue #506). Major-minor
+# matches the `clap` pin; clap_complete 4.5.x is the same series the
+# edge-cli's clap 4.5 dependency resolves to (Cargo.lock has clap 4.6.1).
+# The five shells (bash, zsh, fish, powershell, elvish) all ship under
+# default features.
+clap_complete = { version = "4.5" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -53,6 +59,12 @@ rpassword = "7"
 # runner auto-mints so a CLI retry on a transient network error
 # replays the original deployment instead of creating a duplicate.
 uuid = { version = "1.10", features = ["v4"] }
+# Vendors the canonical WIT tree (repo-root `wit/`) into the CLI
+# binary at compile time, so `edge init --lang=rust` can materialize
+# a self-contained, offline-buildable project (issue #576). The
+# build.rs rerun-if-changed=../wit hook refreshes the embed when any
+# `.wit` file changes.
+include_dir = "^0.7"
 edge-config = { path = "../edge-config" }
 
 [features]

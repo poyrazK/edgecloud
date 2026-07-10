@@ -327,6 +327,14 @@ pub struct AppStatus {
     /// as "no dedupe" (legacy behaviour preserved).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_id: Option<String>,
+    /// Last error message from a crash / panic-in-spawn / trap
+    /// (issue #45). Operators see this on the heartbeat so they can
+    /// diagnose *why* the app reached `status: "crashed"` without
+    /// grepping the worker's structured logs. `None` for healthy
+    /// apps. The control plane surfaces this in the app's status
+    /// response and in audit logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -501,6 +509,7 @@ mod tests {
                     labels: vec![],
                 },
             ],
+            last_error: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         let parsed: AppStatus = serde_json::from_str(&json).expect("deserialize");
@@ -546,11 +555,67 @@ mod tests {
             ws_port: None,
             dedupe_id: None,
             observer_metrics: vec![],
+            last_error: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(
             json.contains(r#""outbound_bytes":512"#),
             "outbound_bytes must always appear in serialized AppStatus; got: {json}"
+        );
+    }
+
+    /// `last_error` is stamped onto the heartbeat so operators can
+    /// diagnose a `status: "crashed"` app without grepping the
+    /// worker's structured logs (issue #45). When the field is
+    /// `None` it must NOT appear on the wire (skip_serializing_if)
+    /// so old control planes don't see an unexpected `last_error`
+    /// field; when it is `Some`, it must round-trip exactly.
+    #[test]
+    fn last_error_round_trips_and_skips_when_none() {
+        // None: must be absent from the JSON.
+        let none_status = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            observer_metrics: vec![],
+            last_error: None,
+        };
+        let json_none = serde_json::to_string(&none_status).expect("serialize");
+        assert!(
+            !json_none.contains("last_error"),
+            "last_error must be absent when None (skip_serializing_if); got: {json_none}"
+        );
+
+        // Some: round-trip preserves the panic payload verbatim.
+        let some_status = AppStatus {
+            last_error: Some("app task panicked: synthetic".into()),
+            ..none_status.clone()
+        };
+        let json_some = serde_json::to_string(&some_status).expect("serialize");
+        assert!(
+            json_some.contains(r#""last_error":"app task panicked: synthetic""#),
+            "last_error must serialize verbatim; got: {json_some}"
+        );
+        let parsed: AppStatus = serde_json::from_str(&json_some).expect("deserialize");
+        assert_eq!(
+            parsed.last_error.as_deref(),
+            Some("app task panicked: synthetic")
+        );
+
+        // Old workers that don't send the field must deserialize to None.
+        let parsed_old: AppStatus = serde_json::from_str(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":0,"tenant_id":"t_1","port":8080}"#,
+        )
+        .expect("deserialize legacy heartbeat");
+        assert!(
+            parsed_old.last_error.is_none(),
+            "old workers without last_error must deserialize to None (serde default)"
         );
     }
 
