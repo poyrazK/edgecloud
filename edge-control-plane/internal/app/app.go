@@ -710,7 +710,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// DeleteExpiredPreviewsByIDs) and the artifact store
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
-		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore),
+		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore, metricsAgg.NewPreviewGCSink(), metricsAgg.NewPreviewBlobFailureRecorder()),
 		// Cache-retry sweep (issue #501). Re-attempts cache pushes
 		// that landed in regions_cache_failed. The three getters
 		// read the live pusher + regionArtifactCaches map +
