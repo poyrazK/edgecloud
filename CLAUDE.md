@@ -26,7 +26,8 @@ This is a **Cargo workspace** at the repo root (`Cargo.toml`, `[workspace] resol
 
 **Excluded from the workspace** (`Cargo.toml [workspace.exclude]`):
 - `edge-worker/tests/fixtures/handler` — built separately by the Phase E fixture-build script. Uses `wasm32-unknown-unknown` and an older `wit-bindgen` pin.
-- `edge-js-runtime` — QuickJS runtime for the JS/QuickJS pilot (issue #317). Not yet normalized against the workspace.
+- `edge-js-runtime` — QuickJS runtime for the JS/QuickJS pilot (issue #317). Exports the `edge-runtime-handler` (FaaS) world (`wasi:http/incoming-handler@0.2.1`). The `register_*` namespace helpers are factored into `edge-js-runtime/src/register.rs` and reused by the LR sibling.
+- `edge-js-runtime-long` — QuickJS runtime rlib for the long-running `edge-runtime` world (issue #426). rlib-only (NOT cdylib) because the canonical world requires `start: func()` as an export, and a cdylib in this crate would land a second `start` symbol in the shim's final link and clash. The cdylib is produced by the shim (`samples/hello-js-ws/`); this crate just supplies the per-namespace registrars + `compile_user_bundle` + `USER_BYTECODE` once, shared by every shim.
 
 **Documentation map:**
 - `whitepaper.md` is the broad design doc (2026-06-14). Per-tool design docs (e.g. `edge-migrate/docs/design.md`) are scoped to one tool and may be newer — **when the two conflict, trust the per-tool design doc**. Treat any design doc as the source of intent, but always verify against the actual code.
@@ -132,7 +133,7 @@ These rules govern how this repo expects Claude (or any other agent reading `CLA
 
 A request flows through the system like this:
 
-1. **Build** — developer runs `edge build` → for Rust, `cargo build --target wasm32-wasip2 --release` → `.wasm` component. For JS (issue #317), the JS source is bundled and executed in the QuickJS runtime via `edge-js-runtime`.
+1. **Build** — developer runs `edge build` → for Rust, `cargo build --target wasm32-wasip2 --release` → `.wasm` component. For JS (issue #317), the JS source is bundled and executed in the QuickJS runtime via `edge-js-runtime` (FaaS world `edge-runtime-handler`) or via a shim that pulls `register_*` from `edge-js-runtime-long` (long-running world `edge-runtime`, issue #426). The shim is the one that produces the cdylib; the LR crate is rlib-only and only supplies the helpers.
 2. **Sign** — `edge deploy` POSTs the artifact to `POST /api/v1/deploy/{appName}` with a Bearer API key. The control plane (`edge-control-plane/internal/service/deployment.go`) SHA-256-hashes the blob, stores it via `storage.ArtifactStore.Save` (defaulting to `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`), signs `(sha256_raw_32_bytes || deployment_id)` with Ed25519, and writes the row + signature to `deployments`.
 3. **Pre-compile** — `edge activate <deployment_id>` flips `active_deployments`, then the control plane's `precompile.PrecompileCwasm` (best-effort) shells out to `wasm2cwasm` and stores the result via `ArtifactStore.SaveFormat(..., "cwasm", ...)` next to the `.wasm`.
 4. **Activate** — the control plane's `deployment.Service.ActivateDeployment` then publishes a `TaskMessage` over NATS JetStream to `edgecloud.tasks.<region>`. In parallel, `cache_pusher` PUTs the artifact to each per-region edge-cache binary (3-second timeout, best-effort) and updates `active_deployments.regions_cached` / `regions_cache_failed`.
