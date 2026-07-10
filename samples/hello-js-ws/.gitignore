@@ -4,5 +4,6 @@ target/
 # Sample crate is a workspace-isolated cdylib; lockfiles aren't shared
 # with the parent workspace and would churn on every dependency bump.
 Cargo.lock
-# npm lock for the local @edgecloud/sdk dep — same reasoning.
-package-lock.json
+# `package-lock.json` IS committed (issue #423) so the
+# `rust-js-build` CI job can `npm ci` against a 1-dep + 1-devDep
+# hermetic install. Net churn is near-zero.

@@ -2,6 +2,15 @@
 **/target/
 Cargo.lock
 *.wasm
+# Intentional exceptions — these binaries are committed on purpose:
+#   - The WASI Preview 1 reactor adapter vendored by `edge build --lang=js`
+#     (issue #423; SHA-256 checked by the `rust-js-build` CI job).
+#   - The component-model fixtures consumed by edge-worker tests; they were
+#     previously `git add -f`-ed in earlier PRs.
+!edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm
+!edge-worker/tests/fixtures/js_websocket_handler.wasm
+!edge-worker/tests/fixtures/handler.wasm
+!edge-worker/tests/fixtures/test-handle.wasm
 *.wat
 *.log
 .env
