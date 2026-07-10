@@ -114,13 +114,13 @@ func (d *OutboxDrainer) Tick(ctx context.Context) {
 //
 // Issue #569: dispatch switches on row.Kind:
 //   - "task_update" | "full_sync"   → unmarshal as nats.TaskMessage,
-//                                    call PublishTaskUpdate per region.
+//     call PublishTaskUpdate per region.
 //   - "task_purge"                 → unmarshal as nats.PurgePayload,
-//                                    call PublishPurge per region.
+//     call PublishPurge per region.
 //   - anything else                → terminal failure (unknown kind)
-//                                    so a future kind lands in a
-//                                    controlled failure row rather
-//                                    than silently dropping.
+//     so a future kind lands in a
+//     controlled failure row rather
+//     than silently dropping.
 //
 // Ordering invariant: a `task_update` for tenant T may already be
 // claimed (in_flight, not yet published) when `task_purge` for the
