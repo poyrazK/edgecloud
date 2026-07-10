@@ -702,7 +702,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ArtifactPath:    cfg.Storage.ArtifactPath,
 		WorkerSvc:       workerSvc,
 		ReconcileSvc:    reconcileSvc,
-		LogGC:           service.NewLogGCService(logEntryRepo),
+		LogGC:           service.NewLogGCService(logEntryRepo, metricsAgg.NewLogGCSink()),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
 		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
 		// Preview GC (issue #308). Wired with the deployment
