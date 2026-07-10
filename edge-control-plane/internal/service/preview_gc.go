@@ -69,9 +69,9 @@ type previewBlobDeleter interface {
 // sink is NOT called when the run is refused-to-run or when the
 // context is pre-cancelled — same rationale as LogGCService.
 type PreviewGCService struct {
-	repo               previewRepoForGC
-	blobs              previewBlobDeleter
-	sink               PreviewGCSink
+	repo                previewRepoForGC
+	blobs               previewBlobDeleter
+	sink                PreviewGCSink
 	blobFailureRecorder PreviewBlobFailureRecorder
 }
 
