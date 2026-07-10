@@ -613,9 +613,10 @@ jobs:
   # ============================================================
   # CLI-JS-SMOKE — end-to-end build of the JS sample
   # (issue #423 / #424). Skipped on PRs that don't touch the JS
-  # pipeline (edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, this
-  # workflow) so the cost (~5-10 min for `cargo install wasm-tools`
-  # on a cold cache) is only paid when relevant. Wired via
+  # pipeline (edge-cli/, edge-js-runtime/, edge-js-runtime-long/,
+  # edge-js-sdk/, wit/, this workflow) so the cost (~5-10 min for
+  # `cargo install wasm-tools` on a cold cache) is only paid when
+  # relevant. Wired via
   # `dorny/paths-filter` so the skip is real, not a comment-only
   # claim.
   # ============================================================
@@ -662,6 +663,7 @@ jobs:
             changes:
               - 'edge-cli/**'
               - 'edge-js-runtime/**'
+              - 'edge-js-runtime-long/**'
               - 'edge-js-sdk/**'
               - 'wit/**'
               - 'samples/hello-js/**'
@@ -675,7 +677,7 @@ jobs:
       - name: Skip — no JS-surface changes
         if: steps.changes.outputs.changes != 'true'
         run: |
-          echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
+          echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-runtime-long/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
           exit 0
 
       - name: Install Rust toolchain (wasm32-wasip1, wasm32-wasip2)

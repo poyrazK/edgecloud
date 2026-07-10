@@ -42,11 +42,11 @@ pub mod edge_modules;
 // `edge-js-runtime-long/` can share the bodies (it has its own
 // `register` with the same body but bound to its own bindgen-generated
 // `edge::cloud::*`). See `register.rs` header for the full duplication
-// rationale. The sibling crate is added to the workspace's `exclude`
-// list (parallel to `edge-js-runtime` itself) because it intentionally
-// uses the same `wit-bindgen 0.45` + `rquickjs 0.9` pins — normalizing
-// these into a single workspace member would force `wit-bindgen`
-// versions across the rest of the workspace.
+// rationale. Both crates are now workspace members (issue #510); the
+// shared `wit-bindgen 0.45` + `rquickjs 0.9` pins stay inline in each
+// `Cargo.toml` (see decision in #510: hoisting them to
+// `[workspace.dependencies]` would only matter if a third host member
+// adopted them, which the current roadmap does not anticipate).
 #[cfg(target_arch = "wasm32")]
 pub mod register;
 
@@ -60,9 +60,7 @@ pub mod register;
 mod wasm_only {
     use super::{compile_user_bundle, USER_BYTECODE};
     use exports::wasi::http::incoming_handler::Guest;
-    use wasi::http::types::{
-        Fields, IncomingRequest, OutgoingResponse, ResponseOutparam,
-    };
+    use wasi::http::types::{Fields, IncomingRequest, OutgoingResponse, ResponseOutparam};
 
     wit_bindgen::generate!({
         world: "edge-runtime-handler",
@@ -130,9 +128,8 @@ mod wasm_only {
                 // `Runtime` that produced them. Any drift between
                 // producer + consumer engines would surface as an
                 // `Err` on the next line, not as UB.
-                let module = match unsafe {
-                    rquickjs::module::Module::load(ctx.clone(), &bytecode)
-                } {
+                let module = match unsafe { rquickjs::module::Module::load(ctx.clone(), &bytecode) }
+                {
                     Ok(m) => m,
                     Err(e) => return send_error(out, &format!("bytecode load: {e}")),
                 };
@@ -258,7 +255,11 @@ mod wasm_only {
                 .as_string()
                 .map(|s| s.to_string().unwrap_or_default())
                 .unwrap_or_default();
-            (200, body.into_bytes(), "text/plain; charset=utf-8".to_string())
+            (
+                200,
+                body.into_bytes(),
+                "text/plain; charset=utf-8".to_string(),
+            )
         }
     }
 
@@ -283,7 +284,6 @@ mod wasm_only {
     fn send_error(out: ResponseOutparam, msg: &str) {
         send_response(out, 500, msg.as_bytes(), "text/plain");
     }
-
 }
 
 // ─── Host-safe items (used by the wasm target AND the bench) ─────────
@@ -342,15 +342,9 @@ pub fn compile_user_bundle(rt: &rquickjs::Runtime) -> Result<Vec<u8>, String> {
     let wrapped = wrap_as_module(USER_JS);
     let ctx = rquickjs::Context::full(rt).map_err(|e| format!("context: {e}"))?;
     ctx.with(|ctx| {
-        let module = rquickjs::module::Module::declare(
-            ctx.clone(),
-            "user.js",
-            wrapped.as_bytes(),
-        )
-        .map_err(|e| format!("declare: {e}"))?;
-        module
-            .write_le()
-            .map_err(|e| format!("write_le: {e}"))
+        let module = rquickjs::module::Module::declare(ctx.clone(), "user.js", wrapped.as_bytes())
+            .map_err(|e| format!("declare: {e}"))?;
+        module.write_le().map_err(|e| format!("write_le: {e}"))
     })
 }
 
@@ -371,17 +365,29 @@ mod tests {
     /// every bundle) or `usize::MAX` (defeats the guardrail).
     #[test]
     fn max_bytecode_bytes_is_bounded() {
+        // Clippy's `assertions_on_constants` / `identity_op` lints fold
+        // compile-time values; if both sides of an `assert!` resolve at
+        // compile time the assertion looks pointless. The point of this
+        // test is to catch a future regression where someone edits
+        // `MAX_BYTECODE_BYTES` in `src/lib.rs:321` to a value that
+        // blocks reasonable bundles (`< 1 MiB`) or defeats the guardrail
+        // (`> 100 MiB`). Hide the values behind named locals so the
+        // constant-folding analysis can't see them, then assert against
+        // the named locals.
+        let observed = MAX_BYTECODE_BYTES;
+        let min_bytes = 1024 * 1024;
         assert!(
-            MAX_BYTECODE_BYTES >= 1 * 1024 * 1024,
-            "MAX_BYTECODE_BYTES = {MAX_BYTECODE_BYTES} is too low \
+            observed >= min_bytes,
+            "MAX_BYTECODE_BYTES = {observed} is too low \
              (would block reasonable esbuild bundles)"
         );
         // Loose upper bound: the control plane caps the input at
         // 100 MiB (`MaxArtifactSize`), so the bytecode form is at
         // most that large. A cap of 100 MiB or more is a no-op.
+        let max_bytes = 100 * 1024 * 1024;
         assert!(
-            MAX_BYTECODE_BYTES <= 100 * 1024 * 1024,
-            "MAX_BYTECODE_BYTES = {MAX_BYTECODE_BYTES} is too high \
+            observed <= max_bytes,
+            "MAX_BYTECODE_BYTES = {observed} is too high \
              (defeats the inner-side guardrail)"
         );
     }
