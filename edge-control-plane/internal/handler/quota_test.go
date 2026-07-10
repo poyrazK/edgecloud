@@ -187,6 +187,70 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_Requests(t *testing.T) {
 	}
 }
 
+// TestQuotaHandler_GetQuotaInternal_OverCap_Memory (issue #44, part 2):
+// used_memory_mb at MaxMemoryMB → over_cap=true. Edge-ingress reads
+// this and injects the request-time 402 block. The deploy-time gate is
+// the leading signal (rejects the next activate), but the request-time
+// gate is the user-facing backstop that flips a serving tenant's
+// already-deployed apps to 402 until they roll back.
+func TestQuotaHandler_GetQuotaInternal_OverCap_Memory(t *testing.T) {
+	q, err := domain.QuotaForPlan("free")
+	if err != nil {
+		t.Fatalf("QuotaForPlan(free): %v", err)
+	}
+	q.TenantID = "t_over_mem"
+	q.UsedMemoryMB = int64(q.MaxMemoryMB) // 256 = 100%
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over_mem", nil)
+	req.SetPathValue("tenantID", "t_over_mem")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.OverCap {
+		t.Errorf("over_cap = false at used_memory_mb = MaxMemoryMB, want true")
+	}
+}
+
+// TestQuotaHandler_GetQuotaInternal_OverCap_MemoryEnterpriseBypasses
+// (issue #44, part 2): MaxMemoryMB = -1 is the unlimited sentinel and
+// must NOT trip over_cap on the memory axis even when used_memory_mb
+// is absurd. Same shape as the existing tests' enterprise bypass for
+// requests/outbound.
+func TestQuotaHandler_GetQuotaInternal_OverCap_MemoryEnterpriseBypasses(t *testing.T) {
+	q := &domain.Quota{
+		TenantID:            "t_ent",
+		MaxRequestsPerMonth: -1,
+		MaxOutboundMB:       -1,
+		MaxMemoryMB:         -1,
+		UsedMemoryMB:        9_999_999,
+	}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_ent", nil)
+	req.SetPathValue("tenantID", "t_ent")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.OverCap {
+		t.Errorf("over_cap = true with MaxMemoryMB=-1, want false (unlimited sentinel)")
+	}
+}
+
 // TestQuotaHandler_GetQuotaInternal_NotFound: GetQuotaForInternal
 // returns nil → 404 with a JSON error envelope. Edge-ingress fails
 // open on a missing tenant (no 402 injected); the 404 is the
