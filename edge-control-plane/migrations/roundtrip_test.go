@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 66 // 33 .up.sql + 33 .down.sql on current main (after 025_app_env_plaintext_audit, issue #441 PR #462 follow-up)
+const splitFileCount = 68 // 34 .up.sql + 34 .down.sql on current main (after 026_active_deployments_activation_attempt_started_at, issue #440 full close follow-up)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -164,14 +164,15 @@ var wantColumns = map[string][]string{
 		"tenant_id",
 		"app_name",
 		"deployment_id",
-		"last_good_deployment_id", // 005_add_last_good
-		"auto_rollback_enabled",   // 009_add_auto_rollback
-		"stable_since",            // 009_add_auto_rollback
-		"regions_published",       // 010_active_deployments_regions
-		"regions_failed",          // 010_active_deployments_regions
-		"regions_cached",          // 017_active_deployments_regions_cached
-		"last_publish_at",         // 010_active_deployments_regions
-		"last_publish_attempt_id", // 010_active_deployments_regions
+		"last_good_deployment_id",                  // 005_add_last_good
+		"auto_rollback_enabled",                    // 009_add_auto_rollback
+		"stable_since",                             // 009_add_auto_rollback
+		"regions_published",                        // 010_active_deployments_regions
+		"regions_failed",                           // 010_active_deployments_regions
+		"regions_cached",                           // 017_active_deployments_regions_cached
+		"last_publish_at",                          // 010_active_deployments_regions
+		"last_publish_attempt_id",                  // 010_active_deployments_regions
+		"activation_attempt_started_at",            // 026_active_deployments_activation_attempt_started_at
 	},
 	"app_env": {
 		"tenant_id",
@@ -376,16 +377,17 @@ var wantTypes = map[string]map[string]string{
 		"build_attestation":     "jsonb", // 020_add_build_attestation (nullable)
 	},
 	"active_deployments": {
-		"tenant_id":               "text",
-		"app_name":                "text",
-		"deployment_id":           "text",
-		"last_good_deployment_id": "text",        // 005_add_last_good
-		"auto_rollback_enabled":   "bool",        // 009_add_auto_rollback
-		"stable_since":            "timestamptz", // 009_add_auto_rollback (nullable)
-		"regions_published":       "_text",       // 010_active_deployments_regions
-		"regions_failed":          "_text",       // 010_active_deployments_regions
-		"last_publish_at":         "timestamptz", // 010_active_deployments_regions (nullable)
-		"last_publish_attempt_id": "uuid",        // 010_active_deployments_regions (nullable)
+		"tenant_id":                    "text",
+		"app_name":                     "text",
+		"deployment_id":                "text",
+		"last_good_deployment_id":      "text",        // 005_add_last_good
+		"auto_rollback_enabled":        "bool",        // 009_add_auto_rollback
+		"stable_since":                 "timestamptz", // 009_add_auto_rollback (nullable)
+		"regions_published":            "_text",       // 010_active_deployments_regions
+		"regions_failed":               "_text",       // 010_active_deployments_regions
+		"last_publish_at":              "timestamptz", // 010_active_deployments_regions (nullable)
+		"last_publish_attempt_id":      "uuid",        // 010_active_deployments_regions (nullable)
+		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)
 	},
 	"app_env": {
 		"tenant_id": "text",

@@ -266,12 +266,12 @@ func TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty(t *testing.
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// In-tx ListByTenant returns the pre-commit snapshot.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number"}).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}).
 			AddRow(tenantID, "app1", "d_1", nil, false, nil,
 				pq.Array(regions), pq.Array([]string{}), pq.Array([]string{}), pq.Array([]string{}),
-				nil, nil, nil, nil))
+				nil, nil, nil, nil, nil))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
@@ -336,9 +336,9 @@ func TestDisableTenantAtomically_RacingActivateSucceeded_SkipsEmptyPublish(t *te
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// In-tx snapshot: empty (no active rows).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number"}))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
@@ -385,9 +385,9 @@ func TestDisableTenantAtomically_EmptyActiveList_NoPublish(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`)).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number"}))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "last_good_deployment_id", "auto_rollback_enabled", "stable_since", "regions_published", "regions_failed", "regions_cached", "regions_cache_failed", "last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number", "activation_attempt_started_at"}))
 	mock.ExpectCommit()
 
 	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {

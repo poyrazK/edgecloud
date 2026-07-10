@@ -230,6 +230,26 @@ type ActiveDeployment struct {
 	// lives on the deployments row and is the GC's sweep key.
 	PreviewID       *string `db:"preview_id"`
 	PreviewPRNumber *int    `db:"preview_pr_number"`
+	// ActivationAttemptStartedAt (issue #440) is stamped to NOW() by
+	// ActivateDeployment / RollbackDeployment / PromoteDeployment at
+	// the moment they write the active row inside their tx. It is the
+	// "an activate is in flight or just committed for this row" marker
+	// the disable path uses (via waitForActiveRowPublishes in
+	// service.WorkerService) to detect a racing activate whose
+	// publishSwap has not yet completed — and wait for it to land on
+	// the wire before publishing the empty task_update that would
+	// otherwise kill the just-activated app.
+	//
+	// Distinct from LastPublishAt above: LastPublishAt is stamped AFTER
+	// the NATS publish returns (in publishSwap's post-publish append
+	// tx), while ActivationAttemptStartedAt is stamped BEFORE the
+	// publishSwap runs — so the disable path can observe an in-flight
+	// activate as "active row exists with ActivationAttemptStartedAt
+	// non-NULL and LastPublishAt still NULL."
+	//
+	// Nullable because pre-migration-026 rows have no value; the
+	// disable path treats NULL as "no in-flight activate."
+	ActivationAttemptStartedAt *time.Time `db:"activation_attempt_started_at"`
 }
 
 // AppEnv stores environment variables for an app.
