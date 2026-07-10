@@ -121,6 +121,92 @@ jobs:
         run: cargo nextest run --workspace
 
   # ============================================================
+  # RUST-JS-BUILD — Issue #423: exercise `edge build --lang=js`
+  # end-to-end on a fresh ubuntu-latest. Verifies the vendored
+  # WASI Preview 1 reactor adapter's SHA-256 and confirms
+  # `edge-cli build --lang=js` resolves the adapter and core
+  # wasm paths against a fresh CARGO_HOME (so any adapter
+  # resolution via the registry fallback is impossible, proving
+  # the vendored file is genuinely the canonical source).
+  # ============================================================
+  rust-js-build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # clang + mold are needed by edge-js-runtime's rquickjs-sys
+      # (auto-stages wasi-sdk on first build) and the linker arg.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
+      - name: Add wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      # Node 24 is the runner default; per CLAUDE.md we omit
+      # node-version so CI tracks upstream. npm ci against the
+      # committed samples/hello-js-ws/package-lock.json (issue
+      # #423) makes this hermetic.
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          cache: npm
+          cache-dependency-path: samples/hello-js-ws/package-lock.json
+
+      - name: Install JS dependencies
+        working-directory: samples/hello-js-ws
+        run: npm ci
+
+      - name: Install edge CLI
+        run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.252.0 --locked --root "$CARGO_HOME"
+
+      - name: Expose CLI tools on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # SHA-256 check on the vendored adapter BEFORE the build —
+      # a missing or drifted file fails fast, before the slow
+      # rquickjs-sys wasi-sdk staging step.
+      - name: Verify vendored WASI adapter checksum
+        working-directory: edge-cli/adapters
+        run: sha256sum -c SHA256SUMS
+
+      # Build against a clean CARGO_HOME so the `cargo install
+      # wasm-tools` step above can't have populated the registry
+      # with a `wasi-preview1-component-adapter-provider-*` crate
+      # that would mask a missing vendored adapter via the
+      # registry-glob fallback. Proves the vendored file is
+      # genuinely the source on a fresh clone.
+      - name: Build JS sample with vendored adapter
+        working-directory: samples/hello-js-ws
+        env:
+          CARGO_HOME: ${{ runner.temp }}/edgecloud-js-build-cargo-home
+        run: |
+          mkdir -p "$CARGO_HOME"
+          edge-cli build --lang=js
+
+  # ============================================================
   # RUST-SEMVER — Run cargo-semver-checks
   # ============================================================
   rust-semver:

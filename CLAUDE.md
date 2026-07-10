@@ -62,7 +62,7 @@ cd edge-control-plane && gofmt -l . && go vet ./...
 
 The workspace pulls in heavy crates (wasmtime, tree-sitter, wasmtime-wasi-http). Each `git worktree` owns its own working tree, and Cargo's default `target/` lives inside it — running 5 agents in parallel worktrees can balloon to 20 GB+. To keep local dev light, the repo is wired to share `target/` and wrap `rustc` with `sccache`:
 
-- **`target/` is shared across worktrees.** `.cargo/config.toml` (committed) sets `build.target-dir = "$HOME/.cache/edgecloud-cargo"`. Every worktree compiles into the same dir; content-addressed fingerprinting means only changed sources rebuild.
+- **`target/` is shared across worktrees.** `.cargo/config.toml:36-37` (committed) sets `build.target-dir = "../target-cache/edgecloud"` — config-relative, so the resolved path is `<workspace>/target-cache/edgecloud/`. Every worktree compiles into the same dir; content-addressed fingerprinting means only changed sources rebuild.
 - **`rustc` is wrapped with sccache.** Same file sets `build.rustc-wrapper = "sccache"`. Install once: `brew install sccache` (or `cargo install sccache`). sccache itself stores its cache at `~/.cache/sccache-edgecloud` (override with `SCCACHE_DIR`).
 - **Dev profile is trimmed.** `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` so backtraces still resolve file:line but `.dwp`/`.dwo` bloat is dropped.
 
@@ -71,10 +71,18 @@ Verify after a fresh clone:
 ```bash
 sccache --version                       # ≥ 0.7
 cargo build --workspace                 # cold; observe "Compiling ..." via sccache
-du -sh ~/.cache/edgecloud-cargo         # single shared target
+du -sh ../target-cache/edgecloud        # single shared target (one dir up from the workspace root)
 ```
 
 If a build fails with `could not execute wrapper 'sccache'`, install sccache or unset the wrapper locally with `CARGO_BUILD_RUSTC_WRAPPER=""`. CI does not use sccache — `Swatinem/rust-cache@v2` already caches cold builds, and the per-job `RUSTFLAGS` set `-C debuginfo=0` so CI builds stay lean.
+
+### Vendored WASI Preview 1 reactor adapter
+
+`edge build --lang=js` shells out to `wasm-tools component new --adapt <adapter>` to wrap the `wasm32-wasip1` core module produced by `edge-js-runtime` into a WASI Preview 2 component the host linker accepts. The adapter is committed at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm` (52,238 bytes, SHA-256 `49fafbdac877303ac91bd178d8ad6b14041aca5136362fe6864f96c8413b5bea`). Pinned against wasmtime **v45.0.3** — byte-identical to the asset at <https://github.com/bytecodealliance/wasmtime/releases/download/v45.0.3/wasi_snapshot_preview1.reactor.wasm>. SHA-256 is checked by `sha256sum -c SHA256SUMS` (sidecar at `edge-cli/adapters/SHA256SUMS`); that step runs in the `rust-js-build` CI job. Issue #423.
+
+A wasmtime bump in `edge-runtime/Cargo.toml` requires re-vendoring the adapter: download the new release asset, drop it at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`, and update `SHA256SUMS` so the CI check stays green.
+
+`edge-cli/src/commands/build.rs::resolve_wasi_adapter()` probes three sources in priority order — `$EDGE_JS_WASI_ADAPTER` env override, the vendored file, then a fallback cargo-registry glob for dev machines with `wasi-preview1-component-adapter-provider-45.0.x` cached locally from another project. The vendored file wins on a fresh clone.
 
 ### CI
 
@@ -96,6 +104,7 @@ CI jobs:
 | `go-test-integration` | `go test -tags=integration -v ./migrations/...` against a postgres:16 service |
 | `typos` | crate-ci/typos across the whole repo |
 | `coverage-rust` | cargo-llvm-cov (informational) |
+| `rust-js-build` | Exercises the JS build pipeline end-to-end (`rustup target add wasm32-wasip1` + esbuild + `wasm-tools component new --adapt <vendored adapter>` against `samples/hello-js-ws/`); also verifies the vendored WASI Preview 1 reactor adapter via `sha256sum -c edge-cli/adapters/SHA256SUMS` (issue #423). |
 
 `.github/workflows/preview.yml` is a `deploy-preview` job that runs on every PR `opened`/`synchronize` event (issue #308). The composite action at `.github/actions/deploy-preview/action.yml` builds the CLI via `cargo install --root $CARGO_HOME`, then runs `edge deploy --preview --pr-number=${{ github.event.pull_request.number }}`. The action includes a `Expose edge CLI on PATH` step that appends `$CARGO_HOME/bin` to `$GITHUB_PATH` — without it the next bash step fails with `edge: command not found` (rc=127). The URL is parsed from the CLI's stdout and exposed as the `preview-url` step output; the workflow's `Comment PR` step posts it on the PR when `EDGECLOUD_API_KEY` is set (fork PRs lack the secret and silently no-op).
 
