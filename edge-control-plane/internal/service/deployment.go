@@ -356,6 +356,10 @@ type deployActiveRepoInterface interface {
 type tenantRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.TenantRepository
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	// GetForUpdate is GetByID with a row-level write lock; used by
+	// the activate / rollback tx to serialize against SetDisabledAt
+	// (issue #440).
+	GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
 // quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
@@ -450,6 +454,54 @@ type DeploymentService struct {
 	// the constructor; never nil/empty (the config layer defaults to
 	// "global" when unset).
 	defaultRegion string
+}
+
+// lockTenantForUpdate is the issue #440 disable-vs-write gate. It must
+// be the first SQL call inside any DeploymentService tx that ends in
+// either an active_deployments mutation OR an outbox INSERT —
+// specifically activateDeployment and RollbackDeployment, which both
+// publish a TaskMessage (directly via the outbox drainer) on commit.
+//
+// Locking the tenant row BEFORE reading active_deployments serializes
+// against concurrent SetDisabledAt / ClearDisabledAt:
+//
+//   - If we read disabled_at = NULL, the disable either commits after
+//     our tx (we hold the row lock until our commit, so the disable
+//     waits; it then sees our freshly-committed active row mutation
+//     and writes disabled_at) — the outbox row we enqueue carries a
+//     TaskMessage the OutboxDrainer will eventually publish, but the
+//     worker side already sees the tenant as disabled via the
+//     heartbeat-driven route-table update (ApplyTenantDelta fires on
+//     disabled_at writes), and the per-region dedupe_id on the message
+//     (issue #418) prevents the worker from re-applying the same
+//     delta on JetStream redelivery. The stale publish is therefore
+//     tolerable.
+//
+//   - If we read disabled_at set, the disable committed first and we
+//     abort with ErrTenantDisabled before touching the active row —
+//     no TaskMessage is enqueued.
+//
+// Lock-order: tenant first, then active_deployments. The two write
+// paths must agree on this order or a disable could commit between
+// one path's tenant read and the other's active read, producing a
+// split-brain state where activate publishes but rollback doesn't (or
+// vice versa).
+//
+// Returns (nil, nil) — i.e. ErrTenantNotFound — when the tenant row
+// does not exist. Callers MUST treat this as a hard error: a tenant
+// the control plane has forgotten about must not receive a publish.
+func (s *DeploymentService) lockTenantForUpdate(ctx context.Context, txTenant *repository.TenantRepository, tenantID string) (*domain.Tenant, error) {
+	tenantRow, err := txTenant.GetForUpdate(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("locking tenant: %w", err)
+	}
+	if tenantRow == nil {
+		return nil, ErrTenantNotFound
+	}
+	if tenantRow.IsDisabled() {
+		return nil, ErrTenantDisabled
+	}
+	return tenantRow, nil
 }
 
 func NewDeploymentService(
@@ -1151,6 +1203,16 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	}
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-activate gate — see
+		// lockTenantForUpdate for the race window + the worker-side
+		// dedupe_id / route-table mechanism that makes the
+		// "disable commits after we read NULL" arm tolerable.
+		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+			return err
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1463,6 +1525,17 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 
 	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
 		txActive := s.activeRepo.WithTx(tx)
+		txTenant := s.tenantRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-rollback gate — symmetric with the
+		// activateDeployment call above. See lockTenantForUpdate
+		// for the race window + the worker-side dedupe_id /
+		// route-table mechanism that makes the "disable commits
+		// after we read NULL" arm tolerable.
+		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+			return err
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
