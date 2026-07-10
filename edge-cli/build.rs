@@ -13,11 +13,17 @@
 //! CLI binary refreshes automatically.
 
 fn main() {
+    // The whole `wit/` tree is the embed input — cargo's rerun
+    // directive walks the directory recursively, so a single
+    // declaration covers every `.wit` file under it. The two
+    // followup lines below pin the two highest-churn subpaths
+    // (the entrypoint `edge-cloud.wit` and `deps/`, which holds
+    // the 7 WASI Preview 2 packages). On filesystems with poor
+    // mtime resolution (HFS+, some NFS mounts) cargo's recursive
+    // watcher can miss leaf-level edits — these explicit leaf
+    // paths are a backstop so a tweak to `edge-cloud.wit` or a
+    // WIT dep always invalidates the embed.
     println!("cargo:rerun-if-changed=../wit");
-    // Belt-and-suspenders for the two highest-churn entry points.
-    // cargo's recursive watcher only sees directory mtimes, so
-    // touching a leaf .wit without these lines can fail to invalidate
-    // the embed on some filesystems.
     println!("cargo:rerun-if-changed=../wit/edge-cloud.wit");
     println!("cargo:rerun-if-changed=../wit/deps");
 }

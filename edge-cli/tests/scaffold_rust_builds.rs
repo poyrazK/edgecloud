@@ -167,14 +167,21 @@ fn edge_init_rust_scaffolds_working_faas_project() {
     let workspace = tempfile::tempdir().expect("tempdir for scaffold");
     let project = workspace.path();
 
-    let init_status = Command::new(&edge)
+    // Capture stdout/stderr so a failure leaves breadcrumbs to debug
+    // from. `Command::status()` discards both, leaving an opaque
+    // "exited non-zero" message with nothing to inspect — using
+    // `output()` and including stderr in the assertion is strictly
+    // more useful for triage.
+    let init_out = Command::new(&edge)
         .args(["init", APP_NAME, "--lang=rust"])
         .current_dir(project)
-        .status()
+        .output()
         .expect("spawn edge init");
     assert!(
-        init_status.success(),
-        "edge init exited non-zero; see stderr above"
+        init_out.status.success(),
+        "edge init exited non-zero; stderr:\n{}\nstdout:\n{}",
+        String::from_utf8_lossy(&init_out.stderr),
+        String::from_utf8_lossy(&init_out.stdout)
     );
 
     let app_dir = project.join(APP_NAME);

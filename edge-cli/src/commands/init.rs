@@ -458,6 +458,31 @@ mod tests {
         );
     }
 
+    /// Rust counterpart — the `*_pins_*` tests above check that the
+    /// literal strings appear in the rendered TOML, but a regression
+    /// that introduced stray whitespace or a quoting typo could keep
+    /// the substring match intact while producing invalid TOML. This
+    /// test parses the rendered output and pulls the language /
+    /// target / world fields back out, so the contract that the
+    /// `Project` schema parses it holds for Rust as well as JS.
+    /// See `config/edgetoml.rs:38` for the world field's
+    /// required-ness and `config/edgetoml.rs:61` for the default
+    /// target that `Project::default_target` falls back to.
+    #[test]
+    fn rust_header_round_trips_through_parser() {
+        let result = render_header("myapp", super::LangArg::Rust);
+        let parsed: toml::Value = toml::from_str(&result).expect("invalid TOML");
+        assert_eq!(parsed["project"]["language"].as_str(), Some("rust"));
+        assert_eq!(
+            parsed["project"]["target"].as_str(),
+            Some("wasm32-unknown-unknown")
+        );
+        assert_eq!(
+            parsed["project"]["world"].as_str(),
+            Some("edge-runtime-handler")
+        );
+    }
+
     // ── shared preamble (issue #576) ──────────────────────────────────
 
     #[test]

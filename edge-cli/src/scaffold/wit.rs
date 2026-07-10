@@ -207,9 +207,11 @@ mod tests {
 
         // Idempotency: a pre-existing `wit/` is left untouched.
         let sentinel = project.join("wit/edge-cloud.wit");
-        let original = std::fs::read(&sentinel).expect("read sentinel");
         // Mutate the on-disk copy to a known-bogus byte; if
-        // write_wit_tree re-writes, the sentinel will flip back.
+        // write_wit_tree re-writes, the sentinel will flip back to
+        // the canonical embed bytes. The tempdir is dropped after
+        // this block so we don't bother restoring — the sentinel is
+        // about to be deleted anyway.
         std::fs::write(&sentinel, b"BOGUS").expect("write sentinel");
         write_wit_tree(project).expect("second write");
         let after = std::fs::read(&sentinel).expect("read sentinel after");
@@ -217,8 +219,5 @@ mod tests {
             after, b"BOGUS",
             "write_wit_tree must NOT overwrite a pre-existing <project>/wit/"
         );
-        // Restore so the tempdir cleanup succeeds (not strictly needed,
-        // but keeps the test self-consistent if anyone debugs it).
-        let _ = std::fs::write(&sentinel, original);
     }
 }
