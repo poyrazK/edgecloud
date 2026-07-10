@@ -88,9 +88,13 @@ func (t *tenantRepoForDisable) WithTx(tx *sqlx.Tx) *repository.TenantRepository 
 type listByTenantWrapper struct {
 	concrete *repository.ActiveDeploymentRepository
 	fn       func(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error)
+	getFn    func(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error)
 }
 
 func (w *listByTenantWrapper) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
+	if w.getFn != nil {
+		return w.getFn(ctx, tenantID, appName)
+	}
 	return w.concrete.Get(ctx, tenantID, appName)
 }
 func (w *listByTenantWrapper) SetStableSince(ctx context.Context, tenantID, appName, deploymentID string, ts time.Time) error {
@@ -414,3 +418,290 @@ func keysOf(m map[string][]byte) []string {
 
 // silence unused-import warnings if a future refactor drops a usage.
 var _ = log.Writer
+
+// TestDisableTenantAtomically_WaitsForInFlightActivatePublishes
+// pins the canonical race fix (issue #440 commit 3): the disable
+// path detects an in-flight activate row (ActivationAttemptStartedAt
+// recent, LastPublishAt NULL) and polls last_publish_at until the
+// activate's publishSwap stamps it. Only then does disable publish
+// the empty task_update — JetStream per-subject ordering means the
+// activate's non-empty message reaches workers first.
+func TestDisableTenantAtomically_WaitsForInFlightActivatePublishes(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	regions := []string{"us-east"}
+	now := time.Now()
+	priorAttemptStart := now.Add(-2 * time.Second)
+	var getCalls int
+	publishDoneCh := make(chan struct{})
+
+	svc, mock, js, cleanup := workerSvcForDisableTest(t, func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
+		// One in-flight row from a racing activate. disable path
+		// must poll Get(...) until LastPublishAt becomes non-NULL.
+		return []domain.ActiveDeployment{
+			{
+				TenantID:                   "t_a",
+				AppName:                    "app1",
+				DeploymentID:               "d_1",
+				RegionsPublished:           regions,
+				ActivationAttemptStartedAt: &priorAttemptStart,
+				LastPublishAt:              nil,
+			},
+		}, nil
+	})
+	// Override Get on the wrapper so we can simulate the activate's
+	// publishSwap stamping last_publish_at mid-wait.
+	svc.activeRepo.(*listByTenantWrapper).getFn = func(_ context.Context, _, appName string) (*domain.ActiveDeployment, error) {
+		getCalls++
+		lp := &now
+		if getCalls < 3 {
+			// First two polls: still null (simulate in-flight publish).
+			lp = nil
+		}
+		// From the 3rd call: stamped.
+		if getCalls == 3 {
+			close(publishDoneCh)
+		}
+		return &domain.ActiveDeployment{
+			TenantID:                   "t_a",
+			AppName:                    appName,
+			DeploymentID:               "d_1",
+			RegionsPublished:           regions,
+			ActivationAttemptStartedAt: &priorAttemptStart,
+			LastPublishAt:              lp,
+		}, nil
+	}
+	// Use a fast controllable ticker so the test completes quickly.
+	svc.SetDisablePublishWaitPoll(func(_ time.Duration) (<-chan time.Time, func()) {
+		ch := make(chan time.Time, 1)
+		// Fire one tick after a short delay so the loop runs a few
+		// iterations; the Get override stamps LastPublishAt on the
+		// third call.
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			ch <- time.Now()
+		}()
+		return ch, func() {}
+	})
+	// Generous budget so we don't time out before the 3rd poll.
+	svc.SetDisablePublishWaitBudget(2 * time.Second)
+	defer cleanup()
+
+	const tenantID = "t_a"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
+		WithArgs(tenantID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
+		t.Fatalf("disableTenantAtomically: %v", err)
+	}
+
+	// Wait loop must have polled Get at least once before stamping.
+	if getCalls < 3 {
+		t.Errorf("Get call count = %d, want ≥ 3 (wait loop polled; closed over `publishDoneCh` after stamp)", getCalls)
+	}
+	select {
+	case <-publishDoneCh:
+	default:
+		t.Errorf("publishDoneCh never closed — wait loop never saw last_publish_at stamped")
+	}
+	if len(js.publishes) != len(regions) {
+		t.Fatalf("publish count = %d, want %d (empty per region after wait completed)", len(js.publishes), len(regions))
+	}
+	out := buf.String()
+	if !strings.Contains(out, "waiting up to") {
+		t.Errorf("missing 'waiting up to' log line; got %q", out)
+	}
+	if !strings.Contains(out, "all stamped last_publish_at") {
+		t.Errorf("missing 'all stamped' log line; got %q", out)
+	}
+}
+
+// TestDisableTenantAtomically_WaitTimeoutExitsAndPublishes pins the
+// graceful-degrade path (issue #440 commit 3): when the in-flight
+// activate's publishSwap never completes within the budget, the
+// disable path logs a 'timed out' line and publishes empty anyway.
+// The trade-off documented in the plan: better to publish empty
+// than to leave workers running an over-quota tenant for the 5-min
+// reconcile cycle.
+func TestDisableTenantAtomically_WaitTimeoutExitsAndPublishes(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	regions := []string{"us-east"}
+	now := time.Now()
+	priorAttemptStart := now.Add(-2 * time.Second)
+
+	svc, mock, js, cleanup := workerSvcForDisableTest(t, func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
+		return []domain.ActiveDeployment{
+			{
+				TenantID:                   "t_a",
+				AppName:                    "app1",
+				DeploymentID:               "d_1",
+				RegionsPublished:           regions,
+				ActivationAttemptStartedAt: &priorAttemptStart,
+				LastPublishAt:              nil, // never stamps
+			},
+		}, nil
+	})
+	svc.activeRepo.(*listByTenantWrapper).getFn = func(_ context.Context, _, appName string) (*domain.ActiveDeployment, error) {
+		return &domain.ActiveDeployment{
+			TenantID: "t_a", AppName: appName, DeploymentID: "d_1",
+			RegionsPublished:           regions,
+			ActivationAttemptStartedAt: &priorAttemptStart,
+			LastPublishAt:              nil,
+		}, nil
+	}
+	// Ticker that fires a few times but budget is short.
+	svc.SetDisablePublishWaitPoll(func(_ time.Duration) (<-chan time.Time, func()) {
+		ch := make(chan time.Time, 1)
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			ch <- time.Now()
+		}()
+		return ch, func() {}
+	})
+	svc.SetDisablePublishWaitBudget(50 * time.Millisecond)
+	defer cleanup()
+
+	const tenantID = "t_a"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
+		WithArgs(tenantID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	start := time.Now()
+	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
+		t.Fatalf("disableTenantAtomically: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("disable took %s, want < 2s (budget was 50ms)", elapsed)
+	}
+	if len(js.publishes) != len(regions) {
+		t.Fatalf("publish count = %d, want %d (empty per region after timeout)", len(js.publishes), len(regions))
+	}
+	out := buf.String()
+	if !strings.Contains(out, "publish wait timed out") {
+		t.Errorf("missing 'timed out' log line; got %q", out)
+	}
+}
+
+// TestDisableTenantAtomically_NoInFlightRows_PublishesImmediately
+// pins the common-case fast path (issue #440 commit 3): no rows
+// have a recent ActivationAttemptStartedAt with NULL
+// LastPublishAt, so the disable path skips the wait loop and
+// publishes empty immediately. The 'waiting' log line must NOT
+// appear.
+func TestDisableTenantAtomically_NoInFlightRows_PublishesImmediately(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	regions := []string{"us-east"}
+	priorPublish := time.Now().Add(-1 * time.Second)
+	svc, mock, js, cleanup := workerSvcForDisableTest(t, func(_ context.Context, _ string) ([]domain.ActiveDeployment, error) {
+		return []domain.ActiveDeployment{
+			{
+				TenantID:                   "t_a",
+				AppName:                    "app1",
+				DeploymentID:               "d_1",
+				RegionsPublished:           regions,
+				ActivationAttemptStartedAt: nil, // no in-flight marker
+				LastPublishAt:              &priorPublish,
+			},
+		}, nil
+	})
+	defer cleanup()
+
+	const tenantID = "t_a"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
+		WithArgs(tenantID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := svc.disableTenantAtomically(context.Background(), tenantID); err != nil {
+		t.Fatalf("disableTenantAtomically: %v", err)
+	}
+
+	if len(js.publishes) != len(regions) {
+		t.Fatalf("publish count = %d, want %d", len(js.publishes), len(regions))
+	}
+	out := buf.String()
+	if strings.Contains(out, "waiting up to") {
+		t.Errorf("unexpected 'waiting up to' log line; got %q", out)
+	}
+}
+
+// TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled
+// pins commit 2's coverage for the rollback path (issue #440):
+// when tenant.GetForUpdate returns a row with non-nil
+// disabled_at inside the rollback tx, rollback must abort with
+// ErrTenantDisabled and skip the publishSwap. The handler's
+// errors.Is(err, ErrTenantDisabled) → 409 mapping at
+// deployment.go:798 is therefore reachable for the rollback route
+// — it was previously dead code.
+func TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T) {
+	disabledAt := time.Now().Add(-1 * time.Hour)
+	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+	sqlxDB := sqlx.NewDb(mockDB, "postgres")
+	pub := newRecordingPublisher()
+	svc := &DeploymentService{
+		db:             sqlxDB,
+		deploymentRepo: repository.NewDeploymentRepository(sqlxDB),
+		activeRepo:     repository.NewActiveDeploymentRepository(sqlxDB),
+		appEnvRepo:     repository.NewAppEnvRepository(sqlxDB),
+		tenantRepo:     repository.NewTenantRepository(sqlxDB),
+		quotaRepo:      repository.NewQuotaRepository(sqlxDB),
+		publisher:      pub,
+		defaultRegion:  "us-east",
+	}
+
+	// Rollback tx: first query is tenants FOR UPDATE (disabled row).
+	// Commit 2's guard reads it; on non-nil DisabledAt, abort with
+	// ErrTenantDisabled. No further SQL runs.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+		WithArgs("t_disabled").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
+			AddRow("t_disabled", "Disabled", "free", pq.Array([]string{}), time.Now().Add(-24*time.Hour), disabledAt))
+	mock.ExpectRollback()
+
+	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp")
+	if err == nil {
+		t.Fatalf("RollbackDeployment on disabled tenant returned nil; want ErrTenantDisabled")
+	}
+	if !isErrTenantDisabled(err) {
+		t.Errorf("err = %v, want ErrTenantDisabled", err)
+	}
+	// No publish should happen — publishSwap is skipped by the
+	// guard.
+	if got := len(pub.calls); got != 0 {
+		t.Errorf("publish count = %d, want 0 (rollback aborted before publishSwap)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
