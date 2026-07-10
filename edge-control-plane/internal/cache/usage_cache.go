@@ -18,9 +18,9 @@ import (
 // UsageCache is a per-tenant stale-while-revalidate cache for
 // domain.TenantUsage. The intended caller pattern is:
 //
-//	1. TryGet(tenantID, now) → if fresh, return immediately.
-//	2. On miss or stale hit, the service does a synchronous refresh.
-//	3. After refresh, Set(tenantID, payload, ttl).
+//  1. TryGet(tenantID, now) → if fresh, return immediately.
+//  2. On miss or stale hit, the service does a synchronous refresh.
+//  3. After refresh, Set(tenantID, payload, ttl).
 //
 // To avoid thundering-herd on cache expiry, callers must guard the
 // refresh path with TryStartRefresh(tenantID): only one in-flight
@@ -48,9 +48,9 @@ type UsageCache struct {
 // guarantees the new pointer is visible atomically).
 type usageCacheEntry struct {
 	payload    *domain.TenantUsage
-	expiresAt  time.Time     // wall-clock time, set by the caller via Set
-	refreshing bool          // guarded by mu
-	mu         sync.Mutex    // guards refreshing only
+	expiresAt  time.Time  // wall-clock time, set by the caller via Set
+	refreshing bool       // guarded by mu
+	mu         sync.Mutex // guards refreshing only
 }
 
 // NewUsageCache builds a cache with the given fresh TTL and the

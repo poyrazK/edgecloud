@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -45,8 +46,10 @@ func NewUsageHandler(svc UsageServiceInterface) *UsageHandler {
 const defaultUsageWindow = 30 * 24 * time.Hour
 
 // defaultUsageLimit / maxUsageLimit bound the events[] slice length.
-// The service clamps internally as well; we clamp here so a bad
-// client gets 400 instead of a silently-truncated response.
+// limit > maxUsageLimit is rejected with 400 (not clamped) so the
+// dashboard gets an immediate signal instead of a silently-truncated
+// response — matches the OpenAPI `maximum: 200` and the rest of the
+// 400-able param validation in this handler.
 const (
 	defaultUsageLimit = 50
 	maxUsageLimit     = 200
@@ -68,6 +71,16 @@ const (
 //	500  any other error from the service
 func (h *UsageHandler) GetUsage(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
+	if tenantID == "" {
+		// middleware.GetTenantID returns "" silently when no tenant
+		// is stamped on the context. The auth layer normally catches
+		// this before the request reaches us, but defense-in-depth:
+		// a missing tenant would otherwise 404 on the quotas lookup,
+		// which is misleading. Surface 401 instead so the dashboard
+		// prompts the user to sign in.
+		http.Error(w, `{"error": "unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
 
 	from, to, limit, err := parseUsageParams(r)
 	if err != nil {
@@ -132,7 +145,10 @@ func parseUsageParams(r *http.Request) (time.Time, time.Time, int, error) {
 			return time.Time{}, time.Time{}, 0, errors.New("invalid 'limit': must be a positive integer")
 		}
 		if n > maxUsageLimit {
-			n = maxUsageLimit
+			// Reject rather than clamp: matches the OpenAPI
+			// `maximum: 200` strictly and is consistent with the
+			// other 400 paths (bad from, bad to, from > to).
+			return time.Time{}, time.Time{}, 0, fmt.Errorf("invalid 'limit': must be <= %d", maxUsageLimit)
 		}
 		limit = n
 	}

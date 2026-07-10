@@ -77,6 +77,7 @@ type UsageService struct {
 	cache          *cache.UsageCache
 	defaultLimit   int
 	defaultWindow  time.Duration
+	refreshTimeout time.Duration
 	log            *log.Logger
 }
 
@@ -85,9 +86,10 @@ type UsageService struct {
 // useful zero value; the cosmetic knobs go here so adding a new one
 // doesn't break every test's NewUsageService call site.
 type UsageServiceConfig struct {
-	DefaultLimit  int           // events slice cap when the request omits limit (default 50)
-	DefaultWindow time.Duration // default from→to span (default 30d)
-	Logger        *log.Logger   // optional; nil falls back to log.Default
+	DefaultLimit   int           // events slice cap when the request omits limit (default 50)
+	DefaultWindow  time.Duration // default from→to span (default 30d)
+	RefreshTimeout time.Duration // ctx timeout for background refreshes (default 5s)
+	Logger         *log.Logger   // optional; nil falls back to log.Default
 }
 
 // NewUsageService builds a UsageService. portalOpener is the narrow
@@ -109,17 +111,21 @@ func NewUsageService(
 	if cfg.DefaultWindow <= 0 {
 		cfg.DefaultWindow = 30 * 24 * time.Hour
 	}
+	if cfg.RefreshTimeout <= 0 {
+		cfg.RefreshTimeout = 5 * time.Second
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
 	return &UsageService{
-		quotaRepo:     quotaRepo,
-		billingRepo:   billingRepo,
-		portalOpener:  portalOpener,
-		cache:         usageCache,
-		defaultLimit:  cfg.DefaultLimit,
-		defaultWindow: cfg.DefaultWindow,
-		log:           cfg.Logger,
+		quotaRepo:      quotaRepo,
+		billingRepo:    billingRepo,
+		portalOpener:   portalOpener,
+		cache:          usageCache,
+		defaultLimit:   cfg.DefaultLimit,
+		defaultWindow:  cfg.DefaultWindow,
+		refreshTimeout: cfg.RefreshTimeout,
+		log:            cfg.Logger,
 	}
 }
 
@@ -246,7 +252,7 @@ func (s *UsageService) backgroundRefresh(tenantID string) {
 	if cached, ok, _ := s.cache.TryGet(tenantID, now); ok && cached != nil {
 		from, to = cached.From, cached.To
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.refreshTimeout)
 	defer cancel()
 	if _, err := s.refresh(ctx, tenantID, from, to, s.defaultLimit, now); err != nil {
 		s.log.Printf("usage backgroundRefresh(%s): %v", tenantID, err)

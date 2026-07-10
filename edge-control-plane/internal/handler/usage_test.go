@@ -96,9 +96,9 @@ func TestUsageHandler_GetUsage_Success(t *testing.T) {
 func TestUsageHandler_GetUsage_DefaultWindow(t *testing.T) {
 	var capturedFrom, capturedTo time.Time
 	svc := &captureWindowSvc{
-		usage:     &domain.TenantUsage{TenantID: "t_free"},
-		fromOut:   &capturedFrom,
-		toOut:     &capturedTo,
+		usage:   &domain.TenantUsage{TenantID: "t_free"},
+		fromOut: &capturedFrom,
+		toOut:   &capturedTo,
 	}
 	h := newUsageHandlerFor(svc)
 
@@ -126,14 +126,18 @@ func TestUsageHandler_GetUsage_DefaultWindow(t *testing.T) {
 // default-window test can assert on them without going through the
 // full service stack.
 type captureWindowSvc struct {
-	usage  *domain.TenantUsage
+	usage   *domain.TenantUsage
 	fromOut *time.Time
 	toOut   *time.Time
 }
 
 func (m *captureWindowSvc) GetUsage(_ context.Context, _ string, from, to time.Time, _ int) (*domain.TenantUsage, error) {
-	if m.fromOut != nil { *m.fromOut = from }
-	if m.toOut != nil { *m.toOut = to }
+	if m.fromOut != nil {
+		*m.fromOut = from
+	}
+	if m.toOut != nil {
+		*m.toOut = to
+	}
 	return m.usage, nil
 }
 
@@ -151,6 +155,27 @@ func TestUsageHandler_GetUsage_NotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestUsageHandler_GetUsage_MissingTenantContext confirms the defense-in-depth
+// 401 path: middleware.GetTenantID returns "" when no tenant is stamped on
+// the context, and the handler surfaces that as 401 rather than silently
+// looking up quotas for an empty tenant ID (which would 404).
+func TestUsageHandler_GetUsage_MissingTenantContext(t *testing.T) {
+	svc := &usageMockSvc{}
+	h := newUsageHandlerFor(svc)
+
+	// No reqWithTenant — the request context has no tenant.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage", nil)
+	rr := httptest.NewRecorder()
+	h.GetUsage(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+	if svc.calls != 0 {
+		t.Errorf("svc called %d times, want 0 (auth must short-circuit)", svc.calls)
 	}
 }
 
@@ -253,13 +278,12 @@ func TestUsageHandler_GetUsage_BadLimit(t *testing.T) {
 	}
 }
 
-// TestUsageHandler_GetUsage_LimitClamped confirms that a limit above
-// maxUsageLimit is silently clamped (not rejected). The dashboard
-// asks for too much; we cap it and return what we have.
-func TestUsageHandler_GetUsage_LimitClamped(t *testing.T) {
-	var capturedLimit int
-	svc := &captureLimitSvc{capture: &capturedLimit}
-	svc.usage = &domain.TenantUsage{TenantID: "t_1"}
+// TestUsageHandler_GetUsage_LimitOverMax confirms that a limit above
+// maxUsageLimit is rejected with 400 — not silently clamped. The
+// dashboard asks for too much; we surface the error rather than return
+// a truncated response. Matches the OpenAPI `maximum: 200`.
+func TestUsageHandler_GetUsage_LimitOverMax(t *testing.T) {
+	svc := &usageMockSvc{}
 	h := newUsageHandlerFor(svc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage?limit=10000", nil)
@@ -267,24 +291,15 @@ func TestUsageHandler_GetUsage_LimitClamped(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.GetUsage(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
 	}
-	if capturedLimit != maxUsageLimit {
-		t.Errorf("limit = %d, want %d (clamped to maxUsageLimit)", capturedLimit, maxUsageLimit)
+	if svc.calls != 0 {
+		t.Errorf("svc called %d times on bad request, want 0", svc.calls)
 	}
-}
-
-// captureLimitSvc is a service mock that records the limit argument
-// the handler passed so the clamp test can assert on it.
-type captureLimitSvc struct {
-	usage   *domain.TenantUsage
-	capture *int
-}
-
-func (m *captureLimitSvc) GetUsage(_ context.Context, _ string, _ time.Time, _ time.Time, limit int) (*domain.TenantUsage, error) {
-	*m.capture = limit
-	return m.usage, nil
+	if !strings.Contains(rr.Body.String(), "limit") {
+		t.Errorf("body = %q, want error mentioning 'limit'", rr.Body.String())
+	}
 }
 
 // TestParseUsageParams_Defaults exercises the param parser directly
@@ -308,9 +323,9 @@ func TestParseUsageParams_Defaults(t *testing.T) {
 // 400-able input. Each row is a (query string, wantErrSubstr) pair.
 func TestParseUsageParams_BadInputs(t *testing.T) {
 	cases := []struct {
-		name      string
-		query     string
-		wantSub   string // substring expected in err.Error()
+		name    string
+		query   string
+		wantSub string // substring expected in err.Error()
 	}{
 		{"bad-from", "?from=not-rfc3339", "from"},
 		{"bad-to", "?to=2026-13-99", "to"},
@@ -318,6 +333,7 @@ func TestParseUsageParams_BadInputs(t *testing.T) {
 		{"bad-limit", "?limit=abc", "limit"},
 		{"zero-limit", "?limit=0", "limit"},
 		{"negative-limit", "?limit=-5", "limit"},
+		{"over-max-limit", "?limit=201", "limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
