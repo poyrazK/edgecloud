@@ -42,7 +42,7 @@ async fn signup_writes_returned_key_to_config_file() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -62,7 +62,7 @@ async fn signup_writes_returned_key_to_config_file() {
 fn login_with_key_flag_writes_to_config() {
     let home = common::isolated_home();
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("login").arg("--key").arg("k_from_flag");
 
@@ -81,7 +81,7 @@ fn login_with_key_flag_writes_to_config() {
 fn login_from_stdin_writes_to_config() {
     let home = common::isolated_home();
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("login").write_stdin("k_from_stdin\n");
 
@@ -108,7 +108,7 @@ fn login_from_stdin_writes_to_config() {
 fn login_no_echo_without_tty_fails_clearly_and_does_not_write_key() {
     let home = common::isolated_home();
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     // No `--key`, so the no_echo branch is taken; rpassword reads
     // from /dev/tty which is unavailable under assert_cmd.
@@ -136,7 +136,7 @@ fn login_no_echo_without_tty_fails_clearly_and_does_not_write_key() {
 fn login_no_echo_with_explicit_key_still_writes_to_config() {
     let home = common::isolated_home();
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth")
         .arg("login")
@@ -172,7 +172,7 @@ async fn whoami_prints_tenant_info() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -190,7 +190,7 @@ fn logout_removes_key_from_config() {
     let home = common::isolated_home();
     common::seed_api_key(&home, "k_to_remove");
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("logout");
 
@@ -206,7 +206,7 @@ fn logout_is_idempotent_when_no_key() {
     let home = common::isolated_home();
     // No config file exists.
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("logout");
 
@@ -228,7 +228,7 @@ async fn login_rejects_bad_key_exits_one_keeps_saved_key() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -275,7 +275,7 @@ async fn login_verifies_just_saved_key_not_env_var() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .env("EDGE_API_KEY", "k_env_stale")
@@ -304,7 +304,7 @@ async fn signup_server_rejects_invalid_plan_does_not_write_key() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -350,7 +350,7 @@ async fn keys_create_prints_token_and_does_not_overwrite_saved_key() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -379,7 +379,7 @@ async fn keys_create_without_saved_key_exits_non_zero() {
     // No seed_api_key call → no key on disk, no EDGE_API_KEY env.
     // The CLI must refuse to try to authenticate against /api/keys.
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth")
         .arg("keys")
@@ -405,7 +405,7 @@ async fn keys_create_server_rejects_does_not_overwrite_key() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -460,7 +460,7 @@ async fn keys_list_prints_table_with_current_marker() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -526,7 +526,7 @@ async fn keys_list_handles_real_length_uuid_ids() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -587,7 +587,7 @@ async fn keys_list_json_emits_raw_array() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -610,7 +610,7 @@ async fn keys_list_without_saved_key_exits_non_zero() {
     // No seed_api_key → no key on disk, no EDGE_API_KEY env.
     // The CLI must refuse to try to authenticate against /api/v1/keys.
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.arg("auth").arg("keys").arg("list");
 
@@ -675,7 +675,7 @@ async fn keys_revoke_by_id_sends_delete_with_bearer() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -711,7 +711,7 @@ async fn keys_revoke_self_refuses_without_force() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -748,7 +748,7 @@ async fn keys_revoke_self_proceeds_with_force() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -784,7 +784,7 @@ async fn keys_revoke_404_surfaces_in_stderr() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -828,7 +828,7 @@ async fn keys_revoke_without_yes_in_non_tty_refuses_with_clear_error() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -861,7 +861,7 @@ async fn keys_revoke_warning_omitted_when_env_key_unaffected() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .env("EDGE_API_KEY", "k_env")
@@ -899,7 +899,7 @@ async fn keys_revoke_warning_fires_when_bearer_key_revoked() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -969,7 +969,7 @@ world = "edge-runtime-handler"
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -1001,7 +1001,7 @@ async fn signup_force_overwrites_saved_key_without_warning() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -1040,7 +1040,7 @@ async fn signup_warns_then_overwrites_when_saved_key_present() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -1089,7 +1089,7 @@ async fn keys_list_no_longer_calls_whoami() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -1133,7 +1133,7 @@ async fn keys_revoke_no_longer_calls_list_endpoint() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -1182,7 +1182,7 @@ async fn rejected_response_with_huge_body_truncates_in_stderr() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri())
         .arg("auth")
@@ -1231,7 +1231,7 @@ async fn server_error_with_huge_body_does_not_oom_cli() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     // Tight timeout — if the CLI OOMs or hangs, the test fails fast
     // (otherwise a regression here could hang the suite indefinitely).

@@ -58,7 +58,7 @@ async fn list_decodes_wrapped_response_empty() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -109,7 +109,7 @@ async fn list_decodes_wrapped_response_populated() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -144,7 +144,7 @@ async fn list_propagates_404_for_missing_app() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())

@@ -45,7 +45,7 @@ async fn list_returns_empty_message() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("apps");
@@ -90,7 +90,7 @@ async fn list_returns_populated_table() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri()).arg("apps");
@@ -125,7 +125,7 @@ async fn get_shows_details_for_existing_app() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -162,7 +162,7 @@ async fn get_shows_details_app_with_null_description() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())
@@ -191,7 +191,7 @@ async fn get_propagates_404_for_missing_app() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
     cmd.env("EDGE_API_URL", server.uri())

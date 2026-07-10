@@ -74,7 +74,7 @@ async fn rollback_flips_state_to_returned_deployment_id() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -116,7 +116,7 @@ async fn rollback_no_last_good_exits_non_zero() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -159,7 +159,7 @@ async fn rollback_resolves_app_from_positional_when_state_differs() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -191,7 +191,7 @@ async fn rollback_resolves_app_from_state_when_arg_empty() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -223,7 +223,7 @@ async fn rollback_does_not_overwrite_state_for_different_app() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -267,7 +267,7 @@ world = "edge-runtime-handler"
     // No mock mounted — if the CLI erroneously tries to hit the API,
     // it will get a connection refused and surface a different error.
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());

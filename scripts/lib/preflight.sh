@@ -103,6 +103,21 @@ preflight::check_prereqs() {
     echo "[preflight]       The samples/hello build in Phase 10 will fail without it." >&2
   fi
 
+  # JS build pipeline prereqs (issue #423). The CLI's
+  # `edge build --lang=js` needs `wasm-tools` on PATH (for the
+  # `component new --adapt` step) AND the `wasm32-wasip1` rust target
+  # (for compiling edge-js-runtime). These are independent of the
+  # Rust pipeline — JS projects are an opt-in feature, so warn but
+  # don't fail the dev-up flow when they're missing.
+  if ! command -v wasm-tools >/dev/null 2>&1; then
+    echo "[preflight] WARN: wasm-tools not on PATH. JS builds will fail." >&2
+    echo "[preflight]       Install with: cargo install wasm-tools --locked --version '^1.252'" >&2
+  fi
+  if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
+    echo "[preflight] WARN: rustup target wasm32-wasip1 not installed. JS builds will fail." >&2
+    echo "[preflight]       Install with: rustup target add wasm32-wasip1" >&2
+  fi
+
   [[ $quiet -eq 0 ]] && preflight::_log "prereqs OK"
   return 0
 }

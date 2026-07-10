@@ -96,7 +96,7 @@ async fn logs_prints_entries_returned_by_server() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -149,7 +149,7 @@ async fn logs_emits_one_json_object_per_line_in_pipe_mode() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -205,7 +205,7 @@ async fn logs_returns_error_on_400_from_server() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -246,7 +246,7 @@ async fn logs_sends_bearer_auth_header() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -348,7 +348,7 @@ async fn logs_prints_crashed_hint_when_worker_status_is_crashed() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -399,7 +399,7 @@ async fn logs_skips_hint_when_heartbeat_stale() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -444,7 +444,7 @@ async fn logs_skips_hint_when_status_is_running() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -488,7 +488,7 @@ async fn logs_silently_continues_when_status_endpoint_fails() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());

@@ -87,7 +87,7 @@ async fn deploy_forwards_idempotency_key_header_when_flag_set() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -128,7 +128,7 @@ async fn deploy_auto_mints_idempotency_key_when_flag_omitted() {
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+    let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.env("EDGE_API_URL", server.uri());
     cmd.current_dir(project.path());
@@ -179,7 +179,7 @@ async fn deploy_replay_returns_same_id_in_state_file() {
         .await;
 
     for _ in 0..2 {
-        let mut cmd = Command::cargo_bin("edge-cli").unwrap();
+        let mut cmd = Command::cargo_bin("edge").unwrap();
         common::set_platform_env(&mut cmd, &home);
         cmd.env("EDGE_API_URL", server.uri());
         cmd.current_dir(project.path());

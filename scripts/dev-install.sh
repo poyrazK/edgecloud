@@ -90,11 +90,38 @@ else
   rustup target add wasm32-wasip2
 fi
 
+# wasm32-wasip1 target — required for edge-js-runtime (the QuickJS host
+# crate). Distinct from wasm32-wasip2: the JS pipeline still targets
+# preview-1 (the runtime is wrapped into a preview-2 component via
+# `wasm-tools component new --adapt` using the wasi-preview1 reactor
+# adapter). See issue #317 / #423.
+if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
+  log "rustup target wasm32-wasip1 already installed"
+else
+  log "adding rustup target wasm32-wasip1"
+  rustup target add wasm32-wasip1
+fi
+
+# wasm-tools — required for the JS build pipeline's
+# `wasm-tools component new --adapt` step (issue #423). The CLI globs
+# $CARGO_HOME/registry/... for the wasi-preview1 reactor adapter, and
+# that artifact is a transitive dep of `wasi-preview1-component-adapter-provider`
+# — which `wasm-tools` pulls in. So installing wasm-tools once is the
+# only host-side setup needed; the CLI handles the adapter lookup.
+# Pin to ^1.252 to match the version CI uses
+# (.github/workflows/preview.yml:80-81).
+if command -v wasm-tools >/dev/null 2>&1; then
+  log "wasm-tools already installed"
+else
+  log "installing wasm-tools (1.252.x) — first build only, ~3-5 min"
+  cargo install wasm-tools --locked --version "^1.252"
+fi
+
 # ── 4. Final check ──────────────────────────────────────────────────────
 
 log "verifying installation..."
 MISSING=()
-for bin in go cargo rustc rustup docker openssl jq; do
+for bin in go cargo rustc rustup docker openssl jq wasm-tools; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     MISSING+=("$bin")
   fi
