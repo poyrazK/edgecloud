@@ -184,6 +184,8 @@ var wantColumns = map[string][]string{
 		"regions_published",             // 010_active_deployments_regions
 		"regions_failed",                // 010_active_deployments_regions
 		"regions_cached",                // 017_active_deployments_regions_cached
+		"regions_cache_failed",          // 018_active_deployments_regions_cache_failed
+		"region_cache_retry_count",      // 028_active_deployments_region_cache_retry_count (issue #501 retry cap)
 		"last_publish_at",               // 010_active_deployments_regions
 		"last_publish_attempt_id",       // 010_active_deployments_regions
 		"activation_attempt_started_at", // 026_active_deployments_activation_attempt_started_at
@@ -418,6 +420,9 @@ var wantTypes = map[string]map[string]string{
 		"stable_since":                  "timestamptz", // 009_add_auto_rollback (nullable)
 		"regions_published":             "_text",       // 010_active_deployments_regions
 		"regions_failed":                "_text",       // 010_active_deployments_regions
+		"regions_cached":                "_text",       // 017_active_deployments_regions_cached
+		"regions_cache_failed":          "_text",       // 018_active_deployments_regions_cache_failed
+		"region_cache_retry_count":      "jsonb",       // 028_active_deployments_region_cache_retry_count (issue #501 retry cap)
 		"last_publish_at":               "timestamptz", // 010_active_deployments_regions (nullable)
 		"last_publish_attempt_id":       "uuid",        // 010_active_deployments_regions (nullable)
 		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)

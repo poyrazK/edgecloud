@@ -1,0 +1,54 @@
+-- +migrate Up
+-- Issue #501 (cache-retry sweep, retry-cap follow-up): per-region
+-- attempt counter for the cache-retry sweep.
+--
+-- The sweep introduced by migration 027 retries per-region
+-- artifact-cache pushes indefinitely — a permanently-dead region
+-- cache binary would log the same error every REGION_CACHE_RETRY_INTERVAL
+-- (default 5m) forever. Issue #501's acceptance criteria explicitly
+-- call for a per-deployment retry cap: "give up after N sweeps,
+-- log at warn, reset the counter on new activation."
+--
+-- `region_cache_retry_count` is a JSONB map of region name to
+-- integer attempt count. The sweep increments the count for a
+-- region on every push failure; once the count reaches
+-- `REGION_CACHE_RETRY_MAX_ATTEMPTS` (default 10) the sweep routes
+-- the region to a `giveUp` partition: it drops the region from
+-- `regions_cache_failed` with a WARN log and stops attempting
+-- pushes until the operator intervenes (or a new activation
+-- resets the counter via the `RESET` path in publishSwap).
+--
+-- JSONB (over text[] or a sibling table) was chosen because:
+--
+--   1. The sweep already reads per-row in ListCacheFailed
+--      (migration 027's partial index), so the counter is read
+--      with no extra query — just one more column in the
+--      existing SELECT projection.
+--   2. Cross-region updates happen in a single JSONB SET expression
+--      (jsonb arithmetic) — no per-region row lock acquisition.
+--   3. SQL operators for "increment the value at key K" are
+--      single-statement atomic under the row's UPDATE lock.
+--
+-- A sibling table keyed (tenant_id, app_name, region) was the
+-- alternative; rejected because (a) it would require another
+-- migration for the index, (b) the sweep would need a JOIN per
+-- row, and (c) the JSONB shape maps 1:1 onto the existing
+-- `regions_cache_failed text[]` workflow (per-row list, per-region
+-- decision). Operators querying for "regions with count >= N
+-- fleet-wide" can do so via a single
+--   SELECT * FROM active_deployments
+--    WHERE EXISTS (SELECT 1 FROM jsonb_each(region_cache_retry_count)
+--                   WHERE (value::int) >= 10)
+-- query — no extra index needed for the read; we don't optimize
+-- the operator path today because no production workload hits it.
+--
+-- DEFAULT '{}'::jsonb — every existing row starts at 0 attempts
+-- for every region. The sweep's `if count >= MaxAttempts` check
+-- is therefore a no-op for fresh rows.
+--
+-- Migration is NOT `notransaction` — ADD COLUMN is safe inside a
+-- transaction and the deploy window doesn't need a CONCURRENTLY
+-- equivalent here (no concurrent writes are blocked on a
+-- nullable-add with a constant default).
+ALTER TABLE active_deployments
+    ADD COLUMN IF NOT EXISTS region_cache_retry_count JSONB NOT NULL DEFAULT '{}'::jsonb;
