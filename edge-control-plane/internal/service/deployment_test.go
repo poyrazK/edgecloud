@@ -167,14 +167,17 @@ func (m *mockDeployQuotaRepo) VerifyMemoryUnderCap(ctx context.Context, tenantID
 	return true, nil
 }
 
-// AddMemoryMB is required to satisfy quotaRepoForDeploymentSvc but
-// is only called inside the activate / rollback tx paths (which the
-// mock-backed Deploy tests never reach). Returning (nil, nil) keeps
-// the interface satisfied without seeding an active_deployments
-// mutation story into these unit tests. Activate/rollback are
-// integration-tested via deployment_regions_test.go.
-func (m *mockDeployQuotaRepo) AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error) {
-	return nil, nil
+// mockDeployMemoryQuotaFactory returns the tx-scoped memory quota
+// factory used by the unit tests below. The factory returns a fresh
+// *repository.MemoryQuotaRepository whose tx field is nil — these
+// tests never reach the activate / rollback paths that call
+// AddMemoryMB, so the nil tx is never dereferenced. The integration
+// tests in deployment_regions_test.go stand up a real tx via
+// sqlmock and pass repository.NewMemoryQuotaRepository directly.
+func mockDeployMemoryQuotaFactory() func(*sqlx.Tx) *repository.MemoryQuotaRepository {
+	return func(_ *sqlx.Tx) *repository.MemoryQuotaRepository {
+		return repository.NewMemoryQuotaRepository(nil)
+	}
 }
 
 // mockDeployTenantRepo satisfies tenantRepoForDeploymentSvc.
@@ -288,6 +291,8 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	bad := bytes.NewReader([]byte("this is not a wasm binary — no magic bytes"))
@@ -347,6 +352,8 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -426,6 +433,8 @@ func TestDeploy_InvalidRegion_ReturnsErrInvalidRegion(t *testing.T) {
 		// constructor doesn't matter for this test (validation
 		// fires before the default-region fallback is consulted).
 		keyring: signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
@@ -462,6 +471,8 @@ func TestDeploy_ReportsFirstInvalidRegion(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
@@ -499,6 +510,8 @@ func TestDeploy_TooManyRegions_ReturnsErrTooManyRegions(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	// Build 17 valid regions (a..q) — the cap is 16.
@@ -573,6 +586,8 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	regions := make([]string, 0, 16)
@@ -654,6 +669,8 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(badDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -740,6 +757,8 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 		artifactStore:  storage.NewFSArtifactStore(badDir),
 		appSvc:         appSvc,
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -798,6 +817,8 @@ func TestDeploy_PersistsSignedAttestation(t *testing.T) {
 		quotaRepo:      repository.NewQuotaRepository(db),
 		artifactStore:  storage.NewFSArtifactStore(tmpDir),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	good := bytes.NewReader(validWasmBytes)
@@ -831,7 +852,9 @@ func TestGetDeployment_FoundAndTenantMatches(t *testing.T) {
 			return &domain.Deployment{ID: id, TenantID: "t_test"}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	d, err := svc.GetDeployment(context.Background(), "t_test", "d_1")
 	if err != nil {
 		t.Fatalf("GetDeployment: %v", err)
@@ -847,7 +870,9 @@ func TestGetDeployment_TenantMismatch(t *testing.T) {
 			return &domain.Deployment{ID: id, TenantID: "t_other"}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	d, err := svc.GetDeployment(context.Background(), "t_test", "d_1")
 	if err != nil {
 		t.Fatalf("GetDeployment: %v", err)
@@ -858,7 +883,9 @@ func TestGetDeployment_TenantMismatch(t *testing.T) {
 }
 
 func TestGetDeployment_NotFound(t *testing.T) {
-	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{}}
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{},
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	d, err := svc.GetDeployment(context.Background(), "t_test", "d_missing")
 	if err != nil {
 		t.Fatalf("GetDeployment: %v", err)
@@ -877,7 +904,9 @@ func TestListDeployments_ReturnsRows(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	list, err := svc.ListDeployments(context.Background(), "t_test", "myapp")
 	if err != nil {
 		t.Fatalf("ListDeployments: %v", err)
@@ -895,7 +924,9 @@ func TestListDeploymentsPaginated_AppliesDefaults(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 0, -1)
 	if capturedLimit != 20 {
 		t.Errorf("limit = %d, want 20", capturedLimit)
@@ -913,7 +944,9 @@ func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 200, 0)
 	if capturedLimit != 100 {
 		t.Errorf("limit = %d, want 100", capturedLimit)
@@ -929,7 +962,9 @@ func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
 			return []domain.Deployment{{ID: "d_1"}}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	list, total, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, 0)
 	if err != nil {
 		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
@@ -953,7 +988,9 @@ func TestGetActiveDeployment_Found(t *testing.T) {
 			return &domain.ActiveDeployment{DeploymentID: "d_1"}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: deploymentRepo, activeRepo: activeRepo}
+	svc := &DeploymentService{deploymentRepo: deploymentRepo, activeRepo: activeRepo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	d, err := svc.GetActiveDeployment(context.Background(), "t_test", "myapp")
 	if err != nil {
 		t.Fatalf("GetActiveDeployment: %v", err)
@@ -964,7 +1001,9 @@ func TestGetActiveDeployment_Found(t *testing.T) {
 }
 
 func TestGetActiveDeployment_NoActiveRow(t *testing.T) {
-	svc := &DeploymentService{activeRepo: &mockDeployActiveRepo{}}
+	svc := &DeploymentService{activeRepo: &mockDeployActiveRepo{},
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	d, err := svc.GetActiveDeployment(context.Background(), "t_test", "myapp")
 	if err != nil {
 		t.Fatalf("GetActiveDeployment: %v", err)
@@ -991,7 +1030,9 @@ func TestGetArtifact_FoundAndTenantMatches(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	svc := &DeploymentService{deploymentRepo: repo, artifactStore: store}
+	svc := &DeploymentService{deploymentRepo: repo, artifactStore: store,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	rc, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_1", "wasm")
 	if err != nil {
 		t.Fatalf("GetArtifact: %v", err)
@@ -1000,7 +1041,9 @@ func TestGetArtifact_FoundAndTenantMatches(t *testing.T) {
 }
 
 func TestGetArtifact_NotFound(t *testing.T) {
-	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{}}
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{},
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	_, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_missing", "wasm")
 	if err == nil {
 		t.Fatal("expected error for missing deployment")
@@ -1013,7 +1056,9 @@ func TestGetArtifact_TenantMismatch(t *testing.T) {
 			return &domain.Deployment{ID: id, TenantID: "t_other", AppName: "myapp"}, nil
 		},
 	}
-	svc := &DeploymentService{deploymentRepo: repo}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
 	_, err := svc.GetArtifact(context.Background(), "t_test", "myapp", "d_1", "wasm")
 	if err == nil {
 		t.Fatal("expected error for tenant mismatch")
@@ -1091,6 +1136,8 @@ func TestDeploy_SubscriptionPastDue_Returns402(t *testing.T) {
 		tenantRepo:     &mockDeployTenantRepo{},
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1135,6 +1182,8 @@ func TestDeploy_FreeTierLockdown_Returns402(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1206,6 +1255,8 @@ func TestDeploy_OverageGraceSkipsCapCheck(t *testing.T) {
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 		keyring:        signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1258,6 +1309,8 @@ func TestDeploy_VerifyUnderCap_Returns402(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1301,6 +1354,8 @@ func TestDeploy_VerifyUnderCap_BoundarySuccess(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1332,6 +1387,8 @@ func newMinimalDeploymentServiceForRollback(t *testing.T, db *sqlx.DB) *Deployme
 		quotaRepo:      repository.NewQuotaRepository(db),
 		outboxRepo:     repository.NewOutboxRepository(db),
 		defaultRegion:  "us-east",
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 }
 
@@ -1375,6 +1432,8 @@ func TestDeploy_MemoryQuota_Rejects402(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1447,6 +1506,8 @@ func TestDeploy_MemoryQuota_Accepts(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	// We don't care if Deploy ultimately fails (artifact save needs a
 	// real DB); we only care it didn't fail at pre-check 5.
@@ -1515,6 +1576,8 @@ func TestDeploy_MemoryQuotaEnterprisePlan_Bypasses(t *testing.T) {
 		tenantRepo:     ten,
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
@@ -1575,6 +1638,8 @@ func TestDeploy_MemoryQuota_OverageGrace_Bypasses(t *testing.T) {
 		},
 		artifactStore: storage.NewFSArtifactStore(t.TempDir()),
 		keyring:       signing.TestKeyring(t),
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),

@@ -80,11 +80,11 @@ func (m *mockWorkerRepo) DeleteOlderThan(ctx context.Context, age time.Duration)
 
 // mockQuotaRepo implements quotaRepoInterface for testing.
 type mockQuotaRepo struct {
-	getByTenantIDFunc     func(ctx context.Context, tenantID string) (*domain.Quota, error)
-	addOutboundBytesFunc  func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
-	addRequestCountFunc   func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	getByTenantIDFunc      func(ctx context.Context, tenantID string) (*domain.Quota, error)
+	addOutboundBytesFunc   func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addRequestCountFunc    func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addResidentSecondsFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
-	setGraceUntilFunc     func(ctx context.Context, tenantID string, until *time.Time) error
+	setGraceUntilFunc      func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 func (m *mockQuotaRepo) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {

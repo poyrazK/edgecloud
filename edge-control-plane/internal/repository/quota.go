@@ -16,9 +16,9 @@ import (
 // Adding a new usage counter means (a) adding the column here and
 // (b) writing a thin public wrapper below.
 var addColumnAccumulators = map[string]bool{
-	"used_outbound_bytes":    true,
-	"used_request_count":     true,
-	"used_resident_seconds":  true,
+	"used_outbound_bytes":   true,
+	"used_request_count":    true,
+	"used_resident_seconds": true,
 }
 
 // addColumn atomically adds delta to one of the per-month usage counters on
@@ -122,24 +122,40 @@ func (r *QuotaRepository) AddResidentSeconds(ctx context.Context, tenantID strin
 	return r.addColumn(ctx, tenantID, int64(delta), "used_resident_seconds")
 }
 
-// AddMemoryMB atomically accumulates a signed delta into used_memory_mb and
-// returns the updated quota row (issue #44, part 2). Positive delta =
-// activate / promote; negative delta = rollback. Unlike AddOutboundBytes /
-// AddRequestCount this counter is NOT month-bounded — the cap is
-// per-tenant-aggregate, not per-month, so the lazy-rollover CASE against
-// quota_period_start would be wrong. Implemented as a direct UPDATE
-// rather than routed through addColumn for the same reason.
-//
-// Caller MUST wrap via QuotaRepository.WithTx(tx). Calling the outer
-// repo opens a different connection and breaks atomicity — the counter
-// would commit before/after the active_deployments row mutation in the
-// caller's tx, leaving the counter ahead of the row set on tx abort.
-// This requirement is unenforced at the type level (Go has no way to
-// require it without a context key trick); the convention is documented
-// here and at every call site.
-func (r *QuotaRepository) AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error) {
+// MemoryQuotaRepository is the transaction-bound variant of QuotaRepository
+// for the *one* operation whose correctness depends on running inside the
+// caller's tx: AddMemoryMB (issue #44, part 2). The outer QuotaRepository
+// intentionally does NOT expose AddMemoryMB — calling it from outside a
+// tx would open a separate connection, commit the counter mutation
+// independently of the active_deployments row mutation, and leave the
+// counter ahead of the row set on tx abort (or behind on abort after a
+// rollback). The split type makes the requirement static: the compiler
+// refuses any call site that didn't first acquire a tx via WithTx and
+// then route through NewMemoryQuotaRepository(tx).
+type MemoryQuotaRepository struct {
+	tx *sqlx.Tx
+}
+
+// NewMemoryQuotaRepository returns a memory-only quota repository bound
+// to the given transaction. There is no `(*QuotaRepository).AddMemoryMB`
+// method on the outer repo — this type is the only way to call
+// AddMemoryMB, and it is only constructible from a tx. Positive delta =
+// activate / promote; negative delta = rollback.
+func NewMemoryQuotaRepository(tx *sqlx.Tx) *MemoryQuotaRepository {
+	return &MemoryQuotaRepository{tx: tx}
+}
+
+// AddMemoryMB atomically accumulates a signed delta into used_memory_mb
+// and returns the updated quota row (issue #44, part 2). Unlike
+// AddOutboundBytes / AddRequestCount this counter is NOT month-bounded —
+// the cap is per-tenant-aggregate, not per-month, so the lazy-rollover
+// CASE against quota_period_start would be wrong. Implemented as a
+// direct UPDATE rather than routed through addColumn for the same
+// reason. Must run inside a tx so the counter mutation is atomic with
+// the active_deployments row mutation that triggered it.
+func (r *MemoryQuotaRepository) AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error) {
 	var q domain.Quota
-	err := r.db.GetContext(ctx, &q, `
+	err := r.tx.GetContext(ctx, &q, `
 		UPDATE quotas SET used_memory_mb = used_memory_mb + $2
 		WHERE tenant_id = $1
 		RETURNING tenant_id, max_deployments, max_apps, max_workers,

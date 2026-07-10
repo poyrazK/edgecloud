@@ -161,7 +161,7 @@ func New(
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
+		quotaRepo, repository.NewMemoryQuotaRepository, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
 	)
 	// OutboxDrainer (issue #42): the SOLE caller of
 	// Publisher.PublishTaskUpdate for `task_update` messages. Tunable

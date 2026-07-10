@@ -654,6 +654,8 @@ func TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 		quotaRepo:      repository.NewQuotaRepository(sqlxDB),
 		publisher:      pub,
 		defaultRegion:  "us-east",
+
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
 
 	// Rollback tx: first query is tenants FOR UPDATE (disabled row).

@@ -107,6 +107,8 @@ func activateSvcForTest(t *testing.T, pub nats.Publisher, defaultRegion string) 
 		outboxRepo:     outboxRepo,
 		publisher:      pub,
 		defaultRegion:  defaultRegion,
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 	drainer := NewOutboxDrainer(outboxRepo, pub, time.Second, 50, 10)
 	return svc, drainer, mock, func() { _ = mockDB.Close() }
@@ -791,6 +793,8 @@ func TestPublishSwap_NoOpWhenNothingConfigured(t *testing.T) {
 		db:         db,
 		activeRepo: repository.NewActiveDeploymentRepository(db),
 		publisher:  pub,
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 
 	// cachePusher is nil → publishSwap short-circuits before any DB
@@ -944,6 +948,8 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 			"iad": "http://cache.iad:18080",
 		},
 		defaultRegion: "fra",
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 
 	// waitForWorkers (issue #42): publishSwap no longer calls
@@ -1035,6 +1041,8 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 			"fra": "http://cache.fra:18080",
 		},
 		defaultRegion: "fra",
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 
 	// waitForWorkers (issue #42): publishSwap no longer calls
@@ -1144,6 +1152,8 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 			"iad": "http://cache.iad:18080",
 		},
 		defaultRegion: "fra",
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 
 	// waitForWorkers (issue #42): publishSwap no longer calls
@@ -1242,6 +1252,8 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 			"iad": "http://cache.iad:18080",
 		},
 		defaultRegion: "fra",
+
+		memoryQuotaRepo: repository.NewMemoryQuotaRepository,
 	}
 
 	// waitForWorkers (issue #42): publishSwap no longer calls

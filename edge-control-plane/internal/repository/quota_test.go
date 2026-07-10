@@ -22,6 +22,37 @@ func newQuotaMockRepo(t *testing.T) (*QuotaRepository, sqlmock.Sqlmock, func()) 
 	return NewQuotaRepository(sqlxDB), mock, func() { _ = mockDB.Close() }
 }
 
+// newQuotaMockMemoryRepo returns a *MemoryQuotaRepository bound to a
+// mock tx so AddMemoryMB tests can exercise the tx-scoped code path
+// (issue #44, part 2). The mock doesn't really start a tx — every
+// query the wrapper issues routes through sqlmock just like the
+// outer repo's queries do. The returned *sqlx.Tx is just a handle
+// that satisfies the constructor; the mock matches queries by regex.
+func newQuotaMockMemoryRepo(t *testing.T) (*MemoryQuotaRepository, sqlmock.Sqlmock, func()) {
+	t.Helper()
+	mockDB, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	sqlxDB := sqlx.NewDb(mockDB, "postgres")
+	// We need a *sqlx.Tx-shaped value but sqlmock doesn't actually
+	// begin a real transaction for these tests — the BeginTx method
+	// on sqlxDB returns a real tx that wraps the mock, so we start
+	// one and let the test drive its expectations. The closer ends
+	// the tx with Rollback so expectations are satisfied.
+	mock.ExpectBegin()
+	tx, err := sqlxDB.BeginTxx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("BeginTxx: %v", err)
+	}
+	// ExpectBegin is satisfied by the BeginTxx call above; the test
+	// closes the tx via tx.Rollback() in the returned closer.
+	return NewMemoryQuotaRepository(tx), mock, func() {
+		_ = tx.Rollback()
+		_ = mockDB.Close()
+	}
+}
+
 func TestQuotaRepository_Create(t *testing.T) {
 	repo, mock, cleanup := newQuotaMockRepo(t)
 	defer cleanup()
@@ -207,7 +238,7 @@ func TestQuotaRepository_AddRequestCount_NotFound(t *testing.T) {
 // a positive delta increments used_memory_mb. This is the activate
 // path's tx-scoped counter write.
 func TestQuotaRepository_AddMemoryMB_Accumulates(t *testing.T) {
-	repo, mock, cleanup := newQuotaMockRepo(t)
+	repo, mock, cleanup := newQuotaMockMemoryRepo(t)
 	defer cleanup()
 
 	rows := sqlmock.NewRows([]string{
@@ -235,7 +266,7 @@ func TestQuotaRepository_AddMemoryMB_Accumulates(t *testing.T) {
 // the rollback path passes a negative delta. The repo method is
 // int64-signed so negative inputs flow through unchanged.
 func TestQuotaRepository_AddMemoryMB_NegativeDelta(t *testing.T) {
-	repo, mock, cleanup := newQuotaMockRepo(t)
+	repo, mock, cleanup := newQuotaMockMemoryRepo(t)
 	defer cleanup()
 
 	rows := sqlmock.NewRows([]string{
@@ -313,7 +344,7 @@ func TestQuotaRepository_AddResidentSeconds_NotFound(t *testing.T) {
 // TestQuotaRepository_AddMemoryMB_NoRows: a missing tenant returns
 // (nil, nil) like the other addColumn-based wrappers.
 func TestQuotaRepository_AddMemoryMB_NoRows(t *testing.T) {
-	repo, mock, cleanup := newQuotaMockRepo(t)
+	repo, mock, cleanup := newQuotaMockMemoryRepo(t)
 	defer cleanup()
 
 	mock.ExpectQuery(`UPDATE quotas SET used_memory_mb`).

@@ -388,6 +388,12 @@ type tenantRepoForDeploymentSvc interface {
 
 // quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
 // methods used by DeploymentService.
+//
+// AddMemoryMB is intentionally absent from this interface — it lives on
+// repository.MemoryQuotaRepository, a tx-only type whose constructor
+// requires *sqlx.Tx. The split makes the tx requirement static: the
+// compiler refuses any call site that didn't first acquire a tx and
+// route it through repository.NewMemoryQuotaRepository(tx).
 type quotaRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
@@ -395,11 +401,17 @@ type quotaRepoForDeploymentSvc interface {
 	// VerifyMemoryUnderCap is the deploy-time aggregate-memory gate
 	// (issue #44, part 2). See internal/repository/quota.go.
 	VerifyMemoryUnderCap(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error)
-	// AddMemoryMB increments/decrements used_memory_mb. Called via
-	// WithTx(tx) inside activate / rollback / promote so the counter
-	// commits atomically with the active_deployments mutation.
-	AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error)
 }
+
+// memoryQuotaRepoForDeploymentSvc is the tx-scoped memory quota seam
+// (issue #44, part 2). It is a single-method factory whose production
+// value is repository.NewMemoryQuotaRepository — the only function
+// that can construct a *repository.MemoryQuotaRepository, since that
+// type deliberately has no outer (non-tx) constructor. The seam is a
+// function value rather than a typed wrapper so tests can pass a
+// stub that records the tx and returns a hand-built fake without
+// standing up a real transaction in every test.
+type memoryQuotaRepoForDeploymentSvc = func(*sqlx.Tx) *repository.MemoryQuotaRepository
 
 // billingRepoForDeploymentSvc is the subset of *repository.BillingRepository
 // methods used by DeploymentService. Added in issue #420 — the deploy-time
@@ -440,8 +452,14 @@ type DeploymentService struct {
 	activeRepo     deployActiveRepoInterface
 	appEnvRepo     appEnvRepoForDeploymentSvc
 	quotaRepo      quotaRepoForDeploymentSvc
-	billingRepo    billingRepoForDeploymentSvc
-	tenantRepo     tenantRepoForDeploymentSvc
+	// memoryQuotaRepo is the tx-scoped memory-quota seam (issue #44,
+	// part 2). A function value rather than a typed wrapper so the
+	// compiler enforces "must run inside a tx": the production wiring
+	// passes repository.NewMemoryQuotaRepository, whose signature
+	// requires *sqlx.Tx — see memoryQuotaRepoForDeploymentSvc above.
+	memoryQuotaRepo memoryQuotaRepoForDeploymentSvc
+	billingRepo     billingRepoForDeploymentSvc
+	tenantRepo      tenantRepoForDeploymentSvc
 	// idempotencyRepo is the (tenant_id, key) -> deployment_id
 	// replay cache (issue #52). Optional — when nil, the replay
 	// check is skipped and every Deploy mints a fresh row. Set
@@ -549,6 +567,11 @@ func NewDeploymentService(
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
 	quotaRepo *repository.QuotaRepository,
+	// memoryQuotaRepo is the tx-scoped memory-quota factory. In
+	// production this is repository.NewMemoryQuotaRepository, whose
+	// only signature requires *sqlx.Tx. Passing a different factory
+	// here is a test-only escape hatch — see deployment_test.go.
+	memoryQuotaRepo memoryQuotaRepoForDeploymentSvc,
 	tenantRepo *repository.TenantRepository,
 	outboxRepo *repository.OutboxRepository,
 	artifactStore storage.ArtifactStore,
@@ -566,17 +589,18 @@ func NewDeploymentService(
 		defaultRegion = "global"
 	}
 	return &DeploymentService{
-		db:             db,
-		deploymentRepo: deploymentRepo,
-		activeRepo:     activeRepo,
-		appEnvRepo:     appEnvRepo,
-		quotaRepo:      quotaRepo,
-		tenantRepo:     tenantRepo,
-		outboxRepo:     outboxRepo,
-		artifactStore:  artifactStore,
-		publisher:      publisher,
-		defaultRegion:  defaultRegion,
-		keyring:        keyring,
+		db:              db,
+		deploymentRepo:  deploymentRepo,
+		activeRepo:      activeRepo,
+		appEnvRepo:      appEnvRepo,
+		quotaRepo:       quotaRepo,
+		memoryQuotaRepo: memoryQuotaRepo,
+		tenantRepo:      tenantRepo,
+		outboxRepo:      outboxRepo,
+		artifactStore:   artifactStore,
+		publisher:       publisher,
+		defaultRegion:   defaultRegion,
+		keyring:         keyring,
 	}
 }
 
@@ -1441,7 +1465,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// Must use WithTx(tx) — calling the outer s.quotaRepo would
 		// open a different connection and break atomicity, leaving
 		// the counter ahead of the active_deployments row set.
-		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, perAppMemoryMB(activateQuota))
+_, err = s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, s.perAppMemoryMB(activateQuota))
 		if err != nil {
 			return fmt.Errorf("incrementing memory quota: %w", err)
 		}
@@ -1826,10 +1850,13 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// it started. For tier migrations (tenant upgraded plan between
 		// activate and rollback) the net delta is non-zero and the
 		// counter follows the active row's actual memory footprint.
-		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, rollbackPerApp); err != nil {
+		// Both deltas go through the tx-scoped memory repo so the
+		// compiler enforces "must run inside the active_deployments
+		// tx" (issue #44, part 2).
+		if _, err := s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, rollbackPerApp); err != nil {
 			return fmt.Errorf("adding memory quota for rolled-back-to deployment: %w", err)
 		}
-		if _, err := s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, -rollbackPerApp); err != nil {
+		if _, err := s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, -rollbackPerApp); err != nil {
 			return fmt.Errorf("subtracting memory quota for rolled-back-from deployment: %w", err)
 		}
 		return nil
