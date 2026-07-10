@@ -1,5 +1,17 @@
 package service
 
+// Note (issue #560): the legacy tests in this file use the hand-
+// rolled `mockEnvRepo` harness and only set appEnvRepo on
+// EnvService. They therefore exercise the NON-PUBLISH code path
+// (publishDepsReady() == false → no tx, no outbox row).
+//
+// The new publish-if-active tx path is covered separately in
+// env_publish_test.go using sqlmock + newEnvSvcForPublish. If you're
+// adding a test that needs outbox / active-deployment / quota
+// behavior, add it to env_publish_test.go so it stays under the
+// tx-bound harness. If you're adding a test for the encryption /
+// plaintext-decrypt / legacy-not-allowed shape, it belongs here.
+
 import (
 	"context"
 	"errors"

@@ -39,13 +39,6 @@ func NewPublishBuilder() *publishBuilder {
 	return &publishBuilder{}
 }
 
-// newPublishBuilder is the in-package alias kept so existing test
-// harnesses (which use the unexported constructor for fixture
-// simplicity) keep compiling without churn.
-func newPublishBuilder() *publishBuilder {
-	return NewPublishBuilder()
-}
-
 // buildPublishPayload assembles the marshaled TaskMessage that
 // accompanies the caller's active_deployments mutation. All
 // inputs are pre-resolved under the caller's *sqlx.Tx at the
@@ -123,8 +116,6 @@ func (b *publishBuilder) buildPublishPayload(
 			),
 		},
 	}
-
-	_ = regions
 
 	return json.Marshal(msg)
 }

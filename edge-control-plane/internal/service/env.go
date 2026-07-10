@@ -63,6 +63,15 @@ func (s *EnvService) SetSecretEncryptor(sec *SecretEncryptor) *EnvService {
 	return s
 }
 
+// GetEncryptor exposes the underlying encryptor. Returns nil when
+// encryption is disabled (dev mode). Used by DeploymentService's
+// env-load+decrypt block (issue #560) so it can route through the
+// shared loadDecryptedEnvMap helper below without needing a
+// passthrough Decrypt call.
+func (s *EnvService) GetEncryptor() *SecretEncryptor {
+	return s.encryptor
+}
+
 // SetPublishDeps wires the publish-if-active path (issue #560). All
 // seven deps must be non-nil for env writes to notify workers; if
 // any is missing, SetEnv/DeleteEnv silently skip the publish (best-
@@ -215,30 +224,15 @@ func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantI
 		return fmt.Errorf("loading quota: %w", err)
 	}
 
-	envRows, err := s.appEnvRepoTx.WithTx(tx).List(ctx, tenantID, appName)
+	envMap, err := loadDecryptedEnvMap(ctx, s.appEnvRepoTx.WithTx(tx), s.encryptor, tenantID, appName)
 	if err != nil {
-		return fmt.Errorf("listing env vars: %w", err)
-	}
-	envMap := make(map[string]string, len(envRows))
-	for _, e := range envRows {
-		if s.encryptor != nil {
-			plain, derr := s.encryptor.Decrypt(e.EnvValue)
-			if derr != nil {
-				return fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
-			}
-			envMap[e.EnvKey] = plain
-			continue
-		}
-		envMap[e.EnvKey] = e.EnvValue
+		return err
 	}
 
 	regions := deployment.Regions
-	if len(regions) == 0 {
-		// Empty regions — leave it that way; the publisher fans
-		// out via stream config. Mirrors the activate path's
-		// deployment.Regions propagation.
-		regions = []string{}
-	}
+	// Empty regions are fine — the publisher fans out via stream config,
+	// and pq.StringArray below handles both nil and []string{}. Mirrors
+	// the activate path's deployment.Regions propagation.
 
 	payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
 		active.DeploymentID, deployment, tenant, regions, quota, envMap)
@@ -264,6 +258,38 @@ func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantI
 // that read env vars from the repo directly and need to decrypt inline.
 func (s *EnvService) Decrypt(value string) (string, error) {
 	return s.encryptor.Decrypt(value)
+}
+
+// loadDecryptedEnvMap reads the full env map for (tenantID, appName)
+// via appEnvRepo and decrypts each value through encryptor (a nil
+// encryptor signals plaintext passthrough — dev mode). Replaces the
+// otherwise-duplicated 12-line list+decrypt block that previously
+// lived in three places:
+//
+//   - (*EnvService).publishIfActiveTx (issue #560)
+//   - (*DeploymentService).activateDeployment (issue #440)
+//   - (*DeploymentService).RollbackDeployment (issue #440)
+//
+// The call site is responsible for tx-scoping appEnvRepo (typically
+// `appEnvRepo.WithTx(tx)`); this helper does no transaction management.
+func loadDecryptedEnvMap(ctx context.Context, appEnvRepo *repository.AppEnvRepository, encryptor *SecretEncryptor, tenantID, appName string) (map[string]string, error) {
+	rows, err := appEnvRepo.List(ctx, tenantID, appName)
+	if err != nil {
+		return nil, fmt.Errorf("listing env vars: %w", err)
+	}
+	envMap := make(map[string]string, len(rows))
+	for _, e := range rows {
+		if encryptor != nil {
+			plain, derr := encryptor.Decrypt(e.EnvValue)
+			if derr != nil {
+				return nil, fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
+			}
+			envMap[e.EnvKey] = plain
+			continue
+		}
+		envMap[e.EnvKey] = e.EnvValue
+	}
+	return envMap, nil
 }
 
 // ListEnv fetches the env rows for an app and decrypts them for the

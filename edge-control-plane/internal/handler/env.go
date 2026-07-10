@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // EnvServiceInterface is the subset of *service.EnvService used by EnvHandler.
@@ -58,6 +60,16 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.envSvc.SetEnv(r.Context(), tenantID, appName, req.Key, req.Value); err != nil {
+		// Issue #560: surface the disabled-tenant gate as 409 so the
+		// CLI / operator tooling can distinguish "tenant is locked,
+		// don't retry" from a generic infrastructure 500. Mirrors the
+		// deployment.go:785 mapping. Anything else (db unreachable,
+		// lock timeout, …) stays a 500 with the canonical envelope.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
+			return
+		}
+		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
@@ -97,6 +109,12 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
 	if err := h.envSvc.DeleteEnv(r.Context(), tenantID, appName, key); err != nil {
+		// Issue #560: see EnvHandler.Set above for the rationale.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			httperror.ConflictCtx(w, r, "tenant is disabled")
+			return
+		}
+		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}

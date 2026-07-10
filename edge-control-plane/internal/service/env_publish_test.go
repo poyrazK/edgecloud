@@ -62,7 +62,7 @@ func newEnvSvcForPublish(t *testing.T, db *sqlx.DB) *EnvService {
 		repository.NewQuotaRepository(db),
 		repository.NewOutboxRepository(db),
 		appEnvRepo, // same instance; both fields hit the same rows
-		newPublishBuilder(),
+		NewPublishBuilder(),
 	)
 	// Disable encryption so plaintext values flow through unchanged
 	// — the test asserts the marshaled TaskMessage carries the
@@ -290,7 +290,7 @@ func TestEnvService_DeleteEnv_PublishesIfActive(t *testing.T) {
 func TestBuildPublishPayload_Shape(t *testing.T) {
 	tenantID, appName, deploymentID := "t_shape", "myapp", "d_shape"
 
-	b := newPublishBuilder()
+	b := NewPublishBuilder()
 	dep := &domain.Deployment{
 		Hash:         "h",
 		Signature:    "sig",

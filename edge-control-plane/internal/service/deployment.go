@@ -1405,21 +1405,18 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// schema so a buggy re-enqueue surfaces as a constraint
 		// violation rather than a double-publish.
 		txAppEnv := s.appEnvRepo.WithTx(tx)
-		envRows, err := txAppEnv.List(ctx, tenantID, appName)
-		if err != nil {
-			return fmt.Errorf("listing env vars: %w", err)
+		// Reach through envSvc.GetEncryptor() so the helper sees the
+		// same nil-safe decrypt path the original inlined loop did.
+		// s.envSvc is conventionally non-nil in production wiring
+		// (set by SetEnvService in app.go), but the nil guard
+		// preserves backward-compat for any test that omits it.
+		var encryptor *SecretEncryptor
+		if s.envSvc != nil {
+			encryptor = s.envSvc.GetEncryptor()
 		}
-		envMap := make(map[string]string, len(envRows))
-		for _, e := range envRows {
-			if s.envSvc != nil {
-				plain, derr := s.envSvc.Decrypt(e.EnvValue)
-				if derr != nil {
-					return fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
-				}
-				envMap[e.EnvKey] = plain
-				continue
-			}
-			envMap[e.EnvKey] = e.EnvValue
+		envMap, err := loadDecryptedEnvMap(ctx, txAppEnv, encryptor, tenantID, appName)
+		if err != nil {
+			return err
 		}
 		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
 			deploymentID, deployment, tenant, regions, activateQuota, envMap)
@@ -1789,21 +1786,18 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			deploymentForPayload.PreviewPRNumber = &pr
 		}
 		txAppEnv := s.appEnvRepo.WithTx(tx)
-		envRows, err := txAppEnv.List(ctx, tenantID, appName)
-		if err != nil {
-			return fmt.Errorf("listing env vars: %w", err)
+		// Reach through envSvc.GetEncryptor() so the helper sees the
+		// same nil-safe decrypt path the original inlined loop did.
+		// s.envSvc is conventionally non-nil in production wiring
+		// (set by SetEnvService in app.go), but the nil guard
+		// preserves backward-compat for any test that omits it.
+		var encryptor *SecretEncryptor
+		if s.envSvc != nil {
+			encryptor = s.envSvc.GetEncryptor()
 		}
-		envMap := make(map[string]string, len(envRows))
-		for _, e := range envRows {
-			if s.envSvc != nil {
-				plain, derr := s.envSvc.Decrypt(e.EnvValue)
-				if derr != nil {
-					return fmt.Errorf("decrypting env %s: %w", e.EnvKey, derr)
-				}
-				envMap[e.EnvKey] = plain
-				continue
-			}
-			envMap[e.EnvKey] = e.EnvValue
+		envMap, err := loadDecryptedEnvMap(ctx, txAppEnv, encryptor, tenantID, appName)
+		if err != nil {
+			return err
 		}
 		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
 			rolledBackID, deploymentForPayload, tenant, regions, rollbackQuota, envMap)
