@@ -34,6 +34,29 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow::anyhow!("nats: {}", e)
 }
 
+/// Resolve the effective durable-consumer identity for a worker.
+///
+/// Fan-out mode (empty `queue_group`): each worker gets its own durable
+/// consumer named after `consumer_name` — every worker receives every
+/// message (issue #316) and the supervisor's diff logic handles
+/// duplicates.
+///
+/// Queue-group mode (issue #86): every worker in the group must share
+/// ONE durable consumer (named after the group) and one deliver
+/// subject. In JetStream, each durable consumer independently receives
+/// every stream message — `deliver_group` only load-balances the
+/// subscribers *of a single consumer* on its deliver subject. Per-worker
+/// consumer names would therefore fan out despite the group and pinning
+/// would never happen; the shared name is what makes exactly-one
+/// delivery real.
+pub fn effective_consumer_name<'a>(consumer_name: &'a str, queue_group: &'a str) -> &'a str {
+    if queue_group.is_empty() {
+        consumer_name
+    } else {
+        queue_group
+    }
+}
+
 /// Build the JetStream consumer config for subscribing to task messages.
 /// Extracted as a pure function so the wire contract can be unit-tested
 /// without a real NATS connection.
@@ -41,21 +64,23 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// `queue_group` enables intra-region HA pinning (issue #86): when set,
 /// NATS delivers each `TaskMessage` to exactly one worker in the group,
 /// so multiple workers in the same region don't all try to start the
-/// same app. Empty string → fan-out (the historical default).
+/// same app. Empty string → fan-out (the historical default). See
+/// [`effective_consumer_name`] for why the group shares one durable.
 pub fn build_consumer_config(
     consumer_name: &str,
     region: &str,
     queue_group: &str,
 ) -> PushConsumerConfig {
-    let deliver_subject = format!("_INBOX.task.{}", consumer_name);
+    let name = effective_consumer_name(consumer_name, queue_group);
+    let deliver_subject = format!("_INBOX.task.{}", name);
     let deliver_group = if queue_group.is_empty() {
         None
     } else {
         Some(queue_group.to_string())
     };
     PushConsumerConfig {
-        name: Some(consumer_name.to_string()),
-        durable_name: Some(consumer_name.to_string()),
+        name: Some(name.to_string()),
+        durable_name: Some(name.to_string()),
         deliver_subject,
         deliver_group,
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
@@ -177,12 +202,16 @@ impl NatsClient for NatsClientImpl {
 
         // Durable push consumer with explicit ack. If `queue_group` is
         // set, NATS delivers each `TaskMessage` to exactly one worker in
-        // the group (intra-region HA pinning, issue #86). Empty group →
+        // the group (intra-region HA pinning, issue #86) — all group
+        // members share ONE durable consumer named after the group (see
+        // `effective_consumer_name`), and async-nats queue-subscribes to
+        // its deliver subject under `deliver_group`. Empty group →
         // fan-out (every worker in the region receives every
         // `TaskMessage`; the supervisor's diff logic handles duplicates).
         let config = build_consumer_config(consumer_name, region, &self.queue_group);
+        let effective_name = effective_consumer_name(consumer_name, &self.queue_group);
         let consumer: jetstream::consumer::PushConsumer = stream
-            .get_or_create_consumer(consumer_name, config)
+            .get_or_create_consumer(effective_name, config)
             .await
             .map_err(nats_err)
             .context("failed to create durable consumer")?;
@@ -267,6 +296,29 @@ pub(crate) mod tests {
             Some("ha-group-fra"),
             "queue group must propagate to deliver_group for HA pinning"
         );
+    }
+
+    #[test]
+    fn consumer_config_queue_group_shares_one_durable() {
+        // Issue #86: pinning only works when every group member shares
+        // ONE durable consumer. Per-worker durable names would each
+        // receive a full copy of the stream (deliver_group only
+        // load-balances subscribers of a single consumer), so two
+        // workers with distinct names would BOTH start the app.
+        let cfg_a = build_consumer_config("consumer-a", "fra", "ha-group-fra");
+        let cfg_b = build_consumer_config("consumer-b", "fra", "ha-group-fra");
+        assert_eq!(cfg_a.durable_name, cfg_b.durable_name);
+        assert_eq!(cfg_a.durable_name.as_deref(), Some("ha-group-fra"));
+        assert_eq!(
+            cfg_a.deliver_subject, cfg_b.deliver_subject,
+            "group members must queue-subscribe to the same deliver subject"
+        );
+    }
+
+    #[test]
+    fn effective_consumer_name_resolution() {
+        assert_eq!(effective_consumer_name("c1", ""), "c1");
+        assert_eq!(effective_consumer_name("c1", "grp"), "grp");
     }
 
     #[test]

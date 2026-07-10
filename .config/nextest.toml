@@ -1,0 +1,13 @@
+# Workspace-wide nextest configuration.
+#
+# terminate-after is the load-bearing setting: without it, nextest marks a
+# test SLOW every `period` but waits forever for it to finish. A single
+# hung test (e.g. a parked spawn_blocking thread that blocks tokio's
+# runtime teardown — see issue #602) then wedges the whole CI job until
+# the job-level timeout-minutes kills the runner, eating ~30 minutes per
+# occurrence. With terminate-after, nextest SIGTERMs the test process
+# after period * terminate-after (60s * 3 = 180s) and fails just that
+# test. 180s is ~8x the slowest legitimate test in the repo (the
+# container-backed queue-group test at ~23s).
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "10s" }

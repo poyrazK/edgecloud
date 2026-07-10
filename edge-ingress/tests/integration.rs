@@ -207,6 +207,13 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
         return;
     }
 
+    // Install the Prometheus recorder BEFORE the pipeline runs. Under
+    // nextest each test is its own process, so nothing else has
+    // installed a global recorder — `metrics::counter!` calls made
+    // before installation go to the no-op recorder and are silently
+    // lost, leaving `handle.render()` empty at assertion time.
+    let handle = install_metrics_recorder();
+
     let (_nats, nats_url) = start_nats().await;
 
     let mock_server = MockServer::start().await;
@@ -280,8 +287,7 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
     .await
     .expect("wiremock saw a POST /load within 5s");
 
-    // Read recorded metrics from the handle.
-    let handle = install_metrics_recorder();
+    // Read recorded metrics from the handle installed at test start.
     let output = handle.render();
 
     // The boot push and heartbeat push should have produced reload attempts.

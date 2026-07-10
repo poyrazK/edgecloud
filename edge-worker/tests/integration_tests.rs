@@ -245,19 +245,26 @@ impl TestHarness {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Helper: subscribe to heartbeats and collect the first one, with its own timeout.
 /// Establish a live core-NATS subscription BEFORE the caller publishes.
 /// Core NATS pub/sub has no durability — a message published before a
 /// subscriber's interest is registered with the server is lost with no
 /// redelivery (unlike JetStream). Callers must subscribe first, then
 /// publish, then await on the returned `Subscriber`.
+///
+/// The `flush()` is load-bearing: `subscribe()` resolves once the SUB
+/// command is buffered client-side, NOT once the server has registered
+/// interest. The publisher runs on a different connection, so without
+/// the flush (a server round-trip) the publish can still race ahead of
+/// the SUB frame and the message is silently dropped.
 async fn heartbeat_subscriber(
     nats_url: &str,
     region: &str,
 ) -> anyhow::Result<async_nats::Subscriber> {
     let client = async_nats::connect(nats_url).await?;
     let subject = format!("edgecloud.heartbeats.{}", region);
-    Ok(client.subscribe(subject).await?)
+    let sub = client.subscribe(subject).await?;
+    client.flush().await?;
+    Ok(sub)
 }
 
 async fn recv_heartbeat(sub: &mut async_nats::Subscriber) -> anyhow::Result<HeartbeatMessage> {
@@ -1067,7 +1074,12 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
                 "deployment_id": "d_pinned_001",
                 "deployment_hash": test_component_hash(),
                 "env": {},
-                "allowlist": []
+                "allowlist": [],
+                // Required, non-defaulted u64 on AppSpec — omitting it
+                // makes the whole TaskMessage fail to deserialize and the
+                // consume loop discards it, so NO worker ever starts the
+                // app (the original failure mode of this test).
+                "max_memory_mb": 256
             }
         }
     });

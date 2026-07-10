@@ -109,7 +109,16 @@ async fn tcp_connect_retry(addr: &str, attempts: u32) -> tokio::net::TcpStream {
 // calls `tokio::task::block_in_place` (see edge-runtime's websocket.rs),
 // which panics on a single-threaded runtime. Matches production, which
 // always runs under `#[tokio::main]`'s multi-threaded default.
+//
+// Quarantined (issue #602): the host's websocket accept() parks an
+// uncancellable blocking thread in std TcpListener::accept inside
+// spawn_blocking; tokio's Runtime::drop waits for blocking threads, so
+// even when the outer 60s timeout below fires and panics, the test
+// process cannot exit — nextest reports SLOW forever and the CI job
+// wedges until its 30-minute timeout. Un-ignore once #602 lands a
+// cancellable accept path.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "issue #602: websocket accept() parks an uncancellable spawn_blocking thread; runtime teardown hangs the test process even after the 60s timeout panics"]
 async fn js_websocket_round_trip() {
     if should_skip_integration_tests() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");

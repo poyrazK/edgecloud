@@ -124,10 +124,15 @@ async fn run_test() -> anyhow::Result<()> {
     // Subscribe from a separate async-nats client (simulating the ingress
     // process) BEFORE publishing — core NATS pub/sub has no durability,
     // so a message published before the subscriber's interest reaches
-    // the server is lost with no redelivery.
+    // the server is lost with no redelivery. The flush() is load-bearing:
+    // subscribe() resolves once the SUB command is buffered client-side,
+    // NOT once the server has registered interest; the publisher runs on
+    // a different connection, so without the round-trip the publish can
+    // still race ahead of the SUB frame.
     let client = async_nats::connect(&nats_url).await?;
     let subject = format!("edgecloud.heartbeats.{}", region);
     let mut sub = client.subscribe(subject).await?;
+    client.flush().await?;
 
     // Build the heartbeat exactly as the worker would on its 30s tick
     // (see `edge-worker/src/main.rs:110`).
