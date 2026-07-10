@@ -20,7 +20,10 @@ points). Confirm with `edge --version`.
 ## Quick start
 
 ```sh
-# 1. Create an account (opens a browser to the signup form).
+# 1. Create a tenant + API key via the control plane's self-signup
+#    endpoint (POST /api/v1/tenants). The CLI prints the new tenant
+#    ID and API key on stdout, then saves the key to
+#    ~/.config/edgecloud/config.toml. No browser interaction.
 edge auth signup
 
 # 2. Scaffold a FaaS-shaped Rust starter. The starter ships with a
