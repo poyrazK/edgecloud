@@ -334,7 +334,23 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
         .wait()?;
 
     if !status.success() {
-        anyhow::bail!("wasm-tools component new failed");
+        // The most common failure mode is "wasi-preview1 adapter not
+        // found in the cargo registry" — see `resolve_wasi_adapter`
+        // below for the lookup. That case is already surfaced with a
+        // clear "Cannot find the wasi-preview1 adapter in <path>"
+        // message; the message here covers the *other* failure modes
+        // (e.g. wasm-tools on PATH but the wrap actually failed).
+        anyhow::bail!(
+            "wasm-tools component new failed (exit {exit}). \
+             If the error mentions a missing `wasi_snapshot_preview1.reactor.wasm`, \
+             run `cargo install wasm-tools --locked --version '^1.252'` and re-run \
+             `cargo fetch` so the adapter is downloaded into the registry. \
+             See resolve_wasi_adapter for the lookup path.",
+            exit = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".to_string()),
+        );
     }
 
     println!("✓ Built successfully");
