@@ -927,6 +927,191 @@ mod heartbeat_integration_tests {
             .await;
         assert_eq!(survivor_inst.status, AppInstanceStatus::Running);
     }
+
+    /// Issue #45, Site 2 (review follow-up) — `handle_app_crash` is
+    /// the shared trap/panic/Hung machinery. Calling it with a
+    /// `panic-in-spawn` shape (synthetic anyhow::Error wrapping the
+    /// JoinError payload) must increment the restart counter, flip
+    /// `AppInstance.status` to the supplied terminal variant when
+    /// the cap is exceeded, and signal `terminal == true` so the
+    /// caller's `break` fires. The matching `Crashed` vs `Hung`
+    /// status flip is what distinguishes "guest trapped" from
+    /// "guest stopped yielding" on the wire — a regression here
+    /// would conflate the two failure modes for the heartbeat.
+    ///
+    /// The test drives `handle_app_crash` directly because
+    /// `run_app_loop` requires a real `InstancePre<RuntimeState>`
+    /// which can't be synthesized in a unit test. The behavior
+    /// asserted here is exactly what `run_app_loop`'s trap arm,
+    /// panic arm, and Hung arm all depend on.
+    #[tokio::test]
+    async fn handle_app_crash_flips_to_crashed_after_max_restarts() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        let (_shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d_panic".into(),
+            app_name: "panic-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18002,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d_panic".into())),
+            shutdown_tx: Some(_shutdown_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "panic-app".into()), app);
+
+        let sup = build_supervisor(state.clone());
+
+        // Simulate the panic-in-spawn synthetic error shape that
+        // run_app_loop's `Ok(Err(join_err))` arm produces. The
+        // payload itself isn't threaded into handle_app_crash
+        // (the helper takes the terminal status directly) but we
+        // keep it here as documentation of the call shape.
+        let _synthetic_err = anyhow::anyhow!("app task panicked: synthetic");
+
+        // Drive handle_app_crash 4 times under the cap — each call
+        // should return `false` (continue-with-backoff).
+        let base = Duration::from_millis(1);
+        let max = Duration::from_millis(4);
+        for rc in 1..5 {
+            let terminal = Supervisor::handle_app_crash(
+                &state,
+                "t_test",
+                "panic-app",
+                "d_panic",
+                &sup.downloader,
+                rc,
+                5,
+                base,
+                max,
+                AppInstanceStatus::Crashed { restart_count: rc },
+                "app crashed (panic-in-spawn)",
+            )
+            .await;
+            assert!(
+                !terminal,
+                "rc={rc} under cap must NOT be terminal (handle_app_crash returned true)"
+            );
+        }
+
+        // The 5th call hits the cap and must return `true`.
+        let terminal = Supervisor::handle_app_crash(
+            &state,
+            "t_test",
+            "panic-app",
+            "d_panic",
+            &sup.downloader,
+            5,
+            5,
+            base,
+            max,
+            AppInstanceStatus::Crashed { restart_count: 5 },
+            "app crashed (panic-in-spawn)",
+        )
+        .await;
+        assert!(
+            terminal,
+            "rc=5 at the cap MUST be terminal (handle_app_crash returned false)"
+        );
+
+        // App status was flipped to Crashed { restart_count: 5 }.
+        let snapshot = state.read().await;
+        let inst = snapshot
+            .apps
+            .get(&("t_test".into(), "panic-app".into()))
+            .expect("app present")
+            .lock()
+            .await;
+        assert_eq!(
+            inst.status,
+            AppInstanceStatus::Crashed { restart_count: 5 },
+            "after 5 panics, status must be Crashed {{ restart_count: 5 }}"
+        );
+    }
+
+    /// Sibling assertion: `handle_app_crash` with the `Hung`
+    /// terminal status must produce `AppInstanceStatus::Hung`, not
+    /// `Crashed`. This is what lets the heartbeat distinguish
+    /// "guest trapped" from "guest stopped yielding" on the wire
+    /// (issue #45 review follow-up — both arms now route through
+    /// `handle_app_crash` so the status flip can't drift).
+    #[tokio::test]
+    async fn handle_app_crash_flips_to_hung_for_timeout_path() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        let (_shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d_hung".into(),
+            app_name: "hung-app".into(),
+            tenant_id: "t_test".into(),
+            port: 18003,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d_hung".into())),
+            shutdown_tx: Some(_shutdown_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "hung-app".into()), app);
+
+        let sup = build_supervisor(state.clone());
+
+        let base = Duration::from_millis(1);
+        let max = Duration::from_millis(4);
+        let terminal = Supervisor::handle_app_crash(
+            &state,
+            "t_test",
+            "hung-app",
+            "d_hung",
+            &sup.downloader,
+            5,
+            5,
+            base,
+            max,
+            AppInstanceStatus::Hung,
+            "app hung (health check timeout)",
+        )
+        .await;
+        assert!(terminal, "rc=5 at the cap MUST be terminal");
+
+        let snapshot = state.read().await;
+        let inst = snapshot
+            .apps
+            .get(&("t_test".into(), "hung-app".into()))
+            .expect("app present")
+            .lock()
+            .await;
+        assert_eq!(
+            inst.status,
+            AppInstanceStatus::Hung,
+            "timeout path must produce Hung, NOT Crashed"
+        );
+    }
 }
 
 // ── extracted pure functions tests ──────────────────────────────────────
@@ -1856,21 +2041,27 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Shared trap-handling arm for `run_app_loop` (issue #45).
+    /// Shared crash-handling arm for `run_app_loop` (issue #45).
     ///
     /// Called from BOTH the `Ok(Ok(Err(e)))` arm (wasm trap from the
     /// guest) and the `Ok(Err(join_err))` arm (panic inside the
     /// spawned `execute_app` task) after `restart_count` has been
-    /// incremented. Returns `true` iff the supervisor has hit the
-    /// restart cap and the caller should `break` out of `run_app_loop`:
-    /// the app is marked `Crashed { restart_count }`, an auto-rollback
-    /// POST is fired (best-effort), and the loop terminates. Returns
-    /// `false` when a restart is allowed — the caller sleeps the
-    /// computed backoff and loops.
+    /// incremented, AND from the `Err(_elapsed)` arm (health-check
+    /// timeout → Hung), which passes the terminal `AppInstanceStatus`
+    /// variant via `terminal_status`. Returns `true` iff the
+    /// supervisor has hit the restart cap and the caller should
+    /// `break` out of `run_app_loop`: the app is flipped to the
+    /// supplied terminal status, an auto-rollback POST is fired
+    /// (best-effort), and the loop terminates. Returns `false` when a
+    /// restart is allowed — the caller sleeps the computed backoff
+    /// and loops.
     ///
-    /// Splitting this out keeps the two arms in `run_app_loop`
+    /// Splitting this out keeps the three arms in `run_app_loop`
     /// legible and prevents the auto-rollback POST + status flip
-    /// from drifting between the trap and panic code paths.
+    /// from drifting between the trap, panic-in-spawn, and Hung code
+    /// paths. Add new failure classes (OOM, store-limit-exceeded,
+    /// etc.) by passing a different `terminal_status` and a matching
+    /// `log_msg` — do NOT reintroduce inline copies.
     #[allow(clippy::too_many_arguments)]
     async fn handle_app_crash(
         state: &Arc<RwLock<WorkerState>>,
@@ -1882,23 +2073,20 @@ impl Supervisor {
         max_restarts: u32,
         base_backoff: Duration,
         max_backoff: Duration,
-        err: anyhow::Error,
+        terminal_status: AppInstanceStatus,
         log_msg: &'static str,
     ) -> bool {
         if restart_count >= max_restarts {
-            tracing::error!(
-                restart_count,
-                err = %err,
-                "max restarts exceeded, giving up"
-            );
-            // Mark the app as crashed so the heartbeat reflects the
-            // failure.
+            tracing::error!(restart_count, "max restarts exceeded, giving up");
+            // Mark the app with the supplied terminal status so the
+            // heartbeat reflects the failure mode (Crashed for traps /
+            // host panics, Hung for health-check timeouts, ...).
             {
                 let mut s = state.write().await;
                 let crash_key = (tenant_id.to_string(), app_name.to_string());
                 if let Some(inst) = s.apps.get_mut(&crash_key) {
                     let mut inst = inst.lock().await;
-                    inst.status = AppInstanceStatus::Crashed { restart_count };
+                    inst.status = terminal_status;
                 }
             }
             // Best-effort auto-rollback: signal the control plane so
@@ -1930,11 +2118,9 @@ impl Supervisor {
         } else {
             let backoff = std::cmp::min(base_backoff * 2u32.pow(restart_count - 1), max_backoff);
             tracing::warn!(
-                err = %err,
                 restart_count,
-                "{}; restarting in {:?}",
-                log_msg,
-                backoff
+                backoff_secs = backoff.as_secs(),
+                "{log_msg}; restarting"
             );
             false
         }
@@ -1987,50 +2173,6 @@ impl Supervisor {
         let current_deployment_id = meter.deployment_id.clone();
 
         loop {
-            // Issue #45: spawn the host task OUTSIDE the select! so a
-            // panic inside execute_app surfaces as a `JoinError`
-            // rather than unwinding out of `run_app_loop` (which
-            // would crash the worker process via `stop_app`'s
-            // `panic::resume_unwind`). The select! body below
-            // matches on `JoinError` and routes panics through the
-            // same restart-or-Crashed path as a wasm trap.
-            //
-            // `tokio::spawn` requires `'static`, so we clone every
-            // borrow into an owned form. `instance_pre` is already
-            // `Clone`-able (it's a wasmtime `Component`-derived
-            // pre-instance) and `meter` is wrapped in `Arc`, so the
-            // cost is one Arc bump per restart. `env`, `allowlist`,
-            // and `metrics_acc` are owned (no borrow), so we move
-            // them into the async block.
-            let app_task = tokio::spawn({
-                let instance_pre = instance_pre.clone();
-                let meter = Arc::clone(&meter);
-                let tenant_id = tenant_id.clone();
-                let app_name = app_name.clone();
-                let log_forwarder = Arc::clone(&log_forwarder);
-                let preview_id = preview_id.clone();
-                let env = env.clone();
-                let allowlist = allowlist.clone();
-                let metrics_acc = metrics_acc.clone();
-                async move {
-                    Self::execute_app(
-                        &instance_pre,
-                        &meter,
-                        env,
-                        max_memory_mb,
-                        epoch_deadline_ticks,
-                        &tenant_id,
-                        allowlist,
-                        &app_name,
-                        &log_forwarder,
-                        metrics_acc,
-                        socket_mode,
-                        preview_id.as_deref(),
-                        preview_pr_number,
-                    )
-                    .await
-                }
-            });
             tokio::select! {
                 // Graceful shutdown signal from supervisor
                 _ = &mut shutdown_rx => {
@@ -2046,9 +2188,59 @@ impl Supervisor {
                 //      guest traps in a syscall that doesn't yield (or the
                 //      epoch ticker is starved), the host marks the app as
                 //      Hung and restarts after backoff.
+                //
+                // Issue #45: the spawn happens LAZILY inside the
+                // select! future expression. This (a) avoids paying
+                // the spawn cost on every loop iteration when the
+                // shutdown arm wins, and (b) keeps the spawn inside
+                // the future-polling context, so a panic inside
+                // `execute_app` surfaces as a `JoinError` on the
+                // outer future rather than unwinding out of
+                // `run_app_loop` (which would crash the worker
+                // process via `stop_app`'s `panic::resume_unwind`).
+                // The match arms below route the new `Ok(Err(join_err))`
+                // variant through the same restart-or-Crashed path
+                // as a wasm trap.
+                //
+                // `tokio::spawn` requires `'static`, so we clone
+                // every borrow into an owned form. `instance_pre`
+                // is already `Clone`-able (it's a wasmtime
+                // `Component`-derived pre-instance) and `meter` is
+                // wrapped in `Arc`, so the cost is one Arc bump per
+                // restart. `env`, `allowlist`, and `metrics_acc`
+                // are owned (no borrow), so we move them into the
+                // async block.
                 result = tokio::time::timeout(
                     Duration::from_secs(health_check_timeout_secs),
-                    app_task,
+                    tokio::spawn({
+                        let instance_pre = instance_pre.clone();
+                        let meter = Arc::clone(&meter);
+                        let tenant_id = tenant_id.clone();
+                        let app_name = app_name.clone();
+                        let log_forwarder = Arc::clone(&log_forwarder);
+                        let preview_id = preview_id.clone();
+                        let env = env.clone();
+                        let allowlist = allowlist.clone();
+                        let metrics_acc = metrics_acc.clone();
+                        async move {
+                            Self::execute_app(
+                                &instance_pre,
+                                &meter,
+                                env,
+                                max_memory_mb,
+                                epoch_deadline_ticks,
+                                &tenant_id,
+                                allowlist,
+                                &app_name,
+                                &log_forwarder,
+                                metrics_acc,
+                                socket_mode,
+                                preview_id.as_deref(),
+                                preview_pr_number,
+                            )
+                            .await
+                        }
+                    }),
                 ) => {
                     match result {
                         Ok(Ok(Ok(true))) => {
@@ -2061,7 +2253,7 @@ impl Supervisor {
                             tracing::info!("component exited normally");
                             break;
                         }
-                        Ok(Ok(Err(e))) => {
+                        Ok(Ok(Err(_e))) => {
                             // Wasm trap or runtime error — treat as crash.
                             restart_count += 1;
                             let terminal = Self::handle_app_crash(
@@ -2074,8 +2266,8 @@ impl Supervisor {
                                 max_restarts,
                                 base_backoff,
                                 max_backoff,
-                                e,
-                                "app crashed",
+                                AppInstanceStatus::Crashed { restart_count },
+                                "app crashed (trap)",
                             )
                             .await;
                             if terminal {
@@ -2108,7 +2300,6 @@ impl Supervisor {
                                 panic_payload = %payload,
                                 "app task panicked inside run_app_loop; routing through restart/Crashed"
                             );
-                            let e = anyhow::anyhow!(payload);
                             restart_count += 1;
                             let terminal = Self::handle_app_crash(
                                 &state,
@@ -2120,7 +2311,7 @@ impl Supervisor {
                                 max_restarts,
                                 base_backoff,
                                 max_backoff,
-                                e,
+                                AppInstanceStatus::Crashed { restart_count },
                                 "app crashed (panic-in-spawn)",
                             )
                             .await;
@@ -2134,52 +2325,35 @@ impl Supervisor {
                             sleep(backoff).await;
                         }
                         Err(_elapsed) => {
-                            // Health check timeout — app hung.
+                            // Health check timeout — app hung. Same
+                            // restart-or-terminal machinery as the
+                            // trap and panic arms, just with a
+                            // different terminal status (Hung, not
+                            // Crashed) so the heartbeat distinguishes
+                            // "guest stopped yielding" from "guest
+                            // trapped".
                             restart_count += 1;
+                            let terminal = Self::handle_app_crash(
+                                &state,
+                                &tenant_id,
+                                &app_name,
+                                &current_deployment_id,
+                                &downloader,
+                                restart_count,
+                                max_restarts,
+                                base_backoff,
+                                max_backoff,
+                                AppInstanceStatus::Hung,
+                                "app hung (health check timeout)",
+                            )
+                            .await;
+                            if terminal {
+                                break;
+                            }
                             let backoff = std::cmp::min(
                                 base_backoff * 2u32.pow(restart_count - 1),
                                 max_backoff,
                             );
-                            tracing::warn!(
-                                restart_count,
-                                timeout_secs = health_check_timeout_secs,
-                                "app hung (health check timeout), restarting in {:?}",
-                                backoff
-                            );
-                            if restart_count >= max_restarts {
-                                let mut s = state.write().await;
-                                let hang_key = (tenant_id.clone(), app_name.clone());
-                                if let Some(inst) = s.apps.get_mut(&hang_key) {
-                                    let mut inst = inst.lock().await;
-                                    inst.status = AppInstanceStatus::Hung;
-                                }
-                                // Same auto-rollback as the Crashed
-                                // branch above — Hung means the guest
-                                // stopped yielding (vs Crashed which
-                                // means it trapped). Both are tenant-
-                                // facing failure modes, both deserve a
-                                // rollback signal if the tenant opted in.
-                                let dl = downloader.clone();
-                                let tenant = tenant_id.clone();
-                                let name = app_name.clone();
-                                let dep = current_deployment_id.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = dl
-                                        .post_auto_rollback(&tenant, &name, &dep, restart_count)
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            tenant_id = %tenant,
-                                            app_name = %name,
-                                            current_deployment_id = %dep,
-                                            restart_count,
-                                            err = %err,
-                                            "auto-rollback POST failed; user must run `edge rollback` manually"
-                                        );
-                                    }
-                                });
-                                break;
-                            }
                             sleep(backoff).await;
                         }
                     }
