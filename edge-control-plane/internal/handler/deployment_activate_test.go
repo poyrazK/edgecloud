@@ -20,19 +20,23 @@ import (
 type stubActivator struct {
 	err    error
 	called bool
-	// lastTenant / lastApp / lastDeploymentID record the arguments the
-	// handler passed so tests can assert that the tenant context (not
-	// the URL) wins and that the path values reach the service layer.
-	lastTenant       string
-	lastApp          string
-	lastDeploymentID string
+	// lastTenant / lastApp / lastDeploymentID / lastIdempotencyKey
+	// record the arguments the handler passed so tests can assert that
+	// the tenant context (not the URL) wins, that the path values
+	// reach the service layer, and that the Idempotency-Key header is
+	// plumbed through (issue #439).
+	lastTenant         string
+	lastApp            string
+	lastDeploymentID   string
+	lastIdempotencyKey string
 }
 
-func (s *stubActivator) ActivateDeployment(_ context.Context, tenantID, appName, deploymentID string) error {
+func (s *stubActivator) ActivateDeployment(_ context.Context, tenantID, appName, deploymentID, idempotencyKey string) error {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName
 	s.lastDeploymentID = deploymentID
+	s.lastIdempotencyKey = idempotencyKey
 	return s.err
 }
 
@@ -236,5 +240,102 @@ func TestActivate_TenantDisabled_Returns409(t *testing.T) {
 	// Body must not leak the raw sentinel or the underlying DB driver error.
 	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
 		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Activate — Idempotency-Key plumbing (issue #439)
+// ---------------------------------------------------------------------------
+//
+// Issue #439 closes the activate-vs-activate race by making
+// ActivateDeployment idempotent under retries when the caller carries
+// an `Idempotency-Key` header. The handler's job is purely to
+// read the header, validate it against `idempotencyKeyFormat`, plumb
+// it to the service, and map ErrIdempotencyKeyMismatch to 422.
+
+// TestActivate_HonoursIdempotencyKey asserts that a valid
+// `Idempotency-Key` header reaches the service layer untouched. The
+// service-layer short-circuit (replay == cache hit == no new
+// outbox row) is exercised at the service layer in
+// deployment_test.go; this test only proves the handler-side
+// header plumbing.
+func TestActivate_HonoursIdempotencyKey(t *testing.T) {
+	svc := &stubActivator{}
+	mux := newActivateMux(svc)
+
+	const valid = "01234567-89ab-cdef-0123-456789abcdef"
+	req := httptest.NewRequest("POST", "/api/apps/myapp/activate/d_x", nil)
+	req.Header.Set("Idempotency-Key", valid)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if !svc.called {
+		t.Fatal("ActivateDeployment was not called")
+	}
+	if svc.lastIdempotencyKey != valid {
+		t.Errorf("ActivateDeployment called with idempotencyKey %q, want %q", svc.lastIdempotencyKey, valid)
+	}
+}
+
+// TestActivate_MalformedIdempotencyKey_Returns400 covers the regex
+// gate at the top of Activate: a key that doesn't match
+// [a-fA-F0-9-]{8,128} is rejected with 400 before reaching the
+// service layer (the same shape Deploy uses). The stub's
+// `called` flag must stay false so a future refactor that hoists
+// the regex check after the service call would fail this test.
+func TestActivate_MalformedIdempotencyKey_Returns400(t *testing.T) {
+	svc := &stubActivator{}
+	mux := newActivateMux(svc)
+
+	for _, bad := range []string{"short", "with spaces", "üñîçødé", "01234567-89ab-cdef-0123-456789abcdeX"} {
+		req := httptest.NewRequest("POST", "/api/apps/myapp/activate/d_x", nil)
+		req.Header.Set("Idempotency-Key", bad)
+		req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("key %q: status = %d, want 400; body: %s", bad, rr.Code, rr.Body.String())
+		}
+		if svc.called {
+			t.Errorf("key %q: ActivateDeployment must not be called for malformed key", bad)
+		}
+	}
+	// Reset the stub between input pairs by leaving the loop; the
+	// invariant is "called stays false across every iteration".
+	if svc.called {
+		t.Error("ActivateDeployment was called at least once across malformed-key iterations")
+	}
+}
+
+// TestActivate_IdempotencyKeyMismatch_Returns422 covers the
+// re-use-with-different-body path: the service layer's
+// ErrIdempotencyKeyMismatch sentinel bubbles up as a 422 with the
+// legacy bare `http.Error` body shape (no httperror.UnprocessableEntityCtx
+// helper is exported today). The body must surface the sentinel
+// message verbatim so the CLI / operator tooling can distinguish
+// "you reused a key by mistake" from a generic 500.
+func TestActivate_IdempotencyKeyMismatch_Returns422(t *testing.T) {
+	svc := &stubActivator{err: service.ErrIdempotencyKeyMismatch}
+	mux := newActivateMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/activate/d_x", nil)
+	req.Header.Set("Idempotency-Key", "01234567-89ab-cdef-0123-456789abcdef")
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), service.ErrIdempotencyKeyMismatch.Error()) {
+		t.Errorf("body must surface the sentinel message %q; got %s", service.ErrIdempotencyKeyMismatch.Error(), rr.Body.String())
+	}
+	if !svc.called {
+		t.Error("ActivateDeployment was not called — the 422 mapping only matters if the request reached the cache check")
 	}
 }

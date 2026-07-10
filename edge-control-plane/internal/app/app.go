@@ -147,6 +147,14 @@ func New(
 	// and only test harnesses that explicitly want the
 	// pre-#52 behavior omit it.
 	idempotencyRepo := repository.NewIdempotencyKeyRepo(db)
+	// Issue #439: replay cache for the activate / promote / rollback
+	// paths. When neither is injected, the activate path falls back
+	// to pre-#439 fresh-publish semantics (same shape as Deploy's
+	// nil-check on idempotencyRepo). Production always wires it so
+	// concurrent retries carrying the same Idempotency-Key
+	// short-circuit inside the tx without enqueueing a duplicate
+	// task_update outbox row.
+	activateIdempotencyRepo := repository.NewActiveDeploymentIdempotencyKeyRepo(db)
 	// Outbox (issue #42): durable-publish queue for `task_update`
 	// NATS messages. Rows are written in the same tx as the
 	// active_deployments mutation; the OutboxDrainer (below) relays
@@ -292,6 +300,7 @@ func New(
 	webhookSvc := service.NewWebhookService(webhookRepo)
 	deploymentSvc.SetWebhookService(webhookSvc)
 	deploymentSvc.SetIdempotencyRepo(idempotencyRepo)
+	deploymentSvc.SetActivateIdempotencyRepo(activateIdempotencyRepo)
 	webhookHandler := handler.NewWebhookHandler(webhookSvc)
 
 	// Billing service (issue #419). The provider is selected by

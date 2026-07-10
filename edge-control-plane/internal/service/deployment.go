@@ -438,6 +438,27 @@ type idempotencyRepoForDeploymentSvc interface {
 	Insert(ctx context.Context, k *domain.IdempotencyKey) error
 }
 
+// activateDeploymentIdempotencyRepoForDeploymentSvc is the subset
+// of *repository.ActiveDeploymentIdempotencyKeyRepo used by
+// DeploymentService for the activate / promote / rollback replay
+// cache (issue #439). Identical surface area to the concrete
+// repo (Lookup + Insert + WithTx); defined here so service-level
+// tests can substitute a stub without spinning up sqlx.
+//
+// WithTx is part of the interface because the activate-path
+// Insert participates in the same transaction as the
+// active_deployments mutation + outbox INSERT, so a rollback of
+// any earlier statement (or a hard error mid-tx) also rolls back
+// the cache row. Without WithTx, the Insert would land on the
+// pool connection and commit independently — the activate path
+// MUST NOT use a stale cache row to short-circuit a later
+// request after a tx rolled back.
+type activateDeploymentIdempotencyRepoForDeploymentSvc interface {
+	WithTx(tx *sqlx.Tx) *repository.ActiveDeploymentIdempotencyKeyRepo
+	Lookup(ctx context.Context, tenantID, key string) (*domain.ActiveDeploymentIdempotencyKey, error)
+	Insert(ctx context.Context, k *domain.ActiveDeploymentIdempotencyKey) error
+}
+
 // outboxRepoForDeploymentSvc is the subset of *repository.OutboxRepository
 // methods used by DeploymentService. The interface exists so tests can
 // inject a sqlmock-backed fake without depending on the tx machinery.
@@ -467,12 +488,21 @@ type DeploymentService struct {
 	// test harnesses that don't care about the cache don't need
 	// to thread an extra arg.
 	idempotencyRepo idempotencyRepoForDeploymentSvc
-	outboxRepo      outboxRepoForDeploymentSvc
-	artifactStore   storage.ArtifactStore
-	publisher       nats.Publisher
-	appSvc          *AppService
-	envSvc          *EnvService     // injected for decryption at publish
-	webhookSvc      *WebhookService // injected for webhook events
+	// activateIdempotencyRepo is the (tenant_id, idempotency_key)
+	// -> (app_name, deployment_id) replay cache for the activate /
+	// promote / rollback paths (issue #439). Optional — when nil,
+	// the cache lookup is skipped and every call mints a fresh
+	// outbox row (preserving the pre-#439 behaviour for callers
+	// that don't send the Idempotency-Key header). Set via
+	// SetActivateIdempotencyRepo so test harnesses that don't
+	// care about the cache don't need an extra constructor arg.
+	activateIdempotencyRepo activateDeploymentIdempotencyRepoForDeploymentSvc
+	outboxRepo              outboxRepoForDeploymentSvc
+	artifactStore           storage.ArtifactStore
+	publisher               nats.Publisher
+	appSvc                  *AppService
+	envSvc                  *EnvService     // injected for decryption at publish
+	webhookSvc              *WebhookService // injected for webhook events
 	// cachePusher pushes the activation artifact bytes to a per-region
 	// edge-artifact-cache binary before the NATS TaskMessage publish
 	// (issue #332). Optional; when nil, the cache-push step is skipped
@@ -684,6 +714,22 @@ func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
 // constructor arg.
 func (s *DeploymentService) SetIdempotencyRepo(r idempotencyRepoForDeploymentSvc) {
 	s.idempotencyRepo = r
+}
+
+// SetActivateIdempotencyRepo injects the activate / promote /
+// rollback Idempotency-Key replay cache (issue #439). When nil
+// (the default), the activate path skips the cache lookup and
+// every call mints a fresh outbox row — preserving the pre-#439
+// behaviour for callers that don't send the Idempotency-Key
+// header on POST /apps/{appName}/activate/{deploymentID},
+// /promote/{deploymentID}, or /rollback.
+//
+// Mirrors SetIdempotencyRepo (issue #52) so test harnesses that
+// don't care about idempotency don't have to thread an extra
+// constructor arg. In production wiring the repo is set by
+// cmd/api/main.go after NewDeploymentService returns.
+func (s *DeploymentService) SetActivateIdempotencyRepo(r activateDeploymentIdempotencyRepoForDeploymentSvc) {
+	s.activateIdempotencyRepo = r
 }
 
 // Deploy creates a new deployment and stores the artifact.
@@ -1229,7 +1275,7 @@ func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(ctx context.Contex
 	return deployments, total, nil
 }
 
-func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error {
+func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID, idempotencyKey string) error {
 	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
 	if err != nil || deployment == nil {
 		return fmt.Errorf("deployment not found")
@@ -1238,14 +1284,14 @@ func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, ap
 		return fmt.Errorf("deployment not found")
 	}
 
-	return s.activateDeployment(ctx, tenantID, appName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+	return s.activateDeployment(ctx, tenantID, appName, deploymentID, deployment, deployment.AutoRollbackEnabled, idempotencyKey)
 }
 
 // PromoteDeployment activates a deployment under a different app name than
 // the one it was originally deployed under. This enables the preview →
 // production promotion workflow: a user deploys as `myapp--pr-42` (gets a
 // unique preview URL), then promotes the same artifact to `myapp`.
-func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error {
+func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID, idempotencyKey string) error {
 	deployment, err := s.deploymentRepo.GetByID(ctx, deploymentID)
 	if err != nil || deployment == nil {
 		return ErrDeploymentNotFound
@@ -1253,7 +1299,7 @@ func (s *DeploymentService) PromoteDeployment(ctx context.Context, tenantID, tar
 	if deployment.TenantID != tenantID {
 		return ErrDeploymentNotFound
 	}
-	return s.activateDeployment(ctx, tenantID, targetAppName, deploymentID, deployment, deployment.AutoRollbackEnabled)
+	return s.activateDeployment(ctx, tenantID, targetAppName, deploymentID, deployment, deployment.AutoRollbackEnabled, idempotencyKey)
 }
 
 // previewIDFromDeployment unwraps the *string on the deployment
@@ -1288,7 +1334,7 @@ func previewPRNumberFromDeployment(d *domain.Deployment) int {
 // and PromoteDeployment. It sets the active deployment row and enqueues
 // a durable NATS publish via the transactional outbox (issue #42),
 // without checking the deployment's original app name.
-func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
+func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool, idempotencyKey string) error {
 
 	// Atomically move the current active id into last_good_deployment_id
 	// and write the new id. Two readers can race on a non-tx read+write;
@@ -1345,6 +1391,46 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		tenant, err := s.lockTenantForUpdate(ctx, txTenant, tenantID)
 		if err != nil {
 			return err
+		}
+
+		// Issue #439: Idempotency-Key replay check. AFTER the
+		// tenant gate so a replay against a disabled tenant still
+		// returns 409 (the disabled-vs-replay path is governed by
+		// the same ErrTenantDisabled sentinel as a fresh activate).
+		// BEFORE txActive.GetForUpdate so a hit short-circuits
+		// the row-level FOR UPDATE — replays don't contend with
+		// fresh activates on the active_deployments row, which
+		// is the whole point: a duplicate activate that hits the
+		// cache must not queue behind another fresh activate on
+		// the same row.
+		//
+		// Lookup errors other than the (nil, nil) miss bubble up
+		// as 500 via the handler's existing InternalErrorCtx
+		// path; the same shape as Deploy's issue #52 cache
+		// lookup at line ~711.
+		//
+		// On a hit we compare the cached (app_name, deployment_id)
+		// against this request's targets. A mismatch (caller
+		// reused a key against a different request body) returns
+		// ErrIdempotencyKeyMismatch → 422, the same contract
+		// Deploy uses for body-hash mismatch.
+		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
+			cached, lookupErr := s.activateIdempotencyRepo.WithTx(tx).Lookup(ctx, tenantID, idempotencyKey)
+			if lookupErr != nil {
+				return fmt.Errorf("activate idempotency lookup: %w", lookupErr)
+			}
+			if cached != nil {
+				if cached.AppName != appName || cached.DeploymentID != deploymentID {
+					return ErrIdempotencyKeyMismatch
+				}
+				// Replay: skip Set, ClearStableSince, quota
+				// read, buildPublishPayload, and outbox INSERT.
+				// Commit the (empty) tx and return. The active
+				// row already reflects this deployment from the
+				// original call; a second TaskMessage would
+				// cause the worker to restart the app twice.
+				return nil
+			}
 		}
 
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
@@ -1468,6 +1554,31 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		_, err = s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, perAppMemoryMB(activateQuota))
 		if err != nil {
 			return fmt.Errorf("incrementing memory quota: %w", err)
+		}
+		// Issue #439: record the Idempotency-Key replay row AFTER
+		// the outbox INSERT so the cache row participates in the
+		// same tx as the active_deployments mutation + outbox
+		// INSERT. A rollback of any earlier statement (outbox
+		// INSERT, buildPublishPayload, ClearStableSince, Set, the
+		// quota read, the lockTenantForUpdate gate) also rolls
+		// back this cache row, so a stale cache row can never
+		// short-circuit a later request after a tx failure.
+		//
+		// ON CONFLICT DO NOTHING absorbs concurrent retries with
+		// the same key — the first writer wins; subsequent
+		// retries hit the original row on their next lookup. The
+		// WithTx(tx) wrapper is required so the INSERT lands on
+		// the tx's connection, not the pool — same atomicity
+		// argument as AddMemoryMB above.
+		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
+			if iErr := s.activateIdempotencyRepo.WithTx(tx).Insert(ctx, &domain.ActiveDeploymentIdempotencyKey{
+				TenantID:       tenantID,
+				IdempotencyKey: idempotencyKey,
+				AppName:        appName,
+				DeploymentID:   deploymentID,
+			}); iErr != nil {
+				return fmt.Errorf("recording activate idempotency key: %w", iErr)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1650,7 +1761,7 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 // On success, returns the deployment_id that is now active (i.e., the
 // prior last_good value). The prior current deployment_id is overwritten
 // — there is no multi-step history in this minimum viable version.
-func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error) {
+func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error) {
 	var rolledBackID string
 	var deploymentHash string
 	var deploymentSignature string
@@ -1789,6 +1900,36 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
 
+		// Issue #439: Idempotency-Key replay check on the rollback
+		// path. AFTER lockTenantForUpdate (so a replay against a
+		// disabled tenant still returns 409), AFTER txActive.Set
+		// (so we know the rolled-back-to deployment_id is fixed
+		// and can compare it to the cached row), and BEFORE the
+		// outbox INSERT (so a hit short-circuits without
+		// publishing a second task_update).
+		//
+		// The cached (app_name, deployment_id) tuple keys on the
+		// rolled-back-TO deployment_id (not the rolled-back-FROM
+		// one) — that's the deployment that ends up active after
+		// the rollback commits, and that's the deployment a
+		// future rollback replay must verify against.
+		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
+			cached, lookupErr := s.activateIdempotencyRepo.WithTx(tx).Lookup(ctx, tenantID, idempotencyKey)
+			if lookupErr != nil {
+				return fmt.Errorf("rollback idempotency lookup: %w", lookupErr)
+			}
+			if cached != nil {
+				if cached.AppName != appName || cached.DeploymentID != rolledBackID {
+					return ErrIdempotencyKeyMismatch
+				}
+				// Replay: the active row already reflects this
+				// deployment_id from the original rollback.
+				// Skip buildPublishPayload + outbox INSERT +
+				// AddMemoryMB deltas + the cache Insert below.
+				return nil
+			}
+		}
+
 		// Build the TaskMessage payload inside the tx (issue #42) so
 		// env / tenant / quota reads participate in the same atomic
 		// snapshot as the active_deployments mutation. The drainer
@@ -1858,6 +1999,24 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		}
 		if _, err := s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, -rollbackPerApp); err != nil {
 			return fmt.Errorf("subtracting memory quota for rolled-back-from deployment: %w", err)
+		}
+		// Issue #439: Idempotency-Key replay record for rollback.
+		// Mirrors the activate-path Insert above: lands inside the
+		// same tx as the active_deployments mutation + outbox
+		// INSERT, so a tx rollback also rolls back the cache row.
+		// ON CONFLICT DO NOTHING absorbs concurrent retries.
+		// Lookup (above, after txActive.Set) keys the comparison
+		// on (app_name, rolledBackID) — the rolled-back-TO
+		// deployment id, not the rolled-back-FROM one.
+		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
+			if iErr := s.activateIdempotencyRepo.WithTx(tx).Insert(ctx, &domain.ActiveDeploymentIdempotencyKey{
+				TenantID:       tenantID,
+				IdempotencyKey: idempotencyKey,
+				AppName:        appName,
+				DeploymentID:   rolledBackID,
+			}); iErr != nil {
+				return fmt.Errorf("recording rollback idempotency key: %w", iErr)
+			}
 		}
 		return nil
 	}); err != nil {

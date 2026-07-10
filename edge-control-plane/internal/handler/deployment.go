@@ -57,20 +57,27 @@ type DeploymentHandler struct {
 // Kept package-local so handler tests can implement it inline without
 // having to mock the full DeploymentService surface.
 type deploymentRollbacker interface {
-	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error)
 }
 
 // deploymentActivator is the narrow contract the Activate handler needs.
 // Mirrors deploymentRollbacker for the activate path.
+//
+// `idempotencyKey` is the value of the Idempotency-Key header
+// (issue #439). Empty string preserves pre-#439 behaviour — the
+// service skips the cache lookup and mints a fresh outbox row.
+// Non-empty triggers the activate-side replay cache at
+// DeploymentService.SetActivateIdempotencyRepo.
 type deploymentActivator interface {
-	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID string) error
+	ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID, idempotencyKey string) error
 }
 
 // deploymentPromoter is the narrow contract the Promote handler needs.
 // PromoteDeployment activates a deployment under a different app name
 // than it was originally deployed under (preview → production).
+// `idempotencyKey` mirrors deploymentActivator (issue #439).
 type deploymentPromoter interface {
-	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID string) error
+	PromoteDeployment(ctx context.Context, tenantID, targetAppName, deploymentID, idempotencyKey string) error
 }
 
 func NewDeploymentHandler(deploymentSvc *service.DeploymentService, workerSvc service.AppTargetLookup, trafficSvc *service.TrafficService, artifactStore storage.ArtifactStore, wasm2cwasmPath string) *DeploymentHandler {
@@ -755,6 +762,22 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotency-Key (issue #439). Mirrors the Deploy handler
+	// (issue #52) — optional header that pins a retry to the
+	// original publish so a concurrent activate (CI retry on 502,
+	// two operators clicking the dashboard button) doesn't enqueue
+	// a second task_update outbox row.
+	//
+	// 400 (not 422) for a malformed key: the value can't be
+	// reshaped into something useful; "go away and re-decide
+	// whether you want idempotency" is the right message — same
+	// shape as Deploy.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" && !idempotencyKeyFormat.MatchString(idemKey) {
+		httperror.BadRequestCtx(w, r, "invalid Idempotency-Key format (must match [a-fA-F0-9-]{8,128})")
+		return
+	}
+
 	weightStr := r.URL.Query().Get("weight")
 	// Omitting ?weight entirely means atomic activation (weight=100) — the
 	// legacy default. Parsing only overrides the value when the query
@@ -776,7 +799,7 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	// Treats ?weight=100 as identical to omitting ?weight= entirely (the
 	// canary path is for partial weights only).
 	if weight == 100 {
-		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID); err != nil {
+		if err := h.activateSvc.ActivateDeployment(r.Context(), tenantID, appName, deploymentID, idemKey); err != nil {
 			// Issue #440: surface the disable-vs-activate race gate as a
 			// 409 Conflict so the CLI / operator tooling can distinguish
 			// "tenant is locked, don't retry" from a generic infrastructure
@@ -784,6 +807,16 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 			// a 500 with the canonical "internal error" envelope.
 			if errors.Is(err, service.ErrTenantDisabled) {
 				httperror.ConflictCtx(w, r, "tenant is disabled")
+				return
+			}
+			// Issue #439: surface the Idempotency-Key reuse-with-
+			// different-body path as a 422 so the CLI can distinguish
+			// "you reused a key by mistake" from a generic 500 — same
+			// shape Deploy uses at handler/deployment.go:457.
+			// httperror doesn't export a 422 helper today, so this
+			// mirrors Deploy's bare http.Error(... 422) pattern.
+			if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
 				return
 			}
 			log.Printf("internal error: %v", err)
@@ -878,7 +911,15 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName)
+	// Idempotency-Key (issue #439). Mirrors the Activate handler —
+	// see handler/deployment.go:Activate for the rationale.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" && !idempotencyKeyFormat.MatchString(idemKey) {
+		httperror.BadRequestCtx(w, r, "invalid Idempotency-Key format (must match [a-fA-F0-9-]{8,128})")
+		return
+	}
+
+	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName, idemKey)
 	if err != nil {
 		if errors.Is(err, service.ErrTenantDisabled) {
 			httperror.ConflictCtx(w, r, "tenant is disabled")
@@ -892,10 +933,12 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 			return
 		}
-		// Issue #440: tenant disabled mid-rollback. 409 matches
-		// the state-conflict mapping above for ErrNoLastGood.
-		if errors.Is(err, service.ErrTenantDisabled) {
-			http.Error(w, `{"error": "tenant is disabled; re-enable via the admin endpoint and retry"}`, http.StatusConflict)
+		// Issue #439: surface the Idempotency-Key reuse-with-
+		// different-body path as a 422 so the CLI can distinguish
+		// "you reused a key by mistake" from a generic 500 — same
+		// shape Deploy uses at handler/deployment.go:457.
+		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
 			return
 		}
 		log.Printf("internal error: %v", err)
@@ -949,7 +992,15 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID); err != nil {
+	// Idempotency-Key (issue #439). Mirrors the Activate handler —
+	// see handler/deployment.go:Activate for the rationale.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" && !idempotencyKeyFormat.MatchString(idemKey) {
+		httperror.BadRequestCtx(w, r, "invalid Idempotency-Key format (must match [a-fA-F0-9-]{8,128})")
+		return
+	}
+
+	if err := h.promoteSvc.PromoteDeployment(r.Context(), tenantID, targetAppName, deploymentID, idemKey); err != nil {
 		if errors.Is(err, service.ErrDeploymentNotFound) {
 			httperror.NotFoundCtx(w, r, "deployment not found")
 			return
@@ -959,6 +1010,13 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 		// the gate fires identically and the handler maps to 409 here.
 		if errors.Is(err, service.ErrTenantDisabled) {
 			httperror.ConflictCtx(w, r, "tenant is disabled")
+			return
+		}
+		// Issue #439: surface the Idempotency-Key reuse-with-
+		// different-body path as a 422 — same shape Deploy uses at
+		// handler/deployment.go:457.
+		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
 			return
 		}
 		log.Printf("internal error: %v", err)

@@ -25,19 +25,23 @@ import (
 type stubPromoter struct {
 	err    error
 	called bool
-	// lastTenant / lastApp / lastDeploymentID record the arguments the
-	// handler passed so the disabled-tenant test can assert that the
-	// request actually reached the service layer before the gate fired.
-	lastTenant       string
-	lastApp          string
-	lastDeploymentID string
+	// lastTenant / lastApp / lastDeploymentID / lastIdempotencyKey
+	// record the arguments the handler passed so the disabled-tenant
+	// test can assert that the request actually reached the service
+	// layer before the gate fired, and that the Idempotency-Key header
+	// is plumbed through (issue #439).
+	lastTenant         string
+	lastApp            string
+	lastDeploymentID   string
+	lastIdempotencyKey string
 }
 
-func (s *stubPromoter) PromoteDeployment(_ context.Context, tenantID, appName, deploymentID string) error {
+func (s *stubPromoter) PromoteDeployment(_ context.Context, tenantID, appName, deploymentID, idempotencyKey string) error {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName
 	s.lastDeploymentID = deploymentID
+	s.lastIdempotencyKey = idempotencyKey
 	return s.err
 }
 
@@ -110,5 +114,93 @@ func TestPromote_TenantDisabled_Returns409(t *testing.T) {
 	// Body must not leak the raw sentinel.
 	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
 		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Promote — Idempotency-Key plumbing (issue #439)
+// ---------------------------------------------------------------------------
+//
+// PromoteDeployment delegates to the same activateDeployment
+// inner function as Activate. Promoting with the same
+// `Idempotency-Key` should be idempotent under the issue #439
+// fix — the handler plumbs the header through and the service
+// layer short-circuits on cache hit.
+
+// TestPromote_HonoursIdempotencyKey asserts the header reaches the
+// service layer untouched. Service-side replay short-circuit is
+// exercised at the service layer (deployment_test.go).
+func TestPromote_HonoursIdempotencyKey(t *testing.T) {
+	svc := &stubPromoter{}
+	mux := newPromoteMux(svc)
+
+	const valid = "01234567-89ab-cdef-0123-456789abcdef"
+	req := httptest.NewRequest("POST", "/api/apps/myapp/promote/d_x", nil)
+	req.Header.Set("Idempotency-Key", valid)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	// Promote stub returns nil err on success — the handler writes a
+	// 200 with the {"status":"promoted"} body shape.
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if !svc.called {
+		t.Fatal("PromoteDeployment was not called")
+	}
+	if svc.lastIdempotencyKey != valid {
+		t.Errorf("PromoteDeployment called with idempotencyKey %q, want %q", svc.lastIdempotencyKey, valid)
+	}
+}
+
+// TestPromote_MalformedIdempotencyKey_Returns400 mirrors the
+// activate-side and rollback-side tests. The regex gate sits at
+// the top of Promote (after path-segment validation), so a
+// malformed key short-circuits before any service call. The
+// stub's `called` flag must stay false.
+func TestPromote_MalformedIdempotencyKey_Returns400(t *testing.T) {
+	svc := &stubPromoter{}
+	mux := newPromoteMux(svc)
+
+	for _, bad := range []string{"short", "with spaces", "01234567-89ab-cdef-0123-456789abcdeX"} {
+		req := httptest.NewRequest("POST", "/api/apps/myapp/promote/d_x", nil)
+		req.Header.Set("Idempotency-Key", bad)
+		req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("key %q: status = %d, want 400; body: %s", bad, rr.Code, rr.Body.String())
+		}
+		if svc.called {
+			t.Errorf("key %q: PromoteDeployment must not be called for malformed key", bad)
+		}
+	}
+}
+
+// TestPromote_IdempotencyKeyMismatch_Returns422 covers the
+// re-use-with-different-body path on the promote side. Body
+// shape mirrors the activate-side and rollback-side 422
+// (legacy bare http.Error — no httperror.UnprocessableEntityCtx
+// helper exported today).
+func TestPromote_IdempotencyKeyMismatch_Returns422(t *testing.T) {
+	svc := &stubPromoter{err: service.ErrIdempotencyKeyMismatch}
+	mux := newPromoteMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/promote/d_x", nil)
+	req.Header.Set("Idempotency-Key", "01234567-89ab-cdef-0123-456789abcdef")
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), service.ErrIdempotencyKeyMismatch.Error()) {
+		t.Errorf("body must surface sentinel message %q; got %s", service.ErrIdempotencyKeyMismatch.Error(), rr.Body.String())
+	}
+	if !svc.called {
+		t.Error("PromoteDeployment was not called — the 422 mapping only matters if the request reached the cache check")
 	}
 }

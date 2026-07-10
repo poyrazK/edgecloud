@@ -103,8 +103,13 @@ type InternalHandler struct {
 // GetDeployment + GetArtifact so the production code path doesn't need
 // to switch field accessors. Mirrors the pattern in DeploymentHandler
 // (deploymentRollbacker in deployment.go).
+//
+// Issue #439: trailing idempotencyKey (always "" for internal callers
+// today — AutoRollback is worker-driven, never carries an
+// Idempotency-Key header; the parameter exists only so the contract
+// matches the one in deployment.go).
 type autoRollbacker interface {
-	RollbackDeployment(ctx context.Context, tenantID, appName string) (string, error)
+	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error)
 	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
 	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string, format string) (io.ReadCloser, error)
 }
@@ -406,7 +411,7 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	//
 	// Note (issue #42): the previous 502 case for service.ErrPublishFailed
 	// is removed — the post-commit publish is now durable via the outbox.
-	newID, err := h.deploymentSvc.RollbackDeployment(r.Context(), req.TenantID, appName)
+	newID, err := h.deploymentSvc.RollbackDeployment(r.Context(), req.TenantID, appName, "")
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrNoLastGood):
