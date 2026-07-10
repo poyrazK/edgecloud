@@ -557,10 +557,10 @@ jobs:
           echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
           exit 0
 
-      - name: Install Rust toolchain (wasm32-wasip1 + wasm32-wasip2)
+      - name: Install Rust toolchain (wasm32-wasip2)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip1,wasm32-wasip2
+          targets: wasm32-wasip2
 
       - name: Install Node 20
         uses: actions/setup-node@v4
@@ -569,13 +569,14 @@ jobs:
 
       - name: Install wasm-tools 1.252.x
         # Pin to ^1.252 to match the version scripts/dev-install.sh
-        # and .github/workflows/preview.yml use. wasm-tools pulls in
-        # `wasi-preview1-component-adapter-provider` as a transitive
-        # dep, which is what populates the cargo registry with the
-        # wasi-preview1 reactor adapter the CLI's build.rs globs for.
-        # `cargo install --locked` pins the dependency graph; the
-        # `target-dir` override is just to keep the install out of
-        # the project's target/ tree.
+        # and .github/workflows/preview.yml use. wasm-tools is
+        # required by the Rust guest pipeline (`edge build --lang=rust`'s
+        # wrap step), `edge-migrate`, the worker fixture build, and
+        # the Go control plane's `wrapAsComponent` — NOT by the JS
+        # pipeline anymore (the wasip2 cargo target emits a complete
+        # component, no wrap). `cargo install --locked` pins the
+        # dependency graph; the `target-dir` override keeps the
+        # install out of the project's target/ tree.
         run: |
           cargo install wasm-tools --locked --version '^1.252' \
             --root "$HOME/.cargo"
@@ -597,9 +598,10 @@ jobs:
         # The full happy-path the user takes: `npm install` resolves
         # `@edgecloud/sdk` from npm via the `^0.2.0` pin in
         # samples/hello-js/package.json, then `edge build --lang=js`
-        # bundles src/handler.js, builds edge-js-runtime for
-        # wasm32-wasip1, and wraps with `wasm-tools component new
-        # --adapt`. The end-to-end build is the regression check —
+        # bundles src/handler.js and builds edge-js-runtime directly
+        # for `wasm32-wasip2` (no `--adapt` wrap needed — the wasip2
+        # cargo target emits a complete WASI Preview 2 component
+        # natively). The end-to-end build is the regression check —
         # the unit tests in edge-cli/src/commands/init.rs only cover
         # the template shape, not the build itself.
         #
