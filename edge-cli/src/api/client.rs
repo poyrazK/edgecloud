@@ -724,24 +724,35 @@ impl ApiClient {
         // optional — `None` still works (older CLI versions never
         // produced it), the server treats an absent part the same
         // as a JSON document with every field empty.
+        //
+        // ORDER MATTERS: the server-side `extractDeployParts` walks
+        // the multipart body and stops at the first `file` part so
+        // the handler can read its body via `io.Copy`. That means
+        // any `build_metadata` part must appear BEFORE the `file`
+        // part in the envelope — otherwise it's silently dropped.
+        // reqwest's `Form::part`/`Form::text` preserve insertion
+        // order, so we append `build_metadata` first, then `file`.
+        // (Issue #52 follow-up.)
         let mut form = reqwest::blocking::multipart::Form::new();
+        if let Some(meta) = build_metadata {
+            // `build_metadata` is JSON — encode it once and ship as
+            // a text part so the server-side handler can
+            // `multipart.FormValue` it and parse. Must be appended
+            // before the `file` part (see ORDER MATTERS comment).
+            let raw = serde_json::to_string(meta)?;
+            form = form.text("build_metadata", raw);
+        }
         // `file` part: the wasm bytes with a sensible filename so
         // the server's `mime/multipart` parser sees
         // `filename="<app>.wasm"` (helps when the handler wants to
-        // log the name).
+        // log the name). Append LAST so the server's
+        // `extractDeployParts` finds it after scanning `build_metadata`.
         let cursor = std::io::Cursor::new(wasm_bytes.to_vec());
         let file_part = reqwest::blocking::multipart::Part::reader(cursor)
             .file_name(format!("{}.wasm", app_name))
             .mime_str("application/wasm")
             .map_err(|e| anyhow::anyhow!("invalid mime: {e}"))?;
         form = form.part("file", file_part);
-        if let Some(meta) = build_metadata {
-            // `build_metadata` is JSON — encode it once and ship as
-            // a text part so the server-side handler can
-            // `multipart.FormValue` it and parse.
-            let raw = serde_json::to_string(meta)?;
-            form = form.text("build_metadata", raw);
-        }
 
         // Issue #52: forward the Idempotency-Key header when the caller
         // supplied one. Empty string = "auto-mint happened, the
