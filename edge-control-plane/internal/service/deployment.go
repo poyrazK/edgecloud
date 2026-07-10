@@ -853,6 +853,14 @@ func previewPRNumberFromDeployment(d *domain.Deployment) int {
 // a task update, without checking the deployment's original app name.
 func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, appName, deploymentID string, deployment *domain.Deployment, autoRollbackEnabled bool) error {
 
+	// Generate a fresh attempt_id stamped onto this activation's
+	// active_deployments row. The post-commit publishSwap then runs
+	// a CAS UPDATE that requires the row to still carry THIS attempt
+	// id; if a concurrent activate has overwritten it, the CAS
+	// matches zero rows and the publish is skipped (the other
+	// activate owns this publish cycle). See issue #439.
+	attemptID := uuid.NewString()
+
 	// Atomically move the current active id into last_good_deployment_id
 	// and write the new id. Two readers can race on a non-tx read+write;
 	// use a tx with FOR UPDATE so concurrent activate/rollback serialize.
@@ -897,6 +905,13 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			// pre-#308 behavior.
 			PreviewID:       deployment.PreviewID,
 			PreviewPRNumber: deployment.PreviewPRNumber,
+			// Stamp this activation's attempt id (issue #439). Set's
+			// DO UPDATE clause resets last_publish_attempt_id to the
+			// caller-supplied value (repository/active_deployment.go:97),
+			// so by writing the fresh UUID here the row becomes
+			// "owned" by THIS activate until publishSwap's CAS
+			// either claims it or a concurrent activate overwrites it.
+			LastPublishAttemptID: &attemptID,
 		}); err != nil {
 			return fmt.Errorf("setting active deployment: %w", err)
 		}
@@ -989,7 +1004,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 	if len(regions) == 0 {
 		regions = []string{s.defaultRegion}
 	}
-	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions); err != nil {
+	if err := s.publishSwap(ctx, tenantID, appName, deploymentID, msg, regions, attemptID); err != nil {
 		return err
 	}
 	if s.webhookSvc != nil {
@@ -1039,7 +1054,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 // wrapping ErrPublishFailed on any per-region failure.
 // errors.Is(err, ErrPublishFailed) matches via the *PublishError's
 // Unwrap, preserving the contract the pre-step-6 handler relied on.
-func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string) error {
+func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, deploymentID string, msg *nats.TaskMessage, regions []string, attemptID string) error {
 	// Read the committed row's publish state. The Set upsert at the
 	// start of Activate / Rollback wipes regions_published and
 	// regions_failed to empty (see ActiveDeploymentRepository.Set's
@@ -1105,7 +1120,39 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 		return nil
 	}
 
-	attemptID := uuid.NewString()
+	// CAS gate (issue #439). The activate / rollback tx wrote
+	// attemptID onto the active_deployments row's last_publish_attempt_id
+	// column. If a CONCURRENT activate / rollback on the same
+	// (tenant, app) has since overwritten our attempt_id with a
+	// different UUID, that other caller's Set bumped the column to
+	// their own attempt_id and they own the publish cycle for THIS
+	// deployment_id. Skip silently — the row's publish state is now
+	// theirs to drive.
+	//
+	// Single round trip; row-level write lock is acquired and
+	// released inside this one statement (no long-held lock through
+	// the NATS loop). Set-vs-publishSwap is the only race here:
+	// Set itself is serialized by the activate tx's
+	// active_deployments GetForUpdate, so two concurrent activates
+	// on the same row will produce two writes whose relative order
+	// is determined by Postgres's row-lock grant order. The loser
+	// of that race observes the winner's attempt_id here and exits.
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE active_deployments
+		SET    last_publish_attempt_id = $3
+		WHERE  tenant_id = $1 AND app_name = $2
+		  AND  last_publish_attempt_id = $3
+	`, tenantID, appName, attemptID)
+	if err != nil {
+		return fmt.Errorf("claiming publish attempt: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// Lost the race. The other activate's Set overwrote our
+		// attempt_id; it owns the publish for this deployment_id.
+		return nil
+	}
+
 	now := time.Now()
 
 	// Per-region artifact-cache push (issue #332, Layer 3). Runs
@@ -1373,6 +1420,20 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	var rollbackPreviewID string
 	var rollbackPreviewPRNumber int
 	var regions []string
+	// Fresh attempt id for this rollback's publish cycle (issue
+	// #439). Mirrors the activate path: written inside the tx onto
+	// last_publish_attempt_id, then the post-commit publishSwap CAS
+	// claims it. If a concurrent activate/rollback has overwritten
+	// our attempt_id by then, the CAS matches zero rows and the
+	// other path owns the publish for this deployment_id.
+	//
+	// We pre-allocate the UUID (vs. a closure inside the tx) so the
+	// same value is referenced both by Set's LastPublishAttemptID
+	// pointer and by the post-commit publishSwap call. The cost of
+	// allocating a UUID that the tx then rolls back is negligible —
+	// uuid.NewString is cheap and the value is only consumed by the
+	// CAS predicate, which is no-op against a rolled-back row.
+	attemptID := uuid.NewString()
 	var tenant *domain.Tenant
 	var envs []domain.AppEnv
 	var maxMemoryMB int
@@ -1444,6 +1505,14 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			// it's a tenant preference, not a property of any single
 			// deployment, so it should survive a swap.
 			AutoRollbackEnabled: current.AutoRollbackEnabled,
+			// Stamp this rollback's attempt id (issue #439). Same
+			// contract as activate: Set's DO UPDATE clause resets
+			// last_publish_attempt_id to caller-supplied
+			// (repository/active_deployment.go:97), so the row
+			// becomes "owned" by THIS rollback until the CAS in
+			// publishSwap either claims it or a concurrent
+			// activate / rollback overwrites it.
+			LastPublishAttemptID: &attemptID,
 		}); err != nil {
 			return fmt.Errorf("swapping active deployment: %w", err)
 		}
@@ -1515,7 +1584,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			),
 		},
 	}
-	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions); err != nil {
+	if err := s.publishSwap(ctx, tenantID, appName, rolledBackID, msg, regions, attemptID); err != nil {
 		return "", err
 	}
 

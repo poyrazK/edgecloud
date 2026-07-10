@@ -567,6 +567,28 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+// expectCASGate mocks the issue #439 CAS UPDATE that publishSwap
+// runs after the post-commit read. The activate / rollback tx
+// wrote attemptID onto the row's last_publish_attempt_id column;
+// this UPDATE re-asserts it so the service can detect a concurrent
+// activate / rollback that overwrote the column. RowsAffected=1
+// means publishSwap proceeds; RowsAffected=0 means it lost the race
+// and returns nil silently (the other caller owns this publish
+// cycle). Default RowsAffected=1 here because every test below
+// expects the gate to succeed.
+//
+// attemptID is sqlmock.AnyArg() when the UUID is generated inside
+// the service (ActivateDeployment callers), or a literal UUID
+// when the test calls publishSwap directly and supplies its own.
+// The CAS string is whitespace-tolerant so the same regex matches
+// regardless of whether the production code formats the SQL with
+// a single space or newlines.
+func expectCASGate(mock sqlmock.Sqlmock, tenantID, appName string, attemptID interface{}) {
+	mock.ExpectExec(`UPDATE active_deployments\s+SET\s+last_publish_attempt_id = \$3\s+WHERE\s+tenant_id = \$1\s+AND\s+app_name = \$2\s+AND\s+last_publish_attempt_id = \$3`).
+		WithArgs(tenantID, appName, attemptID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
 // expectPostCommitReadAndAppend mocks the post-tx publish-state
 // read + the append calls that publishSwap issues on a freshly-
 // activated row. The Set upsert inside ActivateDeployment resets
@@ -611,6 +633,15 @@ func expectPostCommitReadAndAppend(mock sqlmock.Sqlmock, tenantID, appName strin
 			"{}", "{}", "{}", "{}",
 			nil, nil, nil, nil,
 		))
+
+	// CAS gate (issue #439). The activate / rollback tx wrote
+	// attemptID onto the row; this UPDATE re-asserts it so the
+	// service detects a concurrent activate / rollback that
+	// overwrote it. RowsAffected=1 means publishSwap proceeds.
+	// The attempt id is generated inside the service for
+	// ActivateDeployment calls and supplied by the test for direct
+	// publishSwap calls; sqlmock.AnyArg() covers both cases.
+	expectCASGate(mock, tenantID, appName, sqlmock.AnyArg())
 
 	// AppendRegionsPublished / AppendRegionsFailed fire on a
 	// successful / failed per-region publish respectively;
@@ -689,6 +720,11 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	// The atomic test deliberately uses a known attemptID so the
+	// failing-append path is exercised below.
+	expectCASGate(mock, tenantID, appName, "attempt-atomic")
+
 	pub := &RecordingPublisher{
 		// us-east succeeds, eu-west fails — so published=[us-east],
 		// failed=[eu-west] and BOTH appends run inside the tx.
@@ -721,7 +757,7 @@ func TestPublishSwap_AppendsAreAtomic(t *testing.T) {
 		TenantID: tenantID,
 		Apps:     map[string]nats.AppConfig{appName: {DeploymentID: "d_atomic"}},
 	}
-	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic", msg, []string{"us-east", "eu-west"})
+	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic", msg, []string{"us-east", "eu-west"}, "attempt-atomic")
 	if err == nil {
 		t.Fatal("publishSwap: want PublishError wrapping ErrPublishFailed, got nil")
 	}
@@ -842,6 +878,9 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-skip")
+
 	pub := &RecordingPublisher{}
 	// Wire the cache pusher so the cache loop runs. Both regions
 	// succeed; `fra` is skipped due to alreadyCached (no push),
@@ -897,7 +936,7 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_skip", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_skip", msg, []string{"fra", "iad"}, "attempt-skip"); err != nil {
 		t.Fatalf("publishSwap: %v", err)
 	}
 
@@ -955,6 +994,9 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-atomic-cache")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 
@@ -1006,7 +1048,7 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic_cache", msg, []string{"fra"})
+	err = svc.publishSwap(context.Background(), tenantID, appName, "d_atomic_cache", msg, []string{"fra"}, "attempt-atomic-cache")
 	// The publish itself succeeded (the NATS publish loop is
 	// before the tx) — so the publisher saw the call. The cache
 	// append failure is "best effort" (matches the existing
@@ -1078,6 +1120,9 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-split")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 
@@ -1130,7 +1175,7 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_split", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_split", msg, []string{"fra", "iad"}, "attempt-split"); err != nil {
 		t.Fatalf("publishSwap: want nil (no NATS failures, cache is best-effort), got %v", err)
 	}
 
@@ -1187,6 +1232,9 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 			nil, nil, nil, nil,
 		))
 
+	// Issue #439: publishSwap runs the CAS gate after the read.
+	expectCASGate(mock, tenantID, appName, "attempt-best-effort")
+
 	pub := &RecordingPublisher{}
 	cachePusher := newRecordingCachePusher()
 	cachePusher.failFor["fra"] = errors.New("cache 500")
@@ -1242,7 +1290,7 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"worker_id", "apps", "last_report"}).
 			AddRow("w_us-east_1", json.RawMessage(appsJSON), time.Now()))
 
-	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_best_effort", msg, []string{"fra", "iad"}); err != nil {
+	if err := svc.publishSwap(context.Background(), tenantID, appName, "d_best_effort", msg, []string{"fra", "iad"}, "attempt-best-effort"); err != nil {
 		t.Fatalf("publishSwap: want nil (cache failures are best-effort), got %v", err)
 	}
 
