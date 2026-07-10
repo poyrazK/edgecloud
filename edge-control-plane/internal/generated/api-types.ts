@@ -1882,6 +1882,19 @@ export interface components {
              */
             used_request_count?: number;
             /**
+             * Format: int64
+             * @description Aggregate memory (MiB) held by the tenant's active deployments (issue #44, part 2).
+             *     Incremented on activate / promote, decremented on rollback. Unlike
+             *     `used_outbound_bytes` and `used_request_count`, this counter is NOT
+             *     month-bounded: the cap is per-tenant-aggregate, not per-month. Drives
+             *     deploy-time enforcement — when `used_memory_mb + per_app_memory >
+             *     max_memory_mb`, deploy-time returns 402 PAYMENT_REQUIRED with reason
+             *     `memory_quota_will_be_exceeded`. Enterprise plan uses max_memory_mb=-1
+             *     to bypass the check.
+             * @example 0
+             */
+            used_memory_mb?: number;
+            /**
              * Format: date-time
              * @description UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
              * @example 2026-07-01T00:00:00Z
@@ -2471,8 +2484,11 @@ export interface components {
          *     payment action. Distinct from `QuotaExceeded` (429), which is
          *     a per-resource throttle with a Retry-After hint. 402 indicates
          *     a billing condition that will not resolve by waiting:
-         *     `subscription_past_due`, `free_tier_exceeded`,
-         *     `quota_lock_grace_active`, or `quota_will_be_exceeded`.
+         *     `subscription_past_due`, `subscription_canceled`,
+         *     `free_tier_exceeded`, `quota_lock_grace_active`,
+         *     `quota_will_be_exceeded`, or `memory_quota_will_be_exceeded`
+         *     (issue #44, part 2 — the tenant's aggregate active-deployment
+         *     memory would exceed `max_memory_mb`).
          */
         PaymentRequired: {
             headers: {
@@ -2483,7 +2499,7 @@ export interface components {
                  * @example {
                  *       "error": {
                  *         "code": "PAYMENT_REQUIRED",
-                 *         "message": "quota will be exceeded by this deploy"
+                 *         "message": "memory quota will be exceeded by this deploy"
                  *       }
                  *     }
                  */

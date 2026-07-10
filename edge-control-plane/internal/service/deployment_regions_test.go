@@ -654,7 +654,7 @@ func expectInTxOutboxInsert(mock sqlmock.Sqlmock, tenantID, appName string) {
 // (issue #44 part 2): deployment.go::activateDeployment re-reads the
 // quota row inside the tx (defensive snapshot read after the outbox
 // INSERT — same row shape as the buildPublishPayload read above),
-// calls perAppMemoryMB(quota) to get the per-app value, then UPDATEs
+// calls perAppMemoryMB(quota) to get the per-app value, then UPDATE
 // used_memory_mb = used_memory_mb + $N. The shape of the delta
 // (positive for activate, negative for rollback) is mirrored by
 // `maxMemoryMB`: the SELECT row uses that as max_memory_mb (since
