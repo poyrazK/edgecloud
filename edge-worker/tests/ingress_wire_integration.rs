@@ -177,28 +177,56 @@ async fn run_test() -> anyhow::Result<()> {
     assert_eq!(received.worker_id, worker_id, "worker_id must round-trip");
     assert_eq!(received.region, region, "region must round-trip");
 
-    // Assert 3: the ingress's apply_heartbeat populates the routing
-    // table from the parsed message. The table is empty before the
-    // call, has exactly one row after, and the row carries the
-    // worker's address verbatim.
+    // Assert 3a: an app-less heartbeat is the "worker shutting down"
+    // signal — apply_heartbeat removes any routes for the worker and
+    // returns false when there was nothing to remove. (The pre-#583
+    // behavior of inserting a placeholder port-0 row is gone.)
     let table = Arc::new(RoutingTable::new());
     assert_eq!(table.len().await, 0, "table starts empty");
 
     let changed = apply_heartbeat(&table, &received).await;
     assert!(
+        !changed,
+        "empty-apps heartbeat against an empty table must be a no-op"
+    );
+    assert_eq!(
+        table.len().await,
+        0,
+        "no placeholder row for app-less heartbeats"
+    );
+
+    // Assert 3b: the same wire-parsed message WITH an app populates the
+    // routing table, and the row carries the worker's address verbatim —
+    // the actual #70 contract (worker_addr flows into routing).
+    let mut with_app = received.clone();
+    with_app.apps.insert(
+        "wire-app".to_string(),
+        edge_worker::messages::AppStatus {
+            deployment_id: "d_wire_001".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_wire".to_string(),
+            port: 8081,
+            observer_metrics: Vec::new(),
+            ws_port: None,
+            dedupe_id: None,
+            last_error: None,
+        },
+    );
+    let changed = apply_heartbeat(&table, &with_app).await;
+    assert!(
         changed,
-        "apply_heartbeat must return true for a valid heartbeat"
+        "apply_heartbeat must return true for a heartbeat with a running app"
     );
 
     let snap = table.snapshot().await;
     assert_eq!(snap.len(), 1, "exactly one route expected");
     assert_eq!(snap[0].worker_addr, worker_worker_addr);
     assert_eq!(snap[0].worker_addr, "203.0.113.42:8080");
-    assert_eq!(
-        snap[0].port, 0,
-        "no apps in heartbeat ⇒ port is the default 0"
-    );
-    assert_eq!(snap[0].tenant_id, "", "no apps ⇒ no tenant_id");
+    assert_eq!(snap[0].port, 8081, "route must carry the app's port");
+    assert_eq!(snap[0].tenant_id, "t_wire", "route must carry the tenant");
 
     Ok(())
 }

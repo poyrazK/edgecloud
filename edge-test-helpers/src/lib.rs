@@ -207,8 +207,18 @@ async fn build_supervisor_inner(
         config.starting_port,
         config.port_cooldown_secs,
     )));
-    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url, 1, String::new()).await?)
-        as Arc<dyn NatsClientTrait>;
+    // Thread the config's queue_group through — hardcoding an empty
+    // string here silently forced every test supervisor into fan-out
+    // mode, so tests that set Config::queue_group (the issue-#86
+    // pinning test) never actually exercised queue-group delivery.
+    let nats = Arc::new(
+        NatsClientImpl::connect(
+            &config.nats_url,
+            config.task_stream_replicas,
+            config.queue_group.clone(),
+        )
+        .await?,
+    ) as Arc<dyn NatsClientTrait>;
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),

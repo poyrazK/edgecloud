@@ -270,22 +270,23 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
         .expect("publish heartbeat");
     client.flush().await.expect("flush");
 
-    // Wait for the pipeline to actually process the heartbeat and reload
-    // Caddy — poll the mock server rather than a fixed sleep (mirrors
-    // heartbeat_pipeline_drives_a_caddy_reload above). A blind fixed
-    // sleep is a flaky pattern: too short under load, and it gives no
-    // signal about whether the metric was ever going to appear.
-    timeout(Duration::from_secs(5), async {
+    // Wait for the SECOND Caddy reload before reading metrics. The
+    // pipeline pushes twice: a boot push at startup (empty routing
+    // table — gauges are set inside push_now, so it records
+    // routes_active=0) and a debounced push after the heartbeat upserts
+    // the route (routes_active=1). Polling for just one request races
+    // the boot push and reads the stale zero gauge.
+    timeout(Duration::from_secs(10), async {
         loop {
             let reqs = mock_server.received_requests().await.unwrap_or_default();
-            if !reqs.is_empty() {
+            if reqs.len() >= 2 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("wiremock saw a POST /load within 5s");
+    .expect("wiremock saw the boot POST /load AND the heartbeat-triggered one within 10s");
 
     // Read recorded metrics from the handle installed at test start.
     let output = handle.render();

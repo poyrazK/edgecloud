@@ -981,7 +981,11 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        // Unique port range: most TestHarness-based tests in this binary
+        // bind Handler apps at 18_000, and nextest runs tests
+        // concurrently — sharing 18_000 makes this test lose the OS bind
+        // race and the app lands in Crashed instead of Running.
+        starting_port: 23_000,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -1017,7 +1021,10 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
-        starting_port: 18_000,
+        // Distinct from worker A's 23_000 so an accidental double-start
+        // (pinning regression) fails the total==1 assert below instead
+        // of masking itself behind an intra-process bind conflict.
+        starting_port: 23_100,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
         epoch_deadline_ticks: 100,
@@ -1047,16 +1054,24 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     let (shutdown_tx_a, _) = tokio::sync::broadcast::channel::<()>(1);
     let (shutdown_tx_b, _) = tokio::sync::broadcast::channel::<()>(1);
 
+    // Surface consume-loop errors on stderr — `let _ =` would swallow a
+    // failed subscribe (missing stream, consumer-config rejection, …) and
+    // the test would then fail 15s later with an unexplained "no worker
+    // started" instead of the actual cause.
     let sup_a_clone = sup_a.clone();
     let shutdown_rx_a = shutdown_tx_a.subscribe();
     let handle_a = tokio::spawn(async move {
-        let _ = sup_a_clone.run_consume_loop(shutdown_rx_a).await;
+        if let Err(e) = sup_a_clone.run_consume_loop(shutdown_rx_a).await {
+            eprintln!("worker A consume loop exited with error: {e:#}");
+        }
     });
 
     let sup_b_clone = sup_b.clone();
     let shutdown_rx_b = shutdown_tx_b.subscribe();
     let handle_b = tokio::spawn(async move {
-        let _ = sup_b_clone.run_consume_loop(shutdown_rx_b).await;
+        if let Err(e) = sup_b_clone.run_consume_loop(shutdown_rx_b).await {
+            eprintln!("worker B consume loop exited with error: {e:#}");
+        }
     });
 
     // Give both consume loops a moment to subscribe before publishing.
@@ -1092,6 +1107,23 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
     let started =
         wait_for_either_app_running(&[sup_a.clone(), sup_b.clone()], "t_test", "pinned-app", 15)
             .await;
+    if started.is_none() {
+        // Dump both workers' app registries so a CI failure explains
+        // itself (registered-but-crashed vs never-delivered).
+        for (label, sup) in [("A", &sup_a), ("B", &sup_b)] {
+            let state = sup.state.read().await;
+            if state.apps.is_empty() {
+                eprintln!("worker {label}: no apps registered (message never consumed?)");
+            }
+            for ((tenant, name), inst) in state.apps.iter() {
+                let inst = inst.lock().await;
+                eprintln!(
+                    "worker {label}: app ({tenant}, {name}) status={:?} last_error={:?}",
+                    inst.status, inst.last_error
+                );
+            }
+        }
+    }
     assert!(
         started.is_some(),
         "exactly one worker should have started pinned-app"
