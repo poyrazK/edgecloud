@@ -116,3 +116,60 @@ type NormalizedEvent interface {
 	Status() string
 	Provider() BillingProvider
 }
+
+// MeterKind is the closed set of metered dimensions the platform
+// knows about (issue #485). The string values mirror the CHECK
+// constraint on billing_usage_events.kind (migration 030) so the
+// domain type and the schema stay in lock-step; a new dimension
+// requires a migration that extends the CHECK list first.
+//
+// Symmetry with `BillingProvider`: a typed-domain alias that the
+// application code reads/writes while the DB sees the plain string,
+// so a future migration adding a fourth dimension only requires
+// adding a constant here plus the schema change.
+type MeterKind string
+
+const (
+	// MeterKindResidentSeconds is the LongRunning-resident-time
+	// dimension. The worker stamps it on each heartbeat (issue #484)
+	// and the MeteringProvider records it as Stripe metered usage
+	// (issue #485). Quantity = wall-clock seconds.
+	MeterKindResidentSeconds MeterKind = "resident_seconds"
+
+	// MeterKindRequestCount is the per-request dimension. Summed from
+	// every accepted HTTP request across Handler (FaaS) and
+	// long-running app entries. Quantity = request count.
+	MeterKindRequestCount MeterKind = "request_count"
+
+	// MeterKindOutboundBytes is the outbound-bandwidth dimension.
+	// Summed from RequestMeter.outbound_bytes at heartbeat time.
+	// Quantity = bytes.
+	MeterKindOutboundBytes MeterKind = "outbound_bytes"
+)
+
+// MeterUsageEvent mirrors a single billing_usage_events row (issue
+// #485, migration 030). One row per (tenant, kind, quantity) batch —
+// the heartbeat pipeline writes one row per dimension per
+// `dedupe_id`, and the MeteringDrainer reads + dispatches them to the
+// configured MeteringProvider.
+//
+// `Kind` is constrained by the schema's CHECK constraint; the Go type
+// enforces the same closed set at compile time. A typed error
+// surfaces when the database ever returns an unknown value (it
+// shouldn't, but the repository is defensive about future schema
+// drifts that pre-empt a code update).
+//
+// The `db:` tags match the column names verbatim so sqlx can scan
+// RETURNING rows directly into this struct. `ProcessedAt` is a
+// pointer so the `IS NULL` column reads cleanly without a separate
+// nullable wrapper type.
+type MeterUsageEvent struct {
+	ID             int64      `db:"id"`
+	TenantID       string     `db:"tenant_id"`
+	Kind           MeterKind  `db:"kind"`
+	Quantity       int64      `db:"quantity"`
+	IdempotencyKey string     `db:"idempotency_key"`
+	RecordedAt     time.Time  `db:"recorded_at"`
+	ProcessedAt    *time.Time `db:"processed_at"`
+	Provider       string     `db:"provider"`
+}
