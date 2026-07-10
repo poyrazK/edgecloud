@@ -702,7 +702,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		ArtifactPath:    cfg.Storage.ArtifactPath,
 		WorkerSvc:       workerSvc,
 		ReconcileSvc:    reconcileSvc,
-		LogGC:           service.NewLogGCService(logEntryRepo),
+		LogGC:           service.NewLogGCService(logEntryRepo, metricsAgg.NewLogGCSink()),
 		WorkerGC:        service.NewWorkerGCService(workerRepo),
 		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
 		// Preview GC (issue #308). Wired with the deployment
@@ -710,7 +710,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// DeleteExpiredPreviewsByIDs) and the artifact store
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
-		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore),
+		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore, metricsAgg.NewPreviewGCSink(), metricsAgg.NewPreviewBlobFailureRecorder()),
 		// Cache-retry sweep (issue #501). Re-attempts cache pushes
 		// that landed in regions_cache_failed. The three getters
 		// read the live pusher + regionArtifactCaches map +
@@ -726,6 +726,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 			deploymentSvc.GetCachePusher,
 			deploymentSvc.GetRegionArtifactCaches,
 			func() int { return cfg.CacheRetry.MaxAttempts },
+			metricsAgg.NewCacheRetrySweepSink(),
 		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,

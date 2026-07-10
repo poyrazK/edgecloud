@@ -98,6 +98,7 @@ type CacheRetrySweepService struct {
 	pusherGetter       func() artifactCachePusher // late-bound — reads live pusher
 	regionCachesGetter func() map[string]string   // late-bound — reads live map
 	maxAttemptsGetter  func() int                 // late-bound — reads live MaxAttempts
+	sink               CacheRetrySweepSink        // issue #581 — metrics sink
 }
 
 // NewCacheRetrySweepService wires the sweep against its four
@@ -121,17 +122,28 @@ type CacheRetrySweepService struct {
 // another attempt). This matches the operator intent of "I want
 // retries forever" — the default is 10, but a `MaxAttempts=0` flip
 // is the documented escape hatch.
+//
+// The optional `sink` records one sweep-tick outcome (issue #581).
+// nil sink is a no-op so tests can construct the service without an
+// aggregator. The sink is called on every sweep tick (success or
+// error) but NOT when the run is refused-to-run or when the context
+// is pre-cancelled — same rationale as LogGCService.
 func NewCacheRetrySweepService(
 	repo cacheRetryRepoForSweep,
 	pusherGetter func() artifactCachePusher,
 	regionCachesGetter func() map[string]string,
 	maxAttemptsGetter func() int,
+	sink CacheRetrySweepSink,
 ) *CacheRetrySweepService {
+	if sink == nil {
+		sink = func(int, int, int, int, int, int, bool) {}
+	}
 	return &CacheRetrySweepService{
 		repo:               repo,
 		pusherGetter:       pusherGetter,
 		regionCachesGetter: regionCachesGetter,
 		maxAttemptsGetter:  maxAttemptsGetter,
+		sink:               sink,
 	}
 }
 
@@ -207,6 +219,7 @@ func (s *CacheRetrySweepService) Run(ctx context.Context, interval time.Duration
 				// next tick (next interval) re-attempts. A tight
 				// retry loop would amplify a transient DB blip into
 				// CPU pressure; the operator sees the log line.
+				s.sink(totalRowsTouched, totalPushedOK, totalPushedFailed, totalConfigMissing, totalGivenUp, totalBatchesSwept, true) // issue #581
 				return
 			}
 			if len(rows) == 0 {
@@ -239,6 +252,11 @@ func (s *CacheRetrySweepService) Run(ctx context.Context, interval time.Duration
 			log.Printf("cache_retry_sweep: sweep complete: %d rows touched, %d regions pushed OK, %d regions still failing, %d regions dropped (config missing), %d regions given up across %d batches",
 				totalRowsTouched, totalPushedOK, totalPushedFailed, totalConfigMissing, totalGivenUp, totalBatchesSwept)
 		}
+		// Record per-tick metrics (issue #581). One sink call per
+		// sweep, regardless of whether any rows were touched. The
+		// error flag is false here because every error path above
+		// returns BEFORE this point.
+		s.sink(totalRowsTouched, totalPushedOK, totalPushedFailed, totalConfigMissing, totalGivenUp, totalBatchesSwept, false)
 	}
 
 	runOnce()

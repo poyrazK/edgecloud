@@ -18,12 +18,24 @@ type logEntryRepoForGC interface {
 //
 // Errors are logged and the loop continues — a transient DB failure should
 // not silently halt the GC forever, but the operator should also see it.
+//
+// The optional `sink` records one tick outcome into the MetricsAggregator
+// (issue #581). nil sink is a no-op so tests can construct the service
+// without an aggregator. The sink is called on every sweep tick (success
+// or error) but NOT when the run is refused-to-run (zero/negative
+// interval or negative retention) or when the context is pre-cancelled —
+// those don't represent a tick attempt, and an "alert on never-ticked"
+// rule should fire in that case.
 type LogGCService struct {
 	repo logEntryRepoForGC
+	sink LogGCSink
 }
 
-func NewLogGCService(repo logEntryRepoForGC) *LogGCService {
-	return &LogGCService{repo: repo}
+func NewLogGCService(repo logEntryRepoForGC, sink LogGCSink) *LogGCService {
+	if sink == nil {
+		sink = func(int64, bool) {} // nil-safe no-op for tests
+	}
+	return &LogGCService{repo: repo, sink: sink}
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires immediately
@@ -75,11 +87,13 @@ func (s *LogGCService) Run(ctx context.Context, interval, retention time.Duratio
 				return // shutting down — expected
 			}
 			log.Printf("log_gc: delete failed (retention=%s): %v", retention, err)
+			s.sink(0, true) // issue #581 — record the failed tick
 			return
 		}
 		if deleted > 0 {
 			log.Printf("log_gc: deleted %d rows older than %s", deleted, retention)
 		}
+		s.sink(deleted, false) // issue #581 — record the successful tick
 	}
 
 	runOnce()

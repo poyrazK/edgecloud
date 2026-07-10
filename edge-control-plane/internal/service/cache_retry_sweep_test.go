@@ -147,7 +147,7 @@ func TestCacheRetrySweep_NoRows_NoWork(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -198,7 +198,7 @@ func TestCacheRetrySweep_OneRowOneRegion_Succeeds_MovesToCached(t *testing.T) {
 	regionCaches := map[string]string{"fra": "http://cache.fra"}
 
 	var pusherPtr artifactCachePusher = pusher
-	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 })
+	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -254,7 +254,7 @@ func TestCacheRetrySweep_OneRowOneRegion_FailsTwice_RemainsInCacheFailed(t *test
 	regionCaches := map[string]string{"iad": "http://cache.iad"}
 
 	var pusherPtr artifactCachePusher = pusher
-	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 })
+	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -297,7 +297,7 @@ func TestCacheRetrySweep_OneRowOneRegion_MissingCacheConfig_RemovedFromCacheFail
 	regionCaches := map[string]string{} // sin absent — config gap
 
 	var pusherPtr artifactCachePusher = pusher
-	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 })
+	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -351,7 +351,7 @@ func TestCacheRetrySweep_PusherNil_AllRegionsRemovedAsConfigMissing(t *testing.T
 		repo,
 		func() artifactCachePusher { return nil }, // pusher disabled
 		func() map[string]string { return regionCaches },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -406,7 +406,7 @@ func TestCacheRetrySweep_MixedRowOutcomes(t *testing.T) {
 	}}
 	var pusherPtr artifactCachePusher = customPusher
 
-	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 })
+	svc := NewCacheRetrySweepService(repo, func() artifactCachePusher { return pusherPtr }, func() map[string]string { return regionCaches }, func() int { return 10 }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -484,7 +484,7 @@ func TestCacheRetrySweep_RepoListError_LoopSurvives(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -518,7 +518,7 @@ func TestCacheRetrySweep_ZeroInterval_RefusesToRun(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	done := make(chan struct{})
@@ -548,7 +548,7 @@ func TestCacheRetrySweep_PreemptsOnCancelledContext(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -580,7 +580,7 @@ func TestCacheRetrySweep_ImmediateFirstSweep(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -623,7 +623,7 @@ func TestCacheRetrySweep_ConcurrentPublishSwap_AppendRegionsCacheStateCalled(t *
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -724,7 +724,7 @@ func TestCacheRetrySweep_RegionOverCap_GiveUpWithWarn(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -785,7 +785,7 @@ func TestCacheRetrySweep_StillFailing_IncrementsCounter(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -846,7 +846,7 @@ func TestCacheRetrySweep_Success_RemovesCounterEntry(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -909,7 +909,7 @@ func TestCacheRetrySweep_ConfigMissing_RemovesCounterEntry(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{} },
-		func() int { return 10 },
+		func() int { return 10 }, nil,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -977,7 +977,7 @@ func TestCacheRetrySweep_MaxAttemptsZero_DisablesCap(t *testing.T) {
 		repo,
 		func() artifactCachePusher { return pusherPtr },
 		func() map[string]string { return map[string]string{"fra": "http://cache.fra"} },
-		func() int { return 0 }, // cap disabled
+		func() int { return 0 }, nil, // cap disabled
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1013,5 +1013,255 @@ func TestCacheRetrySweep_MaxAttemptsZero_DisablesCap(t *testing.T) {
 	defer pusher.mu.Unlock()
 	if len(pusher.calls) != 1 {
 		t.Errorf("pusher.calls = %d, want 1 (cap disabled — push attempted)", len(pusher.calls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics sink integration (issue #581).
+// ---------------------------------------------------------------------------
+
+// recordingCacheRetrySink records every CacheRetrySweepSink call.
+type recordingCacheRetrySink struct {
+	mu    sync.Mutex
+	calls []cacheRetrySinkCall
+}
+
+type cacheRetrySinkCall struct {
+	rowsTouched   int
+	pushedOK      int
+	stillFailing  int
+	configMissing int
+	givenUp       int
+	batchesSwept  int
+	hadError      bool
+}
+
+func (r *recordingCacheRetrySink) record(rowsTouched, pushedOK, stillFailing, configMissing, givenUp, batchesSwept int, hadError bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, cacheRetrySinkCall{rowsTouched, pushedOK, stillFailing, configMissing, givenUp, batchesSwept, hadError})
+}
+
+func (r *recordingCacheRetrySink) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+// makeRecordingCacheRetrySink returns (CacheRetrySweepSink, *recordingCacheRetrySink).
+func makeRecordingCacheRetrySink() (CacheRetrySweepSink, *recordingCacheRetrySink) {
+	r := &recordingCacheRetrySink{}
+	var sink CacheRetrySweepSink = r.record
+	return sink, r
+}
+
+// TestCacheRetrySweep_RecordsMetrics_HappyPath: 1 row, 2 regions, both
+// push OK. Sink records (rowsTouched=1, pushedOK=2, stillFailing=0,
+// configMissing=0, givenUp=0, batchesSwept=1, hadError=false).
+func TestCacheRetrySweep_RecordsMetrics_HappyPath(t *testing.T) {
+	repo := &mockCacheRetryRepo{
+		listResult: []repository.CacheFailedRow{{
+			TenantID: "t_test", AppName: "myapp", DeploymentID: "d_v1",
+			RegionsCacheFailed: []string{"fra", "iad"},
+		}},
+	}
+	pusher := &mockArtifactCachePusher{}
+	regionCaches := map[string]string{
+		"fra": "http://cache.fra",
+		"iad": "http://cache.iad",
+	}
+	var pusherPtr artifactCachePusher = pusher
+	sink, rec := makeRecordingCacheRetrySink()
+	svc := NewCacheRetrySweepService(
+		repo,
+		func() artifactCachePusher { return pusherPtr },
+		func() map[string]string { return regionCaches },
+		func() int { return 10 },
+		sink,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.callCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.calls[0]
+	if got.rowsTouched != 1 || got.pushedOK != 2 || got.stillFailing != 0 ||
+		got.configMissing != 0 || got.givenUp != 0 || got.batchesSwept != 1 || got.hadError {
+		t.Errorf("sink call = %+v, want {1,2,0,0,0,1,false}", got)
+	}
+}
+
+// TestCacheRetrySweep_RecordsMetrics_PartitionCounters: 2 rows covering
+// the giveUp (count at MaxAttempts) and configMissing (region not in
+// regionCaches) partitions. Assert each counter reflects the partition
+// totals correctly.
+func TestCacheRetrySweep_RecordsMetrics_PartitionCounters(t *testing.T) {
+	countsJSON := []byte(`{"fra": 10}`)
+	repo := &mockCacheRetryRepo{
+		listResult: []repository.CacheFailedRow{
+			{
+				TenantID: "t1", AppName: "a1", DeploymentID: "d1",
+				RegionsCacheFailed:    []string{"fra"},
+				RegionCacheRetryCount: countsJSON, // fra is at MaxAttempts → giveUp
+			},
+			{
+				TenantID: "t2", AppName: "a2", DeploymentID: "d2",
+				RegionsCacheFailed: []string{"iad"}, // not in regionCaches → configMissing
+			},
+		},
+	}
+	pusher := &mockArtifactCachePusher{} // push would succeed if called
+	regionCaches := map[string]string{
+		"fra": "http://cache.fra",
+	}
+	var pusherPtr artifactCachePusher = pusher
+	sink, rec := makeRecordingCacheRetrySink()
+	svc := NewCacheRetrySweepService(
+		repo,
+		func() artifactCachePusher { return pusherPtr },
+		func() map[string]string { return regionCaches },
+		func() int { return 10 },
+		sink,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.callCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.calls[0]
+	if got.rowsTouched != 2 {
+		t.Errorf("rowsTouched = %d, want 2", got.rowsTouched)
+	}
+	if got.givenUp != 1 {
+		t.Errorf("givenUp = %d, want 1 (fra reached MaxAttempts)", got.givenUp)
+	}
+	if got.configMissing != 1 {
+		t.Errorf("configMissing = %d, want 1 (iad not in regionCaches)", got.configMissing)
+	}
+	if got.pushedOK != 0 {
+		t.Errorf("pushedOK = %d, want 0 (both rows partitioned away)", got.pushedOK)
+	}
+	if got.hadError {
+		t.Error("hadError = true, want false on healthy path")
+	}
+}
+
+// TestCacheRetrySweep_RecordsMetrics_ListError: a ListCacheFailed
+// failure records one sink call with hadError=true and zero counters.
+func TestCacheRetrySweep_RecordsMetrics_ListError(t *testing.T) {
+	repo := &mockCacheRetryRepo{listErr: errors.New("simulated db blip")}
+	pusher := &mockArtifactCachePusher{}
+	regionCaches := map[string]string{"fra": "http://cache.fra"}
+	var pusherPtr artifactCachePusher = pusher
+	sink, rec := makeRecordingCacheRetrySink()
+	svc := NewCacheRetrySweepService(
+		repo,
+		func() artifactCachePusher { return pusherPtr },
+		func() map[string]string { return regionCaches },
+		func() int { return 10 },
+		sink,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.callCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.calls[0]
+	if !got.hadError {
+		t.Error("hadError = false, want true on list error")
+	}
+	if got.rowsTouched != 0 || got.pushedOK != 0 {
+		t.Errorf("counters = %+v, want all zeros on list error", got)
+	}
+}
+
+// TestCacheRetrySweep_ZeroInterval_NoMetrics: refused-to-run does NOT
+// bump any metrics.
+func TestCacheRetrySweep_ZeroInterval_NoMetrics(t *testing.T) {
+	repo := &mockCacheRetryRepo{}
+	pusher := &mockArtifactCachePusher{}
+	regionCaches := map[string]string{"fra": "http://cache.fra"}
+	var pusherPtr artifactCachePusher = pusher
+	sink, rec := makeRecordingCacheRetrySink()
+	svc := NewCacheRetrySweepService(
+		repo,
+		func() artifactCachePusher { return pusherPtr },
+		func() map[string]string { return regionCaches },
+		func() int { return 10 },
+		sink,
+	)
+
+	done := make(chan struct{})
+	go func() {
+		svc.Run(context.Background(), 0)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return on interval=0")
+	}
+	if got := rec.callCount(); got != 0 {
+		t.Errorf("sink call count = %d, want 0 (refused-to-run must not tick)", got)
+	}
+}
+
+// TestCacheRetrySweep_NilSink_NoPanic: passing nil as the sink to
+// NewCacheRetrySweepService must not panic. The constructor nil-guards.
+func TestCacheRetrySweep_NilSink_NoPanic(t *testing.T) {
+	repo := &mockCacheRetryRepo{
+		listResult: []repository.CacheFailedRow{{
+			TenantID: "t_test", AppName: "myapp", DeploymentID: "d_v1",
+			RegionsCacheFailed: []string{"fra"},
+		}},
+	}
+	pusher := &mockArtifactCachePusher{}
+	regionCaches := map[string]string{"fra": "http://cache.fra"}
+	var pusherPtr artifactCachePusher = pusher
+	svc := NewCacheRetrySweepService(
+		repo,
+		func() artifactCachePusher { return pusherPtr },
+		func() map[string]string { return regionCaches },
+		func() int { return 10 },
+		nil,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond)
+		close(done)
+	}()
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit on nil sink")
 	}
 }

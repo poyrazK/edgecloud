@@ -392,6 +392,18 @@ Per-app, per-deployment:
 - `DeploymentGC.Run` — TTL'd deployment-row GC (older than `DEPLOYMENT_GC_MAX_AGE`, default 30 days; not preview deployments — those are `PreviewGC`).
 - `CacheRetrySweep.Run` — issue #501. Background sweep that re-attempts per-region artifact-cache pushes for deployments whose previous push landed in `regions_cache_failed`. Tick interval `cfg.CacheRetry.IntervalS` (env `REGION_CACHE_RETRY_INTERVAL`, default 5m). Per-region attempt cap `cfg.CacheRetry.MaxAttempts` (env `REGION_CACHE_RETRY_MAX_ATTEMPTS`, default 10): over-cap regions are routed to a `giveUp` partition (drop from `regions_cache_failed` with a WARN log). The per-region counter is reset on every activation (`publishSwap` calls `ResetRegionCacheRetryCount` inside the cache-state transaction), so the cap is per-deployment, not per-tenant-app-lifetime. Set `MaxAttempts<=0` to disable the cap entirely (escape hatch for environments that want unbounded retries).
 
+### Background-GC metrics (issue #581)
+
+All three background GCs above (`LogGC`, `PreviewGC`, `CacheRetrySweep`) emit Prometheus metrics via the hand-rolled `service.MetricsAggregator` (no `prometheus/client_golang` dependency — see `edge-control-plane/internal/service/metrics.go`). Each GC takes a typed sink closure in its constructor; the aggregator exposes `NewLogGCSink`, `NewPreviewGCSink`, `NewPreviewBlobFailureRecorder`, `NewCacheRetrySweepSink` — wired in `app.New` (`edge-control-plane/internal/app/app.go:705-731`).
+
+20 label-free families are exposed on BOTH `/metrics` (unauthenticated, operator) AND `/api/v1/metrics` (per-tenant) — the per-tenant endpoint appends the global GC families after the per-tenant/app series so tenants can see fleet-wide GC health on their own page:
+
+- **`edge_log_gc_*`** (4 families, `edge-control-plane/internal/service/log_gc.go`): `ticks_total`, `rows_deleted_total`, `errors_total`, `last_tick_timestamp_seconds` (Unix seconds — alert if older than `2 * LOG_GC_INTERVAL`).
+- **`edge_preview_gc_*`** (7 families, `edge-control-plane/internal/service/preview_gc.go`): `ticks_total`, `blobs_deleted_total`, `rows_deleted_total`, `batches_swept_total`, `errors_total`, `blob_delete_failures_total` (per-blob granular), `last_tick_timestamp_seconds`.
+- **`edge_cache_retry_sweep_*`** (9 families, `edge-control-plane/internal/service/cache_retry_sweep.go`): `ticks_total`, `batches_swept_total`, `rows_touched_total`, `pushed_ok_total`, `still_failing_total`, `config_missing_total`, `given_up_total` (exhaustion signal — alert if non-zero over a sustained window), `errors_total`, `last_tick_timestamp_seconds`.
+
+The sink is invoked once per sweep tick (success or error). The refused-to-run path (zero/negative interval, negative retention, pre-cancelled context) does NOT bump `ticks_total` — this is intentional so an "alert on never-ticked" operator rule fires correctly when a GC is misconfigured or stuck at boot.
+
 ### Secrets encryption (`edge-control-plane/internal/service/secrets.go`)
 
 - `cfg.Secrets.ActiveKeyID` + `cfg.Secrets.Keys` (keyring, multi-key) — only path; supports rotation via the keyring key IDs.
