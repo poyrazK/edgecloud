@@ -1146,7 +1146,12 @@ func TestMigrationService_StoresWasmToolsPath(t *testing.T) {
 }
 
 // TestInjectWitBindgen confirms the macro block is prepended at byte
-// 0 and the WIT dir is properly quoted.
+// 0, the WIT dir is properly quoted, and the transformer's input is
+// passed through verbatim. The transformer now emits
+// `use crate::wasi::*` directly via WASI_RUST_PRELUDE
+// (edge-migrate-lib/src/rust_transformer.rs), so injectWitBindgen is
+// a pass-through on the body (issue #417 closed the previous
+// `bytes.ReplaceAll` rewrite path).
 func TestInjectWitBindgen(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := newMockArtifactStore()
@@ -1158,7 +1163,10 @@ func TestInjectWitBindgen(t *testing.T) {
 		signing.TestKeyring(t),
 	)
 
-	in := []byte("use wasi::socket::tcp::TcpSocket;\n")
+	// Input mirrors what the Rust transformer now emits — `use
+	// crate::wasi::*` directly. injectWitBindgen must not rewrite
+	// it; the test pins identity on the body.
+	in := []byte("use crate::wasi::sockets::tcp_create_socket::create_tcp_socket;\n")
 	out := svc.injectWitBindgen(in)
 
 	if !bytes.HasPrefix(out, []byte("wit_bindgen::generate!")) {
@@ -1173,14 +1181,15 @@ func TestInjectWitBindgen(t *testing.T) {
 	if !bytes.Contains(out, []byte(`world: "edge-runtime-handler"`)) {
 		t.Errorf("expected edge-runtime-handler world; got: %s", out)
 	}
-	// The rewritten transformed source must follow the macro
-	// block, not be lost — and the import scope must be under
-	// `crate::wasi::` (where wit-bindgen 0.45 generates bindings).
-	if !bytes.Contains(out, []byte("use crate::wasi::socket::tcp::TcpSocket;")) {
-		t.Errorf("expected rewritten 'use crate::wasi::' import; got: %s", out)
+	// The transformer's body must follow the macro block verbatim
+	// (no rewriting). The old test asserted the stop-gap rewrote
+	// `use wasi::` → `use crate::wasi::`; the stop-gap is gone
+	// (issue #417) so we now assert the input survives untouched.
+	if !bytes.Contains(out, in) {
+		t.Errorf("expected transformer body to be passed through verbatim; got: %s", out)
 	}
 	if bytes.Contains(out, []byte("use wasi::")) {
-		t.Errorf("expected no leftover 'use wasi::' imports (rewritten to 'use crate::wasi::'); got: %s", out)
+		t.Errorf("expected no 'use wasi::' imports in transformer output; got: %s", out)
 	}
 }
 

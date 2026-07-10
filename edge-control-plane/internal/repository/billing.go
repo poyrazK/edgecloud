@@ -126,3 +126,20 @@ func (r *BillingRepository) MarkProcessed(ctx context.Context, eventID string) e
 		eventID, time.Now().UTC())
 	return err
 }
+
+// GetSubscriptionStatus returns just the status column for the tenant's
+// billing_subscriptions row. Cheaper than GetByTenant (single column read
+// vs full row) and avoids the temptation to leak the rest of the row out
+// of the deploy-time path. Returns ("", nil) when the tenant has never
+// been through StartCheckout — the caller treats that as "no paid
+// subscription, fall through to the free-tier checks" rather than as an
+// error. Added in issue #420.
+func (r *BillingRepository) GetSubscriptionStatus(ctx context.Context, tenantID string) (domain.SubscriptionStatus, error) {
+	var status string
+	const q = `SELECT status FROM billing_subscriptions WHERE tenant_id = $1`
+	err := r.db.GetContext(ctx, &status, q, tenantID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return domain.SubscriptionStatus(status), err
+}

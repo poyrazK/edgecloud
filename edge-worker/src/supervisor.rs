@@ -189,6 +189,17 @@ mod heartbeat_integration_tests {
     }
 
     fn build_supervisor(state: Arc<RwLock<WorkerState>>) -> Arc<Supervisor> {
+        build_supervisor_with_cooldown_secs(state, 1)
+    }
+
+    /// Same as `build_supervisor` but lets the test pick the
+    /// `PortPool`'s cooldown. Used by `stop_app_releases_ws_port`
+    /// (#448 regression) so released ports stay observable in
+    /// `cooling_down` while the test asserts on them.
+    fn build_supervisor_with_cooldown_secs(
+        state: Arc<RwLock<WorkerState>>,
+        cooldown_secs: u64,
+    ) -> Arc<Supervisor> {
         let jwt = WorkerJwtSigner::new(
             String::new(),
             None,
@@ -207,7 +218,7 @@ mod heartbeat_integration_tests {
                 jwt.clone(),
                 None,
             )),
-            port_pool: Arc::new(Mutex::new(PortPool::new(10000, 1))),
+            port_pool: Arc::new(Mutex::new(PortPool::new(10000, cooldown_secs))),
             nats: nats as Arc<dyn NatsClient>,
             log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
             jwt_signer: jwt,
@@ -626,6 +637,87 @@ mod heartbeat_integration_tests {
         let result = sup.stop_app("t_test", "my-app").await;
         assert!(result.is_ok());
         assert!(state.read().await.apps.is_empty());
+    }
+
+    /// Issue #448 regression — `stop_app` must release BOTH the primary
+    /// `port` AND the dedicated `ws_port` it allocated from the same
+    /// pool. The previous code only released `port`, so `ws_port`
+    /// leaked until the 60s cooldown returned it. Under bursty WS-app
+    /// redeploys this exhausted the PortPool in CI.
+    ///
+    /// The regression assertion is structural: install an app with
+    /// both `port` and `ws_port`, call `stop_app`, then assert BOTH
+    /// ports are now in the pool's cooldown set. The cooldown set
+    /// is the only observable signal of a `release()` — released
+    /// ports don't return to `available` until the cooldown
+    /// elapses; with the default 1s-cooldown test pool they re-enter
+    /// `available` immediately, so the test constructs a
+    /// `Supervisor` with a 60s-cooldown pool directly (the
+    /// `build_supervisor` helper hard-codes 1s). The test-only
+    /// `PortPool::is_in_cooldown` accessor
+    /// (`edge-worker/src/port_pool.rs:115-126`) lets the test
+    /// target both ports directly without exposing the internal
+    /// `cooling_down` Vec.
+    #[tokio::test]
+    async fn stop_app_releases_ws_port() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+
+        let (oneshot_tx, _) = tokio::sync::oneshot::channel::<()>();
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-ws-app".into(),
+            tenant_id: "t_test".into(),
+            port: 10001,
+            status: AppInstanceStatus::Running,
+            meter: Arc::new(RequestMeter::new("t_test".into(), "d1".into())),
+            shutdown_tx: Some(oneshot_tx),
+            shutdown_tx_broadcast: None,
+            instance_pre,
+            handle: None,
+            ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: Some(10002),
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-ws-app".into()), app);
+
+        // Inline-construct with a 60s-cooldown pool so the released
+        // ports stay observable in `cooling_down` for the duration of
+        // this assertion. Mirrors `build_supervisor` (line 191) with a
+        // single field change. We avoid `build_supervisor`'s 1s cooldown
+        // because `reap_cooled_ports` (triggered by `acquire` /
+        // `free_slots`) would otherwise re-empty the cooldown set
+        // between `stop_app` and our assertion.
+        let sup = build_supervisor_with_cooldown_secs(state.clone(), 60);
+
+        sup.stop_app("t_test", "my-ws-app")
+            .await
+            .expect("stop_app with ws_port must not error");
+
+        // Both ports must now be in cooldown — proves `release(port)`
+        // AND `release(ws_port)` ran. Before the fix, `ws_port`
+        // leaked (never re-entered the cooldown set).
+        let pool = sup.port_pool.lock().await;
+        assert!(
+            pool.is_in_cooldown(10001),
+            "primary port 10001 must be in cooldown after stop_app (release(port) regression)"
+        );
+        assert!(
+            pool.is_in_cooldown(10002),
+            "ws_port 10002 must be in cooldown after stop_app (release(ws_port) regression)"
+        );
+
+        assert!(
+            state.read().await.apps.is_empty(),
+            "app must be removed from state after stop_app"
+        );
     }
 
     #[tokio::test]
@@ -1493,12 +1585,13 @@ impl Supervisor {
             state.apps.get(&key).cloned()
         };
 
-        let (port, handle, ticker, _dispatch) = if let Some(inst) = instance {
+        let (port, ws_port, handle, ticker, _dispatch) = if let Some(inst) = instance {
             // Phase 1: set Draining, signal serve() to stop accepting,
             // then drain in-flight requests.
             let mut inst = inst.lock().await;
             inst.status = AppInstanceStatus::Draining;
             let port = inst.port;
+            let ws_port = inst.ws_port;
             let handle = inst.handle.clone();
             let ticker = inst.ticker.take();
             let broadcast_tx = inst.shutdown_tx_broadcast.take();
@@ -1531,7 +1624,7 @@ impl Supervisor {
                 }
             }
 
-            (port, handle, ticker, dispatch)
+            (port, ws_port, handle, ticker, dispatch)
         } else {
             return Ok(()); // already gone
         };
@@ -1539,10 +1632,17 @@ impl Supervisor {
         // Remove from the map.
         self.state.write().await.apps.remove(&key);
 
-        // Free the port.
+        // Free both the primary app port AND the dedicated WebSocket
+        // listener port (issue #448 — previously only `port` was
+        // released; `ws_port` leaked until the 60-second cooldown
+        // eventually returned it. Burst WS-app redeploys exhausted
+        // the PortPool in CI under the old behavior.).
         {
             let mut pool = self.port_pool.lock().await;
             pool.release(port);
+            if let Some(ws) = ws_port {
+                pool.release(ws);
+            }
         }
 
         // Abort the epoch ticker so the engine clock stops advancing for
@@ -1910,14 +2010,18 @@ impl Supervisor {
         // matches the FaaS path in `edge-worker/src/dispatch.rs::handle_request`.
         let instance = instance_pre.instantiate_async(&mut store).await?;
 
-        // `_start` is the canonical WASI Preview 2 entry point for
-        // long-running components. The v0.1 `handle` export is no
-        // longer supported — fixtures in Phase D export `_start`.
-        // Must use `call_async` for the same reason as `instantiate_async`
+        // `start` is the canonical top-level export of the
+        // long-running `edge-runtime` world (wit/edge-cloud.wit:124-148).
+        // Components implement it via wit-bindgen's `impl Guest for ...`
+        // and the `export!` macro; the resulting component's top-level
+        // export is named `start`. The previous `_start` symbol
+        // came from wasi-snapshot-preview1 reactor components; the
+        // canonical v0.2 world uses `start` instead. Must use
+        // `call_async` for the same reason as `instantiate_async`
         // above — wasmtime rejects sync `call` on a store built with
         // `async_support(true)`.
         instance
-            .get_typed_func::<(), ()>(&mut store, "_start")?
+            .get_typed_func::<(), ()>(&mut store, "start")?
             .call_async(&mut store, ())
             .await?;
 

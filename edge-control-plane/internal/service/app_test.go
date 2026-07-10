@@ -110,6 +110,10 @@ func (m *mockQuotaRepoForApps) AddRequestCount(_ context.Context, _ string, _ ui
 	return &domain.Quota{}, nil
 }
 
+func (m *mockQuotaRepoForApps) SetGraceUntil(_ context.Context, _ string, _ *time.Time) error {
+	return nil
+}
+
 // appSvcForTest builds an AppService with mock dependencies.
 // Only use for testing methods that don't invoke cascade delete (Create, Get, List, CreateIfNotExists).
 // Delete is not testable without a real DB connection for repository.Transaction.

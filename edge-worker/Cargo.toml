@@ -79,6 +79,12 @@ ed25519-dalek = { version = "2.2", features = ["std"] }
 base64 = "0.22"
 # Generate self-signed TLS certs for the try_load_tls_config test (issue #209).
 rcgen = { version = "0.13", features = ["pem"] }
+# SHA-1 for the WebSocket Sec-WebSocket-Accept handshake in the
+# JS WebSocket e2e test (issue #448). RFC 6455 §1.3 mandates SHA-1
+# over the client key + `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`. Same
+# algorithm the host's own `compute_accept_key` uses
+# (edge-runtime/src/interfaces/websocket.rs:642-650).
+sha1 = "0.10"
 # Shared test harness: NATS container startup, skip predicate, and
 # Supervisor wiring (formerly duplicated across integration_tests.rs,
 # ingress_wire_integration.rs, and edge-ingress/tests/integration.rs).

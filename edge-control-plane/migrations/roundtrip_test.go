@@ -64,7 +64,15 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 68 // 34 .up.sql + 34 .down.sql on current main (after 026_active_deployments_activation_attempt_started_at, issue #440 full close follow-up)
+//
+// On current branch after rebase of PR #466 (#42) onto PR #469 (#52)
+// and PR #420 (quota grace columns, which became 025_quotas_grace_columns
+// and pushed the next migration to 026), plus issue #440 commit 6
+// (which adds 026_active_deployments_activation_attempt_started_at):
+// 37 .up.sql + 37 .down.sql = 74 split files. Some numeric prefixes
+// collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*), so this
+// is the on-disk file count, not a strict 2× the migration number.
+const splitFileCount = 74 // 37 .up.sql + 37 .down.sql after issue #440 full close merge
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -89,6 +97,8 @@ var wantTables = []string{
 	"webhook_deliveries",
 	"billing_subscriptions", // 022 (issue #419)
 	"billing_events",        // 023 (issue #419)
+	"outbox",                // 025 (issue #42)
+	"idempotency_keys",      // 026 (issue #52)
 }
 
 // wantColumns enumerates the public-schema columns each table must
@@ -119,6 +129,7 @@ var wantColumns = map[string][]string{
 		"plan",
 		"allowlisted_destinations",
 		"created_at",
+		"overage_allowed_until", // 025_quotas_grace_columns (issue #420)
 	},
 	"quotas": {
 		"tenant_id",
@@ -131,6 +142,7 @@ var wantColumns = map[string][]string{
 		"quota_period_start",     // 009_quotas_used_outbound
 		"max_requests_per_month", // 013
 		"used_request_count",     // 013
+		"quota_lock_grace_until", // 025_quotas_grace_columns (issue #420)
 	},
 	"api_keys": {
 		"id",
@@ -164,15 +176,15 @@ var wantColumns = map[string][]string{
 		"tenant_id",
 		"app_name",
 		"deployment_id",
-		"last_good_deployment_id",                  // 005_add_last_good
-		"auto_rollback_enabled",                    // 009_add_auto_rollback
-		"stable_since",                             // 009_add_auto_rollback
-		"regions_published",                        // 010_active_deployments_regions
-		"regions_failed",                           // 010_active_deployments_regions
-		"regions_cached",                           // 017_active_deployments_regions_cached
-		"last_publish_at",                          // 010_active_deployments_regions
-		"last_publish_attempt_id",                  // 010_active_deployments_regions
-		"activation_attempt_started_at",            // 026_active_deployments_activation_attempt_started_at
+		"last_good_deployment_id",       // 005_add_last_good
+		"auto_rollback_enabled",         // 009_add_auto_rollback
+		"stable_since",                  // 009_add_auto_rollback
+		"regions_published",             // 010_active_deployments_regions
+		"regions_failed",                // 010_active_deployments_regions
+		"regions_cached",                // 017_active_deployments_regions_cached
+		"last_publish_at",               // 010_active_deployments_regions
+		"last_publish_attempt_id",       // 010_active_deployments_regions
+		"activation_attempt_started_at", // 026_active_deployments_activation_attempt_started_at
 	},
 	"app_env": {
 		"tenant_id",
@@ -301,6 +313,22 @@ var wantColumns = map[string][]string{
 		"processed_at",
 		"payload_hash",
 	},
+	"outbox": { // 025 (issue #42)
+		"id",
+		"tenant_id",
+		"app_name",
+		"kind",
+		"payload",
+		"regions",
+		"attempt_count",
+		"next_attempt_at",
+		"status",
+		"last_error",
+		"dedupe_key",
+		"created_at",
+		"published_at",
+		"claimed_until",
+	},
 }
 
 // IndexExpectation describes one CREATE INDEX statement that must
@@ -338,6 +366,7 @@ var wantTypes = map[string]map[string]string{
 		"plan":                     "text",
 		"allowlisted_destinations": "_text", // 001 — TEXT[]
 		"created_at":               "timestamptz",
+		"overage_allowed_until":    "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
 	},
 	"quotas": {
 		"tenant_id":              "text",
@@ -350,6 +379,7 @@ var wantTypes = map[string]map[string]string{
 		"quota_period_start":     "timestamptz", // 009_quotas_used_outbound
 		"max_requests_per_month": "int4",        // 013
 		"used_request_count":     "int8",        // 013
+		"quota_lock_grace_until": "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
 	},
 	"api_keys": {
 		"id":             "text",
@@ -377,16 +407,16 @@ var wantTypes = map[string]map[string]string{
 		"build_attestation":     "jsonb", // 020_add_build_attestation (nullable)
 	},
 	"active_deployments": {
-		"tenant_id":                    "text",
-		"app_name":                     "text",
-		"deployment_id":                "text",
-		"last_good_deployment_id":      "text",        // 005_add_last_good
-		"auto_rollback_enabled":        "bool",        // 009_add_auto_rollback
-		"stable_since":                 "timestamptz", // 009_add_auto_rollback (nullable)
-		"regions_published":            "_text",       // 010_active_deployments_regions
-		"regions_failed":               "_text",       // 010_active_deployments_regions
-		"last_publish_at":              "timestamptz", // 010_active_deployments_regions (nullable)
-		"last_publish_attempt_id":      "uuid",        // 010_active_deployments_regions (nullable)
+		"tenant_id":                     "text",
+		"app_name":                      "text",
+		"deployment_id":                 "text",
+		"last_good_deployment_id":       "text",        // 005_add_last_good
+		"auto_rollback_enabled":         "bool",        // 009_add_auto_rollback
+		"stable_since":                  "timestamptz", // 009_add_auto_rollback (nullable)
+		"regions_published":             "_text",       // 010_active_deployments_regions
+		"regions_failed":                "_text",       // 010_active_deployments_regions
+		"last_publish_at":               "timestamptz", // 010_active_deployments_regions (nullable)
+		"last_publish_attempt_id":       "uuid",        // 010_active_deployments_regions (nullable)
 		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)
 	},
 	"app_env": {
@@ -515,6 +545,27 @@ var wantTypes = map[string]map[string]string{
 		"received_at":  "timestamptz",
 		"processed_at": "timestamptz", // nullable
 		"payload_hash": "varchar",     // VARCHAR(128)
+	},
+	"outbox": { // 025 (issue #42)
+		"id":              "int8",
+		"tenant_id":       "text",
+		"app_name":        "text",
+		"kind":            "text",
+		"payload":         "jsonb",
+		"regions":         "_text",
+		"attempt_count":   "int4",
+		"next_attempt_at": "timestamptz",
+		"status":          "text",
+		"dedupe_key":      "text",
+		"created_at":      "timestamptz",
+		// last_error, published_at, claimed_until are nullable (see wantNotNull).
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		"tenant_id":      "text",        // TEXT (PK)
+		"key":            "text",        // TEXT (PK)
+		"deployment_id":  "text",        // TEXT (FK target)
+		"request_sha256": "bytea",       // BYTEA — 32-byte SHA-256
+		"created_at":     "timestamptz", // TIMESTAMPTZ, default NOW()
 	},
 }
 
@@ -703,6 +754,27 @@ var wantNotNull = map[string][]string{
 		"payload_hash",
 		// tenant_id, processed_at are nullable.
 	},
+	"outbox": { // 025 (issue #42)
+		"id",
+		"tenant_id",
+		"app_name",
+		"kind",
+		"payload",
+		"regions",
+		"attempt_count",
+		"next_attempt_at",
+		"status",
+		"dedupe_key",
+		"created_at",
+		// last_error, published_at, claimed_until are nullable.
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		"tenant_id",
+		"key",
+		"deployment_id",
+		"request_sha256",
+		// created_at has a non-NULL default — see wantDefaults.
+	},
 }
 
 // wantIndexes enumerates every CREATE INDEX in the migrations. The
@@ -735,6 +807,12 @@ var wantIndexes = []IndexExpectation{
 	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
 	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
 	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
+	{Table: "outbox", Name: "outbox_due_idx"},                                             // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_tenant_app_idx"},                                      // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_failed_idx"},                                          // 025_outbox (issue #42)
+	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
+	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                         // 025_quotas_grace_columns (issue #420, partial)
+	{Table: "quotas", Name: "idx_quotas_grace_until"},                                     // 025_quotas_grace_columns (issue #420, partial)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -785,6 +863,9 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 	},
 	"domains": {
 		{"fk_domains_app", "FOREIGN KEY (tenant_id, app_name) REFERENCES apps(tenant_id, name) ON DELETE CASCADE"},
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		{"idempotency_keys_deployment_id_fkey", "FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE"},
 	},
 	"quotas": {
 		{"quotas_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
@@ -870,6 +951,9 @@ var wantDefaults = map[string]map[string]string{
 	},
 	"domains": {
 		"status": "'pending'::text", // 010
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		"created_at": "now()", // 026
 	},
 	"logs": {
 		"labels": "'{}'::jsonb", // 005

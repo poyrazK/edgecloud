@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
@@ -276,4 +277,104 @@ func (h *TenantHandler) Enable(w http.ResponseWriter, r *http.Request) {
 	}
 	auditRecord(r, "enable", "tenant", tenantID, "tenant "+tenantID+" re-enabled", "success")
 	w.WriteHeader(http.StatusOK)
+}
+
+// QuotaOverrideRequest is the wire shape for the admin override
+// endpoint (issue #420). All fields are optional; absent fields
+// leave the underlying row untouched. RFC3339 timestamps validate
+// against time.RFC3339; non-negative ints validate against
+// >= 0. The sentinel "-1" for max_requests_per_month and
+// max_outbound_mb is the unlimited signal; passing a negative
+// value other than -1 returns 400.
+type QuotaOverrideRequest struct {
+	MaxRequestsPerMonth      *int    `json:"max_requests_per_month,omitempty"`
+	MaxOutboundMB            *int    `json:"max_outbound_mb,omitempty"`
+	MaxDeployments           *int    `json:"max_deployments,omitempty"`
+	SetOverageAllowedUntil   *string `json:"set_overage_allowed_until,omitempty"`
+	ClearOverageAllowedUntil bool    `json:"clear_overage_allowed_until,omitempty"`
+	ClearDisabledAt          bool    `json:"clear_disabled_at,omitempty"`
+	ClearGrace               bool    `json:"clear_grace,omitempty"`
+}
+
+// QuotaOverride handles POST /api/v1/admin/tenants/{tenantID}/quota-override.
+// Owner-role admin endpoint for manual recovery when a tenant crosses
+// a cap and the period hasn't reset yet. Every call is audit-logged
+// via auditRecord — operators and tenants can trace exactly which
+// fields were changed and when.
+func (h *TenantHandler) QuotaOverride(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		httperror.BadRequestCtx(w, r, "invalid tenant id")
+		return
+	}
+
+	var req QuotaOverrideRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+
+	// Validate int fields. -1 is the unlimited sentinel; any other
+	// negative value is rejected so a typo doesn't quietly turn
+	// into a large unsigned.
+	if req.MaxRequestsPerMonth != nil && *req.MaxRequestsPerMonth < -1 {
+		httperror.BadRequestCtx(w, r, "max_requests_per_month: must be -1 (unlimited) or >= 0")
+		return
+	}
+	if req.MaxOutboundMB != nil && *req.MaxOutboundMB < -1 {
+		httperror.BadRequestCtx(w, r, "max_outbound_mb: must be -1 (unlimited) or >= 0")
+		return
+	}
+	if req.MaxDeployments != nil && *req.MaxDeployments < 0 {
+		httperror.BadRequestCtx(w, r, "max_deployments: must be >= 0")
+		return
+	}
+	// set_overage_allowed_until and clear_overage_allowed_until are
+	// mutually exclusive — operators either set a new grace clock
+	// or clear the existing one, not both.
+	if req.SetOverageAllowedUntil != nil && req.ClearOverageAllowedUntil {
+		httperror.BadRequestCtx(w, r, "set_overage_allowed_until and clear_overage_allowed_until are mutually exclusive")
+		return
+	}
+
+	svcReq := service.QuotaOverrideRequest{
+		TenantID:                 tenantID,
+		MaxRequestsPerMonth:      req.MaxRequestsPerMonth,
+		MaxOutboundMB:            req.MaxOutboundMB,
+		MaxDeployments:           req.MaxDeployments,
+		ClearOverageAllowedUntil: req.ClearOverageAllowedUntil,
+		ClearDisabledAt:          req.ClearDisabledAt,
+		ClearGrace:               req.ClearGrace,
+	}
+	if req.SetOverageAllowedUntil != nil {
+		ts, err := time.Parse(time.RFC3339, *req.SetOverageAllowedUntil)
+		if err != nil {
+			httperror.BadRequestCtx(w, r, "set_overage_allowed_until: must be RFC3339")
+			return
+		}
+		svcReq.SetOverageAllowedUntil = &ts
+	}
+
+	tq, err := h.tenantSvc.OverrideTenantQuota(r.Context(), svcReq)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrTenantNotFound), errors.Is(err, service.ErrQuotaNotFound):
+			httperror.NotFoundCtx(w, r, "tenant not found")
+		default:
+			log.Printf("QuotaOverride(%s): %v", tenantID, err)
+			httperror.InternalErrorCtx(w, r)
+		}
+		return
+	}
+
+	// Build a one-line details string so the audit row is
+	// grep-friendly. The full request body could include PII
+	// (operator notes) so we don't echo it.
+	auditRecord(r, "quota.override", "tenant", tenantID,
+		"quota override applied to tenant "+tenantID, "success")
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(tq); err != nil {
+		log.Printf("QuotaOverride: failed to encode response: %v", err)
+	}
 }

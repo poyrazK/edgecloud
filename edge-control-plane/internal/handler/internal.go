@@ -303,8 +303,6 @@ type AutoRollbackRequest struct {
 //     "we got your signal but the tenant didn't opt in" — distinct
 //     from 403 (auth) so the worker can distinguish a config issue
 //     from a permission issue.
-//   - 502: rollback committed but the post-commit NATS publish
-//     failed.
 //   - 500: anything else.
 //
 // Like every other /api/internal/* endpoint, this is currently
@@ -349,6 +347,9 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	// sentinel lives in package repository (it's a string-matched
 	// sentinel to avoid an import cycle with service); the handler
 	// matches via errors.Is using a re-exported alias below.
+	//
+	// Note (issue #42): the previous 502 case for service.ErrPublishFailed
+	// is removed — the post-commit publish is now durable via the outbox.
 	newID, err := h.deploymentSvc.RollbackDeployment(r.Context(), req.TenantID, appName)
 	if err != nil {
 		switch {
@@ -358,9 +359,6 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 		case errors.Is(err, service.ErrAutoRollbackDisabled):
 			http.Error(w, `{"error": "auto-rollback disabled for this app"}`, http.StatusPreconditionFailed)
-		case errors.Is(err, service.ErrPublishFailed):
-			writePublishFailureEnvelope(w, r, err,
-				"rollback committed but worker notification failed; please retry")
 		default:
 			log.Printf("internal error: %v", err)
 			httperror.InternalErrorCtx(w, r)

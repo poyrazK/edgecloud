@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -63,6 +64,14 @@ func (m *mockTenantSvcRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (m *mockTenantSvcRepo) SetOverageAllowedUntil(ctx context.Context, tenantID string, at time.Time) error {
+	return nil
+}
+
+func (m *mockTenantSvcRepo) ClearOverageAllowedUntil(ctx context.Context, tenantID string) error {
+	return nil
+}
+
 func (m *mockTenantSvcRepo) ClearDisabledAt(ctx context.Context, tenantID string) error {
 	if m.clearDisabledAtFn != nil {
 		return m.clearDisabledAtFn(ctx, tenantID)
@@ -95,6 +104,10 @@ func (m *mockQuotaSvcRepo) Update(ctx context.Context, quota *domain.Quota) erro
 	if m.updateFn != nil {
 		return m.updateFn(ctx, quota)
 	}
+	return nil
+}
+
+func (m *mockQuotaSvcRepo) SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error {
 	return nil
 }
 

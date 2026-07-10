@@ -32,6 +32,16 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # so the `warm_vs_cold` bench can use the same `globalThis.EdgeCloud`
 # shape as the wasm-target runtime. Not enabled by `cargo build`
 # (which targets wasm32 and would otherwise pull in unused code).
+#
+# Issue #426: the long-running (`edge-runtime`) world entry point lives
+# in the sibling crate `edge-js-runtime-long/` rather than here.
+# Putting both worlds in one cdylib is impossible — each
+# `wit_bindgen::generate!` invocation emits a `wasi:cli/run` export,
+# and two exports of the same symbol in the same artifact produce a
+# link-time collision. Two sibling cdylibs avoid this cleanly; the LR
+# crate shares `compile_user_bundle` + `USER_BYTECODE` + the `register`
+# bodies via duplication (mirrored `src/register.rs`, see that file's
+# header for the rationale).
 [features]
 bench = []
 

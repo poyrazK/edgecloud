@@ -13,6 +13,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 // mockTenantSvc is a minimal mock for service.TenantServiceInterface —
@@ -54,6 +55,14 @@ func (m *mockAuthTenantSvc) GetQuota(ctx context.Context, tenantID string) (*dom
 }
 
 func (m *mockAuthTenantSvc) EnableTenant(ctx context.Context, tenantID string) error {
+	panic("not used by Whoami")
+}
+
+func (m *mockAuthTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	panic("not used by Whoami")
+}
+
+func (m *mockAuthTenantSvc) OverrideTenantQuota(ctx context.Context, req service.QuotaOverrideRequest) (*domain.TenantWithQuota, error) {
 	panic("not used by Whoami")
 }
 

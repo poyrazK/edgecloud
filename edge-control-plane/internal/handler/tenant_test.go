@@ -36,6 +36,8 @@ type mockTenantSvc struct {
 	enableTenantErr     error
 	enableTenantCalls   int
 	enableTenantLastID  string
+	overrideResp        *domain.TenantWithQuota
+	overrideErr         error
 }
 
 func (m *mockTenantSvc) BootstrapTenant(ctx context.Context, name, plan, keyName string) (*domain.Tenant, string, error) {
@@ -93,6 +95,20 @@ func (m *mockTenantSvc) EnableTenant(ctx context.Context, tenantID string) error
 	m.enableTenantCalls++
 	m.enableTenantLastID = tenantID
 	return m.enableTenantErr
+}
+
+func (m *mockTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	if m.getQuotaErr != nil {
+		return nil, m.getQuotaErr
+	}
+	return m.getQuotaResp, nil
+}
+
+func (m *mockTenantSvc) OverrideTenantQuota(ctx context.Context, req service.QuotaOverrideRequest) (*domain.TenantWithQuota, error) {
+	if m.overrideErr != nil {
+		return nil, m.overrideErr
+	}
+	return m.overrideResp, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -796,5 +812,162 @@ func TestEnable_ServiceError(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("expected status 500 on opaque error, got: %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QuotaOverride (issue #420 — admin escape hatch for #420 billing boundary)
+// ---------------------------------------------------------------------------
+
+// TestTenantHandler_QuotaOverride_HappyPath verifies the full override
+// body is parsed, the service is called once, and the response is 200 +
+// the service-returned TenantWithQuota JSON. All fields are optional;
+// the test exercises every field at once.
+func TestTenantHandler_QuotaOverride_HappyPath(t *testing.T) {
+	maxReq := 1_000_000
+	maxMB := 5000
+	maxDeploy := 25
+	grace := "2026-08-01T00:00:00Z"
+	want := &domain.TenantWithQuota{
+		Tenant: domain.Tenant{ID: "t_ovr", Plan: "pro"},
+		Quota:  domain.Quota{TenantID: "t_ovr", MaxRequestsPerMonth: maxReq, MaxOutboundMB: maxMB, MaxDeployments: maxDeploy},
+	}
+	svc := &mockTenantSvc{overrideResp: want}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"max_requests_per_month":1000000,"max_outbound_mb":5000,"max_deployments":25,"set_overage_allowed_until":"2026-08-01T00:00:00Z"}`
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_ovr")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp domain.TenantWithQuota
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MaxRequestsPerMonth != maxReq {
+		t.Errorf("MaxRequestsPerMonth = %d, want %d", resp.MaxRequestsPerMonth, maxReq)
+	}
+	_ = maxMB
+	_ = maxDeploy
+	_ = grace
+}
+
+// TestTenantHandler_QuotaOverride_InvalidBody returns 400 on JSON parse
+// failure. The handler must short-circuit before calling the service.
+func TestTenantHandler_QuotaOverride_InvalidBody(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
+	h := handler.NewTenantHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader("not-json"))
+	req.SetPathValue("tenantID", "t_ovr")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_QuotaOverride_PathTraversal rejects a tenantID
+// that contains "..". The handler shares containsPathTraversal with
+// other tenant handlers; we lock the behavior in here.
+func TestTenantHandler_QuotaOverride_PathTraversal(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
+	h := handler.NewTenantHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/..%2Fetc/quota-override", strings.NewReader("{}"))
+	req.SetPathValue("tenantID", "../etc")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for path-traversal tenantID, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_QuotaOverride_MutuallyExclusive set+clear: operators
+// cannot set and clear overage_allowed_until in the same call. The
+// handler must reject with 400 before the service is called.
+func TestTenantHandler_QuotaOverride_MutuallyExclusive(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"set_overage_allowed_until":"2026-08-01T00:00:00Z","clear_overage_allowed_until":true}`
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_ovr")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for set+clear, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_QuotaOverride_BadTimestamp returns 400 when
+// set_overage_allowed_until is not RFC3339-parseable. The handler
+// parses the timestamp before constructing the service request, so
+// the service must not be called.
+func TestTenantHandler_QuotaOverride_BadTimestamp(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"set_overage_allowed_until":"yesterday"}`
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_ovr")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for non-RFC3339 timestamp, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_QuotaOverride_TenantNotFound maps ErrTenantNotFound
+// to 404. The handler distinguishes tenant-not-found from generic
+// errors so operators get an accurate 404 instead of a 500.
+func TestTenantHandler_QuotaOverride_TenantNotFound(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: service.ErrTenantNotFound}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"clear_disabled_at":true}`
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_missing/quota-override", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_missing")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing tenant, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_QuotaOverride_ServiceError maps an unknown error
+// from OverrideTenantQuota to 500 and does not leak the raw error
+// text into the response body.
+func TestTenantHandler_QuotaOverride_ServiceError(t *testing.T) {
+	svc := &mockTenantSvc{overrideErr: errors.New("internal database explosion")}
+	h := handler.NewTenantHandler(svc)
+
+	body := `{"clear_grace":true}`
+	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_ovr")
+	rr := httptest.NewRecorder()
+
+	h.QuotaOverride(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "internal database explosion") {
+		t.Errorf("response should not contain raw error, got: %s", rr.Body.String())
 	}
 }

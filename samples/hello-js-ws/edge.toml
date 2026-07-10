@@ -1,0 +1,40 @@
+# edgeCloud project config consumed by `edge deploy` / `edge build`.
+#
+# Issue #448: this sample is a LONG-RUNNING JS handler (not FaaS). The
+# FaaS (Handler) world can't accept WebSocket upgrades because the host
+# owns the TCP listener and the request-scoped JS runtime is destroyed
+# between requests — see issue #326 #3. Only the long-running world
+# (`edge-runtime`, the world `edge_js_runtime`'s shim is built for)
+# supports `websocket.listen(8081)` + a looping `accept`/`receive`/
+# `send`/`close` cycle.
+#
+# The Rust shim at `src/lib.rs` generates this world's WIT bindings
+# via `wit_bindgen::generate!({ world: "edge-runtime", ... })`. The
+# shim reads `EDGE_WS_PORT` from the process env (the worker allocates
+# it from the PortPool and threads it in at
+# `edge-worker/src/supervisor.rs:1217-1218`), builds a QuickJS runtime
+# in-process, evaluates the embedded JS once, and calls the
+# `globalThis.start({ wsPort })` function defined in `src/handler.js`.
+# The synchronous JS `start()` runs inside `ctx.with(...)` and never
+# returns, which is what keeps the world alive — no `runtime.idle()`,
+# no re-invocation from the supervisor; the supervisor's
+# `execute_app` awaits the wasm call and only re-enters the JS
+# bundle if it returns.
+
+[project]
+name = "hello-js-ws"
+version = "0.1.0"
+# Build for wasm32-wasip1 instead of wasm32-unknown-unknown because
+# the rquickjs-sys dependency auto-stages the wasi-sdk (clang + sysroot)
+# only for the `wasi` target_os — see rquickjs-sys/build.rs:181-197. The
+# wasi-sdk is what compiles the bundled QuickJS C sources. The wasi vs
+# unknown-unknown distinction only affects the *core* module's import
+# set; the `wasm-tools component new --adapt <wasi adapter>` step in
+# `edge build` strips the wasi imports and rewrites the component to
+# the long-running `edge-runtime` world declared below.
+target = "wasm32-wasip1"
+world = "edge-runtime"
+language = "js"
+
+[deployment]
+api = "https://api.edgecloud.dev"

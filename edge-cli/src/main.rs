@@ -237,6 +237,20 @@ enum Command {
         /// under the app's real name. The preview URL stops working after promotion.
         #[arg(long, value_name = "deployment_id")]
         promote: Option<String>,
+
+        /// Forward an explicit Idempotency-Key (issue #52) on the
+        /// deploy request. When omitted, `edge deploy` auto-mints a
+        /// fresh UUID v4 per invocation so a CLI retry on a
+        /// transient network error replays the original deployment
+        /// instead of minting a duplicate. CI typically passes an
+        /// explicit key to dedupe retried jobs across runs; laptop
+        /// users can ignore this flag.
+        ///
+        /// Format: server validates as `[a-fA-F0-9-]{8,128}` — UUID
+        /// v4 strings pass without modification. Replay returns the
+        /// cached deployment_id with status 200 instead of 201.
+        #[arg(long, value_name = "uuid")]
+        idempotency_key: Option<String>,
     },
 
     /// Inspect runtime and deployment status.
@@ -495,6 +509,7 @@ fn main() -> Result<()> {
             preview_ttl,
             promote,
             lang,
+            idempotency_key,
         } => {
             if let Some(dep_id) = promote {
                 return commands::deploy::run_promote(&cli.path, &app, &dep_id);
@@ -543,6 +558,7 @@ fn main() -> Result<()> {
                 file.as_deref(),
                 lang,
                 preview_opts.as_ref(),
+                idempotency_key.as_deref(),
             )
         }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {

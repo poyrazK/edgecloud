@@ -7,6 +7,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -84,14 +85,32 @@ type TenantServiceInterface interface {
 	CreateTenant(ctx context.Context, name, plan string) (*domain.Tenant, error)
 	GetTenant(ctx context.Context, id string) (*domain.TenantWithQuota, error)
 	GetQuota(ctx context.Context, tenantID string) (*domain.Quota, error)
+	GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error)
 	ListTenants(ctx context.Context) ([]domain.Tenant, error)
 	UpdateTenant(ctx context.Context, t *domain.Tenant) error
 	UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error
+	OverrideTenantQuota(ctx context.Context, req QuotaOverrideRequest) (*domain.TenantWithQuota, error)
 	DeleteTenant(ctx context.Context, id string) error
 	// EnableTenant clears tenants.disabled_at for a tenant that
-	// SetDisabledAt previously stamped (issue #440). The handler
-	//'s 409 message references this endpoint.
+	// SetDisabledAt previously stamped (issue #440). The handler's
+	// 409 message references this endpoint.
 	EnableTenant(ctx context.Context, tenantID string) error
+}
+
+// QuotaOverrideRequest is the input to the admin quota-override
+// endpoint (issue #420). All fields are optional — a missing field
+// leaves the corresponding row untouched. The handler validates the
+// shape (RFC3339 timestamps, non-negative ints) before reaching the
+// service.
+type QuotaOverrideRequest struct {
+	TenantID                 string
+	MaxRequestsPerMonth      *int
+	MaxOutboundMB            *int
+	MaxDeployments           *int
+	SetOverageAllowedUntil   *time.Time
+	ClearOverageAllowedUntil bool
+	ClearDisabledAt          bool
+	ClearGrace               bool
 }
 
 // Package-level interfaces for testability. The concrete
@@ -106,6 +125,8 @@ type tenantRepoForTenantSvc interface {
 	Update(ctx context.Context, tenant *domain.Tenant) error
 	Delete(ctx context.Context, id string) error
 	List(ctx context.Context) ([]domain.Tenant, error)
+	SetOverageAllowedUntil(ctx context.Context, tenantID string, at time.Time) error
+	ClearOverageAllowedUntil(ctx context.Context, tenantID string) error
 	ClearDisabledAt(ctx context.Context, tenantID string) error
 }
 
@@ -115,7 +136,8 @@ type quotaRepoForTenantSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.QuotaRepository
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	Create(ctx context.Context, quota *domain.Quota) error
-	Update(ctx context.Context, quota *domain.Quota) error
+	Update(ctx context.Context, q *domain.Quota) error
+	SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error
 }
 
 // apiKeyRepoForTenantSvc is the subset of *repository.APIKeyRepository
@@ -254,6 +276,21 @@ func (s *TenantService) GetQuota(ctx context.Context, tenantID string) (*domain.
 	return s.quotaRepo.GetByTenantID(ctx, tenantID)
 }
 
+// GetQuotaForInternal is the read endpoint the edge-ingress quota
+// fetcher polls (issue #420). Returns the same shape as GetQuota; the
+// "internal" name signals the caller is a trusted service (validated
+// by the InternalAuth middleware) so we can skip the tenant-context
+// lookup and the row-level authorization that GetQuota requires.
+//
+// over_cap is computed from max_* vs used_* in the handler — the
+// service stays a thin pass-through. subscription_status is out of
+// scope for this PR (it's not part of the per-tenant quota cap); the
+// field is reserved in the OpenAPI spec for a follow-up that adds
+// the billing repo dependency to TenantService.
+func (s *TenantService) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
+	return s.quotaRepo.GetByTenantID(ctx, tenantID)
+}
+
 func (s *TenantService) ListTenants(ctx context.Context) ([]domain.Tenant, error) {
 	return s.tenantRepo.List(ctx)
 }
@@ -342,6 +379,93 @@ func (s *TenantService) EnableTenant(ctx context.Context, tenantID string) error
 		return fmt.Errorf("%w: %s", ErrTenantNotFound, tenantID)
 	}
 	return s.tenantRepo.ClearDisabledAt(ctx, tenantID)
+}
+
+// OverrideTenantQuota is the manual recovery path for issue #420.
+// Operator-only; the handler is mounted under RequireRole("owner")
+// and audit-logs every call. Each non-nil field is applied; nil
+// fields leave the row untouched. Returns the post-override
+// TenantWithQuota so the operator can verify the change in the
+// response. Does NOT touch the heartbeat counters (used_*) — those
+// are the actual consumption signal and should only move via
+// heartbeats.
+func (s *TenantService) OverrideTenantQuota(ctx context.Context, req QuotaOverrideRequest) (*domain.TenantWithQuota, error) {
+	if req.TenantID == "" {
+		return nil, fmt.Errorf("tenant id required")
+	}
+	tenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("getting tenant: %w", err)
+	}
+	if tenant == nil {
+		return nil, ErrTenantNotFound
+	}
+	quota, err := s.quotaRepo.GetByTenantID(ctx, req.TenantID)
+	if err != nil {
+		return nil, fmt.Errorf("getting quota: %w", err)
+	}
+	if quota == nil {
+		return nil, ErrQuotaNotFound
+	}
+
+	// Quota row updates: only the max_* columns, never the used_*
+	// counters. The UPDATE is a thin pass-through — sqlx scans
+	// directly into the domain struct; if any of the optional
+	// fields is nil we keep the prior value.
+	if req.MaxRequestsPerMonth != nil {
+		quota.MaxRequestsPerMonth = *req.MaxRequestsPerMonth
+	}
+	if req.MaxOutboundMB != nil {
+		quota.MaxOutboundMB = *req.MaxOutboundMB
+	}
+	if req.MaxDeployments != nil {
+		quota.MaxDeployments = *req.MaxDeployments
+	}
+	if err := s.quotaRepo.Update(ctx, quota); err != nil {
+		return nil, fmt.Errorf("updating quota: %w", err)
+	}
+
+	// Grace-clock clear (free-tier first-cross grace).
+	if req.ClearGrace {
+		if err := s.quotaRepo.SetGraceUntil(ctx, req.TenantID, nil); err != nil {
+			return nil, fmt.Errorf("clearing grace: %w", err)
+		}
+		quota.QuotaLockGraceUntil = nil
+	}
+
+	// Tenant row: overage grace + disabled_at clear.
+	if req.SetOverageAllowedUntil != nil {
+		if err := s.tenantRepo.SetOverageAllowedUntil(ctx, req.TenantID, *req.SetOverageAllowedUntil); err != nil {
+			return nil, fmt.Errorf("setting overage grace: %w", err)
+		}
+		tenant.OverageAllowedUntil = req.SetOverageAllowedUntil
+	}
+	if req.ClearOverageAllowedUntil {
+		if err := s.tenantRepo.ClearOverageAllowedUntil(ctx, req.TenantID); err != nil {
+			return nil, fmt.Errorf("clearing overage grace: %w", err)
+		}
+		tenant.OverageAllowedUntil = nil
+	}
+	if req.ClearDisabledAt {
+		if err := s.tenantRepo.ClearDisabledAt(ctx, req.TenantID); err != nil {
+			return nil, fmt.Errorf("clearing disabled_at: %w", err)
+		}
+		tenant.DisabledAt = nil
+	}
+
+	// Re-read the post-override state so the response payload is
+	// canonical. Cheap and avoids drift between the in-memory
+	// struct above and what's on disk (a partial failure would
+	// otherwise be invisible to the operator).
+	freshTenant, err := s.tenantRepo.GetByID(ctx, req.TenantID)
+	if err != nil || freshTenant == nil {
+		return nil, fmt.Errorf("re-reading tenant: %w", err)
+	}
+	freshQuota, err := s.quotaRepo.GetByTenantID(ctx, req.TenantID)
+	if err != nil || freshQuota == nil {
+		return nil, fmt.Errorf("re-reading quota: %w", err)
+	}
+	return &domain.TenantWithQuota{Tenant: *freshTenant, Quota: *freshQuota}, nil
 }
 
 // GetEgressAllowlist returns the current outbound allowlist for a tenant.
