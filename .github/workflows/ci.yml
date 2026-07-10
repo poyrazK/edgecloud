@@ -121,6 +121,64 @@ jobs:
         run: cargo nextest run --workspace
 
   # ============================================================
+  # RUST-TEST-INTEGRATION — Docker-backed integration/e2e tests
+  # ============================================================
+  # The workspace's container-backed tests (edge-worker + edge-ingress:
+  # integration_tests, js_websocket_e2e, ingress_wire_integration, the
+  # edge-ingress integration binary, plus the already-green
+  # layer_integration) self-skip whenever `CI` is set — see
+  # `should_skip_integration_tests()` in edge-test-helpers. The fast
+  # `rust-test` job above therefore never exercises them. This job sets
+  # RUN_INTEGRATION_TESTS=1 to opt back in and runs them for real against
+  # the runner's Docker daemon (testcontainers spins up NATS itself, so no
+  # `services:` block is needed — ubuntu-latest ships Docker, same daemon
+  # go-test-integration relies on).
+  rust-test-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "1"
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
+      # Opt back in to the container-backed tests that self-skip under CI.
+      RUN_INTEGRATION_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Run integration tests (nextest)
+        # kind(test) selects the tests/ integration binaries only (skips
+        # kind(lib) unit tests already covered by rust-test); scoping to
+        # edge-worker + edge-ingress limits the run to the container-backed
+        # packages. --no-fail-fast so one flaky container doesn't mask the
+        # rest of the suite.
+        run: |
+          cargo nextest run \
+            --no-fail-fast \
+            -E 'kind(test) & (package(edge-worker) | package(edge-ingress))'
+
+  # ============================================================
   # RUST-SEMVER — Run cargo-semver-checks
   # ============================================================
   rust-semver:

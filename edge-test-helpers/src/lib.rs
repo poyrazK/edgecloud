@@ -46,19 +46,30 @@ use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
 use edge_worker::verifier::Keyring;
 
-/// Returns `true` if integration tests should be skipped. We skip when:
+/// Returns `true` if integration tests should be skipped.
 ///
-///   - `SKIP_INTEGRATION_TESTS` is set in the environment (for local
-///     runs when Docker is unavailable).
-///   - `CI` is set (mirrors the convention in `.gitlab-ci.yml` —
-///     integration tests run locally on a developer machine, but the
-///     shared CI runner doesn't have docker-in-docker for these
-///     crates' test step).
+/// **Explicit opt-in wins.** When `RUN_INTEGRATION_TESTS` is set, the
+/// container-backed tests run for real regardless of `CI` — provided Docker
+/// is actually reachable (`/var/run/docker.sock`). This is what the dedicated
+/// `rust-test-integration` CI job sets so these tests execute on GitHub
+/// Actions runners (which do ship Docker), while the fast `rust-test` job
+/// leaves the var unset and keeps self-skipping them.
+///
+/// Absent that override, we skip when:
+///
+///   - `SKIP_INTEGRATION_TESTS` is set in the environment (local escape
+///     hatch when Docker is unavailable).
+///   - `CI` is set — the default for the fast `cargo nextest run --workspace`
+///     job, which is not provisioned to wait on container startup. The
+///     dedicated integration job opts back in via `RUN_INTEGRATION_TESTS`.
 ///   - `/var/run/docker.sock` is absent (we hard-require Docker on the
-///     host for `testcontainers`; touching that socket from inside a
-///     container needs `--privileged` or a DinD setup the team doesn't
-///     run in CI).
+///     host for `testcontainers`).
 pub fn should_skip_integration_tests() -> bool {
+    // Opt-in overrides the CI default; the Docker-socket guard still applies
+    // so the tests skip cleanly where Docker is genuinely absent.
+    if std::env::var("RUN_INTEGRATION_TESTS").is_ok() {
+        return !std::path::Path::new("/var/run/docker.sock").exists();
+    }
     std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
         || std::env::var("CI").is_ok()
         || !std::path::Path::new("/var/run/docker.sock").exists()
