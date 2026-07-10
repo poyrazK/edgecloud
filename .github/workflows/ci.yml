@@ -134,14 +134,17 @@ jobs:
     env:
       CARGO_INCREMENTAL: "1"
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0 -C link-arg=-fuse-ld=mold"
-      # CARGO_HOME is intentionally NOT set at job scope — leaving it
-      # unset lets the runner use its default $HOME/.cargo so the
-      # `cargo install --root "$CARGO_HOME"` + `Expose CLI tools on
-      # PATH` steps land edge-cli + wasm-tools in a known location.
-      # The build step below overrides CARGO_HOME with a fresh tmpdir
-      # to prove the vendored adapter is genuinely canonical (the
-      # registry fallback would only fire if both $EDGE_JS_WASI_ADAPTER
-      # and the vendored file were missing — and they're not).
+      # CARGO_HOME is set explicitly at job scope to $HOME/.cargo so
+      # the two `cargo install` steps and the PATH-export step below
+      # agree on a single install root. GitHub-hosted runners do NOT
+      # preset CARGO_HOME, so an unset $CARGO_HOME would expand to ""
+      # and `cargo install --root ""` would silently land binaries
+      # under ./bin/ (the pre-fix `edge-cli: command not found`
+      # symptom). The build step below overrides CARGO_HOME with a
+      # fresh tmpdir to prove the vendored adapter is genuinely
+      # canonical (the registry fallback would only fire if both
+      # $EDGE_JS_WASI_ADAPTER and the vendored file were missing).
+      CARGO_HOME: $HOME/.cargo
     steps:
       - uses: actions/checkout@v5
         with:
@@ -185,24 +188,29 @@ jobs:
         run: npm ci
 
       - name: Install edge CLI
-        # Use $HOME/.cargo explicitly (not $CARGO_HOME): GitHub-hosted
-        # runners do NOT preset CARGO_HOME, so an unset $CARGO_HOME
-        # expands to "" and `cargo install --root ""` lands binaries
-        # under ./bin/. Same root cause as the pre-fix preview.yml
-        # `edge-cli: command not found` symptom (CLAUDE.md line 114).
-        run: cargo install --path ./edge-cli --locked --root "$HOME/.cargo"
+        run: cargo install --path ./edge-cli --locked
 
       - name: Install wasm-tools
-        run: cargo install wasm-tools --version 1.252.0 --locked --root "$HOME/.cargo"
+        run: cargo install wasm-tools --version 1.252.0 --locked
 
       - name: Expose CLI tools on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       # SHA-256 check on the vendored adapter BEFORE the build —
       # a missing or drifted file fails fast, before the slow
       # rquickjs-sys wasi-sdk staging step.
       - name: Verify vendored WASI adapter checksum
         working-directory: edge-cli/adapters
+        run: sha256sum -c SHA256SUMS
+
+      # SHA-256 check on the component-model fixtures consumed by
+      # edge-worker tests. These are committed binaries (gitignored
+      # exception) without per-file SHA pinning — the sidecar here
+      # mirrors the edge-cli/adapters/SHA256SUMS pattern (F1 review
+      # follow-up) so drift surfaces here in <1s instead of as a
+      # confusing later test failure.
+      - name: Verify test fixture checksums
+        working-directory: edge-worker/tests/fixtures
         run: sha256sum -c SHA256SUMS
 
       # Build against a clean CARGO_HOME so the `cargo install

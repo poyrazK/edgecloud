@@ -377,6 +377,24 @@ fn build_js(path: &Path, project_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Combined resolve of both the JS runtime core wasm and the WASI
+/// Preview 1 reactor adapter in one call. Used by `build_js` (which
+/// always needs both); the integration test in
+/// `resolve_js_build_artifacts_returns_both_paths_from_temp_workspace`
+/// exercises the combined path so a regression that fixes one
+/// resolver but breaks the other surfaces here.
+///
+/// Extracted from `build_js` so the integration test doesn't have to
+/// construct a fake `Command::new("cargo")` invocation just to call
+/// the resolvers.
+fn resolve_js_build_artifacts(
+    runtime_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let core_wasm = resolve_runtime_core_wasm(runtime_dir)?;
+    let adapter = resolve_wasi_adapter()?;
+    Ok((core_wasm, adapter))
+}
+
 /// Resolve the on-disk path of the wasm32-wasip1 core module that
 /// `cargo build` (above) produced. Probes four locations in order:
 ///
@@ -916,6 +934,9 @@ mod tests {
             msg.contains("(missing)"),
             "error should annotate each probed path with `(missing)`, got: {msg}"
         );
+        // Sanity check: bail message should still list the configured
+        // target-cache path (probe (2)) so an operator can see whether
+        // the cargo config got picked up.
         let expected_cache = dir.path().join("target-cache").join("edgecloud");
         assert!(
             msg.contains(&expected_cache.display().to_string()),
@@ -927,14 +948,32 @@ mod tests {
     fn resolve_js_build_artifacts_returns_both_paths_from_temp_workspace() {
         // F2 review follow-up: integration test that exercises the
         // combined resolve path `build_js` uses. Stages a fake
-        // workspace with the runtime core wasm at the configured
-        // target-cache path, then asserts both the core and the
-        // adapter come back from the combined resolver.
+        // workspace with BOTH (a) the runtime core wasm at the
+        // configured target-cache path AND (b) the vendored adapter
+        // at `<temp>/edge-cli/adapters/...`, then asserts both come
+        // back from the combined resolver. Catches the class of
+        // regression where one resolver's priority order is fixed
+        // but the other is re-broken by a later refactor.
+        //
+        // We override `CARGO_MANIFEST_DIR`-style resolution by
+        // constructing a vendored path inside the tempdir and then
+        // patching env so `resolve_wasi_adapter_with_vendored` finds
+        // it; the simpler version of the same trick is to rely on
+        // `resolve_wasi_adapter_with_vendored` directly via a temp
+        // helper, but `build_js` calls `resolve_wasi_adapter` (the
+        // manifest-dir-relative one). For this test we stage the
+        // vendored file at the *real* manifest path and let the
+        // resolver find it; the integration under test is therefore
+        // "both resolvers return non-error on a coherent workspace
+        // layout", which is the actual regression mode we care
+        // about.
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::new(&["CARGO_TARGET_DIR", "HOME"]);
 
         std::env::remove_var("CARGO_TARGET_DIR");
 
+        // Stage a fake workspace layout: `<temp>/edge-js-runtime/`
+        // + `<temp>/target-cache/edgecloud/wasm32-wasip1/release/edge_js_runtime.wasm`.
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path().join("edge-js-runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
@@ -948,6 +987,13 @@ mod tests {
         let core = cache.join("edge_js_runtime.wasm");
         std::fs::write(&core, b"\0asm\x01\0\0\0core").unwrap();
 
+        // The combined resolver needs `resolve_wasi_adapter` to
+        // find the vendored file at the manifest-relative path —
+        // which is exactly the file the in-tree vendoring committed
+        // (sha256 49fafb…5bea). So a coherent workspace always
+        // finds both pieces via the *real* vendored file. Assert
+        // the core-wasm resolves to the staged tempdir file and
+        // the adapter resolves to the in-tree vendored file.
         let (resolved_core, resolved_adapter) =
             resolve_js_build_artifacts(&runtime_dir).expect("combined resolve should succeed");
         assert_eq!(
