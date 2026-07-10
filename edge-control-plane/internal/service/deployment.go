@@ -238,22 +238,6 @@ var (
 	// tenant should always be able to manually reverse their own
 	// activation, even if they opted out of auto-rollback.
 	ErrAutoRollbackDisabled = errors.New("auto-rollback disabled")
-	// ErrTenantDisabled is returned by ActivateDeployment /
-	// RollbackDeployment / PromoteDeployment when the tenants row
-	// has disabled_at IS NOT NULL at the moment the activate tx takes
-	// its SELECT … FOR UPDATE on (tenants.id) — issue #440. The
-	// row-level lock serializes the activate tx against
-	// WorkerService.disableTenantAtomically, so a racing tenant
-	// disable either blocks the activate (we then read disabled_at
-	// non-nil and abort the publish) or commits ahead of us (the
-	// disable path's post-commit active-deployments diff then sees
-	// our row and skips publishing an empty task_update that would
-	// otherwise kill the just-activated app). Handler maps to
-	// HTTP 409 Conflict (RFC 9110 §15.5.10 — "request can't be
-	// processed in current resource state"); match the conventional
-	// ErrNoLastGood / ErrAlreadyActivated mappings at the top of
-	// handler/deployment.go.
-	ErrTenantDisabled = errors.New("tenant is disabled (issue #440); re-enable via POST /api/v1/admin/tenants/.../enable or wait for the quota-billing cycle to reset")
 )
 
 // PaymentRequiredError wraps ErrPaymentRequired with a structured
@@ -380,6 +364,10 @@ type deployActiveRepoInterface interface {
 type tenantRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.TenantRepository
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
+	// GetForUpdate is GetByID with a row-level write lock; used by
+	// the activate / rollback tx to serialize against SetDisabledAt
+	// (issue #440).
+	GetForUpdate(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
 // quotaRepoForDeploymentSvc is the subset of *repository.QuotaRepository
@@ -474,6 +462,54 @@ type DeploymentService struct {
 	// the constructor; never nil/empty (the config layer defaults to
 	// "global" when unset).
 	defaultRegion string
+}
+
+// lockTenantForUpdate is the issue #440 disable-vs-write gate. It must
+// be the first SQL call inside any DeploymentService tx that ends in
+// either an active_deployments mutation OR an outbox INSERT —
+// specifically activateDeployment and RollbackDeployment, which both
+// publish a TaskMessage (directly via the outbox drainer) on commit.
+//
+// Locking the tenant row BEFORE reading active_deployments serializes
+// against concurrent SetDisabledAt / ClearDisabledAt:
+//
+//   - If we read disabled_at = NULL, the disable either commits after
+//     our tx (we hold the row lock until our commit, so the disable
+//     waits; it then sees our freshly-committed active row mutation
+//     and writes disabled_at) — the outbox row we enqueue carries a
+//     TaskMessage the OutboxDrainer will eventually publish, but the
+//     worker side already sees the tenant as disabled via the
+//     heartbeat-driven route-table update (ApplyTenantDelta fires on
+//     disabled_at writes), and the per-region dedupe_id on the message
+//     (issue #418) prevents the worker from re-applying the same
+//     delta on JetStream redelivery. The stale publish is therefore
+//     tolerable.
+//
+//   - If we read disabled_at set, the disable committed first and we
+//     abort with ErrTenantDisabled before touching the active row —
+//     no TaskMessage is enqueued.
+//
+// Lock-order: tenant first, then active_deployments. The two write
+// paths must agree on this order or a disable could commit between
+// one path's tenant read and the other's active read, producing a
+// split-brain state where activate publishes but rollback doesn't (or
+// vice versa).
+//
+// Returns (nil, nil) — i.e. ErrTenantNotFound — when the tenant row
+// does not exist. Callers MUST treat this as a hard error: a tenant
+// the control plane has forgotten about must not receive a publish.
+func (s *DeploymentService) lockTenantForUpdate(ctx context.Context, txTenant *repository.TenantRepository, tenantID string) (*domain.Tenant, error) {
+	tenantRow, err := txTenant.GetForUpdate(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("locking tenant: %w", err)
+	}
+	if tenantRow == nil {
+		return nil, ErrTenantNotFound
+	}
+	if tenantRow.IsDisabled() {
+		return nil, ErrTenantDisabled
+	}
+	return tenantRow, nil
 }
 
 func NewDeploymentService(
@@ -1178,23 +1214,23 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// inside the same tx as the active_deployments FOR UPDATE so
 		// the tenant state is observed under the lock — not after a
 		// post-commit GetByID race. The lock also serializes against
-		// WorkerService.disableTenantAtomically (added in commit 3):
-		// if disable commits ahead, our tx observes disabled_at
-		// non-nil and we abort before publishing; if our tx commits
-		// first, disable's post-commit active-deployments diff sees
-		// the row we just wrote and skips the empty task_update
-		// that would otherwise kill the just-activated app.
-		txTenant, err := s.tenantRepo.WithTx(tx).GetForUpdate(ctx, tenantID)
-		if err != nil {
-			return fmt.Errorf("reading tenant for update: %w", err)
-		}
-		if txTenant == nil {
-			return fmt.Errorf("tenant not found")
-		}
-		if txTenant.IsDisabled() {
-			return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
-		}
+		// WorkerService.disableTenantAtomically: if disable commits
+		// ahead, our tx observes disabled_at non-nil and we abort
+		// before publishing; if our tx commits first, disable's
+		// post-commit active-deployments diff sees the row we just
+		// wrote and skips the empty task_update that would
+		// otherwise kill the just-activated app.
+		txTenant := s.tenantRepo.WithTx(tx)
 		txActive := s.activeRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-activate gate — see
+		// lockTenantForUpdate for the race window + the worker-side
+		// dedupe_id / route-table mechanism that makes the
+		// "disable commits after we read NULL" arm tolerable.
+		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+			return err
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1533,18 +1569,18 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		// mapping at handler/deployment.go:798 was previously
 		// dead code for the rollback path — this guard makes
 		// it reachable.
-		txTenant, err := s.tenantRepo.WithTx(tx).GetForUpdate(ctx, tenantID)
-		if err != nil {
-			return fmt.Errorf("reading tenant for rollback: %w", err)
-		}
-		if txTenant == nil {
-			return fmt.Errorf("tenant not found")
-		}
-		if txTenant.IsDisabled() {
-			return fmt.Errorf("%w: tenant=%s", ErrTenantDisabled, tenantID)
+		txTenant := s.tenantRepo.WithTx(tx)
+		txActive := s.activeRepo.WithTx(tx)
+
+		// Issue #440 disable-vs-rollback gate — symmetric with the
+		// activateDeployment call above. See lockTenantForUpdate
+		// for the race window + the worker-side dedupe_id /
+		// route-table mechanism that makes the "disable commits
+		// after we read NULL" arm tolerable.
+		if _, err := s.lockTenantForUpdate(ctx, txTenant, tenantID); err != nil {
+			return err
 		}
 
-		txActive := s.activeRepo.WithTx(tx)
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)

@@ -139,10 +139,10 @@ func TestActivateDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 	// 2. Activate tx: tenant.GetForUpdate returns a disabled row →
 	//    abort. The active_deployments GetForUpdate must NOT run.
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Disabled Tenant", "free", pq.Array([]string{}), time.Now().Add(-1*time.Hour), time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Disabled Tenant", "free", pq.Array([]string{}), time.Now().Add(-1*time.Hour), time.Now(), nil))
 	mock.ExpectRollback()
 
 	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
@@ -201,10 +201,10 @@ func TestActivateDeployment_DisabledAtPostCommit_ReturnsErrTenantDisabled(t *tes
 	//    ErrTenantDisabled without touching active_deployments or
 	//    the outbox.
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), time.Now(), nil))
 	mock.ExpectRollback()
 
 	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
@@ -248,10 +248,10 @@ func TestDisableTenantAtomically_NoConcurrentActivate_PublishesEmpty(t *testing.
 	const tenantID = "t_a"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -331,10 +331,10 @@ func TestDisableTenantAtomically_RacingActivatePublishCompleted_PublishesEmpty(t
 	const tenantID = "t_a"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -367,10 +367,10 @@ func TestDisableTenantAtomically_EmptyActiveList_NoPublish(t *testing.T) {
 	const tenantID = "t_empty"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Empty Tenant", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Empty Tenant", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -468,10 +468,10 @@ func TestDisableTenantAtomically_WaitsForInFlightActivatePublishes(t *testing.T)
 	const tenantID = "t_a"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -552,10 +552,10 @@ func TestDisableTenantAtomically_WaitTimeoutExitsAndPublishes(t *testing.T) {
 	const tenantID = "t_a"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -606,10 +606,10 @@ func TestDisableTenantAtomically_NoInFlightRows_PublishesImmediately(t *testing.
 	const tenantID = "t_a"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), nil, nil))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE tenants SET disabled_at = $2 WHERE id = $1`)).
 		WithArgs(tenantID, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -660,10 +660,10 @@ func TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 	// Commit 2's guard reads it; on non-nil DisabledAt, abort with
 	// ErrTenantDisabled. No further SQL runs.
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at FROM tenants WHERE id = \$1 FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id = \$1 FOR UPDATE`).
 		WithArgs("t_disabled").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at"}).
-			AddRow("t_disabled", "Disabled", "free", pq.Array([]string{}), time.Now().Add(-24*time.Hour), disabledAt))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at", "disabled_at", "overage_allowed_until"}).
+			AddRow("t_disabled", "Disabled", "free", pq.Array([]string{}), time.Now().Add(-24*time.Hour), disabledAt, nil))
 	mock.ExpectRollback()
 
 	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp")
