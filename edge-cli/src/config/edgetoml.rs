@@ -23,7 +23,7 @@ pub struct Project {
     /// common Rust path — `edge build` running cargo + a `wasm-tools
     /// component new` wrap — works on a toml that omits the key.
     /// Set explicitly for projects that need a different target
-    /// (e.g. `wasm32-wasip1`).
+    /// (e.g. `wasm32-wasip2` for direct wasi-http component emission).
     #[serde(default = "default_target")]
     pub target: String,
     /// WIT world the guest component implements, used to wrap the
@@ -260,7 +260,7 @@ world = "edge-runtime-handler"
 
     #[test]
     fn target_respects_explicit_value() {
-        // Setting `target = "wasm32-wasip1"` (or any other value) is
+        // Setting `target = "wasm32-wasip2"` (or any other value) is
         // preserved verbatim — the default is only the fallback for
         // absent keys. This keeps backward compat with projects that
         // explicitly opt into non-default targets.
@@ -268,13 +268,13 @@ world = "edge-runtime-handler"
             r#"[project]
 name = "x"
 version = "0.1.0"
-target = "wasm32-wasip1"
+target = "wasm32-wasip2"
 world = "edge-runtime-handler"
 
 [deployment]
 "#,
         );
-        assert_eq!(toml.project.target, "wasm32-wasip1");
+        assert_eq!(toml.project.target, "wasm32-wasip2");
     }
 
     #[test]
