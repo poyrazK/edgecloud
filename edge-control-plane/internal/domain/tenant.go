@@ -56,15 +56,16 @@ func (t *Tenant) IsDisabled() bool {
 // keys (no json tags); the rename to snake_case is part of the billing v0
 // wire-shape change.
 type Quota struct {
-	TenantID            string `db:"tenant_id"              json:"tenant_id"`
-	MaxDeployments      int    `db:"max_deployments"        json:"max_deployments"`
-	MaxApps             int    `db:"max_apps"               json:"max_apps"`
-	MaxWorkers          int    `db:"max_workers"            json:"max_workers"`
-	MaxMemoryMB         int    `db:"max_memory_mb"          json:"max_memory_mb"`
-	MaxOutboundMB       int    `db:"max_outbound_mb"        json:"max_outbound_mb"`
-	MaxRequestsPerMonth int    `db:"max_requests_per_month" json:"max_requests_per_month"`
-	UsedOutboundBytes   int64  `db:"used_outbound_bytes"    json:"used_outbound_bytes"`
-	UsedRequestCount    int64  `db:"used_request_count"     json:"used_request_count"`
+	TenantID                   string `db:"tenant_id"                      json:"tenant_id"`
+	MaxDeployments             int    `db:"max_deployments"                json:"max_deployments"`
+	MaxApps                    int    `db:"max_apps"                       json:"max_apps"`
+	MaxWorkers                 int    `db:"max_workers"                    json:"max_workers"`
+	MaxMemoryMB                int    `db:"max_memory_mb"                  json:"max_memory_mb"`
+	MaxOutboundMB              int    `db:"max_outbound_mb"                json:"max_outbound_mb"`
+	MaxRequestsPerMonth        int    `db:"max_requests_per_month"         json:"max_requests_per_month"`
+	MaxResidentSecondsPerMonth int    `db:"max_resident_seconds_per_month" json:"max_resident_seconds_per_month"`
+	UsedOutboundBytes          int64  `db:"used_outbound_bytes"            json:"used_outbound_bytes"`
+	UsedRequestCount           int64  `db:"used_request_count"             json:"used_request_count"`
 	// UsedMemoryMB is the aggregate memory (MiB) currently consumed
 	// by the tenant's active deployments (issue #44, part 2).
 	// Incremented on activate / promote, decremented on rollback.
@@ -74,8 +75,9 @@ type Quota struct {
 	// would be wrong. The deploy-time gate rejects a new deploy when
 	// UsedMemoryMB + perAppMemory > MaxMemoryMB (with MaxMemoryMB == 0
 	// or < 0 falling through to the per-instance hint path).
-	UsedMemoryMB     int64     `db:"used_memory_mb"         json:"used_memory_mb"`
-	QuotaPeriodStart time.Time `db:"quota_period_start"     json:"quota_period_start"`
+	UsedMemoryMB        int64     `db:"used_memory_mb"         json:"used_memory_mb"`
+	UsedResidentSeconds int64     `db:"used_resident_seconds"  json:"used_resident_seconds"`
+	QuotaPeriodStart    time.Time `db:"quota_period_start"     json:"quota_period_start"`
 	// QuotaLockGraceUntil is set by applyTenantDelta on free-tier
 	// first-cross of a monthly cap (issue #420). It bounds the
 	// request-time 402 — deploys are blocked immediately, but the
@@ -86,15 +88,22 @@ type Quota struct {
 	QuotaLockGraceUntil *time.Time `db:"quota_lock_grace_until" json:"quota_lock_grace_until,omitempty"`
 }
 
-// UsagePct returns the highest usage percentage across the two monthly caps
-// (outbound bytes and request count) as a 0–100 value. Returns nil when both
-// caps are unlimited (sentinel < 0). The caller is expected to wrap this into
-// a response shape with omitempty so unlimited tenants don't get a misleading 0.
+// UsagePct returns the highest usage percentage across the three monthly caps
+// (outbound bytes, request count, resident seconds) as a 0–100 value. Returns
+// nil when all caps are unlimited (sentinel < 0). The caller is expected to
+// wrap this into a response shape with omitempty so unlimited tenants don't
+// get a misleading 0.
+//
+// Resident-seconds was added in issue #485 as the third metered dimension.
+// Handler (FaaS) apps do not contribute (the worker stamps
+// resident_seconds=None; the CP translates None to 0). The cap check
+// fires on LongRunning apps that exceed the monthly uptime budget.
 func (q Quota) UsagePct() *float64 {
 	outCap := int64(q.MaxOutboundMB) * 1024 * 1024
 	reqCap := int64(q.MaxRequestsPerMonth)
+	resCap := int64(q.MaxResidentSecondsPerMonth)
 
-	var outPct, reqPct *float64
+	var outPct, reqPct, resPct *float64
 	if outCap > 0 {
 		v := float64(q.UsedOutboundBytes) / float64(outCap) * 100
 		outPct = &v
@@ -103,18 +112,43 @@ func (q Quota) UsagePct() *float64 {
 		v := float64(q.UsedRequestCount) / float64(reqCap) * 100
 		reqPct = &v
 	}
+	if resCap > 0 {
+		v := float64(q.UsedResidentSeconds) / float64(resCap) * 100
+		resPct = &v
+	}
 	switch {
-	case outPct == nil && reqPct == nil:
+	case outPct == nil && reqPct == nil && resPct == nil:
 		return nil
-	case outPct == nil:
+	case outPct == nil && reqPct == nil:
+		return resPct
+	case outPct == nil && resPct == nil:
 		return reqPct
+	case reqPct == nil && resPct == nil:
+		return outPct
+	case outPct == nil:
+		if *reqPct > *resPct {
+			return reqPct
+		}
+		return resPct
 	case reqPct == nil:
-		return outPct
+		if *outPct > *resPct {
+			return outPct
+		}
+		return resPct
+	case resPct == nil:
+		if *outPct > *reqPct {
+			return outPct
+		}
+		return reqPct
 	}
-	if *outPct > *reqPct {
-		return outPct
+	best := *outPct
+	if *reqPct > best {
+		best = *reqPct
 	}
-	return reqPct
+	if *resPct > best {
+		best = *resPct
+	}
+	return &best
 }
 
 // TenantWithQuota combines tenant and quota data.

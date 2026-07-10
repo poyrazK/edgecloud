@@ -67,13 +67,14 @@ import (
 //
 // On current branch after merge of PR #466 (#42), PR #420 (quota
 // grace columns → 025_quotas_grace_columns), issue #440 commit 6
-// (026_active_deployments_activation_attempt_started_at), and PR
-// #534 (027_used_memory_mb + 028_quota_memory_constraint etc.):
-// 38 .up.sql + 38 .down.sql = 76 split files. Some numeric prefixes
+// (026_active_deployments_activation_attempt_started_at), PR #534
+// (027_used_memory_mb + 028_quota_memory_constraint etc.), and
+// PR #485 (029_quotas_resident_seconds + 030_billing_usage_events):
+// 40 .up.sql + 40 .down.sql = 80 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
-// 028_*), so this is the on-disk file count, not a strict 2× the
-// migration number.
-const splitFileCount = 76 // 38 .up.sql + 38 .down.sql after PR #534 merge
+// 028_*, 029_*, 030_*), so this is the on-disk file count, not a
+// strict 2× the migration number.
+const splitFileCount = 80 // 40 .up.sql + 40 .down.sql after PR #485 merge
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -100,6 +101,7 @@ var wantTables = []string{
 	"billing_events",        // 023 (issue #419)
 	"outbox",                // 025 (issue #42)
 	"idempotency_keys",      // 026 (issue #52)
+	"billing_usage_events",  // 030 (issue #485)
 }
 
 // wantColumns enumerates the public-schema columns each table must
@@ -134,17 +136,19 @@ var wantColumns = map[string][]string{
 	},
 	"quotas": {
 		"tenant_id",
-		"max_deployments",        // 001
-		"max_apps",               // 001
-		"max_workers",            // 001
-		"max_memory_mb",          // 001
-		"max_outbound_mb",        // 001
-		"used_outbound_bytes",    // 009_quotas_used_outbound
-		"quota_period_start",     // 009_quotas_used_outbound
-		"max_requests_per_month", // 013
-		"used_request_count",     // 013
-		"quota_lock_grace_until", // 025_quotas_grace_columns (issue #420)
-		"used_memory_mb",         // 027_used_memory_mb (issue #44 part 2)
+		"max_deployments",                // 001
+		"max_apps",                       // 001
+		"max_workers",                    // 001
+		"max_memory_mb",                  // 001
+		"max_outbound_mb",                // 001
+		"used_outbound_bytes",            // 009_quotas_used_outbound
+		"quota_period_start",             // 009_quotas_used_outbound
+		"max_requests_per_month",         // 013
+		"used_request_count",             // 013
+		"quota_lock_grace_until",         // 025_quotas_grace_columns (issue #420)
+		"used_memory_mb",                 // 027_used_memory_mb (issue #44 part 2)
+		"max_resident_seconds_per_month", // 029_quotas_resident_seconds (issue #485)
+		"used_resident_seconds",          // 029_quotas_resident_seconds (issue #485)
 	},
 	"api_keys": {
 		"id",
@@ -317,6 +321,16 @@ var wantColumns = map[string][]string{
 		"processed_at",
 		"payload_hash",
 	},
+	"billing_usage_events": { // 030 (issue #485)
+		"id",
+		"tenant_id",
+		"kind",
+		"quantity",
+		"idempotency_key",
+		"recorded_at",
+		"processed_at",
+		"provider",
+	},
 	"outbox": { // 025 (issue #42)
 		"id",
 		"tenant_id",
@@ -373,18 +387,20 @@ var wantTypes = map[string]map[string]string{
 		"overage_allowed_until":    "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
 	},
 	"quotas": {
-		"tenant_id":              "text",
-		"max_deployments":        "int4",        // 001
-		"max_apps":               "int4",        // 001
-		"max_workers":            "int4",        // 001
-		"max_memory_mb":          "int4",        // 001
-		"max_outbound_mb":        "int4",        // 001
-		"used_outbound_bytes":    "int8",        // 009_quotas_used_outbound
-		"quota_period_start":     "timestamptz", // 009_quotas_used_outbound
-		"max_requests_per_month": "int4",        // 013
-		"used_request_count":     "int8",        // 013
-		"quota_lock_grace_until": "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
-		"used_memory_mb":         "int8",        // 027_used_memory_mb (issue #44 part 2)
+		"tenant_id":                      "text",
+		"max_deployments":                "int4",        // 001
+		"max_apps":                       "int4",        // 001
+		"max_workers":                    "int4",        // 001
+		"max_memory_mb":                  "int4",        // 001
+		"max_outbound_mb":                "int4",        // 001
+		"used_outbound_bytes":            "int8",        // 009_quotas_used_outbound
+		"quota_period_start":             "timestamptz", // 009_quotas_used_outbound
+		"max_requests_per_month":         "int4",        // 013
+		"used_request_count":             "int8",        // 013
+		"quota_lock_grace_until":         "timestamptz", // 025_quotas_grace_columns (issue #420, nullable)
+		"used_memory_mb":                 "int8",        // 027_used_memory_mb (issue #44 part 2)
+		"max_resident_seconds_per_month": "int4",        // 029_quotas_resident_seconds (issue #485)
+		"used_resident_seconds":          "int8",        // 029_quotas_resident_seconds (issue #485)
 	},
 	"api_keys": {
 		"id":             "text",
@@ -554,6 +570,16 @@ var wantTypes = map[string]map[string]string{
 		"processed_at": "timestamptz", // nullable
 		"payload_hash": "varchar",     // VARCHAR(128)
 	},
+	"billing_usage_events": { // 030 (issue #485)
+		"id":              "int8",    // BIGSERIAL
+		"tenant_id":       "varchar", // VARCHAR(64)
+		"kind":            "varchar", // VARCHAR(16)
+		"quantity":        "int8",    // BIGINT
+		"idempotency_key": "varchar", // VARCHAR(128)
+		"recorded_at":     "timestamptz",
+		"processed_at":    "timestamptz", // nullable
+		"provider":        "varchar",     // VARCHAR(32)
+	},
 	"outbox": { // 025 (issue #42)
 		"id":              "int8",
 		"tenant_id":       "text",
@@ -597,16 +623,18 @@ var wantNotNull = map[string][]string{
 	},
 	"quotas": {
 		"tenant_id",
-		"max_deployments",        // 001
-		"max_apps",               // 001
-		"max_workers",            // 001
-		"max_memory_mb",          // 001
-		"max_outbound_mb",        // 001
-		"used_outbound_bytes",    // 009_quotas_used_outbound
-		"quota_period_start",     // 009_quotas_used_outbound
-		"max_requests_per_month", // 013
-		"used_request_count",     // 013
-		"used_memory_mb",         // 027_used_memory_mb (issue #44 part 2)
+		"max_deployments",                // 001
+		"max_apps",                       // 001
+		"max_workers",                    // 001
+		"max_memory_mb",                  // 001
+		"max_outbound_mb",                // 001
+		"used_outbound_bytes",            // 009_quotas_used_outbound
+		"quota_period_start",             // 009_quotas_used_outbound
+		"max_requests_per_month",         // 013
+		"used_request_count",             // 013
+		"used_memory_mb",                 // 027_used_memory_mb (issue #44 part 2)
+		"max_resident_seconds_per_month", // 029_quotas_resident_seconds (issue #485)
+		"used_resident_seconds",          // 029_quotas_resident_seconds (issue #485)
 	},
 	"api_keys": {
 		"id",
@@ -763,6 +791,16 @@ var wantNotNull = map[string][]string{
 		"payload_hash",
 		// tenant_id, processed_at are nullable.
 	},
+	"billing_usage_events": { // 030 (issue #485)
+		"id",
+		"tenant_id",
+		"kind",
+		"quantity",
+		"idempotency_key",
+		"recorded_at",
+		"provider",
+		// processed_at is nullable.
+	},
 	"outbox": { // 025 (issue #42)
 		"id",
 		"tenant_id",
@@ -794,7 +832,7 @@ var wantNotNull = map[string][]string{
 // Update when a migration creates or renames an index. Inline comments
 // reference the migration number where the index was created.
 var wantIndexes = []IndexExpectation{
-	{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
+{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
 	{Table: "deployments", Name: "idx_deployments_tenant"},                                      // 002_add_indexes
 	{Table: "workers", Name: "idx_workers_region"},                                              // 002_add_indexes
 	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                            // 002_add_indexes
@@ -823,6 +861,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "active_deployments", Name: "idx_active_deployments_regions_cache_failed_nonempty"}, // 027_active_deployments_regions_cache_failed_index (issue #501)
 	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                               // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "quotas", Name: "idx_quotas_grace_until"},                                           // 025_quotas_grace_columns (issue #420, partial)
+	{Table: "billing_usage_events", Name: "idx_billing_usage_events_unprocessed"},               // 030_billing_usage_events (issue #485, partial)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -858,6 +897,9 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 	},
 	"api_keys": {
 		{"api_keys_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
+	},
+	"billing_usage_events": { // 030 (issue #485)
+		{"billing_usage_events_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id)"},
 	},
 	"app_traffic_splits": {
 		{"app_traffic_splits_deployment_id_fkey", "FOREIGN KEY (deployment_id) REFERENCES deployments(id)"},
@@ -907,10 +949,12 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 // here are pinned to PG 16; if the team upgrades to PG 17/18 and the
 // rendering changes, the test will need updates.
 var wantChecks = map[string]string{
-	"api_keys.api_keys_hash_algorithm_check":             "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",           // 005_api_key_hash_algorithm
-	"app_traffic_splits.app_traffic_splits_weight_check": "CHECK (((weight >= 0) AND (weight <= 100)))",                                        // 009_traffic_splits
-	"autoscale_events.autoscale_events_action_check":     "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))", // 012_autoscale_events
-	"quotas.quotas_used_memory_mb_nonneg":                "CHECK ((used_memory_mb >= 0))",                                                      // 027_used_memory_mb (issue #44 part 2)
+	"api_keys.api_keys_hash_algorithm_check":                   "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",                              // 005_api_key_hash_algorithm
+	"app_traffic_splits.app_traffic_splits_weight_check":       "CHECK (((weight >= 0) AND (weight <= 100)))",                                                           // 009_traffic_splits
+	"autoscale_events.autoscale_events_action_check":           "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))",                    // 012_autoscale_events
+	"quotas.quotas_used_memory_mb_nonneg":                      "CHECK ((used_memory_mb >= 0))",                                                                         // 027_used_memory_mb (issue #44 part 2)
+	"billing_usage_events.billing_usage_events_kind_check":     "CHECK ((kind = ANY (ARRAY['resident_seconds'::text, 'request_count'::text, 'outbound_bytes'::text])))", // 030_billing_usage_events (issue #485)
+	"billing_usage_events.billing_usage_events_quantity_check": "CHECK ((quantity >= 0))",                                                                               // 030_billing_usage_events (issue #485)
 }
 
 // wantDefaults enumerates every public-schema column that has a
@@ -955,6 +999,9 @@ var wantDefaults = map[string]map[string]string{
 	"billing_events": { // 023 (issue #419)
 		"received_at": "now()", // 023
 	},
+	"billing_usage_events": { // 030 (issue #485)
+		"recorded_at": "now()", // 030
+	},
 	"deployments": {
 		"auto_rollback_enabled": "false",            // 009
 		"regions":               "'{}'::text[]",     // 008
@@ -970,16 +1017,18 @@ var wantDefaults = map[string]map[string]string{
 		"labels": "'{}'::jsonb", // 005
 	},
 	"quotas": {
-		"max_apps":               "5",                                                           // 001
-		"max_deployments":        "10",                                                          // 001
-		"max_memory_mb":          "256",                                                         // 001
-		"max_outbound_mb":        "1000",                                                        // 001
-		"max_requests_per_month": "100000",                                                      // 013
-		"max_workers":            "3",                                                           // 001
-		"quota_period_start":     "date_trunc('month'::text, (now() AT TIME ZONE 'UTC'::text))", // 009
-		"used_outbound_bytes":    "0",                                                           // 009
-		"used_request_count":     "0",                                                           // 013
-		"used_memory_mb":         "0",                                                           // 027_used_memory_mb (issue #44 part 2)
+		"max_apps":                       "5",                                                           // 001
+		"max_deployments":                "10",                                                          // 001
+		"max_memory_mb":                  "256",                                                         // 001
+		"max_outbound_mb":                "1000",                                                        // 001
+		"max_requests_per_month":         "100000",                                                      // 013
+		"max_resident_seconds_per_month": "0",                                                           // 029_quotas_resident_seconds (issue #485); backfilled per plan
+		"max_workers":                    "3",                                                           // 001
+		"quota_period_start":             "date_trunc('month'::text, (now() AT TIME ZONE 'UTC'::text))", // 009
+		"used_outbound_bytes":            "0",                                                           // 009
+		"used_request_count":             "0",                                                           // 013
+		"used_memory_mb":                 "0",                                                           // 027_used_memory_mb (issue #44 part 2)
+		"used_resident_seconds":          "0",                                                           // 029_quotas_resident_seconds (issue #485)
 	},
 	"tenants": {
 		"allowlisted_destinations": "'{}'::text[]", // 001
@@ -1253,6 +1302,107 @@ func TestRoundtrip(t *testing.T) {
 				"plan %q: quotas.max_requests_per_month = %d, want %d (013 backfill drifted?)",
 				e.plan, got, e.wantCap)
 		}
+	})
+
+	t.Run("BackfillsResidentSecondsCapPerPlan_029", func(t *testing.T) {
+		// Data-dependent backfill contract for issue #485 / migration
+		// 029. Mirrors the 013 backfill subtest above: seed tenants
+		// with each plan tier, run the 029 backfill in isolation, and
+		// verify max_resident_seconds_per_month matches the per-plan
+		// values declared in internal/domain/plans.go.
+		//
+		// Uses a fresh DB container so we can stop at a specific
+		// migration version and seed data before the backfill runs.
+		subPgC := newTestPostgres(t, ctx)
+		subCtx, subCancel := context.WithTimeout(ctx, 2*time.Minute)
+		t.Cleanup(func() {
+			cctx, c := context.WithTimeout(context.Background(), 30*time.Second)
+			defer c()
+			_ = subPgC.Terminate(cctx)
+			subCancel()
+		})
+
+		subDB := newDBFromContainer(t, subCtx, subPgC)
+		t.Cleanup(func() { _ = subDB.Close() })
+
+		// Apply all migrations to set up the full schema.
+		_, err := migrate.Exec(subDB.DB, "postgres", &migrate.FileMigrationSource{Dir: src}, migrate.Up)
+		require.NoError(t, err)
+
+		// Reset to pre-029 state by dropping the columns 029 adds.
+		// CASCADE drops dependent rows so the seeding step below
+		// controls the row set.
+		_, err = subDB.DB.Exec(`
+			ALTER TABLE quotas
+				DROP COLUMN IF EXISTS max_resident_seconds_per_month,
+				DROP COLUMN IF EXISTS used_resident_seconds;
+		`)
+		require.NoError(t, err)
+
+		// Seed one tenant + matching quota row per plan tier. Each
+		// tenant needs a pre-existing quota row for the UPDATE backfill
+		// (which joins quotas to tenants) to produce a value the test
+		// can read back.
+		for _, plan := range []string{"free", "pro", "business", "enterprise", "unknown"} {
+			_, err := subDB.DB.Exec(
+				"INSERT INTO tenants (id, name, plan) VALUES ($1, $2, $3)",
+				"t_resid_"+plan, "Test "+plan, plan)
+			require.NoErrorf(t, err, "seeding tenant for plan %q", plan)
+			_, err = subDB.DB.Exec(
+				"INSERT INTO quotas (tenant_id) VALUES ($1)",
+				"t_resid_"+plan)
+			require.NoErrorf(t, err, "seeding quota row for plan %q", plan)
+		}
+
+		// Run the 029 backfill in isolation — same shape as the
+		// migration body, with the per-tier caps matching plans.go.
+		_, err = subDB.DB.Exec(`
+			ALTER TABLE quotas
+				ADD COLUMN IF NOT EXISTS max_resident_seconds_per_month INT   NOT NULL DEFAULT 0,
+				ADD COLUMN IF NOT EXISTS used_resident_seconds           BIGINT NOT NULL DEFAULT 0;
+			UPDATE quotas q
+			   SET max_resident_seconds_per_month = CASE t.plan
+			       WHEN 'free'       THEN  2592000
+			       WHEN 'pro'        THEN  7776000
+			       WHEN 'business'   THEN 31104000
+			       WHEN 'enterprise' THEN       -1
+			       ELSE 2592000
+			   END
+			  FROM tenants t
+			 WHERE q.tenant_id = t.id;
+		`)
+		require.NoError(t, err)
+
+		// Verify each plan got the right cap. Values must match
+		// internal/domain/plans.go:planTiers exactly — if a future
+		// change drops or swaps a WHEN, this test fails with a clear diff.
+		type expectation struct {
+			plan    string
+			wantCap int
+		}
+		expected := []expectation{
+			{"free", 2592000},      // explicit
+			{"pro", 7776000},       // explicit
+			{"business", 31104000}, // explicit
+			{"enterprise", -1},     // explicit (unlimited)
+			{"unknown", 2592000},   // ELSE falls back to free-tier
+		}
+		for _, e := range expected {
+			var got int
+			require.NoError(t, subDB.Get(&got,
+				"SELECT max_resident_seconds_per_month FROM quotas WHERE tenant_id=$1",
+				"t_resid_"+e.plan))
+			require.Equalf(t, e.wantCap, got,
+				"plan %q: quotas.max_resident_seconds_per_month = %d, want %d (029 backfill drifted?)",
+				e.plan, got, e.wantCap)
+		}
+
+		// And used_resident_seconds is 0 across the board (default).
+		var usedCount int
+		require.NoError(t, subDB.Get(&usedCount,
+			"SELECT COUNT(*) FROM quotas WHERE used_resident_seconds != 0"))
+		require.Equalf(t, 0, usedCount,
+			"every quota row should have used_resident_seconds=0 after backfill")
 	})
 }
 

@@ -53,6 +53,12 @@ rpassword = "7"
 # runner auto-mints so a CLI retry on a transient network error
 # replays the original deployment instead of creating a duplicate.
 uuid = { version = "1.10", features = ["v4"] }
+# Vendors the canonical WIT tree (repo-root `wit/`) into the CLI
+# binary at compile time, so `edge init --lang=rust` can materialize
+# a self-contained, offline-buildable project (issue #576). The
+# build.rs rerun-if-changed=../wit hook refreshes the embed when any
+# `.wit` file changes.
+include_dir = "^0.7"
 edge-config = { path = "../edge-config" }
 
 [features]

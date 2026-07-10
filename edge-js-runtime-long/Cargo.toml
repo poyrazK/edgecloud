@@ -5,12 +5,10 @@ edition = "2021"
 publish = false
 description = "edgeCloud long-running JS runtime — QuickJS + edge:cloud WIT bindings for the `edge-runtime` (long-running) world. Issue #426."
 
-# Isolated workspace: parallel to `edge-js-runtime`'s workspace block.
-# Without this, cargo would walk up to the parent edgeCloud workspace
-# and try to resolve `edge-js-runtime-long` against the host repo's
-# members (edge-runtime, edge-cli, edge-worker, …). Those are host-only
-# crates that can't be cross-compiled to wasm32-wasip1.
-[workspace]
+# rlib-only ratchet: issue #426 explained why this crate must NOT
+# produce a cdylib (a second `start` export would collide with the
+# shim's). Adding it as a workspace member (issue #510) does not
+# change that — the crate-type list below stays `["rlib"]`.
 
 [lib]
 # rlib only. The cdylib shape (a self-contained wasm component
@@ -48,3 +46,13 @@ rquickjs = { version = "0.9.0", features = ["bindgen"] }
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# `cargo +nightly udeps --workspace --all-targets` reports false
+# positives for `rquickjs` and `wit-bindgen` because both are only
+# referenced from `#[cfg(target_arch = "wasm32")]` modules — the
+# host-target udeps scan never sees their use sites. They're real
+# runtime deps on the wasm32-wasip1 build that the FaaS shim
+# (`samples/hello-js-ws/`) links against. Issue #510 surfaced this
+# when the crate moved into the workspace.
+[package.metadata.cargo-udeps.ignore]
+normal = ["rquickjs", "wit-bindgen"]

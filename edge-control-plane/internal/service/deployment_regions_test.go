@@ -192,13 +192,12 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
 
-	// 4. tenantRepo.GetByID — return a tenant with an allowlist so the
-	// TaskMessage carries it. Projection widened post-#420 with
-	// `disabled_at, overage_allowed_until`.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow(tenantID, "Test Tenant", "free", `{"api.example.com"}`, time.Now()))
+	// 4. tenant row reused from lockTenantForUpdate above (issue #560):
+	// the helper now takes the tenant row pre-resolved, so the
+	// separate tenantRepo.GetByID SELECT inside the OLD
+	// buildPublishPayload is gone. The expectTenantForUpdateOK above
+	// returned a row whose allowlisted_destinations is `{}`, so the
+	// TaskMessage's Allowlist is empty in this test.
 
 	// Issue #42: outbox INSERT happens inside the tx (after the
 	// ClearStableSince UPDATE, before the commit).
@@ -307,10 +306,9 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Issue #560: tenants SELECT inside buildPublishPayload was dropped
+	// — the helper takes the tenant row pre-resolved from
+	// lockTenantForUpdate. Row shape matches expectTenantForUpdateOK.
 
 	// Issue #42: outbox INSERT happens inside the tx.
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -382,9 +380,10 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Issue #560: the previous tenants SELECT inside buildPublishPayload
+	// was dropped — the helper now takes the tenant row pre-resolved
+	// from lockTenantForUpdate. The row shape matches the one
+	// `expectTenantForUpdateOK` returned above.
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -453,9 +452,10 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Issue #560: the previous tenants SELECT inside buildPublishPayload
+	// was dropped — the helper now takes the tenant row pre-resolved
+	// from lockTenantForUpdate. The row shape matches the one
+	// `expectTenantForUpdateOK` returned above.
 
 	// Issue #42: outbox INSERT inside tx; drainer observes the
 	// partial-failure outcome (the Activate call itself returns
@@ -533,10 +533,9 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Issue #560: tenants SELECT inside buildPublishPayload was dropped
+	// — the helper takes the tenant row pre-resolved from
+	// lockTenantForUpdate. Row shape matches expectTenantForUpdateOK.
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -599,10 +598,9 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow("t_test", "T", "free", `{}`, time.Now()))
+	// Issue #560: tenants SELECT inside buildPublishPayload was dropped
+	// — the helper takes the tenant row pre-resolved from
+	// lockTenantForUpdate. Row shape matches expectTenantForUpdateOK.
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -1472,10 +1470,9 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow(tenantID, "T", "free", `{}`, time.Now()))
+	// Issue #560: tenants SELECT inside buildPublishPayload was dropped
+	// — the helper takes the tenant row pre-resolved from
+	// lockTenantForUpdate. Row shape matches expectTenantForUpdateOK.
 
 	// Outbox INSERT inside the tx (issue #42): the drainer relays
 	// the marshaled TaskMessage after commit. The drainer tick

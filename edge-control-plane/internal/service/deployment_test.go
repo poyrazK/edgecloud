@@ -1634,7 +1634,11 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 
 	// 3. In-tx quota read (issue #44 part 2): read once up-front, reused
 	// for buildPublishPayload's maxMemoryMB and the in-tx AddMemoryMB
-	// UPDATE. env / tenant are then read by buildPublishPayload.
+	// UPDATE. env is then read by the activate-side env-load block at
+	// deployment.go (issue #560: extracted from buildPublishPayload into
+	// the caller so every read participates in the same tx snapshot as
+	// the active_deployments mutation). The tenant row is already
+	// available from lockTenantForUpdate above — no second SELECT.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1646,10 +1650,6 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow(tenantID, "T", "pro", `{}`, now))
 
 	// 4. outbox INSERT
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).
@@ -1740,16 +1740,15 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 		WithArgs(tenantID, appName).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// In-tx reads for buildPublishPayload: env / tenant. The quota row
-	// was loaded once above and reused for buildPublishPayload's
-	// maxMemoryMB — no second SELECT (issue #44 part 2 hoisted).
+	// In-tx reads for buildPublishPayload: env. The tenant row is
+	// already available from lockTenantForUpdate above (issue #560:
+	// the helper now takes pre-resolved typed inputs, so the call
+	// site doesn't repeat the SELECT). The quota row was loaded
+	// once above and reused for buildPublishPayload's maxMemoryMB —
+	// no second SELECT (issue #44 part 2 hoisted).
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
-			AddRow(tenantID, "T", "pro", `{}`, now))
 
 	// outbox INSERT
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).

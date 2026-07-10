@@ -33,22 +33,27 @@ func discardLog() (LogFn, func() string) {
 	}
 }
 
-// waitForExited polls until the loop's body has returned (running=false).
-// Run / RunErr now spawn their own goroutine, so callers need a way to
-// synchronize on the body finishing before asserting on post-state.
-// waitForExited times out after 2s — generous enough to avoid flakes
-// on busy CI, short enough that a broken test fails fast.
+// waitForExited blocks until the loop's body has fully returned —
+// including any panic-recovery logging via the supplied LogFn. We
+// wait on l.Done() (closed by runInner's defer after the recovery
+// log completes) rather than polling l.Running(), because closing a
+// channel is a release fence: anything the deferred logFn writes
+// happens-before a receiver on Done() returns, while a Running()==false
+// observation only synchronizes the atomic itself, not subsequent
+// goroutine writes (issue surfaced under go test -race on the
+// worktree-cp-582-preview-gc-race branch).
+//
+// Times out after 2s — generous enough to avoid flakes on busy CI,
+// short enough that a broken test fails fast.
 func waitForExited(t *testing.T, l *Loop) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !l.Running() && !l.StartedAt().IsZero() {
-			return
-		}
-		time.Sleep(1 * time.Millisecond)
+	select {
+	case <-l.Done():
+		return
+	case <-time.After(2 * time.Second):
+		t.Fatalf("loop %q did not finish within 2s (running=%v started=%v)",
+			l.Name(), l.Running(), l.StartedAt())
 	}
-	t.Fatalf("loop %q did not finish within 2s (running=%v started=%v)",
-		l.Name(), l.Running(), l.StartedAt())
 }
 
 func TestTracker_GetLazyCreates(t *testing.T) {

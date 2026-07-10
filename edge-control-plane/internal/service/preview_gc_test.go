@@ -127,7 +127,7 @@ func TestPreviewGC_FirstSweep_FiresImmediately(t *testing.T) {
 		},
 	}
 	blobs := &mockBlobStore{}
-	svc := NewPreviewGCService(repo, blobs)
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -154,12 +154,20 @@ func TestPreviewGC_FirstSweep_FiresImmediately(t *testing.T) {
 		t.Fatal("FirstSweepDone did not fire within 2s")
 	}
 
+	// Issue #582: lock repo.mu while reading the booleans the closure
+	// goroutine writes (mockPreviewGCRepo.ListExpiredPreviewBlobs sets
+	// listCalled at preview_gc_test.go:42-44 and
+	// DeleteExpiredPreviewsByIDs sets deleteCalled at :56-59, both
+	// under repo.mu). Without this lock, go test -race flags the
+	// pair as a data race.
+	repo.mu.Lock()
 	if !repo.listCalled {
 		t.Error("ListExpiredPreviewBlobs was not called on first sweep")
 	}
 	if !repo.deleteCalled {
 		t.Error("DeleteExpiredPreviewsByIDs was not called on first sweep")
 	}
+	repo.mu.Unlock()
 
 	blobs.mu.Lock()
 	defer blobs.mu.Unlock()
@@ -191,7 +199,7 @@ func TestPreviewGC_BlobDeleteFails_StillDeletesOthers(t *testing.T) {
 		},
 	}
 	blobs := &mockBlobStore{errOnID: "d_fail"}
-	svc := NewPreviewGCService(repo, blobs)
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -231,7 +239,7 @@ func TestPreviewGC_BlobDeleteFails_StillDeletesOthers(t *testing.T) {
 func TestPreviewGC_ListError_LoopContinues(t *testing.T) {
 	repo := &mockPreviewGCRepo{listErr: errors.New("simulated list failure")}
 	blobs := &mockBlobStore{}
-	svc := NewPreviewGCService(repo, blobs)
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -262,7 +270,7 @@ func TestPreviewGC_ListError_LoopContinues(t *testing.T) {
 func TestPreviewGC_ZeroInterval_RefusesToRun(t *testing.T) {
 	repo := &mockPreviewGCRepo{}
 	blobs := &mockBlobStore{}
-	svc := NewPreviewGCService(repo, blobs)
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -293,7 +301,7 @@ func TestPreviewGC_ZeroInterval_RefusesToRun(t *testing.T) {
 func TestPreviewGC_FirstSweep_PanicStillClosesDone(t *testing.T) {
 	repo := &mockPreviewGCRepo{listPanic: true}
 	blobs := &mockBlobStore{}
-	svc := NewPreviewGCService(repo, blobs)
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
 
 	panicked := make(chan any, 1)
 	go func() {
@@ -338,4 +346,243 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Metrics sink integration (issue #581).
+// ---------------------------------------------------------------------------
+
+// recordingPreviewSink records every sink call (per-tick) and every
+// blob-failure-recorder call so tests can assert the call sites fired.
+type recordingPreviewSink struct {
+	mu               sync.Mutex
+	sinkCalls        []previewSinkCall
+	blobFailureCalls int
+}
+
+type previewSinkCall struct {
+	blobsDeleted int
+	rowsDeleted  int
+	batchesSwept int
+	hadError     bool
+}
+
+func (r *recordingPreviewSink) record(blobsDeleted, rowsDeleted, batchesSwept int, hadError bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sinkCalls = append(r.sinkCalls, previewSinkCall{blobsDeleted, rowsDeleted, batchesSwept, hadError})
+}
+
+func (r *recordingPreviewSink) recordBlobFailure() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.blobFailureCalls++
+}
+
+func (r *recordingPreviewSink) sinkCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.sinkCalls)
+}
+
+func (r *recordingPreviewSink) blobFailureCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.blobFailureCalls
+}
+
+// makeRecordingPreviewSink returns (PreviewGCSink, PreviewBlobFailureRecorder, recorder).
+func makeRecordingPreviewSink() (PreviewGCSink, PreviewBlobFailureRecorder, *recordingPreviewSink) {
+	r := &recordingPreviewSink{}
+	var sink PreviewGCSink = r.record
+	var recorder PreviewBlobFailureRecorder = r.recordBlobFailure
+	return sink, recorder, r
+}
+
+// TestPreviewGC_RecordsMetrics_HappyPath: a 2-blob sweep emits one sink
+// call with (blobsDeleted=2, rowsDeleted=2, batchesSwept=1, hadError=false).
+func TestPreviewGC_RecordsMetrics_HappyPath(t *testing.T) {
+	repo := &mockPreviewGCRepo{
+		blobsReturned: []repository.PreviewBlobRef{
+			{ID: "d_a", TenantID: "t_gc", AppName: "preview-app"},
+			{ID: "d_b", TenantID: "t_gc", AppName: "preview-app"},
+		},
+	}
+	blobs := &mockBlobStore{}
+	sink, recorder, rec := makeRecordingPreviewSink()
+	svc := NewPreviewGCService(repo, blobs, sink, recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.sinkCallCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.sinkCalls[0]
+	if got.blobsDeleted != 2 || got.rowsDeleted != 2 || got.batchesSwept != 1 || got.hadError {
+		t.Errorf("sink call = %+v, want {2,2,1,false}", got)
+	}
+	if got := rec.blobFailureCount(); got != 0 {
+		t.Errorf("blobFailureCount = %d, want 0", got)
+	}
+}
+
+// TestPreviewGC_RecordsMetrics_BlobFailureCountedSeparately: a 3-blob
+// sweep with one failed blob delete records one sink call (with the
+// 2 successful blobs + 2 successful rows) AND one blobFailureRecorder
+// call.
+func TestPreviewGC_RecordsMetrics_BlobFailureCountedSeparately(t *testing.T) {
+	repo := &mockPreviewGCRepo{
+		blobsReturned: []repository.PreviewBlobRef{
+			{ID: "d_ok1", TenantID: "t_gc", AppName: "preview-app"},
+			{ID: "d_fail", TenantID: "t_gc", AppName: "preview-app"},
+			{ID: "d_ok2", TenantID: "t_gc", AppName: "preview-app"},
+		},
+	}
+	blobs := &mockBlobStore{errOnID: "d_fail"}
+	sink, recorder, rec := makeRecordingPreviewSink()
+	svc := NewPreviewGCService(repo, blobs, sink, recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.sinkCallCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.sinkCalls[0]
+	if got.blobsDeleted != 2 || got.rowsDeleted != 2 || got.batchesSwept != 1 || got.hadError {
+		t.Errorf("sink call = %+v, want {2,2,1,false}", got)
+	}
+	if got := rec.blobFailureCount(); got != 1 {
+		t.Errorf("blobFailureCount = %d, want 1", got)
+	}
+}
+
+// TestPreviewGC_RecordsMetrics_AllBlobsFailed_IncrementsErrors: when all
+// blobs in a batch fail, the sweep bails (no row delete) and records one
+// sink call with hadError=true AND N blobFailureRecorder calls.
+func TestPreviewGC_RecordsMetrics_AllBlobsFailed_IncrementsErrors(t *testing.T) {
+	repo := &mockPreviewGCRepo{
+		blobsReturned: []repository.PreviewBlobRef{
+			{ID: "d_a", TenantID: "t_gc", AppName: "preview-app"},
+			{ID: "d_b", TenantID: "t_gc", AppName: "preview-app"},
+		},
+	}
+	blobs := &mockBlobStore{delErr: errors.New("blob store down")}
+	sink, recorder, rec := makeRecordingPreviewSink()
+	svc := NewPreviewGCService(repo, blobs, sink, recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.sinkCallCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.sinkCalls[0]
+	if !got.hadError {
+		t.Error("sink call hadError = false, want true on all-blobs-failed")
+	}
+	if got := rec.blobFailureCount(); got != 2 {
+		t.Errorf("blobFailureCount = %d, want 2", got)
+	}
+}
+
+// TestPreviewGC_RecordsMetrics_ListError_IncrementsErrors: a ListExpiredPreviewBlobs
+// failure records one sink call with hadError=true and 0 blobFailureRecorder calls.
+func TestPreviewGC_RecordsMetrics_ListError_IncrementsErrors(t *testing.T) {
+	repo := &mockPreviewGCRepo{listErr: errors.New("simulated list failure")}
+	blobs := &mockBlobStore{}
+	sink, recorder, rec := makeRecordingPreviewSink()
+	svc := NewPreviewGCService(repo, blobs, sink, recorder)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 10*time.Second, 7*24*time.Hour)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.sinkCallCount(); got != 1 {
+		t.Fatalf("sink call count = %d, want 1", got)
+	}
+	got := rec.sinkCalls[0]
+	if !got.hadError {
+		t.Error("sink call hadError = false, want true on list error")
+	}
+	if got := rec.blobFailureCount(); got != 0 {
+		t.Errorf("blobFailureCount = %d, want 0", got)
+	}
+}
+
+// TestPreviewGC_ZeroInterval_NoMetrics: refused-to-run (interval<=0) does
+// NOT bump any metrics.
+func TestPreviewGC_ZeroInterval_NoMetrics(t *testing.T) {
+	repo := &mockPreviewGCRepo{}
+	blobs := &mockBlobStore{}
+	sink, recorder, rec := makeRecordingPreviewSink()
+	svc := NewPreviewGCService(repo, blobs, sink, recorder)
+
+	done := make(chan struct{})
+	go func() {
+		svc.Run(context.Background(), 0, 7*24*time.Hour)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return on interval=0")
+	}
+	if got := rec.sinkCallCount(); got != 0 {
+		t.Errorf("sink call count = %d, want 0 (refused-to-run must not tick)", got)
+	}
+	if got := rec.blobFailureCount(); got != 0 {
+		t.Errorf("blobFailureCount = %d, want 0", got)
+	}
+}
+
+// TestPreviewGC_NilSink_NoPanic: passing nil sinks to NewPreviewGCService
+// must not panic. The constructor nil-guards.
+func TestPreviewGC_NilSink_NoPanic(t *testing.T) {
+	repo := &mockPreviewGCRepo{
+		blobsReturned: []repository.PreviewBlobRef{
+			{ID: "d_a", TenantID: "t_gc", AppName: "preview-app"},
+		},
+	}
+	blobs := &mockBlobStore{}
+	svc := NewPreviewGCService(repo, blobs, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond, 7*24*time.Hour)
+		close(done)
+	}()
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit on nil sinks")
+	}
 }

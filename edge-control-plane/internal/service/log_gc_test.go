@@ -60,7 +60,7 @@ func (m *mockLogGCRepo) lastRetention() (time.Duration, bool) {
 // window, and we cancel the context before the first tick would fire.
 func TestLogGC_DeletesOldRows(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -105,7 +105,7 @@ func TestLogGC_DeletesOldRows(t *testing.T) {
 // (now passed as a Duration, not a Go-computed cutoff) is preserved.
 func TestLogGC_RetentionFromConfig(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -140,7 +140,7 @@ func TestLogGC_RetentionFromConfig(t *testing.T) {
 // ticker path is actually wired (not just the immediate sweep).
 func TestLogGC_TickerFiresAtInterval(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -172,7 +172,7 @@ func TestLogGC_TickerFiresAtInterval(t *testing.T) {
 // loop continues. The next tick should still attempt the delete.
 func TestLogGC_RepoErrorDoesNotStopLoop(t *testing.T) {
 	repo := &mockLogGCRepo{err: errors.New("simulated DB outage")}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -204,7 +204,7 @@ func TestLogGC_RepoErrorDoesNotStopLoop(t *testing.T) {
 // guard alongside parseDurationEnv in main.go.
 func TestLogGC_ZeroIntervalRefusesToRun(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -227,7 +227,7 @@ func TestLogGC_ZeroIntervalRefusesToRun(t *testing.T) {
 // This guards the boundary in addition to parseDurationEnv.
 func TestLogGC_NegativeRetentionRefusesToRun(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	done := make(chan struct{})
 	go func() {
@@ -250,7 +250,7 @@ func TestLogGC_NegativeRetentionRefusesToRun(t *testing.T) {
 // first-sweep path also honors it.
 func TestLogGC_PreemptsOnCancelledContext(t *testing.T) {
 	repo := &mockLogGCRepo{}
-	svc := NewLogGCService(repo)
+	svc := NewLogGCService(repo, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled before Run starts
@@ -267,5 +267,193 @@ func TestLogGC_PreemptsOnCancelledContext(t *testing.T) {
 	}
 	if got := repo.callCount(); got != 0 {
 		t.Errorf("DeleteOlderThan call count = %d, want 0 (pre-cancelled ctx must skip DELETE)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics sink integration (issue #581).
+//
+// The LogGCSink closure passed to NewLogGCService is invoked on every
+// sweep tick (success or error) but NOT when the run is refused-to-run
+// or when the context is pre-cancelled. We assert the call counts and
+// args via a recordingLogSink mutex-guarded wrapper.
+// ---------------------------------------------------------------------------
+
+// recordingLogSink records every invocation so tests can assert
+// per-tick totals. A nil receiver or nil underlying func means the
+// sink is a no-op (matches MetricsAggregator.NewLogGCSink()).
+type recordingLogSink struct {
+	mu    sync.Mutex
+	calls []logSinkCall
+}
+
+type logSinkCall struct {
+	rowsDeleted int64
+	hadError    bool
+}
+
+func (r *recordingLogSink) record(rowsDeleted int64, hadError bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, logSinkCall{rowsDeleted, hadError})
+}
+
+func (r *recordingLogSink) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.calls)
+}
+
+func (r *recordingLogSink) rowsDeletedTotal() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var sum int64
+	for _, c := range r.calls {
+		sum += c.rowsDeleted
+	}
+	return sum
+}
+
+func (r *recordingLogSink) errorCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var n int
+	for _, c := range r.calls {
+		if c.hadError {
+			n++
+		}
+	}
+	return n
+}
+
+// makeRecordingLogSink returns (LogGCSink, *recordingLogSink) — the
+// sink is what the GC calls; the recorder is what the test inspects.
+func makeRecordingLogSink() (LogGCSink, *recordingLogSink) {
+	r := &recordingLogSink{}
+	var sink LogGCSink = r.record
+	return sink, r
+}
+
+// mockLogGCRepoWithCounting returns a stateful repo that simulates
+// (firstN rows, ok) → (zeroN rows, errMsg on call #errAt) → ... across
+// successive calls. errAt=0 means never error; firstN applies only
+// to call #1, zeroN to subsequent calls.
+type mockLogGCRepoWithCounting struct {
+	mu     sync.Mutex
+	calls  int
+	errAt  int
+	errMsg string
+	firstN int64
+	zeroN  int64
+}
+
+func (m *mockLogGCRepoWithCounting) DeleteOlderThanBatched(_ context.Context, _ time.Duration, _, _ int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	n := m.calls
+	if n == m.errAt && m.errMsg != "" {
+		return 0, errors.New(m.errMsg)
+	}
+	if n == 1 {
+		return m.firstN, nil
+	}
+	return m.zeroN, nil
+}
+
+func (m *mockLogGCRepoWithCounting) callCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+// TestLogGC_RecordsMetrics: a 3-tick sequence (5, err, 0) is reflected
+// in the sink: >=3 calls total, rowsDeletedTotal=5, errorCount=1.
+func TestLogGC_RecordsMetrics(t *testing.T) {
+	repo := &mockLogGCRepoWithCounting{
+		firstN: 5,
+		zeroN:  0,
+		errAt:  2,
+		errMsg: "simulated DB outage",
+	}
+	sink, rec := makeRecordingLogSink()
+	svc := NewLogGCService(repo, sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond, 1*time.Hour)
+	}()
+	time.Sleep(120 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rec.callCount(); got < 3 {
+		t.Errorf("sink call count = %d, want >= 3", got)
+	}
+	if got := rec.rowsDeletedTotal(); got != 5 {
+		t.Errorf("rowsDeletedTotal = %d, want 5 (only first tick deleted rows)", got)
+	}
+	if got := rec.errorCount(); got != 1 {
+		t.Errorf("errorCount = %d, want 1", got)
+	}
+}
+
+// TestLogGC_RecordsMetrics_TickCountEqualsSweepCount: a healthy repo
+// (0 rows, no errors) records one sink call per sweep.
+func TestLogGC_RecordsMetrics_TickCountEqualsSweepCount(t *testing.T) {
+	repo := &mockLogGCRepoWithCounting{firstN: 0, zeroN: 0}
+	sink, rec := makeRecordingLogSink()
+	svc := NewLogGCService(repo, sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond, 1*time.Hour)
+	}()
+	time.Sleep(120 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	sweeps := repo.callCount()
+	if sweeps < 3 {
+		t.Errorf("repo.callCount = %d, want >= 3", sweeps)
+	}
+	if got := rec.callCount(); got != sweeps {
+		t.Errorf("sink call count = %d, want %d (one sink call per sweep)", got, sweeps)
+	}
+	for i, c := range rec.calls {
+		if c.rowsDeleted != 0 {
+			t.Errorf("sink call[%d] rowsDeleted = %d, want 0", i, c.rowsDeleted)
+		}
+		if c.hadError {
+			t.Errorf("sink call[%d] hadError = true, want false on healthy repo", i)
+		}
+	}
+}
+
+// TestLogGC_NilSink_NoPanic: passing nil as the sink to NewLogGCService
+// must not panic. The LogGC service must guard the sink call with a
+// nil-check (or the MetricsAggregator.NewLogGCSink closure must handle
+// it). We take the cheaper route: the MetricsAggregator already returns
+// a no-op closure for nil receivers, but the GC service is also safe to
+// wire with a literal nil.
+func TestLogGC_NilSink_NoPanic(t *testing.T) {
+	repo := &mockLogGCRepo{}
+	svc := NewLogGCService(repo, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond, 1*time.Hour)
+		close(done)
+	}()
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit on nil sink")
 	}
 }

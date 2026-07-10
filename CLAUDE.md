@@ -16,7 +16,7 @@ This is a **Cargo workspace** at the repo root (`Cargo.toml`, `[workspace] resol
 | `edge-runtime/bin/wasm2cwasm/` | Rust | AOT pre-compile helper binary (issue #315). Reads `.wasm`, writes `.cwasm`. Invoked by the control plane's `precompile.go` after activation. |
 | `edge-worker/` | Rust | Per-node supervisor binary. Subscribes to NATS for desired-app updates, instantiates WASM components, hosts their HTTP servers. Two execution models: long-running and FaaS (Handler). |
 | `edge-ingress/` | Rust | Public-facing Caddy controller. Subscribes `edgecloud.heartbeats.<region>`, renders Caddyfile-JSON that maps `<tenant>-<app>.edgecloud.dev` to a worker host:port. DDoS caps + per-IP rate limit. |
-| `edge-cli/` | Rust | Developer CLI (`edge init \| build \| deploy \| dev \| activate \| env \| ...`). The package is `edge-cli` but the installed binary is named `edge` (`[[bin]] name = "edge"` in edge-cli/Cargo.toml). Persists local state to `.edge/state.json`. Reads `~/.config/edgecloud/config.toml` via `edge-config`. |
+| `edge-cli/` | Rust | Developer CLI (`edge init \| build \| deploy \| dev \| activate \| env \| ...`). The package is `edge-cli` but the installed binary is named `edge` (`[[bin]] name = "edge"` in edge-cli/Cargo.toml). Persists local state to `.edge/state.json`. Reads `~/.config/edgecloud/config.toml` via `edge-config`. `edge init --lang=rust` (issue #576) scaffolds a FaaS-shaped `src/lib.rs` + `Cargo.toml` modeled on `samples/hello/`, plus a vendored `wit/` tree (embedded into the binary via `include_dir!` — `edge-cli/src/scaffold/wit.rs`) so the scaffolded project builds offline outside the monorepo. |
 | `edge-js-sdk/` | JS | JS-side shim package (`@edgecloud/sdk` on npm) that delegates to `globalThis.EdgeCloud.*` host functions injected by `edge-js-runtime` at request time. Resolved by `edge init --lang=js` from npm (issue #424 — earlier versions referenced the in-tree SDK via a `file:` path that only worked inside the monorepo). |
 | `edge-config/` | Rust | Shared helpers for `~/.config/edgecloud/config.toml` loading. Used by `edge-cli` and `edge-migrate-bin` so a config-schema change ships in one crate. |
 | `edge-spool/` | Rust | Append-only JSONL disk spool for worker log-batch durability. Worker side, between `LogForwarder`'s in-memory buffer and the control plane's `POST /api/internal/logs`. |
@@ -27,8 +27,8 @@ This is a **Cargo workspace** at the repo root (`Cargo.toml`, `[workspace] resol
 
 **Excluded from the workspace** (`Cargo.toml [workspace.exclude]`):
 - `edge-worker/tests/fixtures/handler` — built separately by the Phase E fixture-build script. Uses `wasm32-unknown-unknown` and an older `wit-bindgen` pin.
-- `edge-js-runtime` — QuickJS runtime for the JS/QuickJS pilot (issue #317). Exports the `edge-runtime-handler` (FaaS) world (`wasi:http/incoming-handler@0.2.1`). The `register_*` namespace helpers are factored into `edge-js-runtime/src/register.rs` and reused by the LR sibling.
-- `edge-js-runtime-long` — QuickJS runtime rlib for the long-running `edge-runtime` world (issue #426). rlib-only (NOT cdylib) because the canonical world requires `start: func()` as an export, and a cdylib in this crate would land a second `start` symbol in the shim's final link and clash. The cdylib is produced by the shim (`samples/hello-js-ws/`); this crate just supplies the per-namespace registrars + `compile_user_bundle` + `USER_BYTECODE` once, shared by every shim.
+
+`edge-js-runtime` (QuickJS runtime for the FaaS / `edge-runtime-handler` world, issue #317) and `edge-js-runtime-long` (rlib for the long-running / `edge-runtime` world, issue #426) are also workspace members (issue #510). The `register_*` namespace helpers are factored into `edge-js-runtime/src/register.rs` and reused (via duplication) by the LR sibling; the LR crate is rlib-only (NOT cdylib) because the canonical world requires `start: func()` as an export, and a cdylib in this crate would land a second `start` symbol in the shim's final link and clash.
 
 **Documentation map:**
 - `whitepaper.md` is the broad design doc (2026-06-14). Per-tool design docs (e.g. `edge-migrate/docs/design.md`) are scoped to one tool and may be newer — **when the two conflict, trust the per-tool design doc**. Treat any design doc as the source of intent, but always verify against the actual code.
@@ -62,7 +62,7 @@ cd edge-control-plane && gofmt -l . && go vet ./...
 
 The workspace pulls in heavy crates (wasmtime, tree-sitter, wasmtime-wasi-http). Each `git worktree` owns its own working tree, and Cargo's default `target/` lives inside it — running 5 agents in parallel worktrees can balloon to 20 GB+. To keep local dev light, the repo is wired to share `target/` and wrap `rustc` with `sccache`:
 
-- **`target/` is shared across worktrees.** `.cargo/config.toml` (committed) sets `build.target-dir = "$HOME/.cache/edgecloud-cargo"`. Every worktree compiles into the same dir; content-addressed fingerprinting means only changed sources rebuild.
+- **`target/` is shared across worktrees.** `.cargo/config.toml:36-37` (committed) sets `build.target-dir = "../target-cache/edgecloud"` — config-relative, so the resolved path is `<workspace>/target-cache/edgecloud/`. Every worktree compiles into the same dir; content-addressed fingerprinting means only changed sources rebuild.
 - **`rustc` is wrapped with sccache.** Same file sets `build.rustc-wrapper = "sccache"`. Install once: `brew install sccache` (or `cargo install sccache`). sccache itself stores its cache at `~/.cache/sccache-edgecloud` (override with `SCCACHE_DIR`).
 - **Dev profile is trimmed.** `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` so backtraces still resolve file:line but `.dwp`/`.dwo` bloat is dropped.
 
@@ -71,10 +71,18 @@ Verify after a fresh clone:
 ```bash
 sccache --version                       # ≥ 0.7
 cargo build --workspace                 # cold; observe "Compiling ..." via sccache
-du -sh ~/.cache/edgecloud-cargo         # single shared target
+du -sh ../target-cache/edgecloud        # single shared target (one dir up from the workspace root)
 ```
 
 If a build fails with `could not execute wrapper 'sccache'`, install sccache or unset the wrapper locally with `CARGO_BUILD_RUSTC_WRAPPER=""`. CI does not use sccache — `Swatinem/rust-cache@v2` already caches cold builds, and the per-job `RUSTFLAGS` set `-C debuginfo=0` so CI builds stay lean.
+
+### Vendored WASI Preview 1 reactor adapter
+
+`edge build --lang=js` shells out to `wasm-tools component new --adapt <adapter>` to wrap the `wasm32-wasip1` core module produced by `edge-js-runtime` into a WASI Preview 2 component the host linker accepts. The adapter is committed at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm` (52,238 bytes, SHA-256 `49fafbdac877303ac91bd178d8ad6b14041aca5136362fe6864f96c8413b5bea`). Pinned against wasmtime **v45.0.3** — byte-identical to the asset at <https://github.com/bytecodealliance/wasmtime/releases/download/v45.0.3/wasi_snapshot_preview1.reactor.wasm>. SHA-256 is checked by `sha256sum -c SHA256SUMS` (sidecar at `edge-cli/adapters/SHA256SUMS`); that step runs in the `rust-js-build` CI job. Issue #423.
+
+A wasmtime bump in `edge-runtime/Cargo.toml` requires re-vendoring the adapter: download the new release asset, drop it at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`, and update `SHA256SUMS` so the CI check stays green.
+
+`edge-cli/src/commands/build.rs::resolve_wasi_adapter()` probes three sources in priority order — `$EDGE_JS_WASI_ADAPTER` env override, the vendored file, then a fallback cargo-registry glob for dev machines with `wasi-preview1-component-adapter-provider-45.0.x` cached locally from another project. The vendored file wins on a fresh clone.
 
 ### CI
 
@@ -96,6 +104,7 @@ CI jobs:
 | `go-test-integration` | `go test -tags=integration -v ./migrations/...` against a postgres:16 service |
 | `typos` | crate-ci/typos across the whole repo |
 | `coverage-rust` | cargo-llvm-cov (informational) |
+| `rust-js-build` | Exercises the JS build pipeline end-to-end (`rustup target add wasm32-wasip1` + esbuild + `wasm-tools component new --adapt <vendored adapter>` against `samples/hello-js-ws/`); also verifies the vendored WASI Preview 1 reactor adapter via `sha256sum -c edge-cli/adapters/SHA256SUMS` (issue #423). |
 
 `.github/workflows/preview.yml` is a `deploy-preview` job that runs on every PR `opened`/`synchronize` event (issue #308). The composite action at `.github/actions/deploy-preview/action.yml` builds the CLI via `cargo install --root $CARGO_HOME`, then runs `edge deploy --preview --pr-number=${{ github.event.pull_request.number }}`. The action includes a `Expose edge CLI on PATH` step that appends `$CARGO_HOME/bin` to `$GITHUB_PATH` — without it the next bash step fails with `edge: command not found` (rc=127). The URL is parsed from the CLI's stdout and exposed as the `preview-url` step output; the workflow's `Comment PR` step posts it on the PR when `EDGECLOUD_API_KEY` is set (fork PRs lack the secret and silently no-op).
 
@@ -364,6 +373,7 @@ Per-app, per-deployment:
 - **Activate** — flips `active_deployments`, runs `precompile.PrecompileCwasm` (best-effort, logs and continues on failure), **enqueues a `task_update` `outbox` row inside the same transaction as the `active_deployments` mutation**, then `publishSwap` (now cache-only) runs the per-region cache-push best-effort. NATS publish is owned by `service.OutboxDrainer` (issue #42): `FOR UPDATE SKIP LOCKED` claim + exponential backoff, `pending` → `in_flight` → `published` (or `failed` after `OUTBOX_MAX_ATTEMPTS`). `regions_cached` / `regions_cache_failed` track per-region outcome; the next activate uses `regions_cached` for incremental caching.
 - **Rollback** — restores `last_good_deployment_id` (set by `005_add_last_good` migration); enqueues its `task_update` `outbox` row inside the same tx.
 - **Promote** — explicit move of a deployment into active status (used in canary workflows); delegates to `activateDeployment` and inherits its outbox behavior.
+- **Env edits** (`EnvService.SetEnv` / `DeleteEnv`, issue #560) — write the `app_env` row AND, if the app has an active deployment, enqueue a `task_update` `outbox` row in the same tx as the env upsert/delete. Apps with no active deployment skip the publish silently. The tenant-disabled gate mirrors `activateDeployment`'s (issue #440): `tenants FOR UPDATE` would be the rigorous form, but the env write path instead does a same-tx `SELECT … FROM tenants` plus `IsDisabled()` check and returns `ErrTenantDisabled` (handler maps to 409) if set. The env write itself rolls back with the rest of the tx on any failure. The shared TaskMessage marshaling lives at `internal/service/publish_payload.go` (`(*publishBuilder).buildPublishPayload`) — same instance is wired into both `DeploymentService` and `EnvService` from `internal/app/app.go`. Note: until issue #561 lands (worker-side restart-on-env-change), the published message reaches the worker but does not trigger a restart; the env value is consumed on the next activate / FullSync, closing the previous "running apps serve stale env until next activate" gap within seconds (well under the 5-minute reconcile window).
 
 ### Reconcile (`edge-control-plane/internal/service/reconcile.go`)
 
@@ -383,6 +393,18 @@ Per-app, per-deployment:
 - `PreviewGC.Run` — issue #308. TTL'd preview deployment GC: every `PREVIEW_GC_INTERVAL` (default 1h), sweep deployments whose `preview_expires_at < NOW()`, delete their artifact blobs FIRST, then delete the rows. Mirror of `LogGC.Run`; same batched-delete + immediate-first-sweep shape.
 - `DeploymentGC.Run` — TTL'd deployment-row GC (older than `DEPLOYMENT_GC_MAX_AGE`, default 30 days; not preview deployments — those are `PreviewGC`).
 - `CacheRetrySweep.Run` — issue #501. Background sweep that re-attempts per-region artifact-cache pushes for deployments whose previous push landed in `regions_cache_failed`. Tick interval `cfg.CacheRetry.IntervalS` (env `REGION_CACHE_RETRY_INTERVAL`, default 5m). Per-region attempt cap `cfg.CacheRetry.MaxAttempts` (env `REGION_CACHE_RETRY_MAX_ATTEMPTS`, default 10): over-cap regions are routed to a `giveUp` partition (drop from `regions_cache_failed` with a WARN log). The per-region counter is reset on every activation (`publishSwap` calls `ResetRegionCacheRetryCount` inside the cache-state transaction), so the cap is per-deployment, not per-tenant-app-lifetime. Set `MaxAttempts<=0` to disable the cap entirely (escape hatch for environments that want unbounded retries).
+
+### Background-GC metrics (issue #581)
+
+All three background GCs above (`LogGC`, `PreviewGC`, `CacheRetrySweep`) emit Prometheus metrics via the hand-rolled `service.MetricsAggregator` (no `prometheus/client_golang` dependency — see `edge-control-plane/internal/service/metrics.go`). Each GC takes a typed sink closure in its constructor; the aggregator exposes `NewLogGCSink`, `NewPreviewGCSink`, `NewPreviewBlobFailureRecorder`, `NewCacheRetrySweepSink` — wired in `app.New` (`edge-control-plane/internal/app/app.go:705-731`).
+
+20 label-free families are exposed on BOTH `/metrics` (unauthenticated, operator) AND `/api/v1/metrics` (per-tenant) — the per-tenant endpoint appends the global GC families after the per-tenant/app series so tenants can see fleet-wide GC health on their own page:
+
+- **`edge_log_gc_*`** (4 families, `edge-control-plane/internal/service/log_gc.go`): `ticks_total`, `rows_deleted_total`, `errors_total`, `last_tick_timestamp_seconds` (Unix seconds — alert if older than `2 * LOG_GC_INTERVAL`).
+- **`edge_preview_gc_*`** (7 families, `edge-control-plane/internal/service/preview_gc.go`): `ticks_total`, `blobs_deleted_total`, `rows_deleted_total`, `batches_swept_total`, `errors_total`, `blob_delete_failures_total` (per-blob granular), `last_tick_timestamp_seconds`.
+- **`edge_cache_retry_sweep_*`** (9 families, `edge-control-plane/internal/service/cache_retry_sweep.go`): `ticks_total`, `batches_swept_total`, `rows_touched_total`, `pushed_ok_total`, `still_failing_total`, `config_missing_total`, `given_up_total` (exhaustion signal — alert if non-zero over a sustained window), `errors_total`, `last_tick_timestamp_seconds`.
+
+The sink is invoked once per sweep tick (success or error). The refused-to-run path (zero/negative interval, negative retention, pre-cancelled context) does NOT bump `ticks_total` — this is intentional so an "alert on never-ticked" operator rule fires correctly when a GC is misconfigured or stuck at boot.
 
 ### Secrets encryption (`edge-control-plane/internal/service/secrets.go`)
 
@@ -411,7 +433,8 @@ The `ArtifactStore` interface (`storage/artifact.go`) covers `Save`/`Open`/`Dele
 
 ## Conventions & Gotchas
 
-- **Cargo workspace at the root.** `[workspace]` is in `/Cargo.toml`; 9 members listed under `[workspace.members]`. `cargo --workspace` is the default; use `--manifest-path` only for surgical single-crate work. Adding a new crate: edit `[workspace.members]` and (if it can't share resolver-2 defaults) add to `[workspace.exclude]`.
+- **Cargo workspace at the root.** `[workspace]` is in `/Cargo.toml`; 11 crates listed under `[workspace.members]` (9 host crates + 2 JS runtime crates, issue #510). `cargo --workspace` is the default; use `--manifest-path` only for surgical single-crate work. Adding a new crate: edit `[workspace.members]` and (if it can't share resolver-2 defaults) add to `[workspace.exclude]`. `edge-test-helpers/` is a path-dep pulled into workspace builds by `edge-worker`/`edge-ingress`'s `[dev-dependencies]` but is not an explicit member (kept off `[workspace.members]` so its `testcontainers` + `async-nats` transitive closure doesn't widen the workspace build for every member).
+- **`cargo-udeps` ignore-list schema.** `[package.metadata.cargo-udeps.ignore]` is the canonical place (used by the `rust-nightly` CI job, `cargo +nightly udeps --workspace --all-targets`). The schema is **nested** — `normal = ["..."]` covers `[dependencies]`, `development = ["..."]` covers `[dev-dependencies]`. A flat `ignore = ["..."]` key is silently dropped. Add an entry whenever a dep is referenced only from a `#[cfg(target_arch = "wasm32")]` module (host udeps scan cannot see those use sites) or only when a non-default feature is enabled. `edge-js-runtime` / `edge-js-runtime-long` ignore `wit-bindgen`/`rquickjs` for exactly that reason — they're shipped via `wasm32-wasip1`/`wasm32-wasip2` builds; see those crates' `Cargo.toml`s.
 - **`edge-runtime` engine is meant to be shared.** Create one engine per worker process via `edge_runtime::create_engine()`. Per-app `StandbyPool` reuses it across instances.
 - **Bridge sync → async.** The WIT trait impls in `runtime.rs` are sync; async work (`http_client.fetch()`, `http_server` accept loops, `egress_transport::spawn_send_request_handler`) is bridged via `tokio::runtime::Handle::current().block_on(...)`. Don't move async work outside that bridge — the historical foot-gun was a blocking reqwest runtime panic when dropped in an async context.
 - **Guest exit vs. wasm trap.** Always check `RuntimeState::exit_requested()` after a guest call returns `Err` — a clean `process.exit` looks like a trap to wasmtime.
