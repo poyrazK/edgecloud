@@ -90,6 +90,7 @@ fn runtime_state() -> RuntimeState {
         HashMap::new(),
         None,
         "js-smoke".to_string(),
+        "js-smoke",
         Arc::new(EgressPolicy::allow_all()),
         Arc::new(CountingSink {
             pushes: AtomicUsize::new(0),

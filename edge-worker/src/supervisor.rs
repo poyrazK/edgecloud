@@ -1977,6 +1977,7 @@ impl Supervisor {
             env,
             Some(Arc::clone(meter)),
             tenant_id.to_string(),
+            app_name,
             preview_id,
             preview_pr_number,
             egress,

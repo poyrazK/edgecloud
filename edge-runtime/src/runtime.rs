@@ -116,6 +116,12 @@ pub struct RuntimeState {
     /// Tenant that owns this runtime instance.
     pub tenant_id: String,
 
+    /// App that owns this runtime instance (issue #558). Stored on the
+    /// struct so `Clone` can rebuild the per-app preopen path inside
+    /// `wasi_ctx` (the `WasiCtx` itself is not `Clone` in wasmtime 25
+    /// and gets reconstructed from stored host metadata).
+    pub app_name: String,
+
     /// Per-deployment egress policy. Enforced on:
     ///   * `wasi:http/outgoing-handler` via `EgressHttpHooks::send_request`
     ///     (URL/hostname + hard-deny).
@@ -210,6 +216,7 @@ impl RuntimeState {
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: env,
             tenant_id: String::new(),
+            app_name: String::new(),
             egress: egress.clone(),
             socket_mode: SocketEgressPolicy::default(),
             hostname_pinning: Arc::new(crate::socket_egress::HostnamePinning::new()),
@@ -243,6 +250,7 @@ impl RuntimeState {
         env: std::collections::HashMap<String, String>,
         _meter: Option<Arc<RequestMeter>>,
         tenant_id: String,
+        app_name: &str,
         egress: Arc<EgressPolicy>,
         log_sink: Arc<dyn observe::LogSink>,
         app_ctx: observe::AppLogContext,
@@ -254,6 +262,7 @@ impl RuntimeState {
             env,
             _meter,
             tenant_id,
+            app_name,
             None,
             None,
             egress,
@@ -282,6 +291,7 @@ impl RuntimeState {
         mut env: std::collections::HashMap<String, String>,
         _meter: Option<Arc<RequestMeter>>,
         tenant_id: String,
+        app_name: &str,
         preview_id: Option<&str>,
         preview_pr_number: Option<u32>,
         egress: Arc<EgressPolicy>,
@@ -324,8 +334,14 @@ impl RuntimeState {
         let cache_store = get_or_create_cache(&store_key);
         let scheduling = get_or_create_scheduler(&store_key);
 
-        let wasi_ctx =
-            build_wasi_ctx_for_tenant(&env, &tenant_id, &egress, socket_mode, &hostname_pinning);
+        let wasi_ctx = build_wasi_ctx_for_tenant(
+            &env,
+            &tenant_id,
+            app_name,
+            &egress,
+            socket_mode,
+            &hostname_pinning,
+        );
 
         let mut observe_cfg = observe::ObserveConfig::new()
             .with_log_sink(log_sink)
@@ -351,6 +367,7 @@ impl RuntimeState {
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: env,
             tenant_id: tenant_id.clone(),
+            app_name: app_name.to_string(),
             egress: egress.clone(),
             socket_mode,
             hostname_pinning,
@@ -429,6 +446,7 @@ impl Clone for RuntimeState {
             wasi_ctx: build_wasi_ctx_for_tenant(
                 &self.wasi_env_for_clone,
                 &self.tenant_id,
+                &self.app_name,
                 &self.egress,
                 self.socket_mode,
                 // `hostname_pinning: Arc<HostnamePinning>` is `Arc::clone`d
@@ -446,6 +464,7 @@ impl Clone for RuntimeState {
             resource_table: ResourceTable::new(),
             wasi_env_for_clone: self.wasi_env_for_clone.clone(),
             tenant_id: self.tenant_id.clone(),
+            app_name: self.app_name.clone(),
             egress: self.egress.clone(),
             socket_mode: self.socket_mode,
             // Arc::clone so every RuntimeState::clone shares the same
@@ -655,6 +674,7 @@ mod send_request_tests {
             std::collections::HashMap::new(),
             None,
             "phase-c8-test".to_string(),
+            "phase-c8",
             policy,
             Arc::new(NoopSink) as Arc<dyn LogSink>,
             AppLogContext {
@@ -909,14 +929,33 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 
 /// Build a `WasiCtx` for a tenant from the supplied env `HashMap`.
 ///
-/// Per-tenant preopens (Phase C-5): if `EDGE_FS_PATH` is set, the
-/// tenant's directory `{EDGE_FS_PATH}/{tenant_id}/` is mounted at the
-/// guest's `/` so it can call `wasi:filesystem/types::open-at("/",
-/// ...)` from any handler/long-running component. The directory is
-/// created on first use (idempotent — `create_dir_all`). If the base
-/// path is missing or `create_dir_all` fails (read-only mount, EACCES),
-/// the ctx falls through without the preopen so the guest still runs
-/// (no filesystem access) rather than refusing to start.
+/// Per-app preopens (Phase C-5, hardened in #558): if `EDGE_FS_PATH` is
+/// set, the per-app directory `{EDGE_FS_PATH}/{tenant_id}/{app_name}/`
+/// is mounted at the guest's `/` so it can call
+/// `wasi:filesystem/types::open-at("/", ...)` from any
+/// handler/long-running component. The per-app subdirectory is created
+/// on first use (idempotent — `create_dir_all`). If the base path is
+/// missing or `create_dir_all` fails (read-only mount, EACCES), the ctx
+/// falls through without the preopen so the guest still runs (no
+/// filesystem access) rather than refusing to start.
+///
+/// **Why per-app and not per-tenant:** two apps of the same tenant must
+/// not share a filesystem root. Sharing lets app A read, overwrite, or
+/// corrupt app B's files — the workload the preopens enable (e.g.
+/// SQLite-backed apps, see issue #550) is particularly fragile to this
+/// (SQLite corruption from concurrent writers is miserable to debug).
+/// The on-disk store namespaces for KV / cache / scheduling remain
+/// per-tenant by design — those are *namespaces* the tenant may
+/// intentionally want to share across apps (KV: a session store read by
+/// app B written by app A; scheduling: UUID-keyed task ids). Filesystem
+/// clobbering has a different blast radius, so it gets a different
+/// default.
+///
+/// **Migration break:** preopens are recent (Phase C-5 / PR #337) and
+/// have not seen production use. The first mount of an app whose
+/// per-app subdir does not exist yet starts with an empty directory
+/// (the WARN log emitted below names the app). Pre-existing files at
+/// `{EDGE_FS_PATH}/{tenant_id}/` are NOT migrated automatically.
 ///
 /// Sockets egress (issue #309): calls `builder.socket_addr_check(...)`
 /// with a closure sourced from `socket_egress::make_socket_addr_check`.
@@ -939,6 +978,7 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 fn build_wasi_ctx_for_tenant(
     env: &Arc<HashMap<String, String>>,
     tenant_id: &str,
+    app_name: &str,
     egress: &Arc<EgressPolicy>,
     mode: SocketEgressPolicy,
     hostname_pinning: &Arc<crate::socket_egress::HostnamePinning>,
@@ -970,27 +1010,67 @@ fn build_wasi_ctx_for_tenant(
     builder.allow_ip_name_lookup(true);
 
     if let Some(base) = resolve_edge_fs_path() {
-        let tenant_dir = base.join(tenant_id);
-        match std::fs::create_dir_all(&tenant_dir) {
-            Ok(()) => {
-                if let Err(e) =
-                    builder.preopened_dir(&tenant_dir, "/", DirPerms::all(), FilePerms::all())
-                {
+        // Defense in depth: refuse the preopen if the app name fails the
+        // filesystem-safety check (mirrors `is_safe_tenant_id` for the
+        // tenant half of the path). The worker upstream also validates
+        // `app_name` (see `edge-worker/src/downloader.rs::is_safe_app_name`),
+        // but the runtime does not trust upstream — a misconfigured
+        // upstream or a future caller that bypasses it should not let
+        // a `..` slip through into a `Path::join`.
+        if !crate::interfaces::is_safe_app_name(app_name) {
+            tracing::warn!(
+                tenant_id,
+                app_name,
+                "EDGE_FS_PATH preopen refused: unsafe app_name; running without filesystem access"
+            );
+        } else {
+            let app_dir = base.join(tenant_id).join(app_name);
+            match std::fs::create_dir_all(&app_dir) {
+                Ok(()) => {
+                    // First-time warning if the per-tenant parent exists
+                    // with files but the per-app subdir does not — the
+                    // migration break called out in this function's doc
+                    // comment. This is a clean break: preopens are
+                    // recent (Phase C-5) and have not seen production
+                    // use, so we don't auto-rename. Operators with
+                    // existing on-disk state should re-deploy or copy
+                    // files manually.
+                    let tenant_root = base.join(tenant_id);
+                    let had_tenant_files = std::fs::read_dir(&tenant_root)
+                        .map(|mut it| it.next().is_some())
+                        .unwrap_or(false);
+                    let had_app_dir = app_dir.exists();
+                    if had_tenant_files && !had_app_dir {
+                        tracing::warn!(
+                            tenant_id,
+                            app_name,
+                            dir = ?app_dir,
+                            "EDGE_FS_PATH per-app preopen: starting empty; \
+                             pre-existing tenant-root files are NOT migrated — \
+                             see issue #558"
+                        );
+                    }
+                    if let Err(e) =
+                        builder.preopened_dir(&app_dir, "/", DirPerms::all(), FilePerms::all())
+                    {
+                        tracing::warn!(
+                            tenant_id,
+                            app_name,
+                            dir = ?app_dir,
+                            err = %e,
+                            "EDGE_FS_PATH preopen failed; running without filesystem access"
+                        );
+                    }
+                }
+                Err(e) => {
                     tracing::warn!(
                         tenant_id,
-                        dir = ?tenant_dir,
+                        app_name,
+                        dir = ?app_dir,
                         err = %e,
-                        "EDGE_FS_PATH preopen failed; running without filesystem access"
+                        "EDGE_FS_PATH directory create failed; running without filesystem access"
                     );
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    tenant_id,
-                    dir = ?tenant_dir,
-                    err = %e,
-                    "EDGE_FS_PATH directory create failed; running without filesystem access"
-                );
             }
         }
     }
@@ -1324,6 +1404,7 @@ mod with_env_and_meter_tests {
             env,
             None,
             tenant_id.to_string(),
+            "test",
             Arc::new(EgressPolicy::allow_all()),
             Arc::new(NoopSink) as Arc<dyn LogSink>,
             AppLogContext {
@@ -1501,6 +1582,7 @@ mod with_env_and_meter_tests {
             env,
             None,
             tenant_id.to_string(),
+            "test",
             preview_id,
             preview_pr_number,
             Arc::new(EgressPolicy::allow_all()),

@@ -794,6 +794,12 @@ impl HandlerDispatch {
             self.config.env.clone(),
             Some(self.config.meter.clone()),
             self.config.tenant_id.clone(),
+            // Per-app preopen (issue #558): pass app_name through to
+            // scope the EDGE_FS_PATH mount to
+            // `{base}/{tenant_id}/{app_name}/`. Sourced from the
+            // already-populated AppLogContext — no HandlerConfig field
+            // change needed.
+            self.config.app_ctx.app_name.as_str(),
             self.config.preview_id.as_deref(),
             self.config.preview_pr_number,
             self.config.egress.clone(),
