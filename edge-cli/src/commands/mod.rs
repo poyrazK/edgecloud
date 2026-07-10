@@ -4,6 +4,7 @@ pub mod activate;
 pub mod apps;
 pub mod auth;
 pub mod build;
+pub mod completions;
 pub mod deploy;
 pub mod deployments;
 pub mod dev;

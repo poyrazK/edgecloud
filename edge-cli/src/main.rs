@@ -10,6 +10,7 @@ mod state;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use std::time::SystemTime;
 
 use crate::config::EdgeToml;
@@ -448,6 +449,15 @@ enum Command {
         #[command(subcommand)]
         action: commands::egress::EgressAction,
     },
+
+    /// Emit a shell completion script to stdout (issue #506).
+    /// Pipe the output to your shell's completion directory; see
+    /// `edge-cli/README.md` for the per-shell install one-liners.
+    Completions {
+        /// Target shell: bash, zsh, fish, powershell, or elvish.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -634,6 +644,7 @@ fn main() -> Result<()> {
             }
             commands::egress::EgressAction::Clear => commands::egress::clear(&cli.path),
         },
+        Command::Completions { shell } => commands::completions::run(shell),
     }
 }
 
