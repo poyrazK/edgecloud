@@ -64,8 +64,8 @@ fn two_apps_same_tenant_get_distinct_preopen_subdirs() {
     std::env::set_var("EDGE_FS_PATH", &base_path);
 
     let tenant_id = "tenant-shared";
-    let app_a = build_state(tenant_id, "app-a");
-    let app_b = build_state(tenant_id, "app-b");
+    let _app_a = build_state(tenant_id, "app-a");
+    let _app_b = build_state(tenant_id, "app-b");
 
     // After construction, both per-app subdirectories must exist.
     let app_a_dir = base_path.join(tenant_id).join("app-a");
@@ -88,7 +88,4 @@ fn two_apps_same_tenant_get_distinct_preopen_subdirs() {
         app_a_dir, app_b_dir,
         "per-app preopen directories must be distinct (issue #558)"
     );
-
-    // Touch the references so the unused-variable lint stays quiet.
-    let _ = (&app_a, &app_b);
 }
