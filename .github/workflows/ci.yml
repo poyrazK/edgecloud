@@ -185,13 +185,18 @@ jobs:
         run: npm ci
 
       - name: Install edge CLI
-        run: cargo install --path ./edge-cli --locked --root "$CARGO_HOME"
+        # Use $HOME/.cargo explicitly (not $CARGO_HOME): GitHub-hosted
+        # runners do NOT preset CARGO_HOME, so an unset $CARGO_HOME
+        # expands to "" and `cargo install --root ""` lands binaries
+        # under ./bin/. Same root cause as the pre-fix preview.yml
+        # `edge-cli: command not found` symptom (CLAUDE.md line 114).
+        run: cargo install --path ./edge-cli --locked --root "$HOME/.cargo"
 
       - name: Install wasm-tools
-        run: cargo install wasm-tools --version 1.252.0 --locked --root "$CARGO_HOME"
+        run: cargo install wasm-tools --version 1.252.0 --locked --root "$HOME/.cargo"
 
       - name: Expose CLI tools on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # SHA-256 check on the vendored adapter BEFORE the build —
       # a missing or drifted file fails fast, before the slow
