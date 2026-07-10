@@ -48,6 +48,7 @@ fn runtime_state() -> RuntimeState {
         HashMap::new(),
         None,
         "smoke".to_string(),
+        "smoke",
         Arc::new(EgressPolicy::allow_all()),
         Arc::new(CountingSink {
             pushes: AtomicUsize::new(0),
