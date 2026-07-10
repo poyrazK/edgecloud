@@ -1891,6 +1891,17 @@ export interface components {
              */
             max_requests_per_month?: number;
             /**
+             * @description LongRunning-app resident-time cap per calendar month (UTC), in
+             *     seconds. -1 = unlimited (enterprise). 0 = unset / admin-cleared
+             *     (cap check skipped). Default value depends on the tenant's plan:
+             *     free=2592000 (30 days of 1 LR app), pro=7776000 (90 days),
+             *     business=31104000 (360 days), enterprise=unlimited.
+             *     Handler (FaaS) apps do not contribute resident time.
+             *     Resident-seconds is the third metered dimension added in #485.
+             * @example 2592000
+             */
+            max_resident_seconds_per_month?: number;
+            /**
              * Format: int64
              * @description Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
              *     Drives enforcement: when this value reaches `max_outbound_mb`,
@@ -1920,6 +1931,19 @@ export interface components {
              * @example 0
              */
             used_memory_mb?: number;
+            /**
+             * Format: int64
+             * @description Cumulative LongRunning-app resident time in the current UTC month,
+             *     in seconds. Resets on month rollover. Handler (FaaS) apps do
+             *     not contribute (the worker stamps `resident_seconds=null`,
+             *     the CP translates that to 0). Drives enforcement the same way
+             *     as `used_outbound_bytes` and `used_request_count` — when this
+             *     value reaches `max_resident_seconds_per_month`, deploy-time
+             *     returns 402 PAYMENT_REQUIRED with reason `quota_will_be_exceeded`
+             *     and edge-ingress returns 402.
+             * @example 0
+             */
+            used_resident_seconds?: number;
             /**
              * Format: date-time
              * @description UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
@@ -1956,16 +1980,23 @@ export interface components {
             subscription_status?: "active" | "past_due" | "canceled" | "trialing";
             /**
              * @description Derived: true when `used_request_count >= max_requests_per_month`
-             *     OR `used_outbound_bytes / 1MiB >= max_outbound_mb`. The
-             *     edge-ingress fetcher keys its Caddy `static_response` 402
-             *     block off this boolean.
+             *     OR `used_outbound_bytes / 1MiB >= max_outbound_mb`
+             *     OR (when `max_resident_seconds_per_month > 0`)
+             *     `used_resident_seconds >= max_resident_seconds_per_month`.
+             *     The edge-ingress fetcher keys its Caddy `static_response` 402
+             *     block off this boolean. Resident-seconds is the third metered
+             *     dimension added in #485; Handler (FaaS) apps do not contribute
+             *     (the worker stamps `resident_seconds=null`, the CP translates
+             *     that to a 0 contribution).
              * @example false
              */
             over_cap?: boolean;
             /**
-             * @description Highest usage percentage across the two monthly caps
-             *     (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
-             *     expressed as a 0-100 value. null when both caps are unlimited.
+             * @description Highest usage percentage across the three monthly caps
+             *     (outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+             *     and used_resident_seconds / max_resident_seconds_per_month),
+             *     expressed as a 0-100 value. null when all caps are unlimited
+             *     (sentinel -1). Caps set to 0 (unset) are skipped.
              * @example 42.5
              */
             usage_pct?: number | null;
@@ -2014,8 +2045,10 @@ export interface components {
              */
             outbound_bytes_cap?: number;
             /**
-             * @description Highest usage percentage across the two monthly caps (0-100).
-             *     null when both caps are unlimited. Same semantics as
+             * @description Highest usage percentage across the three monthly caps (0-100):
+             *     outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+             *     and used_resident_seconds / max_resident_seconds_per_month.
+             *     null when all caps are unlimited (sentinel -1). Same semantics as
              *     `Quota.usage_pct`; duplicated here so the dashboard can
              *     subscribe to this endpoint alone.
              * @example 31.2
