@@ -226,6 +226,10 @@ pub struct HandlerConfig {
     /// Per-app log sink — guest `emit_log` records flow here.
     pub log_sink: Arc<dyn LogSink>,
     /// App context stamped onto every log record for attribution.
+    /// `app_ctx.app_name` is also threaded into
+    /// `RuntimeState::with_env_and_meter_preview` as the per-app preopen
+    /// subdirectory (issue #558) — keep this populated whenever you
+    /// build a `HandlerConfig`.
     pub app_ctx: AppLogContext,
     /// Per-deployment request meter — incremented per accepted request
     /// so the heartbeat carries the right counts.
