@@ -1,4 +1,15 @@
 //! `edge:kv-store` — durable key-value persistence.
+//!
+//! **Per-tenant lifecycle (issue #569):** the on-disk store file at
+//! `<EDGE_KV_STORE_PATH>/<tenant_id>/store.json` and the in-memory
+//! `KV_STORES` registry entry are created on first
+//! `RuntimeState::with_env_and_meter` for a given tenant, and
+//! cleared ONLY by an explicit `task_purge` `TaskMessage` via
+//! `edge_runtime::purge_tenant`. Stop / crash / rebalance do NOT
+//! delete state — a worker restart reopens the same dir. Forward-
+//! compatible with #475/#476 (CP-side durable `tenant_kv` tier):
+//! when that ships, purge routes through the CP-side BatchDelete
+//! in addition to the worker-side clear.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;

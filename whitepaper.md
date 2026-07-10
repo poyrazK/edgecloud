@@ -616,6 +616,18 @@ Streams are configured with:
 }
 ```
 
+**TaskPurge** (published by CP → NATS): Tombstone for per-tenant KV/cache/scheduling data (issue #569). Distinct `type` discriminator on the same `edgecloud.tasks.<region>` subject. Workers stop matching apps (drains in-flight requests), then call `edge_runtime::runtime::purge_tenant` which removes the in-memory registry entry + on-disk directories. Empty `app_name` is reserved for tenant-wide variants — current code always sets it.
+```json
+{
+  "type": "task_purge",
+  "timestamp": "2026-07-10T12:00:00Z",
+  "tenant_id": "t_abc123",
+  "app_name": "my-service",
+  "reason": "app_deleted"
+}
+```
+`reason` is `"app_deleted"` (per-app purge) or `"tenant_offboarded"` (per-tenant purge, enqueued once per app).
+
 **HeartbeatMessage** (published by Worker → NATS):
 ```json
 {

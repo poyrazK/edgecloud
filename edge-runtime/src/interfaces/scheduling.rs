@@ -1,4 +1,13 @@
 //! `edge:scheduling` — delayed and repeating task execution.
+//!
+//! **Per-tenant lifecycle (issue #569):** the on-disk schedule file
+//! at `<EDGE_SCHEDULING_PATH>/<tenant_id>/schedule.json` and the
+//! in-memory `SCHEDULERS` registry entry follow the same
+//! create-on-first-use, clear-on-`task_purge` contract as
+//! `kv_store` / `cache` (see `interfaces/kv_store.rs`). On
+//! purge, `Scheduler::abort_all` cancels every tokio task for the
+//! tenant BEFORE the registry entry is removed, so a tenant
+//! offboard mid-flight does not leak scheduled tasks.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
