@@ -154,7 +154,7 @@ func New(
 		log.Printf("WARNING: EDGE_SIGNING_KEY_ID is empty; rotation semantics will be ambiguous. Set a logical key id (e.g. \"k1\") before shipping rotation code.")
 	}
 
-	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
+	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo, appRepo, outboxRepo, cfg.Region)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(
 		db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo,
