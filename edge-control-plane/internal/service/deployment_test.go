@@ -1620,8 +1620,10 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, now, false, "", "", []byte{}, 0, nil, nil, nil))
 
-	// 2. Begin tx + GetForUpdate returns no rows (first activate)
+	// 2. Begin tx + lockTenantForUpdate (issue #440) +
+	// GetForUpdate returns no rows (first activate).
 	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs(tenantID, appName).
 		WillReturnError(sql.ErrNoRows)
@@ -1693,6 +1695,7 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 	now := time.Now()
 
 	// Mock the rollback tx flow:
+	// - tx begin → lockTenantForUpdate (issue #440)
 	// - getActive → returns active deployment row referencing the new deployment
 	// - tx begin → SELECT last_good FROM active_deployments FOR UPDATE
 	// - tx read app_env / tenants / quota
@@ -1702,6 +1705,7 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 	// - commit
 
 	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
 
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs(tenantID, appName).

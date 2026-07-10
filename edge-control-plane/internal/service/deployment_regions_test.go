@@ -1396,6 +1396,22 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 			`{"us-east"}`, time.Now(), false, "", "", []byte("null"), 0, nil, nil, nil,
 		))
 
+	// In-tx quota read (issue #44 part 2, hoisted): the per-app
+	// memory value used to build the TaskMessage (below) and the
+	// values used to bump the counter (last 2 mocks) provably come
+	// from the same snapshot. Production reads this row BEFORE the
+	// Set on line 1660 of deployment.go and reuses it in
+	// buildPublishPayload so we don't double-SELECT.
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, now, nil))
+
 	// active_deployments Set — swap the active id and clear
 	// last_good so a second rollback is a no-op (issue #127 step 6).
 	// The Set query is an INSERT ... ON CONFLICT DO UPDATE with 14
@@ -1417,7 +1433,8 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 		WithArgs(tenantID, appName).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// In-tx reads inside buildPublishPayload: env / tenant / quota.
+	// In-tx reads inside buildPublishPayload: env / tenant. Quota
+	// was SELECTed above (hoisted) so it's not re-SELECTed.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -1425,10 +1442,6 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow(tenantID, "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "used_outbound_bytes", "quota_period_start"}).
-			AddRow(tenantID, 100, 50, 10, 256, 1024, 0, time.Now()))
 
 	// Outbox INSERT inside the tx (issue #42): the drainer relays
 	// the marshaled TaskMessage after commit. The drainer tick
@@ -1436,6 +1449,29 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	// visible → drainer relays to NATS" contract that the gate
 	// exists to protect.
 	expectInTxOutboxInsert(mock, tenantID, appName)
+
+	// Issue #44 part 2: in-tx counter swap. +256 for the
+	// rolled-back-TO deployment (now active), -256 for the
+	// rolled-back-FROM (current.DeploymentID before Set). Both
+	// inside the same tx so a failure rolls all three mutations
+	// back together.
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
+		WithArgs(tenantID, int64(256)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 256, now, nil))
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
+		WithArgs(tenantID, int64(-256)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, now, nil))
+
 	mock.ExpectCommit()
 
 	// post-commit publishSwap: cachePusher is nil AND
