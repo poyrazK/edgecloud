@@ -443,6 +443,26 @@ impl Scheduler {
             Err(format!("task not found: {}", id))
         }
     }
+
+    /// Drop every scheduled task in this scheduler. Used by
+    /// `runtime::purge_tenant` (issue #569) when a tenant's data
+    /// lifecycle ends — the worker stops every app for the tenant,
+    /// then drops the in-memory scheduling state before the
+    /// on-disk directory is removed.
+    ///
+    /// Unlike per-task `cancel`, this method does NOT call
+    /// `flush_if_persistent` — the caller is about to remove the
+    /// persistence file, so a final flush would race with the
+    /// `remove_dir_all`. The in-memory `JoinHandle`s held by each
+    /// task are dropped here; their `Drop` impl aborts the
+    /// underlying tokio task, so a 60s repeating task in flight is
+    /// cancelled without further work.
+    pub fn abort_all(&self) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let n = tasks.len();
+        tasks.clear();
+        tracing::debug!(count = n, "scheduler.abort_all dropped all tasks");
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +514,32 @@ mod tests {
         let scheduler = Scheduler::new();
         let result = scheduler.cancel("not-a-real-id");
         assert!(result.is_err());
+    }
+
+    // abort_all (issue #569): a bulk drop of every scheduled task —
+    // the runtime purge_tenant helper relies on this to tear down a
+    // tenant's scheduler entries without enumerating IDs. After
+    // abort_all, every prior cancel returns Err (task not found).
+    #[test]
+    fn test_abort_all_drops_every_task() {
+        let scheduler = Scheduler::new();
+        let id1 = scheduler.schedule_once(60_000, b"a".to_vec()).unwrap();
+        let id2 = scheduler.schedule_repeating(60_000, b"b".to_vec()).unwrap();
+
+        scheduler.abort_all();
+
+        assert!(scheduler.cancel(&id1).is_err(), "id1 must be gone");
+        assert!(scheduler.cancel(&id2).is_err(), "id2 must be gone");
+    }
+
+    // abort_all on an empty scheduler is a no-op — locks the
+    // idempotency contract runtime::purge_tenant depends on.
+    #[test]
+    fn test_abort_all_on_empty_is_noop() {
+        let scheduler = Scheduler::new();
+        scheduler.abort_all();
+        // No panic, no side effects. Asserting only via re-call.
+        scheduler.abort_all();
     }
 
     #[test]

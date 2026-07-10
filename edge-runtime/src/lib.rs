@@ -89,5 +89,5 @@ pub use egress::EgressPolicy;
 pub use engine::create_engine;
 pub use linker::{create_component_linker_handler, create_component_linker_long_running};
 pub use metering::RequestMeter;
-pub use runtime::{is_safe_tenant_id, RuntimeState};
+pub use runtime::{is_safe_tenant_id, purge_tenant, RuntimeState};
 pub use store::create_store;
