@@ -59,6 +59,16 @@ type App struct {
 	// invalid interval/retention — PreviewGCService.Run refuses
 	// to start with non-positive values.
 	PreviewGC *service.PreviewGCService
+	// CacheRetrySweep (issue #501) re-attempts per-region
+	// artifact-cache pushes for deployments whose previous push
+	// attempt landed in regions_cache_failed. Tunable via env
+	// REGION_CACHE_RETRY_INTERVAL (default 5m). Disabled by an
+	// invalid interval — CacheRetrySweepService.Run refuses to
+	// start on a non-positive value (matches PreviewGC's safety
+	// check). Reads the live pusher + region map on every sweep
+	// tick via getter closures, so operator-set config is honored
+	// at runtime.
+	CacheRetrySweep *service.CacheRetrySweepService
 	// DeploymentSvc is exposed so main.go can inject the per-region
 	// artifact-cache pusher (issue #332) after construction. Optional
 	// post-New wiring — when not set, the deployment service runs
@@ -690,7 +700,19 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// DeleteExpiredPreviewsByIDs) and the artifact store
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
-		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
+		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore),
+		// Cache-retry sweep (issue #501). Re-attempts cache pushes
+		// that landed in regions_cache_failed. The two getters
+		// read the live pusher + regionArtifactCaches map on every
+		// tick so the sweep honors operator-set config at runtime
+		// (cmd/api/main.go calls SetCachePusher and
+		// SetRegionArtifactCaches AFTER app.New returns — the
+		// getter closures defer the read to the first sweep tick).
+		CacheRetrySweep: service.NewCacheRetrySweepService(
+			activeDeploymentRepo,
+			deploymentSvc.GetCachePusher,
+			deploymentSvc.GetRegionArtifactCaches,
+		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
 		OutboxDrainer: outboxDrainer,
@@ -767,6 +789,17 @@ func (a *App) RunBackground(ctx context.Context) {
 	previewGCInterval := parseDurationEnv("PREVIEW_GC_INTERVAL", 1*time.Hour)
 	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
+
+	// Cache-retry sweep (issue #501). Re-attempts per-region
+	// artifact-cache pushes stranded in regions_cache_failed.
+	// Uses the same raw-goroutine shape as PreviewGC: the sweep
+	// is "best-effort" — a transient DB blip logs and returns,
+	// the next tick re-attempts — and is not on the loopHealth
+	// critical path (the worker still serves requests by pulling
+	// from /api/internal/download, so a stuck sweep is an
+	// observability hit but not a service-level outage).
+	cacheRetryInterval := parseDurationEnv("REGION_CACHE_RETRY_INTERVAL", 5*time.Minute)
+	go a.CacheRetrySweep.Run(ctx, cacheRetryInterval)
 
 	// Outbox drainer (issue #42). The drainer is the sole owner of
 	// `task_update` NATS publishes for activate / rollback. Its tick
