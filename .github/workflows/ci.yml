@@ -492,9 +492,11 @@ jobs:
   # ============================================================
   # CLI-JS-SMOKE — end-to-end build of the JS sample
   # (issue #423 / #424). Skipped on PRs that don't touch the JS
-  # pipeline (edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/) so
-  # the cost (~5-10 min for `cargo install wasm-tools` on a cold
-  # cache) is only paid when relevant.
+  # pipeline (edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, this
+  # workflow) so the cost (~5-10 min for `cargo install wasm-tools`
+  # on a cold cache) is only paid when relevant. Wired via
+  # `dorny/paths-filter` so the skip is real, not a comment-only
+  # claim.
   # ============================================================
   cli-js-smoke:
     runs-on: ubuntu-latest
@@ -510,18 +512,40 @@ jobs:
     # for the larger `rust-test` / `rust-lint` runs.
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
-    # `paths` is OR'd, so this triggers when ANY of the listed
-    # paths change. Uses `dorny/paths-filter` style: github.event
-    # is a `push` for main, a `pull_request` for PRs; both expose
-    # `github.sha` so we can read the changed-file list via the
-    # API. To avoid that round-trip, we use a simpler heuristic:
-    # always run on push to main, AND on any PR. The cost is
-    # ~5-10 min for `cargo install wasm-tools` on a cold cache;
-    # Swatinem/rust-cache covers the rust side.
     steps:
+      # Path filter: only run the smoke job when the change touches
+      # the JS surface. The `filter` step below evaluates the changed
+      # file list against these globs and exports `changes == 'true'`
+      # when at least one matches. `dorny/paths-filter` defaults to
+      # "any match" semantics for OR-style filtering. We list the
+      # workflow file itself (`**.yml`) so edits here re-trigger the
+      # smoke job — otherwise a future fix to this file would be
+      # unverified.
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            changes:
+              - 'edge-cli/**'
+              - 'edge-js-runtime/**'
+              - 'edge-js-sdk/**'
+              - 'wit/**'
+              - 'samples/hello-js/**'
+              - '.github/workflows/ci.yml'
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      # Skip the rest of the job when the diff doesn't touch JS.
+      # `if:` on every subsequent step would be more verbose; the
+      # early-exit step surfaces a clear "skipped (no JS changes)"
+      # message in the run summary and is the pattern used elsewhere
+      # in this workflow.
+      - name: Skip — no JS-surface changes
+        if: steps.changes.outputs.changes != 'true'
+        run: |
+          echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
+          exit 0
 
       - name: Install Rust toolchain (wasm32-wasip1 + wasm32-wasip2)
         uses: dtolnay/rust-toolchain@stable
@@ -546,37 +570,53 @@ jobs:
           cargo install wasm-tools --locked --version '^1.252' \
             --root "$HOME/.cargo"
 
-      - name: Build + install edge-cli
+      - name: Build + install edge
         # Build from source rather than relying on a published binary
         # so the smoke tests the exact CLI the next dev will get when
-        # they pull the branch. `cargo install --root` puts the binary
-        # in `$root/bin/`, but that dir is NOT on `$PATH` by default
-        # in CI; the next step needs `edge` discoverable. Append it
-        # to `$GITHUB_PATH` (the same trick `.github/actions/deploy-preview`
-        # uses, per CLAUDE.md).
+        # they pull the branch. The `edge-cli` package declares a
+        # `[[bin]] name = "edge"` (see edge-cli/Cargo.toml), so
+        # `cargo install` produces `$root/bin/edge`. That dir is NOT
+        # on `$PATH` by default in CI; append it to `$GITHUB_PATH`
+        # (the same trick `.github/actions/deploy-preview` uses, per
+        # CLAUDE.md).
         run: |
           cargo install --path edge-cli --locked --root "$HOME/.cargo"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build samples/hello-js
         # The full happy-path the user takes: npm install (resolves
-        # @edgecloud/sdk from the in-tree edge-js-sdk), then
-        # `edge-cli build --lang=js` (which bundles src/handler.js,
+        # @edgecloud/sdk from npm via the `^0.2.0` pin in
+        # samples/hello-js/package.json — note: in CI that pin
+        # resolves to the published npm version; the in-tree SDK at
+        # edge-js-sdk/ is *not* used unless someone `npm link`s it),
+        # then `edge build --lang=js` (which bundles src/handler.js,
         # builds edge-js-runtime for wasm32-wasip1, and wraps with
-        # `wasm-tools component new --adapt`). The end-to-end
-        # build is the regression check — the unit tests in
+        # `wasm-tools component new --adapt`). The end-to-end build
+        # is the regression check — the unit tests in
         # edge-cli/src/commands/init.rs only cover the template
         # shape, not the build itself.
-        #
-        # Note: the `edge-cli` package's binary is named `edge-cli`
-        # (not `edge`) — `cargo install --path edge-cli` produces
-        # `$root/bin/edge-cli`. A future `Cargo.toml` rename to
-        # `[[bin]] name = "edge"` would let users run `edge build`
-        # directly; today the binary is `edge-cli`.
         working-directory: samples/hello-js
         run: |
+          # Pre-flight: confirm `@edgecloud/sdk` is published and the
+          # `^0.2.0` pin in samples/hello-js/package.json is
+          # satisfiable. Without this, `npm install` would happily
+          # succeed locally (via the in-tree file: resolution if
+          # anyone `npm link`s it) or fail with a 404 in CI without
+          # making the publish gap obvious. `npm view` exits 0 when
+          # the package + version range are reachable.
+          echo "Resolving @edgecloud/sdk from npm…"
+          npm view '@edgecloud/sdk' version >/dev/null || {
+            echo "::error::@edgecloud/sdk is not published to npm. Run: cd edge-js-sdk && npm publish --access public"
+            exit 1
+          }
           npm install
-          edge-cli build --lang=js
+          # Confirm the npm resolution actually produced the SDK at
+          # the pinned version (catches a future drift to a 0.2.x
+          # with breaking changes — the `^0.2.0` pin allows any
+          # 0.2.x, so this is a stronger assertion than just "npm
+          # install succeeded").
+          npm ls @edgecloud/sdk
+          edge build --lang=js
           # The CLI's path_for("js") returns target/javy/<name>.wasm
           # (see edge-cli/src/commands/build.rs:89-104). The artifact
           # is the user-visible deliverable; assert it exists.
