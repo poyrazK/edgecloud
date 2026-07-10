@@ -32,8 +32,8 @@ type PlanSpec struct {
 //
 // The same plan→cap values are duplicated in
 // migrations/013_quotas_used_requests.up.sql + 029_quotas_resident_seconds.up.sql
-// for the backfill UPDATEs. Keep all three in sync when adding tiers
-// or adjusting caps.
+// for the backfill statements. Keep all three in sync when adding
+// tiers or adjusting caps.
 var planTiers = map[string]PlanSpec{
 	"free": {
 		Name: "free", DisplayName: "Free", PricePerMonthCents: 0,
