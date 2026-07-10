@@ -663,11 +663,23 @@ jobs:
   # ============================================================
   coverage-rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
     steps:
       - uses: actions/checkout@v5
 
       - name: Generate Cargo.lock
         run: cargo generate-lockfile || true
+
+      # .cargo/config.toml sets build.rustc-wrapper = "sccache"
+      # unconditionally, so every cargo invocation below needs the
+      # wrapper on PATH — this job was missing the step every other
+      # rust job has, so `cargo llvm-cov` failed with `could not
+      # execute process sccache` on every run; the `|| true` on the
+      # coverage step below silently swallowed that failure, making
+      # the job report a fast, hollow "pass" with no actual coverage.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
