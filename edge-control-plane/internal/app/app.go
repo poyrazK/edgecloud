@@ -59,6 +59,16 @@ type App struct {
 	// invalid interval/retention — PreviewGCService.Run refuses
 	// to start with non-positive values.
 	PreviewGC *service.PreviewGCService
+	// CacheRetrySweep (issue #501) re-attempts per-region
+	// artifact-cache pushes for deployments whose previous push
+	// attempt landed in regions_cache_failed. Tunable via env
+	// REGION_CACHE_RETRY_INTERVAL (default 5m). Disabled by an
+	// invalid interval — CacheRetrySweepService.Run refuses to
+	// start on a non-positive value (matches PreviewGC's safety
+	// check). Reads the live pusher + region map on every sweep
+	// tick via getter closures, so operator-set config is honored
+	// at runtime.
+	CacheRetrySweep *service.CacheRetrySweepService
 	// DeploymentSvc is exposed so main.go can inject the per-region
 	// artifact-cache pusher (issue #332) after construction. Optional
 	// post-New wiring — when not set, the deployment service runs
@@ -78,6 +88,16 @@ type App struct {
 	// logs. See internal/loophealth for the package contract. Related
 	// to issue #443.
 	loopHealth *loophealth.Tracker
+
+	// cacheRetryIntervalS is the cache-retry sweep's tick interval
+	// in seconds, captured from cfg.CacheRetry.IntervalS at
+	// construction time. Stored as a field so RunBackground
+	// doesn't need the original *config.Config after New returns
+	// (matches the "post-New wiring" pattern documented in the
+	// CacheRetrySweep doc — only the pusher and region map are
+	// late-bound getters, the interval is fixed for process
+	// lifetime). Issue #501.
+	cacheRetryIntervalS int
 }
 
 // New creates a fully-wired App from the given infrastructure dependencies.
@@ -690,11 +710,31 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// DeleteExpiredPreviewsByIDs) and the artifact store
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
-		PreviewGC:     service.NewPreviewGCService(deploymentRepo, artifactStore),
+		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore),
+		// Cache-retry sweep (issue #501). Re-attempts cache pushes
+		// that landed in regions_cache_failed. The three getters
+		// read the live pusher + regionArtifactCaches map +
+		// MaxAttempts on every tick so the sweep honors operator-
+		// set config at runtime (cmd/api/main.go calls
+		// SetCachePusher and SetRegionArtifactCaches AFTER app.New
+		// returns — the getter closures defer the read to the
+		// first sweep tick). MaxAttempts is read directly from
+		// the typed config because it's loaded once at startup
+		// (no post-New setter).
+		CacheRetrySweep: service.NewCacheRetrySweepService(
+			activeDeploymentRepo,
+			deploymentSvc.GetCachePusher,
+			deploymentSvc.GetRegionArtifactCaches,
+			func() int { return cfg.CacheRetry.MaxAttempts },
+		),
 		DeploymentSvc: deploymentSvc,
 		AutoscaleSvc:  autoscaleSvc,
 		OutboxDrainer: outboxDrainer,
 		loopHealth:    loopHealth,
+
+		// Captured at construction; see the field doc for why we
+		// don't use a getter closure like the pusher / region map.
+		cacheRetryIntervalS: cfg.CacheRetry.IntervalS,
 	}
 }
 
@@ -767,6 +807,42 @@ func (a *App) RunBackground(ctx context.Context) {
 	previewGCInterval := parseDurationEnv("PREVIEW_GC_INTERVAL", 1*time.Hour)
 	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
+
+	// Cache-retry sweep (issue #501). Re-attempts per-region
+	// artifact-cache pushes stranded in regions_cache_failed.
+	// Uses the same raw-goroutine shape as PreviewGC: the sweep
+	// is "best-effort" — a transient DB blip logs and returns,
+	// the next tick re-attempts — and is not on the loopHealth
+	// critical path (the worker still serves requests by pulling
+	// from /api/internal/download, so a stuck sweep is an
+	// observability hit but not a service-level outage).
+	//
+	// DB-load note: the sweep makes up to 3 DB calls per row
+	// (AppendRegionsCacheState for success + AppendRegionsCacheState
+	// for still-failing + RemoveFromCacheFailed for configMissing).
+	// At gcBatchSize=10_000 rows per batch and gcMaxBatches=1000
+	// per tick (10M rows worst-case), lowering the interval
+	// proportionally multiplies the per-minute DB load — the
+	// default 5m keeps a worst-case tick under the row cap; an
+	// operator who lowers the interval during an incident should
+	// expect ~interval/5m × default DB pressure.
+	// Use the typed config (issue #501 acceptance item: "config in
+	// internal/config/config.go"). The interval is integer seconds
+	// in the config (CacheRetry.IntervalS) — converted to a
+	// time.Duration for the Run signature. parseDurationEnv is
+	// intentionally NOT used here so the config struct is the
+	// single source of truth (callers in cmd/api/main.go can
+	// override via REGION_CACHE_RETRY_INTERVAL env var, which
+	// config.Load translates to CacheRetry.IntervalS).
+	//
+	// We capture the interval at construction (via the App's
+	// stored interval) so RunBackground doesn't need to read
+	// the config struct post-construction. The interval is
+	// fixed for the process lifetime — same as
+	// previewGCInterval / logGCInterval, which are also captured
+	// into locals at RunBackground time.
+	cacheRetryInterval := time.Duration(a.cacheRetryIntervalS) * time.Second
+	go a.CacheRetrySweep.Run(ctx, cacheRetryInterval)
 
 	// Outbox drainer (issue #42). The drainer is the sole owner of
 	// `task_update` NATS publishes for activate / rollback. Its tick

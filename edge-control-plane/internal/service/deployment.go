@@ -583,6 +583,15 @@ func (s *DeploymentService) SetCachePusher(p artifactCachePusher) {
 	s.cachePusher = p
 }
 
+// GetCachePusher returns the currently-injected cache pusher (may be
+// nil). Used by the cache-retry sweep (issue #501) so it can re-push
+// stranded cache writes without a separate DI seam. Returns the live
+// pointer — operators may rotate the pusher at runtime via
+// SetCachePusher, and the sweep reads the latest value each tick.
+func (s *DeploymentService) GetCachePusher() artifactCachePusher {
+	return s.cachePusher
+}
+
 // SetBillingRepo injects the billing repo used by the deploy-time
 // quota gate (issue #420). Optional injection — Deploy is the only
 // caller, and existing tests that don't care about billing can leave
@@ -599,6 +608,17 @@ func (s *DeploymentService) SetBillingRepo(b billingRepoForDeploymentSvc) {
 // be set AND the region must be in the map for a push to occur.
 func (s *DeploymentService) SetRegionArtifactCaches(m map[string]string) {
 	s.regionArtifactCaches = m
+}
+
+// GetRegionArtifactCaches returns the live per-region URL map. Used by
+// the cache-retry sweep (issue #501) so it consults the current config
+// each sweep tick — operators may rotate the map at runtime via
+// SetRegionArtifactCaches (e.g. on a config hot-reload or a region
+// addition). Returning the live map (not a snapshot) is intentional:
+// the sweep is expected to handle "config disappeared since last
+// activate" by treating those rows as configMissing.
+func (s *DeploymentService) GetRegionArtifactCaches() map[string]string {
+	return s.regionArtifactCaches
 }
 
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
@@ -1575,21 +1595,46 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 		cachedSucceeded = append(cachedSucceeded, region)
 	}
 
-	// Persist cache-state outcome. Best-effort — a DB error is
+	// Persist cache-state outcome AND reset the per-region retry
+	// counter (issue #501 retry cap). Best-effort — a DB error is
 	// logged but does not change the function's return value.
-	if len(cachedSucceeded) > 0 || len(cachedSkipped) > 0 || len(cacheFailed) > 0 {
-		now := time.Now()
-		if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
-			txRepo := s.activeRepo.WithTx(tx)
-			mergedSucceeded := append([]string{}, cachedSucceeded...)
-			mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
+	//
+	// The counter reset is per-deployment: a new activation
+	// re-arms the retry path so a healthy deployment isn't
+	// penalized by stale failure history from a prior
+	// deployment. The reset MUST run inside the same transaction
+	// as the AppendRegionsCacheState so the sweep can't observe
+	// "no regions cached" with a stale counter (or vice versa).
+	//
+	// The reset runs unconditionally (not gated on
+	// len(cachedSucceeded|Skipped|Failed) > 0): a re-activation
+	// of the same deployment where every region is in
+	// alreadyCached still needs to clear the counter because
+	// the sweep's giveUp partition may have left a non-empty
+	// counter from a prior deployment. We always go through the
+	// transaction.
+	now := time.Now()
+	if err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		txRepo := s.activeRepo.WithTx(tx)
+		mergedSucceeded := append([]string{}, cachedSucceeded...)
+		mergedSucceeded = append(mergedSucceeded, cachedSkipped...)
+		if len(mergedSucceeded) > 0 || len(cacheFailed) > 0 {
 			if err := txRepo.AppendRegionsCacheState(ctx, tenantID, appName, mergedSucceeded, cacheFailed, now); err != nil {
 				return fmt.Errorf("append regions_cache_state: %w", err)
 			}
-			return nil
-		}); err != nil {
-			log.Printf("warning: persisting cache state for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
 		}
+		// Counter reset fires on EVERY activation (including
+		// re-activations of the same deployment where every
+		// region is already cached). The sweep's
+		// `MaxAttempts` cap is therefore per-deployment, not
+		// per-tenant-app-lifetime — matching the issue's "reset
+		// the counter on new activation" requirement.
+		if err := txRepo.ResetRegionCacheRetryCount(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("reset region_cache_retry_count: %w", err)
+		}
+		return nil
+	}); err != nil {
+		log.Printf("warning: persisting cache state for %s/%s/%s: %v", tenantID, appName, deploymentID, err)
 	}
 	return nil
 }

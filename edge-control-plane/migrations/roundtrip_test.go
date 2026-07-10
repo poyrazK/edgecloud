@@ -184,6 +184,8 @@ var wantColumns = map[string][]string{
 		"regions_published",             // 010_active_deployments_regions
 		"regions_failed",                // 010_active_deployments_regions
 		"regions_cached",                // 017_active_deployments_regions_cached
+		"regions_cache_failed",          // 018_active_deployments_regions_cache_failed
+		"region_cache_retry_count",      // 028_active_deployments_region_cache_retry_count (issue #501 retry cap)
 		"last_publish_at",               // 010_active_deployments_regions
 		"last_publish_attempt_id",       // 010_active_deployments_regions
 		"activation_attempt_started_at", // 026_active_deployments_activation_attempt_started_at
@@ -418,6 +420,9 @@ var wantTypes = map[string]map[string]string{
 		"stable_since":                  "timestamptz", // 009_add_auto_rollback (nullable)
 		"regions_published":             "_text",       // 010_active_deployments_regions
 		"regions_failed":                "_text",       // 010_active_deployments_regions
+		"regions_cached":                "_text",       // 017_active_deployments_regions_cached
+		"regions_cache_failed":          "_text",       // 018_active_deployments_regions_cache_failed
+		"region_cache_retry_count":      "jsonb",       // 028_active_deployments_region_cache_retry_count (issue #501 retry cap)
 		"last_publish_at":               "timestamptz", // 010_active_deployments_regions (nullable)
 		"last_publish_attempt_id":       "uuid",        // 010_active_deployments_regions (nullable)
 		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)
@@ -789,34 +794,35 @@ var wantNotNull = map[string][]string{
 // Update when a migration creates or renames an index. Inline comments
 // reference the migration number where the index was created.
 var wantIndexes = []IndexExpectation{
-	{Table: "deployments", Name: "idx_deployments_tenant_app"},                            // 002_add_indexes
-	{Table: "deployments", Name: "idx_deployments_tenant"},                                // 002_add_indexes
-	{Table: "workers", Name: "idx_workers_region"},                                        // 002_add_indexes
-	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                      // 002_add_indexes
-	{Table: "active_deployments", Name: "idx_active_deployments_tenant"},                  // 002_add_indexes
-	{Table: "app_env", Name: "idx_app_env_tenant_app"},                                    // 002_add_indexes
-	{Table: "workers", Name: "idx_workers_tenant_id"},                                     // 003_workers_tenant_id
-	{Table: "apps", Name: "idx_apps_tenant_id"},                                           // 004_apps
-	{Table: "logs", Name: "idx_logs_tenant_app_ts"},                                       // 005_logs
-	{Table: "logs", Name: "idx_logs_ts"},                                                  // 005_logs
-	{Table: "api_keys", Name: "idx_api_keys_lookup_hash"},                                 // 006_api_key_lookup_hash
-	{Table: "app_traffic_splits", Name: "idx_ats_tenant_app"},                             // 009_traffic_splits
-	{Table: "domains", Name: "idx_domains_tenant_app"},                                    // 010_domains
-	{Table: "domains", Name: "idx_domains_fqdn"},                                          // 010_domains
-	{Table: "autoscale_events", Name: "idx_autoscale_events_region_time"},                 // 012_autoscale_events
-	{Table: "audit_logs", Name: "idx_audit_logs_tenant_created"},                          // 014_audit_logs
-	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                                // 014_audit_logs
-	{Table: "webhooks", Name: "idx_webhooks_tenant"},                                      // 015_webhooks
-	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"},                 // 015_webhooks
-	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
-	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
-	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
-	{Table: "outbox", Name: "outbox_due_idx"},                                             // 025_outbox (issue #42)
-	{Table: "outbox", Name: "outbox_tenant_app_idx"},                                      // 025_outbox (issue #42)
-	{Table: "outbox", Name: "outbox_failed_idx"},                                          // 025_outbox (issue #42)
-	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
-	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                         // 025_quotas_grace_columns (issue #420, partial)
-	{Table: "quotas", Name: "idx_quotas_grace_until"},                                     // 025_quotas_grace_columns (issue #420, partial)
+	{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
+	{Table: "deployments", Name: "idx_deployments_tenant"},                                      // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_region"},                                              // 002_add_indexes
+	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                            // 002_add_indexes
+	{Table: "active_deployments", Name: "idx_active_deployments_tenant"},                        // 002_add_indexes
+	{Table: "app_env", Name: "idx_app_env_tenant_app"},                                          // 002_add_indexes
+	{Table: "workers", Name: "idx_workers_tenant_id"},                                           // 003_workers_tenant_id
+	{Table: "apps", Name: "idx_apps_tenant_id"},                                                 // 004_apps
+	{Table: "logs", Name: "idx_logs_tenant_app_ts"},                                             // 005_logs
+	{Table: "logs", Name: "idx_logs_ts"},                                                        // 005_logs
+	{Table: "api_keys", Name: "idx_api_keys_lookup_hash"},                                       // 006_api_key_lookup_hash
+	{Table: "app_traffic_splits", Name: "idx_ats_tenant_app"},                                   // 009_traffic_splits
+	{Table: "domains", Name: "idx_domains_tenant_app"},                                          // 010_domains
+	{Table: "domains", Name: "idx_domains_fqdn"},                                                // 010_domains
+	{Table: "autoscale_events", Name: "idx_autoscale_events_region_time"},                       // 012_autoscale_events
+	{Table: "audit_logs", Name: "idx_audit_logs_tenant_created"},                                // 014_audit_logs
+	{Table: "audit_logs", Name: "idx_audit_logs_resource"},                                      // 014_audit_logs
+	{Table: "webhooks", Name: "idx_webhooks_tenant"},                                            // 015_webhooks
+	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_webhook"},                       // 015_webhooks
+	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                          // 021_add_preview_columns (issue #308)
+	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"},       // 022_billing_subscriptions (issue #419)
+	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                       // 023_billing_events (issue #419)
+	{Table: "outbox", Name: "outbox_due_idx"},                                                   // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_tenant_app_idx"},                                            // 025_outbox (issue #42)
+	{Table: "outbox", Name: "outbox_failed_idx"},                                                // 025_outbox (issue #42)
+	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},                     // 026_idempotency_keys (issue #52)
+	{Table: "active_deployments", Name: "idx_active_deployments_regions_cache_failed_nonempty"}, // 027_active_deployments_regions_cache_failed_index (issue #501)
+	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                               // 025_quotas_grace_columns (issue #420, partial)
+	{Table: "quotas", Name: "idx_quotas_grace_until"},                                           // 025_quotas_grace_columns (issue #420, partial)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that

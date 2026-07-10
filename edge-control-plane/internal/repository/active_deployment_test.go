@@ -632,3 +632,199 @@ func TestListByTenantWithDeployment_OrphanPassesThrough(t *testing.T) {
 		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
+
+// TestListCacheFailed_IssuesExpectedStatement (issue #501) pins the
+// SQL shape of ListCacheFailed: SELECT the (tenant_id, app_name,
+// deployment_id, regions_cache_failed) projection filtered to
+// non-empty `regions_cache_failed`, ORDER BY (tenant_id, app_name)
+// for deterministic pagination, LIMIT $1 for batch sizing.
+//
+// sqlmock's QueryMatcherRegexp catches any future refactor that
+// drops the partial-index predicate, the ORDER BY, or the LIMIT —
+// the partial index `idx_active_deployments_regions_cache_failed_nonempty`
+// (migration 027) relies on the exact `regions_cache_failed <> '{}'`
+// predicate to remain planner-friendly.
+func TestListCacheFailed_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT tenant_id, app_name, deployment_id, regions_cache_failed, region_cache_retry_count FROM active_deployments WHERE regions_cache_failed <> '{}' ORDER BY tenant_id, app_name LIMIT $1`,
+	)).
+		WithArgs(500).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "deployment_id", "regions_cache_failed", "region_cache_retry_count"}).
+			AddRow("t_test", "myapp", "d_v1", pq.StringArray{"fra", "iad"}, []byte(`{"fra":2}`)))
+
+	rows, err := repo.ListCacheFailed(context.Background(), 500)
+	if err != nil {
+		t.Fatalf("ListCacheFailed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	want := CacheFailedRow{
+		TenantID:           "t_test",
+		AppName:            "myapp",
+		DeploymentID:       "d_v1",
+		RegionsCacheFailed: pq.StringArray{"fra", "iad"},
+	}
+	if rows[0].TenantID != want.TenantID ||
+		rows[0].AppName != want.AppName ||
+		rows[0].DeploymentID != want.DeploymentID ||
+		!equalStringArray(rows[0].RegionsCacheFailed, want.RegionsCacheFailed) {
+		t.Errorf("rows[0] = %+v, want %+v", rows[0], want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestRemoveFromCacheFailed_IssuesExpectedStatement (issue #501)
+// pins the SQL shape of RemoveFromCacheFailed: a single UPDATE that
+// re-derives `regions_cache_failed` via unnest() + array_agg(DISTINCT
+// r) WHERE r <> ALL($3::text[]), filtering out the regions the caller
+// asked to drop. The dedup-merge keeps the column deterministic and
+// safe under concurrent callers — neither append nor remove mutates
+// last_publish_at / last_publish_attempt_id, so a refresh sweep does
+// not flap those audit-trail columns.
+func TestRemoveFromCacheFailed_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE active_deployments SET regions_cache_failed = (`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.RemoveFromCacheFailed(context.Background(), "t_test", "myapp",
+		[]string{"fra"}); err != nil {
+		t.Fatalf("RemoveFromCacheFailed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// equalStringArray compares two pq.StringArray values for equality,
+// tolerating nil as equivalent to an empty slice. Used by the
+// ListCacheFailed test to assert the projected column shape end-to-end
+// without depending on pq.StringArray's nil-vs-empty semantics at the
+// sqlmock boundary.
+func equalStringArray(a, b pq.StringArray) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestIncrementRegionCacheRetryCount_IssuesExpectedStatement
+// (issue #501 retry cap) pins the SQL shape of
+// IncrementRegionCacheRetryCount: a single UPDATE that chains
+// `jsonb_build_object(region, COALESCE(existing, '0')::int + 1)`
+// expressions with `||`, one per region in the input slice, applied
+// to the existing `region_cache_retry_count` column. The
+// COALESCE handles the first-failure case (key not yet in the
+// JSONB map). The expression is server-side atomic against
+// concurrent updates.
+func TestIncrementRegionCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(`jsonb_build_object`).
+		WithArgs("t_test", "myapp", "fra", "iad").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{"fra", "iad"}); err != nil {
+		t.Fatalf("IncrementRegionCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestIncrementRegionCacheRetryCount_EmptyRegions_NoOp verifies the
+// defensive guard: a call with an empty regions slice returns nil
+// without touching the row. The guard is required so the sweep
+// can call IncrementRegionCacheRetryCount unconditionally on a
+// row's `stillFailing` partition (the partition may be empty if
+// every region was configMissing or already over cap).
+func TestIncrementRegionCacheRetryCount_EmptyRegions_NoOp(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", nil); err != nil {
+		t.Errorf("IncrementRegionCacheRetryCount(nil regions) = %v, want nil", err)
+	}
+	if err := repo.IncrementRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{}); err != nil {
+		t.Errorf("IncrementRegionCacheRetryCount([]string{}) = %v, want nil", err)
+	}
+	// sqlmock: no expectations were set, so any Exec would fail.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met (Exec was called on empty regions): %v", err)
+	}
+}
+
+// TestRemoveFromCacheRetryCount_IssuesExpectedStatement (issue #501
+// retry cap) pins the SQL shape of RemoveFromCacheRetryCount: a
+// single UPDATE that uses `region_cache_retry_count - $3::text[]`
+// to drop the keys. `jsonb - text[]` is a no-op for missing keys
+// so the call is idempotent against regions that aren't currently
+// in the map.
+func TestRemoveFromCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`region_cache_retry_count = region_cache_retry_count - $3::text[]`,
+	)).
+		WithArgs("t_test", "myapp", sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.RemoveFromCacheRetryCount(context.Background(),
+		"t_test", "myapp", []string{"fra"}); err != nil {
+		t.Fatalf("RemoveFromCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestResetRegionCacheRetryCount_IssuesExpectedStatement (issue #501
+// retry cap) pins the SQL shape of ResetRegionCacheRetryCount: a
+// single UPDATE that sets `region_cache_retry_count = '{}'::jsonb`.
+// Called by publishSwap on every activation so the per-region
+// counter starts at 0 for the new deployment (the cap is
+// per-deployment, not per-tenant-app-lifetime).
+func TestResetRegionCacheRetryCount_IssuesExpectedStatement(t *testing.T) {
+	db, mock, cleanup := newActiveDeploymentMockDB(t)
+	defer cleanup()
+	repo := NewActiveDeploymentRepository(db)
+
+	mock.ExpectExec(regexp.QuoteMeta(
+		`region_cache_retry_count = '{}'::jsonb`,
+	)).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repo.ResetRegionCacheRetryCount(context.Background(),
+		"t_test", "myapp"); err != nil {
+		t.Fatalf("ResetRegionCacheRetryCount: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
