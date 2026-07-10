@@ -64,7 +64,7 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-const splitFileCount = 66 // 33 .up.sql + 33 .down.sql on current main (after 025_app_env_plaintext_audit, issue #441 PR #462 follow-up)
+const splitFileCount = 68 // 34 .up.sql + 34 .down.sql on current main (after 026_idempotency_keys, issue #52)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -89,6 +89,7 @@ var wantTables = []string{
 	"webhook_deliveries",
 	"billing_subscriptions", // 022 (issue #419)
 	"billing_events",        // 023 (issue #419)
+	"idempotency_keys",      // 026 (issue #52)
 }
 
 // wantColumns enumerates the public-schema columns each table must
@@ -514,6 +515,13 @@ var wantTypes = map[string]map[string]string{
 		"processed_at": "timestamptz", // nullable
 		"payload_hash": "varchar",     // VARCHAR(128)
 	},
+	"idempotency_keys": { // 026 (issue #52)
+		"tenant_id":      "text",        // TEXT (PK)
+		"key":            "text",        // TEXT (PK)
+		"deployment_id":  "text",        // TEXT (FK target)
+		"request_sha256": "bytea",       // BYTEA — 32-byte SHA-256
+		"created_at":     "timestamptz", // TIMESTAMPTZ, default NOW()
+	},
 }
 
 // wantNotNull enumerates the columns that must have is_nullable='NO'.
@@ -701,6 +709,13 @@ var wantNotNull = map[string][]string{
 		"payload_hash",
 		// tenant_id, processed_at are nullable.
 	},
+	"idempotency_keys": { // 026 (issue #52)
+		"tenant_id",
+		"key",
+		"deployment_id",
+		"request_sha256",
+		// created_at has a non-NULL default — see wantDefaults.
+	},
 }
 
 // wantIndexes enumerates every CREATE INDEX in the migrations. The
@@ -733,6 +748,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "deployments", Name: "idx_deployments_preview_expires_at"},                    // 021_add_preview_columns (issue #308)
 	{Table: "billing_subscriptions", Name: "idx_billing_subscriptions_provider_customer"}, // 022_billing_subscriptions (issue #419)
 	{Table: "billing_events", Name: "idx_billing_events_tenant_received"},                 // 023_billing_events (issue #419)
+	{Table: "idempotency_keys", Name: "idx_idempotency_keys_deployment_id"},               // 026_idempotency_keys (issue #52)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -783,6 +799,9 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 	},
 	"domains": {
 		{"fk_domains_app", "FOREIGN KEY (tenant_id, app_name) REFERENCES apps(tenant_id, name) ON DELETE CASCADE"},
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		{"idempotency_keys_deployment_id_fkey", "FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE"},
 	},
 	"quotas": {
 		{"quotas_tenant_id_fkey", "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE"},
@@ -868,6 +887,9 @@ var wantDefaults = map[string]map[string]string{
 	},
 	"domains": {
 		"status": "'pending'::text", // 010
+	},
+	"idempotency_keys": { // 026 (issue #52)
+		"created_at": "now()", // 026
 	},
 	"logs": {
 		"labels": "'{}'::jsonb", // 005

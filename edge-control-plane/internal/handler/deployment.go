@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,19 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 )
+
+// idempotencyKeyFormat (issue #52) is the byte-shape the
+// Idempotency-Key header must match. [a-fA-F0-9-]{8,128} admits
+// UUID v4 (8-4-4-4-12 = 36 chars with hyphens) while staying
+// narrow enough to keep the lookup index selective — a 128-char
+// upper bound gives callers room to use any future ID scheme
+// (ULID, KSUID, etc.) without re-asking the server.
+//
+// Rejecting malformed keys with 400 is the right move: the
+// value can't be reshaped into something useful, and a
+// degenerate key in the replay cache would invite either an
+// infinite cache or a hash-collision surface.
+var idempotencyKeyFormat = regexp.MustCompile(`^[a-fA-F0-9-]{8,128}$`)
 
 // DeploymentHandler handles deployment HTTP requests.
 type DeploymentHandler struct {
@@ -190,6 +205,24 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Idempotency-Key (issue #52). Optional header that pins a
+	// retry to the original deployment_id (200 + same body)
+	// instead of minting a fresh row (201). Format is
+	// [a-fA-F0-9-]{8,128} — narrow enough to keep the index
+	// selective, wide enough to admit UUID v4 and any user
+	// JID. An empty header means "no idempotency" and falls
+	// through to fresh-deploy semantics, so a pre-#52 CLI on
+	// a #52 server sees no behavior change.
+	//
+	// 400 (not 422) for a malformed key: the value can't be
+	// reshaped into something useful; "go away and re-decide
+	// whether you want idempotency" is the right message.
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey != "" && !idempotencyKeyFormat.MatchString(idemKey) {
+		http.Error(w, `{"error":"invalid Idempotency-Key format (must match [a-fA-F0-9-]{8,128})"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Parse `?regions=us-east,eu-west`. Split on `,`, trim whitespace,
 	// drop empties, dedupe (preserving first-seen order so the response
 	// is stable). Invalid regions are caught at the service layer
@@ -299,6 +332,47 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = filePart.Close() }()
 
+	// Idempotency-Key artifact hash (issue #52). Read the
+	// extracted filePart into a tee-buffer that mirrors
+	// every byte to a SHA-256 hasher, then hand the service
+	// an io.Reader over that buffer so its own streaming
+	// SaveAndHash can re-read the bytes. The digest is the
+	// "same key, different body" guard:
+	//
+	//   * Hashing the artifact (not the multipart envelope)
+	//     keeps the contract stable across CLIs that vary
+	//     the boundary string, swap build_metadata order,
+	//     or stamp a fresh build time while rebuilding the
+	//     same WASM. The unit of identity for a deploy is
+	//     the artifact, not the wire envelope.
+	//
+	//   * Teeing into a buffer trades the streaming win
+	//     for a bounded memory cost. MaxArtifactSize caps
+	//     the body at 100 MiB; the buffer is bounded by
+	//     the same MaxBytesReader cap on `r.Body`, so the
+	//     worst case is one full-artifact buffer per
+	//     in-flight deploy. Acceptable for the size class.
+	var artifactBuf bytes.Buffer
+	var artifactSHA [32]byte
+	{
+		hasher := sha256.New()
+		mw := io.MultiWriter(&artifactBuf, hasher)
+		written, copyErr := io.Copy(mw, filePart)
+		if copyErr != nil {
+			// Mid-stream read failure → 413 (the
+			// MaxBytesReader cap surfaces here as
+			// *http.MaxBytesError, but anything else is
+			// also a bad-body 413 from the operator's POV).
+			http.Error(w, `{"error":"artifact exceeds maximum size"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		if written == 0 {
+			http.Error(w, `{"error":"deploy requires a non-empty file part"}`, http.StatusBadRequest)
+			return
+		}
+		copy(artifactSHA[:], hasher.Sum(nil))
+	}
+
 	// Decode the optional `build_metadata` form field into a
 	// CLISideMetadata struct. A missing or malformed value is
 	// best-effort: the service builds an envelope with "unknown"
@@ -315,7 +389,12 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	deployment, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, filePart, regions, autoRollback, desiredReplicas, cliMeta, previewOpts)
+	// The service contract accepts an io.Reader over the
+	// artifact bytes; the teeBuffer satisfies that. The
+	// streaming win (no extra copy beyond what
+	// extractDeployParts already does) is traded for the
+	// replay-cache requirement to know the SHA-256 up front.
+	deployment, fromCache, err := h.deploymentSvc.Deploy(r.Context(), tenantID, appName, &artifactBuf, regions, autoRollback, desiredReplicas, cliMeta, previewOpts, idemKey, artifactSHA)
 	if err != nil {
 		// *http.MaxBytesError surfaces from the service's streaming
 		// reads when the body exceeds the cap (chunked uploads
@@ -349,13 +428,34 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "invalid wasm artifact: missing magic bytes"}`, http.StatusBadRequest)
 			return
 		}
+		// ErrIdempotencyKeyMismatch (issue #52) — the caller reused
+		// a key against a request body whose artifact hash differs
+		// from the one stored on the cached row. 422 (Unprocessable
+		// Entity): the wire shape is well-formed, but a semantic
+		// conflict between the key and the body means we can't
+		// safely replay. The CLI should either pick a different
+		// key or accept that the artifact changed.
+		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
+	// 200 vs 201 selection (issue #52). A replay returns 200 OK
+	// with the original deployment row; a fresh deploy returns
+	// 201 Created. The response body is byte-equivalent in both
+	// cases (same deployResponse shape) so a CLI that ignores
+	// the status code still parses the row identically across
+	// fresh / replay / idempotent retry.
+	status := http.StatusCreated
+	if fromCache {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
 	// Build the response with preview fields populated only when
 	// the deploy was a preview (issue #308). The three omitempty
 	// tags keep the non-preview wire shape byte-identical to the
@@ -951,6 +1051,15 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 // Parts other than `file` and `build_metadata` are silently drained
 // and discarded, so the request body's bytes don't leak through to
 // the file part stream.
+//
+// Stop scanning as soon as both the file part AND the optional
+// build_metadata part have been collected. mime/multipart's NextPart
+// consumes a part's body to find the next boundary, so iterating
+// past the file part would drain the artifact bytes the caller
+// wants to read. Concretely: a file-only multipart body hits
+// NextPart three times — build_metadata absent, file collected,
+// NextPart drains the file body to find the closing boundary, then
+// returns io.EOF. The file body would be unreadable on return.
 func extractDeployParts(mr *multipart.Reader) (*multipart.Part, []byte, error) {
 	var (
 		filePart       *multipart.Part
@@ -1001,6 +1110,21 @@ func extractDeployParts(mr *multipart.Reader) (*multipart.Part, []byte, error) {
 			// `file` part's bytes remain contiguous.
 			_, _ = io.Copy(io.Discard, p)
 			_ = p.Close()
+		}
+		// Stop once we have the file part. Continuing to scan
+		// would drain the file part's body via NextPart (see
+		// function comment); the caller is responsible for
+		// closing filePart and reading it to EOF. The
+		// build_metadata part must appear BEFORE the file part
+		// in the multipart envelope — the CLI's PR2 envelope
+		// builder writes fields in that order; if a future
+		// caller reverses the order, this code returns the
+		// file part first and never scans the metadata. The
+		// handler treats missing metadata as "unknown" tooling,
+		// so a reversed-order caller just loses the provenance
+		// stamp, not the deploy.
+		if filePart != nil {
+			break
 		}
 	}
 	if filePart == nil {

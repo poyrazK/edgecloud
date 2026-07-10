@@ -99,6 +99,14 @@ func New(
 	autoscaleEventRepo := repository.NewAutoscaleRepository(db)
 	// Billing (issue #419): billing_subscriptions + billing_events.
 	billingRepo := repository.NewBillingRepository(db)
+	// Idempotency-Key replay cache (issue #52). The repo is
+	// optional from the service's perspective — when not
+	// injected, Deploy behaves exactly as it did pre-#52
+	// (always mints a fresh deployment_id). We always wire
+	// it here so production gets the replay cache by default
+	// and only test harnesses that explicitly want the
+	// pre-#52 behavior omit it.
+	idempotencyRepo := repository.NewIdempotencyKeyRepo(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -211,6 +219,7 @@ func New(
 	webhookRepo := repository.NewWebhookRepository(db)
 	webhookSvc := service.NewWebhookService(webhookRepo)
 	deploymentSvc.SetWebhookService(webhookSvc)
+	deploymentSvc.SetIdempotencyRepo(idempotencyRepo)
 	webhookHandler := handler.NewWebhookHandler(webhookSvc)
 
 	// Billing service (issue #419). The provider is selected by

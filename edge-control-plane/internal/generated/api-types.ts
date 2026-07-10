@@ -161,6 +161,33 @@ export interface paths {
          * @description Stores the artifact, registers a new deployment, and auto-creates
          *     the app record if it does not already exist. The artifact is
          *     validated as a WebAssembly binary before storage.
+         *
+         *     ## Idempotency-Key (issue #52)
+         *
+         *     A retry on a transient network error (504, dropped TCP) should
+         *     not produce a duplicate `deployments` row. Send an
+         *     `Idempotency-Key` header on the retry to pin the call to the
+         *     original deployment:
+         *
+         *     * Header is optional. Omitting it gives fresh-deploy semantics —
+         *       same behavior as pre-#52.
+         *     * Header value must match `^[a-fA-F0-9-]{8,128}$` (UUID v4 fits
+         *       unmodified; ULIDs and similar IDs also fit). Malformed → 400.
+         *     * Header is **tenant-scoped**: lookup is keyed on
+         *       `(tenant_id, key)`, never on the key alone. Two tenants
+         *       sending the same key each get independent rows.
+         *     * Replay returns the cached `deployment_id` with status **200**.
+         *       The response body is byte-equivalent to the 201 fresh path.
+         *     * Replaying a key against a different artifact body returns
+         *       **422 Unprocessable Entity** — this is the "you reused a
+         *       key by mistake" guard rail. The error message identifies the
+         *       sentinel `idempotency key reused with a different request body`.
+         *     * Lookup TTL is 24h. Rows older than the cutoff are treated
+         *       as fresh-deploy.
+         *
+         *     The CLI auto-mints a UUID v4 per invocation; pass
+         *     `--idempotency-key <UUID>` to pin a key explicitly (CI uses
+         *     this to dedupe retried jobs).
          */
         post: operations["deploy"];
         delete?: never;
@@ -2384,7 +2411,14 @@ export interface operations {
     deploy: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Optional key that pins a retry to the original
+                 *     `deployment_id`. See the operation description for the
+                 *     full contract (replay, TTL, body-mismatch guard).
+                 */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Unique name of the app within the tenant. */
                 appName: string;
@@ -2398,6 +2432,20 @@ export interface operations {
             };
         };
         responses: {
+            /**
+             * @description Idempotent replay — the `Idempotency-Key` matched a row
+             *     in the replay cache. The response body is the original
+             *     `deployResponse`; the `id` field is the cached
+             *     `deployment_id`.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeployResponse"];
+                };
+            };
             /** @description Deployment created. */
             201: {
                 headers: {
@@ -2409,6 +2457,23 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /**
+             * @description The `Idempotency-Key` was reused against a request whose
+             *     artifact SHA-256 differs from the cached row's hash.
+             *     The client should pick a different key or accept that the
+             *     artifact has changed.
+             */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example idempotency key reused with a different request body */
+                        error?: string;
+                    };
+                };
+            };
             429: components["responses"]["QuotaExceeded"];
             500: components["responses"]["InternalError"];
         };

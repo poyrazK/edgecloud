@@ -37,6 +37,12 @@ ctrlc = "3"
 # `edge auth login --no-echo` is used (issue #108). Default login
 # path (stdin paste, echo on) is preserved for CI/pipe ergonomics.
 rpassword = "7"
+# Used by `edge deploy` to mint a per-run UUID v4 Idempotency-Key
+# (issue #52). When the user supplies `--idempotency-key <UUID>`
+# (CI override), that value is forwarded verbatim; otherwise the
+# runner auto-mints so a CLI retry on a transient network error
+# replays the original deployment instead of creating a duplicate.
+uuid = { version = "1.10", features = ["v4"] }
 edge-config = { path = "../edge-config" }
 
 [features]

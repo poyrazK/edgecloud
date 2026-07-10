@@ -29,6 +29,14 @@ use crate::LangArg;
 /// toml's `[project] language` to also resolve to `l`; mismatches
 /// surface as a clear error so a stale `rust` path can't be served
 /// for a Javy artifact. `None` defers to the toml entirely.
+///
+/// `idempotency_key` is the issue-#52 Idempotency-Key to forward
+/// to the server. `Some(uuid)` passes through verbatim (CI uses
+/// this to dedupe retried jobs); `None` triggers auto-mint in
+/// `run_upload` so a laptop retry on a transient network error
+/// replays the original deployment. `run_activate` ignores the
+/// value — activation is a separate endpoint and the Idempotency-
+/// Key header is wired only on the upload path.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "network")]
 pub fn run(
@@ -41,6 +49,7 @@ pub fn run(
     file: Option<&Path>,
     lang: Option<LangArg>,
     preview_opts: Option<&crate::api::PreviewOpts>,
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
@@ -54,6 +63,7 @@ pub fn run(
         file,
         lang,
         preview_opts,
+        idempotency_key,
     )
 }
 
@@ -74,6 +84,13 @@ pub fn run(
 /// (issue #308) — the server scopes its KV/cache/scheduler under a
 /// per-preview subdirectory and stamps `EDGE_PREVIEW_PR_NUMBER` into
 /// the guest env. `None` for normal deploys.
+///
+/// `idempotency_key`: optional issue-#52 header. `Some(uuid)` is
+/// forwarded verbatim. `None` auto-mints a fresh UUID v4 so a CLI
+/// retry on a transient network error replays the original
+/// deployment instead of minting a duplicate. The minted UUID is
+/// echoed to the user via `output::info` so a CI script that
+/// wants to retry the exact same key can grab it from logs.
 #[cfg(feature = "network")]
 #[allow(clippy::too_many_arguments)]
 fn run_upload(
@@ -85,6 +102,7 @@ fn run_upload(
     file: Option<&Path>,
     lang: Option<LangArg>,
     preview_opts: Option<&crate::api::PreviewOpts>,
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
@@ -148,6 +166,21 @@ fn run_upload(
             None
         }
     };
+    // Issue #52: resolve the Idempotency-Key header. When the user
+    // didn't pass `--idempotency-key`, mint a fresh UUID v4 so a
+    // CLI retry on a transient network error replays the original
+    // deployment instead of minting a duplicate. The minted value
+    // is echoed on stderr so a CI script that wants to grep the
+    // exact key out of deploy logs can.
+    let idem_key_owned: String;
+    let idem_key_slice: &str = match idempotency_key {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            idem_key_owned = uuid::Uuid::new_v4().to_string();
+            output::info(&format!("idempotency-key: {idem_key_owned}"));
+            idem_key_owned.as_str()
+        }
+    };
     let resp = client.deploy(
         &app_name,
         &wasm_bytes,
@@ -156,6 +189,7 @@ fn run_upload(
         replicas,
         build_metadata_json.as_ref(),
         preview_opts,
+        idem_key_slice,
     )?;
 
     let live_url = resp.url.clone();
