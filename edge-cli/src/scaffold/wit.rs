@@ -107,33 +107,42 @@ fn write_dir(target: &Path, dir: &Dir) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-/// Recursive helper: walk `embed`, and for every file compare the
-/// on-disk `<disk_root>/<rel-to-this-dir>` bytes against
-/// `f.contents()`. On mismatch, panic with a message that names the
-/// drifted path AND points the operator at the rebuild command.
+/// Compare every file in `WIT_TREE` against the on-disk tree rooted
+/// at `disk_root`. Returns `Ok(())` if every file in the embed has a
+/// matching on-disk copy with identical bytes. Returns
+/// `Err(anyhow::Error)` with a drifted-path message and the rebuild
+/// command if any file is missing from disk or has different bytes.
 ///
-/// Mirrors `write_dir` directly (same embed-rooted-path gotcha).
-/// `include_dir`'s `DirEntry::Dir::path()` returns a path rooted at
-/// the embed root (e.g. the `cli` subdir of `wit/deps/` is reported
-/// as `"deps/cli"`, not `"cli"`), so the Dir arm takes only the
-/// leaf segment to recurse, and the File arm `strip_prefix`-es the
-/// embed-rooted prefix to get the leaf-relative relpath before
-/// joining onto `disk_root`.
+/// Mirrors `write_dir` directly (same embed-rooted-path gotcha: the
+/// `Dir` arm recurses with the leaf-name, the `File` arm strips the
+/// embed-rooted prefix to land on the leaf-relative relpath).
 ///
-/// Promoted to `pub(crate)` by issue #592 Commit 2 so the
-/// `EDGE_VERIFY_EMBED=1` runtime check can share this code path.
-fn diff_against_disk(disk_root: &Path, embed: &Dir) {
+/// Issue #592: this lets the `EDGE_VERIFY_EMBED=1` runtime check in
+/// `edge init --lang=rust` catch a stale CLI install on a developer
+/// machine without rebuilding — a situation the `cargo test` unit
+/// test cannot detect (the unit test always rebuilds before running).
+pub(crate) fn verify_embed_matches_disk(disk_root: &Path) -> Result<()> {
+    diff_against_disk(disk_root, &WIT_TREE)
+}
+
+/// Recursive helper used by `verify_embed_matches_disk`. Mirrors
+/// `write_dir` (same embed-rooted-path gotcha: `DirEntry::Dir::path()`
+/// is embed-rooted, so the `Dir` arm recurses with the leaf-name; the
+/// `File` arm `strip_prefix`-es to the leaf-relative relpath). Returns
+/// `Err(anyhow::Error)` on the first drifted file — the unit test
+/// (`wit_embed_matches_canonical_wit_tree`) calls this and `.unwrap()`s
+/// to keep the panic-shaped test failure mode.
+fn diff_against_disk(disk_root: &Path, embed: &Dir) -> Result<()> {
     use include_dir::DirEntry;
     for entry in embed.entries() {
         match entry {
             DirEntry::Dir(sub) => {
                 // `sub.path()` is embed-rooted; we want only the
                 // leaf segment to walk down `disk_root`.
-                let name = sub.path().file_name().unwrap_or_else(|| {
-                    panic!("embed DirEntry::Dir has no leaf name: {:?}", sub.path())
-                });
-                diff_against_disk(&disk_root.join(name), sub);
+                let name = sub.path().file_name().ok_or_else(|| {
+                    anyhow::anyhow!("embed DirEntry::Dir has no leaf name: {:?}", sub.path())
+                })?;
+                diff_against_disk(&disk_root.join(name), sub)?;
             }
             DirEntry::File(f) => {
                 // Strip the embed-rooted prefix (e.g. `deps/cli/...`)
@@ -145,33 +154,33 @@ fn diff_against_disk(disk_root: &Path, embed: &Dir) {
                     .unwrap_or(f.path())
                     .to_path_buf();
                 let on_disk_path = disk_root.join(&rel);
-                // Build the human-readable embed-rooted relative
-                // path for error messages. `f.path()` is already the
-                // embed-rooted form, so it's the string a developer
+                // `f.path()` is embed-rooted — the string a developer
                 // would grep against `wit/` to find the file.
                 let canonical_rel = f.path().to_string_lossy().into_owned();
-                let on_disk = std::fs::read(&on_disk_path).unwrap_or_else(|e| {
-                    panic!(
+                let rebuild_hint = "rebuild with `cargo install --path edge-cli --locked` \
+                                    to refresh the embed";
+                let on_disk = std::fs::read(&on_disk_path).map_err(|e| {
+                    anyhow::anyhow!(
                         "WIT_TREE embed references {canonical_rel:?} (looked at {}) but \
                          the canonical tree has no matching file (read error: {e}). \
                          This usually means `wit/` was edited after the CLI was built; \
-                         rebuild with `cargo install --path edge-cli --locked` to \
-                         refresh the embed.",
+                         {rebuild_hint}.",
                         on_disk_path.display()
                     )
-                });
+                })?;
                 let embedded = f.contents();
-                assert_eq!(
-                    on_disk.as_slice(),
-                    embedded,
-                    "WIT_TREE embed of {canonical_rel:?} is stale — the canonical `wit/` \
-                     tree ({on_disk:?}) has different bytes than what the CLI binary \
-                     embedded at compile time. Rebuild with `cargo install --path \
-                     edge-cli --locked` to refresh the embed."
-                );
+                if on_disk.as_slice() != embedded {
+                    return Err(anyhow::anyhow!(
+                        "WIT_TREE embed of {canonical_rel:?} is stale — the canonical `wit/` \
+                         tree at {} has different bytes than what the CLI binary embedded \
+                         at compile time. {rebuild_hint}.",
+                        on_disk_path.display()
+                    ));
+                }
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +320,12 @@ mod tests {
     #[test]
     fn wit_embed_matches_canonical_wit_tree() {
         let canonical_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wit");
-        diff_against_disk(&canonical_root, &WIT_TREE);
+        // `.unwrap()` keeps the test's panic-shaped failure mode.
+        // `diff_against_disk` returns `Result` so the
+        // `EDGE_VERIFY_EMBED=1` runtime check (Commit 2) can surface
+        // the same error message as `anyhow::Error` instead of a
+        // panic.
+        diff_against_disk(&canonical_root, &WIT_TREE)
+            .expect("WIT_TREE embed matches canonical wit/");
     }
 }
