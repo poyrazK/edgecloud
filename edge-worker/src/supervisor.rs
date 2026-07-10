@@ -973,6 +973,7 @@ mod heartbeat_integration_tests {
             instance_pre: instance_pre.clone(),
             handle: Some(Arc::new(panicking_handle)),
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -996,6 +997,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1084,6 +1086,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1198,6 +1201,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1275,6 +1279,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -4163,6 +4168,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()
@@ -4219,6 +4225,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            last_error: None,
         }));
         state
             .write()

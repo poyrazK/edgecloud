@@ -1465,7 +1465,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		// Must use WithTx(tx) — calling the outer s.quotaRepo would
 		// open a different connection and break atomicity, leaving
 		// the counter ahead of the active_deployments row set.
-_, err = s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, s.perAppMemoryMB(activateQuota))
+		_, err = s.memoryQuotaRepo(tx).AddMemoryMB(ctx, tenantID, perAppMemoryMB(activateQuota))
 		if err != nil {
 			return fmt.Errorf("incrementing memory quota: %w", err)
 		}

@@ -832,7 +832,7 @@ var wantNotNull = map[string][]string{
 // Update when a migration creates or renames an index. Inline comments
 // reference the migration number where the index was created.
 var wantIndexes = []IndexExpectation{
-{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
+	{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
 	{Table: "deployments", Name: "idx_deployments_tenant"},                                      // 002_add_indexes
 	{Table: "workers", Name: "idx_workers_region"},                                              // 002_add_indexes
 	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                            // 002_add_indexes

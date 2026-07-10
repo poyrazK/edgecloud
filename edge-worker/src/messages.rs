@@ -536,7 +536,7 @@ mod tests {
         );
     }
 
-// ── last_error rolling-upgrade contract (issue #45) ───────────────
+    // ── last_error rolling-upgrade contract (issue #45) ───────────────
 
     /// `last_error` is stamped onto the heartbeat so operators can
     /// diagnose a `status: "crashed"` app without grepping the
@@ -635,6 +635,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            last_error: None,
             resident_seconds: None,
             observer_metrics: vec![],
         };
@@ -663,6 +664,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            last_error: None,
             resident_seconds: Some(0),
             observer_metrics: vec![],
         };
