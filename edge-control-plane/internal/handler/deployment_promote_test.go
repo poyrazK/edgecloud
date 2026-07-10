@@ -15,11 +15,13 @@ import (
 // stubPromoter is the minimum implementation of deploymentPromoter
 // needed by the Promote handler. It records the args it was called
 // with so tests can assert the tenant filter is applied correctly,
-// and returns whatever err the test sets. There is no success-path
-// test here today — the only Promote coverage at the moment exercises
-// the ErrTenantDisabled → 409 mapping. Happy-path coverage of
-// PromoteDeployment lives at the service layer
-// (internal/service/deployment_test.go).
+// and returns whatever err the test sets.
+//
+// Note: there is no happy-path coverage for PromoteDeployment at any
+// layer today. Adding TestPromoteDeployment_HappyPath at the service
+// layer (mirroring the TestActivateDeployment_* family) is tracked as
+// a follow-up; this file ships only the disabled-tenant mapping test
+// because that is what the PR scope required.
 type stubPromoter struct {
 	err    error
 	called bool

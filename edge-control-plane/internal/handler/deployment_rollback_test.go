@@ -236,6 +236,12 @@ func TestRollback_TenantDisabled_Returns409(t *testing.T) {
 	if got["error"]["message"] != "tenant is disabled" {
 		t.Errorf("error.message = %q, want %q; body: %s", got["error"]["message"], "tenant is disabled", rr.Body.String())
 	}
+	// The service must have been called before the gate fired — the
+	// mapping only matters if the request actually reaches the
+	// tenant-locking tx.
+	if !svc.called {
+		t.Error("RollbackDeployment was not called")
+	}
 	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
 		t.Errorf("body leaks sentinel: %s", rr.Body.String())
 	}
