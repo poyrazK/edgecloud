@@ -107,10 +107,15 @@ func (r *QuotaRepository) AddRequestCount(ctx context.Context, tenantID string, 
 // AddRequestCount this counter is NOT month-bounded — the cap is
 // per-tenant-aggregate, not per-month, so the lazy-rollover CASE against
 // quota_period_start would be wrong. Implemented as a direct UPDATE
-// rather than routed through addColumn for the same reason. The activate
-// / rollback / promote paths MUST call this via QuotaRepository.WithTx(tx)
-// so the counter mutation commits/rolls back atomically with the
-// active_deployments row mutation.
+// rather than routed through addColumn for the same reason.
+//
+// Caller MUST wrap via QuotaRepository.WithTx(tx). Calling the outer
+// repo opens a different connection and breaks atomicity — the counter
+// would commit before/after the active_deployments row mutation in the
+// caller's tx, leaving the counter ahead of the row set on tx abort.
+// This requirement is unenforced at the type level (Go has no way to
+// require it without a context key trick); the convention is documented
+// here and at every call site.
 func (r *QuotaRepository) AddMemoryMB(ctx context.Context, tenantID string, delta int64) (*domain.Quota, error) {
 	var q domain.Quota
 	err := r.db.GetContext(ctx, &q, `

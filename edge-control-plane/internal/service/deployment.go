@@ -259,9 +259,9 @@ func (e *PaymentRequiredError) Unwrap() error { return ErrPaymentRequired }
 // (handled inside VerifyMemoryUnderCap itself). A zero or negative
 // MaxMemoryMB (legacy / admin-cleared / nil-quota path) falls back to
 // 256 — the pre-#44 buildPublishPayload behavior the runtime expects.
-func (s *DeploymentService) perAppMemoryMB(quota *domain.Quota) int {
+func (s *DeploymentService) perAppMemoryMB(quota *domain.Quota) int64 {
 	if quota != nil && quota.MaxMemoryMB > 0 {
-		return quota.MaxMemoryMB
+		return int64(quota.MaxMemoryMB)
 	}
 	return 256
 }
@@ -809,13 +809,19 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	}
 
 	// Pre-check 5: tenant-aggregate memory gate (issue #44, part 2).
+	// Paired with pre-check 4 (VerifyUnderCap) — both sit under the
+	// same `quota != nil` guard set by the overage-grace bypass at the
+	// top of Deploy. If you ever change that bypass, change both
+	// pre-checks together or the operator UX will diverge between
+	// request-count and memory-cap enforcement.
+	//
 	// Skipped when the overage grace is active (quota==nil) and
 	// when the tenant's MaxMemoryMB is the unlimited sentinel (<0)
 	// or unset (==0); both are honored inside VerifyMemoryUnderCap
 	// itself. perAppMemoryMB is the same value the activate path
 	// will increment the counter by — see perAppMemoryMB() below.
 	if quota != nil {
-		perAppMemoryMB := int64(s.perAppMemoryMB(quota))
+		perAppMemoryMB := s.perAppMemoryMB(quota)
 		ok, err := s.quotaRepo.VerifyMemoryUnderCap(ctx, tenantID, perAppMemoryMB)
 		if err != nil {
 			return nil, false, fmt.Errorf("verifying memory cap: %w", err)
@@ -1305,15 +1311,26 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			return fmt.Errorf("clearing stability clock: %w", err)
 		}
 
+		// Issue #44, part 2: read quota inside the tx ONCE so the
+		// per-app memory value used to build the TaskMessage
+		// (below) and the value used to bump the counter (after
+		// the outbox INSERT) provably come from the same snapshot.
+		// The same row is reused by buildPublishPayload (passed
+		// via the new quota arg) so we don't double-SELECT.
+		activateQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("getting quota for activate: %w", err)
+		}
+
 		// Build the TaskMessage payload inside the tx so env /
-		// tenant / quota reads participate in the same atomic
-		// snapshot as the active_deployments mutation. Decryption
-		// (CPU-only, no DB) is fine inside the closure. The
-		// dedupe_key is `<tenant>:<app>:<attempt_id>` — UNIQUE in
-		// the outbox schema so a buggy re-enqueue surfaces as a
-		// constraint violation rather than a double-publish.
+		// tenant reads participate in the same atomic snapshot as
+		// the active_deployments mutation. Decryption (CPU-only,
+		// no DB) is fine inside the closure. The dedupe_key is
+		// `<tenant>:<app>:<attempt_id>` — UNIQUE in the outbox
+		// schema so a buggy re-enqueue surfaces as a constraint
+		// violation rather than a double-publish.
 		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
-			deploymentID, deployment, regions)
+			deploymentID, deployment, regions, activateQuota)
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
@@ -1328,23 +1345,14 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 		}); err != nil {
 			return fmt.Errorf("enqueueing outbox row: %w", err)
 		}
-		// Issue #44, part 2: read quota inside the tx so the
-		// per-app memory value used to build the TaskMessage
-		// (above) and the value used to bump the counter
-		// (below) provably come from the same snapshot. Then
-		// increment the per-tenant aggregate memory counter
-		// inside the same tx as the active_deployments mutation
-		// so a rollback of any statement above (outbox INSERT,
-		// build payload, ClearStableSince, Set) reverts this
-		// counter too. Must use WithTx(tx) — calling the outer
-		// s.quotaRepo would open a different connection and
-		// break atomicity, leaving the counter ahead of the
-		// active_deployments row set.
-		activateQuota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
-		if err != nil {
-			return fmt.Errorf("getting quota for activate: %w", err)
-		}
-		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, int64(s.perAppMemoryMB(activateQuota)))
+		// Increment the per-tenant aggregate memory counter inside
+		// the same tx as the active_deployments mutation so a
+		// rollback of any statement above (outbox INSERT, build
+		// payload, ClearStableSince, Set) reverts this counter too.
+		// Must use WithTx(tx) — calling the outer s.quotaRepo would
+		// open a different connection and break atomicity, leaving
+		// the counter ahead of the active_deployments row set.
+		_, err = s.quotaRepo.WithTx(tx).AddMemoryMB(ctx, tenantID, s.perAppMemoryMB(activateQuota))
 		if err != nil {
 			return fmt.Errorf("incrementing memory quota: %w", err)
 		}
@@ -1375,16 +1383,19 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 
 // buildPublishPayload assembles the marshaled TaskMessage that
 // accompanies the active_deployments mutation. Runs INSIDE the
-// caller's tx so env / tenant / quota reads participate in the same
-// snapshot (the on-wire message reflects post-commit state). Decryption
-// is CPU-only and safe inside the closure.
+// caller's tx so env / tenant reads participate in the same snapshot
+// (the on-wire message reflects post-commit state). Decryption is
+// CPU-only and safe inside the closure.
 //
 // Takes pre-resolved regions (so the activate path's default-region
 // fallback and the rollback path's deployment-regions resolution
-// aren't duplicated) plus the deployment row (for hash / signature /
-// signing_key_id / preview linkage). Returns the marshaled JSON
-// payload ready to be stored on the outbox row.
-func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx, tenantID, appName, deploymentID string, deployment *domain.Deployment, regions []string) ([]byte, error) {
+// aren't duplicated), the deployment row (for hash / signature /
+// signing_key_id / preview linkage), and the quota row the caller
+// already loaded inside the tx (so we don't repeat the SELECT — the
+// caller needs the same row for the per-tenant memory counter
+// increment / decrement on issue #44 part 2). Returns the marshaled
+// JSON payload ready to be stored on the outbox row.
+func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx, tenantID, appName, deploymentID string, deployment *domain.Deployment, regions []string, quota *domain.Quota) ([]byte, error) {
 	envsList, err := s.appEnvRepo.WithTx(tx).List(ctx, tenantID, appName)
 	if err != nil {
 		return nil, fmt.Errorf("listing env vars: %w", err)
@@ -1423,11 +1434,7 @@ func (s *DeploymentService) buildPublishPayload(ctx context.Context, tx *sqlx.Tx
 		return nil, fmt.Errorf("tenant %s is disabled (quota exceeded)", tenantID)
 	}
 
-	quota, err := s.quotaRepo.WithTx(tx).GetByTenantID(ctx, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("getting quota: %w", err)
-	}
-	maxMemoryMB := s.perAppMemoryMB(quota)
+	maxMemoryMB := int(s.perAppMemoryMB(quota))
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
@@ -1654,7 +1661,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		if err != nil {
 			return fmt.Errorf("getting quota: %w", err)
 		}
-		rollbackPerApp := int64(s.perAppMemoryMB(rollbackQuota))
+		rollbackPerApp := s.perAppMemoryMB(rollbackQuota)
 
 		// Clear last_good so a second rollback is a no-op (returns 409
 		// rather than rolling back to whatever was active two steps ago —
@@ -1699,7 +1706,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			deploymentForPayload.PreviewPRNumber = &pr
 		}
 		payload, err := s.buildPublishPayload(ctx, tx, tenantID, appName,
-			rolledBackID, deploymentForPayload, regions)
+			rolledBackID, deploymentForPayload, regions, rollbackQuota)
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
@@ -1777,7 +1784,7 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 	if err != nil {
 		return fmt.Errorf("getting quota: %w", err)
 	}
-	maxMemoryMB := s.perAppMemoryMB(quota)
+	maxMemoryMB := int(s.perAppMemoryMB(quota))
 
 	var failedApps []string
 	for _, ad := range activeList {

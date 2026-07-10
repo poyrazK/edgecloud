@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -128,6 +129,14 @@ type mockDeployQuotaRepo struct {
 	getByTenantIDFn        func(ctx context.Context, tenantID string) (*domain.Quota, error)
 	verifyUnderCapFn       func(ctx context.Context, tenantID string, projectedReqs, projectedBytes int64) (bool, error)
 	verifyMemoryUnderCapFn func(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error)
+	// verifyMemoryCalls is bumped on every VerifyMemoryUnderCap
+	// invocation. Pre-flight tests opt-in by asserting >= 1 after
+	// Deploy returns, so a future regression that adds a gate ABOVE
+	// pre-check 5 and short-circuits before the memory gate fires is
+	// caught here (the mock's default VerifyMemoryUnderCap returns
+	// (true, nil) — silent acceptance is invisible without the
+	// counter).
+	verifyMemoryCalls atomic.Int32
 }
 
 func (m *mockDeployQuotaRepo) WithTx(_ *sqlx.Tx) *repository.QuotaRepository { return nil }
@@ -148,8 +157,10 @@ func (m *mockDeployQuotaRepo) VerifyUnderCap(ctx context.Context, tenantID strin
 
 // verifyMemoryUnderCapFn defaults to (true, nil) so the existing
 // tests don't accidentally regress on memory — only the new memory
-// quota tests opt in via the hook.
+// quota tests opt in via the hook. Every invocation bumps the
+// verifyMemoryCalls counter so tests can assert the gate was reached.
 func (m *mockDeployQuotaRepo) VerifyMemoryUnderCap(ctx context.Context, tenantID string, perAppMemoryMB int64) (bool, error) {
+	m.verifyMemoryCalls.Add(1)
 	if m.verifyMemoryUnderCapFn != nil {
 		return m.verifyMemoryUnderCapFn(ctx, tenantID, perAppMemoryMB)
 	}
@@ -1375,6 +1386,12 @@ func TestDeploy_MemoryQuota_Rejects402(t *testing.T) {
 	if reason != "memory_quota_will_be_exceeded" {
 		t.Errorf("reason = %q, want %q", reason, "memory_quota_will_be_exceeded")
 	}
+	// Gate must have been consulted exactly once — if a future
+	// pre-check short-circuits above this one, the count will be
+	// 0 and this assertion fails.
+	if got := q.verifyMemoryCalls.Load(); got != 1 {
+		t.Errorf("VerifyMemoryUnderCap call count = %d, want 1 (pre-check 5 must fire)", got)
+	}
 }
 
 // TestDeploy_MemoryQuota_Accepts proves the boundary case: per-app
@@ -1442,6 +1459,10 @@ func TestDeploy_MemoryQuota_Accepts(t *testing.T) {
 			t.Fatalf("got unexpected 402 memory_quota_will_be_exceeded: %v", err)
 		}
 	}
+	// Gate must have been consulted exactly once.
+	if got := q.verifyMemoryCalls.Load(); got != 1 {
+		t.Errorf("VerifyMemoryUnderCap call count = %d, want 1", got)
+	}
 }
 
 // TestDeploy_MemoryQuotaEnterprisePlan_Bypasses covers the enterprise
@@ -1504,6 +1525,12 @@ func TestDeploy_MemoryQuotaEnterprisePlan_Bypasses(t *testing.T) {
 			t.Fatalf("enterprise plan must bypass memory gate, got 402: %v", err)
 		}
 	}
+	// Enterprise plan must still consult the gate — the short-circuit
+	// lives inside VerifyMemoryUnderCap's SQL (max_memory_mb = -1 OR
+	// ...). The service calls it; the repo returns true.
+	if got := q.verifyMemoryCalls.Load(); got != 1 {
+		t.Errorf("VerifyMemoryUnderCap call count = %d, want 1 (service must still call the gate)", got)
+	}
 }
 
 // TestDeploy_MemoryQuota_OverageGrace_Bypasses mirrors
@@ -1558,6 +1585,13 @@ func TestDeploy_MemoryQuota_OverageGrace_Bypasses(t *testing.T) {
 	if errors.Is(err, ErrPaymentRequired) {
 		t.Fatalf("overage grace must bypass memory gate, got 402: %v", err)
 	}
+	// Overage grace makes quota == nil → the service skips pre-check
+	// 4 AND pre-check 5. The gate must NEVER fire while grace is
+	// active. If a future refactor lifts the bypass for one gate
+	// but not the other, this assertion catches it.
+	if got := q.verifyMemoryCalls.Load(); got != 0 {
+		t.Errorf("VerifyMemoryUnderCap call count = %d, want 0 (overage grace must skip pre-check 5)", got)
+	}
 }
 
 // TestActivateDeployment_IncrementsMemoryCounter confirms the
@@ -1596,7 +1630,17 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// 3. buildPublishPayload reads — env / tenant / quota (MaxMemoryMB=512)
+	// 3. In-tx quota read (issue #44 part 2): read once up-front, reused
+	// for buildPublishPayload's maxMemoryMB and the in-tx AddMemoryMB
+	// UPDATE. env / tenant are then read by buildPublishPayload.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, now, nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -1604,29 +1648,15 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow(tenantID, "T", "pro", `{}`, now))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers",
-			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"used_outbound_bytes", "used_request_count", "used_memory_mb",
-			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, now, nil))
 
 	// 4. outbox INSERT
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).
 		WithArgs(tenantID, appName, "task_update", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
-	// 5. Issue #44 part 2: in-tx quota re-read + AddMemoryMB(+512)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers",
-			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"used_outbound_bytes", "used_request_count", "used_memory_mb",
-			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, now, nil))
+	// 5. Issue #44 part 2: AddMemoryMB(+512). The quota row was loaded
+	// once above (step 3) and reused for both buildPublishPayload and
+	// this UPDATE — no second SELECT.
 	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
 		WithArgs(tenantID, int64(512)).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1706,7 +1736,9 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 		WithArgs(tenantID, appName).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// In-tx reads for buildPublishPayload: env / tenant / quota
+	// In-tx reads for buildPublishPayload: env / tenant. The quota row
+	// was loaded once above and reused for buildPublishPayload's
+	// maxMemoryMB — no second SELECT (issue #44 part 2 hoisted).
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -1714,14 +1746,6 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow(tenantID, "T", "pro", `{}`, now))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers",
-			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"used_outbound_bytes", "used_request_count", "used_memory_mb",
-			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 256, now, nil))
 
 	// outbox INSERT
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).

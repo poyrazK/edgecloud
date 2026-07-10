@@ -180,8 +180,14 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota are now read
-	// inside the tx by buildPublishPayload.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -193,14 +199,6 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow(tenantID, "Test Tenant", "free", `{"api.example.com"}`, time.Now()))
-
-	// 5. quotaRepo.GetByTenantID — ActivateDeployment reads the quota
-	// to populate MaxMemoryMB on the AppConfig (per main's quota
-	// wiring, post-#420 with `used_request_count, quota_lock_grace_until`).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 
 	// Issue #42: outbox INSERT happens inside the tx (after the
 	// ClearStableSince UPDATE, before the commit).
@@ -296,8 +294,14 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota are now read
-	// inside the tx by buildPublishPayload.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -305,10 +309,6 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 
 	// Issue #42: outbox INSERT happens inside the tx.
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -368,15 +368,18 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -434,15 +437,18 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name, plan, allowlisted_destinations, created_at, disabled_at, overage_allowed_until FROM tenants WHERE id =`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow("t_test", 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 
 	// Issue #42: outbox INSERT inside tx; drainer observes the
 	// partial-failure outcome (the Activate call itself returns
@@ -505,7 +511,16 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	// Quota row with MaxMemoryMB=0 — should be treated as "unset" and
+	// fall through to the 256 default.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow("t_test", 100, 50, 10, 0, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -513,12 +528,6 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	// Quota row with MaxMemoryMB=0 — should be treated as "unset" and
-	// fall through to the 256 default.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow("t_test", 100, 50, 10, 0, 1024, 100_000, 0, 0, 0, time.Now(), nil))
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -568,7 +577,14 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	// In-tx reads (issue #42): env / tenant / quota.
+	// In-tx reads (issue #42 / #44 part 2): quota is read once,
+	// up-front (reused for buildPublishPayload's maxMemoryMB and the
+	// in-tx AddMemoryMB UPDATE — see deployment.go::activateDeployment).
+	// env / tenant are then read by buildPublishPayload.
+	// Empty row set (no quota row) — GetByTenantID returns (nil, nil).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs("t_test").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs("t_test", "myapp").
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -576,10 +592,6 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 		WithArgs("t_test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "plan", "allowlisted_destinations", "created_at"}).
 			AddRow("t_test", "T", "free", `{}`, time.Now()))
-	// Empty row set (no quota row) — GetByTenantID returns (nil, nil).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
-		WithArgs("t_test").
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "quota_period_start", "quota_lock_grace_until"}))
 
 	// Issue #42: outbox INSERT inside tx; drainer relays to "us-east".
 	expectInTxOutboxInsert(mock, "t_test", "myapp")
@@ -651,27 +663,20 @@ func expectInTxOutboxInsert(mock sqlmock.Sqlmock, tenantID, appName string) {
 }
 
 // expectInTxMemoryAdd mocks the activate-tx memory counter mutation
-// (issue #44 part 2): deployment.go::activateDeployment re-reads the
-// quota row inside the tx (defensive snapshot read after the outbox
-// INSERT — same row shape as the buildPublishPayload read above),
-// calls perAppMemoryMB(quota) to get the per-app value, then UPDATE
-// used_memory_mb = used_memory_mb + $N. The shape of the delta
-// (positive for activate, negative for rollback) is mirrored by
-// `maxMemoryMB`: the SELECT row uses that as max_memory_mb (since
-// perAppMemoryMB returns MaxMemoryMB when > 0), and the UPDATE
-// passes the same value as the delta.
+// (issue #44 part 2): deployment.go::activateDeployment reuses the
+// quota row it already loaded for buildPublishPayload (single read,
+// no redundant SELECT — see the deploy.go refactor that hoisted the
+// read above the outbox INSERT), computes perAppMemoryMB(quota), and
+// runs `UPDATE used_memory_mb = used_memory_mb + $N` inside the tx.
+// The delta (positive for activate, negative for rollback) equals
+// MaxMemoryMB when > 0 — perAppMemoryMB returns MaxMemoryMB in that
+// case — so the UPDATE delta matches the SELECT row's max_memory_mb
+// in the matching expectation set above.
+//
+// Only the UPDATE is mocked here; the SELECT belongs to the
+// quota-row mock the caller set up for buildPublishPayload's input.
 func expectInTxMemoryAdd(mock sqlmock.Sqlmock, tenantID string, maxMemoryMB int64) {
 	now := time.Now()
-	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`,
-	)).
-		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers",
-			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"used_outbound_bytes", "used_request_count", "used_memory_mb",
-			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, maxMemoryMB, 1024, 100_000, 0, 0, 0, now, nil))
 	mock.ExpectQuery(regexp.QuoteMeta(
 		`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`,
 	)).
