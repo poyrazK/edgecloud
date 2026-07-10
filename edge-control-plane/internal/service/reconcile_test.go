@@ -34,9 +34,18 @@ type fakeTenantRepo struct {
 	tenants      []domain.Tenant
 	getByIDFunc  func(ctx context.Context, id string) (*domain.Tenant, error)
 	getByIDCalls []string // every ID looked up, in order — useful for asserting "was GetByID called?"
+	// listActivePanic, if true, makes ListActive panic on entry. Used
+	// by TestRun_FirstSweep_PanicStillClosesDone to assert the
+	// firstSweepDone channel closes even when the first sweep
+	// panics — locks the defer-before-runOnce invariant at
+	// reconcile.go's Run call site (issue #586 review follow-up).
+	listActivePanic bool
 }
 
 func (f *fakeTenantRepo) ListActive(_ context.Context) ([]domain.Tenant, error) {
+	if f.listActivePanic {
+		panic("simulated first-sweep panic (reconcile issue #586 panic test)")
+	}
 	var active []domain.Tenant
 	for _, t := range f.tenants {
 		if !t.IsDisabled() {
@@ -646,17 +655,18 @@ func TestRun_FiresImmediatelyThenRespectsCancellation(t *testing.T) {
 	}()
 
 	// Wait deterministically for the immediate-first-sweep to finish
-	// publishing (issue #586). FirstPublishDone() closes at the end
-	// of the first runOnce — by which point every PublishFullSync
-	// call inside the sweep has completed AND the publisher's mu
-	// has been released, so reading pub.calls without holding the
-	// lock is safe. The prior time.Sleep + len(pub.calls) polling
-	// was racy under -race -count=20 because it read pub.calls
-	// outside the publisher's mu.
+	// publishing (issue #586). FirstSweepDone() closes at the end of
+	// the first runOnce — by which point every PublishFullSync call
+	// inside the sweep has completed AND the publisher's mu has been
+	// released, so reading pub.calls under the lock is safe. The
+	// prior time.Sleep + len(pub.calls) polling was racy under -race
+	// -count=20 because it read pub.calls outside the publisher's mu.
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
 	select {
-	case <-svc.FirstPublishDone():
-	case <-time.After(2 * time.Second):
-		t.Fatal("FirstPublishDone did not fire within 2s")
+	case <-svc.FirstSweepDone():
+	case <-waitTimer.C:
+		t.Fatal("FirstSweepDone did not fire within 2s")
 	}
 
 	pub.mu.Lock()
@@ -684,6 +694,62 @@ type errPublisher struct {
 
 func (p *errPublisher) PublishFullSync(string, *nats.TaskMessage) error {
 	return errors.New("simulated NATS outage")
+}
+
+// TestRun_FirstSweep_PanicStillClosesDone locks the
+// defer-before-runOnce invariant at reconcile.go's Run call site:
+// if the first sweep panics, FirstSweepDone() must STILL close so
+// any test waiting on the channel doesn't deadlock. Without the
+// defer, a panicking first sweep would leave the channel open
+// forever — turning a transient repo bug into a silent test hang.
+//
+// The test goroutine wraps svc.Run in `defer recover()` so the
+// panic doesn't kill the test runner; we then assert the channel
+// closes within 2s (it should be effectively instant — the panic
+// unwinds straight into the defer).
+func TestRun_FirstSweep_PanicStillClosesDone(t *testing.T) {
+	pub := &capturingPublisher{}
+	repo := &fakeTenantRepo{listActivePanic: true}
+	svc := NewReconcileService(
+		repo,
+		&fakeActiveRepo{},
+		&fakeAppEnvRepo{},
+		&fakeQuotaRepo{},
+		&fakeWorkerRepo{},
+		pub,
+		"global",
+	)
+
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			panicked <- recover()
+		}()
+		svc.Run(context.Background(), 1*time.Hour)
+	}()
+
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
+	select {
+	case <-svc.FirstSweepDone():
+	case <-waitTimer.C:
+		t.Fatal("FirstSweepDone did not close within 2s after first-sweep panic")
+	}
+
+	// Negative-space check: confirms we actually exercised the
+	// panic path. A nil recovered value means Run returned cleanly,
+	// which would mean the test never hit the defer-before-runOnce
+	// branch.
+	panicTimer := time.NewTimer(2 * time.Second)
+	defer panicTimer.Stop()
+	select {
+	case p := <-panicked:
+		if p == nil {
+			t.Fatal("goroutine returned without panicking; the test didn't exercise the defer-before-runOnce path")
+		}
+	case <-panicTimer.C:
+		t.Fatal("goroutine never finished after first-sweep panic")
+	}
 }
 
 func TestRequestSync_PublisherError_DoesNotPanic(t *testing.T) {

@@ -98,8 +98,8 @@ type ReconcileService struct {
 	publisher     nats.Publisher
 	defaultRegion string
 	envDecrypter  TrafficEnvDecrypter // nil = plaintext pass-through
-	// firstPublishDone is closed at the end of the first runOnce()
-	// inside Run. Tests wait on this channel via FirstPublishDone()
+	// firstSweepDone is closed at the end of the first runOnce()
+	// inside Run. Tests wait on this channel via FirstSweepDone()
 	// instead of time.Sleep + len(pub.calls) polling to synchronize
 	// on the immediate-first-sweep (issue #586 — replaces the
 	// liveness-racy time.Sleep pattern with a deterministic done-
@@ -109,7 +109,7 @@ type ReconcileService struct {
 	// calling Run in a goroutine and start the wait immediately —
 	// no race on "has Run started yet". Never closed if Run is
 	// never called.
-	firstPublishDone chan struct{}
+	firstSweepDone chan struct{}
 }
 
 func NewReconcileService(
@@ -125,18 +125,18 @@ func NewReconcileService(
 		defaultRegion = "global"
 	}
 	return &ReconcileService{
-		tenantRepo:       tenantRepo,
-		activeRepo:       activeRepo,
-		appEnvRepo:       appEnvRepo,
-		quotaRepo:        quotaRepo,
-		workerRepo:       workerRepo,
-		publisher:        publisher,
-		defaultRegion:    defaultRegion,
-		firstPublishDone: make(chan struct{}),
+		tenantRepo:     tenantRepo,
+		activeRepo:     activeRepo,
+		appEnvRepo:     appEnvRepo,
+		quotaRepo:      quotaRepo,
+		workerRepo:     workerRepo,
+		publisher:      publisher,
+		defaultRegion:  defaultRegion,
+		firstSweepDone: make(chan struct{}),
 	}
 }
 
-// FirstPublishDone returns a channel that closes at the end of the
+// FirstSweepDone returns a channel that closes at the end of the
 // first runOnce inside Run. Tests use it to synchronize on the
 // immediate-first-sweep without racing on time.Sleep + len(pub.calls)
 // polling (issue #586). Always returns the same channel; never
@@ -147,8 +147,8 @@ func NewReconcileService(
 // so the goroutine that calls Run in the background and the test
 // goroutine that waits on the channel can be scheduled in either
 // order without liveness races.
-func (s *ReconcileService) FirstPublishDone() <-chan struct{} {
-	return s.firstPublishDone
+func (s *ReconcileService) FirstSweepDone() <-chan struct{} {
+	return s.firstSweepDone
 }
 
 // SetEnvDecrypter injects the decrypter for env values at publish.
@@ -181,28 +181,21 @@ func (s *ReconcileService) Run(ctx context.Context, interval time.Duration) {
 		}
 	}
 
-	// firstPublishOnce closes firstPublishDone exactly once, after
-	// the first runOnce returns. Tests wait on FirstPublishDone()
-	// instead of time.Sleep + len(pub.calls) polling to synchronize
-	// on the immediate-first-sweep (issue #586). We close it
-	// regardless of whether the sweep published anything — "we ran
-	// the first sweep" is the contract; "the sweep published at
-	// least one full_sync" is a separate signal the tests can
-	// assert on top. The defer sits BEFORE the first runOnce()
-	// call so even a panicking first sweep still signals "the
-	// goroutine completed" to any test waiting on the channel —
-	// matching the memory-rule close(chan) inside the goroutine,
-	// never after.
-	var firstPublishOnce sync.Once
+	// Signal "first runOnce completed" to FirstSweepDone() waiters.
+	// The defer-before-runOnce placement guarantees the channel closes
+	// even if the first sweep panics; the explicit close after runOnce
+	// is redundant with the defer but keeps the happy path obvious.
+	// See the firstSweepDone field doc on the struct for rationale.
+	var firstSweepOnce sync.Once
 	defer func() {
-		firstPublishOnce.Do(func() {
-			close(s.firstPublishDone)
+		firstSweepOnce.Do(func() {
+			close(s.firstSweepDone)
 		})
 	}()
 
 	runOnce()
-	firstPublishOnce.Do(func() {
-		close(s.firstPublishDone)
+	firstSweepOnce.Do(func() {
+		close(s.firstSweepDone)
 	})
 
 	ticker := time.NewTicker(interval)

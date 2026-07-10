@@ -33,6 +33,12 @@ type mockPreviewGCRepo struct {
 	// listErr is returned from ListExpiredPreviewBlobs; nil means
 	// "happy path".
 	listErr error
+	// listPanic, if true, makes ListExpiredPreviewBlobs panic on
+	// entry. Used by TestPreviewGC_FirstSweep_PanicStillClosesDone
+	// to assert the firstSweepDone channel closes even when the
+	// first sweep panics — locks the defer-before-runOnce invariant
+	// at preview_gc.go's Run call site (issue #586 review follow-up).
+	listPanic bool
 	// listCalled / deleteCalled let tests assert each method was
 	// invoked without poking the id slice.
 	listCalled, deleteCalled bool
@@ -42,6 +48,15 @@ func (m *mockPreviewGCRepo) ListExpiredPreviewBlobs(_ context.Context, _ int) ([
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.listCalled = true
+	if m.listPanic {
+		// Released the mu before panicking — defer runs before
+		// panic unwinds, so the lock is free by the time the test
+		// observes state. Locking pattern matches atomic-load-no-
+		// fence-rule: never read post-state from outside the
+		// panicked goroutine without a synchronizing event (here,
+		// the channel close).
+		panic("simulated first-sweep panic (preview_gc issue #586 panic test)")
+	}
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
@@ -131,9 +146,11 @@ func TestPreviewGC_FirstSweep_FiresImmediately(t *testing.T) {
 	// blobs.calls, all the writes are visible. The 2s ceiling is
 	// generous enough for busy CI but short enough that a broken
 	// service fails the test fast.
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
 	select {
 	case <-svc.FirstSweepDone():
-	case <-time.After(2 * time.Second):
+	case <-waitTimer.C:
 		t.Fatal("FirstSweepDone did not fire within 2s")
 	}
 
@@ -186,9 +203,11 @@ func TestPreviewGC_BlobDeleteFails_StillDeletesOthers(t *testing.T) {
 	// We can't assert on deletedIDs before the sweep ran — without
 	// this handshake the prior version had to time.Sleep(20ms) and
 	// hope the goroutine had scheduled.
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
 	select {
 	case <-svc.FirstSweepDone():
-	case <-time.After(2 * time.Second):
+	case <-waitTimer.C:
 		t.Fatal("FirstSweepDone did not fire within 2s")
 	}
 	cancel()
@@ -221,9 +240,11 @@ func TestPreviewGC_ListError_LoopContinues(t *testing.T) {
 	// Wait for the immediate-first-sweep to finish, then cancel and
 	// check the blob store has zero deletes (issue #586). The prior
 	// time.Sleep(20ms) version was racy under -race -count=20.
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
 	select {
 	case <-svc.FirstSweepDone():
-	case <-time.After(2 * time.Second):
+	case <-waitTimer.C:
 		t.Fatal("FirstSweepDone did not fire within 2s")
 	}
 	cancel()
@@ -255,6 +276,54 @@ func TestPreviewGC_ZeroInterval_RefusesToRun(t *testing.T) {
 	}
 	if repo.listCalled {
 		t.Error("ListExpiredPreviewBlobs was called despite invalid interval")
+	}
+}
+
+// TestPreviewGC_FirstSweep_PanicStillClosesDone locks the
+// defer-before-runOnce invariant at the Run call site: if the
+// first sweep panics, FirstSweepDone() must STILL close so any test
+// waiting on the channel doesn't deadlock. Without the defer, a
+// panicking first sweep would leave the channel open forever —
+// turning a transient repo bug into a silent test hang.
+//
+// The test goroutine wraps svc.Run in `defer recover()` so the
+// panic doesn't kill the test runner; we then assert the channel
+// closes within 2s (it should be effectively instant — the panic
+// unwinds straight into the defer).
+func TestPreviewGC_FirstSweep_PanicStillClosesDone(t *testing.T) {
+	repo := &mockPreviewGCRepo{listPanic: true}
+	blobs := &mockBlobStore{}
+	svc := NewPreviewGCService(repo, blobs)
+
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			panicked <- recover()
+		}()
+		svc.Run(context.Background(), 10*time.Second, 7*24*time.Hour)
+	}()
+
+	waitTimer := time.NewTimer(2 * time.Second)
+	defer waitTimer.Stop()
+	select {
+	case <-svc.FirstSweepDone():
+	case <-waitTimer.C:
+		t.Fatal("FirstSweepDone did not close within 2s after first-sweep panic")
+	}
+
+	// The panic MUST have surfaced in the goroutine (otherwise the
+	// recover wrapper would have observed nil). This is the
+	// negative-space check: confirms we actually exercised the
+	// panic path, not just a normal early return.
+	panicTimer := time.NewTimer(2 * time.Second)
+	defer panicTimer.Stop()
+	select {
+	case p := <-panicked:
+		if p == nil {
+			t.Fatal("goroutine returned without panicking; the test didn't exercise the defer-before-runOnce path")
+		}
+	case <-panicTimer.C:
+		t.Fatal("goroutine never finished after first-sweep panic")
 	}
 }
 

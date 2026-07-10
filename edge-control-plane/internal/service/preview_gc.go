@@ -225,17 +225,11 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 		}
 	}
 
-	// firstSweepOnce closes firstSweepDone exactly once, after the
-	// first runOnce returns. Tests wait on FirstSweepDone() instead
-	// of time.Sleep(N) to synchronize on the immediate-first-sweep
-	// (issue #586). We close it regardless of whether the sweep did
-	// any work — "we ran the first sweep" is the contract; "the
-	// sweep deleted at least one row" is a separate signal the
-	// tests can assert on top. The defer sits BEFORE the first
-	// runOnce() call so even a panicking first sweep still signals
-	// "the goroutine completed" to any test waiting on the channel
-	// — matching the memory-rule close(chan) inside the goroutine,
-	// never after.
+	// Signal "first runOnce completed" to FirstSweepDone() waiters.
+	// The defer-before-runOnce placement guarantees the channel closes
+	// even if the first sweep panics; the explicit close after runOnce
+	// is redundant with the defer but keeps the happy path obvious.
+	// See the firstSweepDone field doc on the struct for rationale.
 	var firstSweepOnce sync.Once
 	defer func() {
 		firstSweepOnce.Do(func() {
