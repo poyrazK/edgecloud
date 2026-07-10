@@ -678,10 +678,18 @@ jobs:
           echo "cli-js-smoke: skipped (no changes under edge-cli/, edge-js-runtime/, edge-js-sdk/, wit/, samples/hello-js/, or this workflow)"
           exit 0
 
-      - name: Install Rust toolchain (wasm32-wasip2)
+      - name: Install Rust toolchain (wasm32-wasip1, wasm32-wasip2)
         uses: dtolnay/rust-toolchain@stable
+        # Issue #423: `edge build --lang=js` compiles the JS runtime
+        # crate (`edge-js-runtime/`) for `wasm32-wasip1` and then
+        # wraps it into a component via `wasm-tools component new
+        # --adapt` against the vendored adapter. The legacy
+        # `wasm32-wasip2` toolchain install is kept because
+        # `edge-migrate`'s Rust migration output also targets wasip2
+        # (compile path is separate; this smoke job doesn't exercise
+        # it but the target is small and the install is cached).
         with:
-          targets: wasm32-wasip2
+          targets: wasm32-wasip1, wasm32-wasip2
 
       - name: Install Node 20
         uses: actions/setup-node@v4
@@ -720,11 +728,13 @@ jobs:
         # `@edgecloud/sdk` from npm via the `^0.2.0` pin in
         # samples/hello-js/package.json, then `edge build --lang=js`
         # bundles src/handler.js and builds edge-js-runtime directly
-        # for `wasm32-wasip2` (no `--adapt` wrap needed — the wasip2
-        # cargo target emits a complete WASI Preview 2 component
-        # natively). The end-to-end build is the regression check —
-        # the unit tests in edge-cli/src/commands/init.rs only cover
-        # the template shape, not the build itself.
+        # for `wasm32-wasip1`, then `wasm-tools component new
+        # --adapt edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm`
+        # wraps it into a WASI Preview 2 component the host linker
+        # accepts. Issue #423. The end-to-end build is the
+        # regression check — the unit tests in
+        # edge-cli/src/commands/init.rs only cover the template
+        # shape, not the build itself.
         #
         # The SDK isn't on the public npm registry yet, so this job
         # exercises the install path against a local tarball via
