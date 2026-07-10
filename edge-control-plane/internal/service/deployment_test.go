@@ -993,9 +993,9 @@ func TestDeploy_SubscriptionPastDue_Returns402(t *testing.T) {
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 	}
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
-		[]string{"fra"}, false, 0, nil, nil)
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
 	reason, ok := errIsPaymentRequired(t, err)
 	if !ok {
 		t.Fatalf("expected PaymentRequiredError, got %v", err)
@@ -1037,9 +1037,9 @@ func TestDeploy_FreeTierLockdown_Returns402(t *testing.T) {
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 	}
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
-		[]string{"fra"}, false, 0, nil, nil)
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
 	reason, ok := errIsPaymentRequired(t, err)
 	if !ok {
 		t.Fatalf("expected PaymentRequiredError, got %v", err)
@@ -1108,9 +1108,9 @@ func TestDeploy_OverageGraceSkipsCapCheck(t *testing.T) {
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 		keyring:        signing.TestKeyring(t),
 	}
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
-		[]string{"fra"}, false, 0, nil, nil)
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
 	if err == nil {
 		t.Fatalf("expected an error from the count check; we should have fallen through to it")
 	}
@@ -1160,9 +1160,9 @@ func TestDeploy_VerifyUnderCap_Returns402(t *testing.T) {
 		deploymentRepo: dep,
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 	}
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
-		[]string{"fra"}, false, 0, nil, nil)
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
 	reason, ok := errIsPaymentRequired(t, err)
 	if !ok {
 		t.Fatalf("expected PaymentRequiredError, got %v", err)
@@ -1203,9 +1203,9 @@ func TestDeploy_VerifyUnderCap_BoundarySuccess(t *testing.T) {
 		deploymentRepo: &mockDeployDeploymentRepo{},
 		artifactStore:  storage.NewFSArtifactStore(t.TempDir()),
 	}
-	_, err := svc.Deploy(context.Background(), "t_test", "myapp",
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
 		bytes.NewReader(validWasmBytes),
-		[]string{"fra"}, false, 0, nil, nil)
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
 	if err == nil {
 		// We expect ErrMaxDeploymentsQuotaExceeded from the deployment
 		// count check (default count=0 < MaxDeployments=100, actually

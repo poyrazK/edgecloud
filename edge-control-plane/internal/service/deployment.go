@@ -660,13 +660,13 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	if s.billingRepo != nil {
 		status, err := s.billingRepo.GetSubscriptionStatus(ctx, tenantID)
 		if err != nil {
-			return nil, fmt.Errorf("getting subscription status: %w", err)
+			return nil, false, fmt.Errorf("getting subscription status: %w", err)
 		}
 		switch status {
 		case domain.SubscriptionPastDue:
-			return nil, &PaymentRequiredError{Reason: "subscription_past_due"}
+			return nil, false, &PaymentRequiredError{Reason: "subscription_past_due"}
 		case domain.SubscriptionCanceled:
-			return nil, &PaymentRequiredError{Reason: "subscription_canceled"}
+			return nil, false, &PaymentRequiredError{Reason: "subscription_canceled"}
 		}
 	}
 
@@ -678,7 +678,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	if s.tenantRepo != nil {
 		tenant, err := s.tenantRepo.GetByID(ctx, tenantID)
 		if err != nil {
-			return nil, fmt.Errorf("getting tenant: %w", err)
+			return nil, false, fmt.Errorf("getting tenant: %w", err)
 		}
 		if tenant != nil && tenant.IsDisabled() {
 			// Free-tier lockdown is a billing cliff — apps should
@@ -686,7 +686,7 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 			// (quota_lock_grace_until) is checked separately below
 			// so the request-time gate can still serve 402 only
 			// after grace expires.
-			return nil, &PaymentRequiredError{Reason: "free_tier_exceeded"}
+			return nil, false, &PaymentRequiredError{Reason: "free_tier_exceeded"}
 		}
 		// Pre-check 3: admin overage grace. The grace is a
 		// per-tenant bypass for the cap check only — it does NOT
@@ -713,10 +713,10 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 	if quota != nil {
 		ok, err := s.quotaRepo.VerifyUnderCap(ctx, tenantID, 1, 0)
 		if err != nil {
-			return nil, fmt.Errorf("verifying cap: %w", err)
+			return nil, false, fmt.Errorf("verifying cap: %w", err)
 		}
 		if !ok {
-			return nil, &PaymentRequiredError{Reason: "quota_will_be_exceeded"}
+			return nil, false, &PaymentRequiredError{Reason: "quota_will_be_exceeded"}
 		}
 	}
 
