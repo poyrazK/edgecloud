@@ -866,6 +866,18 @@ func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
+	// Defense-in-depth: the production *service.TenantService translates
+	// repo-side (nil, nil) into ErrTenantNotFound (see tenant.go:129),
+	// but the tenantGetter interface permits other implementations
+	// (test mocks, custom deployments). Treat a nil tenant with nil
+	// error as not-found so a future call-site change can't reopen
+	// the nil-deref that PR #491 review caught.
+	if tenant == nil {
+		auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+			fmt.Sprintf("worker %s requested token for missing tenant %s", workerID, req.TenantID), "failure")
+		httperror.NotFoundCtx(w, r, "tenant not found")
+		return
+	}
 	// Disabled tenants get the same treatment as missing ones — the
 	// token would technically verify, but issuing it costs the CP
 	// nothing useful and lets the worker downstream 402-storm on

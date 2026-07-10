@@ -92,8 +92,12 @@ func bootstrapToken(t *testing.T) string {
 
 // newWorkerTokenServer wires MintWorkerToken behind the same WorkerAuth
 // middleware the production app.go does. Returns an http.Handler the
-// test can drive with httptest.NewRecorder().
-func newWorkerTokenServer(tg *mockTenantGetter, ttl time.Duration) http.Handler {
+// test can drive with httptest.NewRecorder(). The tenantGetter
+// interface is what production *service.TenantService satisfies;
+// accepting it here lets tests substitute any narrow contract
+// implementation (mockTenantGetter, nilOnMissingTenantGetter, …)
+// without copying the full service-graph setup.
+func newWorkerTokenServer(tg tenantGetter, ttl time.Duration) http.Handler {
 	h := &InternalHandler{
 		tenantSvc:      tg,
 		issuer:         workerTokenTestIssuer,
@@ -200,7 +204,7 @@ func TestMintWorkerToken_HappyPath(t *testing.T) {
 	if claims.Role != middleware.RoleWorker {
 		t.Fatalf("issued token carried role=%q, want %q", claims.Role, middleware.RoleWorker)
 	}
-	expMinusIat := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time)
+	expMinusIat := claims.ExpiresAt.Sub(claims.IssuedAt.Time)
 	if expMinusIat < 14*time.Minute || expMinusIat > 16*time.Minute {
 		t.Fatalf("exp - iat = %v, want ~15m", expMinusIat)
 	}
@@ -292,7 +296,7 @@ func TestMintWorkerToken_IssuedTokenVerifies(t *testing.T) {
 	if claims.WorkerID != workerTokenTestBootstrapped {
 		t.Fatalf("expected worker_id propagated from input JWT, got %q", claims.WorkerID)
 	}
-	if !claims.ExpiresAt.Time.After(time.Now()) {
+	if !claims.ExpiresAt.After(time.Now()) {
 		t.Fatalf("issued token is already expired")
 	}
 }
@@ -309,7 +313,7 @@ func TestMintWorkerToken_DefaultTTL(t *testing.T) {
 	_, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	claims := decodeIssuedToken(t, resp.Token)
 
-	expMinusIat := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time)
+	expMinusIat := claims.ExpiresAt.Sub(claims.IssuedAt.Time)
 	if expMinusIat < 14*time.Minute || expMinusIat > 16*time.Minute {
 		t.Fatalf("default TTL: exp - iat = %v, want ~15m", expMinusIat)
 	}
@@ -325,7 +329,7 @@ func TestMintWorkerToken_CustomTTL(t *testing.T) {
 	_, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	claims := decodeIssuedToken(t, resp.Token)
 
-	expMinusIat := claims.ExpiresAt.Time.Sub(claims.IssuedAt.Time)
+	expMinusIat := claims.ExpiresAt.Sub(claims.IssuedAt.Time)
 	if expMinusIat < 4*time.Minute || expMinusIat > 6*time.Minute {
 		t.Fatalf("custom TTL: exp - iat = %v, want ~5m", expMinusIat)
 	}
@@ -419,6 +423,30 @@ func TestAuditRecord_NilAuditor_AfterSeam(t *testing.T) {
 
 	// Should not panic when auditor is nil.
 	auditRecord(httptest.NewRequest("POST", "/x", nil), "test", "x", "y", "", "success")
+}
+
+// Case 5c (nil-tenant contract): the production
+// repository.TenantRepository.GetByID returns (nil, nil) for
+// not-found rows (not a typed error). The service-layer
+// translation added in the previous commit turns that into
+// ErrTenantNotFound, but the handler-side fixture
+// nilOnMissingTenantGetter explicitly mirrors the production
+// shape so this test catches a regression where the
+// service-layer translation is bypassed (e.g. someone wires the
+// raw repo back into the handler). Without the translation,
+// MintWorkerToken would nil-deref on `t.DisabledAt` and panic
+// the request goroutine — which the earlier mockTenantGetter
+// (which returns ErrTenantNotFound directly) was hiding.
+func TestMintWorkerToken_NilTenantDoesNotPanic(t *testing.T) {
+	// nilOnMissingTenantGetter mirrors repository.TenantRepository.GetByID:
+	// not-found returns (nil, nil), no error.
+	srv := newWorkerTokenServer(nilOnMissingTenantGetter{}, workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_phantom"})
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nil-tenant not-found, got %d (body=%s)",
+			w.Code, w.Body.String())
+	}
 }
 
 // Case 9 (auth gate): the endpoint must reject requests with no
