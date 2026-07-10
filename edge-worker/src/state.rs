@@ -63,6 +63,18 @@ pub struct AppInstance {
     /// never advance, and the Store-level deadline would never fire.
     /// Wrapped in Option so stop_app can take it out of the locked struct.
     pub ticker: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the resident-seconds ticker (issue #484). Spawned
+    /// only for LongRunning apps — the per-app ticker bumps
+    /// `meter.record_resident_seconds(RESIDENT_TICK_SECS)` every
+    /// 30s, matching the default `Config::heartbeat_interval_secs`.
+    /// Finer granularity yields no new billing-grade signal but 30×
+    /// the atomic-op load. Handler (FaaS) apps leave this as `None` —
+    /// they don't contribute resident seconds and the supervisor
+    /// stamps `resident_seconds = None` on the heartbeat when the
+    /// field is absent.
+    /// Wrapped in `Option` so `stop_app` can take it out of the locked
+    /// struct, mirroring the `ticker` precedent above.
+    pub resident_ticker: Option<tokio::task::JoinHandle<()>>,
     /// Which execution model the guest uses.
     ///
     /// `LongRunning` guests drive themselves via `_start` (spawned by

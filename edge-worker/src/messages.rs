@@ -293,6 +293,18 @@ pub struct AppStatus {
     /// response and in audit logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Total resident seconds since the last heartbeat interval (issue
+    /// #484, third metered dimension). `None` for Handler (FaaS) apps
+    /// that do not contribute (the per-app resident ticker is
+    /// LongRunning-only). `Some(0)` for a LongRunning app that started
+    /// within the current interval — distinct from None because
+    /// `applyTenantDelta` would otherwise fold both to delta=0 and the
+    /// control plane would not be able to distinguish "just-started LR"
+    /// from "FaaS that doesn't contribute". Absent on pre-#484 workers
+    /// (legacy control planes treat absence as no contribution, same as
+    /// a Handler app).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_seconds: Option<u64>,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -447,6 +459,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            resident_seconds: None,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -512,6 +525,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            resident_seconds: None,
             observer_metrics: vec![],
             last_error: None,
         };
@@ -521,6 +535,8 @@ mod tests {
             "outbound_bytes must always appear in serialized AppStatus; got: {json}"
         );
     }
+
+// ── last_error rolling-upgrade contract (issue #45) ───────────────
 
     /// `last_error` is stamped onto the heartbeat so operators can
     /// diagnose a `status: "crashed"` app without grepping the
@@ -543,6 +559,7 @@ mod tests {
             dedupe_id: None,
             observer_metrics: vec![],
             last_error: None,
+            resident_seconds: None,
         };
         let json_none = serde_json::to_string(&none_status).expect("serialize");
         assert!(
@@ -577,6 +594,86 @@ mod tests {
         );
     }
 
+    // ── resident_seconds rolling-upgrade contract (issue #484) ────────────
+
+    /// Old workers that don't send `resident_seconds` must deserialize
+    /// to None (not fail). The control plane treats None as "no
+    /// contribution" — the same way it treats Handler (FaaS) apps.
+    #[test]
+    fn resident_seconds_absent_deserializes_to_none() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(
+            s.resident_seconds, None,
+            "absent resident_seconds must deserialize to None (FaaS-like)"
+        );
+    }
+
+    /// Explicit value round-trips correctly — Some(N) → Some(N).
+    #[test]
+    fn resident_seconds_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":0,"tenant_id":"t_1","port":8080,"resident_seconds":90}"#,
+        );
+        assert_eq!(s.resident_seconds, Some(90));
+    }
+
+    /// `skip_serializing_if = "Option::is_none"` drops the field when
+    /// None — old control planes that don't parse `resident_seconds`
+    /// must keep working. The serialized JSON must NOT contain
+    /// "resident_seconds" when None.
+    #[test]
+    fn resident_seconds_skipped_when_none() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            resident_seconds: None,
+            observer_metrics: vec![],
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            !json.contains("resident_seconds"),
+            "resident_seconds must be skipped from serialized AppStatus when None; got: {json}"
+        );
+    }
+
+    /// `Some(0)` is distinct from `None`: a just-started LongRunning
+    /// app has accumulated 0 resident seconds, while a Handler (FaaS)
+    /// app has no concept of resident time at all. Both fold to
+    /// delta=0 in applyTenantDelta, but the wire shape preserves the
+    /// distinction for future debugging and for the worker's own
+    /// reasoning about whether it ever spawned the resident ticker.
+    #[test]
+    fn resident_seconds_zero_serializes() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "starting".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            resident_seconds: Some(0),
+            observer_metrics: vec![],
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""resident_seconds":0"#),
+            "Some(0) must serialize as 0 (NOT skipped); got: {json}"
+        );
+        let parsed: AppStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.resident_seconds, Some(0));
+    }
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────
 
     fn app_spec_from_json(json: &str) -> AppSpec {
