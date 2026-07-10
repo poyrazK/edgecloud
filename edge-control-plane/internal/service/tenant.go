@@ -465,8 +465,25 @@ func (s *TenantService) EnableTenant(ctx context.Context, tenantID string) error
 // the single interface for tenant row reads; the alternative
 // (exposing the underlying tenantRepo at the app composition layer)
 // would duplicate the wiring in two places.
+//
+// Translates the repo's (nil, nil) on missing-row into
+// service.ErrTenantNotFound so callers can use a single `errors.Is`
+// check — `repository.TenantRepository.GetByID` returns `(nil, nil)`
+// for not-found (matches the pattern of `tenantRepo.GetForUpdate`),
+// but every service-level method on this struct returns the wrapped
+// sentinel. Without the translation, callers would have to nil-check
+// the row alongside `errors.Is(err, ErrTenantNotFound)`, which is
+// exactly the foot-gun PR #491 review flagged: a handler that calls
+// `tenant.IsDisabled()` on a nil tenant panics on the typo path.
 func (s *TenantService) GetByID(ctx context.Context, id string) (*domain.Tenant, error) {
-	return s.tenantRepo.GetByID(ctx, id)
+	t, err := s.tenantRepo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTenantNotFound, id)
+	}
+	return t, nil
 }
 
 // OverrideTenantQuota is the manual recovery path for issue #420.
