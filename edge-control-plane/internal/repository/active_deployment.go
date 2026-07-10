@@ -83,8 +83,8 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	query := `INSERT INTO active_deployments (
 		tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled,
 		regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id,
-		preview_id, preview_pr_number
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		preview_id, preview_pr_number, activation_attempt_started_at
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	ON CONFLICT (tenant_id, app_name) DO UPDATE SET
 		deployment_id = $3,
 		last_good_deployment_id = $4,
@@ -96,13 +96,20 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 		last_publish_at = $10,
 		last_publish_attempt_id = $11,
 		preview_id = $12,
-		preview_pr_number = $13`
+		preview_pr_number = $13,
+		activation_attempt_started_at = $14`
 	// pq.StringArray must be non-nil for the NOT NULL DEFAULT '{}'
 	// columns to take a value rather than a SQL NULL. domain.StringArrayFrom
 	// converts nil → empty pq.StringArray. Same for the *time.Time and
 	// *string fields — passing nil pointer writes SQL NULL. The two
 	// preview columns (issue #308) are also *string/*int and follow
 	// the same nil-pointer-writes-NULL convention.
+	//
+	// ActivationAttemptStartedAt (issue #440, migration 026) is
+	// unconditional in DO UPDATE — every activate / rollback / promote
+	// stamp resets it to NOW(). The disable path observes the new
+	// value as "an activate is in flight for this row" and waits for
+	// the matching last_publish_at stamp before publishing empty.
 	regionsPublished := domain.StringArrayFrom(ad.RegionsPublished)
 	regionsFailed := domain.StringArrayFrom(ad.RegionsFailed)
 	regionsCached := domain.StringArrayFrom(ad.RegionsCached)
@@ -110,7 +117,7 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	_, err := r.db.ExecContext(ctx, query,
 		ad.TenantID, ad.AppName, ad.DeploymentID, ad.LastGoodDeploymentID, ad.AutoRollbackEnabled,
 		regionsPublished, regionsFailed, regionsCached, regionsCacheFailed, ad.LastPublishAt, ad.LastPublishAttemptID,
-		ad.PreviewID, ad.PreviewPRNumber,
+		ad.PreviewID, ad.PreviewPRNumber, ad.ActivationAttemptStartedAt,
 		ad.DesiredReplicas,
 	)
 	return err
@@ -267,7 +274,7 @@ var (
 
 func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -280,7 +287,7 @@ func (r *ActiveDeploymentRepository) Get(ctx context.Context, tenantID, appName 
 // deployment_id ↔ last_good_deployment_id atomically. Pair with WithTx.
 func (r *ActiveDeploymentRepository) GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.ActiveDeployment, error) {
 	var ad domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2 FOR UPDATE`
 	err := r.db.GetContext(ctx, &ad, query, tenantID, appName)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -295,7 +302,7 @@ func (r *ActiveDeploymentRepository) Delete(ctx context.Context, tenantID, appNa
 
 func (r *ActiveDeploymentRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.ActiveDeployment, error) {
 	var ads []domain.ActiveDeployment
-	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1`
+	query := `SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1`
 	err := r.db.SelectContext(ctx, &ads, query, tenantID)
 	return ads, err
 }
@@ -352,7 +359,7 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 		       ad.auto_rollback_enabled, ad.stable_since, ad.regions_published,
 		       ad.regions_failed, ad.regions_cached, ad.regions_cache_failed,
 		       ad.last_publish_at, ad.last_publish_attempt_id,
-		       ad.preview_id, ad.preview_pr_number,
+		       ad.preview_id, ad.preview_pr_number, ad.activation_attempt_started_at,
 		       d.hash, d.signature, d.signing_key_id, d.regions
 		FROM active_deployments ad
 		LEFT JOIN deployments d ON d.id = ad.deployment_id

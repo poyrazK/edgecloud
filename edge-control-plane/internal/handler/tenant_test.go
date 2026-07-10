@@ -33,6 +33,9 @@ type mockTenantSvc struct {
 	deleteTenantErr     error
 	getQuotaResp        *domain.Quota
 	getQuotaErr         error
+	enableTenantErr     error
+	enableTenantCalls   int
+	enableTenantLastID  string
 	overrideResp        *domain.TenantWithQuota
 	overrideErr         error
 }
@@ -86,6 +89,12 @@ func (m *mockTenantSvc) GetQuota(ctx context.Context, tenantID string) (*domain.
 		return nil, m.getQuotaErr
 	}
 	return m.getQuotaResp, nil
+}
+
+func (m *mockTenantSvc) EnableTenant(ctx context.Context, tenantID string) error {
+	m.enableTenantCalls++
+	m.enableTenantLastID = tenantID
+	return m.enableTenantErr
 }
 
 func (m *mockTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
@@ -738,6 +747,71 @@ func TestUpdate_PlanChange_ResponseShowsNewQuota(t *testing.T) {
 	}
 	if resp.MaxRequestsPerMonth != 5_000_000 {
 		t.Errorf("MaxRequestsPerMonth = %d, want 5_000_000 (post-update re-fetch should override pre-update value)", resp.MaxRequestsPerMonth)
+	}
+}
+
+// ----------------------------------------------------------------
+// EnableTenant (issue #440 admin enable endpoint).
+//
+// Owner-only re-enable for a tenant disabled by SetDisabledAt via
+// the quota-exceeded path. Tested at the handler level: routing
+// and role-gating are exercised end-to-end in app_test.go's route
+// table; the handler unit tests pin the per-status-code mapping.
+
+// TestEnable_HappyPath verifies that calling Enable on a known
+// tenant returns 200 and forwards the tenantID to the service.
+func TestEnable_HappyPath(t *testing.T) {
+	svc := &mockTenantSvc{}
+	h := handler.NewTenantHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/admin/tenants/t_acme/enable", nil)
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+
+	h.Enable(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected status 200, got: %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if svc.enableTenantCalls != 1 {
+		t.Errorf("EnableTenant call count = %d, want 1", svc.enableTenantCalls)
+	}
+	if svc.enableTenantLastID != "t_acme" {
+		t.Errorf("EnableTenant called with %q, want t_acme", svc.enableTenantLastID)
+	}
+}
+
+// TestEnable_NotFound verifies that an ErrTenantNotFound from the
+// service maps to 404.
+func TestEnable_NotFound(t *testing.T) {
+	svc := &mockTenantSvc{enableTenantErr: service.ErrTenantNotFound}
+	h := handler.NewTenantHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/admin/tenants/t_missing/enable", nil)
+	req.SetPathValue("tenantID", "t_missing")
+	rr := httptest.NewRecorder()
+
+	h.Enable(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected status 404 on ErrTenantNotFound, got: %d (body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestEnable_ServiceError verifies that an opaque error from the
+// service maps to 500 (no leaky information).
+func TestEnable_ServiceError(t *testing.T) {
+	svc := &mockTenantSvc{enableTenantErr: errors.New("connection refused")}
+	h := handler.NewTenantHandler(svc)
+
+	req := httptest.NewRequest("POST", "/api/admin/tenants/t_x/enable", nil)
+	req.SetPathValue("tenantID", "t_x")
+	rr := httptest.NewRecorder()
+
+	h.Enable(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500 on opaque error, got: %d", rr.Code)
 	}
 }
 

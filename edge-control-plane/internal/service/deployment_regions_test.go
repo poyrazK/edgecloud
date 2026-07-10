@@ -168,7 +168,7 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs(tenantID, appName).
 		WillReturnError(sql.ErrNoRows)
@@ -273,17 +273,19 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_legacy"
+	const tenantID = "t_test"
+	const appName = "myapp"
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	// Issue #440: tenant FOR UPDATE gate. Must come before the
 	// active_deployments read so the disable-vs-activate race is
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -347,17 +349,20 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	svc, drainer, mock, cleanup := activateSvcForTest(t, pub, "us-east")
 	defer cleanup()
 
+	const deploymentID = "d_x"
+	const tenantID = "t_test"
+	const appName = "myapp"
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
-		WithArgs("d_x").
+		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow("d_x", "t_test", "myapp", domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	// Issue #440: tenant FOR UPDATE gate. Must come before the
 	// active_deployments read so the disable-vs-activate race is
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -416,17 +421,19 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_partial"
+	const tenantID = "t_test"
+	const appName = "myapp"
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	// Issue #440: tenant FOR UPDATE gate. Must come before the
 	// active_deployments read so the disable-vs-activate race is
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -489,18 +496,20 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	defer cleanup()
 
 	const deploymentID = "d_zero_quota"
+	const tenantID = "t_test"
+	const appName = "myapp"
 	regionsCol := `{"us-east"}`
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	// Issue #440: tenant FOR UPDATE gate. Must come before the
 	// active_deployments read so the disable-vs-activate race is
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -555,18 +564,20 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	defer cleanup()
 
 	const deploymentID = "d_no_quota"
+	const tenantID = "t_test"
+	const appName = "myapp"
 	regionsCol := `{"us-east"}`
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
-			AddRow(deploymentID, "t_test", "myapp", domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
 	mock.ExpectBegin()
 	// Issue #440: tenant FOR UPDATE gate. Must come before the
 	// active_deployments read so the disable-vs-activate race is
 	// closed (see deployment.go::activateDeployment). Disabled=nil
 	// so the gate passes; the dedicated *_TenantGate_* tests cover
 	// the disabled and not-found arms.
-	expectTenantForUpdateOK(mock, "t_test")
+	expectTenantForUpdateOK(mock, tenantID)
 	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
 		WithArgs("t_test", "myapp").
 		WillReturnError(sql.ErrNoRows)
@@ -655,9 +666,7 @@ func outboxRowPayload(t *testing.T, tenantID, appName, deploymentID string, maxM
 // enqueue; both are pinned via AnyArg so the test stays agnostic
 // about JSON shape and UUID format.
 func expectInTxOutboxInsert(mock sqlmock.Sqlmock, tenantID, appName string) {
-	mock.ExpectExec(regexp.QuoteMeta(
-		`INSERT INTO outbox`,
-	)).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).
 		WithArgs(tenantID, appName, "task_update", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 }
@@ -882,7 +891,7 @@ func TestPublishSwap_SkipsAlreadyCachedRegion(t *testing.T) {
 	// loop should skip "fra" and push "iad". The NATS publish
 	// loop runs for BOTH regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -980,7 +989,7 @@ func TestPublishSwap_AtomicOnCacheAppendFailure(t *testing.T) {
 
 	// Post-commit read: empty arrays; both regions are in toPublish.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1081,7 +1090,7 @@ func TestPublishSwap_TracksCachedSucceededAndSkippedSeparately(t *testing.T) {
 	// skipped and `iad` is pushed. The cache pusher is wired so
 	// the cache loop runs. NATS publishes for both regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1169,7 +1178,7 @@ func TestPublishSwap_CacheFailureIsBestEffort(t *testing.T) {
 	// (no failFor on the publisher). The cache pusher fails for
 	// both regions.
 	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
+		`SELECT tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled, stable_since, regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id, preview_id, preview_pr_number, activation_attempt_started_at FROM active_deployments WHERE tenant_id = $1 AND app_name = $2`,
 	)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{
@@ -1425,7 +1434,7 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 		WithArgs(tenantID, appName, lastGoodID, nil,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), 0).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), 0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	// ClearStableSince — reset the stability clock for the new
 	// active deployment.

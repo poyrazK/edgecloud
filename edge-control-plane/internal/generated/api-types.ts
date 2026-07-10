@@ -810,6 +810,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/tenants/{tenantID}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-enable a tenant disabled by quota-exceeded (admin only)
+         * @description Clears tenants.disabled_at for a tenant that the quota-exceeded
+         *     path stamped via SetDisabledAt (issue #440). Subsequent
+         *     activate / rollback / deploy requests proceed without
+         *     returning 409 tenant_disabled.
+         *
+         *     Idempotent: calling on an already-enabled tenant is a 200
+         *     with no state change.
+         */
+        post: operations["enableTenant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/apps/{appName}": {
         parameters: {
             query?: never;
@@ -4066,6 +4092,30 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    enableTenant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tenant re-enabled. The disabled_at column has been cleared. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];

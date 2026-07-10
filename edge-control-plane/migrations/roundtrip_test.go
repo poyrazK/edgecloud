@@ -64,13 +64,16 @@ import (
 // Each logical migration has one .up.sql and one .down.sql, so the
 // apply + rollback paths will track this many records in gorp_migrations.
 // Update when adding a new migration pair.
-// On current main after rebase of PR #466 (#42) onto PR #469 (#52)
-// and PR #420 (quota grace columns, which became 025_quotas_grace_columns
-// and pushed the next migration to 026):
-// 35 .up.sql + 35 .down.sql = 70 split files. Some numeric prefixes
-// collide (005_*, 009_*, 010_*, 017_*, 018_*), so this is the
-// on-disk file count, not a strict 2× the migration number.
-const splitFileCount = 72 // +2 from 027_used_memory_mb (issue #44 part 2)
+//
+// On current branch after merge of PR #466 (#42), PR #420 (quota
+// grace columns → 025_quotas_grace_columns), issue #440 commit 6
+// (026_active_deployments_activation_attempt_started_at), and PR
+// #534 (027_used_memory_mb + 028_quota_memory_constraint etc.):
+// 38 .up.sql + 38 .down.sql = 76 split files. Some numeric prefixes
+// collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
+// 028_*), so this is the on-disk file count, not a strict 2× the
+// migration number.
+const splitFileCount = 76 // 38 .up.sql + 38 .down.sql after PR #534 merge
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -175,14 +178,15 @@ var wantColumns = map[string][]string{
 		"tenant_id",
 		"app_name",
 		"deployment_id",
-		"last_good_deployment_id", // 005_add_last_good
-		"auto_rollback_enabled",   // 009_add_auto_rollback
-		"stable_since",            // 009_add_auto_rollback
-		"regions_published",       // 010_active_deployments_regions
-		"regions_failed",          // 010_active_deployments_regions
-		"regions_cached",          // 017_active_deployments_regions_cached
-		"last_publish_at",         // 010_active_deployments_regions
-		"last_publish_attempt_id", // 010_active_deployments_regions
+		"last_good_deployment_id",       // 005_add_last_good
+		"auto_rollback_enabled",         // 009_add_auto_rollback
+		"stable_since",                  // 009_add_auto_rollback
+		"regions_published",             // 010_active_deployments_regions
+		"regions_failed",                // 010_active_deployments_regions
+		"regions_cached",                // 017_active_deployments_regions_cached
+		"last_publish_at",               // 010_active_deployments_regions
+		"last_publish_attempt_id",       // 010_active_deployments_regions
+		"activation_attempt_started_at", // 026_active_deployments_activation_attempt_started_at
 	},
 	"app_env": {
 		"tenant_id",
@@ -406,16 +410,17 @@ var wantTypes = map[string]map[string]string{
 		"build_attestation":     "jsonb", // 020_add_build_attestation (nullable)
 	},
 	"active_deployments": {
-		"tenant_id":               "text",
-		"app_name":                "text",
-		"deployment_id":           "text",
-		"last_good_deployment_id": "text",        // 005_add_last_good
-		"auto_rollback_enabled":   "bool",        // 009_add_auto_rollback
-		"stable_since":            "timestamptz", // 009_add_auto_rollback (nullable)
-		"regions_published":       "_text",       // 010_active_deployments_regions
-		"regions_failed":          "_text",       // 010_active_deployments_regions
-		"last_publish_at":         "timestamptz", // 010_active_deployments_regions (nullable)
-		"last_publish_attempt_id": "uuid",        // 010_active_deployments_regions (nullable)
+		"tenant_id":                     "text",
+		"app_name":                      "text",
+		"deployment_id":                 "text",
+		"last_good_deployment_id":       "text",        // 005_add_last_good
+		"auto_rollback_enabled":         "bool",        // 009_add_auto_rollback
+		"stable_since":                  "timestamptz", // 009_add_auto_rollback (nullable)
+		"regions_published":             "_text",       // 010_active_deployments_regions
+		"regions_failed":                "_text",       // 010_active_deployments_regions
+		"last_publish_at":               "timestamptz", // 010_active_deployments_regions (nullable)
+		"last_publish_attempt_id":       "uuid",        // 010_active_deployments_regions (nullable)
+		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)
 	},
 	"app_env": {
 		"tenant_id": "text",

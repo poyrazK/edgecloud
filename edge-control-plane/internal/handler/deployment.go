@@ -892,6 +892,12 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error": "no active deployment"}`, http.StatusNotFound)
 			return
 		}
+		// Issue #440: tenant disabled mid-rollback. 409 matches
+		// the state-conflict mapping above for ErrNoLastGood.
+		if errors.Is(err, service.ErrTenantDisabled) {
+			http.Error(w, `{"error": "tenant is disabled; re-enable via the admin endpoint and retry"}`, http.StatusConflict)
+			return
+		}
 		log.Printf("internal error: %v", err)
 		http.Error(w, `{"error": "rollback failed"}`, http.StatusInternalServerError)
 		return

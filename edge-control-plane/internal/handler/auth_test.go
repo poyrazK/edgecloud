@@ -54,6 +54,10 @@ func (m *mockAuthTenantSvc) GetQuota(ctx context.Context, tenantID string) (*dom
 	panic("not used by Whoami")
 }
 
+func (m *mockAuthTenantSvc) EnableTenant(ctx context.Context, tenantID string) error {
+	panic("not used by Whoami")
+}
+
 func (m *mockAuthTenantSvc) GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	panic("not used by Whoami")
 }

@@ -97,6 +97,10 @@ type TenantServiceInterface interface {
 	UpdateTenantPlan(ctx context.Context, tenantID, newPlan string, applyQuotaDefaults bool) error
 	OverrideTenantQuota(ctx context.Context, req QuotaOverrideRequest) (*domain.TenantWithQuota, error)
 	DeleteTenant(ctx context.Context, id string) error
+	// EnableTenant clears tenants.disabled_at for a tenant that
+	// SetDisabledAt previously stamped (issue #440). The handler's
+	// 409 message references this endpoint.
+	EnableTenant(ctx context.Context, tenantID string) error
 }
 
 // QuotaOverrideRequest is the input to the admin quota-override
@@ -362,6 +366,25 @@ func (s *TenantService) UpdateTenantPlan(ctx context.Context, tenantID, newPlan 
 
 func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {
 	return s.tenantRepo.Delete(ctx, id)
+}
+
+// EnableTenant clears tenants.disabled_at for a tenant that
+// SetDisabledAt previously stamped (issue #440). Called from the
+// owner-only admin endpoint POST /api/v1/admin/tenants/{id}/enable.
+//
+// Returns the wrapped sentinel service.ErrTenantNotFound if no such
+// tenant exists; the handler maps it to 404. Calling on an
+// already-enabled tenant is a no-op (ClearDisabledAt is idempotent —
+// it writes NULL whether or not disabled_at was previously set).
+func (s *TenantService) EnableTenant(ctx context.Context, tenantID string) error {
+	existing, err := s.tenantRepo.GetByID(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return fmt.Errorf("%w: %s", ErrTenantNotFound, tenantID)
+	}
+	return s.tenantRepo.ClearDisabledAt(ctx, tenantID)
 }
 
 // OverrideTenantQuota is the manual recovery path for issue #420.
