@@ -105,13 +105,28 @@ async fn tcp_connect_retry(addr: &str, attempts: u32) -> tokio::net::TcpStream {
 
 // ── Test ──────────────────────────────────────────────────────────
 
-#[tokio::test]
+// Multi-threaded flavor is required: the host's websocket::accept impl
+// calls `tokio::task::block_in_place` (see edge-runtime's websocket.rs),
+// which panics on a single-threaded runtime. Matches production, which
+// always runs under `#[tokio::main]`'s multi-threaded default.
+#[tokio::test(flavor = "multi_thread")]
 async fn js_websocket_round_trip() {
     if should_skip_integration_tests() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
 
+    // Hard outer timeout: defense-in-depth against a repeat of the
+    // "Cannot start a runtime from within a runtime" panic (fixed in
+    // edge-runtime's websocket.rs) or any future regression that hangs
+    // the guest's websocket.accept — a single stuck test must not be
+    // able to wedge the whole CI job.
+    tokio::time::timeout(Duration::from_secs(60), js_websocket_round_trip_inner())
+        .await
+        .expect("js_websocket_round_trip timed out after 60s");
+}
+
+async fn js_websocket_round_trip_inner() {
     // 1. Spin up the mock control plane + a Supervisor with AllowAll
     //    egress so the shim's `websocket.listen(wsPort)` can bind
     //    freely. Production runs with the default BlockAll

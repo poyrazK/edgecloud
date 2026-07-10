@@ -121,6 +121,14 @@ async fn run_test() -> anyhow::Result<()> {
     let config = wire_test_config(worker_id, region, worker_addr);
     let supervisor: Arc<Supervisor> = build_supervisor_from_url(&nats_url, config).await?;
 
+    // Subscribe from a separate async-nats client (simulating the ingress
+    // process) BEFORE publishing — core NATS pub/sub has no durability,
+    // so a message published before the subscriber's interest reaches
+    // the server is lost with no redelivery.
+    let client = async_nats::connect(&nats_url).await?;
+    let subject = format!("edgecloud.heartbeats.{}", region);
+    let mut sub = client.subscribe(subject).await?;
+
     // Build the heartbeat exactly as the worker would on its 30s tick
     // (see `edge-worker/src/main.rs:110`).
     let heartbeat = supervisor.build_heartbeat().await;
@@ -138,11 +146,6 @@ async fn run_test() -> anyhow::Result<()> {
         .await
         .context("publish heartbeat via NatsClient")?;
 
-    // Subscribe from a separate async-nats client (simulating the ingress
-    // process) and pull the raw bytes.
-    let client = async_nats::connect(&nats_url).await?;
-    let subject = format!("edgecloud.heartbeats.{}", region);
-    let mut sub = client.subscribe(subject).await?;
     let msg = timeout(Duration::from_secs(5), sub.next())
         .await
         .context("subscription timed out — heartbeat was not published")?
