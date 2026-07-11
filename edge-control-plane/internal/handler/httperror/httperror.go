@@ -23,6 +23,15 @@ const (
 	CodeBadGateway          ErrorCode = "BAD_GATEWAY"
 	CodePayloadTooLarge     ErrorCode = "PAYLOAD_TOO_LARGE"
 	CodeServiceUnavailable  ErrorCode = "SERVICE_UNAVAILABLE"
+	// CodeBillingTenantUnresolved is the billing-specific 422 path on
+	// the Stripe webhook (issue #419): the provider's signature was
+	// valid but we couldn't attribute the event to a known tenant (no
+	// matching customer row in billing_subscriptions). Distinct from
+	// CodeUnprocessableEntity — that one is used by the Idempotency-Key
+	// replay rejection path (issue #439). Both are 422 because both
+	// are "request was understood but cannot be processed", but the
+	// SDK branches on the code, so the distinction matters.
+	CodeBillingTenantUnresolved ErrorCode = "BILLING_TENANT_UNRESOLVED"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -175,6 +184,17 @@ func PayloadTooLarge(w http.ResponseWriter, message string) {
 // PayloadTooLargeCtx reports an oversize request body or response stream with trace context (HTTP 413).
 func PayloadTooLargeCtx(w http.ResponseWriter, r *http.Request, message string) {
 	write(w, CodePayloadTooLarge, message, http.StatusRequestEntityTooLarge, requestIDFromContext(r.Context()))
+}
+
+// BillingTenantUnresolvedCtx reports a billing webhook event whose
+// provider signature verified but which we cannot attribute to a
+// known tenant (HTTP 422). Distinct from NotFoundCtx (404): the URL
+// is correct, the body parsed, the signature passed — there's just
+// no row we can hang the event off of. The merchant (Stripe) will
+// see this as a successful delivery and won't retry; ops has to
+// reconcile manually via the admin endpoint.
+func BillingTenantUnresolvedCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodeBillingTenantUnresolved, message, http.StatusUnprocessableEntity, requestIDFromContext(r.Context()))
 }
 
 // writeWithDetails extends write() with arbitrary top-level fields

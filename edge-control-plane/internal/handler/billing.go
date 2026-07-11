@@ -189,8 +189,12 @@ func (h *BillingHandler) StripeWebhook(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ignored"})
 		case errors.Is(err, billing.ErrTenantUnresolved):
-			// 422 — the event landed but we can't attribute it.
-			httperror.BadRequestCtx(w, r, "tenant unresolved for event")
+			// 422 — the event landed but we can't attribute it. Distinct
+			// error code (BILLING_TENANT_UNRESOLVED, not BAD_REQUEST) so
+			// the SDK can branch without parsing the message string —
+			// matches the OpenAPI doc at docs/api/openapi.yaml for
+			// /api/v1/billing/webhook 422.
+			httperror.BillingTenantUnresolvedCtx(w, r, "tenant unresolved for event")
 		default:
 			log.Printf("HandleWebhook: %v", err)
 			httperror.InternalErrorCtx(w, r)

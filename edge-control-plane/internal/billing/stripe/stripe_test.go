@@ -135,8 +135,16 @@ func TestCreateCheckoutSessionSurfacesStripeErrors(t *testing.T) {
 		PriceIDs:  map[string]string{"pro": "price_pro"},
 	})
 	_, err := p.CreateCheckoutSession(context.Background(), billing.CheckoutInput{TenantID: "t_checkout", Plan: "pro"})
-	if err == nil || !strings.Contains(err.Error(), "lookup/create customer") {
-		t.Fatalf("CreateCheckoutSession error = %v, want wrapped Stripe lookup error", err)
+	// The wrapped error must mention both our wrapper prefix
+	// ("lookup/create customer") AND the upstream Stripe message
+	// ("stripe unavailable"). Pinning the upstream substring prevents
+	// a future refactor from accidentally swallowing the original
+	// error in a way that hides the merchant-side root cause from
+	// the operator.
+	if err == nil ||
+		!strings.Contains(err.Error(), "lookup/create customer") ||
+		!strings.Contains(err.Error(), "stripe unavailable") {
+		t.Fatalf("CreateCheckoutSession error = %v, want wrapped Stripe error mentioning both prefixes", err)
 	}
 }
 
@@ -247,6 +255,20 @@ func TestVerifyWebhookBadSignature(t *testing.T) {
 
 	p := New(billing.StripeConfig{WebhookSecret: secret})
 	_, err := p.VerifyWebhook(headers, []byte(`{"id":"evt_checkout","object":"event","type":"checkout.session.completed","data":{"object":{"client_reference_id":"tampered"}}}`))
+	if !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("VerifyWebhook error = %v, want ErrInvalidSignature", err)
+	}
+}
+
+// TestVerifyWebhookMissingSignature pins the stripe.go:191 guard: a
+// request with NO Stripe-Signature header at all (not just a malformed
+// one) must surface ErrInvalidSignature so the handler can return 400
+// and let Stripe retry. Without this test, a future refactor could
+// silently let a missing header reach ConstructEventWithOptions and
+// produce a less-helpful error.
+func TestVerifyWebhookMissingSignature(t *testing.T) {
+	p := New(billing.StripeConfig{WebhookSecret: "whsec_test_secret"})
+	_, err := p.VerifyWebhook(http.Header{}, []byte(`{"id":"evt_checkout","type":"checkout.session.completed"}`))
 	if !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("VerifyWebhook error = %v, want ErrInvalidSignature", err)
 	}
