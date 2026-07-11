@@ -71,7 +71,7 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 //
 // The trailing mintWorkerToken fields (workerJWTConfig / workerTokenTTL /
 // issuer / activeKID / tenantSvc) are issue #491 — they power
-// POST /api/internal/worker-token, the per-tenant JWT mint endpoint.
+// POST /api/internal/tokens/tenant, the per-tenant JWT mint endpoint.
 // `workerJWTConfig` is the resolver for signing keys (keyring-aware —
 // issue #307 follow-up). `tenantSvc` is held as a narrow interface
 // so handler tests can swap in a mock without dragging in the full
@@ -93,6 +93,9 @@ type InternalHandler struct {
 	issuer          string
 	activeKID       string
 	tenantSvc       tenantGetter
+	// workerHostingSvc answers "which tenants is this worker hosting?"
+	// — the issue #491 constraint #2 gate. See hostingGetter.
+	workerHostingSvc hostingGetter
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -157,6 +160,19 @@ type tenantGetter interface {
 	GetByID(ctx context.Context, id string) (*domain.Tenant, error)
 }
 
+// hostingGetter is the narrow contract POST /api/internal/tokens/tenant
+// uses to answer "which tenants is this worker currently hosting?"
+// (issue #491 constraint #2). Returns a deduplicated slice of tenant
+// IDs derived from worker_status.apps where status = 'running'.
+// Satisfied by *service.WorkerService.
+//
+// Kept as a separate interface from tenantGetter so handler tests can
+// substitute just the hosting logic without standing up the full
+// *service.WorkerService (DB + NATS conn + metrics aggregator).
+type hostingGetter interface {
+	TenantsHostedBy(ctx context.Context, workerID string) ([]string, error)
+}
+
 func NewInternalHandler(
 	deploymentSvc autoRollbacker,
 	workerSvc workerRegisterer,
@@ -172,22 +188,24 @@ func NewInternalHandler(
 	issuer string,
 	activeKID string,
 	tenantSvc tenantGetter,
+	workerHostingSvc hostingGetter,
 ) *InternalHandler {
 	return &InternalHandler{
-		deploymentSvc:   deploymentSvc,
-		workerSvc:       workerSvc,
-		domainSvc:       domainSvc,
-		logEntryRepo:    logEntryRepo,
-		reconcileSvc:    reconcileSvc,
-		syncBuilder:     syncBuilder,
-		cpRegion:        cpRegion,
-		bootstrapSecret: bootstrapSecret,
-		jwtSecret:       jwtSecret,
-		workerJWTConfig: workerJWTConfig,
-		workerTokenTTL:  workerTokenTTL,
-		issuer:          issuer,
-		activeKID:       activeKID,
-		tenantSvc:       tenantSvc,
+		deploymentSvc:    deploymentSvc,
+		workerSvc:        workerSvc,
+		domainSvc:        domainSvc,
+		logEntryRepo:     logEntryRepo,
+		reconcileSvc:     reconcileSvc,
+		syncBuilder:      syncBuilder,
+		cpRegion:         cpRegion,
+		bootstrapSecret:  bootstrapSecret,
+		jwtSecret:        jwtSecret,
+		workerJWTConfig:  workerJWTConfig,
+		workerTokenTTL:   workerTokenTTL,
+		issuer:           issuer,
+		activeKID:        activeKID,
+		tenantSvc:        tenantSvc,
+		workerHostingSvc: workerHostingSvc,
 	}
 }
 
@@ -728,7 +746,7 @@ func (h *InternalHandler) WorkerSecret(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// WorkerTokenRequest is the body shape for POST /api/internal/worker-token
+// WorkerTokenRequest is the body shape for POST /api/internal/tokens/tenant
 // (issue #491). The worker presents its existing (wildcard or scoped)
 // bearer JWT to authenticate, supplies the tenant_id it wants a token
 // for, and receives a freshly-signed JWT whose TenantID claim is bound
@@ -753,7 +771,7 @@ type WorkerTokenResponse struct {
 	TenantID  string `json:"tenant_id"`
 }
 
-// isSafeTenantID gates tenant_id values on POST /api/internal/worker-token.
+// isSafeTenantID gates tenant_id values on POST /api/internal/tokens/tenant.
 // Returns nil when the value is a legal EdgeCloud tenant identifier and
 // a descriptive error otherwise. Mirrors `supervisor.rs::is_safe_tenant_id`
 // — same regex spirit (`^[a-z0-9_-]{1,64}$`, no path-traversal chars),
@@ -798,7 +816,7 @@ func isSafeTenantID(s string) error {
 	return nil
 }
 
-// MintWorkerToken handles POST /api/internal/worker-token (issue #491).
+// MintWorkerToken handles POST /api/internal/tokens/tenant (issue #491).
 //
 // The worker presents an existing valid bearer JWT (the bootstrap-derived
 // 24h JWT today, or any previously-minted scoped token later) and asks
@@ -817,7 +835,7 @@ func isSafeTenantID(s string) error {
 //
 // Request:
 //
-//	POST /api/internal/worker-token
+//	POST /api/internal/tokens/tenant
 //	Authorization: Bearer <bootstrap or previously-minted scoped JWT>
 //	Content-Type: application/json
 //	{"tenant_id": "t_abc123"}
@@ -831,8 +849,11 @@ func isSafeTenantID(s string) error {
 //	200 — token issued
 //	400 — malformed body / missing or invalid tenant_id
 //	401 — caller has no / expired bearer (set by WorkerAuth middleware)
-//	404 — tenant_id does not exist in the tenants table
-//	500 — signing key resolution or signature construction failure
+//	403 — caller is not currently hosting the requested tenant
+//	      (issue #491 constraint #2; see workerHostingSvc gate below)
+//	404 — tenant_id does not exist or is disabled
+//	500 — signing key resolution, hosting lookup, or signature
+//	      construction failure
 func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request) {
 	workerID := middleware.GetWorkerID(r.Context())
 
@@ -890,6 +911,47 @@ func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request
 			fmt.Sprintf("worker %s requested token for disabled tenant %s", workerID, req.TenantID), "failure")
 		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
+	}
+
+	// Hosting constraint (issue #491 constraint #2): a worker can
+	// only mint for tenants currently in worker_status.apps with
+	// status = 'running' for this worker_id. Without this gate, a
+	// compromised worker calling POST /tokens/tenant could walk
+	// away with a 15-minute bearer for any tenant it has no
+	// relationship with — functionally identical to today's
+	// wildcard JWT, defeating the entire security goal of #491.
+	//
+	// Order rationale: tenant-existence (404) first prevents the 403
+	// from being a tenant-existence oracle; disabled-tenant (404)
+	// preserves the existing "disabled → 404" invariant; the hosting
+	// check is the last gate before HMAC signing — fail fast before
+	// burning CPU.
+	//
+	// Applies to ALL callers, including inbound wildcard JWTs —
+	// skipping the check for wildcards would re-open the cross-tenant
+	// primitive for every freshly-bootstrapped worker.
+	if h.workerHostingSvc != nil {
+		hosted, err := h.workerHostingSvc.TenantsHostedBy(r.Context(), workerID)
+		if err != nil {
+			log.Printf("worker-token: hosting lookup for worker %s failed: %v", workerID, err)
+			httperror.InternalErrorCtx(w, r)
+			return
+		}
+		hostedNow := false
+		for _, t := range hosted {
+			if t == req.TenantID {
+				hostedNow = true
+				break
+			}
+		}
+		if !hostedNow {
+			auditRecord(r, "worker_token_mint", "tenant", req.TenantID,
+				fmt.Sprintf("worker %s denied token for tenant %s: hosting check failed (worker hosts %v)",
+					workerID, req.TenantID, hosted),
+				"failure")
+			httperror.ForbiddenCtx(w, r, "tenant not hosted by this worker")
+			return
+		}
 	}
 
 	signingKey, err := h.workerJWTConfig.ResolveSigningKey()

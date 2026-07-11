@@ -458,7 +458,7 @@ func (s *TenantService) EnableTenant(ctx context.Context, tenantID string) error
 }
 
 // GetByID is the thin pass-through that satisfies the narrow
-// `handler.tenantGetter` contract used by POST /api/internal/worker-token
+// `handler.tenantGetter` contract used by POST /api/internal/tokens/tenant
 // (issue #491). No business logic — the JWT-mint handler only needs
 // the raw row so it can detect "tenant not found" / "tenant disabled"
 // upstream of the heavy per-request signing path. Keeps TenantService

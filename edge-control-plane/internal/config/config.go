@@ -192,7 +192,7 @@ type JWTConfig struct {
 	TTL    int    `yaml:"ttl_hours"`
 	Issuer string `yaml:"issuer"`
 	// WorkerTokenTTL is the validity period for per-tenant worker tokens
-	// minted by POST /api/internal/worker-token (issues #491 + #492).
+	// minted by POST /api/internal/tokens/tenant (issues #491 + #492).
 	// Shorter than the legacy 24h operator-JWT TTL on purpose: a leaked
 	// worker credential must be useful for at most WorkerTokenTTL.
 	// Format: Go duration string (e.g. "15m", "1h"). Set via

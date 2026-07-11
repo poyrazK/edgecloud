@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,39 @@ func (m *mockTenantGetter) GetByID(_ context.Context, id string) (*domain.Tenant
 		return nil, service.ErrTenantNotFound
 	}
 	return t, nil
+}
+
+// mockHostingGetter exercises the issue #491 constraint #2 gate
+// without standing up the full *service.WorkerService. The `tenants`
+// slice is the worker's "hosted set" — what TenantsHostedBy returns
+// from worker_status.apps where status='running'. Tests construct
+// the slice to express either "this worker hosts the requested
+// tenant" (test passes) or "this worker does NOT host the requested
+// tenant" (test asserts 403).
+type mockHostingGetter struct {
+	tenants []string
+	err     error
+}
+
+func (m *mockHostingGetter) TenantsHostedBy(_ context.Context, _ string) ([]string, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.tenants, nil
+}
+
+// hostTenant is the standard "this worker hosts exactly t_real" fixture
+// used by every pre-#491 mint endpoint happy-path test. Centralized so
+// a future tightening of the hosting check (e.g. requiring > 1 minute
+// of running) only needs one fixture update.
+func hostTenant(tenants ...string) *mockHostingGetter {
+	return &mockHostingGetter{tenants: tenants}
+}
+
+// noHostedTenants pins the "worker has never heartbeated" /
+// "worker hosts nothing" path used by the 403 tests.
+func noHostedTenants() *mockHostingGetter {
+	return &mockHostingGetter{tenants: nil}
 }
 
 // nilOnMissingTenantGetter mirrors the production
@@ -92,24 +126,26 @@ func bootstrapToken(t *testing.T) string {
 
 // newWorkerTokenServer wires MintWorkerToken behind the same WorkerAuth
 // middleware the production app.go does. Returns an http.Handler the
-// test can drive with httptest.NewRecorder(). The tenantGetter
-// interface is what production *service.TenantService satisfies;
-// accepting it here lets tests substitute any narrow contract
-// implementation (mockTenantGetter, nilOnMissingTenantGetter, …)
-// without copying the full service-graph setup.
-func newWorkerTokenServer(tg tenantGetter, ttl time.Duration) http.Handler {
+// test can drive with httptest.NewRecorder(). The tenantGetter and
+// hostingGetter interfaces are what production *service.TenantService
+// and *service.WorkerService satisfy; accepting them here lets tests
+// substitute any narrow contract implementation (mockTenantGetter,
+// nilOnMissingTenantGetter, mockHostingGetter, …) without copying
+// the full service-graph setup.
+func newWorkerTokenServer(tg tenantGetter, hg hostingGetter, ttl time.Duration) http.Handler {
 	h := &InternalHandler{
-		tenantSvc:      tg,
-		issuer:         workerTokenTestIssuer,
-		activeKID:      "",
-		workerTokenTTL: ttl,
+		tenantSvc:        tg,
+		workerHostingSvc: hg,
+		issuer:           workerTokenTestIssuer,
+		activeKID:        "",
+		workerTokenTTL:   ttl,
 		workerJWTConfig: middleware.WorkerJWTConfig{
 			Secret: workerTokenTestSecret,
 			Issuer: workerTokenTestIssuer,
 		},
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/internal/worker-token", h.MintWorkerToken)
+	mux.HandleFunc("POST /api/internal/tokens/tenant", h.MintWorkerToken)
 	return middleware.WorkerAuth(middleware.WorkerJWTConfig{
 		Secret: workerTokenTestSecret,
 		Issuer: workerTokenTestIssuer,
@@ -125,7 +161,7 @@ func postToken(t *testing.T, srv http.Handler, bearer string, req WorkerTokenReq
 	if err != nil {
 		t.Fatalf("failed to marshal request: %v", err)
 	}
-	r := httptest.NewRequest("POST", "/api/internal/worker-token", bytes.NewReader(body))
+	r := httptest.NewRequest("POST", "/api/internal/tokens/tenant", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	if bearer != "" {
 		r.Header.Set("Authorization", "Bearer "+bearer)
@@ -180,7 +216,7 @@ func TestMintWorkerToken_HappyPath(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 
 	w, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 
@@ -219,7 +255,7 @@ func TestMintWorkerToken_WildcardRefused(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"*": enabledTenant("*"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("*"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "*"})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d (body=%s)", w.Code, w.Body.String())
@@ -232,7 +268,7 @@ func TestMintWorkerToken_WildcardRefused(t *testing.T) {
 // Case 3 (empty refused): tenant_id="" is rejected with 400.
 func TestMintWorkerToken_EmptyRefused(t *testing.T) {
 	tg := &mockTenantGetter{}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: ""})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for empty tenant_id, got %d (body=%s)", w.Code, w.Body.String())
@@ -244,7 +280,7 @@ func TestMintWorkerToken_EmptyRefused(t *testing.T) {
 // safety net against an accidental loosening.
 func TestMintWorkerToken_PathTraversalRefused(t *testing.T) {
 	tg := &mockTenantGetter{}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
 	for _, bad := range []string{"../etc", "../../../", "/etc/passwd", "t_real/extra", "t_real\\bad", "T_UPPER"} {
 		w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: bad})
 		if w.Code != http.StatusBadRequest {
@@ -260,7 +296,7 @@ func TestMintWorkerToken_TenantNotFound(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_phantom"})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for missing tenant, got %d (body=%s)", w.Code, w.Body.String())
@@ -274,7 +310,7 @@ func TestMintWorkerToken_TenantDisabled(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_disabled": disabledTenant("t_disabled"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_disabled"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_disabled"})
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for disabled tenant, got %d (body=%s)", w.Code, w.Body.String())
@@ -289,7 +325,7 @@ func TestMintWorkerToken_IssuedTokenVerifies(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	_, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	claims := decodeIssuedToken(t, resp.Token)
 
@@ -309,7 +345,7 @@ func TestMintWorkerToken_DefaultTTL(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	_, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	claims := decodeIssuedToken(t, resp.Token)
 
@@ -325,7 +361,7 @@ func TestMintWorkerToken_CustomTTL(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestCustomTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestCustomTTL)
 	_, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	claims := decodeIssuedToken(t, resp.Token)
 
@@ -353,7 +389,7 @@ func TestMintWorkerToken_AuditLog_SuccessCaptured(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
@@ -388,7 +424,7 @@ func TestMintWorkerToken_AuditLog_FailureCaptured(t *testing.T) {
 	defer func() { DefaultAuditor = oldAuditor }()
 
 	tg := &mockTenantGetter{}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "*"})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
@@ -440,7 +476,7 @@ func TestAuditRecord_NilAuditor_AfterSeam(t *testing.T) {
 func TestMintWorkerToken_NilTenantDoesNotPanic(t *testing.T) {
 	// nilOnMissingTenantGetter mirrors repository.TenantRepository.GetByID:
 	// not-found returns (nil, nil), no error.
-	srv := newWorkerTokenServer(nilOnMissingTenantGetter{}, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(nilOnMissingTenantGetter{}, hostTenant("t_phantom"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_phantom"})
 
 	if w.Code != http.StatusNotFound {
@@ -457,7 +493,7 @@ func TestMintWorkerToken_RequiresBearer(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	w, _ := postToken(t, srv, "", WorkerTokenRequest{TenantID: "t_real"})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 without bearer, got %d", w.Code)
@@ -470,7 +506,7 @@ func TestMintWorkerToken_LengthGuard(t *testing.T) {
 	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
 		"t_real": enabledTenant("t_real"),
 	}}
-	srv := newWorkerTokenServer(tg, workerTokenTestDefaultTTL)
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
 	long := strings.Repeat("a", 65)
 	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: long})
 	if w.Code != http.StatusBadRequest {
@@ -508,5 +544,257 @@ func TestIsSafeTenantID(t *testing.T) {
 		if !tc.wantReject && err != nil {
 			t.Errorf("isSafeTenantID(%q) = %v, want nil", tc.in, err)
 		}
+	}
+}
+
+// -----------------------------------------------------------------------
+// Hosting constraint (issue #491 constraint #2)
+// -----------------------------------------------------------------------
+
+// TestMintWorkerToken_Hosting_Hosted_Success pins the happy path:
+// the worker IS hosting the requested tenant. The constraint passes,
+// signing proceeds, and the test sees the same 200 it would have
+// seen before constraint #2 was added. Regression guard: a future
+// tightening (e.g. requiring > 1 minute of running time) must keep
+// this case green.
+func TestMintWorkerToken_Hosting_Hosted_Success(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
+	w, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	if resp.Token == "" {
+		t.Fatalf("expected non-empty token")
+	}
+}
+
+// TestMintWorkerToken_Hosting_NotHosted_403 is the load-bearing test:
+// a worker asks for a tenant it doesn't host and must be refused
+// with 403 (not 200, not 404, not 500). Without this gate, a
+// compromised worker could mint tokens for tenants it has no
+// relationship with.
+func TestMintWorkerToken_Hosting_NotHosted_403(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		// t_real EXISTS (so we get past the 404 existence check) but
+		// the worker hosts t_other, not t_real.
+		"t_real":  enabledTenant("t_real"),
+		"t_other": enabledTenant("t_other"),
+	}}
+	srv := newWorkerTokenServer(tg, hostTenant("t_other"), workerTokenTestDefaultTTL)
+	w, resp := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not hosted") {
+		t.Errorf("expected error to mention 'not hosted', got body=%s", w.Body.String())
+	}
+	if resp.Token != "" {
+		t.Errorf("expected no token in 403 response, got token")
+	}
+}
+
+// TestMintWorkerToken_Hosting_NoHeartbeatYet_403 pins the freshly-
+// bootstrapped worker path: a worker that has registered but never
+// heartbeated has no worker_status.apps entries, so
+// TenantsHostedBy returns ([]string{}, nil). The handler must treat
+// that as 403 for ANY tenant request — the worker must heartbeat
+// first.
+func TestMintWorkerToken_Hosting_NoHeartbeatYet_403(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for no-heartbeat-yet worker, got %d (body=%s)",
+			w.Code, w.Body.String())
+	}
+}
+
+// TestMintWorkerToken_Hosting_BootstrapWildcard_Allowed pins the
+// design decision that the hosting check applies to ALL callers,
+// including the inbound wildcard JWT. A worker with a wildcard
+// inbound JWT that hosts the requested tenant must still be able to
+// mint — the inbound wildcard is the bootstrap case, not an exemption
+// from the hosting check.
+func TestMintWorkerToken_Hosting_BootstrapWildcard_Allowed(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, hostTenant("t_real"), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for wildcard inbound JWT that hosts t_real, got %d",
+			w.Code)
+	}
+}
+
+// TestMintWorkerToken_Hosting_BootstrapWildcard_NotHosted pins the
+// "wildcard inbound JWT but worker doesn't host" path: the hosting
+// check must still fire. Skipping the check for wildcard callers
+// would re-open the cross-tenant primitive for every freshly-
+// bootstrapped worker, defeating #491's entire goal.
+func TestMintWorkerToken_Hosting_BootstrapWildcard_NotHosted(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for wildcard inbound JWT that doesn't host, got %d",
+			w.Code)
+	}
+}
+
+// TestMintWorkerToken_Hosting_ScopedJWTStillRechecks pins the
+// "worker previously minted a token for tenant A; now asks for tenant
+// B (which it doesn't host)" path. The inbound scoped JWT does NOT
+// bypass the hosting check. Mirrors the wildcard case — every
+// caller is subject to the constraint.
+func TestMintWorkerToken_Hosting_ScopedJWTStillRechecks(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_b": enabledTenant("t_b"),
+	}}
+	srv := newWorkerTokenServer(tg, hostTenant("t_a"), workerTokenTestDefaultTTL)
+
+	// Inbound JWT scoped to t_a (the worker hosts t_a only).
+	claims := &middleware.WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    workerTokenTestIssuer,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
+		},
+		WorkerID: workerTokenTestBootstrapped,
+		TenantID: "t_a",
+		Role:     middleware.RoleWorker,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(workerTokenTestSecret))
+	if err != nil {
+		t.Fatalf("sign scoped JWT: %v", err)
+	}
+
+	w, _ := postToken(t, srv, signed, WorkerTokenRequest{TenantID: "t_b"})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for scoped JWT asking for non-hosted tenant, got %d",
+			w.Code)
+	}
+}
+
+// TestMintWorkerToken_Hosting_DisabledButHosted_404 pins the
+// "disabled tenant wins over hosting" invariant: the existing 404
+// surface for disabled tenants must NOT be downgraded to 403 just
+// because the worker hosts the tenant. Disabling a tenant must
+// always produce 404 to mask its existence from probing workers.
+func TestMintWorkerToken_Hosting_DisabledButHosted_404(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_disabled": disabledTenant("t_disabled"),
+	}}
+	srv := newWorkerTokenServer(tg, hostTenant("t_disabled"), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_disabled"})
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 (disabled wins), got %d", w.Code)
+	}
+}
+
+// TestMintWorkerToken_Hosting_MissingTenantWinsOverNotHosted pins
+// the order: tenant-existence 404 must fire BEFORE the hosting 403.
+// A request for a non-existent tenant_id must return 404, not 403 —
+// otherwise 403 becomes a tenant-existence oracle ("403 = tenant
+// exists but I don't host it; 404 = tenant doesn't exist").
+func TestMintWorkerToken_Hosting_MissingTenantWinsOverNotHosted(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_phantom"})
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing tenant (regardless of hosting), got %d", w.Code)
+	}
+}
+
+// TestMintWorkerToken_Hosting_AuditFailureCaptured pins the audit
+// log shape on a 403: the existing AuditRecorder seam must capture
+// the event with Action="worker_token_mint", Outcome="failure",
+// and a Details string that contains "hosting check failed" so
+// operators can grep for the denial reason.
+func TestMintWorkerToken_Hosting_AuditFailureCaptured(t *testing.T) {
+	spy := &auditSpy{}
+	oldAuditor := DefaultAuditor
+	DefaultAuditor = spy
+	defer func() { DefaultAuditor = oldAuditor }()
+
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, noHostedTenants(), workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+	if got := len(spy.events); got != 1 {
+		t.Fatalf("expected 1 audit event, got %d (%+v)", got, spy.events)
+	}
+	ev := spy.events[0]
+	if ev.Action != "worker_token_mint" {
+		t.Errorf("expected Action=worker_token_mint, got %q", ev.Action)
+	}
+	if ev.Outcome != "failure" {
+		t.Errorf("expected Outcome=failure, got %q", ev.Outcome)
+	}
+	if !strings.Contains(ev.Details, "hosting check failed") {
+		t.Errorf("expected Details to contain 'hosting check failed', got %q", ev.Details)
+	}
+}
+
+// TestMintWorkerToken_Hosting_RepoError_500 pins the fail-closed
+// contract: a DB error from TenantsHostedBy must produce 500, NOT a
+// best-guess 403 ("deny when in doubt"). Returning 403 on a DB error
+// would silently lock the worker out of legitimate mints during a
+// database incident.
+func TestMintWorkerToken_Hosting_RepoError_500(t *testing.T) {
+	hg := &mockHostingGetter{
+		err: errors.New("db unavailable"),
+	}
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	srv := newWorkerTokenServer(tg, hg, workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on hosting-repo error, got %d (body=%s)",
+			w.Code, w.Body.String())
+	}
+}
+
+// TestMintWorkerToken_Hosting_NilServiceSkipsGate pins the
+// defensive nil-check: the handler is structured so the hosting
+// check is skipped (not panicked) when workerHostingSvc is nil. This
+// preserves the behavior of tests that build an InternalHandler by
+// hand without the full dependency graph, and keeps the production
+// wiring as the only required setup path.
+func TestMintWorkerToken_Hosting_NilServiceSkipsGate(t *testing.T) {
+	tg := &mockTenantGetter{tenants: map[string]*domain.Tenant{
+		"t_real": enabledTenant("t_real"),
+	}}
+	// hg = nil — the handler's nil check should skip the gate.
+	srv := newWorkerTokenServer(tg, nil, workerTokenTestDefaultTTL)
+	w, _ := postToken(t, srv, bootstrapToken(t), WorkerTokenRequest{TenantID: "t_real"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 when hosting service is nil (gate skipped), got %d",
+			w.Code)
 	}
 }

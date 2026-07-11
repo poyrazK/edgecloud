@@ -656,7 +656,7 @@ func splitMethod(s string) [2]string {
 // workerTokenTenantKeyFromBody — issue #491 + PR review regression pins.
 //
 // The helper is the per-tenant key-extractor that backs the
-// rate-limiter on POST /api/internal/worker-token. It must:
+// rate-limiter on POST /api/internal/tokens/tenant. It must:
 //   - Extract tenant_id from the request body without consuming it.
 //   - Restore the body so the downstream handler's json.Decoder
 //     still sees the full payload.
@@ -693,7 +693,7 @@ func newWorkerKeyRequest(t *testing.T, body string) *http.Request {
 		t.Fatalf("failed to sign test worker JWT: %v", err)
 	}
 
-	authReq := httptest.NewRequest("POST", "/api/internal/worker-token", strings.NewReader(body))
+	authReq := httptest.NewRequest("POST", "/api/internal/tokens/tenant", strings.NewReader(body))
 	authReq.Header.Set("Authorization", "Bearer "+signed)
 
 	auth := middleware.WorkerAuth(middleware.WorkerJWTConfig{
@@ -716,7 +716,7 @@ func newWorkerKeyRequest(t *testing.T, body string) *http.Request {
 	// Build a fresh request with the captured context and the
 	// ORIGINAL body — the inner handler didn't read it, so it's
 	// intact.
-	return httptest.NewRequest("POST", "/api/internal/worker-token", strings.NewReader(body)).WithContext(capturedCtx)
+	return httptest.NewRequest("POST", "/api/internal/tokens/tenant", strings.NewReader(body)).WithContext(capturedCtx)
 }
 
 func TestWorkerTokenTenantKeyFromBody_HappyPath(t *testing.T) {

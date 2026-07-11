@@ -363,12 +363,17 @@ func New(
 	// both interfaces.
 	//
 	// Issue #491: pass workerJWTConfig + workerTokenTTL + issuer +
-	// activeKID + tenantSvc for the POST /api/internal/worker-token
+	// activeKID + tenantSvc for the POST /api/internal/tokens/tenant
 	// mint endpoint. The four-value tuple of
 	// {JWTConfig + WorkerTokenTTL + Issuer + ActiveKID} mirrors the
 	// workerJWTConfig literal constructed at app.go:649-654 below;
 	// kept as a local struct literal rather than hoisted so the
 	// InternalHandler dependency stays explicit.
+	//
+	// `workerSvc` doubles as the hostingGetter — it has a
+	// TenantsHostedBy(ctx, workerID) method (issue #491 constraint
+	// #2) that the gate uses to refuse tokens for tenants the worker
+	// isn't currently hosting.
 	internalHandler := handler.NewInternalHandler(
 		deploymentSvc, workerSvc, domainSvc, logEntryRepo,
 		reconcileSvc, reconcileSvc,
@@ -383,6 +388,7 @@ func New(
 		cfg.JWT.Issuer,
 		cfg.JWT.ActiveKID,
 		tenantSvc,
+		workerSvc,
 	)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
@@ -424,7 +430,7 @@ func New(
 	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
 
 	// workerTokenTenantKey is the per-tenant key-extractor for the
-	// POST /api/internal/worker-token rate limiter (issue #491). It
+	// POST /api/internal/tokens/tenant rate limiter (issue #491). It
 	// reads the request body's `tenant_id` JSON field without
 	// consuming the body so the handler's own decode still sees the
 	// full payload.
@@ -737,7 +743,7 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	workerTokenPerIP := middleware.NewRateLimiter(60, 30)
 	workerTokenPerWorker := middleware.NewRateLimiter(10, 5)
 	workerTokenPerTenant := middleware.NewRateLimiter(30, 10)
-	internalMux.Handle("POST /api/internal/worker-token",
+	internalMux.Handle("POST /api/internal/tokens/tenant",
 		workerTokenPerIP.Middleware(middleware.ClientIP)(
 			workerTokenPerWorker.Middleware(func(r *http.Request) string {
 				return middleware.GetWorkerID(r.Context())
@@ -1144,12 +1150,13 @@ func newMeteringProvider(cfg config.BillingConfig) billing.MeteringProvider {
 		// "noop" or empty (no production gate — metering is opt-in).
 		return noop.NewMetering()
 	}
+}
 
 // workerTokenTenantKeyFromBody is the package-level helper extracted
 // from the inline closure at the route mount (issue #491 + PR
 // review). It serves two roles:
 //
-//  1. Production use: bound to POST /api/internal/worker-token as
+//  1. Production use: bound to POST /api/internal/tokens/tenant as
 //     the key-extractor for the per-tenant RateLimiter.
 //  2. Test use: exercised directly by
 //     TestWorkerTokenTenantKeyFromBody in app_test.go so the

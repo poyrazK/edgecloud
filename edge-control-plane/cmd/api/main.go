@@ -100,7 +100,7 @@ func main() {
 	}
 
 	// ── Per-tenant worker-token TTL (issue #491) ──────────────────
-	log.Printf("worker-token mint: enabled at POST /api/internal/worker-token (TTL=%s, issuer=%q, active_kid=%q)",
+	log.Printf("worker-token mint: enabled at POST /api/internal/tokens/tenant (TTL=%s, issuer=%q, active_kid=%q)",
 		cfg.JWT.WorkerTokenTTL, cfg.JWT.Issuer, cfg.JWT.ActiveKID)
 
 	// ── HTTP Server ───────────────────────────────────────────────
