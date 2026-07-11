@@ -290,7 +290,7 @@ fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
 /// pattern) don't trample each other's state. Today the CLI is
 /// single-threaded for retry purposes, so the CAS path is
 /// untrafficked — but it's cheap (one `compare_exchange_weak` per
-/// jitter call) and the function would silently mis-distribute
+/// jitter call) and the function would silently miss-distribute
 /// under contention if it weren't there. Period is 2^64 − 1 ≈
 /// 1.8e19, ample for a CLI that runs for seconds-to-minutes.
 fn xorshift_uniform_u64() -> u64 {
