@@ -3215,7 +3215,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 error:
-                  code: BAD_REQUEST
+                  code: BILLING_TENANT_UNRESOLVED
                   message: tenant unresolved for event
         '500':
           $ref: '#/components/responses/InternalError'

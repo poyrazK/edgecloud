@@ -4031,7 +4031,7 @@ export interface operations {
                     /**
                      * @example {
                      *       "error": {
-                     *         "code": "BAD_REQUEST",
+                     *         "code": "BILLING_TENANT_UNRESOLVED",
                      *         "message": "tenant unresolved for event"
                      *       }
                      *     }
