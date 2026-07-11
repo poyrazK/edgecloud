@@ -32,16 +32,11 @@ wasmtime-wasi-http = "=45.0.3"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-# HKDF-SHA256 (issue #430) — used to derive the per-worker JWT signing
-# secret from the cluster master secret + the worker's enrolled
-# Ed25519 public_key. Mirrors `golang.org/x/crypto/hkdf` on the Go
-# control-plane side. The HKDF inputs are:
-#   salt = public_key_hex (32-byte raw hex)
-#   info = "worker-v1|<worker_id>|<tenant_id>|<region>"
-#   L    = 32
-# so the same (master, worker_id, tenant_id, region, pubkey) tuple
-# reproduces the same derived secret on both sides.
-hkdf = "0.12"
+# Per-worker HS256 secret (issue #430) arrives pre-derived from the
+# control plane (Go-side HKDF over the cluster master + worker
+# `public_key`); the worker just stores it under a `wkr_<hex>` kid in
+# `.worker-cache/identity.key` and feeds it to `WorkerJwtSigner`.
+# The worker never re-derives — see `edge-control-plane/internal/signing/worker_key.go`.
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
 # Artifact-signing verifier (issue #307, PR2). Both crates are already
