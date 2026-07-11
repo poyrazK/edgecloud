@@ -1,24 +1,24 @@
 //! `edge traffic` — get or set traffic splits for an app.
+//!
+//! Retry-aware paths route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS` from
+//! `commands::retry`. The `set` path is operator-tunable (main.rs
+//! wires `--max-retries` / `--retry-base-ms` / `--retry-cap-ms` to
+//! it); the `get` (Show) path uses the hardcoded defaults.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
-use super::retry::call_with_retry;
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
-
-/// Hardcoded sensible defaults for `edge traffic` (read). Matches
-/// `edge deploy`'s defaults — a transient outage on `edge traffic`
-/// is treated the same as on `edge deploy`. The `set` path is
-/// operator-tunable (main.rs wires `--max-retries` /
-/// `--retry-base-ms` / `--retry-cap-ms` to it).
-const HARD_CODED_MAX_RETRIES: u32 = 3;
-const HARD_CODED_RETRY_BASE_MS: u64 = 500;
-const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
 
 /// Subcommand enum for `edge traffic`. Mirrors the dispatch in
 /// `main.rs::Command::Traffic`. Lives in this module so the
@@ -40,8 +40,11 @@ pub enum TrafficAction {
         /// attempt, fail fast) — `edge traffic set` is a
         /// PUT-replaces, but the user is unlikely to want retries
         /// on a one-shot CLI invocation; this default is tunable
-        /// via the flag.
-        #[arg(long, default_value_t = 3)]
+        /// via the flag. Hard-capped at 20 by `value_parser` to
+        /// match the exponent saturation in
+        /// `commands::retry::compute_backoff_ms` (2^20 ≈ 1M ms ≈
+        /// 17min is the worst-case single sleep).
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=20))]
         max_retries: u32,
 
         /// Base backoff in milliseconds (issue #571 propagation).
@@ -70,14 +73,12 @@ pub fn get(path: &Path) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    let splits = call_with_retry(
+    let splits = call_with_retry_no_interrupt(
         "traffic get",
         || client.get_traffic(&state.app_name),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )?;
 
     if splits.is_empty() {
@@ -122,14 +123,12 @@ pub fn set(
     }
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    call_with_retry(
+    call_with_retry_no_interrupt(
         "traffic set",
         || client.set_traffic(&state.app_name, splits),
         max_retries,
         retry_base_ms,
         retry_cap_ms,
-        &interrupt,
     )?;
 
     output::success(&format!("Traffic splits set for {}", state.app_name));

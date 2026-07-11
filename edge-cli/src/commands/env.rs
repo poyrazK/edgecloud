@@ -2,22 +2,14 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
-use super::retry::call_with_retry;
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use super::state_io::{load_state_optional, resolve_app_name};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
-
-/// Hardcoded sensible defaults for endpoints that don't expose the
-/// `--max-retries` / `--retry-base-ms` / `--retry-cap-ms` flag
-/// triple. Matches `edge deploy`'s defaults so a transient outage
-/// during `edge env list` / `edge keys list` / `edge domains list`
-/// is treated the same as a transient during `edge deploy`.
-const HARD_CODED_MAX_RETRIES: u32 = 3;
-const HARD_CODED_RETRY_BASE_MS: u64 = 500;
-const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
 
 /// Set an environment variable for the app.
 ///
@@ -64,14 +56,12 @@ pub fn list_vars(path: &Path, app: &str) -> Result<()> {
         .with_context(|| "edge env list requires edge.toml with [deployment] api = \"<url>\"")?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    let vars = call_with_retry(
+    let vars = call_with_retry_no_interrupt(
         "env list",
         || client.list_env(&app_name),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )?;
 
     if vars.is_empty() {
@@ -108,14 +98,12 @@ pub fn delete_var(
         .with_context(|| "edge env delete requires edge.toml with [deployment] api = \"<url>\"")?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    call_with_retry(
+    call_with_retry_no_interrupt(
         "env delete",
         || client.delete_env(&app_name, key),
         max_retries,
         retry_base_ms,
         retry_cap_ms,
-        &interrupt,
     )?;
 
     output::success(&format!("{} deleted", key));

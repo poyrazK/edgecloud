@@ -796,6 +796,16 @@ async fn keys_revoke_404_surfaces_in_stderr() {
 
     cmd.assert()
         .failure()
+        // The new wrapper-preserving `Error::new(e).context("…")` chain
+        // surfaces the caller's `with_context` prefix as the
+        // user-facing line ("revoking key k_missing") and the typed
+        // ApiError as the indented "Caused by" branch. The old
+        // match-arm flatten produced "keys revoke failed: 404 …" as
+        // a single anyhow string — that prefix is gone in the
+        // post-PR contract; the new chain surfaces the call-site
+        // context instead. Pin both: the call-site prefix AND the
+        // 404 marker.
+        .stderr(predicate::str::contains("revoking key k_missing"))
         .stderr(predicate::str::contains("404"));
 }
 

@@ -328,8 +328,13 @@ enum Command {
         /// total number of attempts is `1 + max_retries`. `edge env
         /// delete` is naturally idempotent (DELETE-by-primary-key),
         /// so retries are safe — `--max-retries=0` disables retry
-        /// (single attempt, fail fast).
-        #[arg(long, default_value_t = 3)]
+        /// (single attempt, fail fast). Hard-capped at 20 by
+        /// `value_parser` to match the exponent saturation in
+        /// `commands::retry::compute_backoff_ms` (2^20 ≈ 1M ms ≈
+        /// 17min is the worst-case single sleep); without the cap
+        /// a `--max-retries=u32::MAX` would pin the CLI for ~12
+        /// days on a sustained outage.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=20))]
         max_retries: u32,
 
         /// Base backoff in milliseconds (issue #571 propagation).

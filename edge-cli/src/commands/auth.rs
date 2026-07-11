@@ -1,12 +1,17 @@
 //! `edge auth {signup, login, whoami, logout, keys}` — manage local
 //! credentials and (for `signup`) create a new tenant on the control plane;
 //! for `keys create`, mint additional API keys for the current tenant.
+//!
+//! Retry-aware paths (`keys list`, `keys revoke`) route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS` — a single edit
+//! in `commands::retry` propagates to every retry-aware endpoint.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::env;
 use std::io::{IsTerminal, Read};
-use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
 use crate::api::APIKeySummary;
@@ -14,13 +19,9 @@ use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
 use crate::output;
 
-use super::retry::call_with_retry;
-
-/// Hardcoded sensible defaults for `edge auth keys` retryable paths
-/// (issue #571 propagation). Matches `edge deploy`'s defaults.
-const HARD_CODED_MAX_RETRIES: u32 = 3;
-const HARD_CODED_RETRY_BASE_MS: u64 = 500;
-const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 
 /// Subcommands of `edge auth`.
 #[derive(Subcommand)]
@@ -406,14 +407,12 @@ fn keys_list(as_json: bool) -> Result<()> {
     // the `(current)` marker for that run).
     let current_id: Option<String> = ApiKey::load().ok().map(|k| k.0);
 
-    let interrupt = AtomicBool::new(false);
-    let keys = call_with_retry(
+    let keys = call_with_retry_no_interrupt(
         "auth keys list",
         || client.keys().list(),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )
     .with_context(|| "failed to list API keys")?;
 
@@ -507,14 +506,12 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
         }
     }
 
-    let interrupt = AtomicBool::new(false);
-    call_with_retry(
+    call_with_retry_no_interrupt(
         "auth keys revoke",
         || client.keys().revoke(id).map_err(anyhow::Error::from),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )
     .with_context(|| format!("revoking key {id}"))?;
 

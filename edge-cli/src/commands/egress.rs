@@ -3,22 +3,21 @@
 //! * `edge egress` / `edge egress show` — display the current allowlist.
 //! * `edge egress set <hosts...>` — replace the allowlist with one or more hosts.
 //! * `edge egress clear` — clear the allowlist (allow all outbound traffic).
+//!
+//! Retry-aware paths route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS`.
 
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
-use super::retry::call_with_retry;
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
-
-/// Hardcoded sensible defaults for `edge egress` (issue #571
-/// propagation). Matches `edge deploy`'s defaults — a transient
-/// outage on `edge egress` is treated the same as on `edge deploy`.
-const HARD_CODED_MAX_RETRIES: u32 = 3;
-const HARD_CODED_RETRY_BASE_MS: u64 = 500;
-const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
 
 /// Subcommand enum for `edge egress`. Mirrors the dispatch in
 /// `main.rs::Command::Egress`.
@@ -44,14 +43,12 @@ pub enum EgressAction {
 pub fn show(path: &Path) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    let egress = call_with_retry(
+    let egress = call_with_retry_no_interrupt(
         "egress show",
         || client.get_egress(),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )?;
 
     if egress.allowlist.is_empty() {
@@ -72,14 +69,12 @@ pub fn show(path: &Path) -> Result<()> {
 pub fn set(path: &Path, hosts: &[String]) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let interrupt = AtomicBool::new(false);
-    let egress = call_with_retry(
+    let egress = call_with_retry_no_interrupt(
         "egress set",
         || client.set_egress(hosts),
-        HARD_CODED_MAX_RETRIES,
-        HARD_CODED_RETRY_BASE_MS,
-        HARD_CODED_RETRY_CAP_MS,
-        &interrupt,
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
     )?;
 
     if egress.allowlist.is_empty() {

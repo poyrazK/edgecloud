@@ -13,20 +13,21 @@
 //! identity-level bindings, not deployment artifacts, and a stale
 //! local copy would risk tenants seeing "domain not found" when
 //! reality is the opposite.
+//!
+//! Retry-aware paths (`list`, `check`, `remove`) route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS`. `add` is
+//! Phase-2 deferred — see the docstring on `run`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
-use super::retry::call_with_retry;
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
-
-/// Hardcoded sensible defaults for `edge domains` retryable paths
-/// (issue #571 propagation). Matches `edge deploy`'s defaults.
-const HARD_CODED_MAX_RETRIES: u32 = 3;
-const HARD_CODED_RETRY_BASE_MS: u64 = 500;
-const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
 
 /// The four subcommands. Mirrors the route table in
 /// `edge-control-plane/internal/handler/domain.go`.
@@ -72,14 +73,12 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::List { app } => {
-                let interrupt = AtomicBool::new(false);
-                let rows = call_with_retry(
+                let rows = call_with_retry_no_interrupt(
                     "domains list",
                     || domains.list(&app),
-                    HARD_CODED_MAX_RETRIES,
-                    HARD_CODED_RETRY_BASE_MS,
-                    HARD_CODED_RETRY_CAP_MS,
-                    &interrupt,
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
                 )
                 .with_context(|| format!("listing domains for {app}"))?;
                 if rows.is_empty() {
@@ -97,14 +96,12 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::Check { app, fqdn } => {
-                let interrupt = AtomicBool::new(false);
-                let d = call_with_retry(
+                let d = call_with_retry_no_interrupt(
                     "domains check",
                     || domains.get(&app, &fqdn),
-                    HARD_CODED_MAX_RETRIES,
-                    HARD_CODED_RETRY_BASE_MS,
-                    HARD_CODED_RETRY_CAP_MS,
-                    &interrupt,
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
                 )
                 .with_context(|| format!("checking {fqdn} for {app}"))?;
                 println!("FQDN:     {}", d.fqdn);
@@ -122,14 +119,12 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::Remove { app, fqdn } => {
-                let interrupt = AtomicBool::new(false);
-                call_with_retry(
+                call_with_retry_no_interrupt(
                     "domains remove",
                     || domains.remove(&app, &fqdn),
-                    HARD_CODED_MAX_RETRIES,
-                    HARD_CODED_RETRY_BASE_MS,
-                    HARD_CODED_RETRY_CAP_MS,
-                    &interrupt,
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
                 )
                 .with_context(|| format!("removing {fqdn} from {app}"))?;
                 println!("Removed {fqdn} from {app}.");

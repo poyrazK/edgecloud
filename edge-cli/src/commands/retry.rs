@@ -30,6 +30,18 @@ use super::logs::interruptible_sleep;
 use crate::api::ApiError;
 use crate::output;
 
+/// Hardcoded sensible defaults for endpoints that don't expose the
+/// `--max-retries` / `--retry-base-ms` / `--retry-cap-ms` flag
+/// triple. Matches `edge deploy`'s defaults so a transient outage
+/// during `edge env list` / `edge keys list` / `edge domains list`
+/// is treated the same as a transient during `edge deploy`. The
+/// centralized home here means a future bump (e.g. base 250→500ms)
+/// is one edit instead of five duplicated `const` blocks across
+/// `commands/{env,traffic,egress,auth,domains}.rs`.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_RETRY_BASE_MS: u64 = 500;
+pub const DEFAULT_RETRY_CAP_MS: u64 = 8_000;
+
 /// Generic retry wrapper for any idempotent or naturally-replay-safe
 /// single-shot CLI mutation (issue #571 propagation).
 ///
@@ -82,13 +94,21 @@ pub fn call_with_retry<T, F>(
 where
     F: FnMut() -> Result<T>,
 {
-    // Test-only env override (issue #571 propagation). The wiremock
+    // Test-only env override (issue #571 propagation). **This is a
+    // test hook, NOT a stable user-facing API.** The wiremock
     // integration tests set `EDGE_CLI_RETRY_BASE_MS=10` so a
     // single retry sleeps ~10ms instead of the default 500ms; the
     // full retry sequence runs in well under a second. Without this
     // override, the hardcoded-default endpoints (no flag triple on
     // the surface) would force every retry test to either thread
     // flags through clap or wait seconds per case.
+    //
+    // Production callers must NOT rely on this — a user setting
+    // `EDGE_CLI_RETRY_BASE_MS=0` in their shell will silently shrink
+    // the retry budget to nothing. The env var is read on every
+    // `call_with_retry` call (no startup-cache) for test simplicity;
+    // if production usage is ever formalized, it should be promoted
+    // to a `--retry-base-ms` flag and read once.
     let effective_base_ms = std::env::var("EDGE_CLI_RETRY_BASE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -114,6 +134,38 @@ where
             }
         }
     }
+}
+
+/// Convenience shim for callers that don't install a SIGINT
+/// handler — internally constructs an `AtomicBool::new(false)` and
+/// delegates to [`call_with_retry`]. Ctrl-C still aborts via the
+/// default signal handler on the next blocking call; the flag is
+/// only checked inside [`super::logs::interruptible_sleep`].
+///
+/// The 11 non-deploy retry-aware sites use this shim. The deploy
+/// caller keeps the explicit `&AtomicBool` parameter because it
+/// installs its own ctrlc handler (see
+/// `commands/deploy.rs::run_upload`) and sets the flag on Ctrl-C.
+#[cfg(feature = "network")]
+pub fn call_with_retry_no_interrupt<T, F>(
+    op_label: &str,
+    attempt: F,
+    max_retries: u32,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let interrupt = AtomicBool::new(false);
+    call_with_retry(
+        op_label,
+        attempt,
+        max_retries,
+        retry_base_ms,
+        retry_cap_ms,
+        &interrupt,
+    )
 }
 
 /// Walk the `anyhow::Error` source chain and decide whether the
@@ -570,6 +622,31 @@ mod retry_loop_tests {
         for attempt in 1..=5 {
             let ms = compute_backoff_ms(attempt, 0, 0);
             assert!(ms >= 1, "attempt={attempt} floor must be >=1, got {ms}");
+        }
+    }
+
+    #[test]
+    fn compute_backoff_saturates_at_cap_when_exponent_overflows() {
+        // Pin the `.min(20)` exponent clamp on the saturating_pow
+        // call inside `compute_backoff_ms`. Without it,
+        // `attempt=30` would compute `2^29 × base = 5.4e8 × 1ms`
+        // → `5.4e8ms ≈ 150 hours`, then clip to `cap_ms`. The
+        // clamp ensures `2^attempt` never exceeds `2^20 ≈ 1M`
+        // regardless of how large `attempt` gets — so a future
+        // refactor that accidentally drops the clamp is caught
+        // here (the cap-clip behavior would still pass for any
+        // base that saturates, but the intermediate overflow
+        // would corrupt adjacent state).
+        //
+        // With `base=1ms` and `cap=60_000ms`, attempt=30 must
+        // land within ±25% of `60_000ms` (the cap) — NOT within
+        // ±25% of any 2^29-scaled value.
+        for _ in 0..32 {
+            let ms = compute_backoff_ms(30, 1, 60_000);
+            assert!(
+                (45_000..=75_000).contains(&ms),
+                "attempt=30 base=1 must saturate at cap=60_000, got {ms}"
+            );
         }
     }
 
