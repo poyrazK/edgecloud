@@ -203,7 +203,20 @@ impl WebSocket {
             };
 
             if let Ok(rt) = Handle::try_current() {
-                rt.block_on(tokio::task::spawn_blocking(upgrade))
+                // This host call runs synchronously on whatever thread the
+                // guest's wasm call landed on — which, for the LongRunning
+                // world, is a tokio worker thread already driving the
+                // `run_app_loop` async task. Calling `rt.block_on(...)`
+                // directly panics with "Cannot start a runtime from within
+                // a runtime": tokio refuses to block a thread that's
+                // already polling that same runtime. `block_in_place`
+                // hands this thread's other work off to another worker
+                // first, which is what makes the nested `block_on` legal —
+                // see CLAUDE.md's sync→async bridging note. Requires the
+                // multi-threaded runtime flavor (production's
+                // `#[tokio::main]` default; tests must opt in via
+                // `#[tokio::test(flavor = "multi_thread")]`).
+                tokio::task::block_in_place(|| rt.block_on(tokio::task::spawn_blocking(upgrade)))
                     .map_err(|e| format!("blocking accept panicked: {e}"))?
             } else {
                 upgrade()

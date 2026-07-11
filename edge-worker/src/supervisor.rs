@@ -1599,9 +1599,10 @@ impl Supervisor {
     /// to polling the control plane over HTTP to discover any
     /// reconciliation commands it might be missing.
     ///
-    /// This is a stub in v0.2 — the actual fetch logic lands in a
-    /// follow-up once the FaaS path is stable. Returns `Ok(None)` to
-    /// mean "no task messages received via the HTTP fallback".
+    /// A non-2xx response or a malformed body surfaces as `Ok(None)`
+    /// ("no task message via the HTTP fallback") rather than `Err` — a
+    /// flaky /sync endpoint should not crash the watchdog loop; the
+    /// worker just tries again on the next tick.
     #[allow(dead_code)]
     pub async fn fetch_sync(&self) -> anyhow::Result<Option<crate::messages::TaskMessage>> {
         // Stamp the watchdog so health-check tests don't trip on a
@@ -1609,7 +1610,32 @@ impl Supervisor {
         if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
             *guard = Some(std::time::Instant::now());
         }
-        Ok(None)
+
+        let url = format!(
+            "{}/api/internal/workers/{}/sync",
+            self.config.control_plane_url, self.config.worker_id
+        );
+        let token = self.jwt_signer.sign();
+        let response = match self.http.get(&url).bearer_auth(token).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(err = %e, url, "fetch_sync request failed");
+                return Ok(None);
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(status = %response.status(), url, "fetch_sync got non-2xx response");
+            return Ok(None);
+        }
+
+        match response.json::<crate::messages::TaskMessage>().await {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                tracing::warn!(err = %e, url, "fetch_sync got malformed response body");
+                Ok(None)
+            }
+        }
     }
 
     /// Handle an incoming TaskMessage from NATS.
@@ -1623,6 +1649,16 @@ impl Supervisor {
     /// in the desired set never causes us to stop another tenant's app
     /// that happens to share the same name.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
+        // Stamp the watchdog on entry — "we heard from NATS", not "the
+        // diff fully applied". Stamping only on success would leave the
+        // timer untouched when a partial diff fails (downloader
+        // rejection, hash mismatch, port exhaustion), and the
+        // heartbeat-loop watchdog would then trigger the HTTP /sync
+        // fallback even though NATS is healthy and delivering messages.
+        if let Ok(mut guard) = self.state.read().await.last_task_received_at.lock() {
+            *guard = Some(std::time::Instant::now());
+        }
+
         // Issue #569: `task_purge` tombstones are a distinct wire shape
         // — no `apps` field, derived from the worker's in-memory state.
         // Dispatched to `handle_purge` BEFORE the task_update / full_sync

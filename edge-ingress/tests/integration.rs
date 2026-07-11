@@ -207,6 +207,13 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
         return;
     }
 
+    // Install the Prometheus recorder BEFORE the pipeline runs. Under
+    // nextest each test is its own process, so nothing else has
+    // installed a global recorder — `metrics::counter!` calls made
+    // before installation go to the no-op recorder and are silently
+    // lost, leaving `handle.render()` empty at assertion time.
+    let handle = install_metrics_recorder();
+
     let (_nats, nats_url) = start_nats().await;
 
     let mock_server = MockServer::start().await;
@@ -263,11 +270,25 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
         .expect("publish heartbeat");
     client.flush().await.expect("flush");
 
-    // Wait for the pipeline to process the heartbeat and trigger a reload.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for the SECOND Caddy reload before reading metrics. The
+    // pipeline pushes twice: a boot push at startup (empty routing
+    // table — gauges are set inside push_now, so it records
+    // routes_active=0) and a debounced push after the heartbeat upserts
+    // the route (routes_active=1). Polling for just one request races
+    // the boot push and reads the stale zero gauge.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let reqs = mock_server.received_requests().await.unwrap_or_default();
+            if reqs.len() >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("wiremock saw the boot POST /load AND the heartbeat-triggered one within 10s");
 
-    // Read recorded metrics from the handle.
-    let handle = install_metrics_recorder();
+    // Read recorded metrics from the handle installed at test start.
     let output = handle.render();
 
     // The boot push and heartbeat push should have produced reload attempts.

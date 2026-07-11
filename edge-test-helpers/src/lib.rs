@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::nats::Nats;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -46,19 +46,30 @@ use edge_worker::state::WorkerState;
 use edge_worker::supervisor::Supervisor;
 use edge_worker::verifier::Keyring;
 
-/// Returns `true` if integration tests should be skipped. We skip when:
+/// Returns `true` if integration tests should be skipped.
 ///
-///   - `SKIP_INTEGRATION_TESTS` is set in the environment (for local
-///     runs when Docker is unavailable).
-///   - `CI` is set (mirrors the convention in `.gitlab-ci.yml` —
-///     integration tests run locally on a developer machine, but the
-///     shared CI runner doesn't have docker-in-docker for these
-///     crates' test step).
+/// **Explicit opt-in wins.** When `RUN_INTEGRATION_TESTS` is set, the
+/// container-backed tests run for real regardless of `CI` — provided Docker
+/// is actually reachable (`/var/run/docker.sock`). This is what the dedicated
+/// `rust-test-integration` CI job sets so these tests execute on GitHub
+/// Actions runners (which do ship Docker), while the fast `rust-test` job
+/// leaves the var unset and keeps self-skipping them.
+///
+/// Absent that override, we skip when:
+///
+///   - `SKIP_INTEGRATION_TESTS` is set in the environment (local escape
+///     hatch when Docker is unavailable).
+///   - `CI` is set — the default for the fast `cargo nextest run --workspace`
+///     job, which is not provisioned to wait on container startup. The
+///     dedicated integration job opts back in via `RUN_INTEGRATION_TESTS`.
 ///   - `/var/run/docker.sock` is absent (we hard-require Docker on the
-///     host for `testcontainers`; touching that socket from inside a
-///     container needs `--privileged` or a DinD setup the team doesn't
-///     run in CI).
+///     host for `testcontainers`).
 pub fn should_skip_integration_tests() -> bool {
+    // Opt-in overrides the CI default; the Docker-socket guard still applies
+    // so the tests skip cleanly where Docker is genuinely absent.
+    if std::env::var("RUN_INTEGRATION_TESTS").is_ok() {
+        return !std::path::Path::new("/var/run/docker.sock").exists();
+    }
     std::env::var("SKIP_INTEGRATION_TESTS").is_ok()
         || std::env::var("CI").is_ok()
         || !std::path::Path::new("/var/run/docker.sock").exists()
@@ -69,12 +80,19 @@ pub fn should_skip_integration_tests() -> bool {
 /// stops the container and NATS connections will fail) plus the
 /// `host:port` URL the worker should connect to.
 ///
+/// JetStream is enabled (`nats-server -js`) — the official image
+/// defaults to core-NATS only, and `subscribe_tasks`'s
+/// `ensure_task_stream` then fails with `jetstream request timed out`.
+/// Core-NATS-only tests (heartbeat pub/sub) are unaffected by the flag.
+///
 /// Uses a duration-based ready-condition (5s) rather than the
 /// built-in `WaitFor::Log` matcher — the latter can match stderr output
 /// that arrives before the listener is actually accepting connections,
 /// especially in CI where container I/O can be reordered.
 pub async fn start_nats() -> (ContainerAsync<Nats>, String) {
-    let container: ContainerAsync<Nats> = ContainerRequest::from(Nats::default())
+    let cmd = testcontainers_modules::nats::NatsServerCmd::default().with_jetstream();
+    let container: ContainerAsync<Nats> = Nats::default()
+        .with_cmd(&cmd)
         .with_startup_timeout(Duration::from_secs(30))
         .with_ready_conditions(vec![WaitFor::Duration {
             length: Duration::from_secs(5),
@@ -196,8 +214,18 @@ async fn build_supervisor_inner(
         config.starting_port,
         config.port_cooldown_secs,
     )));
-    let nats = Arc::new(NatsClientImpl::connect(&config.nats_url, 1, String::new()).await?)
-        as Arc<dyn NatsClientTrait>;
+    // Thread the config's queue_group through — hardcoding an empty
+    // string here silently forced every test supervisor into fan-out
+    // mode, so tests that set Config::queue_group (the issue-#86
+    // pinning test) never actually exercised queue-group delivery.
+    let nats = Arc::new(
+        NatsClientImpl::connect(
+            &config.nats_url,
+            config.task_stream_replicas,
+            config.queue_group.clone(),
+        )
+        .await?,
+    ) as Arc<dyn NatsClientTrait>;
     let log_forwarder = LogForwarder::new(
         config.control_plane_url.clone(),
         config.worker_id.clone(),

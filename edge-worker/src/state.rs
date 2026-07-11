@@ -138,7 +138,12 @@ impl WorkerState {
         Self {
             apps: HashMap::new(),
             engine,
-            last_task_received_at: std::sync::Mutex::new(None),
+            // Boot-herd fix: seed to "now" rather than None. A freshly
+            // started worker hasn't received a TaskMessage yet, but it
+            // also hasn't been silent — treating it as None (infinitely
+            // stale) would make every worker's watchdog fire the HTTP
+            // /sync fallback simultaneously on startup.
+            last_task_received_at: std::sync::Mutex::new(Some(std::time::Instant::now())),
         }
     }
 }
@@ -283,10 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn new_worker_state_last_task_is_none() {
+    fn new_worker_state_last_task_is_seeded_not_none() {
+        // Boot-herd fix: a freshly constructed WorkerState seeds
+        // last_task_received_at to Some(now), not None — otherwise every
+        // worker's watchdog would treat startup as "infinitely stale" and
+        // fire the HTTP /sync fallback simultaneously.
         let engine = Engine::default();
         let state = WorkerState::new(engine);
         let last = state.last_task_received_at.lock().unwrap();
-        assert!(last.is_none());
+        assert!(last.is_some());
     }
 }
