@@ -3,11 +3,19 @@
 //! * `edge egress` / `edge egress show` — display the current allowlist.
 //! * `edge egress set <hosts...>` — replace the allowlist with one or more hosts.
 //! * `edge egress clear` — clear the allowlist (allow all outbound traffic).
+//!
+//! Retry-aware paths route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS`.
 
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::Path;
 
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 
@@ -28,12 +36,20 @@ pub enum EgressAction {
     Clear,
 }
 
-/// Display the current egress allowlist.
+/// Display the current egress allowlist. Naturally idempotent
+/// (read); the call routes through [`call_with_retry`] with
+/// hardcoded sensible defaults.
 #[cfg(feature = "network")]
 pub fn show(path: &Path) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let egress = client.get_egress()?;
+    let egress = call_with_retry_no_interrupt(
+        "egress show",
+        || client.get_egress(),
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
+    )?;
 
     if egress.allowlist.is_empty() {
         println!("No egress restrictions — all outbound traffic is allowed.");
@@ -46,12 +62,20 @@ pub fn show(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace the egress allowlist with the given hosts.
+/// Replace the egress allowlist with the given hosts. Naturally
+/// idempotent (PUT-replaces; the same final state replays). The
+/// retry path uses hardcoded sensible defaults.
 #[cfg(feature = "network")]
 pub fn set(path: &Path, hosts: &[String]) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let egress = client.set_egress(hosts)?;
+    let egress = call_with_retry_no_interrupt(
+        "egress set",
+        || client.set_egress(hosts),
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
+    )?;
 
     if egress.allowlist.is_empty() {
         println!("Egress allowlist cleared — all outbound traffic is allowed.");
@@ -68,6 +92,7 @@ pub fn set(path: &Path, hosts: &[String]) -> Result<()> {
 }
 
 /// Clear the egress allowlist (allow all outbound traffic).
+/// Naturally idempotent (PUT-replaces with empty list).
 #[cfg(feature = "network")]
 pub fn clear(path: &Path) -> Result<()> {
     set(path, &[])

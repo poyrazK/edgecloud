@@ -1,6 +1,12 @@
 //! `edge auth {signup, login, whoami, logout, keys}` — manage local
 //! credentials and (for `signup`) create a new tenant on the control plane;
 //! for `keys create`, mint additional API keys for the current tenant.
+//!
+//! Retry-aware paths (`keys list`, `keys revoke`) route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS` — a single edit
+//! in `commands::retry` propagates to every retry-aware endpoint.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -12,6 +18,10 @@ use crate::api::APIKeySummary;
 use crate::api::{ApiClient, ApiError};
 use crate::config::{load_api_url, ApiKey};
 use crate::output;
+
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 
 /// Subcommands of `edge auth`.
 #[derive(Subcommand)]
@@ -397,10 +407,14 @@ fn keys_list(as_json: bool) -> Result<()> {
     // the `(current)` marker for that run).
     let current_id: Option<String> = ApiKey::load().ok().map(|k| k.0);
 
-    let keys = client
-        .keys()
-        .list()
-        .with_context(|| "failed to list API keys")?;
+    let keys = call_with_retry_no_interrupt(
+        "auth keys list",
+        || client.keys().list(),
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
+    )
+    .with_context(|| "failed to list API keys")?;
 
     if as_json {
         println!("{}", serde_json::to_string_pretty(&keys)?);
@@ -492,16 +506,14 @@ fn keys_revoke(id: &str, force: bool, yes: bool) -> Result<()> {
         }
     }
 
-    client
-        .keys()
-        .revoke(id)
-        .map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("keys revoke failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })
-        .with_context(|| format!("revoking key {id}"))?;
+    call_with_retry_no_interrupt(
+        "auth keys revoke",
+        || client.keys().revoke(id).map_err(anyhow::Error::from),
+        DEFAULT_MAX_RETRIES,
+        DEFAULT_RETRY_BASE_MS,
+        DEFAULT_RETRY_CAP_MS,
+    )
+    .with_context(|| format!("revoking key {id}"))?;
 
     output::success(&format!("Revoked key {id}"));
 

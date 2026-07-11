@@ -85,8 +85,18 @@ impl From<reqwest::Error> for ApiError {
 
 impl From<serde_json::Error> for ApiError {
     fn from(source: serde_json::Error) -> Self {
-        ApiError::Transient {
-            source: anyhow::anyhow!("invalid response body: {source}"),
+        // Rejected, not Transient — the wire shape doesn't change on
+        // retry. The classifier (`is_anyhow_retryable` → `ApiError::is_retryable`)
+        // would otherwise loop `max_retries + 1` times against the
+        // same unparseable body, burning the budget uselessly.
+        // `whoami_anyhow` / `get_json_anyhow` wrap with
+        // `Error::new(e).context(...)` so the typed `ApiError::Rejected`
+        // stays in the source chain — the classifier finds it via
+        // `anyhow::Error::chain()` walk and short-circuits on the
+        // first attempt.
+        ApiError::Rejected {
+            status: reqwest::StatusCode::OK,
+            body: format!("invalid response body: {source}"),
         }
     }
 }
@@ -630,21 +640,21 @@ impl ApiClient {
     }
 
     /// Helper for the GET endpoints that surface as `anyhow::Error`
-    /// instead of `ApiError`. Flattens `Rejected` into
-    /// `anyhow!("{op} failed: {status} {body}")` and `Transient` into
-    /// its source. Lets every existing call site keep returning
-    /// `Result<T>` without each one re-writing the same match.
+    /// instead of `ApiError`. Wraps the original `ApiError` in an
+    /// `anyhow::Error::new` so the typed error stays in the source
+    /// chain (callers that route through `commands::retry::call_with_retry`
+    /// need `is_anyhow_retryable` to find an `ApiError` via
+    /// `anyhow::Error::chain()` walk) and chains a `context` for the
+    /// user-facing prefix. Mirrors the deploy-side pattern at
+    /// `client.rs:823` — `Error::new(e).context("...")` keeps the
+    /// typed error AND the user-facing message intact.
     fn get_json_anyhow<T, F>(&self, op: &str, format_url: F) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
         F: FnOnce(&str) -> String,
     {
-        self.get_json(format_url).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("{op} failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })
+        self.get_json(format_url)
+            .map_err(|e| anyhow::Error::new(e).context(format!("{op} failed")))
     }
 
     /// Group accessor for tenant-management endpoints (e.g. signup).
@@ -889,12 +899,8 @@ impl ApiClient {
             .json(&payload)
             .send()?;
 
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("set env failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("set env failed"))?;
         Ok(())
     }
 
@@ -907,12 +913,8 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("delete env failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("delete env failed"))?;
         Ok(())
     }
 
@@ -948,12 +950,8 @@ impl ApiClient {
         }
         let resp = req.send()?;
 
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("activate failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("activate failed"))?;
         Ok(())
     }
 
@@ -977,12 +975,8 @@ impl ApiClient {
             req = req.header("Idempotency-Key", idempotency_key);
         }
         let resp = req.send()?;
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("promote failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("promote failed"))?;
         Ok(())
     }
 
@@ -1016,12 +1010,7 @@ impl ApiClient {
             .body(body)
             .send()?;
 
-        check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("set_traffic failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        check_response(resp).map_err(|e| anyhow::Error::new(e).context("set_traffic failed"))?;
         Ok(())
     }
 
@@ -1043,12 +1032,8 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .send()?;
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("get_traffic failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp = check_response(resp)
+            .map_err(|e| anyhow::Error::new(e).context("get_traffic failed"))?;
         let v: TrafficResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(v.splits
             .into_iter()
@@ -1072,12 +1057,8 @@ impl ApiClient {
         }
         let resp = req.send()?;
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("rollback failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("rollback failed"))?;
 
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
@@ -1153,12 +1134,8 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .json(&payload)
             .send()?;
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("create app failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("create app failed"))?;
         let body: App = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(body)
     }
@@ -1236,12 +1213,8 @@ impl ApiClient {
             .header("Authorization", self.auth_header())
             .json(&payload)
             .send()?;
-        let _ = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("set egress failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("set egress failed"))?;
         // Server returns the stored allowlist; re-fetch to surface it.
         self.get_egress()
     }
@@ -1293,12 +1266,8 @@ impl<'a> Tenants<'a> {
         };
         let resp = self.client.http.post(&url).json(&payload).send()?;
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("signup failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("signup failed"))?;
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 }
@@ -1331,12 +1300,8 @@ impl<'a> Keys<'a> {
             .json(&payload)
             .send()?;
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("keys create failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp = check_response(resp)
+            .map_err(|e| anyhow::Error::new(e).context("keys create failed"))?;
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
@@ -1351,12 +1316,8 @@ impl<'a> Keys<'a> {
             .header("Authorization", self.client.auth_header())
             .send()?;
 
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("keys list failed: {status} {body}")
-            }
-            ApiError::Transient { source } => source,
-        })?;
+        let resp =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("keys list failed"))?;
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
@@ -1507,10 +1468,29 @@ mod tests {
     }
 
     #[test]
-    fn from_serde_json_yields_transient() {
+    fn from_serde_json_yields_rejected_with_invalid_body_marker() {
+        // Re-projection of the contract after the retry-propagation
+        // follow-up (issue #571). The original impl wrapped
+        // `serde_json::Error` in `ApiError::Transient`; that was
+        // wrong because a wire-shape mismatch is deterministic — the
+        // server returns the same bytes on retry, so retrying
+        // wastes the budget. Now `Rejected` carries status 200 (the
+        // server's status) and body "invalid response body: <err>"
+        // so the user-facing stderr surfaces the JSON parse failure
+        // verbatim. `is_anyhow_retryable` walks the chain, finds the
+        // `ApiError::Rejected { status: 200, .. }` (not 429), and
+        // returns false on the first attempt.
         let err: serde_json::Error = serde_json::from_str::<i32>("not int").unwrap_err();
         let e: ApiError = err.into();
-        assert!(matches!(e, ApiError::Transient { .. }));
+        match e {
+            ApiError::Rejected { status, body } => {
+                assert_eq!(status.as_u16(), 200);
+                assert!(body.starts_with("invalid response body: "));
+            }
+            ApiError::Transient { .. } => {
+                panic!("serde_json::Error must map to Rejected, not Transient")
+            }
+        }
     }
 
     // F9: `truncate_body` must (a) leave short bodies unchanged,

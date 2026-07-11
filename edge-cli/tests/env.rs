@@ -13,6 +13,67 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+// ---------------------------------------------------------------------------
+// Issue #571 propagation: retry transient 5xx on env delete.
+//
+// `edge env-delete` is operator-tunable — main.rs wires
+// `--max-retries` / `--retry-base-ms` / `--retry-cap-ms` to it. A
+// single 503-then-200 sequence exercises the wire contract: the
+// retried DELETE must hit the same path with the same Authorization
+// header (so the retry loop's same-args contract is enforced by
+// wiremock's exact-match matcher, not by code-level inspection).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn delete_retries_503_then_succeeds() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    write_minimal_edge_toml(&project);
+    write_state_with_app(&project, "myapp");
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/apps/myapp/env/LOG_LEVEL"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+        .named("env-delete-503")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/apps/myapp/env/LOG_LEVEL"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200))
+        .named("env-delete-200")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.env("EDGE_CLI_RETRY_BASE_MS", "10");
+    cmd.current_dir(project.path());
+    cmd.args([
+        "env-delete",
+        "--app",
+        "myapp",
+        "LOG_LEVEL",
+        "--retry-base-ms=10",
+    ]);
+
+    cmd.assert().success();
+    let received = server.received_requests().await.expect("received requests");
+    assert_eq!(
+        received.len(),
+        2,
+        "expected 503 + 200 = 2 received requests"
+    );
+}
+
 mod common;
 
 /// Write a minimal `edge.toml` so `ApiClient::new` can resolve the

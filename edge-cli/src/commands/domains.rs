@@ -13,10 +13,19 @@
 //! identity-level bindings, not deployment artifacts, and a stale
 //! local copy would risk tenants seeing "domain not found" when
 //! reality is the opposite.
+//!
+//! Retry-aware paths (`list`, `check`, `remove`) route through
+//! `commands::retry::call_with_retry_no_interrupt` with the
+//! centralized defaults `DEFAULT_MAX_RETRIES` /
+//! `DEFAULT_RETRY_BASE_MS` / `DEFAULT_RETRY_CAP_MS`. `add` is
+//! Phase-2 deferred — see the docstring on `run`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use super::retry::{
+    call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
+};
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 
@@ -40,6 +49,15 @@ impl DomainsAction {
     /// `edge domains add myotherapp foo.com` fails when `myotherapp`
     /// has never been deployed — a 404 from the control plane is
     /// the right "no such app" signal.
+    ///
+    /// **Phase-2 deferred (issue #571 follow-up).** `Add` is a POST
+    /// insert and a retried POST could either 409 (duplicate
+    /// `(app, fqdn)`) or insert a duplicate row depending on the
+    /// server's race window — the right fix is CP-side
+    /// `Idempotency-Key` schema extension. Until that lands, `Add`
+    /// does NOT route through `call_with_retry`. The retry umbrella
+    /// covers `Remove` (DELETE-by-fqdn; second call returns 404 with
+    /// no side effect), `List` (read), and `Check` (read).
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
         let edge_toml = EdgeToml::from_path(path)?;
@@ -55,9 +73,14 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::List { app } => {
-                let rows = domains
-                    .list(&app)
-                    .with_context(|| format!("listing domains for {app}"))?;
+                let rows = call_with_retry_no_interrupt(
+                    "domains list",
+                    || domains.list(&app),
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
+                )
+                .with_context(|| format!("listing domains for {app}"))?;
                 if rows.is_empty() {
                     println!("No custom domains for {app}.");
                 } else {
@@ -73,9 +96,14 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::Check { app, fqdn } => {
-                let d = domains
-                    .get(&app, &fqdn)
-                    .with_context(|| format!("checking {fqdn} for {app}"))?;
+                let d = call_with_retry_no_interrupt(
+                    "domains check",
+                    || domains.get(&app, &fqdn),
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
+                )
+                .with_context(|| format!("checking {fqdn} for {app}"))?;
                 println!("FQDN:     {}", d.fqdn);
                 println!("ID:       {}", d.id);
                 println!("Status:   {}", d.status);
@@ -91,9 +119,14 @@ impl DomainsAction {
                 Ok(())
             }
             DomainsAction::Remove { app, fqdn } => {
-                domains
-                    .remove(&app, &fqdn)
-                    .with_context(|| format!("removing {fqdn} from {app}"))?;
+                call_with_retry_no_interrupt(
+                    "domains remove",
+                    || domains.remove(&app, &fqdn),
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
+                )
+                .with_context(|| format!("removing {fqdn} from {app}"))?;
                 println!("Removed {fqdn} from {app}.");
                 Ok(())
             }

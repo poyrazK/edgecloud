@@ -796,7 +796,16 @@ async fn keys_revoke_404_surfaces_in_stderr() {
 
     cmd.assert()
         .failure()
-        .stderr(predicate::str::contains("keys revoke failed"))
+        // The new wrapper-preserving `Error::new(e).context("…")` chain
+        // surfaces the caller's `with_context` prefix as the
+        // user-facing line ("revoking key k_missing") and the typed
+        // ApiError as the indented "Caused by" branch. The old
+        // match-arm flatten produced "keys revoke failed: 404 …" as
+        // a single anyhow string — that prefix is gone in the
+        // post-PR contract; the new chain surfaces the call-site
+        // context instead. Pin both: the call-site prefix AND the
+        // 404 marker.
+        .stderr(predicate::str::contains("revoking key k_missing"))
         .stderr(predicate::str::contains("404"));
 }
 
@@ -1246,4 +1255,92 @@ async fn server_error_with_huge_body_does_not_oom_cli() {
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("... [truncated]"));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #571 propagation: retry transient 5xx on keys revoke.
+//
+// `edge auth keys revoke` is naturally idempotent (DELETE-by-id;
+// second call returns 404 with no side effect). The retry loop uses
+// hardcoded sensible defaults — there's no `--max-retries` flag on
+// the surface. This test pins that the loop still retries through
+// `EDGE_CLI_RETRY_BASE_MS=10` (the test-only env override used to
+// shrink the backoff window below the default 500ms — the production
+// hardcoded base would make the test ~750-2500ms per attempt).
+//
+// The whoami call (for the self-revoke guard) is mocked separately
+// and returns 200 on every call — the retry loop only retries the
+// actual revoke DELETE, not the guard read.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn keys_revoke_retries_503_then_succeeds() {
+    let home = common::isolated_home();
+    let server = MockServer::start().await;
+    common::seed_api_key(&home, "k_existing");
+
+    // whoami — self-revoke guard. Resolves to a DIFFERENT id than
+    // the target so the guard doesn't short-circuit with `exit(2)`.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_existing",
+            "api_key_name": "default",
+            "role": "developer",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .mount(&server)
+        .await;
+
+    // First DELETE: 503. Second DELETE: 200. wiremock walks
+    // mocks in mount order with identical matchers; .named(...)
+    // keeps them as distinct entries.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_other"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+        .named("revoke-503")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/keys/k_other"))
+        .and(header("Authorization", "Bearer k_existing"))
+        .respond_with(ResponseTemplate::new(204))
+        .named("revoke-204")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.env("EDGE_CLI_RETRY_BASE_MS", "10");
+    cmd.timeout(std::time::Duration::from_secs(15));
+    cmd.arg("auth")
+        .arg("keys")
+        .arg("revoke")
+        .arg("--id")
+        .arg("k_other")
+        .arg("--force")
+        .arg("--yes");
+
+    cmd.assert().success();
+    let received = server.received_requests().await.expect("received requests");
+    // Two DELETE attempts (503 + 204) plus one GET /whoami for
+    // the self-revoke guard. The whoami call is NOT retried —
+    // it's a separate read inside the keys_revoke helper.
+    let delete_count = received
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE" && r.url.path() == "/api/v1/keys/k_other")
+        .count();
+    assert_eq!(
+        delete_count, 2,
+        "expected 503 + 204 = 2 DELETE attempts on /api/v1/keys/k_other"
+    );
 }

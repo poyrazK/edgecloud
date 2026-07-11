@@ -322,6 +322,34 @@ enum Command {
         app: String,
         /// Environment variable key to delete.
         key: String,
+
+        /// Maximum number of retries on transient failures (issue
+        /// #571 propagation): 5xx, network errors, and 429. The
+        /// total number of attempts is `1 + max_retries`. `edge env
+        /// delete` is naturally idempotent (DELETE-by-primary-key),
+        /// so retries are safe — `--max-retries=0` disables retry
+        /// (single attempt, fail fast). Hard-capped at 20 by
+        /// `value_parser` to match the exponent saturation in
+        /// `commands::retry::compute_backoff_ms` (2^20 ≈ 1M ms ≈
+        /// 17min is the worst-case single sleep); without the cap
+        /// a `--max-retries=u32::MAX` would pin the CLI for ~12
+        /// days on a sustained outage.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=20))]
+        max_retries: u32,
+
+        /// Base backoff in milliseconds (issue #571 propagation).
+        /// First retry sleeps `retry_base_ms × ±25%` jitter; each
+        /// subsequent retry doubles the wait, capped at
+        /// `retry-cap-ms`. Ignored when `--max-retries=0`.
+        #[arg(long, default_value_t = 500)]
+        retry_base_ms: u64,
+
+        /// Maximum backoff in milliseconds (issue #571
+        /// propagation). Caps the exponential backoff. Hard-capped
+        /// at 60_000 (60s) by `value_parser`. Ignored when
+        /// `--max-retries=0`.
+        #[arg(long, default_value_t = 8_000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        retry_cap_ms: u64,
     },
 
     /// Activate a specific deployment.
@@ -633,7 +661,20 @@ fn main() -> Result<()> {
             commands::env::set_var(&cli.path, &app, &key, &value)
         }
         Command::EnvList { app } => commands::env::list_vars(&cli.path, &app),
-        Command::EnvDelete { app, key } => commands::env::delete_var(&cli.path, &app, &key),
+        Command::EnvDelete {
+            app,
+            key,
+            max_retries,
+            retry_base_ms,
+            retry_cap_ms,
+        } => commands::env::delete_var(
+            &cli.path,
+            &app,
+            &key,
+            max_retries,
+            retry_base_ms,
+            retry_cap_ms,
+        ),
         Command::Activate {
             deployment_id,
             weight,
@@ -705,7 +746,12 @@ fn main() -> Result<()> {
         Command::Auth { action } => action.run(),
         Command::Traffic { action } => match action {
             commands::traffic::TrafficAction::Show => commands::traffic::get(&cli.path),
-            commands::traffic::TrafficAction::Set { splits } => {
+            commands::traffic::TrafficAction::Set {
+                splits,
+                max_retries,
+                retry_base_ms,
+                retry_cap_ms,
+            } => {
                 let parsed: Vec<(String, u8)> = splits
                     .iter()
                     .filter_map(|s| {
@@ -714,7 +760,7 @@ fn main() -> Result<()> {
                         Some((id.to_string(), weight))
                     })
                     .collect();
-                commands::traffic::set(&cli.path, &parsed)
+                commands::traffic::set(&cli.path, &parsed, max_retries, retry_base_ms, retry_cap_ms)
             }
         },
         Command::Domains(cmd) => {
