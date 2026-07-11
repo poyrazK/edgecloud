@@ -1024,6 +1024,11 @@ mod tests {
             tenant_rate_limit_fetch_interval: Duration::from_secs(30),
             global_rate_limit_rps: 0,
             global_rate_limit_burst: 0,
+            l4_port_range_start: 31000,
+            l4_port_range_end: 31999,
+            l4_max_conns_per_app: 1000,
+            l4_max_conns_per_ip: 100,
+            l4_port_cooldown_secs: 60,
         }
     }
 
