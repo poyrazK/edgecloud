@@ -428,6 +428,14 @@ Operator endpoints: `GET /api/v1/admin/secrets/keys` and `POST /api/v1/admin/sec
 - The **active kid** for new signatures is `EDGE_SIGNING_KEY_ID`. If unset, the keyring must contain a `default` entry. Set-but-missing fails startup.
 - Workers verify against the same kid that the CP signed with — the kid travels on the `deployments` row alongside the signature, so per-deployment key rotation is invisible to the worker (it just looks up the kid).
 
+### Per-worker JWT secret (`wkr_` kid namespace, issue #430)
+
+- Every worker holds an Ed25519 identity keypair at `.worker-cache/identity.key` (mode 0600) and runs a three-phase bootstrap handshake against the CP: `POST /api/internal/bootstrap` (HMAC-SHA256 over `worker_id:region:tenant_id:timestamp:nonce:public_key`) → `POST /api/internal/worker-bootstrap/enroll` (Ed25519 signature over `sha256(public_key || enrollment_challenge)`) → derive. Replaces the pre-#430 `GET /api/internal/worker-secret` which leaked `JWT_SECRET` cluster-wide.
+- The CP derives the per-worker HS256 secret via `HKDF-SHA256(JWT_SECRET, salt=public_key, info="worker-v1|<worker_id>|<tenant_id>|<region>", L=32)`. The kid is `"wkr_" + hex(sha256(pubkey))[:8]`. The cluster `JWT_SECRET` never leaves the CP.
+- The CP re-derives the verification secret from the cached `workers.public_key` (`edge-control-plane/internal/middleware/worker_key_cache.go`, 5-min TTL, invalidation on `EnrollWorker::SetPublicKey`). The `wkr_` namespace branch in `WorkerAuth::resolveKey` is fail-closed when the cache is nil — never falls back to the legacy `cfg.JWT.Secret`.
+- Workers persist `{kid, secret, public_key_hex}` to `.worker-cache/identity.key` (binary `EWIS` record, mode 0600) and skip the handshake on subsequent restarts unless `EDGE_WORKER_REENROLL_ON_BOOT=true`. A corrupt persisted record refuses to fall through to bootstrap (defense against an attacker who can write to the cache directory).
+- Rotation: see `docs/jwt-secret-rotation.md`. The CP supports multi-kid verification (`JWT_KEY_<kid>` + `JWT_ACTIVE_KID`); a rotation = add new key → drain workers with `EDGE_WORKER_REENROLL_ON_BOOT=true` → flip active kid → remove old key.
+
 ## Storage (`edge-control-plane/internal/storage/`)
 
 Three backends, picked at startup via `cfg.Storage.ArtifactBackend`:

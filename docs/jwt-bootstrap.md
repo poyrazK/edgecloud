@@ -154,3 +154,11 @@ If the bootstrap succeeded but logs still don't arrive, the worker's JWT
 signer may have a cached token signed with an empty secret from before the
 bootstrap. Restart the worker — the fix in `main.rs` now resolves the
 secret before creating the signer.
+
+## Related
+
+- [`jwt-secret-rotation.md`](jwt-secret-rotation.md) — rotating the
+  cluster `JWT_SECRET` after every worker has been upgraded to the
+  per-worker derived-secret model (issue #430). The `BOOTSTRAP_SECRET`
+  rotation procedure described above is unchanged; the new runbook
+  covers the per-worker `JWT_KEY_<kid>` / `JWT_ACTIVE_KID` flow.
