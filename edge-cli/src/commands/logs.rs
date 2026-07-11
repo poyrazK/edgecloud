@@ -76,7 +76,11 @@ const FOLLOW_POLL_GRANULARITY: Duration = Duration::from_millis(100);
 /// `FOLLOW_POLL_GRANULARITY`. Returns early when `stop` is set so
 /// Ctrl-C exits the follow loop within 100ms instead of up to
 /// `FOLLOW_INTERVAL` (2s).
-fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
+///
+/// `pub(crate)` so the deploy retry loop (issue #571) reuses the same
+/// SIGINT-aware sleep — a retry backoff with the default 8s cap blocks
+/// Ctrl-C for up to 8s without this.
+pub(crate) fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
     let start = Instant::now();
     while start.elapsed() < total {
         if stop.load(Ordering::SeqCst) {

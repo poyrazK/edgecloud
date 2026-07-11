@@ -2,10 +2,15 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::build;
+use super::logs::interruptible_sleep;
 use super::state_io::load_state_optional;
-use crate::api::ApiClient;
+use crate::api::client::DeployResponse;
+use crate::api::{ApiClient, ApiError, PreviewOpts};
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::{BuildMetadata, State};
@@ -37,6 +42,12 @@ use crate::LangArg;
 /// replays the original deployment. `run_activate` ignores the
 /// value — activation is a separate endpoint and the Idempotency-
 /// Key header is wired only on the upload path.
+///
+/// `max_retries` / `retry_base_ms` / `retry_cap_ms` (issue #571)
+/// configure the transient-error retry loop on the upload path.
+/// `run_activate` ignores them — the activate endpoint is a
+/// separate idempotent request keyed on the deployment id, not
+/// the artifact, so the same retry policy doesn't apply.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "network")]
 pub fn run(
@@ -50,6 +61,9 @@ pub fn run(
     lang: Option<LangArg>,
     preview_opts: Option<&crate::api::PreviewOpts>,
     idempotency_key: Option<&str>,
+    max_retries: u32,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
 ) -> Result<()> {
     if let Some(deployment_id) = id {
         return run_activate(path, app, deployment_id);
@@ -64,6 +78,9 @@ pub fn run(
         lang,
         preview_opts,
         idempotency_key,
+        max_retries,
+        retry_base_ms,
+        retry_cap_ms,
     )
 }
 
@@ -91,6 +108,20 @@ pub fn run(
 /// deployment instead of minting a duplicate. The minted UUID is
 /// echoed to the user via `output::info` so a CI script that
 /// wants to retry the exact same key can grab it from logs.
+///
+/// `max_retries` / `retry_base_ms` / `retry_cap_ms` (issue #571):
+/// total attempts = `1 + max_retries`. Backoff doubles per attempt
+/// (`base × 2^(attempt-1)`), capped at `retry_cap_ms`, with ±25%
+/// jitter via a hand-rolled xorshift RNG (no `rand` dep). Each
+/// retry re-calls `client.deploy(...)` with the same `wasm_bytes`
+/// and the same `idempotency_key` so the server's
+/// Idempotency-Key replay path returns the cached
+/// `deployment_id` (200) on the next attempt instead of minting
+/// a duplicate. The 429 status is also retried (the deploy handler
+/// doesn't emit `Retry-After`); all other 4xx are surfaced
+/// immediately as deterministic failures. The backoff sleep is
+/// wired through `interruptible_sleep` so Ctrl-C exits within
+/// ~100ms instead of up to `retry_cap_ms`.
 #[cfg(feature = "network")]
 #[allow(clippy::too_many_arguments)]
 fn run_upload(
@@ -103,6 +134,9 @@ fn run_upload(
     lang: Option<LangArg>,
     preview_opts: Option<&crate::api::PreviewOpts>,
     idempotency_key: Option<&str>,
+    max_retries: u32,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
 ) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let app_name = if !app.is_empty() {
@@ -181,7 +215,22 @@ fn run_upload(
             idem_key_owned.as_str()
         }
     };
-    let resp = client.deploy(
+
+    // Issue #571: install a SIGINT handler so the retry backoff is
+    // interruptible. Without this, an 8s default `retry_cap_ms` blocks
+    // Ctrl-C for up to 8s. The flag is shared with the retry helper so
+    // a Ctrl-C during the sleep unblocks the loop and the next
+    // `client.deploy(...)` call (or the loop's exit branch) returns
+    // promptly. Mirrors `commands/logs.rs:178-183`.
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let interrupt_for_handler = interrupt.clone();
+    ctrlc::set_handler(move || {
+        interrupt_for_handler.store(true, Ordering::SeqCst);
+    })
+    .context("installing SIGINT handler for deploy retry")?;
+
+    let resp = deploy_with_retry(
+        &client,
         &app_name,
         &wasm_bytes,
         regions,
@@ -190,6 +239,10 @@ fn run_upload(
         build_metadata_json.as_ref(),
         preview_opts,
         idem_key_slice,
+        max_retries,
+        retry_base_ms,
+        retry_cap_ms,
+        &interrupt,
     )?;
 
     let live_url = resp.url.clone();
@@ -234,6 +287,177 @@ fn run_upload(
     output::success("Deployed successfully");
     println!("  URL: {}", resp.url);
     Ok(())
+}
+
+/// Retry loop around `client.deploy(...)` for transient failures
+/// (issue #571). Re-runs `client.deploy(...)` with the **same**
+/// `idempotency_key` and the **same** `wasm_bytes` slice on every
+/// attempt — `ApiClient::deploy` rebuilds the multipart `Form`
+/// (and the inner `Cursor`) per call, so the wasm body is not
+/// exhausted across retries (the multipart reader is one-shot).
+///
+/// The Idempotency-Key is preserved byte-for-byte so the server's
+/// replay path returns the cached `deployment_id` (200) on the
+/// next attempt instead of minting a duplicate row (the server
+/// contract at `edge-control-plane/internal/handler/deployment.go:199-495`).
+///
+/// `max_retries` is the number of retries *after* the first
+/// attempt — `--max-retries=0` means a single attempt, no retries
+/// (the `attempt > max_retries` guard short-circuits on the first
+/// failure). Backoff grows as `base × 2^(attempt-1)`, capped at
+/// `cap_ms`, with ±25% jitter.
+///
+/// Only retries on `ApiError::is_retryable()` results — 4xx
+/// (other than 429) surface immediately as deterministic failures.
+/// The 429 case is handled by the `is_retryable()` override on
+/// `Rejected { 429 }`.
+#[cfg(feature = "network")]
+#[allow(clippy::too_many_arguments)]
+fn deploy_with_retry(
+    client: &ApiClient,
+    app_name: &str,
+    wasm_bytes: &[u8],
+    regions: &[String],
+    auto_rollback: bool,
+    replicas: usize,
+    build_metadata: Option<&serde_json::Value>,
+    preview_opts: Option<&PreviewOpts>,
+    idem_key_slice: &str,
+    max_retries: u32,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
+    interrupt: &AtomicBool,
+) -> Result<DeployResponse> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match client.deploy(
+            app_name,
+            wasm_bytes,
+            regions,
+            auto_rollback,
+            replicas,
+            build_metadata,
+            preview_opts,
+            idem_key_slice,
+        ) {
+            Ok(resp) => return Ok(resp),
+            Err(e) if attempt > max_retries || !is_anyhow_retryable(&e) => return Err(e),
+            Err(e) => {
+                let backoff_ms = compute_backoff_ms(attempt, retry_base_ms, retry_cap_ms);
+                output::warn(&format!(
+                    "retrying deploy (attempt {attempt}/{max_retries} after {backoff_ms}ms): {e}"
+                ));
+                interruptible_sleep(Duration::from_millis(backoff_ms), interrupt);
+            }
+        }
+    }
+}
+
+/// Walk the `anyhow::Error` source chain looking for an
+/// `ApiError`; defer to its `is_retryable()` classifier when
+/// found. Falls back to `true` (retry) when the chain doesn't
+/// contain an `ApiError` — non-API errors (multipart builder,
+/// JSON serialize, IO) are conservative "retry once, the second
+/// attempt will surface the same failure" candidates. Mirrors
+/// the conservative `Transient` default in `ApiError::From<anyhow>`
+/// at `client.rs:39-43`.
+fn is_anyhow_retryable(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(api) = cause.downcast_ref::<ApiError>() {
+            return api.is_retryable();
+        }
+    }
+    // No ApiError in the chain — a non-HTTP error (multipart
+    // builder, JSON serialize, IO). Retry once; if the second
+    // attempt hits the same failure, the retry budget caps it.
+    true
+}
+
+/// Exponential backoff with full jitter (issue #571).
+///
+/// `attempt` is 1-indexed — the first failure is attempt #1, so
+/// the first sleep is `base_ms × 2^0 = base_ms`. Doubles each
+/// attempt until `retry_cap_ms` is hit, then plateaus. The
+/// ±25% jitter (`× (0.75..=1.25)`) prevents synchronized
+/// thundering-herd retries from N parallel CI jobs hitting the
+/// same control plane at the same tick.
+///
+/// Returns at least 1ms so the loop is guaranteed to make
+/// forward progress — a future refactor that passes
+/// `retry_base_ms = 0` shouldn't accidentally spin.
+fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    // Clamp the exponent at 20 to keep `2^attempt` from overflowing
+    // even with a pathological `--retry-base-ms=1`. 2^20 ≈ 1M,
+    // so `1 × 2^20 = 1_048_576ms ≈ 17min` is the worst-case
+    // saturated value before `min(cap_ms)` clips it.
+    let exp = 2_u64.saturating_pow(attempt.saturating_sub(1).min(20));
+    let capped = base_ms.saturating_mul(exp).min(cap_ms);
+    // Jitter: random in 0..=50 → scale by 0.75..=1.25 of `capped`.
+    // `capped × (75 + jitter)` can saturate u64 if `capped` is
+    // close to `u64::MAX` — saturating_mul handles that without
+    // overflow. Result floor is 1ms.
+    let jitter = xorshift_uniform_u64() % 51;
+    capped
+        .saturating_mul(75 + jitter)
+        .checked_div(100)
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Hand-rolled xorshift64* RNG (issue #571). No `rand` crate
+/// dependency — `edge-cli` already pulls `getrandom` transitively
+/// through `uuid` for v4 generation, so adding `rand` would
+/// expand the dependency tree for one jitter call site.
+///
+/// State is a `static AtomicU64` seeded on first call from
+/// `SystemTime::now()` nanoseconds (high-entropy, only used once
+/// per process lifetime). The state is updated with a
+/// fetch-update loop (CAS) so concurrent retry sleeps don't
+/// trample each other's state — but the CLI is single-threaded
+/// for retry purposes today, so this is belt-and-braces.
+/// Period is 2^64 − 1 ≈ 1.8e19, ample for a CLI that runs for
+/// seconds-to-minutes.
+fn xorshift_uniform_u64() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static STATE: OnceLock<AtomicU64> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xCAFE_BABE_DEAD_BEEF);
+        // Avoid the all-zero fixed point of xorshift (it would
+        // always return 0). `seed | 1` guarantees the LSB is set.
+        AtomicU64::new(seed | 1)
+    });
+
+    // xorshift64*: state is the value itself; output is the
+    // state × a Weyl-sequence constant. CAS the new state back
+    // in; retry if a concurrent caller raced us. The retry
+    // path is harmless — each iteration just re-derives from
+    // the current state value, so callers may see slightly
+    // older numbers under contention but the distribution
+    // stays uniform.
+    //
+    // CRITICAL: CAS the *original* loaded state value, not the
+    // shifted one. Mutating `x` via `^=` before the CAS would
+    // make `expected` diverge from the memory value, so the CAS
+    // fails on every iteration and the loop spins forever (the
+    // exact symptom this function used to have — issue #571).
+    let mut x = state.load(Ordering::Relaxed);
+    loop {
+        let original = x;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let next = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        match state.compare_exchange_weak(original, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => x = actual,
+        }
+    }
 }
 
 /// Activate a previously-stored deployment by ID (e.g. from `edge migrate`).
