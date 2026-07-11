@@ -21,3 +21,11 @@ pub mod rollback;
 pub(crate) mod state_io;
 pub mod status;
 pub mod traffic;
+
+/// Shared retry loop for transient-failure mutations across the
+/// CLI (issue #571 propagation follow-up). Lifts the loop, the
+/// classifier, and the backoff math out of `commands::deploy.rs`
+/// into a single module so other mutation endpoints (`env delete`,
+/// `traffic set`, `keys revoke`, `domains remove`, `egress set`, …)
+/// route through one canonical home.
+pub mod retry;
