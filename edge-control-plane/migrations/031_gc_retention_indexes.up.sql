@@ -31,7 +31,7 @@
 -- 014/015/012 pattern. Non-concurrent CREATE INDEX on an empty table
 -- is instant, but on a multi-million-row table it holds a SHARE lock
 -- on the table for the build duration (minutes at scale) and will
--- block INSERTs and UPDATEs against that table. If any of the three
+-- block INSERTs and updates against that table. If any of the three
 -- tables above exceeds ~1M rows at deploy time on a given environment,
 -- run this migration during a low-traffic window — or schedule it as
 -- a manual operator step (`psql -f`) before bringing up the new
