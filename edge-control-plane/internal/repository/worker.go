@@ -190,6 +190,52 @@ func (r *WorkerRepository) GetAppStatus(ctx context.Context, tenantID, appName s
 	return &row, nil
 }
 
+// TenantsHostedBy returns the deduplicated set of tenant IDs this
+// worker is currently hosting (issue #491 constraint #2). A tenant
+// counts as "hosted" iff its tenant_id appears in worker_status.apps
+// with status = 'running' — crashed / hung / stopping entries are
+// excluded. A worker whose heartbeat hasn't landed yet (no
+// worker_status row, or empty apps) returns ([]string{}, nil).
+//
+// The JOIN to workers (rather than worker_status alone) is intentional:
+// a worker_status row whose workers row has been GC'd (WorkerGC) must
+// not leak stale hosting data. Mirrors the join shape used by
+// ListRunningAppTarget and GetAppStatus so all three queries agree on
+// "what counts as a live worker".
+//
+// DISTINCT collapses duplicates at the SQL layer; we additionally
+// dedupe in Go to keep the result stable across drivers (sqlmock
+// returns raw rows without applying DISTINCT).
+func (r *WorkerRepository) TenantsHostedBy(ctx context.Context, workerID string) ([]string, error) {
+	const query = `
+		SELECT DISTINCT apps.value->>'tenant_id' AS tenant_id
+		FROM workers
+		JOIN worker_status ON worker_status.worker_id = workers.id
+		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps
+		WHERE workers.id = $1
+		  AND apps.value->>'tenant_id' IS NOT NULL
+		  AND apps.value->>'status'     = 'running'`
+	var rows []struct {
+		TenantID string `db:"tenant_id"`
+	}
+	if err := r.db.SelectContext(ctx, &rows, query, workerID); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.TenantID == "" {
+			continue
+		}
+		if _, ok := seen[row.TenantID]; ok {
+			continue
+		}
+		seen[row.TenantID] = struct{}{}
+		out = append(out, row.TenantID)
+	}
+	return out, nil
+}
+
 func (r *WorkerRepository) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (wasCreated bool, err error) {
 	memoryMB := req.MemoryMB
 	if memoryMB == 0 {

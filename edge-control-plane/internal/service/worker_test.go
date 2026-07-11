@@ -29,6 +29,7 @@ type mockWorkerRepo struct {
 	listRunningAppTargetFunc func(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 	getAppStatusFunc         func(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
 	getByIDFunc              func(ctx context.Context, id string) (*domain.Worker, error)
+	tenantsHostedByFunc      func(ctx context.Context, workerID string) ([]string, error)
 }
 
 func (m *mockWorkerRepo) Upsert(ctx context.Context, tenantID string, req *domain.RegisterWorkerRequest) (bool, error) {
@@ -72,6 +73,12 @@ func (m *mockWorkerRepo) GetByID(ctx context.Context, id string) (*domain.Worker
 		return nil, nil
 	}
 	return m.getByIDFunc(ctx, id)
+}
+func (m *mockWorkerRepo) TenantsHostedBy(ctx context.Context, workerID string) ([]string, error) {
+	if m.tenantsHostedByFunc == nil {
+		return nil, nil
+	}
+	return m.tenantsHostedByFunc(ctx, workerID)
 }
 
 func (m *mockWorkerRepo) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
@@ -925,6 +932,62 @@ func captureLogger(t *testing.T) (*bytes.Buffer, func()) {
 	return buf, func() {
 		log.SetOutput(prev)
 		log.SetFlags(prevFlags)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TenantsHostedBy pass-through (issue #491 constraint #2)
+// ---------------------------------------------------------------------------
+
+// TestWorkerService_TenantsHostedBy_PassThrough pins the service
+// layer's pass-through to the repo: the service adds no logic, so the
+// handler can rely on the repo result being returned unchanged. A
+// future refactor that adds caching or memoization at the service
+// layer must update this test.
+func TestWorkerService_TenantsHostedBy_PassThrough(t *testing.T) {
+	called := false
+	wr := &mockWorkerRepo{
+		tenantsHostedByFunc: func(_ context.Context, workerID string) ([]string, error) {
+			called = true
+			if workerID != "w_us_fra_1" {
+				t.Errorf("repo got workerID=%q, want w_us_fra_1", workerID)
+			}
+			return []string{"t_a", "t_b"}, nil
+		},
+	}
+	svc := workerSvcForTest(wr, &mockQuotaRepo{})
+
+	got, err := svc.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err != nil {
+		t.Fatalf("TenantsHostedBy: %v", err)
+	}
+	if !called {
+		t.Fatal("repo method was not invoked")
+	}
+	if len(got) != 2 || got[0] != "t_a" || got[1] != "t_b" {
+		t.Errorf("got %v, want [t_a t_b]", got)
+	}
+}
+
+// TestWorkerService_TenantsHostedBy_PropagatesError ensures the
+// service layer does not swallow repo errors — the handler depends on
+// the error to return 500 (fail-closed) instead of incorrectly 403-ing
+// every tenant when the DB is down.
+func TestWorkerService_TenantsHostedBy_PropagatesError(t *testing.T) {
+	sentinel := errors.New("db unavailable")
+	wr := &mockWorkerRepo{
+		tenantsHostedByFunc: func(_ context.Context, _ string) ([]string, error) {
+			return nil, sentinel
+		},
+	}
+	svc := workerSvcForTest(wr, &mockQuotaRepo{})
+
+	_, err := svc.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err == nil {
+		t.Fatal("expected error to propagate")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("got err=%v, want errors.Is(%v)", err, sentinel)
 	}
 }
 

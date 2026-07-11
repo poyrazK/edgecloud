@@ -165,6 +165,120 @@ func TestWorkerRepository_GetAppStatus_NotFound(t *testing.T) {
 	}
 }
 
+// TestWorkerRepository_TenantsHostedBy_Single pins the happy path: one
+// app row, one tenant, returns a one-element slice. Verifies the SQL
+// filter (`status = 'running'`) and the result decoder wiring.
+func TestWorkerRepository_TenantsHostedBy_Single(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"tenant_id"}).
+		AddRow("t_a")
+	mock.ExpectQuery(`SELECT DISTINCT apps\.value->>'tenant_id'`).
+		WithArgs("w_us_fra_1").
+		WillReturnRows(rows)
+
+	got, err := repo.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err != nil {
+		t.Fatalf("TenantsHostedBy: %v", err)
+	}
+	if len(got) != 1 || got[0] != "t_a" {
+		t.Errorf("got %v, want [t_a]", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_TenantsHostedBy_Multiple pins DISTINCT
+// collapsing: the SQL returns three raw rows (with a duplicate), the
+// repo returns a two-element slice. The duplicate tenant_id must
+// appear only once.
+func TestWorkerRepository_TenantsHostedBy_Multiple(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"tenant_id"}).
+		AddRow("t_a").
+		AddRow("t_b").
+		AddRow("t_a")
+	mock.ExpectQuery(`SELECT DISTINCT apps\.value->>'tenant_id'`).
+		WithArgs("w_us_fra_1").
+		WillReturnRows(rows)
+
+	got, err := repo.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err != nil {
+		t.Fatalf("TenantsHostedBy: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d tenants, want 2 (DISTINCT must collapse)", len(got))
+	}
+	set := map[string]bool{}
+	for _, x := range got {
+		set[x] = true
+	}
+	if !set["t_a"] || !set["t_b"] {
+		t.Errorf("got %v, want set{t_a, t_b}", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_TenantsHostedBy_Empty pins the no-rows path:
+// the worker has either no worker_status row at all, or an empty apps
+// JSONB. The repo must return ([]string{}, nil), not nil — the
+// handler iterates the slice, ranging over nil is a no-op but a
+// caller doing `len(hosted)` would get 0 either way; the slice
+// non-nil invariant is a defensive shape only.
+func TestWorkerRepository_TenantsHostedBy_Empty(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT DISTINCT apps\.value->>'tenant_id'`).
+		WithArgs("w_us_fra_1").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}))
+
+	got, err := repo.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err != nil {
+		t.Fatalf("TenantsHostedBy: %v", err)
+	}
+	if got == nil {
+		t.Errorf("got nil, want empty slice (handler relies on non-nil for range)")
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_TenantsHostedBy_NoWorkerStatusRow pins the
+// "JOIN returns no rows" path: a worker has been registered (so the
+// `workers` row exists) but has never heartbeated (no `worker_status`
+// row). The repo must return ([]string{}, nil) — NOT propagate a DB
+// error. The handler maps this empty slice to 403 for any tenant.
+func TestWorkerRepository_TenantsHostedBy_NoWorkerStatusRow(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT DISTINCT apps\.value->>'tenant_id'`).
+		WithArgs("w_us_fra_1").
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id"}))
+
+	got, err := repo.TenantsHostedBy(context.Background(), "w_us_fra_1")
+	if err != nil {
+		t.Fatalf("TenantsHostedBy: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("got %v, want empty (no worker_status row)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
 // TestWorkerRepository_GetAppStatus_PicksLatestHeartbeat pins the
 // ORDER BY / LIMIT 1 clause: when multiple workers in different
 // regions have reported on the same app, the repo returns the
