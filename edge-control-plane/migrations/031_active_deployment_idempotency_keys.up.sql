@@ -28,5 +28,3 @@ CREATE TABLE IF NOT EXISTS active_deployment_idempotency_keys (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (tenant_id, idempotency_key)
 );
-CREATE INDEX IF NOT EXISTS idx_active_deployment_idempotency_keys_deployment_id
-    ON active_deployment_idempotency_keys (deployment_id);
