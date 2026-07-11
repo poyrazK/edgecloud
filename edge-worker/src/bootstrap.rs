@@ -129,6 +129,48 @@ impl BootstrapClient {
         }
     }
 
+    /// Build the HMAC-SHA256 payload for phase 1.
+    ///
+    /// Wire format (issue #430):
+    ///
+    /// ```text
+    /// worker_id:region:tenant_id:timestamp:nonce:public_key
+    /// ```
+    ///
+    /// Field order is load-bearing: the CP (`internal/handler/internal.go`)
+    /// reconstructs the same string verbatim before HMAC verification.
+    /// Adding/removing fields requires a coordinated change to both
+    /// sides — keeping this in a single helper means the wire shape is
+    /// defined once on the worker and the test stubs (Phase1Echo) reuse
+    /// it for echo-style assertions.
+    ///
+    /// Visible to the `mod tests` block as `Self::phase1_payload` so
+    /// the wire-format mock can re-derive the same string.
+    pub(crate) fn phase1_payload(
+        worker_id: &str,
+        region: &str,
+        tenant_id: &str,
+        timestamp: &str,
+        nonce: &str,
+        public_key_hex: &str,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            worker_id, region, tenant_id, timestamp, nonce, public_key_hex
+        )
+    }
+
+    /// RFC3339 timestamp for the phase-1 payload. Centralized so a
+    /// future precision tweak (e.g. nanoseconds) only changes one site.
+    fn rfc3339_now() -> String {
+        // chrono::Utc::now().to_rfc3339_opts captures the RFC3339 format
+        // and sub-second precision in one shot. We deliberately don't
+        // use SystemTime directly because the CP-side timestamp parser
+        // (time.Parse(time.RFC3339, ...)) accepts chrono's output
+        // without modification.
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
     /// Run the full bootstrap handshake.
     ///
     /// `identity` is the worker's long-lived Ed25519 keypair. Its
@@ -185,14 +227,18 @@ impl BootstrapClient {
         let timestamp = Self::rfc3339_now();
         let nonce = Uuid::new_v4().to_string();
 
-        // Build the payload to sign:
+        // Build the payload to sign (format defined by phase1_payload):
         //   worker_id:region:tenant_id:timestamp:nonce:public_key
         // The CP's HMAC verification computes the same string and
         // checks it byte-for-byte — adding `public_key` here is the
         // single wire-level change to phase 1 vs the pre-#430 shape.
-        let payload = format!(
-            "{}:{}:{}:{}:{}:{}",
-            self.worker_id, self.region, self.tenant_id, timestamp, nonce, public_key_hex
+        let payload = Self::phase1_payload(
+            &self.worker_id,
+            &self.region,
+            &self.tenant_id,
+            &timestamp,
+            &nonce,
+            public_key_hex,
         );
 
         // Compute HMAC-SHA256 signature.
@@ -350,13 +396,6 @@ impl BootstrapClient {
             public_key_hex: data.public_key_hex,
         })
     }
-
-    /// Return the current time as an RFC 3339 string.
-    fn rfc3339_now() -> String {
-        // Use chrono if available, otherwise use manual formatting.
-        // The worker already has chrono in its dependency tree.
-        chrono::Utc::now().to_rfc3339()
-    }
 }
 
 #[cfg(test)]
@@ -380,8 +419,7 @@ mod tests {
     impl Respond for Phase1Echo {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             let body: serde_json::Value = serde_json::from_slice(&req.body).expect("phase1 json");
-            let payload = format!(
-                "{}:{}:{}:{}:{}:{}",
+            let payload = BootstrapClient::phase1_payload(
                 body["worker_id"].as_str().unwrap_or(""),
                 body["region"].as_str().unwrap_or(""),
                 body["tenant_id"].as_str().unwrap_or(""),
