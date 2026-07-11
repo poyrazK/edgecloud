@@ -214,6 +214,14 @@ func TestWebhookDeliveryGC_NegativeRetentionRefusesToRun(t *testing.T) {
 	}
 }
 
+// Timing note: this test depends on `Run` reading `ctx.Err()`
+// synchronously before the first tick — the pre-cancelled ctx is
+// observed by `runOnce` (or by the loopHealth boundary above it)
+// immediately, so the goroutine returns before `DeleteOlderThanBatched`
+// is ever invoked. If `Run` ever grows a pre-loop blocking call
+// (e.g. a warm-up query) this test will start to deadlock instead of
+// short-circuiting, and the assertion below would need to learn to
+// tolerate it.
 func TestWebhookDeliveryGC_PreemptsOnCancelledContext(t *testing.T) {
 	repo := &mockWebhookDeliveryGCRepo{}
 	svc := NewWebhookDeliveryGCService(repo, nil)
@@ -267,4 +275,66 @@ func TestWebhookDeliveryGC_NilSink_NoPanic(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	cancel()
 	<-done
+}
+
+// mockWebhookDeliveryGCRepoWithCounting returns a stateful repo that
+// simulates (firstN rows, ok) → (zeroN rows, ok) across successive
+// calls. Mirrors mockLogGCRepoWithCounting (log_gc_test.go:337-368) —
+// same shape, different interface.
+type mockWebhookDeliveryGCRepoWithCounting struct {
+	mu     sync.Mutex
+	calls  int
+	firstN int64
+	zeroN  int64
+}
+
+func (m *mockWebhookDeliveryGCRepoWithCounting) DeleteOlderThanBatched(_ context.Context, _ time.Duration, _, _ int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	if m.calls == 1 {
+		return m.firstN, nil
+	}
+	return m.zeroN, nil
+}
+
+func (m *mockWebhookDeliveryGCRepoWithCounting) callCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+// TestWebhookDeliveryGC_RecordsMetrics_TickCountEqualsSweepCount: a
+// healthy repo (0 rows, no errors) records one sink call per sweep —
+// guards against a regression where the sink fires twice (or zero
+// times) per sweep tick.
+func TestWebhookDeliveryGC_RecordsMetrics_TickCountEqualsSweepCount(t *testing.T) {
+	repo := &mockWebhookDeliveryGCRepoWithCounting{firstN: 0, zeroN: 0}
+	sink, rec := makeRecordingWebhookDeliverySink()
+	svc := NewWebhookDeliveryGCService(repo, sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		svc.Run(ctx, 30*time.Millisecond, 1*time.Hour)
+	}()
+	time.Sleep(120 * time.Millisecond)
+	cancel()
+	time.Sleep(20 * time.Millisecond)
+
+	sweeps := repo.callCount()
+	if sweeps < 3 {
+		t.Errorf("repo.callCount = %d, want >= 3", sweeps)
+	}
+	if got := rec.callCount(); got != sweeps {
+		t.Errorf("sink call count = %d, want %d (one sink call per sweep)", got, sweeps)
+	}
+	for i, c := range rec.calls {
+		if c.rowsDeleted != 0 {
+			t.Errorf("sink call[%d] rowsDeleted = %d, want 0", i, c.rowsDeleted)
+		}
+		if c.hadError {
+			t.Errorf("sink call[%d] hadError = true, want false on healthy repo", i)
+		}
+	}
 }

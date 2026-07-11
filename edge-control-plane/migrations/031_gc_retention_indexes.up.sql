@@ -25,6 +25,18 @@
 -- (webhook_deliveries), 012_autoscale_events. Sister services:
 -- service/audit_gc.go, service/webhook_delivery_gc.go,
 -- service/autoscale_event_gc.go (issue #574).
+--
+-- Lock note (non-CONCURRENTLY): the CREATE INDEX statements here are
+-- deliberately NOT `CREATE INDEX CONCURRENTLY`, matching the existing
+-- 014/015/012 pattern. Non-concurrent CREATE INDEX on an empty table
+-- is instant, but on a multi-million-row table it holds a SHARE lock
+-- on the table for the build duration (minutes at scale) and will
+-- block INSERTs and UPDATEs against that table. If any of the three
+-- tables above exceeds ~1M rows at deploy time on a given environment,
+-- run this migration during a low-traffic window — or schedule it as
+-- a manual operator step (`psql -f`) before bringing up the new
+-- control-plane binary. The retention sweep itself only requires the
+-- index to exist; it does not care when the index was built.
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at
     ON audit_logs (created_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_created_at
