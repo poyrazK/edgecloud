@@ -614,6 +614,7 @@ mod tests {
             resident_seconds: None,
             observer_metrics: vec![],
             last_error: None,
+            duration_ms_total: 0,
         }
     }
 
