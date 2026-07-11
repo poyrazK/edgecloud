@@ -25,8 +25,9 @@
 //! (1) ↔ (2) is guarded by `wit-drift-check` CI. (1) ↔ (3) is set at
 //! compile time via the `build.rs` rerun hook — when `wit/` changes,
 //! the CLI rebuilds and the new embed is picked up automatically.
-//! Detecting the CLI binary's embed drift from `wit/` is a known
-//! follow-up; filed separately.
+//! `wit_embed_matches_canonical_wit_tree` (below) re-asserts the
+//! (1) ↔ (3) match at every `cargo test` run as part of the existing
+//! `rust-test` job — so a CI merge cannot ship with a stale embed.
 //!
 //! Related memory: `wit-canonical-location`.
 
@@ -219,5 +220,141 @@ mod tests {
             after, b"BOGUS",
             "write_wit_tree must NOT overwrite a pre-existing <project>/wit/"
         );
+    }
+
+    /// Walk the canonical `wit/` tree on disk and verify every file's
+    /// bytes match the corresponding entry in `WIT_TREE` byte-for-byte.
+    ///
+    /// This guards the third WIT copy (the CLI binary's `include_dir!`
+    /// embed, see the module-level doc) against the same drift that's
+    /// already guarded for the Go control plane's vendored copy by
+    /// `wit-drift-check` CI. Without this test the binary on a
+    /// developer's machine can silently carry yesterday's embed:
+    /// `edge init --lang=rust` writes stale WIT into the scaffolded
+    /// project, the user's build fails the wasmtime linker match
+    /// (issue #576 follow-up #592), and the failure is far from the
+    /// cause.
+    ///
+    /// The test runs against a test binary that cargo rebuilt after
+    /// any `wit/` edit (via `build.rs`'s `cargo:rerun-if-changed=../wit`),
+    /// so a passing assertion here confirms the most recent CLI build
+    /// had a fresh embed. On a stale binary — one built before a `wit/`
+    /// edit was committed — the assertion fails and points the operator
+    /// at the rebuild command.
+    #[test]
+    fn wit_embed_matches_canonical_wit_tree() {
+        let canonical_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../wit");
+        diff_against_disk(&canonical_root, &WIT_TREE)
+            .expect("WIT_TREE embed matches canonical wit/");
+    }
+
+    /// Counterpart to `wit_embed_matches_canonical_wit_tree`: lock the
+    /// negative contract. Materializes the embed to a tempdir via
+    /// `write_wit_tree`, mutates one file, and asserts `diff_against_disk`
+    /// returns `Err` naming the drifted file and the rebuild command.
+    /// Without this, the negative path is "the operator manually edited
+    /// `wit/`" — never exercised in CI.
+    #[test]
+    fn wit_embed_drift_detected_with_tampered_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path();
+
+        // Write the embed to disk so the byte comparison has a real
+        // disk tree to compare against.
+        crate::scaffold::wit::write_wit_tree(project).expect("first write");
+
+        // Tamper one file in place — drop a known-bogus byte in.
+        let target = project.join("wit/edge-cloud.wit");
+        std::fs::write(&target, b"// drifted from canonical\n").expect("tamper");
+
+        let err = diff_against_disk(&project.join("wit"), &WIT_TREE)
+            .expect_err("drifted tree must fail the check");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("edge-cloud.wit") || msg.contains("stale"),
+            "drift error must name the drifted file or its state; got: {msg}"
+        );
+        assert!(
+            msg.contains("cargo install --path edge-cli --locked"),
+            "drift error must point at the rebuild command; got: {msg}"
+        );
+    }
+
+    /// Counterpart to the above: if the embed references a file that
+    /// has been removed from the canonical tree (e.g. a `.wit` got
+    /// renamed and the stale binary still carries it), the diff must
+    /// bail with a clear error rather than silently passing or panicking.
+    #[test]
+    fn wit_embed_missing_on_disk_surfaces_read_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path();
+
+        crate::scaffold::wit::write_wit_tree(project).expect("first write");
+
+        // Delete a file the embed expects — simulates the canonical
+        // tree having moved on while this binary's embed hasn't.
+        let target = project.join("wit/edge-cloud.wit");
+        std::fs::remove_file(&target).expect("remove file");
+
+        let err = diff_against_disk(&project.join("wit"), &WIT_TREE)
+            .expect_err("missing file must fail the check");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("edge-cloud.wit"),
+            "missing-file error must name the absent file; got: {msg}"
+        );
+        assert!(
+            msg.contains("cargo install --path edge-cli --locked"),
+            "missing-file error must point at the rebuild command; got: {msg}"
+        );
+    }
+
+    /// Recursive byte-comparison helper used by the three tests
+    /// above. Mirrors `write_dir` (same embed-rooted-path gotcha:
+    /// `DirEntry::Dir::path()` is embed-rooted, so the `Dir` arm
+    /// recurses with the leaf-name; the `File` arm `strip_prefix`-es
+    /// to the leaf-relative relpath). Returns `Err(anyhow::Error)`
+    /// on the first drifted or missing file.
+    fn diff_against_disk(disk_root: &Path, embed: &Dir) -> Result<()> {
+        for entry in embed.entries() {
+            match entry {
+                DirEntry::Dir(sub) => {
+                    let name = sub.path().file_name().ok_or_else(|| {
+                        anyhow::anyhow!("embed DirEntry::Dir has no leaf name: {:?}", sub.path())
+                    })?;
+                    diff_against_disk(&disk_root.join(name), sub)?;
+                }
+                DirEntry::File(f) => {
+                    let rel = f
+                        .path()
+                        .strip_prefix(embed.path())
+                        .unwrap_or(f.path())
+                        .to_path_buf();
+                    let on_disk_path = disk_root.join(&rel);
+                    let canonical_rel = f.path().to_string_lossy().into_owned();
+                    let rebuild_hint = "rebuild with `cargo install --path edge-cli --locked` \
+                                        to refresh the embed";
+                    let on_disk = std::fs::read(&on_disk_path).map_err(|e| {
+                        anyhow::anyhow!(
+                            "WIT_TREE embed references {canonical_rel:?} (looked at {}) but \
+                             the canonical tree has no matching file (read error: {e}). \
+                             This usually means `wit/` was edited after the CLI was built; \
+                             {rebuild_hint}.",
+                            on_disk_path.display()
+                        )
+                    })?;
+                    let embedded = f.contents();
+                    if on_disk.as_slice() != embedded {
+                        return Err(anyhow::anyhow!(
+                            "WIT_TREE embed of {canonical_rel:?} is stale — the canonical `wit/` \
+                             tree at {} has different bytes than what the CLI binary embedded \
+                             at compile time. {rebuild_hint}.",
+                            on_disk_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/billing/stripe"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/cache"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/loophealth"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
@@ -81,6 +82,15 @@ type App struct {
 	// a 30s claimed_until window on each claimed row.
 	OutboxDrainer *service.OutboxDrainer
 
+	// MeteringDrainer (issue #485) relays metering-ledger rows from
+	// `billing_usage_events` to the configured MeteringProvider.
+	// Multi-instance safe via FOR UPDATE SKIP LOCKED + processed_at
+	// stamping. The drainer is the SOLE caller of
+	// MeteringProvider.RecordUsage; the heartbeat pipeline only writes
+	// to billing_usage_events (Commit 4 of this PR adds that
+	// dual-write call site).
+	MeteringDrainer *service.MeteringDrainer
+
 	// loopHealth tracks liveness of every background goroutine spawned
 	// by RunBackground (heartbeat, log_gc, reconcile, worker_gc,
 	// deployment_gc, autoscale). It also drives the per-loop map on
@@ -138,6 +148,11 @@ func New(
 	// active_deployments mutation; the OutboxDrainer (below) relays
 	// them after commit.
 	outboxRepo := repository.NewOutboxRepository(db)
+	// BillingUsageRepository (issue #485): the metering ledger the
+	// heartbeat pipeline dual-writes into. The MeteringDrainer
+	// (constructed further down) reads from this repo via the same
+	// *sqlx.DB instance.
+	meteringRepo := repository.NewBillingUsageRepository(db)
 
 	// ── Services ──────────────────────────────────────────────────
 	// Load the Ed25519 signing keyring (issue #307 PR1). The config
@@ -154,14 +169,15 @@ func New(
 		log.Printf("WARNING: EDGE_SIGNING_KEY_ID is empty; rotation semantics will be ambiguous. Set a logical key id (e.g. \"k1\") before shipping rotation code.")
 	}
 
-	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo)
+	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo, appRepo, outboxRepo, cfg.Region)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(
 		db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo,
+		outboxRepo, cfg.Region,
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
-		quotaRepo, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
+		quotaRepo, repository.NewMemoryQuotaRepository, tenantRepo, outboxRepo, artifactStore, publisher, cfg.Region, keyring,
 	)
 	// OutboxDrainer (issue #42): the SOLE caller of
 	// Publisher.PublishTaskUpdate for `task_update` messages. Tunable
@@ -194,7 +210,7 @@ func New(
 	// struct (issue #443 review findings #3 and #4).
 	loopHealth := newLoopHealth()
 	workerSvc := service.NewWorkerService(
-		db, workerRepo, quotaRepo, activeDeploymentRepo, tenantRepo,
+		db, workerRepo, quotaRepo, meteringRepo, activeDeploymentRepo, tenantRepo,
 		publisher.Conn(), stableWindowFromEnv(), metricsAgg,
 		loopHealth,
 	)
@@ -285,6 +301,23 @@ func New(
 		cfg.Billing.SuccessURL, cfg.Billing.CancelURL,
 	)
 	billingHandler := handler.NewBillingHandler(billingSvc)
+
+	// Metering provider + drainer (issue #485). Sibling to the
+	// BillingProvider above — same factory shape, different lifecycle
+	// (fire-and-record vs request/response). The drainer ticks at
+	// cfg.Billing.Metering.IntervalS (default 30s = heartbeat cadence)
+	// and claims up to cfg.Billing.Metering.BatchSize rows per tick.
+	// Rate card zero-fallback happens inside the drainer itself, so a
+	// fresh install with no METERING_RATE_* env vars is fully
+	// billing-neutral out of the box.
+	meteringProvider := newMeteringProvider(cfg.Billing)
+	meteringDrainer := service.NewMeteringDrainer(
+		meteringRepo, meteringProvider,
+		time.Duration(cfg.Billing.Metering.IntervalS)*time.Second,
+		cfg.Billing.Metering.BatchSize,
+		cfg.Billing.Metering.MaxAttempts,
+		cfg.Billing.Metering.Rates,
+	)
 
 	migrationHandler := handler.NewMigrationHandler(migrationSvc)
 	logSvc := service.NewLogService(logEntryRepo)
@@ -738,10 +771,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 			func() int { return cfg.CacheRetry.MaxAttempts },
 			metricsAgg.NewCacheRetrySweepSink(),
 		),
-		DeploymentSvc: deploymentSvc,
-		AutoscaleSvc:  autoscaleSvc,
-		OutboxDrainer: outboxDrainer,
-		loopHealth:    loopHealth,
+		DeploymentSvc:   deploymentSvc,
+		AutoscaleSvc:    autoscaleSvc,
+		OutboxDrainer:   outboxDrainer,
+		MeteringDrainer: meteringDrainer,
+		loopHealth:      loopHealth,
 
 		// Captured at construction; see the field doc for why we
 		// don't use a getter closure like the pusher / region map.
@@ -864,6 +898,16 @@ func (a *App) RunBackground(ctx context.Context) {
 	// replicas just for the drainer is fine.
 	a.loopHealth.Run(ctx, "outbox_drainer", "outbox_drainer: ", logPrintf, func(c context.Context) {
 		a.OutboxDrainer.Run(c)
+	})
+
+	// Metering drainer (issue #485). Mirrors the outbox drainer's
+	// loop shape: claims a batch, dispatches each row through the
+	// configured MeteringProvider, marks processed. Rate-card
+	// zero-fallback happens inside the drainer's processRow so a
+	// fresh install with empty Rates ticks cleanly without dispatch.
+	// On a fresh install with no rows, Tick is a no-op — no log noise.
+	a.loopHealth.Run(ctx, "metering_drainer", "metering_drainer: ", logPrintf, func(c context.Context) {
+		a.MeteringDrainer.Run(c)
 	})
 
 	// Cluster autoscaler (issue #85). No-op when cfg.Autoscale.Enabled
@@ -995,5 +1039,39 @@ func newBillingProvider(cfg config.BillingConfig) billing.BillingProvider {
 		// "noop" or empty (defaulted to "noop" by validateBillingConfig
 		// in dev|test environments).
 		return noop.New()
+	}
+}
+
+// newMeteringProvider mirrors newBillingProvider above but selects a
+// MeteringProvider. The MeteringProvider seam is separate from the
+// BillingProvider seam because their lifecycles differ (fire-and-
+// record vs request/response) — see internal/billing/metering_provider.go
+// for the full rationale.
+//
+// Note: unlike newBillingProvider, this factory does NOT fail-closed
+// when metering.provider=stripe but no MeterSubscriptionItemIDs are
+// configured. The metering path is opt-in per dimension — an operator
+// who enables Stripe metering but forgets to wire IDs gets a
+// per-row terminal log + MarkProcessed (so the row stops cycling)
+// rather than a process-level crash. The `subscribed` test will
+// catch the config gap; the production path keeps serving traffic.
+func newMeteringProvider(cfg config.BillingConfig) billing.MeteringProvider {
+	switch cfg.Metering.Provider {
+	case "stripe":
+		meterEventNames := map[domain.MeterKind]string{}
+		for k, v := range cfg.Metering.MeterEventNames {
+			meterEventNames[domain.MeterKind(k)] = v
+		}
+		return stripe.NewMetering(billing.StripeConfig{
+			SecretKey: cfg.Stripe.SecretKey,
+			// WebhookSecret / PublishableKey / PriceIDs are not
+			// used by the metering path; left blank. This keeps the
+			// constructor happy without exposing them via env on
+			// the metering-only install shape.
+			MeterSubscriptionItemIDs: cfg.Metering.SubscriptionItemIDs,
+		}, meterEventNames)
+	default:
+		// "noop" or empty (no production gate — metering is opt-in).
+		return noop.NewMetering()
 	}
 }

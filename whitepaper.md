@@ -616,6 +616,18 @@ Streams are configured with:
 }
 ```
 
+**TaskPurge** (published by CP → NATS): Tombstone for per-tenant KV/cache/scheduling data (issue #569). Distinct `type` discriminator on the same `edgecloud.tasks.<region>` subject. Workers stop matching apps (drains in-flight requests), then call `edge_runtime::runtime::purge_tenant` which removes the in-memory registry entry + on-disk directories. Empty `app_name` is reserved for tenant-wide variants — current code always sets it.
+```json
+{
+  "type": "task_purge",
+  "timestamp": "2026-07-10T12:00:00Z",
+  "tenant_id": "t_abc123",
+  "app_name": "my-service",
+  "reason": "app_deleted"
+}
+```
+`reason` is `"app_deleted"` (per-app purge) or `"tenant_offboarded"` (per-tenant purge, enqueued once per app).
+
 **HeartbeatMessage** (published by Worker → NATS):
 ```json
 {
@@ -627,11 +639,23 @@ Streams are configured with:
     "my-service": {
       "deployment_id": "d_xyz789",
       "status": "running",
-      "exit_code": 0
+      "exit_code": 0,
+      "request_count": 12,
+      "outbound_bytes": 4096,
+      "resident_seconds": 30,
+      "dedupe_id": "w_fra_abc123:d_xyz789:1750000800",
+      "last_error": null
     }
   }
 }
 ```
+
+**Field notes** (issues #418, #484, #485):
+
+- `request_count` and `outbound_bytes` — per-interval deltas for the request-count and outbound-bytes metered dimensions (issue #419/#420 quota hot path).
+- `resident_seconds` — `null` for Handler (FaaS) apps; an integer for LongRunning apps representing seconds resident in the last heartbeat interval (issue #484). `Some(0)` and `null` are distinct on the wire: the former means "an LR app that started within the current interval"; the latter means "an FaaS app, which contributes nothing to this dimension."
+- `dedupe_id` — stable `(worker_id, deployment_id, 30s_bucket)` token the control plane uses to skip re-applying the same delta on JetStream redelivery or reconcile replay (issue #418).
+- `last_error` — string if the app transitioned to `Crashed`/`Errored` in the last interval; `null` for `running`.
 
 ---
 

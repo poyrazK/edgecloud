@@ -50,8 +50,7 @@ where
 
 /// TaskMessage: received via NATS on `edgecloud.tasks.<region>`.
 ///
-/// Two variants share the same `apps` payload shape but carry different
-/// semantics:
+/// Three variants:
 ///
 /// * `task_update` — published when an app set changes (activate / rollback /
 ///   env edit). Workers diff against current state.
@@ -62,8 +61,16 @@ where
 ///   any whose `deployment_id` doesn't match. Closes the gap when a NATS
 ///   `task_update` is lost (workqueue `WorkQueuePolicy` has no replay
 ///   support — see issue #53).
+/// * `task_purge` — issued by the control plane when a tenant's data
+///   lifecycle ends (issue #569). The carrier is an explicit tombstone,
+///   NOT the absence of an app from a `task_update`/`full_sync` —
+///   stop / crash / rebalance must never delete per-tenant persistent
+///   state. The worker drains the in-flight apps for the tenant first,
+///   then calls `edge_runtime::runtime::purge_tenant` to remove the
+///   KV / cache / scheduler dirs and in-memory registry entries.
 ///
-/// Both variants use the same handler logic; the only difference is the
+/// The first two variants share the same `apps` payload shape but carry
+/// different semantics; the only difference between them is the
 /// observability hook (`reconcile_full_sync_total` counter) so an operator
 /// can distinguish a scheduled sync from an event-driven update in metrics.
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +90,41 @@ pub enum TaskMessage {
         tenant_id: String,
         apps: HashMap<String, AppSpec>,
     },
+    #[serde(rename = "task_purge")]
+    TaskPurge {
+        #[allow(dead_code)]
+        timestamp: String,
+        tenant_id: String,
+        /// Per-app purge when set; tenant-wide purge when empty (every
+        /// app currently running for `tenant_id` is stopped before the
+        /// per-tenant dirs are removed). Today the CP enqueues per-app
+        /// rows (`AppService.Delete`) AND per-app rows for each app
+        /// inside `TenantService.DeleteTenant`; the empty-string form
+        /// is kept for forward-compat with a future "tenant-wide"
+        /// single-publish optimization.
+        #[serde(default)]
+        #[allow(dead_code)] // consumed by Commit 3 handle_purge
+        app_name: String,
+        #[allow(dead_code)] // consumed by Commit 3 handle_purge
+        reason: PurgeReason,
+    },
+}
+
+/// Why a `task_purge` was issued (issue #569). The worker logs this for
+/// audit but does NOT act on it — the stop-then-purge behavior is the same
+/// regardless of which entry point fired. Defined here (rather than in
+/// the edge-runtime crate) because the worker is the only consumer and
+/// it lives in this crate.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PurgeReason {
+    /// `DELETE /api/v1/admin/apps/{appName}` — a single app was removed.
+    AppDeleted,
+    /// `DELETE /api/v1/admin/tenants/{id}` — the entire tenant was
+    /// offboarded. The CP enqueues one `task_purge` per app, so the
+    /// worker still sees the per-app shape; this reason just records
+    /// the upstream cause.
+    TenantOffboarded,
 }
 
 /// DeploymentRoute: a single destination in a weighted traffic split.
@@ -293,6 +335,18 @@ pub struct AppStatus {
     /// response and in audit logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Total resident seconds since the last heartbeat interval (issue
+    /// #484, third metered dimension). `None` for Handler (FaaS) apps
+    /// that do not contribute (the per-app resident ticker is
+    /// LongRunning-only). `Some(0)` for a LongRunning app that started
+    /// within the current interval — distinct from None because
+    /// `applyTenantDelta` would otherwise fold both to delta=0 and the
+    /// control plane would not be able to distinguish "just-started LR"
+    /// from "FaaS that doesn't contribute". Absent on pre-#484 workers
+    /// (legacy control planes treat absence as no contribution, same as
+    /// a Handler app).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_seconds: Option<u64>,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -447,6 +501,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            resident_seconds: None,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -512,6 +567,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            resident_seconds: None,
             observer_metrics: vec![],
             last_error: None,
         };
@@ -521,6 +577,8 @@ mod tests {
             "outbound_bytes must always appear in serialized AppStatus; got: {json}"
         );
     }
+
+    // ── last_error rolling-upgrade contract (issue #45) ───────────────
 
     /// `last_error` is stamped onto the heartbeat so operators can
     /// diagnose a `status: "crashed"` app without grepping the
@@ -543,6 +601,7 @@ mod tests {
             dedupe_id: None,
             observer_metrics: vec![],
             last_error: None,
+            resident_seconds: None,
         };
         let json_none = serde_json::to_string(&none_status).expect("serialize");
         assert!(
@@ -577,6 +636,88 @@ mod tests {
         );
     }
 
+    // ── resident_seconds rolling-upgrade contract (issue #484) ────────────
+
+    /// Old workers that don't send `resident_seconds` must deserialize
+    /// to None (not fail). The control plane treats None as "no
+    /// contribution" — the same way it treats Handler (FaaS) apps.
+    #[test]
+    fn resident_seconds_absent_deserializes_to_none() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(
+            s.resident_seconds, None,
+            "absent resident_seconds must deserialize to None (FaaS-like)"
+        );
+    }
+
+    /// Explicit value round-trips correctly — Some(N) → Some(N).
+    #[test]
+    fn resident_seconds_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":0,"tenant_id":"t_1","port":8080,"resident_seconds":90}"#,
+        );
+        assert_eq!(s.resident_seconds, Some(90));
+    }
+
+    /// `skip_serializing_if = "Option::is_none"` drops the field when
+    /// None — old control planes that don't parse `resident_seconds`
+    /// must keep working. The serialized JSON must NOT contain
+    /// "resident_seconds" when None.
+    #[test]
+    fn resident_seconds_skipped_when_none() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            last_error: None,
+            resident_seconds: None,
+            observer_metrics: vec![],
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            !json.contains("resident_seconds"),
+            "resident_seconds must be skipped from serialized AppStatus when None; got: {json}"
+        );
+    }
+
+    /// `Some(0)` is distinct from `None`: a just-started LongRunning
+    /// app has accumulated 0 resident seconds, while a Handler (FaaS)
+    /// app has no concept of resident time at all. Both fold to
+    /// delta=0 in applyTenantDelta, but the wire shape preserves the
+    /// distinction for future debugging and for the worker's own
+    /// reasoning about whether it ever spawned the resident ticker.
+    #[test]
+    fn resident_seconds_zero_serializes() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "starting".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            last_error: None,
+            resident_seconds: Some(0),
+            observer_metrics: vec![],
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""resident_seconds":0"#),
+            "Some(0) must serialize as 0 (NOT skipped); got: {json}"
+        );
+        let parsed: AppStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.resident_seconds, Some(0));
+    }
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────
 
     fn app_spec_from_json(json: &str) -> AppSpec {
@@ -748,6 +889,7 @@ mod tests {
                 assert!(apps.contains_key("myapp"));
             }
             TaskMessage::FullSync { .. } => panic!("task_update parsed as FullSync"),
+            TaskMessage::TaskPurge { .. } => panic!("task_update parsed as TaskPurge"),
         }
     }
 
@@ -783,6 +925,7 @@ mod tests {
                 tenant_id, apps, ..
             } => (tenant_id, apps),
             TaskMessage::TaskUpdate { .. } => panic!("full_sync parsed as TaskUpdate"),
+            TaskMessage::TaskPurge { .. } => panic!("full_sync parsed as TaskPurge"),
         };
         assert_eq!(tenant_id, "t_1");
         assert_eq!(apps.len(), 2);
@@ -814,5 +957,154 @@ mod tests {
         }"#;
         let res: Result<TaskMessage, _> = serde_json::from_str(json);
         assert!(res.is_err(), "unknown type field must fail to parse");
+    }
+
+    // ── TaskMessage::TaskPurge wire format (issue #569) ────────────────────
+
+    /// `task_purge` with `app_name` and `reason=app_deleted` parses into
+    /// the `TaskPurge` variant. Locks the wire shape the CP's
+    /// `AppService.Delete` enqueues.
+    #[test]
+    fn task_purge_deserializes_to_task_purge_variant() {
+        let json = r#"{
+            "type": "task_purge",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_1",
+            "app_name": "myapp",
+            "reason": "app_deleted"
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize task_purge");
+        match msg {
+            TaskMessage::TaskPurge {
+                tenant_id,
+                app_name,
+                reason,
+                ..
+            } => {
+                assert_eq!(tenant_id, "t_1");
+                assert_eq!(app_name, "myapp");
+                assert_eq!(reason, PurgeReason::AppDeleted);
+            }
+            TaskMessage::TaskUpdate { .. } | TaskMessage::FullSync { .. } => {
+                panic!("task_purge parsed as TaskUpdate or FullSync")
+            }
+        }
+    }
+
+    /// `task_purge` with `reason=tenant_offboarded` parses. This is the
+    /// per-app row the CP enqueues from `TenantService.DeleteTenant`
+    /// (one row per app currently owned by the tenant).
+    #[test]
+    fn task_purge_tenant_offboarded_reason_round_trip() {
+        let json = r#"{
+            "type": "task_purge",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_off",
+            "app_name": "demo",
+            "reason": "tenant_offboarded"
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize task_purge");
+        let (tenant_id, app_name, reason) = match msg {
+            TaskMessage::TaskPurge {
+                tenant_id,
+                app_name,
+                reason,
+                ..
+            } => (tenant_id, app_name, reason),
+            TaskMessage::TaskUpdate { .. } | TaskMessage::FullSync { .. } => {
+                panic!("task_purge parsed as TaskUpdate or FullSync")
+            }
+        };
+        assert_eq!(tenant_id, "t_off");
+        assert_eq!(app_name, "demo");
+        assert_eq!(reason, PurgeReason::TenantOffboarded);
+    }
+
+    /// Empty `app_name` (tenant-wide purge) parses with `app_name=""`.
+    /// Today the CP doesn't emit this shape — both call sites enqueue
+    /// per-app rows — but the receiver must accept it for
+    /// forward-compat with a future "single tenant-wide publish"
+    /// optimization. `#[serde(default)]` lets the field be omitted
+    /// entirely too.
+    #[test]
+    fn task_purge_empty_app_name_parses_as_tenant_wide() {
+        let json = r#"{
+            "type": "task_purge",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_wide",
+            "reason": "app_deleted"
+        }"#;
+        let msg: TaskMessage =
+            serde_json::from_str(json).expect("deserialize task_purge (no app_name)");
+        match msg {
+            TaskMessage::TaskPurge { app_name, .. } => {
+                assert_eq!(app_name, "", "missing app_name must default to empty");
+            }
+            _ => panic!("task_purge parsed as wrong variant"),
+        }
+
+        let json_empty = r#"{
+            "type": "task_purge",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_wide",
+            "app_name": "",
+            "reason": "tenant_offboarded"
+        }"#;
+        let msg_empty: TaskMessage =
+            serde_json::from_str(json_empty).expect("deserialize task_purge (app_name='')");
+        match msg_empty {
+            TaskMessage::TaskPurge { app_name, .. } => {
+                assert_eq!(app_name, "");
+            }
+            _ => panic!("task_purge parsed as wrong variant"),
+        }
+    }
+
+    /// Unknown `reason` values fail to deserialize — keeps the
+    /// `PurgeReason` enum closed at the wire boundary, mirroring the
+    /// strict-unknown-tag invariant on `type`.
+    #[test]
+    fn task_purge_unknown_reason_fails_to_deserialize() {
+        let json = r#"{
+            "type": "task_purge",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_1",
+            "app_name": "myapp",
+            "reason": "scheduled_cleanup"
+        }"#;
+        let res: Result<TaskMessage, _> = serde_json::from_str(json);
+        assert!(
+            res.is_err(),
+            "unknown purge reason must fail to parse (closed enum)"
+        );
+    }
+
+    /// `task_update` still parses as `TaskUpdate` after adding the
+    /// `TaskPurge` variant — regression guard so the new enum arm
+    /// doesn't accidentally shadow the existing paths via serde's
+    /// tag dispatch.
+    #[test]
+    fn legacy_task_update_still_parses_after_purge_added() {
+        let json = r#"{
+            "type": "task_update",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "tenant_id": "t_1",
+            "apps": {
+                "myapp": {
+                    "deployment_id": "d_1",
+                    "deployment_hash": "abc",
+                    "env": {},
+                    "max_memory_mb": 256
+                }
+            }
+        }"#;
+        let msg: TaskMessage = serde_json::from_str(json).expect("deserialize task_update");
+        match msg {
+            TaskMessage::TaskUpdate { apps, .. } => {
+                assert_eq!(apps.len(), 1);
+                assert!(apps.contains_key("myapp"));
+            }
+            _ => panic!("task_update parsed as wrong variant after adding TaskPurge"),
+        }
     }
 }

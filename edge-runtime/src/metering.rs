@@ -1,8 +1,9 @@
 //! Request metering for per-request and per-byte billing.
 //!
-//! Tracks HTTP request counts and outbound byte totals for an app instance.
-//! Both counters are read by the Worker Supervisor during heartbeat reporting
-//! and sent to the control plane for billing aggregation and quota enforcement.
+//! Tracks HTTP request counts, outbound byte totals, and resident-seconds
+//! (issue #484) per app instance. All three counters are read by the
+//! Worker Supervisor during heartbeat reporting and sent to the control
+//! plane for billing aggregation and quota enforcement.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,6 +16,14 @@ pub struct RequestMeter {
     /// Atomic outbound byte counter. Accumulates response bytes from
     /// http-client fetches and response bodies written by http-server.
     outbound_bytes: Arc<AtomicU64>,
+    /// Atomic resident-seconds counter (issue #484). LongRunning apps
+    /// bump this from a per-app ticker that fires every
+    /// `RESIDENT_TICK_SECS` (default 30). Handler (FaaS) apps leave it
+    /// at 0 — the worker stamps `resident_seconds = None` on the
+    /// heartbeat when this counter is 0 AND the app is Handler, so the
+    /// control plane's `applyTenantDelta` treats FaaS as a zero
+    /// contribution and never calls `AddResidentSeconds`.
+    resident_seconds: Arc<AtomicU64>,
     /// Tenant ID for reporting.
     pub tenant_id: String,
     /// Deployment ID for reporting.
@@ -27,6 +36,7 @@ impl RequestMeter {
         Self {
             count: Arc::new(AtomicU64::new(0)),
             outbound_bytes: Arc::new(AtomicU64::new(0)),
+            resident_seconds: Arc::new(AtomicU64::new(0)),
             tenant_id,
             deployment_id,
         }
@@ -43,6 +53,15 @@ impl RequestMeter {
         self.outbound_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record resident seconds. Called by the per-app resident ticker
+    /// (LongRunning apps only, issue #484) every `RESIDENT_TICK_SECS`.
+    /// Atomically consistent with the request-count and outbound-byte
+    /// counters so the same `MeterSnapshot` includes all three deltas
+    /// (no TOCTOU at heartbeat time).
+    pub fn record_resident_seconds(&self, n: u64) {
+        self.resident_seconds.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Get the current request count.
     pub fn get_count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
@@ -51,6 +70,12 @@ impl RequestMeter {
     /// Get the current outbound byte total.
     pub fn get_outbound_bytes(&self) -> u64 {
         self.outbound_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get the current resident-seconds total. Returns 0 for Handler
+    /// (FaaS) apps because their ticker is never spawned.
+    pub fn get_resident_seconds(&self) -> u64 {
+        self.resident_seconds.load(Ordering::Relaxed)
     }
 
     /// Subtract previously-snapshotted values from the counters. Called after a
@@ -63,6 +88,16 @@ impl RequestMeter {
             .fetch_sub(bytes_delta, Ordering::Relaxed);
     }
 
+    /// Subtract previously-snapshotted resident-seconds. Mirrors
+    /// `subtract_delta` but for the third metered dimension (issue
+    /// #484). Kept as a separate method (not folded into
+    /// `subtract_delta`) so the existing paired-axis test contract
+    /// doesn't churn — the resident-seconds ticker is LR-only and the
+    /// reset happens alongside deployment-state reset_meters_after.
+    pub fn subtract_resident_seconds(&self, n: u64) {
+        self.resident_seconds.fetch_sub(n, Ordering::Relaxed);
+    }
+
     /// Get a snapshot of the meter state for reporting.
     pub fn snapshot(&self) -> MeterSnapshot {
         MeterSnapshot {
@@ -70,6 +105,7 @@ impl RequestMeter {
             deployment_id: self.deployment_id.clone(),
             request_count: self.get_count(),
             outbound_bytes: self.get_outbound_bytes(),
+            resident_seconds: self.get_resident_seconds(),
         }
     }
 }
@@ -82,6 +118,16 @@ pub struct MeterSnapshot {
     pub request_count: u64,
     /// Total outbound bytes since the last reset (heartbeat interval delta).
     pub outbound_bytes: u64,
+    /// Total resident seconds since the last reset (heartbeat interval
+    /// delta, issue #484). Always 0 for Handler (FaaS) apps because the
+    /// per-app resident ticker is only spawned for LongRunning apps.
+    /// The worker stamps `resident_seconds = Some(0)` (not None) when
+    /// this is 0 for a LongRunning app so the control plane can
+    /// distinguish "just-started LR with 0s uptime" from "FaaS that
+    /// doesn't contribute" — applyTenantDelta folds both to delta=0
+    /// but the wire shape preserves the distinction for future
+    /// debugging.
+    pub resident_seconds: u64,
 }
 
 #[cfg(test)]
@@ -129,5 +175,38 @@ mod tests {
         m2.record_outbound_bytes(50);
         // Both clones share the same Arc, so the total is 150.
         assert_eq!(m.snapshot().outbound_bytes, 150);
+    }
+
+    // -- issue #484 resident-seconds tests ---------------------------------
+
+    #[test]
+    fn record_resident_seconds_accumulates() {
+        let m = RequestMeter::new("t_test".into(), "d_test".into());
+        m.record_resident_seconds(30);
+        m.record_resident_seconds(30);
+        assert_eq!(m.snapshot().resident_seconds, 60);
+        assert_eq!(m.get_resident_seconds(), 60);
+    }
+
+    #[test]
+    fn subtract_resident_seconds_removes_only_snapshotted_values() {
+        let m = RequestMeter::new("t_test".into(), "d_test".into());
+        m.record_resident_seconds(60);
+        let snap = m.snapshot();
+        // Simulate a tick landing after the snapshot but before reset.
+        m.record_resident_seconds(30);
+        m.subtract_resident_seconds(snap.resident_seconds);
+        // Only the post-snapshot tick should remain.
+        assert_eq!(m.snapshot().resident_seconds, 30);
+    }
+
+    #[test]
+    fn clone_shares_resident_seconds() {
+        let m = RequestMeter::new("t_test".into(), "d_test".into());
+        let m2 = m.clone();
+        m.record_resident_seconds(100);
+        m2.record_resident_seconds(50);
+        // Both clones share the same Arc, so the total is 150.
+        assert_eq!(m.snapshot().resident_seconds, 150);
     }
 }

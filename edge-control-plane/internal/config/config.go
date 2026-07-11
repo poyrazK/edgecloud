@@ -1093,6 +1093,86 @@ type BillingConfig struct {
 	// Provider != "stripe" but still parsed so a misconfigured
 	// operator gets a clear validation error.
 	Stripe BillingStripeConfig `yaml:"stripe"`
+
+	// Metering configures the metering-ledger producer (issue #485).
+	// Sibling to the Stripe block above — same shape philosophy
+	// (per-merchant credentials + per-dimension mapping) — but
+	// separated because a tenant can be on Stripe checkout and
+	// noop metering (or vice-versa). The "billing-neutral rollout"
+	// default is Provider="noop" + Rates={} so a fresh install
+	// ticks the drainer cleanly with zero Stripe calls.
+	Metering BillingMeteringConfig `yaml:"metering"`
+}
+
+// BillingMeteringConfig is the metering-ledger producer's per-process
+// configuration block. The drainer reads RateCard + Provider to
+// decide what to dispatch; SubscriptionItemIDs is the per-tenant
+// Stripe-side mapping.
+//
+// Default Provider is empty. validateBillingConfig in Load()
+// interprets empty as "noop" — symmetric with the BillingProvider
+// surface, but with NO production gate (a noop metering path is
+// always safe; it just doesn't bill).
+type BillingMeteringConfig struct {
+	// Provider selects the MeteringProvider implementation. Recognized:
+	//   "stripe" — wraps stripe-go billing/meterevent.New
+	//   "noop"   — dev/CI/test; never dispatches; always MarkProcessed
+	// Empty defaults to "noop" (zero-rate is the billing-neutral
+	// posture — operators opt INTO Stripe billing explicitly).
+	Provider string `yaml:"provider"`
+
+	// IntervalS is the drainer tick interval in seconds. Default 30
+	// matches the heartbeat cadence so a tenant's first stripe event
+	// is recorded within one heartbeat of their first request. Faster
+	// values just add DB load without improving the user-visible
+	// state (the hot-path quotas.used_* mirror is the cap-check
+	// authority; the drainer is the slow-path Stripe reporter).
+	IntervalS int `yaml:"interval_seconds"`
+
+	// BatchSize is the max rows claimed per tick. Default 50 — same
+	// as OutboxDrainer. Lowers under sustained backlog signal.
+	BatchSize int `yaml:"batch_size"`
+
+	// MaxAttempts is the give-up threshold. After this many failed
+	// dispatch attempts the row stays in billing_usage_events with
+	// processed_at IS NULL but no further re-attempts — operators
+	// can inspect via `SELECT * FROM billing_usage_events WHERE
+	// processed_at IS NULL`. Default 10.
+	MaxAttempts int `yaml:"max_attempts"`
+
+	// Rates is the per-kind rate card (USD per unit). The drainer
+	// reads RateCard[kind] and short-circuits to MarkProcessed if
+	// the rate is zero — "consumption is allowed but not billed."
+	// This is the billing-neutral rollout default: leave Rates
+	// empty and every row is consumed but no Stripe call lands.
+	//
+	// Optional today (the drainer does NOT multiply Quantity by
+	// rate; Stripe's own `usage_multiplier` carries the rate on
+	// the price side). Kept on the struct so a future
+	// fixed-fee-flat-rate provider (e.g. AWS Marketplace Metering)
+	// has a place to read its rate.
+	Rates map[string]float64 `yaml:"rates"`
+
+	// SubscriptionItemIDs is the two-level map tenant → kind →
+	// subscription_item_id (the stripe billing-price-id the metered
+	// event should target). Each dimension (resident_seconds /
+	// request_count / outbound_bytes) maps to its own Stripe price
+	// item — different meters, different prices — so a flat
+	// per-tenant id wouldn't model it.
+	//
+	// Empty / nil + Metering.Provider=stripe → the drainer logs a
+	// warning per row and MarkProcessed-with-warn (rather than
+	// spinning forever). Operators must wire IDs before the
+	// first heartbeat can be billed.
+	SubscriptionItemIDs map[string]map[string]string `yaml:"subscription_item_ids"`
+
+	// MeterEventNames maps domain.MeterKind onto the operator's
+	// Stripe meter event_name (each meter has exactly one).
+	// Missing entries cause RecordUsage to fail fast with
+	// ErrNoSubscription + ErrTerminal rather than dispatching an
+	// event with the wrong name — protects tenants from being
+	// billed under the wrong SKU if a config typo slips in.
+	MeterEventNames map[string]string `yaml:"meter_event_names"`
 }
 
 // BillingStripeConfig is the per-merchant credential block. Same

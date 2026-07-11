@@ -56,6 +56,7 @@ import (
 	"github.com/stretchr/testify/require"
 	tcpg "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/testutil"
 )
@@ -832,7 +833,7 @@ var wantNotNull = map[string][]string{
 // Update when a migration creates or renames an index. Inline comments
 // reference the migration number where the index was created.
 var wantIndexes = []IndexExpectation{
-{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
+	{Table: "deployments", Name: "idx_deployments_tenant_app"},                                  // 002_add_indexes
 	{Table: "deployments", Name: "idx_deployments_tenant"},                                      // 002_add_indexes
 	{Table: "workers", Name: "idx_workers_region"},                                              // 002_add_indexes
 	{Table: "api_keys", Name: "idx_api_keys_tenant"},                                            // 002_add_indexes
@@ -1403,6 +1404,85 @@ func TestRoundtrip(t *testing.T) {
 			"SELECT COUNT(*) FROM quotas WHERE used_resident_seconds != 0"))
 		require.Equalf(t, 0, usedCount,
 			"every quota row should have used_resident_seconds=0 after backfill")
+	})
+
+	t.Run("BillingUsageRepository_Roundtrip", func(t *testing.T) {
+		// Exercise the metering ledger (issue #485) end-to-end against
+		// the migrated DB. This is the roundtrip contract for the
+		// MeteringDrainer + heartbeat-pipeline dual-write:
+		//
+		//  1. Enqueue a row (heartbeat path).
+		//  2. Enqueue a second row with the same idempotency_key →
+		//     ErrDuplicateIdempotencyKey (UNIQUE contract).
+		//  3. ClaimDue returns the row (drainer path).
+		//  4. MarkProcessed flips processed_at IS NOT NULL.
+		//  5. A subsequent ClaimDue returns no rows.
+		//  6. EnqueueUsageEvent absorbs duplicates silently (the
+		//     heartbeat pipeline treats redeliveries as "already
+		//     recorded" — no error surfaced to the caller).
+		//  7. CHECK constraint on kind rejects unknown values.
+		_, err := db.Exec(`INSERT INTO tenants (id, name, plan, created_at, updated_at)
+			VALUES ('t_meter_round', 'metering-roundtrip', 'pro', NOW(), NOW())`)
+		require.NoError(t, err)
+
+		repo := repository.NewBillingUsageRepository(db)
+		ctx := context.Background()
+
+		// 1. Enqueue.
+		err = repo.Enqueue(ctx, &domain.MeterUsageEvent{
+			TenantID:       "t_meter_round",
+			Kind:           domain.MeterKindResidentSeconds,
+			Quantity:       30,
+			IdempotencyKey: "roundtrip:resident_seconds:bucket1",
+			Provider:       "",
+		})
+		require.NoError(t, err, "Enqueue first row")
+
+		// 2. Duplicate idempotency_key → ErrDuplicateIdempotencyKey.
+		err = repo.Enqueue(ctx, &domain.MeterUsageEvent{
+			TenantID:       "t_meter_round",
+			Kind:           domain.MeterKindResidentSeconds,
+			Quantity:       30,
+			IdempotencyKey: "roundtrip:resident_seconds:bucket1",
+		})
+		require.ErrorIs(t, err, repository.ErrDuplicateIdempotencyKey,
+			"second Enqueue with same idempotency_key must surface as ErrDuplicateIdempotencyKey")
+
+		// 3. ClaimDue returns the row.
+		rows, err := repo.ClaimDue(ctx, 50)
+		require.NoError(t, err)
+		require.Len(t, rows, 1, "ClaimDue must return the single unprocessed row")
+		require.Equal(t, "t_meter_round", rows[0].TenantID)
+		require.Equal(t, domain.MeterKindResidentSeconds, rows[0].Kind)
+		require.Equal(t, int64(30), rows[0].Quantity)
+		require.Equal(t, "roundtrip:resident_seconds:bucket1", rows[0].IdempotencyKey)
+		require.NotNil(t, rows[0].ProcessedAt, "ClaimDue must stamp processed_at")
+
+		// 4. MarkProcessed — already stamped by ClaimDue; this call
+		// confirms the defensive "re-mark on already-processed row"
+		// guard does not error (operator SQL poking).
+		require.NoError(t, repo.MarkProcessed(ctx, rows[0].ID))
+
+		// 5. A subsequent ClaimDue returns no rows.
+		rows2, err := repo.ClaimDue(ctx, 50)
+		require.NoError(t, err)
+		require.Len(t, rows2, 0, "no unprocessed rows remain after MarkProcessed")
+
+		// 6. EnqueueUsageEvent absorbs duplicates silently.
+		require.NoError(t, repo.EnqueueUsageEvent(ctx, "t_meter_round",
+			domain.MeterKindResidentSeconds, 60, "roundtrip:resident_seconds:bucket2"),
+			"EnqueueUsageEvent first call")
+		require.NoError(t, repo.EnqueueUsageEvent(ctx, "t_meter_round",
+			domain.MeterKindResidentSeconds, 60, "roundtrip:resident_seconds:bucket2"),
+			"EnqueueUsageEvent duplicate must absorb silently")
+
+		// 7. CHECK constraint on kind: an invalid kind must error.
+		_, err = db.Exec(`INSERT INTO billing_usage_events
+			(tenant_id, kind, quantity, idempotency_key, provider)
+			VALUES ($1, $2, 1, 'badsort', '')`, "t_meter_round", "not_a_real_kind")
+		require.Error(t, err, "CHECK constraint on kind must reject unknown kinds")
+		require.Contains(t, strings.ToLower(err.Error()), "check",
+			"rejection must come from the CHECK constraint, not some other source")
 	})
 }
 

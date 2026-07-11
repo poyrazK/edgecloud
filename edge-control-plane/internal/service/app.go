@@ -3,16 +3,19 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // appRepoInterface defines the app repository methods used by AppService.
@@ -40,6 +43,8 @@ type AppService struct {
 	deployRepo    *repository.DeploymentRepository
 	artifactStore storage.ArtifactStore
 	quotaRepo     quotaRepoInterface
+	outboxRepo    *repository.OutboxRepository
+	defaultRegion string
 }
 
 func NewAppService(
@@ -50,7 +55,12 @@ func NewAppService(
 	appEnvRepo *repository.AppEnvRepository,
 	artifactStore storage.ArtifactStore,
 	quotaRepo *repository.QuotaRepository,
+	outboxRepo *repository.OutboxRepository,
+	defaultRegion string,
 ) *AppService {
+	if defaultRegion == "" {
+		defaultRegion = "global"
+	}
 	return &AppService{
 		db:            db,
 		appRepo:       appRepo,
@@ -59,6 +69,8 @@ func NewAppService(
 		deployRepo:    deploymentRepo,
 		artifactStore: artifactStore,
 		quotaRepo:     quotaRepo,
+		outboxRepo:    outboxRepo,
+		defaultRegion: defaultRegion,
 	}
 }
 
@@ -231,6 +243,7 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		appEnvRepo := s.appEnvRepo.WithTx(tx)
 		activeRepo := s.activeRepo.WithTx(tx)
 		deployRepo := s.deployRepo.WithTx(tx)
+		outboxRepo := s.outboxRepo.WithTx(tx)
 
 		if err := appEnvRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting app env: %w", err)
@@ -240,6 +253,39 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		}
 		if err := deployRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting deployments: %w", err)
+		}
+
+		// Issue #569: enqueue a task_purge tombstone inside the
+		// same tx as the cascade deletes — the worker must learn
+		// to drop the per-tenant KV/cache/scheduling state for
+		// this app, atomically with the CP-side row deletes. If
+		// any cascade step fails the tx rolls back and no row is
+		// enqueued, so the worker never receives a phantom purge.
+		//
+		// Forward-compat (NOT implemented in this PR): when #475
+		// / #476 ship the CP-side durable `tenant_kv` Postgres
+		// tier, the same block enqueues a sibling
+		// `tenant_kv BatchDelete` row here. Today we publish
+		// exclusively via the worker KV/cache/scheduling purge.
+		payload, err := json.Marshal(nats.PurgePayload{
+			Type:      nats.TaskMessageKindTaskPurge,
+			Timestamp: time.Now().UTC(),
+			TenantID:  tenantID,
+			AppName:   appName,
+			Reason:    nats.PurgeReasonAppDeleted,
+		})
+		if err != nil {
+			return fmt.Errorf("marshaling purge payload: %w", err)
+		}
+		if err := outboxRepo.Enqueue(ctx, &repository.OutboxRow{
+			TenantID:  tenantID,
+			AppName:   appName,
+			Kind:      nats.TaskMessageKindTaskPurge,
+			Payload:   payload,
+			Regions:   pq.StringArray{s.defaultRegion},
+			DedupeKey: "purge:" + tenantID + ":" + appName + ":" + uuid.NewString(),
+		}); err != nil {
+			return fmt.Errorf("enqueueing task_purge: %w", err)
 		}
 		return nil
 	})

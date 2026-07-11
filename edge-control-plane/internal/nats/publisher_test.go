@@ -403,3 +403,163 @@ func TestBuildAppConfigWithSocketMode_DefaultsToEmpty(t *testing.T) {
 		t.Errorf("empty SocketMode must be omitted; got: %s", data)
 	}
 }
+
+// ── Issue #569: task_purge wire format ──────────────────────────────
+//
+// The worker (edge-worker/src/messages.rs) deserializes these payloads
+// into the TaskMessage::TaskPurge variant. Lock the wire shape here so
+// a future refactor on either side fails fast.
+
+// TestPurgePayload_Marshal_PerApp locks the per-app shape the CP's
+// AppService.Delete emits: type="task_purge", tenant_id, app_name,
+// reason="app_deleted", and the omitempty contract on app_name when the
+// caller is building a tenant-wide message.
+func TestPurgePayload_Marshal_PerApp(t *testing.T) {
+	msg := &PurgePayload{
+		Type:      TaskMessageKindTaskPurge,
+		Timestamp: time.Date(2026, 7, 10, 0, 0, 0, 0, time.UTC),
+		TenantID:  "t_1",
+		AppName:   "myapp",
+		Reason:    PurgeReasonAppDeleted,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	wire := string(data)
+	if !strings.Contains(wire, `"type":"task_purge"`) {
+		t.Errorf(`type field must be "task_purge"; got: %s`, wire)
+	}
+	if !strings.Contains(wire, `"tenant_id":"t_1"`) {
+		t.Errorf("tenant_id missing; got: %s", wire)
+	}
+	if !strings.Contains(wire, `"app_name":"myapp"`) {
+		t.Errorf("app_name missing on per-app payload; got: %s", wire)
+	}
+	if !strings.Contains(wire, `"reason":"app_deleted"`) {
+		t.Errorf(`reason must be "app_deleted"; got: %s`, wire)
+	}
+
+	// Round-trip — locks the field set the worker depends on.
+	var decoded PurgePayload
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != TaskMessageKindTaskPurge {
+		t.Errorf("decoded.Type = %q, want task_purge", decoded.Type)
+	}
+	if decoded.TenantID != "t_1" {
+		t.Errorf("decoded.TenantID = %q, want t_1", decoded.TenantID)
+	}
+	if decoded.AppName != "myapp" {
+		t.Errorf("decoded.AppName = %q, want myapp", decoded.AppName)
+	}
+	if decoded.Reason != PurgeReasonAppDeleted {
+		t.Errorf("decoded.Reason = %q, want app_deleted", decoded.Reason)
+	}
+}
+
+// TestPurgePayload_Marshal_TenantOffboarded locks the reason string the
+// TenantService.DeleteTenant path emits. Same shape as the per-app case;
+// different reason discriminator.
+func TestPurgePayload_Marshal_TenantOffboarded(t *testing.T) {
+	msg := &PurgePayload{
+		Type:      TaskMessageKindTaskPurge,
+		Timestamp: time.Now().UTC(),
+		TenantID:  "t_off",
+		AppName:   "demo",
+		Reason:    PurgeReasonTenantOffboarded,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"reason":"tenant_offboarded"`) {
+		t.Errorf(`reason must be "tenant_offboarded"; got: %s`, data)
+	}
+}
+
+// TestPurgePayload_OmitsAppNameWhenEmpty pins the omitempty contract:
+// a future "single tenant-wide publish" optimization that builds a
+// PurgePayload with AppName="" must NOT emit a `"app_name":""` field
+// (otherwise the worker's `#[serde(default)]` would still parse fine,
+// but the wire would be noisier than the pre-#569 task_update shape).
+func TestPurgePayload_OmitsAppNameWhenEmpty(t *testing.T) {
+	msg := &PurgePayload{
+		Type:      TaskMessageKindTaskPurge,
+		Timestamp: time.Now().UTC(),
+		TenantID:  "t_wide",
+		AppName:   "", // tenant-wide
+		Reason:    PurgeReasonAppDeleted,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"app_name"`) {
+		t.Errorf("empty AppName must be omitted; got: %s", data)
+	}
+	// type + tenant_id + reason are still required.
+	wire := string(data)
+	for _, want := range []string{`"type":"task_purge"`, `"tenant_id":"t_wide"`, `"reason":"app_deleted"`} {
+		if !strings.Contains(wire, want) {
+			t.Errorf("wire missing %s; got: %s", want, wire)
+		}
+	}
+}
+
+// TestMockPublisher_PublishPurge_EmitsTaskPurgeType locks the mock
+// publisher's wire output. Unlike PublishTaskUpdate/PublishFullSync,
+// PublishPurge does NOT call applyTypeOverride — PurgePayload already
+// carries `type:"task_purge"` because the caller set it on the struct.
+// The mock's job is to print the marshaled payload verbatim.
+func TestMockPublisher_PublishPurge_EmitsTaskPurgeType(t *testing.T) {
+	out := captureStdout(t, func() {
+		p := &MockPublisher{}
+		err := p.PublishPurge("global", &PurgePayload{
+			Type:      TaskMessageKindTaskPurge, // set by caller (OutboxDrainer)
+			Timestamp: time.Now().UTC(),
+			TenantID:  "t_1",
+			AppName:   "myapp",
+			Reason:    PurgeReasonAppDeleted,
+		})
+		if err != nil {
+			t.Fatalf("PublishPurge: %v", err)
+		}
+	})
+	if !strings.Contains(out, `"type":"task_purge"`) {
+		t.Errorf("mock didn't emit task_purge type; stdout=%s", out)
+	}
+	if !strings.Contains(out, `"app_name":"myapp"`) {
+		t.Errorf("mock dropped app_name; stdout=%s", out)
+	}
+	if !strings.Contains(out, `"reason":"app_deleted"`) {
+		t.Errorf("mock dropped reason; stdout=%s", out)
+	}
+}
+
+// TestTaskMessageKindConstants pins the wire-level constants used by
+// the OutboxRepository (`Kind` column) and the OutboxDrainer (switch
+// dispatch). If these strings drift, the drainer stops dispatching
+// purges — silent data residue bug.
+func TestTaskMessageKindConstants(t *testing.T) {
+	cases := []struct {
+		got, want string
+	}{
+		{TaskMessageKindTaskUpdate, "task_update"},
+		{TaskMessageKindFullSync, "full_sync"},
+		{TaskMessageKindTaskPurge, "task_purge"},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("kind constant = %q, want %q", c.got, c.want)
+		}
+	}
+	// Reason constants too — same drift hazard.
+	if PurgeReasonAppDeleted != "app_deleted" {
+		t.Errorf("PurgeReasonAppDeleted = %q, want app_deleted", PurgeReasonAppDeleted)
+	}
+	if PurgeReasonTenantOffboarded != "tenant_offboarded" {
+		t.Errorf("PurgeReasonTenantOffboarded = %q, want tenant_offboarded", PurgeReasonTenantOffboarded)
+	}
+}

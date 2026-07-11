@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
@@ -73,6 +74,17 @@ type PreviewGCService struct {
 	blobs               previewBlobDeleter
 	sink                PreviewGCSink
 	blobFailureRecorder PreviewBlobFailureRecorder
+	// firstSweepDone is closed at the end of the first runOnce()
+	// inside Run. Tests wait on this channel instead of
+	// time.Sleep(N) to synchronize on the immediate-first-sweep
+	// (issue #586 — replaces the liveness-racy time.Sleep pattern
+	// with a deterministic done-channel handshake, mirroring the
+	// Loop.Done() pattern from the loophealth PR #585 fix). The
+	// channel is allocated in NewPreviewGCService so tests can
+	// grab a reference to it BEFORE calling Run in a goroutine
+	// and start the wait immediately — no race on "has Run
+	// started yet". Never closed if Run is never called.
+	firstSweepDone chan struct{}
 }
 
 func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter, sink PreviewGCSink, blobFailureRecorder PreviewBlobFailureRecorder) *PreviewGCService {
@@ -82,7 +94,28 @@ func NewPreviewGCService(repo previewRepoForGC, blobs previewBlobDeleter, sink P
 	if blobFailureRecorder == nil {
 		blobFailureRecorder = func() {}
 	}
-	return &PreviewGCService{repo: repo, blobs: blobs, sink: sink, blobFailureRecorder: blobFailureRecorder}
+	return &PreviewGCService{
+		repo:                repo,
+		blobs:               blobs,
+		sink:                sink,
+		blobFailureRecorder: blobFailureRecorder,
+		firstSweepDone:      make(chan struct{}),
+	}
+}
+
+// FirstSweepDone returns a channel that closes at the end of the
+// first runOnce inside Run. Tests use it to synchronize on the
+// immediate-first-sweep without racing on time.Sleep(N) (issue
+// #586). Always returns the same channel; never closes if Run
+// isn't called.
+//
+// Receivers are free to wait on the returned channel even before
+// Run is invoked — the channel is allocated at construction time
+// so the goroutine that calls Run in the background and the test
+// goroutine that waits on the channel can be scheduled in either
+// order without liveness races.
+func (s *PreviewGCService) FirstSweepDone() <-chan struct{} {
+	return s.firstSweepDone
 }
 
 // Run blocks until ctx is cancelled. The first sweep fires
@@ -218,7 +251,22 @@ func (s *PreviewGCService) Run(ctx context.Context, interval, _ time.Duration) {
 		s.sink(totalBlobsDeleted, totalRowsDeleted, totalBatchesSwept, false)
 	}
 
+	// Signal "first runOnce completed" to FirstSweepDone() waiters.
+	// The defer-before-runOnce placement guarantees the channel closes
+	// even if the first sweep panics; the explicit close after runOnce
+	// is redundant with the defer but keeps the happy path obvious.
+	// See the firstSweepDone field doc on the struct for rationale.
+	var firstSweepOnce sync.Once
+	defer func() {
+		firstSweepOnce.Do(func() {
+			close(s.firstSweepDone)
+		})
+	}()
+
 	runOnce()
+	firstSweepOnce.Do(func() {
+		close(s.firstSweepDone)
+	})
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
