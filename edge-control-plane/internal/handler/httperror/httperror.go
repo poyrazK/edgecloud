@@ -11,17 +11,18 @@ import (
 type ErrorCode string
 
 const (
-	CodeBadRequest         ErrorCode = "BAD_REQUEST"
-	CodeUnauthorized       ErrorCode = "UNAUTHORIZED"
-	CodeForbidden          ErrorCode = "FORBIDDEN"
-	CodeNotFound           ErrorCode = "NOT_FOUND"
-	CodeConflict           ErrorCode = "CONFLICT"
-	CodeQuotaExceeded      ErrorCode = "QUOTA_EXCEEDED"
-	CodePaymentRequired    ErrorCode = "PAYMENT_REQUIRED"
-	CodeInternalError      ErrorCode = "INTERNAL_ERROR"
-	CodeBadGateway         ErrorCode = "BAD_GATEWAY"
-	CodePayloadTooLarge    ErrorCode = "PAYLOAD_TOO_LARGE"
-	CodeServiceUnavailable ErrorCode = "SERVICE_UNAVAILABLE"
+	CodeBadRequest          ErrorCode = "BAD_REQUEST"
+	CodeUnauthorized        ErrorCode = "UNAUTHORIZED"
+	CodeForbidden           ErrorCode = "FORBIDDEN"
+	CodeNotFound            ErrorCode = "NOT_FOUND"
+	CodeConflict            ErrorCode = "CONFLICT"
+	CodeUnprocessableEntity ErrorCode = "UNPROCESSABLE_ENTITY"
+	CodeQuotaExceeded       ErrorCode = "QUOTA_EXCEEDED"
+	CodePaymentRequired     ErrorCode = "PAYMENT_REQUIRED"
+	CodeInternalError       ErrorCode = "INTERNAL_ERROR"
+	CodeBadGateway          ErrorCode = "BAD_GATEWAY"
+	CodePayloadTooLarge     ErrorCode = "PAYLOAD_TOO_LARGE"
+	CodeServiceUnavailable  ErrorCode = "SERVICE_UNAVAILABLE"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -111,6 +112,22 @@ func Conflict(w http.ResponseWriter, message string) {
 // ConflictCtx reports a state conflict with trace context (HTTP 409).
 func ConflictCtx(w http.ResponseWriter, r *http.Request, message string) {
 	write(w, CodeConflict, message, http.StatusConflict, requestIDFromContext(r.Context()))
+}
+
+// UnprocessableEntity reports a well-formed request that conflicts with
+// a server-side invariant (HTTP 422). Used by the Idempotency-Key
+// replay path (issue #439): the cache row's (app, deployment) tuple
+// doesn't match the incoming request, meaning the caller is reusing a
+// key against a different body. Distinct from 409 Conflict (used for
+// concurrent state races — issue #440) because the key is something
+// the client controls and can retry with a fresh key.
+func UnprocessableEntity(w http.ResponseWriter, message string) {
+	write(w, CodeUnprocessableEntity, message, http.StatusUnprocessableEntity, "")
+}
+
+// UnprocessableEntityCtx is UnprocessableEntity with trace context.
+func UnprocessableEntityCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodeUnprocessableEntity, message, http.StatusUnprocessableEntity, requestIDFromContext(r.Context()))
 }
 
 // QuotaExceeded reports a quota limit hit (HTTP 429).

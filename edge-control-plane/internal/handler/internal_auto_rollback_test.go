@@ -33,10 +33,11 @@ type stubAutoRollbacker struct {
 	lastApp    string
 }
 
-func (s *stubAutoRollbacker) RollbackDeployment(_ context.Context, tenantID, appName string) (string, error) {
+func (s *stubAutoRollbacker) RollbackDeployment(_ context.Context, tenantID, appName, idempotencyKey string) (string, error) {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName
+	_ = idempotencyKey
 	return s.resp, s.err
 }
 

@@ -69,14 +69,15 @@ import (
 // On current branch after merge of PR #466 (#42), PR #420 (quota
 // grace columns → 025_quotas_grace_columns), issue #440 commit 6
 // (026_active_deployments_activation_attempt_started_at), PR #534
-// (027_used_memory_mb + 028_quota_memory_constraint etc.), and
-// PR #485 (029_quotas_resident_seconds + 030_billing_usage_events):
+// (027_used_memory_mb + 028_quota_memory_constraint etc.), PR #485
+// (029_quotas_resident_seconds + 030_billing_usage_events), PR #439
+// (031_active_deployment_idempotency_keys), and issue #574 retention
+// GCs (additional (created_at) indexes landed on existing migrations):
 // 41 .up.sql + 41 .down.sql = 82 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
-// 028_*, 029_*, 030_*), so this is the on-disk file count, not a
-// strict 2× the migration number. The +2 vs PR #485 is migration 031
-// (issue #574 retention GCs — three (created_at) indexes).
-const splitFileCount = 82 // 41 .up.sql + 41 .down.sql after #574 migration 031
+// 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
+// not a strict 2× the migration number.
+const splitFileCount = 82 // 41 .up.sql + 41 .down.sql after issue #439 + #574
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -99,11 +100,12 @@ var wantTables = []string{
 	"audit_logs",
 	"webhooks",
 	"webhook_deliveries",
-	"billing_subscriptions", // 022 (issue #419)
-	"billing_events",        // 023 (issue #419)
-	"outbox",                // 025 (issue #42)
-	"idempotency_keys",      // 026 (issue #52)
-	"billing_usage_events",  // 030 (issue #485)
+	"billing_subscriptions",              // 022 (issue #419)
+	"billing_events",                     // 023 (issue #419)
+	"outbox",                             // 025 (issue #42)
+	"idempotency_keys",                   // 026 (issue #52)
+	"billing_usage_events",               // 030 (issue #485)
+	"active_deployment_idempotency_keys", // 031 (issue #439)
 }
 
 // wantColumns enumerates the public-schema columns each table must

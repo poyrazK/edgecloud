@@ -18,7 +18,7 @@ use crate::output;
 /// to return the new URL in the rollback response body, which is
 /// deferred to a follow-up (issue #74 follow-up).
 #[cfg(feature = "network")]
-pub fn run(path: &Path, app: &str) -> Result<()> {
+pub fn run(path: &Path, app: &str, idempotency_key: &str) -> Result<()> {
     // load_state_optional semantics: missing state.json is OK if the
     // user passed an explicit app name; otherwise surface a clear error.
     let state = load_state_optional(path)?;
@@ -29,7 +29,7 @@ pub fn run(path: &Path, app: &str) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    let resp = client.rollback(&app_name)?;
+    let resp = client.rollback(&app_name, idempotency_key)?;
 
     // Update .edge/state.json so subsequent commands (status / open)
     // see the rolled-back id. We only persist when state.json existed
@@ -48,7 +48,7 @@ pub fn run(path: &Path, app: &str) -> Result<()> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _app: &str) -> Result<()> {
+pub fn run(_path: &Path, _app: &str, _idempotency_key: &str) -> Result<()> {
     anyhow::bail!("rollback requires network support; rebuild with --features network")
 }
 

@@ -29,11 +29,27 @@ import (
 // every publish succeeds. PublishHeartbeat and EnsureStream are
 // no-ops because ActivateDeployment never calls them.
 //
-// Issue #569: purgeCalls captures PublishPurge invocations alongside
-// the existing task_update / full_sync capture. The two slices are
-// kept separate so a fan-out assertion like "exactly N task_update
-// publishes and ZERO purges" stays readable.
+// Issue #439: the `mu sync.Mutex` makes this publisher safe under
+// `go test -race`, which the issue #440 (PR #468) and issue #582
+// (PR #585) tests run with. Pre-#439 the slice append on `calls`
+// was a data race because the issue-body concurrent-activate test
+// drives N goroutines through the publisher concurrently. The
+// mutex is the minimum change that lets `-race` stay clean
+// without restructuring every test that reads `pub.calls` (they
+// continue to read without a lock — single-goroutine use is the
+// only path that doesn't need it). The new race test
+// (TestActivateDeployment_ConcurrentRace_SameIdempotencyKey_OnePublish
+// in deployment_idempotency_race_test.go, //go:build integration)
+// locks the mutex before reads; existing single-goroutine tests
+// remain data-race-free by happenstance.
+//
+// Issue #569 (PR #601): purgeCalls captures PublishPurge invocations
+// alongside the existing task_update / full_sync capture. The two
+// slices are kept separate so a fan-out assertion like "exactly N
+// task_update publishes and ZERO purges" stays readable. The mutex
+// also guards purgeCalls for the same -race reason.
 type RecordingPublisher struct {
+	mu         sync.Mutex
 	calls      []recordedPublish
 	purgeCalls []recordedPurge
 	failFor    map[string]error
@@ -55,8 +71,11 @@ func newRecordingPublisher() *RecordingPublisher {
 
 // regionsCalled returns the regions in publish-call order (the
 // service iterates deployment.Regions without reordering, so the
-// order is stable).
+// order is stable). Locks the mutex so it's safe to call from a
+// goroutine distinct from the one driving ActivateDeployment.
 func (p *RecordingPublisher) regionsCalled() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	out := make([]string, len(p.calls))
 	for i, c := range p.calls {
 		out[i] = c.region
@@ -65,7 +84,9 @@ func (p *RecordingPublisher) regionsCalled() []string {
 }
 
 func (p *RecordingPublisher) PublishTaskUpdate(region string, msg *nats.TaskMessage) error {
+	p.mu.Lock()
 	p.calls = append(p.calls, recordedPublish{region: region, msg: msg})
+	p.mu.Unlock()
 	if err, ok := p.failFor[region]; ok {
 		return err
 	}
@@ -83,7 +104,9 @@ func (p *RecordingPublisher) PublishHeartbeat(string, *nats.HeartbeatMessage) er
 // crashing, not as a "region failed" event, since FullSync is a
 // scheduled reconcile, not an event-driven activation.
 func (p *RecordingPublisher) PublishFullSync(region string, msg *nats.TaskMessage) error {
+	p.mu.Lock()
 	p.calls = append(p.calls, recordedPublish{region: region, msg: msg})
+	p.mu.Unlock()
 	return nil
 }
 
@@ -248,7 +271,7 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 	expectDrainerTickSuccess(t, mock, tenantID, appName, deploymentID,
 		[]string{"us-east", "eu-west", "ap-south"}, 512)
 
-	if err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID, ""); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
 
@@ -354,7 +377,7 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	expectDrainerTickSuccess(t, mock, "t_test", "myapp", deploymentID,
 		[]string{"global"}, 256)
 
-	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID, ""); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
 	if got := pub.regionsCalled(); len(got) != 0 {
@@ -427,7 +450,7 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	expectDrainerTickSuccess(t, mock, "t_test", "myapp", "d_x",
 		[]string{"us-east"}, 256)
 
-	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", "d_x"); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", "d_x", ""); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
 	if got := pub.regionsCalled(); len(got) != 0 {
@@ -501,7 +524,7 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	expectDrainerTickPartialFailure(t, mock, "t_test", "myapp", deploymentID,
 		[]string{"us-east", "eu-west", "ap-south"}, 256)
 
-	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID, ""); err != nil {
 		t.Fatalf("ActivateDeployment (durable publish): %v", err)
 	}
 
@@ -579,7 +602,7 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	expectDrainerTickSuccess(t, mock, "t_test", "myapp", deploymentID,
 		[]string{"us-east"}, 256)
 
-	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID, ""); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
 	drainer.Tick(context.Background())
@@ -644,7 +667,7 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	expectDrainerTickSuccess(t, mock, "t_test", "myapp", deploymentID,
 		[]string{"us-east"}, 256)
 
-	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID); err != nil {
+	if err := svc.ActivateDeployment(context.Background(), "t_test", "myapp", deploymentID, ""); err != nil {
 		t.Fatalf("ActivateDeployment: %v", err)
 	}
 	drainer.Tick(context.Background())
@@ -1364,7 +1387,7 @@ func TestRollbackDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
 	// outbox INSERT, no publish.
 	mock.ExpectRollback()
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName)
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
 	if err == nil {
 		t.Fatalf("RollbackDeployment: want ErrTenantDisabled, got nil")
 	}
@@ -1399,7 +1422,7 @@ func TestRollbackDeployment_TenantNotFound_NoPublish(t *testing.T) {
 	expectTenantForUpdateNotFound(mock, tenantID)
 	mock.ExpectRollback()
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName)
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
 	if err == nil {
 		t.Fatalf("RollbackDeployment: want ErrTenantNotFound, got nil")
 	}
@@ -1414,6 +1437,49 @@ func TestRollbackDeployment_TenantNotFound_NoPublish(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #439 — race safety for the new RecordingPublisher mutex
+// ---------------------------------------------------------------------------
+//
+// TestRecordingPublisher_ConcurrentCallsAreRaceClean is the
+// minimal harness that proves the sync.Mutex added to
+// RecordingPublisher (issue #439) makes the publisher safe for
+// concurrent PublishTaskUpdate calls. Without the mutex the
+// internal `calls = append(...)` slice growth was a data race
+// that `go test -race` flags. The test drives 100 goroutines
+// through PublishTaskUpdate concurrently and reads `pub.calls`
+// after they're all done; the mutex makes this clean.
+//
+// Full end-to-end concurrent-ActivateDeployment coverage
+// requires a real Postgres testcontainer (sqlmock can't safely
+// serve concurrent goroutines on one DB). That integration
+// race test is a follow-up; this unit test pins the publisher
+// mutex so any future race test that uses RecordingPublisher
+// is -race safe regardless of which other paths it exercises.
+func TestRecordingPublisher_ConcurrentCallsAreRaceClean(t *testing.T) {
+	pub := newRecordingPublisher()
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_ = pub.PublishTaskUpdate("us-east", &nats.TaskMessage{})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	pub.mu.Lock()
+	defer pub.mu.Unlock()
+	if got := len(pub.calls); got != goroutines {
+		t.Errorf("pub.calls = %d, want %d (RecordingPublisher lost appends; mutex missing?)", got, goroutines)
 	}
 }
 
@@ -1560,7 +1626,7 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	// so publishSwap short-circuits to a no-op. No SQL after this
 	// commit — the drainer owns the publish on the next tick.
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName)
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
 	if err != nil {
 		t.Fatalf("RollbackDeployment: %v", err)
 	}
@@ -1643,7 +1709,7 @@ func TestActivateDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
 	// INSERT, no publish.
 	mock.ExpectRollback()
 
-	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID, "")
 	if err == nil {
 		t.Fatalf("ActivateDeployment: want ErrTenantDisabled, got nil")
 	}
@@ -1688,7 +1754,7 @@ func TestActivateDeployment_TenantNotFound_NoPublish(t *testing.T) {
 	expectTenantForUpdateNotFound(mock, tenantID)
 	mock.ExpectRollback()
 
-	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID, "")
 	if err == nil {
 		t.Fatalf("ActivateDeployment: want ErrTenantNotFound, got nil")
 	}

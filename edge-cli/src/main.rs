@@ -333,6 +333,13 @@ enum Command {
         /// this deployment and the currently active one.
         #[arg(long)]
         weight: Option<u8>,
+        /// Idempotency-Key header (issue #439). When supplied (or auto-
+        /// minted if absent), the server pins this activate to the
+        /// original publish — a CLI retry on a transient network error
+        /// replays the original instead of enqueuing a second
+        /// task_update. Echoed on stderr so CI scripts can grep it.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 
     /// List all apps, create an app, or show details for one.
@@ -355,6 +362,11 @@ enum Command {
         /// App name. Defaults to the app in `.edge/state.json`.
         #[arg(default_value = "")]
         app: String,
+        /// Idempotency-Key header (issue #439). Same semantics as
+        /// Activate: a CI retry on a transient error replays the
+        /// original rollback instead of triggering a second one.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 
     /// Analyze source for WASI compatibility.
@@ -619,7 +631,24 @@ fn main() -> Result<()> {
         Command::Activate {
             deployment_id,
             weight,
-        } => commands::activate::run(&cli.path, &deployment_id, weight),
+            idempotency_key,
+        } => {
+            // Issue #439: auto-mint an Idempotency-Key when the caller
+            // didn't pass one so a CI retry on a transient network
+            // error replays the original instead of enqueuing a
+            // duplicate task_update. Mirrors the deploy-side mint
+            // pattern at deploy.rs:179.
+            let idem_key_owned: String;
+            let idem_key_slice: &str = match idempotency_key.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    idem_key_owned = uuid::Uuid::new_v4().to_string();
+                    output::info(&format!("idempotency-key: {idem_key_owned}"));
+                    idem_key_owned.as_str()
+                }
+            };
+            commands::activate::run(&cli.path, &deployment_id, weight, idem_key_slice)
+        }
         Command::Apps { action } => match action {
             None => commands::apps::list(&cli.path),
             Some(AppsCommand::Get { name }) => commands::apps::get(&cli.path, &name),
@@ -627,7 +656,21 @@ fn main() -> Result<()> {
                 commands::apps::create(&cli.path, &name, description.as_deref())
             }
         },
-        Command::Rollback { app } => commands::rollback::run(&cli.path, &app),
+        Command::Rollback {
+            app,
+            idempotency_key,
+        } => {
+            let idem_key_owned: String;
+            let idem_key_slice: &str = match idempotency_key.as_deref() {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    idem_key_owned = uuid::Uuid::new_v4().to_string();
+                    output::info(&format!("idempotency-key: {idem_key_owned}"));
+                    idem_key_owned.as_str()
+                }
+            };
+            commands::rollback::run(&cli.path, &app, idem_key_slice)
+        }
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev { lang } => commands::dev::run(&cli.path, lang),
         Command::Open { force } => commands::open::run(&cli.path, force),
