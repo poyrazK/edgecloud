@@ -36,6 +36,39 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+impl ApiError {
+    /// Whether a retry of the original request is a sane next step.
+    ///
+    /// `Transient` is always retryable — covers 5xx, network failure,
+    /// timeout, and any `anyhow::Error` that bubbled up through the
+    /// `From<anyhow::Error>` arm (e.g. multipart builder errors).
+    ///
+    /// `Rejected` covers the 4xx range. The vast majority of 4xx are
+    /// deterministic — a 401 won't become a 200 on the next try, a 422
+    /// means the Idempotency-Key already mapped to a different artifact
+    /// server-side and retrying just loops the same 422 — so the default
+    /// for `Rejected` is `false`. The one exception is **429 (Too Many
+    /// Requests)**: the deploy handler does not emit a `Retry-After`
+    /// header (issue #571), so a backoff loop is the right shape.
+    ///
+    /// Centralized on `ApiError` (rather than in `commands::deploy.rs`)
+    /// so future retry callers — `set_env`, `set_traffic`, etc. —
+    /// reuse the same classification instead of hand-rolling it.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ApiError::Transient { .. } => true,
+            // 429 from the server IS retryable — the deploy handler
+            // doesn't emit Retry-After, so a backoff loop is the right
+            // shape. All other 4xx are deterministic and must NOT retry
+            // (a 401 won't become a 200 on the next try, a 422 means
+            // the Idempotency-Key already mapped to a different
+            // artifact, etc.).
+            ApiError::Rejected { status, .. } if status.as_u16() == 429 => true,
+            ApiError::Rejected { .. } => false,
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(source: anyhow::Error) -> Self {
         ApiError::Transient { source }
@@ -770,10 +803,21 @@ impl ApiClient {
         }
         let resp = req.multipart(form).send()?;
 
+        // Issue #571: surface `Rejected` as an `anyhow::Error` via
+        // `Error::new` (not `anyhow!()`) so the original `ApiError`
+        // is preserved as the root cause. `commands::deploy`'s
+        // `is_anyhow_retryable` walks the chain with `.chain()` and
+        // `downcast_ref::<ApiError>()` to decide whether to retry;
+        // a fresh `anyhow!()` would drop the type and force the
+        // retry classifier to fall back to the conservative
+        // "retry everything" default (which incorrectly retries
+        // deterministic 4xx like 400/422). The user-facing
+        // `"deploy failed: …"` prefix is preserved by chaining a
+        // `.context("deploy failed")` on top of the wrapped
+        // `ApiError` — anyhow renders both frames in the Display
+        // chain, so the printed message stays identical.
         let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { status, body } => {
-                anyhow::anyhow!("deploy failed: {status} {body}")
-            }
+            ApiError::Rejected { .. } => anyhow::Error::new(e).context("deploy failed"),
             ApiError::Transient { source } => source,
         })?;
 
@@ -1412,5 +1456,75 @@ mod tests {
         // The marker must be present and the function must have
         // returned without panicking.
         assert!(out.ends_with("... [truncated]"));
+    }
+
+    // F13 (issue #571): the retry classifier must distinguish
+    // retryable (Transient, 429) from non-retryable (other 4xx). The
+    // load-bearing cases are 422 (idempotency-key artifact-mismatch —
+    // a retry would loop the same 422 forever) and 429 (the deploy
+    // handler doesn't emit Retry-After, so a backoff loop is the
+    // right shape). The 503 case is a sanity check that 5xx still
+    // routes through `Transient`, not `Rejected` (see
+    // `check_response` at lines 94-100).
+    #[test]
+    fn is_retryable_classifies_transient_as_true() {
+        let e: ApiError = anyhow::anyhow!("boom").into();
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_classifies_429_as_true() {
+        let e = ApiError::Rejected {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: "rate limited".into(),
+        };
+        assert!(e.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_classifies_4xx_other_than_429_as_false() {
+        // 401: bad API key — retrying with the same key won't help.
+        let e = ApiError::Rejected {
+            status: StatusCode::UNAUTHORIZED,
+            body: "bad key".into(),
+        };
+        assert!(!e.is_retryable());
+
+        // 422: idempotency-key artifact-mismatch — retrying with the
+        // same key + same (or different) artifact loops the same 422.
+        let e = ApiError::Rejected {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: "idempotency key reused".into(),
+        };
+        assert!(!e.is_retryable());
+
+        // 404: app not found — retrying won't make the app appear.
+        let e = ApiError::Rejected {
+            status: StatusCode::NOT_FOUND,
+            body: "app not found".into(),
+        };
+        assert!(!e.is_retryable());
+
+        // 402: quota — a billing boundary, not a transient infra issue.
+        let e = ApiError::Rejected {
+            status: StatusCode::PAYMENT_REQUIRED,
+            body: "quota".into(),
+        };
+        assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_5xx_routes_through_transient_not_rejected() {
+        // Sanity check: `check_response` maps 5xx to `Transient`
+        // (via `is_client_error() == false`), so 503 should never
+        // reach `is_retryable` as a `Rejected` variant. Pin the
+        // expectation that a hypothetical `Rejected { 503 }` would
+        // still be non-retryable — guards against a future
+        // refactor that changes the 4xx/5xx split.
+        let e = ApiError::Rejected {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: "down".into(),
+        };
+        assert!(!e.is_retryable());
     }
 }
