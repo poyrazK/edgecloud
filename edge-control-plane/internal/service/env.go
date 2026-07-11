@@ -235,7 +235,7 @@ func (s *EnvService) publishIfActiveTx(ctx context.Context, tx *sqlx.Tx, tenantI
 	// the activate path's deployment.Regions propagation.
 
 	payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
-		active.DeploymentID, deployment, tenant, regions, quota, envMap)
+		active.DeploymentID, deployment, tenant, regions, quota, envMap, "")
 	if err != nil {
 		return fmt.Errorf("building publish payload: %w", err)
 	}

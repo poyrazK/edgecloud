@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -305,7 +306,7 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 	quota := &domain.Quota{TenantID: tenantID, MaxMemoryMB: 256}
 	envMap := map[string]string{"LOG_LEVEL": "trace"}
 	payload, err := b.buildPublishPayload(context.Background(), tenantID, appName,
-		deploymentID, dep, tenant, []string{}, quota, envMap)
+		deploymentID, dep, tenant, []string{}, quota, envMap, "")
 	if err != nil {
 		t.Fatalf("buildPublishPayload: %v", err)
 	}
@@ -334,5 +335,59 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 	}
 	if app.MaxMemoryMB != 256 {
 		t.Errorf("app.MaxMemoryMB = %d, want 256", app.MaxMemoryMB)
+	}
+	if app.SocketMode != "" {
+		t.Errorf("app.SocketMode = %q, want \"\" (default omitted on the wire)", app.SocketMode)
+	}
+}
+
+// TestBuildPublishPayload_SocketModePropagated locks the issue #548
+// wiring: when an activate path calls buildPublishPayload with a
+// non-empty socketMode (computed from nats.SocketModeForProtocol),
+// the value MUST appear on the marshaled AppConfig. Without this
+// regression guard, a future refactor of the helper that drops the
+// arg would silently regress the entire L4 chain — the worker
+// would BlockAll-bind a tcp server and the failure mode would be
+// "no traffic, no error".
+func TestBuildPublishPayload_SocketModePropagated(t *testing.T) {
+	tenantID, appName, deploymentID := "t_l4", "hello-tcp", "d_l4"
+
+	b := NewPublishBuilder()
+	dep := &domain.Deployment{
+		Hash:         "h",
+		Signature:    "sig",
+		SigningKeyID: "default",
+	}
+	tenant := &domain.Tenant{
+		ID:                      tenantID,
+		Name:                    "T",
+		Plan:                    "pro",
+		AllowlistedDestinations: nil,
+	}
+	quota := &domain.Quota{TenantID: tenantID, MaxMemoryMB: 256}
+	payload, err := b.buildPublishPayload(context.Background(), tenantID, appName,
+		deploymentID, dep, tenant, []string{"fra"}, quota, map[string]string{},
+		"allow-all", // <-- the issue #548 input: activate stamped this from protocol="tcp"
+	)
+	if err != nil {
+		t.Fatalf("buildPublishPayload: %v", err)
+	}
+	var msg nats.TaskMessage
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		t.Fatalf("unmarshal TaskMessage: %v", err)
+	}
+	app, ok := msg.Apps[appName]
+	if !ok {
+		t.Fatalf("msg.Apps[%q] missing; got %v", appName, msg.Apps)
+	}
+	if app.SocketMode != "allow-all" {
+		t.Errorf("app.SocketMode = %q, want %q (issue #548 L4 stamping)", app.SocketMode, "allow-all")
+	}
+	// And it should also be visible on the raw JSON — the worker
+	// decoder only sees what hits the wire, not just the Go struct
+	// (regression guard against an `omitempty` regression that would
+	// silently drop the field for non-empty values).
+	if !strings.Contains(string(payload), `"socket_mode":"allow-all"`) {
+		t.Errorf("marshaled payload missing socket_mode=allow-all: %s", payload)
 	}
 }

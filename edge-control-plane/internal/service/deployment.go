@@ -1617,7 +1617,7 @@ func (s *DeploymentService) activateDeployment(ctx context.Context, tenantID, ap
 			return err
 		}
 		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
-			deploymentID, deployment, tenant, regions, activateQuota, envMap)
+			deploymentID, deployment, tenant, regions, activateQuota, envMap, "")
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
@@ -2063,7 +2063,7 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return err
 		}
 		payload, err := s.publishBuilder.buildPublishPayload(ctx, tenantID, appName,
-			rolledBackID, deploymentForPayload, tenant, regions, rollbackQuota, envMap)
+			rolledBackID, deploymentForPayload, tenant, regions, rollbackQuota, envMap, "")
 		if err != nil {
 			return fmt.Errorf("building publish payload: %w", err)
 		}
