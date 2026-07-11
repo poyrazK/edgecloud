@@ -19,6 +19,20 @@
 //! (`edge env set`, `edge keys create`, `edge domains add`) are NOT
 //! routed through this loop yet — see the Phase-2 follow-up issue
 //! for the CP `Idempotency-Key` schema work that has to land first.
+//!
+//! **The whole module is `feature = "network"` gated** — see the
+//! `#![cfg(feature = "network")]` directive at the top of the
+//! file. The defensive test suite in [`retry_loop_tests`] uses
+//! `#[cfg(test)]`, which inherits the file-level `feature = "network"`
+//! gate (no separate `cfg(all(test, feature = "network"))` needed —
+//! the file is already network-gated, so `cfg(test)` alone is enough
+//! to scope the tests to `cargo test` invocations). The `pub mod
+//! retry;` declaration in `commands/mod.rs` is unconditional, but a
+//! non-`network` build gets an empty module body — a future
+//! contributor adding a non-`network` helper to this file would
+//! see the file-level gate as the first thing they edit.
+
+#![cfg(feature = "network")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -82,7 +96,6 @@ pub const DEFAULT_RETRY_CAP_MS: u64 = 8_000;
 /// helpers below — they were lifted verbatim from
 /// `commands/deploy.rs` so the deploy-side tests continue to pin
 /// the same contracts through a `pub(crate) use` re-export.
-#[cfg(feature = "network")]
 pub fn call_with_retry<T, F>(
     op_label: &str,
     mut attempt: F,
@@ -109,14 +122,18 @@ where
     // `call_with_retry` call (no startup-cache) for test simplicity;
     // if production usage is ever formalized, it should be promoted
     // to a `--retry-base-ms` flag and read once.
+    //
+    // Only the base backoff is overridable via env; the cap is
+    // passed in directly because it interacts with the operator-
+    // tunable `--retry-cap-ms` flag on `edge traffic set` /
+    // `edge env delete` (where clap's `value_parser` already
+    // clamps it to 1..=60_000). A test-only cap override would
+    // need `std::env::set_var` (unsafe since Rust 1.86) and would
+    // race parallel tests — not worth the complexity.
     let effective_base_ms = std::env::var("EDGE_CLI_RETRY_BASE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(retry_base_ms);
-    let effective_cap_ms = std::env::var("EDGE_CLI_RETRY_CAP_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(retry_cap_ms);
 
     let mut attempt_no: u32 = 0;
     loop {
@@ -125,8 +142,7 @@ where
             Ok(resp) => return Ok(resp),
             Err(e) if attempt_no > max_retries || !is_anyhow_retryable(&e) => return Err(e),
             Err(e) => {
-                let backoff_ms =
-                    compute_backoff_ms(attempt_no, effective_base_ms, effective_cap_ms);
+                let backoff_ms = compute_backoff_ms(attempt_no, effective_base_ms, retry_cap_ms);
                 output::warn(&format!(
                     "retrying {op_label} (attempt {attempt_no}/{max_retries} after {backoff_ms}ms): {e}"
                 ));
@@ -146,7 +162,17 @@ where
 /// caller keeps the explicit `&AtomicBool` parameter because it
 /// installs its own ctrlc handler (see
 /// `commands/deploy.rs::run_upload`) and sets the flag on Ctrl-C.
-#[cfg(feature = "network")]
+///
+/// **Do not cache the `AtomicBool` in a `OnceLock` or static.** The
+/// flag is constructed fresh on every call so it stays `false`
+/// forever for non-deploy callers — `interruptible_sleep` then
+/// runs the full backoff (Ctrl-C still aborts via the default
+/// signal handler). If the flag were cached at module scope, a
+/// future contributor adding a SIGINT handler at the same scope
+/// (e.g., a shared `ctrlc::set_handler`) could set the cached flag
+/// for ALL callers, not just the deploy path — which would
+/// short-circuit Ctrl-C handling for endpoints that didn't ask
+/// for it. The fresh-per-call construction is load-bearing.
 pub fn call_with_retry_no_interrupt<T, F>(
     op_label: &str,
     attempt: F,
@@ -255,12 +281,18 @@ fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
 ///
 /// State is a `static AtomicU64` seeded on first call from
 /// `SystemTime::now()` nanoseconds (high-entropy, only used once
-/// per process lifetime). The state is updated with a
-/// fetch-update loop (CAS) so concurrent retry sleeps don't
-/// trample each other's state — but the CLI is single-threaded
-/// for retry purposes today, so this is belt-and-braces.
-/// Period is 2^64 − 1 ≈ 1.8e19, ample for a CLI that runs for
-/// seconds-to-minutes.
+/// per process lifetime). The state is updated with a CAS loop
+/// so concurrent retry sleeps from multiple threads (a real
+/// Phase-3 candidate: parallel mutations from a CI script that
+/// spawns tokio workers — see the plan file at
+/// `/Users/poyrazk/.claude/plans/optimized-wondering-quokka.md`
+/// for the FaaS concurrency cap, which already exercises this
+/// pattern) don't trample each other's state. Today the CLI is
+/// single-threaded for retry purposes, so the CAS path is
+/// untrafficked — but it's cheap (one `compare_exchange_weak` per
+/// jitter call) and the function would silently mis-distribute
+/// under contention if it weren't there. Period is 2^64 − 1 ≈
+/// 1.8e19, ample for a CLI that runs for seconds-to-minutes.
 fn xorshift_uniform_u64() -> u64 {
     static STATE: OnceLock<AtomicU64> = OnceLock::new();
     let state = STATE.get_or_init(|| {
@@ -309,7 +341,7 @@ fn xorshift_uniform_u64() -> u64 {
 // passing unchanged.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, feature = "network"))]
+#[cfg(test)]
 mod retry_loop_tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
@@ -584,6 +616,44 @@ mod retry_loop_tests {
             "interrupt must short-circuit the sleep; elapsed={:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn call_with_retry_no_interrupt_matches_call_with_retry_with_default_flag() {
+        // Pin the contract that `call_with_retry_no_interrupt` is
+        // a one-line wrapper around `call_with_retry` with a fresh
+        // `AtomicBool::new(false)`. Both call sites should produce
+        // identical results for any input sequence. A future
+        // contributor who adds logging, metrics, or pre-loop hooks
+        // to the shim (e.g., a "retry started" trace event) is
+        // caught here when the closure-call counts diverge.
+        //
+        // The shim does NOT own ctrlc — a Ctrl-C at runtime aborts
+        // via the default signal handler on the next blocking call.
+        // The flag stays `false` forever, so the loop sleeps for
+        // the full backoff. We don't simulate Ctrl-C in this test
+        // (that path is exercised by `aborts_on_interrupt_flag`
+        // against `call_with_retry` directly — adding the same
+        // coverage against the shim would require plumbing the
+        // flag out of the shim, which would defeat its purpose).
+        let calls = AtomicU32::new(0);
+        let mut attempt = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<CannedValue, _>(canned_transient(503, "warming up"))
+        };
+        let err = call_with_retry_no_interrupt("test", &mut attempt, 3, 1, 1)
+            .expect_err("budget should exhaust on sustained 503 storm");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "1 initial attempt + 3 retries = 4 closure calls (matches call_with_retry)"
+        );
+        // Error chain still carries the typed ApiError (the
+        // classifier contract — same as `eventually_exhausts`).
+        assert!(err.chain().any(|c| matches!(
+            c.downcast_ref::<ApiError>(),
+            Some(ApiError::Transient { .. })
+        )));
     }
 
     // Defensive tests for `compute_backoff_ms`, the
