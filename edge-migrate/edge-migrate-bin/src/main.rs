@@ -176,7 +176,7 @@ struct Args {
     tree: Option<String>,
 
     /// App name for the `--tree` upload. Required when `--tree` is
-    /// used. Must match `^[a-z0-9][a-z0-9_-]{0,62}$`. If omitted, the
+    /// used. Must match `^[a-z0-9][a-z0-9.\-_]{0,62}$`. If omitted, the
     /// basename of `--tree` is used.
     #[arg(long, value_name = "NAME", requires = "tree")]
     app_name: Option<String>,
@@ -520,7 +520,7 @@ async fn run_tree_upload(
     let app_name = app_name_arg.map(|s| s.to_string()).unwrap_or(derived);
     if !is_valid_app_name(&app_name) {
         anyhow::bail!(
-            "invalid app name '{}': must match ^[a-z0-9][a-z0-9_-]{{0,62}}$",
+            "invalid app name '{}': must match ^[a-z0-9][a-z0-9.\\-_]{{0,62}}$",
             app_name
         );
     }

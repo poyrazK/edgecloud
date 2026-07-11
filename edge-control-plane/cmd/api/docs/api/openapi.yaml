@@ -2078,16 +2078,18 @@ paths:
               properties:
                 app_name:
                   type: string
-                  pattern: '^[a-z0-9][a-z0-9_-]{0,62}$'
+                  pattern: '^[a-z0-9][a-z0-9.\-_]{0,62}$'
                   description: |
-                    Unique app name (alphanumeric, underscores, hyphens, 1-63 chars;
-                    regex `^[a-z0-9][a-z0-9_-]{0,62}$`). Widened from
-                    `[a-z0-9-]` to admit `_` for names like `app_v2`
-                    (issue #438). Dots are NOT allowed: a dotted name
-                    would render as a two-label host under
-                    `*.edgecloud.dev` that the single-level wildcard
-                    DNS record and TLS cert do not cover. Use `myapp-v2`
-                    or `myapp_v2` in place of `myapp.v2`.
+                    Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
+                    regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
+                    `[a-z0-9-]` to admit `.` and `_` for semver-ish
+                    names like `myapp.v2` or `app_v2` (issue #438).
+                    Dotted names render as a two-label host under
+                    `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
+                    operators must provision `*.*.edgecloud.dev` DNS and
+                    a matching cert before such names are routable.
+                    Single-label names (`myapp-v2`, `myapp_v2`) work
+                    under the existing `*.edgecloud.dev` wildcard.
                   example: my-app
                 language:
                   type: string

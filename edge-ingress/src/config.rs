@@ -37,6 +37,16 @@ pub struct Config {
     /// Path to the TLS key PEM file. Same Docker constraint as
     /// `cert_file`. Set via `TLS_KEY_FILE` (required).
     pub key_file: String,
+    /// Optional second TLS cert PEM path, loaded into Caddy's
+    /// `load_files` alongside `cert_file`. Used for the multi-label
+    /// wildcard (`*.*.edgecloud.dev`) that covers dotted app names
+    /// like `myapp.v2` (issue #438). When unset, dotted hosts fall
+    /// through to per-route `tls.on_demand: {}` (ACME) on first hit.
+    /// Set via `TLS_CERT_FILE_2` (optional).
+    pub cert_file_2: Option<String>,
+    /// Optional second TLS key PEM path. Pairs with `cert_file_2`.
+    /// Set via `TLS_KEY_FILE_2` (optional).
+    pub key_file_2: Option<String>,
     pub listen_http: String,
     pub listen_https: String,
     pub refresh_debounce_ms: u64,
@@ -126,6 +136,11 @@ impl Config {
     ///   `-v` mount), NOT a host-only path like `/Users/user/...`.
     /// - `TLS_KEY_FILE` — path to the matching key PEM. Same Docker
     ///   path constraint as `TLS_CERT_FILE`.
+    /// - `TLS_CERT_FILE_2` (optional) — path to a second cert PEM for
+    ///   the multi-label `*.*.edgecloud.dev` wildcard that covers
+    ///   dotted app names (`myapp.v2`). When unset, two-label hosts
+    ///   fall through to ACME on-demand issuance. Issue #438.
+    /// - `TLS_KEY_FILE_2` (optional) — path to the matching key PEM.
     ///
     /// Optional env vars:
     /// - `NATS_URL` (default: `nats://localhost:4222`)
@@ -161,6 +176,12 @@ impl Config {
             region: std::env::var("INGRESS_REGION").context("INGRESS_REGION not set")?,
             cert_file: std::env::var("TLS_CERT_FILE").context("TLS_CERT_FILE not set")?,
             key_file: std::env::var("TLS_KEY_FILE").context("TLS_KEY_FILE not set")?,
+            cert_file_2: std::env::var("TLS_CERT_FILE_2")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            key_file_2: std::env::var("TLS_KEY_FILE_2")
+                .ok()
+                .filter(|v| !v.is_empty()),
             listen_http: std::env::var("INGRESS_LISTEN_HTTP").unwrap_or_else(|_| ":80".into()),
             listen_https: std::env::var("INGRESS_LISTEN_HTTPS").unwrap_or_else(|_| ":443".into()),
             refresh_debounce_ms: std::env::var("REFRESH_DEBOUNCE_MS")

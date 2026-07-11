@@ -26,19 +26,27 @@ import (
 )
 
 // IsValidAppName enforces the edgeCloud app-name format
-// `^[a-z0-9][a-z0-9_-]{0,62}$` — 1–63 chars, lowercase alphanumerics
-// plus underscores and hyphens. The first character must be a
-// lowercase letter or digit (rejects `_foo` and `-foo`).
+// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics
+// plus dots, underscores, and hyphens. The first character must be a
+// lowercase letter or digit (rejects `_foo`, `-foo`, `.foo`, and the
+// path-traversal pair `..`).
 //
 // Issue #438 unified the previous parallel validators (the old
 // `IsValidAppName` rejected any `.`/`/`/`\`; `IsValidDeploymentAppName`
-// rejected `.` and `_`) into a single rule that also admits `_` so
-// names like `app_v2` are accepted. `.` is intentionally NOT allowed:
-// a dotted name renders as `<tenant>-my.app.edgecloud.dev`, a two-label
-// host the single-level `*.edgecloud.dev` wildcard DNS record and TLS
-// cert do not cover. `_` is safe because it stays inside the leftmost
-// label (tenant IDs like `t_acme` already carry it). Use `myapp-v2` or
-// `myapp_v2` in place of `myapp.v2`.
+// rejected `.` and `_`) into a single rule that allows semver-ish
+// suffixes like `myapp.v2` and `app_v2`.
+//
+// **Operator prerequisite for dotted names:** a dotted app renders as
+// `<tenant>-my.app.edgecloud.dev`, a TWO-label host. The single-level
+// `*.edgecloud.dev` wildcard DNS record and TLS cert do NOT cover it —
+// operators must additionally provision `*.*.edgecloud.dev` (DNS + cert)
+// before deploying dotted apps. The ingress renders Caddy routes that
+// match the literal FQDN atomically and, if `TLS_CERT_FILE_2`/
+// `TLS_KEY_FILE_2` are set, loads the multi-label cert alongside the
+// single-level wildcard; otherwise the per-route `tls.on_demand: {}`
+// fall-through triggers ACME on first hit for the unknown host. Single
+// label wildcard apps (`myapp-v2`, `myapp_v2`) continue to work without
+// any new operator configuration.
 //
 // This is the single source of truth for app-name shape in the control
 // plane — used by the deploy, activate, rollback, promote, and traffic
@@ -62,7 +70,7 @@ func IsValidAppName(name string) bool {
 	for i, r := range name {
 		isLower := r >= 'a' && r <= 'z'
 		isDigit := r >= '0' && r <= '9'
-		isSpecial := r == '_' || r == '-'
+		isSpecial := r == '.' || r == '_' || r == '-'
 		if i == 0 {
 			if !isLower && !isDigit {
 				return false
