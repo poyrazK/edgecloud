@@ -336,6 +336,10 @@ pub struct APIKeySummary {
     pub expires_at: Option<String>,
 }
 
+// NOTE: This type is *not* re-exported from `crate::api` (unlike the
+// other API DTOs in `api/mod.rs`'s `pub use client::{...}` block) —
+// import it as `crate::api::client::WhoamiResponse`. Issue #107
+// follow-up note; see PR #653 review.
 #[derive(Debug, Deserialize)]
 pub struct WhoamiResponse {
     pub tenant_id: String,

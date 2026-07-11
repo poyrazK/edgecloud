@@ -182,7 +182,13 @@ async fn whoami_prints_tenant_info() {
         .success()
         .stdout(predicate::str::contains("Acme"))
         .stdout(predicate::str::contains("t_xyz"))
-        .stdout(predicate::str::contains("owner"));
+        .stdout(predicate::str::contains("owner"))
+        // Issue #107: the server emits RFC3339-UTC; the CLI must label
+        // it as such in the printed output so a non-UTC reader can read
+        // the timestamp. Pin the exact substring "2026-06-17T12:00:00Z UTC"
+        // to catch either a future server-side format change or a CLI
+        // regression that strips the suffix.
+        .stdout(predicate::str::contains("2026-06-17T12:00:00Z UTC"));
 }
 
 #[test]

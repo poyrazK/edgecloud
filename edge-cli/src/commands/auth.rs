@@ -306,17 +306,42 @@ fn whoami() -> Result<()> {
         .whoami_anyhow()
         .with_context(|| "whoami failed")?;
 
-    println!("  Tenant:    {} ({})", info.tenant_name, info.tenant_id);
-    println!("  Plan:      {}", info.plan);
-    println!("  API key:   {} ({})", info.api_key_name, info.api_key_id);
-    println!("  Role:      {}", info.role);
-    println!("  Created:   {}", info.created_at);
+    println!("{}", render_whoami(&info));
     Ok(())
 }
 
 #[cfg(not(feature = "network"))]
 fn whoami() -> Result<()> {
     anyhow::bail!("auth whoami requires network support; rebuild with --features network")
+}
+
+/// Render the whoami block as a string. Extracted to mirror `render_key_list`
+/// below so the format lives behind a function boundary that unit tests can
+/// exercise offline — every other CLI timestamp print path in this file (the
+/// `keys_list` table) follows the same idiom.
+///
+/// The server formats `created_at` as RFC3339-UTC with a `Z` suffix
+/// (`edge-control-plane/internal/handler/auth.go:84`, pinned by
+/// `edge-control-plane/internal/handler/auth_test.go:158`); the CLI trusts
+/// that wire-format invariant and labels it as such in the output so a user
+/// in a non-UTC timezone can read the timestamp at a glance. Pulling in
+/// `chrono`/`time` just to re-parse and re-render in local time would add
+/// ~150 KB of binary for one column — rejected on cost; see `keys_list`'s
+/// doc comment above for the same rationale.
+fn render_whoami(info: &crate::api::client::WhoamiResponse) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  Tenant:    {} ({})\n",
+        info.tenant_name, info.tenant_id
+    ));
+    out.push_str(&format!("  Plan:      {}\n", info.plan));
+    out.push_str(&format!(
+        "  API key:   {} ({})\n",
+        info.api_key_name, info.api_key_id
+    ));
+    out.push_str(&format!("  Role:      {}\n", info.role));
+    out.push_str(&format!("  Created:   {} UTC\n", info.created_at));
+    out
 }
 
 /// `edge auth logout`
@@ -934,6 +959,99 @@ mod tests {
             last_idx < expires_idx,
             "LAST USED should appear to the LEFT of EXPIRES in the header; \
              header was: {header:?}"
+        );
+    }
+
+    // ── render_whoami ──────────────────────────────────────────────────
+
+    use crate::api::client::WhoamiResponse;
+
+    fn sample_whoami() -> WhoamiResponse {
+        WhoamiResponse {
+            tenant_id: "t_acme".into(),
+            tenant_name: "Acme Co".into(),
+            plan: "free".into(),
+            api_key_id: "k_default".into(),
+            api_key_name: "default".into(),
+            role: "owner".into(),
+            created_at: "2026-01-02T03:04:05Z".into(),
+        }
+    }
+
+    /// Issue #107: the wire format from
+    /// `edge-control-plane/internal/handler/auth.go:84` is RFC3339-UTC
+    /// with a `Z` suffix; the CLI must label it as UTC so a non-UTC
+    /// reader can read it. The exact-string assertion pins the format
+    /// so a future "{created_at}" regression is caught immediately.
+    #[test]
+    fn render_whoami_appends_utc_label() {
+        let rendered = render_whoami(&sample_whoami());
+        assert!(
+            rendered.contains("Created:   2026-01-02T03:04:05Z UTC"),
+            "Created line should suffix the RFC3339-Z timestamp with \" UTC\"; got:\n{rendered}"
+        );
+        // Pin the relative position: the timestamp must land on the
+        // created line, not somewhere incidental. Cheap belt-and-suspenders
+        // for a future refactor that drops the label into a different row.
+        let created_line = rendered
+            .lines()
+            .find(|l| l.starts_with("  Created:"))
+            .expect("rendered output should contain a Created line");
+        assert!(
+            created_line.contains(" UTC"),
+            "Created line should carry a UTC label; got: {created_line:?}"
+        );
+    }
+
+    /// Lock the field set so a future field-add (e.g. a `Region:` row
+    /// after a tenancy-region feature lands) is a deliberate test
+    /// change. Counts occurrences (not just `.contains`) so a field
+    /// emitted twice — the kind of bug a copy-paste during a refactor
+    /// produces — fails loudly instead of silently passing.
+    #[test]
+    fn render_whoami_includes_required_fields() {
+        let rendered = render_whoami(&sample_whoami());
+        for label in ["Tenant:", "Plan:", "API key:", "Role:", "Created:"] {
+            assert_eq!(
+                rendered.matches(label).count(),
+                1,
+                "{label:?} should appear exactly once in rendered output; got:\n{rendered}"
+            );
+        }
+    }
+
+    /// Defensive: a degenerate server response (empty strings) must
+    /// not panic during rendering. Cheap insurance against a future
+    /// deserializer widening some `String` to `Option<String>` and the
+    /// default falling through to a degenerate string.
+    #[test]
+    fn render_whoami_handles_empty_strings() {
+        let degenerate = WhoamiResponse {
+            tenant_id: "".into(),
+            tenant_name: "".into(),
+            plan: "".into(),
+            api_key_id: "".into(),
+            api_key_name: "".into(),
+            role: "".into(),
+            created_at: "".into(),
+        };
+        // Must not panic.
+        let rendered = render_whoami(&degenerate);
+        // Empty timestamp still gets the UTC label — the wire-format
+        // invariant applies even at empty payloads (a malformed server
+        // response would fail at deserialize time, not render time).
+        //
+        // Assert against the *line shape* (suffix " UTC") rather than a
+        // whitespace-exact substring, so future label-width refactors
+        // (e.g. widening the "Created:" label to match a longer tenant
+        // ID column) don't break this test with a confusing diff.
+        let created_line = rendered
+            .lines()
+            .find(|l| l.starts_with("  Created:"))
+            .expect("rendered output should contain a Created line");
+        assert!(
+            created_line.ends_with(" UTC"),
+            "Created line should end with \" UTC\" even when the timestamp is empty; got: {created_line:?}"
         );
     }
 }
