@@ -516,18 +516,20 @@ impl RustPattern {
 }
 
 /// Validate an app name against the edgeCloud public-facing format
-/// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics
-/// plus dots, underscores, and hyphens. The first character must be a
+/// `^[a-z0-9][a-z0-9_-]{0,62}$` — 1–63 chars, lowercase alphanumerics
+/// plus underscores and hyphens. The first character must be a
 /// lowercase letter or digit.
 ///
 /// Locks in lockstep with the Go control plane's `IsValidAppName` in
 /// `edge-control-plane/internal/service/deployment.go` (issue #438
-/// unified the parallel validators and widened the regex to admit
-/// semver-ish suffixes like `myapp.v2` and `app_v2`). Defense-in-depth:
-/// the CLI's `--tree` flag and `MigrationHandler.MigrateTree` both
-/// gate on this; the `..` substring and `/`/`\` characters are
-/// additionally rejected by the CLI's path-safety guards before the
-/// artifact is built.
+/// unified the parallel validators and widened the regex to admit `_`
+/// for names like `app_v2`). `.` is intentionally NOT allowed: a dotted
+/// name would render as a two-label host under `*.edgecloud.dev`, which
+/// the single-level wildcard DNS record and TLS cert do not cover.
+/// Defense-in-depth: the CLI's `--tree` flag and
+/// `MigrationHandler.MigrateTree` both gate on this; the `..` substring
+/// and `/`/`\` characters are additionally rejected by the CLI's
+/// path-safety guards before the artifact is built.
 pub fn is_valid_app_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 63 {
@@ -538,9 +540,9 @@ pub fn is_valid_app_name(name: &str) -> bool {
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return false;
     }
-    // Remaining chars: lowercase letter, digit, '.', '_', or '-'.
+    // Remaining chars: lowercase letter, digit, '_', or '-'.
     for &b in &bytes[1..] {
-        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'.' && b != b'_' && b != b'-' {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'_' && b != b'-' {
             return false;
         }
     }
@@ -556,8 +558,6 @@ mod tests {
         assert!(is_valid_app_name("a"));
         assert!(is_valid_app_name("hello-world"));
         assert!(is_valid_app_name("hello_world"));
-        assert!(is_valid_app_name("foo.bar"));
-        assert!(is_valid_app_name("myapp.v2"));
         assert!(is_valid_app_name("app_v2"));
         assert!(is_valid_app_name("my-app-123"));
         assert!(is_valid_app_name("0"));
@@ -576,7 +576,11 @@ mod tests {
         // Starts with non-alnum (regex first-char constraint)
         assert!(!is_valid_app_name("-hello"));
         assert!(!is_valid_app_name("_hello"));
+        // Dots are not allowed (would produce a two-label host that the
+        // single-level `*.edgecloud.dev` wildcard cannot cover).
         assert!(!is_valid_app_name(".foo"));
+        assert!(!is_valid_app_name("foo.bar"));
+        assert!(!is_valid_app_name("myapp.v2"));
         // Whitespace
         assert!(!is_valid_app_name("hello world"));
         // Slashes
@@ -586,10 +590,9 @@ mod tests {
         // rule and the CLI's layered path-safety guards)
         assert!(!is_valid_app_name("../traversal"));
         assert!(!is_valid_app_name("a/../b"));
-        // Middle-of-string `..` passes the regex's first-char check;
-        // the CLI's path-safety guard is the second defense. Flagged
-        // for reviewer visibility.
-        assert!(is_valid_app_name("a..b"));
+        // Middle-of-string `..` is now rejected outright by the shape
+        // rule (dots are no longer a valid character).
+        assert!(!is_valid_app_name("a..b"));
     }
 
     // ─────────────────────────────────────────────────────────────────

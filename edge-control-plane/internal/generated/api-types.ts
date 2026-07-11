@@ -3491,15 +3491,14 @@ export interface operations {
             content: {
                 "multipart/form-data": {
                     /**
-                     * @description Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
-                     *     regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
-                     *     `[a-z0-9-]` to admit `.` and `_` for semver-ish
-                     *     names like `myapp.v2` or `app_v2` (issue #438).
-                     *     The public hostname `<tenant_id>-<app_name>.edgecloud.dev`
-                     *     can therefore be deeper than two labels under
-                     *     `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
-                     *     downstream tooling must treat `app_name` as a single
-                     *     opaque label.
+                     * @description Unique app name (alphanumeric, underscores, hyphens, 1-63 chars;
+                     *     regex `^[a-z0-9][a-z0-9_-]{0,62}$`). Widened from
+                     *     `[a-z0-9-]` to admit `_` for names like `app_v2`
+                     *     (issue #438). Dots are NOT allowed: a dotted name
+                     *     would render as a two-label host under
+                     *     `*.edgecloud.dev` that the single-level wildcard
+                     *     DNS record and TLS cert do not cover. Use `myapp-v2`
+                     *     or `myapp_v2` in place of `myapp.v2`.
                      * @example my-app
                      */
                     app_name: string;

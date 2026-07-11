@@ -10,14 +10,12 @@ Hosts are formatted as `<tenant_id>-<app_name>.edgecloud.dev` (e.g.
 `https://t_acme-api.edgecloud.dev`) — the `tenant_id` prefix avoids
 cross-tenant name collisions on the shared wildcard.
 
-> **Note (issue #438):** `app_name` may contain `.` or `_` (the unified
-> validator allows `^[a-z0-9][a-z0-9.\-_]{0,62}$`), so a tenant with app
-> `myapp.v2` gets the URL `https://t_acme-myapp.v2.edgecloud.dev` —
-> three labels under `edgecloud.dev`, not two. The wildcard TLS cert
-> still matches, and Caddy routes each FQDN atomically via its anchored
-> regex matchers, but logging/metrics/analytics pipelines must treat
-> `app_name` (and the part of the hostname after `t_<tenant>-`) as a
-> single opaque label.
+> **Note (issue #438):** `app_name` may contain `_` (the unified
+> validator allows `^[a-z0-9][a-z0-9_-]{0,62}$`). `.` is intentionally
+> excluded: a dotted name like `myapp.v2` would render as
+> `https://t_acme-myapp.v2.edgecloud.dev` — a two-label host under
+> `edgecloud.dev` that the single-level `*.edgecloud.dev` wildcard DNS
+> record and TLS cert do not cover. Use `myapp-v2` or `myapp_v2`.
 
 ## Architecture
 

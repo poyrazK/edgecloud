@@ -1021,8 +1021,12 @@ func TestGetArtifact_TenantMismatch(t *testing.T) {
 }
 
 // TestIsValidAppName pins the issue #438 unified contract:
-// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics,
-// dots, underscores, hyphens; first char is a lowercase letter or digit.
+// `^[a-z0-9][a-z0-9_-]{0,62}$` — 1–63 chars, lowercase alphanumerics,
+// underscores, hyphens; first char is a lowercase letter or digit.
+// `.` is NOT allowed: a dotted name would render as a two-label host
+// under `*.edgecloud.dev` that the single-level wildcard DNS record
+// and TLS cert do not cover. Use `myapp-v2` or `myapp_v2` for semver
+// suffixes.
 // This is the single source of truth for app-name shape across the
 // control plane (deploy/activate/rollback/promote/traffic handlers,
 // AppService.Create, MigrationService.MigrateTree, and
@@ -1040,8 +1044,6 @@ func TestIsValidAppName(t *testing.T) {
 		{"alphanumeric", "hello", true},
 		{"with hyphen", "hello-world", true},
 		{"with underscore", "hello_world", true},
-		{"with dot", "foo.bar", true},
-		{"semver-ish suffix", "myapp.v2", true},
 		{"underscore suffix", "app_v2", true},
 		{"trailing digit", "app123", true},
 		{"starts with digit", "0app", true},
@@ -1060,6 +1062,8 @@ func TestIsValidAppName(t *testing.T) {
 		{"leading underscore", "_foo", false},
 		{"leading hyphen", "-hello", false},
 		{"leading dot", ".foo", false},
+		{"middle dot", "foo.bar", false},
+		{"semver-ish suffix with dot", "myapp.v2", false},
 
 		// Invalid — path-traversal / charset
 		{"slash", "a/b", false},
@@ -1068,14 +1072,13 @@ func TestIsValidAppName(t *testing.T) {
 		{"path traversal", "../traversal", false},
 		{"path with bad segment", "a/../b", false},
 
-		// Invalid — middle-of-string `..` passes THIS regex's first-char
-		// check; the handler layer's `containsPathTraversal`
-		// (`internal/handler/deployment.go`) and the storage layer's
-		// `validatePathComponent` (`internal/storage/artifact.go`) are
-		// the defense-in-depth guards that reject it. The validator
-		// alone does not — flag here so the layered contract stays
-		// visible to reviewers.
-		{"double dot middle passes regex alone", "a..b", true},
+		// Middle-of-string `..` is now rejected outright by the shape
+		// rule (dots are no longer a valid character). The handler
+		// layer's `containsPathTraversal` and the storage layer's
+		// `validatePathComponent` remain as defense-in-depth guards
+		// for any other traversal shape (`/`, `\`) that could bypass
+		// the shape check.
+		{"double dot middle", "a..b", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
