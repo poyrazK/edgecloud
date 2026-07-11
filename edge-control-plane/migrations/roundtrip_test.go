@@ -69,13 +69,15 @@ import (
 // On current branch after merge of PR #466 (#42), PR #420 (quota
 // grace columns → 025_quotas_grace_columns), issue #440 commit 6
 // (026_active_deployments_activation_attempt_started_at), PR #534
-// (027_used_memory_mb + 028_quota_memory_constraint etc.), and
-// PR #485 (029_quotas_resident_seconds + 030_billing_usage_events):
-// 40 .up.sql + 40 .down.sql = 80 split files. Some numeric prefixes
+// (027_used_memory_mb + 028_quota_memory_constraint etc.), PR #485
+// (029_quotas_resident_seconds + 030_billing_usage_events), PR #439
+// (031_active_deployment_idempotency_keys), and issue #574 retention
+// GCs (additional (created_at) indexes landed on existing migrations):
+// 41 .up.sql + 41 .down.sql = 82 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
-// 028_*, 029_*, 030_*), so this is the on-disk file count, not a
-// strict 2× the migration number.
-const splitFileCount = 80 // 40 .up.sql + 40 .down.sql after PR #485 merge
+// 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
+// not a strict 2× the migration number.
+const splitFileCount = 82 // 41 .up.sql + 41 .down.sql after issue #439 + #574
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -98,11 +100,12 @@ var wantTables = []string{
 	"audit_logs",
 	"webhooks",
 	"webhook_deliveries",
-	"billing_subscriptions", // 022 (issue #419)
-	"billing_events",        // 023 (issue #419)
-	"outbox",                // 025 (issue #42)
-	"idempotency_keys",      // 026 (issue #52)
-	"billing_usage_events",  // 030 (issue #485)
+	"billing_subscriptions",              // 022 (issue #419)
+	"billing_events",                     // 023 (issue #419)
+	"outbox",                             // 025 (issue #42)
+	"idempotency_keys",                   // 026 (issue #52)
+	"billing_usage_events",               // 030 (issue #485)
+	"active_deployment_idempotency_keys", // 031 (issue #439)
 }
 
 // wantColumns enumerates the public-schema columns each table must
@@ -150,6 +153,8 @@ var wantColumns = map[string][]string{
 		"used_memory_mb",                 // 027_used_memory_mb (issue #44 part 2)
 		"max_resident_seconds_per_month", // 029_quotas_resident_seconds (issue #485)
 		"used_resident_seconds",          // 029_quotas_resident_seconds (issue #485)
+		"max_compute_ms_per_month",       // 031_quotas_compute_ms (issue #555)
+		"used_compute_ms",                // 031_quotas_compute_ms (issue #555)
 	},
 	"api_keys": {
 		"id",
@@ -402,6 +407,8 @@ var wantTypes = map[string]map[string]string{
 		"used_memory_mb":                 "int8",        // 027_used_memory_mb (issue #44 part 2)
 		"max_resident_seconds_per_month": "int4",        // 029_quotas_resident_seconds (issue #485)
 		"used_resident_seconds":          "int8",        // 029_quotas_resident_seconds (issue #485)
+		"max_compute_ms_per_month":       "int4",        // 031_quotas_compute_ms (issue #555)
+		"used_compute_ms":                "int8",        // 031_quotas_compute_ms (issue #555)
 	},
 	"api_keys": {
 		"id":             "text",
@@ -636,6 +643,8 @@ var wantNotNull = map[string][]string{
 		"used_memory_mb",                 // 027_used_memory_mb (issue #44 part 2)
 		"max_resident_seconds_per_month", // 029_quotas_resident_seconds (issue #485)
 		"used_resident_seconds",          // 029_quotas_resident_seconds (issue #485)
+		"max_compute_ms_per_month",       // 031_quotas_compute_ms (issue #555)
+		"used_compute_ms",                // 031_quotas_compute_ms (issue #555)
 	},
 	"api_keys": {
 		"id",
@@ -863,6 +872,9 @@ var wantIndexes = []IndexExpectation{
 	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                               // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "quotas", Name: "idx_quotas_grace_until"},                                           // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "billing_usage_events", Name: "idx_billing_usage_events_unprocessed"},               // 030_billing_usage_events (issue #485, partial)
+	{Table: "audit_logs", Name: "idx_audit_logs_created_at"},                                    // 031_gc_retention_indexes (issue #574)
+	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_created_at"},                    // 031_gc_retention_indexes (issue #574)
+	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                         // 031_gc_retention_indexes (issue #574)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -950,12 +962,12 @@ var wantForeignKeys = map[string][]ForeignKeyExpectation{
 // here are pinned to PG 16; if the team upgrades to PG 17/18 and the
 // rendering changes, the test will need updates.
 var wantChecks = map[string]string{
-	"api_keys.api_keys_hash_algorithm_check":                   "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",                              // 005_api_key_hash_algorithm
-	"app_traffic_splits.app_traffic_splits_weight_check":       "CHECK (((weight >= 0) AND (weight <= 100)))",                                                           // 009_traffic_splits
-	"autoscale_events.autoscale_events_action_check":           "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))",                    // 012_autoscale_events
-	"quotas.quotas_used_memory_mb_nonneg":                      "CHECK ((used_memory_mb >= 0))",                                                                         // 027_used_memory_mb (issue #44 part 2)
-	"billing_usage_events.billing_usage_events_kind_check":     "CHECK ((kind = ANY (ARRAY['resident_seconds'::text, 'request_count'::text, 'outbound_bytes'::text])))", // 030_billing_usage_events (issue #485)
-	"billing_usage_events.billing_usage_events_quantity_check": "CHECK ((quantity >= 0))",                                                                               // 030_billing_usage_events (issue #485)
+	"api_keys.api_keys_hash_algorithm_check":                   "CHECK ((hash_algorithm = ANY (ARRAY['sha256'::text, 'argon2id'::text])))",                                                  // 005_api_key_hash_algorithm
+	"app_traffic_splits.app_traffic_splits_weight_check":       "CHECK (((weight >= 0) AND (weight <= 100)))",                                                                               // 009_traffic_splits
+	"autoscale_events.autoscale_events_action_check":           "CHECK ((action = ANY (ARRAY['scale_up'::text, 'scale_down'::text, 'noop'::text])))",                                        // 012_autoscale_events
+	"quotas.quotas_used_memory_mb_nonneg":                      "CHECK ((used_memory_mb >= 0))",                                                                                             // 027_used_memory_mb (issue #44 part 2)
+	"billing_usage_events.billing_usage_events_kind_check":     "CHECK ((kind = ANY (ARRAY['resident_seconds'::text, 'request_count'::text, 'outbound_bytes'::text, 'compute_ms'::text])))", // 030_billing_usage_events (issue #485, extended for compute_ms in #555)
+	"billing_usage_events.billing_usage_events_quantity_check": "CHECK ((quantity >= 0))",                                                                                                   // 030_billing_usage_events (issue #485)
 }
 
 // wantDefaults enumerates every public-schema column that has a
@@ -1024,6 +1036,7 @@ var wantDefaults = map[string]map[string]string{
 		"max_outbound_mb":                "1000",                                                        // 001
 		"max_requests_per_month":         "100000",                                                      // 013
 		"max_resident_seconds_per_month": "0",                                                           // 029_quotas_resident_seconds (issue #485); backfilled per plan
+		"max_compute_ms_per_month":       "0",                                                           // 031_quotas_compute_ms (issue #555); backfilled per plan
 		"max_workers":                    "3",                                                           // 001
 		"quota_period_start":             "date_trunc('month'::text, (now() AT TIME ZONE 'UTC'::text))", // 009
 		"used_outbound_bytes":            "0",                                                           // 009
@@ -1404,6 +1417,105 @@ func TestRoundtrip(t *testing.T) {
 			"SELECT COUNT(*) FROM quotas WHERE used_resident_seconds != 0"))
 		require.Equalf(t, 0, usedCount,
 			"every quota row should have used_resident_seconds=0 after backfill")
+	})
+
+	t.Run("BackfillsComputeMsCapPerPlan_031", func(t *testing.T) {
+		// Data-dependent backfill contract for issue #555 / migration
+		// 031. Mirrors the 029 backfill subtest above: seed tenants
+		// with each plan tier, run the 031 backfill in isolation, and
+		// verify max_compute_ms_per_month matches the per-plan values
+		// declared in internal/domain/plans.go. The fourth metered
+		// dimension's cap is the resident-seconds cap scaled by
+		// 1_000 (free=2_592_000_000, pro=7_776_000_000,
+		// business=31_104_000_000, enterprise=-1).
+		//
+		// Uses a fresh DB container so we can stop at a specific
+		// migration version and seed data before the backfill runs.
+		subPgC := newTestPostgres(t, ctx)
+		subCtx, subCancel := context.WithTimeout(ctx, 2*time.Minute)
+		t.Cleanup(func() {
+			cctx, c := context.WithTimeout(context.Background(), 30*time.Second)
+			defer c()
+			_ = subPgC.Terminate(cctx)
+			subCancel()
+		})
+
+		subDB := newDBFromContainer(t, subCtx, subPgC)
+		t.Cleanup(func() { _ = subDB.Close() })
+
+		// Apply all migrations to set up the full schema.
+		_, err := migrate.Exec(subDB.DB, "postgres", &migrate.FileMigrationSource{Dir: src}, migrate.Up)
+		require.NoError(t, err)
+
+		// Reset to pre-031 state by dropping the columns 031 adds.
+		_, err = subDB.DB.Exec(`
+			ALTER TABLE quotas
+				DROP COLUMN IF EXISTS max_compute_ms_per_month,
+				DROP COLUMN IF EXISTS used_compute_ms;
+		`)
+		require.NoError(t, err)
+
+		// Seed one tenant + matching quota row per plan tier.
+		for _, plan := range []string{"free", "pro", "business", "enterprise", "unknown"} {
+			_, err := subDB.DB.Exec(
+				"INSERT INTO tenants (id, name, plan) VALUES ($1, $2, $3)",
+				"t_compms_"+plan, "Test "+plan, plan)
+			require.NoErrorf(t, err, "seeding tenant for plan %q", plan)
+			_, err = subDB.DB.Exec(
+				"INSERT INTO quotas (tenant_id) VALUES ($1)",
+				"t_compms_"+plan)
+			require.NoErrorf(t, err, "seeding quota row for plan %q", plan)
+		}
+
+		// Run the 031 backfill in isolation — same shape as the
+		// migration body, with the per-tier caps matching plans.go.
+		_, err = subDB.DB.Exec(`
+			ALTER TABLE quotas
+				ADD COLUMN IF NOT EXISTS max_compute_ms_per_month INT   NOT NULL DEFAULT 0,
+				ADD COLUMN IF NOT EXISTS used_compute_ms           BIGINT NOT NULL DEFAULT 0;
+			UPDATE quotas q
+			   SET max_compute_ms_per_month = CASE t.plan
+			       WHEN 'free'       THEN  2592000000
+			       WHEN 'pro'        THEN  7776000000
+			       WHEN 'business'   THEN 31104000000
+			       WHEN 'enterprise' THEN          -1
+			       ELSE 2592000000
+			   END
+			  FROM tenants t
+			 WHERE q.tenant_id = t.id;
+		`)
+		require.NoError(t, err)
+
+		// Verify each plan got the right cap. Values must match
+		// internal/domain/plans.go:planTiers exactly — if a future
+		// change drops or swaps a WHEN, this test fails with a clear diff.
+		type expectation struct {
+			plan    string
+			wantCap int
+		}
+		expected := []expectation{
+			{"free", 2592000000},      // 30 days × 86_400_000 ms/day
+			{"pro", 7776000000},       // 90 days × 86_400_000 ms/day
+			{"business", 31104000000}, // 360 days × 86_400_000 ms/day
+			{"enterprise", -1},        // unlimited
+			{"unknown", 2592000000},   // ELSE falls back to free-tier
+		}
+		for _, e := range expected {
+			var got int
+			require.NoError(t, subDB.Get(&got,
+				"SELECT max_compute_ms_per_month FROM quotas WHERE tenant_id=$1",
+				"t_compms_"+e.plan))
+			require.Equalf(t, e.wantCap, got,
+				"plan %q: quotas.max_compute_ms_per_month = %d, want %d (031 backfill drifted?)",
+				e.plan, got, e.wantCap)
+		}
+
+		// And used_compute_ms is 0 across the board (default).
+		var usedCount int
+		require.NoError(t, subDB.Get(&usedCount,
+			"SELECT COUNT(*) FROM quotas WHERE used_compute_ms != 0"))
+		require.Equalf(t, 0, usedCount,
+			"every quota row should have used_compute_ms=0 after backfill")
 	})
 
 	t.Run("BillingUsageRepository_Roundtrip", func(t *testing.T) {

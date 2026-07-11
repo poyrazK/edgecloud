@@ -145,7 +145,7 @@ func TestActivateDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 			AddRow(tenantID, "Disabled Tenant", "free", pq.Array([]string{}), time.Now().Add(-1*time.Hour), time.Now(), nil))
 	mock.ExpectRollback()
 
-	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID, "")
 	if err == nil {
 		t.Fatalf("ActivateDeployment on disabled tenant returned nil; want ErrTenantDisabled")
 	}
@@ -207,7 +207,7 @@ func TestActivateDeployment_DisabledAtPostCommit_ReturnsErrTenantDisabled(t *tes
 			AddRow(tenantID, "Tenant A", "free", pq.Array([]string{}), time.Now(), time.Now(), nil))
 	mock.ExpectRollback()
 
-	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID)
+	err := svc.ActivateDeployment(context.Background(), tenantID, appName, deploymentID, "")
 	if err == nil {
 		t.Fatalf("ActivateDeployment on post-commit-disabled tenant returned nil; want ErrTenantDisabled")
 	}
@@ -668,7 +668,7 @@ func TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 			AddRow("t_disabled", "Disabled", "free", pq.Array([]string{}), time.Now().Add(-24*time.Hour), disabledAt, nil))
 	mock.ExpectRollback()
 
-	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp")
+	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp", "")
 	if err == nil {
 		t.Fatalf("RollbackDeployment on disabled tenant returned nil; want ErrTenantDisabled")
 	}

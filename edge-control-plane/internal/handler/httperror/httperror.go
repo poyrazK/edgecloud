@@ -11,17 +11,27 @@ import (
 type ErrorCode string
 
 const (
-	CodeBadRequest         ErrorCode = "BAD_REQUEST"
-	CodeUnauthorized       ErrorCode = "UNAUTHORIZED"
-	CodeForbidden          ErrorCode = "FORBIDDEN"
-	CodeNotFound           ErrorCode = "NOT_FOUND"
-	CodeConflict           ErrorCode = "CONFLICT"
-	CodeQuotaExceeded      ErrorCode = "QUOTA_EXCEEDED"
-	CodePaymentRequired    ErrorCode = "PAYMENT_REQUIRED"
-	CodeInternalError      ErrorCode = "INTERNAL_ERROR"
-	CodeBadGateway         ErrorCode = "BAD_GATEWAY"
-	CodePayloadTooLarge    ErrorCode = "PAYLOAD_TOO_LARGE"
-	CodeServiceUnavailable ErrorCode = "SERVICE_UNAVAILABLE"
+	CodeBadRequest          ErrorCode = "BAD_REQUEST"
+	CodeUnauthorized        ErrorCode = "UNAUTHORIZED"
+	CodeForbidden           ErrorCode = "FORBIDDEN"
+	CodeNotFound            ErrorCode = "NOT_FOUND"
+	CodeConflict            ErrorCode = "CONFLICT"
+	CodeUnprocessableEntity ErrorCode = "UNPROCESSABLE_ENTITY"
+	CodeQuotaExceeded       ErrorCode = "QUOTA_EXCEEDED"
+	CodePaymentRequired     ErrorCode = "PAYMENT_REQUIRED"
+	CodeInternalError       ErrorCode = "INTERNAL_ERROR"
+	CodeBadGateway          ErrorCode = "BAD_GATEWAY"
+	CodePayloadTooLarge     ErrorCode = "PAYLOAD_TOO_LARGE"
+	CodeServiceUnavailable  ErrorCode = "SERVICE_UNAVAILABLE"
+	// CodeBillingTenantUnresolved is the billing-specific 422 path on
+	// the Stripe webhook (issue #419): the provider's signature was
+	// valid but we couldn't attribute the event to a known tenant (no
+	// matching customer row in billing_subscriptions). Distinct from
+	// CodeUnprocessableEntity — that one is used by the Idempotency-Key
+	// replay rejection path (issue #439). Both are 422 because both
+	// are "request was understood but cannot be processed", but the
+	// SDK branches on the code, so the distinction matters.
+	CodeBillingTenantUnresolved ErrorCode = "BILLING_TENANT_UNRESOLVED"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -113,6 +123,22 @@ func ConflictCtx(w http.ResponseWriter, r *http.Request, message string) {
 	write(w, CodeConflict, message, http.StatusConflict, requestIDFromContext(r.Context()))
 }
 
+// UnprocessableEntity reports a well-formed request that conflicts with
+// a server-side invariant (HTTP 422). Used by the Idempotency-Key
+// replay path (issue #439): the cache row's (app, deployment) tuple
+// doesn't match the incoming request, meaning the caller is reusing a
+// key against a different body. Distinct from 409 Conflict (used for
+// concurrent state races — issue #440) because the key is something
+// the client controls and can retry with a fresh key.
+func UnprocessableEntity(w http.ResponseWriter, message string) {
+	write(w, CodeUnprocessableEntity, message, http.StatusUnprocessableEntity, "")
+}
+
+// UnprocessableEntityCtx is UnprocessableEntity with trace context.
+func UnprocessableEntityCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodeUnprocessableEntity, message, http.StatusUnprocessableEntity, requestIDFromContext(r.Context()))
+}
+
 // QuotaExceeded reports a quota limit hit (HTTP 429).
 func QuotaExceeded(w http.ResponseWriter, message string) {
 	write(w, CodeQuotaExceeded, message, http.StatusTooManyRequests, "")
@@ -158,6 +184,17 @@ func PayloadTooLarge(w http.ResponseWriter, message string) {
 // PayloadTooLargeCtx reports an oversize request body or response stream with trace context (HTTP 413).
 func PayloadTooLargeCtx(w http.ResponseWriter, r *http.Request, message string) {
 	write(w, CodePayloadTooLarge, message, http.StatusRequestEntityTooLarge, requestIDFromContext(r.Context()))
+}
+
+// BillingTenantUnresolvedCtx reports a billing webhook event whose
+// provider signature verified but which we cannot attribute to a
+// known tenant (HTTP 422). Distinct from NotFoundCtx (404): the URL
+// is correct, the body parsed, the signature passed — there's just
+// no row we can hang the event off of. The merchant (Stripe) will
+// see this as a successful delivery and won't retry; ops has to
+// reconcile manually via the admin endpoint.
+func BillingTenantUnresolvedCtx(w http.ResponseWriter, r *http.Request, message string) {
+	write(w, CodeBillingTenantUnresolved, message, http.StatusUnprocessableEntity, requestIDFromContext(r.Context()))
 }
 
 // writeWithDetails extends write() with arbitrary top-level fields

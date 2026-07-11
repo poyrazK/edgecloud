@@ -21,16 +21,20 @@ type stubRollbacker struct {
 	resp   string
 	err    error
 	called bool
-	// lastTenant / lastApp record the arguments the handler passed so
-	// tests can assert that the tenant context (not the URL) wins.
-	lastTenant string
-	lastApp    string
+	// lastTenant / lastApp / lastIdempotencyKey record the arguments
+	// the handler passed so tests can assert that the tenant context
+	// (not the URL) wins and that the Idempotency-Key header reaches
+	// the service layer (issue #439).
+	lastTenant         string
+	lastApp            string
+	lastIdempotencyKey string
 }
 
-func (s *stubRollbacker) RollbackDeployment(_ context.Context, tenantID, appName string) (string, error) {
+func (s *stubRollbacker) RollbackDeployment(_ context.Context, tenantID, appName, idempotencyKey string) (string, error) {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName
+	s.lastIdempotencyKey = idempotencyKey
 	return s.resp, s.err
 }
 
@@ -244,5 +248,92 @@ func TestRollback_TenantDisabled_Returns409(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "ErrTenantDisabled") {
 		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rollback — Idempotency-Key plumbing (issue #439)
+// ---------------------------------------------------------------------------
+//
+// RollbackDeployment is symmetric with ActivateDeployment for the
+// race-fix scope: the handler reads `Idempotency-Key`, validates
+// against idempotencyKeyFormat, and maps
+// ErrIdempotencyKeyMismatch to 422. These tests are the rollback
+// mirror of TestActivate_HonoursIdempotencyKey /
+// TestActivate_MalformedIdempotencyKey_Returns400 /
+// TestActivate_IdempotencyKeyMismatch_Returns422.
+
+// TestRollback_HonoursIdempotencyKey asserts the header reaches
+// the service layer untouched. Service-side replay short-circuit
+// is exercised at the service layer (deployment_test.go).
+func TestRollback_HonoursIdempotencyKey(t *testing.T) {
+	svc := &stubRollbacker{resp: "d_rb"}
+	mux := newRollbackMux(svc)
+
+	const valid = "01234567-89ab-cdef-0123-456789abcdef"
+	req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
+	req.Header.Set("Idempotency-Key", valid)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if !svc.called {
+		t.Fatal("RollbackDeployment was not called")
+	}
+	if svc.lastIdempotencyKey != valid {
+		t.Errorf("RollbackDeployment called with idempotencyKey %q, want %q", svc.lastIdempotencyKey, valid)
+	}
+}
+
+// TestRollback_MalformedIdempotencyKey_Returns400 mirrors the
+// activate-side test. The regex gate sits at the top of Rollback
+// (after the path-segment validation), so a malformed key short-
+// circuits before any service call. The stub's `called` flag must
+// stay false.
+func TestRollback_MalformedIdempotencyKey_Returns400(t *testing.T) {
+	svc := &stubRollbacker{}
+	mux := newRollbackMux(svc)
+
+	for _, bad := range []string{"short", "with spaces", "01234567-89ab-cdef-0123-456789abcdeX"} {
+		req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
+		req.Header.Set("Idempotency-Key", bad)
+		req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("key %q: status = %d, want 400; body: %s", bad, rr.Code, rr.Body.String())
+		}
+		if svc.called {
+			t.Errorf("key %q: RollbackDeployment must not be called for malformed key", bad)
+		}
+	}
+}
+
+// TestRollback_IdempotencyKeyMismatch_Returns422 covers the
+// re-use-with-different-body path on the rollback side. Body shape
+// mirrors the activate-side 422 (legacy bare http.Error — no
+// httperror.UnprocessableEntityCtx helper exported today).
+func TestRollback_IdempotencyKeyMismatch_Returns422(t *testing.T) {
+	svc := &stubRollbacker{err: service.ErrIdempotencyKeyMismatch}
+	mux := newRollbackMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/rollback", nil)
+	req.Header.Set("Idempotency-Key", "01234567-89ab-cdef-0123-456789abcdef")
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), service.ErrIdempotencyKeyMismatch.Error()) {
+		t.Errorf("body must surface sentinel message %q; got %s", service.ErrIdempotencyKeyMismatch.Error(), rr.Body.String())
+	}
+	if !svc.called {
+		t.Error("RollbackDeployment was not called — the 422 mapping only matters if the request reached the cache check")
 	}
 }

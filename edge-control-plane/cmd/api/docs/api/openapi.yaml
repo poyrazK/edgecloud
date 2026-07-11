@@ -65,7 +65,79 @@ components:
       properties:
         status:
           type: string
+          enum: [ok, degraded, unhealthy]
           example: ok
+          description: |
+            `ok` — all background loops are healthy. `degraded` — at
+            least one loop has panicked or is stale; the response is
+            still 200 so load balancers keep the CP in rotation. See
+            `degraded_reasons` and `loops` for the per-loop state.
+            `unhealthy` — DB or NATS connectivity failed; the response
+            is 503.
+        loops:
+          type: object
+          description: |
+            Per-background-loop liveness state, sourced from
+            `internal/loophealth` (issue #443). Keys are the loop
+            names (`heartbeat`, `log_gc`, `reconcile`, `worker_gc`,
+            `deployment_gc`, `autoscale`).
+          additionalProperties:
+            $ref: '#/components/schemas/LoopState'
+          example:
+            heartbeat:
+              name: heartbeat
+              panics: 0
+              running: true
+              stale: false
+            log_gc:
+              name: log_gc
+              panics: 0
+              running: true
+              stale: false
+        degraded_reasons:
+          type: array
+          description: |
+            Loop names currently in degraded state
+            (panics>0 or stale=true). Absent when status is `ok`.
+          items:
+            type: string
+          example:
+            - heartbeat
+
+    LoopState:
+      type: object
+      properties:
+        name:
+          type: string
+          example: heartbeat
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: RFC3339 timestamp the loop body first entered.
+        last_beat_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            RFC3339 timestamp of the most recent liveness beat. For
+            the heartbeat and autoscale loops the drain bumps this
+            per message / per tick (issue #443 review finding #3);
+            for the GC loops the wrapper bumps it on entry.
+        panics:
+          type: integer
+          example: 0
+          description: Count of recovered panics since process start.
+        running:
+          type: boolean
+          example: true
+          description: True while the loop body is currently executing.
+        stale:
+          type: boolean
+          example: false
+          description: |
+            True if `now - last_beat_at` exceeds `LOOP_STALE_AFTER`
+            (default 2 minutes).
 
     # -------------------------------------------------------------------------
     # Tenants
@@ -199,6 +271,22 @@ components:
           type: string
           format: date-time
           example: "2026-01-02T03:04:05Z"
+        last_used:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Most recent time this key authenticated a request. Absent
+            (or null) for keys that have never been used. RFC3339.
+          example: "2026-07-08T11:23:45Z"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Absolute expiry timestamp. Absent (or null) for keys
+            that do not expire.
+          example: "2027-01-01T00:00:00Z"
 
     UpdateAPIKeyRequest:
       type: object
@@ -296,6 +384,103 @@ components:
             $ref: '#/components/schemas/Webhook'
 
     # -------------------------------------------------------------------------
+    # Billing (issue #419)
+    # -------------------------------------------------------------------------
+    BillingCheckoutRequest:
+      type: object
+      required: [plan]
+      properties:
+        plan:
+          type: string
+          enum: [pro, business, enterprise]
+          description: Paid tier to charge for. "free" is rejected.
+        success_url:
+          type: string
+          format: uri
+          description: Optional override for the post-checkout redirect target.
+        cancel_url:
+          type: string
+          format: uri
+          description: Optional override for the user-canceled redirect target.
+
+    BillingCheckoutResponse:
+      type: object
+      properties:
+        checkout_url:
+          type: string
+          format: uri
+          description: Hosted checkout page the tenant's browser should be redirected to.
+          example: https://checkout.stripe.com/c/pay/cs_test_abc
+        session_id:
+          type: string
+          description: Provider-side session identifier.
+          example: cs_test_abc
+        expires_at:
+          type: string
+          format: date-time
+          description: When the checkout session expires.
+
+    BillingPortalRequest:
+      type: object
+      required: [return_url]
+      properties:
+        return_url:
+          type: string
+          format: uri
+          description: URL the provider-hosted portal redirects to when the user clicks "back to app".
+
+    BillingPortalResponse:
+      type: object
+      properties:
+        portal_url:
+          type: string
+          format: uri
+          description: Self-service portal URL the tenant's browser should be redirected to.
+
+    BillingWebhookAck:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, ignored]
+          description: "ok when dispatched or replayed; ignored for verified but unsupported event types."
+          example: ok
+
+    BillingSubscription:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        provider:
+          type: string
+          enum: [stripe, noop]
+          example: stripe
+        provider_customer_id:
+          type: string
+          example: cus_abc123
+        provider_subscription_id:
+          type: string
+          example: sub_xyz789
+        plan:
+          type: string
+          enum: [free, pro, business, enterprise]
+        status:
+          type: string
+          enum: [active, past_due, canceled, incomplete, trialing]
+        current_period_end:
+          type: string
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    # -------------------------------------------------------------------------
     # Apps
     # -------------------------------------------------------------------------
     CreateAppRequest:
@@ -375,6 +560,44 @@ components:
           type: string
           description: SHA-256 of the Wasm artifact (lowercase hex).
           example: 3a2f5e4b6c1d...
+        signature:
+          type: string
+          description: |
+            Ed25519 signature over `sha256_raw_32_bytes || deployment_id`
+            (lowercase hex of the artifact SHA-256, then the deployment
+            id). base64url, no padding.
+          example: 5c1e9b...
+        signing_key_id:
+          type: string
+          description: |
+            Operator-chosen kid identifying which Ed25519 public key from
+            the worker keyring should verify the signature.
+          example: prod-2026-q3
+        regions:
+          type: array
+          items: { type: string }
+          example: [us-east-1, eu-west-1]
+        auto_rollback_enabled:
+          type: boolean
+          example: false
+        desired_replicas:
+          type: integer
+          description: |
+            Number of workers that should run this deployment in each
+            region (issue #316). 0 means no threshold.
+          example: 0
+        build_attestation:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: SLSA L1 DSSE envelope (issue #307 PR2).
+        url:
+          type: string
+          description: |
+            Public ingress hostname computed from `tenant_id` + `app_name`
+            via `domain.IngressHost`. Always present in
+            status / list / active responses.
+          example: https://web-app.t_abc123.edgecloud.dev
         created_at:
           type: string
           format: date-time
@@ -603,13 +826,18 @@ components:
           type: string
           example: debug
 
-    EnvMap:
-      type: object
-      additionalProperties:
-        type: string
-      example:
-        LOG_LEVEL: debug
-        NODE_ENV: production
+    EnvList:
+      type: array
+      items:
+        type: object
+        required: [key, value]
+        properties:
+          key:
+            type: string
+            example: LOG_LEVEL
+          value:
+            type: string
+            example: debug
 
     # -------------------------------------------------------------------------
     # Egress
@@ -665,29 +893,319 @@ components:
             Default value depends on the tenant's plan:
             free=100000, pro=5000000, business=50000000, enterprise=unlimited.
           example: 5000000
+        max_resident_seconds_per_month:
+          type: integer
+          description: |
+            LongRunning-app resident-time cap per calendar month (UTC), in
+            seconds. -1 = unlimited (enterprise). 0 = unset / admin-cleared
+            (cap check skipped). Default value depends on the tenant's plan:
+            free=2592000 (30 days of 1 LR app), pro=7776000 (90 days),
+            business=31104000 (360 days), enterprise=unlimited.
+            Handler (FaaS) apps do not contribute resident time.
+            Resident-seconds is the third metered dimension added in #485.
+          example: 2592000
         used_outbound_bytes:
           type: integer
           format: int64
-          description: Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+          description: |
+            Cumulative outbound bytes used in the current UTC month. Resets on month rollover.
+            Drives enforcement: when this value reaches `max_outbound_mb`,
+            deploy-time returns 402 PAYMENT_REQUIRED with reason
+            `quota_will_be_exceeded` and edge-ingress returns 402 with
+            `Retry-After: 3600`.
           example: 0
         used_request_count:
           type: integer
           format: int64
-          description: Cumulative request count in the current UTC month. Resets on month rollover.
+          description: |
+            Cumulative request count in the current UTC month. Resets on month rollover.
+            Drives enforcement in the same way as `used_outbound_bytes`.
+          example: 0
+        used_memory_mb:
+          type: integer
+          format: int64
+          description: |
+            Aggregate memory (MiB) held by the tenant's active deployments (issue #44, part 2).
+            Incremented on activate / promote, decremented on rollback. Unlike
+            `used_outbound_bytes` and `used_request_count`, this counter is NOT
+            month-bounded: the cap is per-tenant-aggregate, not per-month. Drives
+            deploy-time enforcement — when `used_memory_mb + per_app_memory >
+            max_memory_mb`, deploy-time returns 402 PAYMENT_REQUIRED with reason
+            `memory_quota_will_be_exceeded`. Enterprise plan uses max_memory_mb=-1
+            to bypass the check.
+          example: 0
+        used_resident_seconds:
+          type: integer
+          format: int64
+          description: |
+            Cumulative LongRunning-app resident time in the current UTC month,
+            in seconds. Resets on month rollover. Handler (FaaS) apps do
+            not contribute (the worker stamps `resident_seconds=null`,
+            the CP translates that to 0). Drives enforcement the same way
+            as `used_outbound_bytes` and `used_request_count` — when this
+            value reaches `max_resident_seconds_per_month`, deploy-time
+            returns 402 PAYMENT_REQUIRED with reason `quota_will_be_exceeded`
+            and edge-ingress returns 402.
           example: 0
         quota_period_start:
           type: string
           format: date-time
           description: UTC timestamp at which the current usage period began. Used as the month-rollover boundary.
           example: 2026-07-01T00:00:00Z
+        quota_lock_grace_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Set by the heartbeat pipeline when a free-tier tenant first
+            crosses cap. Deploy-time 402 is in effect immediately on
+            first-cross; the request-time 402 (edge-ingress) only
+            activates once this timestamp has passed. Operators can
+            clear via the admin override endpoint.
+          example: 2026-07-15T12:00:00Z
+        overage_allowed_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Per-tenant grace clock for paid tenants that have crossed
+            cap. While this timestamp is in the future, the deploy-time
+            cap check is skipped (request-time 402 at the edge is
+            unaffected). Set by the admin override endpoint.
+          example: 2026-07-20T00:00:00Z
+        subscription_status:
+          type: string
+          enum: [active, past_due, canceled, trialing]
+          description: |
+            Mirrored from `billing_subscriptions.status`. Any value
+            other than `active` or `trialing` causes deploy-time to
+            return 402 PAYMENT_REQUIRED with reason
+            `subscription_past_due`.
+          example: active
+        over_cap:
+          type: boolean
+          description: |
+            Derived: true when `used_request_count >= max_requests_per_month`
+            OR `used_outbound_bytes / 1MiB >= max_outbound_mb`
+            OR (when `max_resident_seconds_per_month > 0`)
+            `used_resident_seconds >= max_resident_seconds_per_month`.
+            The edge-ingress fetcher keys its Caddy `static_response` 402
+            block off this boolean. Resident-seconds is the third metered
+            dimension added in #485; Handler (FaaS) apps do not contribute
+            (the worker stamps `resident_seconds=null`, the CP translates
+            that to a 0 contribution).
+          example: false
         usage_pct:
           type: number
           nullable: true
           description: |
-            Highest usage percentage across the two monthly caps
-            (outbound_bytes / max_outbound_mb and request_count / max_requests_per_month),
-            expressed as a 0-100 value. null when both caps are unlimited.
+            Highest usage percentage across the three monthly caps
+            (outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+            and used_resident_seconds / max_resident_seconds_per_month),
+            expressed as a 0-100 value. null when all caps are unlimited
+            (sentinel -1). Caps set to 0 (unset) are skipped.
           example: 42.5
+
+    # -------------------------------------------------------------------------
+    # Usage dashboard (issue #421)
+    # -------------------------------------------------------------------------
+    CurrentPeriodUsage:
+      type: object
+      description: |
+        Current billing-period usage for the authenticated tenant.
+        Derived from the single `quotas` row; the dashboard polls
+        this every few seconds and renders the percentage + remaining
+        capacity from these numbers.
+      properties:
+        period_start:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the current usage period began.
+          example: 2026-07-01T00:00:00Z
+        period_end:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the current usage period ends (next month boundary).
+          example: 2026-08-01T00:00:00Z
+        requests_used:
+          type: integer
+          format: int64
+          description: Cumulative requests in the current period. Drives deploy-time 402 once it reaches `requests_cap`.
+          example: 312
+        requests_cap:
+          type: integer
+          format: int64
+          description: Per-period request cap for the tenant's plan. -1 = unlimited.
+          example: 100000
+        outbound_bytes_used:
+          type: integer
+          format: int64
+          description: Cumulative outbound bytes in the current period. Drives deploy-time 402 once it reaches `outbound_bytes_cap`.
+          example: 89432
+        outbound_bytes_cap:
+          type: integer
+          format: int64
+          description: Per-period outbound cap in BYTES (not MiB) so the dashboard can render without conversion. -1 = unlimited.
+          example: 1073741824
+        usage_pct:
+          type: number
+          nullable: true
+          description: |
+            Highest usage percentage across the three monthly caps (0-100):
+            outbound_bytes / max_outbound_mb, request_count / max_requests_per_month,
+            and used_resident_seconds / max_resident_seconds_per_month.
+            null when all caps are unlimited (sentinel -1). Same semantics as
+            `Quota.usage_pct`; duplicated here so the dashboard can
+            subscribe to this endpoint alone.
+          example: 31.2
+
+    BillingEventTimelineEntry:
+      type: object
+      description: |
+        One row from the `billing_events` table, projected to the
+        response shape. `payload_hash` (internal dedup key) is
+        intentionally omitted.
+      properties:
+        event_id:
+          type: string
+          description: Merchant event ID (Stripe evt_… etc). Stable per webhook delivery.
+          example: evt_1Hxxxxxx
+        event_type:
+          type: string
+          enum: [checkout.completed, subscription.updated, subscription.deleted, payment.failed]
+          description: Normalized event class — merchant-agnostic.
+          example: subscription.updated
+        received_at:
+          type: string
+          format: date-time
+          description: UTC timestamp at which the webhook arrived at the control plane.
+          example: 2026-07-09T14:23:01Z
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC timestamp at which the dispatcher finished applying the event. NULL = received but not yet processed.
+          example: 2026-07-09T14:23:02Z
+
+    UpgradeOption:
+      type: object
+      description: |
+        One row in the `upgrade_options` array. Empty array when the
+        tenant is on a paid plan (the dashboard hides the upgrade
+        CTA — the tenant manages their plan via the billing portal
+        link instead).
+      properties:
+        plan:
+          type: string
+          description: Plan tier name (matches `PlanSpec.Name` in domain/plans.go).
+          example: pro
+        monthly_price_usd:
+          type: integer
+          description: Per-month price in US dollars (not cents). 0 if free.
+          example: 29
+
+    TenantUsage:
+      type: object
+      description: |
+        Response envelope for GET /api/v1/usage (issue #421). Composes
+        the current-period counters, a windowed subscription-event
+        timeline, and per-tenant upgrade options + billing portal
+        URL. Cached for 10s in-process (stale-while-revalidate) so
+        dashboard refresh doesn't hammer the DB.
+      required: [tenant_id, billing_status, current_period, events, from, to, upgrade_options]
+      properties:
+        tenant_id:
+          type: string
+          example: t_abc123
+        billing_status:
+          type: string
+          enum: [active, action_required]
+          description: |
+            Customer-facing billing status. `active` covers both
+            healthy subscriptions and the no-subscription-row case
+            (free-tier tenants that haven't started checkout).
+            `action_required` covers `past_due` and `canceled`
+            subscriptions — the dashboard surfaces a banner and
+            surfaces the billing portal link.
+          example: active
+        current_period:
+          $ref: '#/components/schemas/CurrentPeriodUsage'
+        events:
+          type: array
+          description: |
+            Subscription lifecycle events received in the requested
+            `[from, to]` window, ordered by `received_at` DESC.
+            Capped at the `limit` query param (default 50, max 200).
+          items:
+            $ref: '#/components/schemas/BillingEventTimelineEntry'
+        from:
+          type: string
+          format: date-time
+          description: Echoed start of the requested window (defaults to now-30d).
+          example: 2026-06-10T00:00:00Z
+        to:
+          type: string
+          format: date-time
+          description: Echoed end of the requested window (defaults to now).
+          example: 2026-07-10T00:00:00Z
+        next_offset:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for fetching the next page of events.
+            Reserved for future pagination — issue #421 returns
+            single-page reads (capped at the `limit` query param).
+          example: null
+        upgrade_options:
+          type: array
+          description: |
+            Paid tiers the tenant can upgrade to. Empty when the
+            tenant is already on a paid plan.
+          items:
+            $ref: '#/components/schemas/UpgradeOption'
+        billing_portal_url:
+          type: string
+          nullable: true
+          format: uri
+          description: |
+            Hosted billing portal URL (Stripe Customer Portal today).
+            Omitted when the tenant has no Stripe customer row
+            (e.g. a free-tier tenant that has never started checkout).
+          example: https://billing.stripe.com/c/p/portal_abc
+
+    QuotaOverrideRequest:
+      type: object
+      description: |
+        Every field is optional. Absent fields are not modified. Setting
+        `max_requests_per_month` / `max_outbound_mb` to a positive value
+        raises or lowers the cap; setting to -1 marks the cap as
+        unlimited. `clear_disabled_at: true` clears the free-tier
+        lockdown flag; `clear_grace: true` clears both
+        `quotas.quota_lock_grace_until` and
+        `tenants.overage_allowed_until`.
+      properties:
+        max_requests_per_month:
+          type: integer
+          description: New request cap (-1 = unlimited).
+          example: 5000000
+        max_outbound_mb:
+          type: integer
+          description: New outbound cap in MB (-1 = unlimited).
+          example: 50000
+        set_overage_allowed_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp until which paid-tenant over-cap deploys are accepted.
+          example: 2026-07-20T00:00:00Z
+        clear_disabled_at:
+          type: boolean
+          description: Clear the free-tier `tenants.disabled_at` lockdown flag.
+          example: false
+        clear_grace:
+          type: boolean
+          description: Clear both `quota_lock_grace_until` and `overage_allowed_until`.
+          example: false
 
     # -------------------------------------------------------------------------
     # Migration
@@ -879,6 +1397,39 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Worker'
+
+    # -------------------------------------------------------------------------
+    # Worker token mint (issue #491)
+    # -------------------------------------------------------------------------
+    WorkerTokenRequest:
+      type: object
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9_-]+$'
+          description: |
+            Tenant ID to mint the per-tenant scoped JWT for. Must
+            match the `^[a-z0-9_-]+$` charset; the wildcard `*` is
+            rejected with 400 (issue #491 refusal-to-mint-wildcard).
+          example: t_abc123
+
+    WorkerTokenResponse:
+      type: object
+      required: [token, expires_at, tenant_id]
+      properties:
+        token:
+          type: string
+          description: HS256-signed JWT carrying tenant_id claim.
+        expires_at:
+          type: integer
+          format: int64
+          description: Unix-seconds expiration. Mirrors `WORKER_TOKEN_TTL` (default 15m).
+        tenant_id:
+          type: string
+          description: Echo of the bound tenant_id for client-side confirmation.
 
     # -------------------------------------------------------------------------
     # Auth
@@ -1146,6 +1697,26 @@ components:
             error:
               code: QUOTA_EXCEEDED
               message: max apps quota exceeded
+
+    PaymentRequired:
+      description: |
+        Billing boundary reached — request cannot be fulfilled without
+        payment action. Distinct from `QuotaExceeded` (429), which is
+        a per-resource throttle with a Retry-After hint. 402 indicates
+        a billing condition that will not resolve by waiting:
+        `subscription_past_due`, `subscription_canceled`,
+        `free_tier_exceeded`, `quota_lock_grace_active`,
+        `quota_will_be_exceeded`, or `memory_quota_will_be_exceeded`
+        (issue #44, part 2 — the tenant's aggregate active-deployment
+        memory would exceed `max_memory_mb`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: PAYMENT_REQUIRED
+              message: memory quota will be exceeded by this deploy
 
     InternalError:
       description: Internal server error.
@@ -1437,6 +2008,33 @@ paths:
         Stores the artifact, registers a new deployment, and auto-creates
         the app record if it does not already exist. The artifact is
         validated as a WebAssembly binary before storage.
+
+        ## Idempotency-Key (issue #52)
+
+        A retry on a transient network error (504, dropped TCP) should
+        not produce a duplicate `deployments` row. Send an
+        `Idempotency-Key` header on the retry to pin the call to the
+        original deployment:
+
+        * Header is optional. Omitting it gives fresh-deploy semantics —
+          same behavior as pre-#52.
+        * Header value must match `^[a-fA-F0-9-]{8,128}$` (UUID v4 fits
+          unmodified; ULIDs and similar IDs also fit). Malformed → 400.
+        * Header is **tenant-scoped**: lookup is keyed on
+          `(tenant_id, key)`, never on the key alone. Two tenants
+          sending the same key each get independent rows.
+        * Replay returns the cached `deployment_id` with status **200**.
+          The response body is byte-equivalent to the 201 fresh path.
+        * Replaying a key against a different artifact body returns
+          **422 Unprocessable Entity** — this is the "you reused a
+          key by mistake" guard rail. The error message identifies the
+          sentinel `idempotency key reused with a different request body`.
+        * Lookup TTL is 24h. Rows older than the cutoff are treated
+          as fresh-deploy.
+
+        The CLI auto-mints a UUID v4 per invocation; pass
+        `--idempotency-key <UUID>` to pin a key explicitly (CI uses
+        this to dedupe retried jobs).
       parameters:
         - name: appName
           in: path
@@ -1444,6 +2042,16 @@ paths:
           schema:
             type: string
           description: Unique name of the app within the tenant.
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: '^[a-fA-F0-9-]{8,128}$'
+          description: |
+            Optional key that pins a retry to the original
+            `deployment_id`. See the operation description for the
+            full contract (replay, TTL, body-mismatch guard).
       requestBody:
         required: true
         content:
@@ -1453,6 +2061,16 @@ paths:
               format: binary
             description: Raw Wasm artifact bytes.
       responses:
+        '200':
+          description: |
+            Idempotent replay — the `Idempotency-Key` matched a row
+            in the replay cache. The response body is the original
+            `deployResponse`; the `id` field is the cached
+            `deployment_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeployResponse'
         '201':
           description: Deployment created.
           content:
@@ -1463,6 +2081,22 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '422':
+          description: |
+            The `Idempotency-Key` was reused against a request whose
+            artifact SHA-256 differs from the cached row's hash.
+            The client should pick a different key or accept that the
+            artifact has changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: idempotency key reused with a different request body
         '429':
           $ref: '#/components/responses/QuotaExceeded'
         '500':
@@ -1577,6 +2211,31 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Tenant is disabled. Returned when the caller's tenant row has
+            `disabled_at IS NOT NULL` at the moment the request reaches
+            the service layer (issue #440 disable-vs-activate race gate).
+            The response body is the standard error envelope with
+            `error.code = "CONFLICT"` and `error.message = "tenant is disabled"`.
+            The CLI / operator tooling can branch on `error.code` to
+            distinguish this from a generic infrastructure 500 — the
+            tenant will not auto-re-enable, retrying without operator
+            action is futile.
+
+            Scope note: this 409 is only reachable on the atomic path
+            (`?weight=100`, the default). Canary activation
+            (`?weight` < 100, which routes through traffic split) is
+            not gated by the disable check and so cannot surface this
+            response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFLICT
+                  message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1617,6 +2276,21 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Tenant is disabled. Promote delegates to the same
+            `activateDeployment` path as the activate endpoint, so the
+            issue #440 disable-vs-activate race gate fires identically
+            here. Body shape and `error.code` are identical to the
+            activate endpoint's 409.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: CONFLICT
+                  message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1652,23 +2326,31 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: |
-            No prior `last_good_deployment_id` is recorded for this app,
-            so there is nothing to roll back to. Returned when the app
-            has only ever had one deployment.
+            Either no `last_good_deployment_id` is recorded for this app
+            (only one deployment has ever been activated, so there is
+            nothing to roll back to), or the caller's tenant is
+            disabled (issue #440 disable-vs-activate race gate).
+            The message field distinguishes the two: `"no previous
+            deployment to roll back to"` for the first, `"tenant is
+            disabled"` for the second. The status code and
+            `error.code = "CONFLICT"` are the same in both cases.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '502':
-          description: |
-            The post-commit NATS publish of the task update failed for
-            every region the deployment is replicated to. The control
-            plane has already committed the new active deployment, but
-            workers may not converge until the publish is retried.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                no_last_good:
+                  summary: No last-good pointer
+                  value:
+                    error:
+                      code: CONFLICT
+                      message: no previous deployment to roll back to
+                tenant_disabled:
+                  summary: Tenant disabled (issue #440)
+                  value:
+                    error:
+                      code: CONFLICT
+                      message: tenant is disabled
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1948,11 +2630,13 @@ paths:
           description: Unique name of the app within the tenant.
       responses:
         '200':
-          description: Map of environment variable key-value pairs.
+          description: |
+            Array of environment variable key-value pairs, sorted
+            alphabetically by key.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EnvMap'
+                $ref: '#/components/schemas/EnvList'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -2078,8 +2762,18 @@ paths:
               properties:
                 app_name:
                   type: string
-                  pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
-                  description: Unique app name (alphanumeric, hyphens, 1-63 chars).
+                  pattern: '^[a-z0-9][a-z0-9.\-_]{0,62}$'
+                  description: |
+                    Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
+                    regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
+                    `[a-z0-9-]` to admit `.` and `_` for semver-ish
+                    names like `myapp.v2` or `app_v2` (issue #438).
+                    Dotted names render as a two-label host under
+                    `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
+                    operators must provision `*.*.edgecloud.dev` DNS and
+                    a matching cert before such names are routable.
+                    Single-label names (`myapp-v2`, `myapp_v2`) work
+                    under the existing `*.edgecloud.dev` wildcard.
                   example: my-app
                 language:
                   type: string
@@ -2134,6 +2828,57 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Quota'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/usage:
+    get:
+      operationId: getUsage
+      summary: Get the authenticated tenant's usage dashboard payload
+      description: |
+        Composes current-period counters, a windowed subscription-event
+        timeline, and per-tenant upgrade options + billing portal URL.
+        Cached for 10s in-process (stale-while-revalidate) so dashboard
+        refresh doesn't hammer the DB. Free-tier tenants see the
+        `upgrade_options` array; paid tenants see the billing portal
+        URL instead.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Start of the event window (RFC3339). Defaults to `to - 30d`.
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: End of the event window (RFC3339). Defaults to now. Must be >= `from`.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum number of events to return. Clamped to 200.
+      responses:
+        '200':
+          description: Usage dashboard payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantUsage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -2374,6 +3119,118 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
+  # Billing (issue #419)
+  # -------------------------------------------------------------------------
+  /api/v1/billing/checkout:
+    post:
+      operationId: startBillingCheckout
+      summary: Open a hosted checkout page for a paid plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingCheckoutRequest'
+      responses:
+        '201':
+          description: Checkout session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingCheckoutResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/portal:
+    post:
+      operationId: openBillingPortal
+      summary: Open the provider-hosted self-service portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingPortalRequest'
+      responses:
+        '200':
+          description: Portal session created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingPortalResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Tenant has no subscription yet — start a checkout first.
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/subscription:
+    get:
+      operationId: getBillingSubscription
+      summary: Get the authenticated tenant's current subscription
+      responses:
+        '200':
+          description: Current subscription state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingSubscription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Tenant has no subscription.
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/billing/webhook:
+    post:
+      operationId: receiveBillingWebhook
+      summary: Provider webhook ingress (signature-verified inline)
+      description: |
+        Inbound webhook from the configured billing provider
+        (e.g. Stripe). The provider verifies the signature inline
+        using its webhook secret; no Bearer token is required.
+        Returns 200 on success or idempotent replay, 400 on
+        signature failure (provider retries), 422 on
+        tenant-unresolved events, 500 on a DB error.
+      security: []
+      responses:
+        '200':
+          description: Event accepted, already processed, or intentionally ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingWebhookAck'
+              examples:
+                ok:
+                  value:
+                    status: ok
+                ignored:
+                  value:
+                    status: ignored
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: The event was signature-valid but could not be attributed to a tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: BILLING_TENANT_UNRESOLVED
+                  message: tenant unresolved for event
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
   # Admin: Tenants
   # -------------------------------------------------------------------------
   /api/v1/admin/tenants:
@@ -2509,6 +3366,82 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/admin/tenants/{tenantID}/quota-override:
+    post:
+      operationId: adminQuotaOverride
+      summary: Manually override a tenant's quota or lock state (admin only)
+      description: |
+        Owner-role escape hatch for the billing umbrella. Every field is
+        optional; absent fields are untouched. The most common uses are
+        to clear a free-tier lockdown (`clear_disabled_at: true`), grant a
+        temporary grace window (`set_overage_allowed_until`), or pin a
+        per-deployment cap for a paying customer that's about to
+        cross the line. Every override is recorded in `audit_logs` with
+        action `quota.override`.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuotaOverrideRequest'
+      responses:
+        '200':
+          description: Quota / lock state updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quota'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/admin/tenants/{tenantID}/enable:
+    post:
+      operationId: enableTenant
+      summary: Re-enable a tenant disabled by quota-exceeded (admin only)
+      description: |
+        Clears tenants.disabled_at for a tenant that the quota-exceeded
+        path stamped via SetDisabledAt (issue #440). Subsequent
+        activate / rollback / deploy requests proceed without
+        returning 409 tenant_disabled.
+
+        Idempotent: calling on an already-enabled tenant is a 200
+        with no state change.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tenant re-enabled. The disabled_at column has been cleared.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   # -------------------------------------------------------------------------
   # Admin: Apps
   # -------------------------------------------------------------------------
@@ -2622,6 +3555,17 @@ paths:
                     type: string
                   encryption_enabled:
                     type: boolean
+                  # Issue #441: count of app_env rows that don't match
+                  # the encrypted shape (kid:nonce:ct with a known kid).
+                  # Drives the operator migration to /admin/secrets/re-encrypt.
+                  # 0 = clean. N > 0 = N plaintext rows still need migration.
+                  # -1 = the count query itself errored; the CP logs the
+                  # underlying error and returns the keyring info anyway
+                  # (see handler.ListKeys). The 401 response shape is
+                  # unchanged.
+                  plaintext_row_count:
+                    type: integer
+                    example: 0
         '401':
           description: Missing or invalid internal token
 
@@ -2641,6 +3585,13 @@ paths:
                 properties:
                   re_encrypted:
                     type: integer
+                  # Issue #441: plaintext rows are already plaintext —
+                  # re-encrypting is a no-op — so they're counted here
+                  # and skipped. A non-zero value after a migration
+                  # run indicates the operator still has legacy rows.
+                  plaintext_skipped:
+                    type: integer
+                    example: 0
                   status:
                     type: string
         '400':
@@ -2701,6 +3652,40 @@ paths:
           description: Invalid app name or tenant ID
         '404':
           description: App not found
+
+  # -------------------------------------------------------------------------
+  # Internal: per-tenant quota state (issue #420)
+  # -------------------------------------------------------------------------
+  /api/v1/internal/quota/{tenantID}:
+    get:
+      summary: Per-tenant quota state for the ingress
+      description: |
+        Returns the per-tenant quota row plus the derived `over_cap`
+        boolean consumed by the edge-ingress quota fetcher. The fetcher
+        polls this endpoint every `QUOTA_FETCH_INTERVAL` seconds
+        (default 30s) and keys its Caddy `static_response` 402 block
+        off `over_cap`. The `locked_until` field is the
+        `quotas.quota_lock_grace_until` value — the request-time 402
+        activates after this timestamp passes.
+      security:
+        - InternalTokenAuth: []
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Quota state for the tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quota'
+        '400':
+          description: Invalid tenant ID
+        '404':
+          description: Tenant not found
 
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)
@@ -2924,6 +3909,54 @@ paths:
                 $ref: '#/components/schemas/WorkerListResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/internal/tokens/tenant:
+    post:
+      operationId: mintWorkerToken
+      summary: Mint a per-tenant scoped worker JWT (issue #491)
+      description: |
+        Issues a short-lived HS256 JWT scoped to one tenant. Requires
+        a valid worker bearer JWT (any scope, including the
+        bootstrap-issued wildcard). The minted token is signed with
+        the active kid and verifies via the standard
+        WorkerJWTAuth middleware.
+
+        Constraint: only tenants currently in worker_status.apps
+        with status='running' for this worker_id may be requested
+        (issue #491 #2). A worker whose heartbeat has not yet landed
+        cannot mint for ANY tenant.
+
+        Refusal-to-mint-wildcard: tenant_id="*" (and "", and any
+        value failing the charset check) is rejected with 400.
+      security:
+        - WorkerJWTAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerTokenRequest'
+      responses:
+        '200':
+          description: Token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerTokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Worker is not currently hosting the requested tenant
+            (issue #491 constraint #2; body explains denial).
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
         '500':
           $ref: '#/components/responses/InternalError'
 

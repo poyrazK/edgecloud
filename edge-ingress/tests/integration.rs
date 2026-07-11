@@ -40,6 +40,8 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         region: "test-region".into(),
         cert_file: "/tmp/test-cert.pem".into(),
         key_file: "/tmp/test-key.pem".into(),
+        cert_file_2: None,
+        key_file_2: None,
         listen_http: ":80".into(),
         listen_https: ":443".into(),
         refresh_debounce_ms: 50,

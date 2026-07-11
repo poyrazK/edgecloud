@@ -213,7 +213,7 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing app_name field"}`, http.StatusBadRequest)
 		return
 	}
-	if !service.IsValidDeploymentAppName(appName[0]) {
+	if !service.IsValidAppName(appName[0]) {
 		http.Error(w, `{"error":"invalid app_name"}`, http.StatusBadRequest)
 		return
 	}

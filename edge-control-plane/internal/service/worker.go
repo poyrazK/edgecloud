@@ -91,6 +91,10 @@ type workerRepoInterface interface {
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
 	ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 	GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
+	// TenantsHostedBy returns the deduplicated set of tenant IDs this
+	// worker is currently hosting (issue #491 constraint #2). Backs the
+	// 403 gate on POST /api/internal/tokens/tenant.
+	TenantsHostedBy(ctx context.Context, workerID string) ([]string, error)
 }
 
 // quotaRepoInterface defines the repository methods used by WorkerService.
@@ -103,6 +107,14 @@ type quotaRepoInterface interface {
 	// AddRequestCount but routes through checkResidentSeconds on every
 	// LongRunning heartbeat.
 	AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	// AddComputeMs accumulates into quotas.used_compute_ms (issue
+	// #555, fourth metered dimension). Mirrors AddResidentSeconds
+	// but routes through checkComputeMs on every Handler (FaaS)
+	// heartbeat — LongRunning apps stamp DurationMsTotal=null which
+	// folds to 0, so this is never called for LR. Pre-#555 workers
+	// don't carry the field either, so legacy workers contribute
+	// nothing here.
+	AddComputeMs(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	// SetGraceUntil stamps quotas.quota_lock_grace_until on free-tier
 	// first-cross (issue #420). Bounds the request-time 402 window
 	// after deploys are already blocked.
@@ -343,6 +355,16 @@ func (s *WorkerService) SetDisablePublishWaitPoll(p func(time.Duration) (<-chan 
 // (tenantID, region) pair before calling ReconcileService.BuildFullSync.
 func (s *WorkerService) Get(ctx context.Context, workerID string) (*domain.Worker, error) {
 	return s.workerRepo.GetByID(ctx, workerID)
+}
+
+// TenantsHostedBy returns the deduplicated set of tenant IDs this
+// worker is currently hosting (issue #491 constraint #2). Backs the
+// 403 gate on POST /api/internal/tokens/tenant — a worker can only
+// mint for tenants present in its worker_status.apps with
+// status='running'. Pass-through to the repo; the service layer holds
+// no extra logic so handler → service → repo layering stays clean.
+func (s *WorkerService) TenantsHostedBy(ctx context.Context, workerID string) ([]string, error) {
+	return s.workerRepo.TenantsHostedBy(ctx, workerID)
 }
 
 // SubscribeHeartbeats starts a background NATS subscription to
@@ -593,6 +615,18 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	// wrapper is never called — no quota work for FaaS. Same goroutine
 	// pattern as the other two dimensions above.
 	go s.checkResidentSeconds(context.WithoutCancel(ctx), hb.Apps)
+
+	// Fourth metered dimension (issue #555): Handler (FaaS) request
+	// duration in milliseconds. LongRunning apps stamp
+	// DurationMsTotal=null on the wire (the dispatch path never stamps
+	// for LR), so DurationMsTotalOrZero() folds to 0 and the
+	// AddComputeMs wrapper is never invoked for LR — symmetric to the
+	// resident-seconds / FaaS inversion above. Same goroutine pattern
+	// as the other three dimensions. The metering-ledger dual-write
+	// uses kind="compute_ms" (MeterKindComputeMs); the
+	// MeteringDrainer's zero-rate gate (METERING_RATE_COMPUTE_MS=0
+	// default) keeps this billing-neutral until pricing enables it.
+	go s.checkComputeMs(context.WithoutCancel(ctx), hb.Apps)
 
 	// Ingest observer metrics into the in-memory aggregator so they are
 	// immediately available at the Prometheus scrape endpoints. Pure
@@ -1229,6 +1263,42 @@ func (s *WorkerService) checkResidentSeconds(ctx context.Context, appsRaw json.R
 		"resident seconds",
 		domain.MeterKindResidentSeconds,
 		s.quotaRepo.AddResidentSeconds,
+		s.enqueueMeterEvent,
+	)
+}
+
+// checkComputeMs accumulates FaaS request duration in milliseconds from
+// this heartbeat into the tenant's running total in the DB (issue #555).
+// When the cumulative total exceeds the per-month
+// max_compute_ms_per_month cap, the tenant is disabled and an empty
+// task_update is published to every region where the tenant has active
+// deployments — same shape as checkOutboundQuota / checkRequestCount /
+// checkResidentSeconds but for the fourth metered dimension.
+//
+// LongRunning apps stamp DurationMsTotal=null on the wire because the
+// dispatch path never stamps for LR (their resident-time axis is
+// resident_seconds). DurationMsTotalOrZero() folds nil → 0 so the
+// AddComputeMs wrapper is never invoked for LR — the symmetric
+// inversion of checkResidentSeconds' FaaS-vs-LR split. Pre-#555
+// workers also serialize no DurationMsTotal field, which decodes as
+// nil; the helper folds to 0 so legacy workers contribute nothing
+// (dedupeId-based dedupe doesn't even need to be consulted).
+//
+// Field selector passed as a method value
+// ((*domain.AppStatus).DurationMsTotalOrZero) rather than a closure —
+// do NOT simplify to `func(a *domain.AppStatus) uint64 { return
+// a.DurationMsTotalOrZero() }`; the method-value form satisfies
+// applyTenantDelta's field parameter type without the extra
+// allocation, and keeps the call sites uniform across the four
+// dimensions.
+func (s *WorkerService) checkComputeMs(ctx context.Context, appsRaw json.RawMessage) {
+	s.applyTenantDelta(ctx, appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		s.quotaRepo.AddComputeMs,
 		s.enqueueMeterEvent,
 	)
 }

@@ -3,6 +3,7 @@
 pub mod activate;
 pub mod apps;
 pub mod auth;
+pub mod billing;
 pub mod build;
 pub mod completions;
 pub mod deploy;

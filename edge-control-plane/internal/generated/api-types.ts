@@ -1196,6 +1196,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/internal/tokens/tenant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a per-tenant scoped worker JWT (issue
+         * @description Issues a short-lived HS256 JWT scoped to one tenant. Requires
+         *     a valid worker bearer JWT (any scope, including the
+         *     bootstrap-issued wildcard). The minted token is signed with
+         *     the active kid and verifies via the standard
+         *     WorkerJWTAuth middleware.
+         *
+         *     Constraint: only tenants currently in worker_status.apps
+         *     with status='running' for this worker_id may be requested
+         *     (issue #491 #2). A worker whose heartbeat has not yet landed
+         *     cannot mint for ANY tenant.
+         *
+         *     Refusal-to-mint-wildcard: tenant_id="*" (and "", and any
+         *     value failing the charset check) is rejected with 400.
+         */
+        post: operations["mintWorkerToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1538,6 +1570,14 @@ export interface components {
              * @description Self-service portal URL the tenant's browser should be redirected to.
              */
             portal_url?: string;
+        };
+        BillingWebhookAck: {
+            /**
+             * @description ok when dispatched or replayed; ignored for verified but unsupported event types.
+             * @example ok
+             * @enum {string}
+             */
+            status?: "ok" | "ignored";
         };
         BillingSubscription: {
             /** @example t_abc123 */
@@ -2296,6 +2336,26 @@ export interface components {
         };
         WorkerListResponse: {
             workers?: components["schemas"]["Worker"][];
+        };
+        WorkerTokenRequest: {
+            /**
+             * @description Tenant ID to mint the per-tenant scoped JWT for. Must
+             *     match the `^[a-z0-9_-]+$` charset; the wildcard `*` is
+             *     rejected with 400 (issue #491 refusal-to-mint-wildcard).
+             * @example t_abc123
+             */
+            tenant_id: string;
+        };
+        WorkerTokenResponse: {
+            /** @description HS256-signed JWT carrying tenant_id claim. */
+            token: string;
+            /**
+             * Format: int64
+             * @description Unix-seconds expiration. Mirrors `WORKER_TOKEN_TTL` (default 15m).
+             */
+            expires_at: number;
+            /** @description Echo of the bound tenant_id for client-side confirmation. */
+            tenant_id: string;
         };
         WhoamiResponse: {
             /** @example t_abc123 */
@@ -3491,7 +3551,16 @@ export interface operations {
             content: {
                 "multipart/form-data": {
                     /**
-                     * @description Unique app name (alphanumeric, hyphens, 1-63 chars).
+                     * @description Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
+                     *     regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
+                     *     `[a-z0-9-]` to admit `.` and `_` for semver-ish
+                     *     names like `myapp.v2` or `app_v2` (issue #438).
+                     *     Dotted names render as a two-label host under
+                     *     `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
+                     *     operators must provision `*.*.edgecloud.dev` DNS and
+                     *     a matching cert before such names are routable.
+                     *     Single-label names (`myapp-v2`, `myapp_v2`) work
+                     *     under the existing `*.edgecloud.dev` wildcard.
                      * @example my-app
                      */
                     app_name: string;
@@ -3952,19 +4021,32 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Event accepted (or already processed). */
+            /** @description Event accepted, already processed, or intentionally ignored. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BillingWebhookAck"];
+                };
             };
-            /** @description Signature failure or tenant unresolved. */
-            400: {
+            400: components["responses"]["BadRequest"];
+            /** @description The event was signature-valid but could not be attributed to a tenant. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "BILLING_TENANT_UNRESOLVED",
+                     *         "message": "tenant unresolved for event"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
             };
             500: components["responses"]["InternalError"];
         };
@@ -4507,6 +4589,45 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["QuotaExceeded"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    mintWorkerToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Token issued. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerTokenResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description Worker is not currently hosting the requested tenant
+             *     (issue #491 constraint #2; body explains denial).
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
             429: components["responses"]["QuotaExceeded"];
             500: components["responses"]["InternalError"];
         };

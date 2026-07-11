@@ -347,6 +347,20 @@ pub struct AppStatus {
     /// a Handler app).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_seconds: Option<u64>,
+    /// Total elapsed wall-clock milliseconds across all FaaS requests
+    /// served by this Handler app since the last heartbeat interval
+    /// (issue #555, fourth metered dimension). The dispatch path
+    /// captures `Instant::now()` after the body-cap 413 early return
+    /// and stamps `meter.record_duration(elapsed)` in each of the four
+    /// terminal arms of `handle_request`'s `receiver.await` match
+    /// (`Ok(Ok)`, `Ok(Err)`, `Err(_dropped)` with `exit_code != 0`,
+    /// `Err(_dropped)` with `exit_code == 0`). LongRunning apps leave
+    /// this at 0 (the dispatch path never stamps for LR). Defaults to
+    /// 0 when absent (legacy workers); legacy control planes ignore
+    /// the field, new control planes apply zero contribution via
+    /// `checkComputeMs`.
+    #[serde(default)]
+    pub duration_ms_total: u64,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -502,6 +516,7 @@ mod tests {
             ws_port: None,
             dedupe_id: None,
             resident_seconds: None,
+            duration_ms_total: 0,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -568,6 +583,7 @@ mod tests {
             ws_port: None,
             dedupe_id: None,
             resident_seconds: None,
+            duration_ms_total: 0,
             observer_metrics: vec![],
             last_error: None,
         };
@@ -602,6 +618,7 @@ mod tests {
             observer_metrics: vec![],
             last_error: None,
             resident_seconds: None,
+            duration_ms_total: 0,
         };
         let json_none = serde_json::to_string(&none_status).expect("serialize");
         assert!(
@@ -679,6 +696,7 @@ mod tests {
             dedupe_id: None,
             last_error: None,
             resident_seconds: None,
+            duration_ms_total: 0,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
@@ -708,6 +726,7 @@ mod tests {
             dedupe_id: None,
             last_error: None,
             resident_seconds: Some(0),
+            duration_ms_total: 0,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
@@ -717,6 +736,60 @@ mod tests {
         );
         let parsed: AppStatus = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.resident_seconds, Some(0));
+    }
+
+    // ── duration_ms_total rolling-upgrade contract (issue #555) ──────────
+
+    /// Old workers that don't send `duration_ms_total` must deserialize
+    /// to 0 (not fail). The control plane treats 0 as "no FaaS
+    /// duration this interval" — same way it treats `outbound_bytes`
+    /// absent. Mirrors `outbound_bytes_absent_deserializes_to_zero`
+    /// (issue #210).
+    #[test]
+    fn duration_ms_total_absent_deserializes_to_zero() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.duration_ms_total, 0);
+    }
+
+    /// Explicit value round-trips correctly. Mirrors
+    /// `outbound_bytes_present_round_trips` (issue #210).
+    #[test]
+    fn duration_ms_total_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":1048576,"duration_ms_total":250,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(s.duration_ms_total, 250);
+    }
+
+    /// Serialization always includes the field (no
+    /// `skip_serializing_if`), so new workers talking to new control
+    /// planes always send the duration_ms count. LongRunning apps
+    /// stamp 0 (the dispatch path never fires for LR); control
+    /// planes treat 0 as "no FaaS contribution this interval".
+    #[test]
+    fn duration_ms_total_always_serialized() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 2,
+            outbound_bytes: 512,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            resident_seconds: None,
+            duration_ms_total: 150,
+            observer_metrics: vec![],
+            last_error: None,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""duration_ms_total":150"#),
+            "duration_ms_total must always appear in serialized AppStatus; got: {json}"
+        );
     }
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────
 

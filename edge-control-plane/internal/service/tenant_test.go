@@ -722,3 +722,51 @@ func TestValidateEgressAllowlist_AcceptsValidFQDN(t *testing.T) {
 		t.Fatalf("expected nil, got %v", err)
 	}
 }
+
+// TestTenantService_GetByID_NilTenantIsNotFound is the regression pin
+// for the PR #491 review's 🔴 finding: production's
+// repository.TenantRepository.GetByID returns (nil, nil) for "row not
+// found". Without a translation, any handler that calls
+// `tenant.IsDisabled()` on the result panics on the typo path.
+//
+// *TenantService.GetByID (added in #491) translates the (nil, nil)
+// into ErrTenantNotFound so callers can rely on a single
+// `errors.Is(err, ErrTenantNotFound)` check, mirroring every other
+// service-level method on this struct.
+//
+// The default mockTenantSvcRepo.GetByID already returns (nil, nil),
+// so this test exercises the production contract end-to-end.
+func TestTenantService_GetByID_NilTenantIsNotFound(t *testing.T) {
+	svc := tenantSvcForTest(&mockTenantSvcRepo{}, &mockQuotaSvcRepo{}, &mockAPIKeySvcRepo{})
+
+	tenant, err := svc.GetByID(context.Background(), "t_phantom")
+	if tenant != nil {
+		t.Errorf("expected nil tenant, got %+v", tenant)
+	}
+	if !errors.Is(err, ErrTenantNotFound) {
+		t.Errorf("expected ErrTenantNotFound, got %v", err)
+	}
+}
+
+// TestTenantService_GetByID_FoundPassesThrough confirms the
+// (nil, nil) translation does NOT clobber a real row.
+func TestTenantService_GetByID_FoundPassesThrough(t *testing.T) {
+	want := &domain.Tenant{ID: "t_real", Name: "acme"}
+	tr := &mockTenantSvcRepo{
+		getByIDFn: func(_ context.Context, id string) (*domain.Tenant, error) {
+			if id == "t_real" {
+				return want, nil
+			}
+			return nil, nil
+		},
+	}
+	svc := tenantSvcForTest(tr, &mockQuotaSvcRepo{}, &mockAPIKeySvcRepo{})
+
+	got, err := svc.GetByID(context.Background(), "t_real")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if got != want {
+		t.Errorf("expected the row to pass through unchanged, got %+v", got)
+	}
+}

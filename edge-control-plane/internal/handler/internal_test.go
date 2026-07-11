@@ -63,7 +63,7 @@ func newInternalHandler(svc handler.InternalDomainServiceInterface) *handler.Int
 	// We rely on the InternalHandler struct's `domainSvc` being the
 	// first thing the custom-domain routes read; the deployment
 	// service is only read by Download, which is not in this test set.
-	return handler.NewInternalHandler(nil, nil, svc, nil, nil, nil, "", "", "")
+	return handler.NewInternalHandler(nil, nil, svc, nil, nil, nil, "", "", "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 }
 
 // TestInternal_ListDomains_HappyPath pins the array-shape contract that
@@ -293,7 +293,7 @@ func withBootstrapCtx(workerID, tenantID, region string) func(*http.Request) *ht
 
 // TestInternal_Bootstrap_NotConfigured returns 501 when bootstrap secret is empty.
 func TestInternal_Bootstrap_NotConfigured(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"2026-07-06T12:00:00Z","nonce":"abc","signature":"def"}`
 	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -305,7 +305,7 @@ func TestInternal_Bootstrap_NotConfigured(t *testing.T) {
 
 // TestInternal_Bootstrap_MissingFields returns 400.
 func TestInternal_Bootstrap_MissingFields(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	tests := []struct {
 		name string
 		body string
@@ -333,7 +333,7 @@ func TestInternal_Bootstrap_MissingFields(t *testing.T) {
 // TestInternal_Bootstrap_InvalidTimestampFormat returns 400 when timestamp
 // is not valid RFC3339.
 func TestInternal_Bootstrap_InvalidTimestampFormat(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"not-a-timestamp","nonce":"abc","signature":"def"}`
 	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -345,7 +345,7 @@ func TestInternal_Bootstrap_InvalidTimestampFormat(t *testing.T) {
 
 // TestInternal_Bootstrap_StaleTimestamp returns 400 when timestamp is >5min old.
 func TestInternal_Bootstrap_StaleTimestamp(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	oldTime := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
 	sig := signBootstrapPayload("w_test", "fra", "t_test", oldTime, "abc", testBootstrapSecret)
 	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"` + oldTime + `","nonce":"abc","signature":"` + sig + `"}`
@@ -359,7 +359,7 @@ func TestInternal_Bootstrap_StaleTimestamp(t *testing.T) {
 
 // TestInternal_Bootstrap_InvalidSignature returns 401.
 func TestInternal_Bootstrap_InvalidSignature(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	now := time.Now().Format(time.RFC3339)
 	body := `{"worker_id":"w_test","region":"fra","tenant_id":"t_test","timestamp":"` + now + `","nonce":"abc","signature":"wrong-signature"}`
 	req := httptest.NewRequest("POST", "/api/internal/bootstrap", strings.NewReader(body))
@@ -372,7 +372,7 @@ func TestInternal_Bootstrap_InvalidSignature(t *testing.T) {
 
 // TestInternal_Bootstrap_Success returns 200 with a JWT token.
 func TestInternal_Bootstrap_Success(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "real-jwt-secret")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, "real-jwt-secret", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	now := time.Now().Format(time.RFC3339)
 	sig := signBootstrapPayload("w_test_abc", "fra", "t_test", now, "unique-nonce", testBootstrapSecret)
 	bodyMap := map[string]string{
@@ -420,7 +420,7 @@ func TestInternal_Bootstrap_Success(t *testing.T) {
 
 // TestInternal_WorkerSecret_NotConfigured returns 501 when bootstrap is not set.
 func TestInternal_WorkerSecret_NotConfigured(t *testing.T) {
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "")
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", "", "", middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 	req := httptest.NewRequest("GET", "/api/internal/worker-secret", nil)
 	rec := httptest.NewRecorder()
 	h.WorkerSecret(rec, req)
@@ -432,7 +432,7 @@ func TestInternal_WorkerSecret_NotConfigured(t *testing.T) {
 // TestInternal_WorkerSecret_Success returns 200 with the JWT secret.
 func TestInternal_WorkerSecret_Success(t *testing.T) {
 	jwtSecret := "the-real-jwt-secret-that-is-at-least-32-b"
-	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, jwtSecret)
+	h := handler.NewInternalHandler(nil, nil, nil, nil, nil, nil, "", testBootstrapSecret, jwtSecret, middleware.WorkerJWTConfig{}, 0, "", "", nil, nil)
 
 	// Issue a bootstrap JWT the same way the Bootstrap handler would.
 	cfg := middleware.BootstrapJWTConfig{

@@ -49,9 +49,16 @@ func Transaction(ctx context.Context, db *sqlx.DB, fn func(tx *sqlx.Tx) error) e
 		return err
 	}
 	if err := fn(tx); err != nil {
-		if rbErr := tx.Rollback(); rbErr != nil {
-			return rbErr
-		}
+		// Always return the closure error so callers and test
+		// traces see the actual cause of the failure. The previous
+		// implementation returned tx.Rollback()'s error when the
+		// rollback itself failed, which masked the original error
+		// and made sqlmock-based tests (e.g. issue #439
+		// TestActivateDeployment_IdempotencyReplay_NoOutboxRow)
+		// impossible to debug because the trace showed
+		// "Rollback transaction, was not expected" instead of the
+		// real underlying mock mismatch.
+		_ = tx.Rollback()
 		return err
 	}
 	return tx.Commit()

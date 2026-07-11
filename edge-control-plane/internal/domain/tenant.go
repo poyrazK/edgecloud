@@ -64,8 +64,18 @@ type Quota struct {
 	MaxOutboundMB              int    `db:"max_outbound_mb"                json:"max_outbound_mb"`
 	MaxRequestsPerMonth        int    `db:"max_requests_per_month"         json:"max_requests_per_month"`
 	MaxResidentSecondsPerMonth int    `db:"max_resident_seconds_per_month" json:"max_resident_seconds_per_month"`
-	UsedOutboundBytes          int64  `db:"used_outbound_bytes"            json:"used_outbound_bytes"`
-	UsedRequestCount           int64  `db:"used_request_count"             json:"used_request_count"`
+	// MaxComputeMsPerMonth is the fourth metered dimension's cap
+	// (issue #555). Bounds the FaaS request-duration total per
+	// month — the GB-ms-style axis the Lambda-comparison narrative
+	// for #484/#485/#555 hangs on. Sentinel < 0 (e.g. enterprise)
+	// means unlimited; == 0 means hard-deny; > 0 is the per-tenant
+	// millisecond budget. Backfilled in migration 031 with the
+	// same per-plan defaults as MaxResidentSecondsPerMonth but
+	// scaled to ms (free=2_592_000_000, pro=7_776_000_000,
+	// business=31_104_000_000, enterprise=-1).
+	MaxComputeMsPerMonth int   `db:"max_compute_ms_per_month" json:"max_compute_ms_per_month"`
+	UsedOutboundBytes    int64 `db:"used_outbound_bytes"      json:"used_outbound_bytes"`
+	UsedRequestCount     int64 `db:"used_request_count"       json:"used_request_count"`
 	// UsedMemoryMB is the aggregate memory (MiB) currently consumed
 	// by the tenant's active deployments (issue #44, part 2).
 	// Incremented on activate / promote, decremented on rollback.
@@ -75,9 +85,18 @@ type Quota struct {
 	// would be wrong. The deploy-time gate rejects a new deploy when
 	// UsedMemoryMB + perAppMemory > MaxMemoryMB (with MaxMemoryMB == 0
 	// or < 0 falling through to the per-instance hint path).
-	UsedMemoryMB        int64     `db:"used_memory_mb"         json:"used_memory_mb"`
-	UsedResidentSeconds int64     `db:"used_resident_seconds"  json:"used_resident_seconds"`
-	QuotaPeriodStart    time.Time `db:"quota_period_start"     json:"quota_period_start"`
+	UsedMemoryMB        int64 `db:"used_memory_mb"        json:"used_memory_mb"`
+	UsedResidentSeconds int64 `db:"used_resident_seconds" json:"used_resident_seconds"`
+	// UsedComputeMs accumulates the Handler (FaaS) request-duration
+	// total in milliseconds (issue #555, fourth metered dimension).
+	// Updated by WorkerService.checkComputeMs from the
+	// duration_ms_total heartbeat field — LongRunning apps stamp 0
+	// (their resident-time axis is resident_seconds), so this counter
+	// advances only when Handler dispatch stamps. Lazy-rollover
+	// semantics against QuotaPeriodStart mirror the existing three
+	// axes so a tenant whose month just rolled over starts fresh.
+	UsedComputeMs    int64     `db:"used_compute_ms" json:"used_compute_ms"`
+	QuotaPeriodStart time.Time `db:"quota_period_start"     json:"quota_period_start"`
 	// QuotaLockGraceUntil is set by applyTenantDelta on free-tier
 	// first-cross of a monthly cap (issue #420). It bounds the
 	// request-time 402 — deploys are blocked immediately, but the

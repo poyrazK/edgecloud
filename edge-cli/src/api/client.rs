@@ -497,6 +497,39 @@ pub struct QuotaResponse {
     pub usage_pct: Option<f64>,
 }
 
+/// Response from `POST /api/v1/billing/checkout`.
+#[derive(Debug, Deserialize)]
+pub struct BillingCheckoutResponse {
+    pub checkout_url: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// Response from `POST /api/v1/billing/portal`.
+#[derive(Debug, Deserialize)]
+pub struct BillingPortalResponse {
+    pub portal_url: String,
+}
+
+/// Subscription mirror returned by `GET /api/v1/billing/subscription`.
+#[derive(Debug, Deserialize)]
+pub struct BillingSubscriptionResponse {
+    pub tenant_id: String,
+    pub provider: String,
+    #[serde(default)]
+    pub provider_customer_id: Option<String>,
+    #[serde(default)]
+    pub provider_subscription_id: Option<String>,
+    pub plan: String,
+    pub status: String,
+    #[serde(default)]
+    pub current_period_end: Option<String>,
+    pub cancel_at_period_end: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Egress allowlist returned by `GET /api/v1/egress` and sent by
 /// `PUT /api/v1/egress`. Mirrors the Go control-plane
 /// `egressResponse` struct.
@@ -886,7 +919,13 @@ impl ApiClient {
     }
 
     /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
-    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
+    pub fn activate(
+        &self,
+        app_name: &str,
+        deployment_id: &str,
+        weight: Option<u8>,
+        idempotency_key: &str,
+    ) -> Result<()> {
         let url = if let Some(w) = weight {
             format!(
                 "{}/api/v1/apps/{}/activate/{}?weight={}",
@@ -898,11 +937,18 @@ impl ApiClient {
                 self.base_url, app_name, deployment_id
             )
         };
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+            .header("Authorization", self.auth_header());
+        // Issue #439: forward the Idempotency-Key header when the
+        // caller supplied one. Empty string = no header, server
+        // runs fresh-publish semantics. Mirrors Deploy's pattern
+        // at api/client.rs:757.
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
 
         let _ =
             check_response(resp).map_err(|e| anyhow::Error::new(e).context("activate failed"))?;
@@ -911,18 +957,23 @@ impl ApiClient {
 
     /// Promote a preview deployment to production.
     /// POST /api/v1/apps/{app_name}/promote/{deployment_id}
-    pub fn promote(&self, app_name: &str, deployment_id: &str) -> Result<()> {
+    pub fn promote(
+        &self,
+        app_name: &str,
+        deployment_id: &str,
+        idempotency_key: &str,
+    ) -> Result<()> {
         let url = format!(
             "{}/api/v1/apps/{}/promote/{}",
             self.base_url, app_name, deployment_id
         );
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
-        let _ =
-            check_response(resp).map_err(|e| anyhow::Error::new(e).context("promote failed"))?;
+        let mut req = self.http.post(&url).header("Authorization", self.auth_header());
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
+        let _ = check_response(resp)
+            .map_err(|e| anyhow::Error::new(e).context("promote failed"))?;
         Ok(())
     }
 
@@ -992,13 +1043,16 @@ impl ApiClient {
     /// active. If the server returns 409 ("no previous deployment to
     /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
     /// caller can detect that via `body.contains("no previous")`.
-    pub fn rollback(&self, app_name: &str) -> Result<RollbackResponse> {
+    pub fn rollback(&self, app_name: &str, idempotency_key: &str) -> Result<RollbackResponse> {
         let url = format!("{}/api/v1/apps/{}/rollback", self.base_url, app_name);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+            .header("Authorization", self.auth_header());
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
 
         let resp =
             check_response(resp).map_err(|e| anyhow::Error::new(e).context("rollback failed"))?;
@@ -1086,6 +1140,57 @@ impl ApiClient {
     /// GET `/api/v1/quotas` — get tenant quota and usage.
     pub fn get_quota(&self) -> Result<QuotaResponse> {
         self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))
+    }
+
+    /// POST `/api/v1/billing/checkout` — create a provider-hosted checkout session.
+    pub fn create_billing_checkout(&self, plan: &str) -> Result<BillingCheckoutResponse> {
+        let url = format!("{}/api/v1/billing/checkout", self.base_url);
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            plan: &'a str,
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&Payload { plan })
+            .send()?;
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("billing checkout failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
+    }
+
+    /// POST `/api/v1/billing/portal` — create a provider-hosted portal session.
+    pub fn create_billing_portal(&self, return_url: &str) -> Result<BillingPortalResponse> {
+        let url = format!("{}/api/v1/billing/portal", self.base_url);
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            return_url: &'a str,
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&Payload { return_url })
+            .send()?;
+        let resp = check_response(resp).map_err(|e| match e {
+            ApiError::Rejected { status, body } => {
+                anyhow::anyhow!("billing portal failed: {status} {body}")
+            }
+            ApiError::Transient { source } => source,
+        })?;
+        serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
+    }
+
+    /// GET `/api/v1/billing/subscription` — get the tenant's subscription mirror.
+    pub fn get_billing_subscription(&self) -> Result<BillingSubscriptionResponse> {
+        self.get_json_anyhow("billing subscription", |base| {
+            format!("{base}/api/v1/billing/subscription")
+        })
     }
 
     /// GET `/api/v1/egress` — get the current egress allowlist.

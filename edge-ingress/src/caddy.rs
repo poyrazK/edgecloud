@@ -685,12 +685,21 @@ pub fn render_routes(
     // hits the control plane's /api/internal/tls-allowed endpoint
     // before issuing a cert for a never-seen-before hostname.
     let mut tls = serde_json::Map::new();
+    // Issue #438 — when TLS_CERT_FILE_2 / TLS_KEY_FILE_2 are set, load
+    // the multi-label `*.*.edgecloud.dev` wildcard cert alongside the
+    // single-level `*.edgecloud.dev` wildcard so dotted app names like
+    // `myapp.v2` resolve via TLS without depending on ACME on-demand.
+    // Without the second cert, dotted hosts still route (the
+    // `host_regexp` matchers catch them) but the TLS handshake falls
+    // through to the on-demand issuer on first hit.
+    let mut load_files = vec![json!({"certificate": cfg.cert_file, "key": cfg.key_file})];
+    if let (Some(cert2), Some(key2)) = (&cfg.cert_file_2, &cfg.key_file_2) {
+        load_files.push(json!({"certificate": cert2, "key": key2}));
+    }
     tls.insert(
         "certificates".to_string(),
         json!({
-            "load_files": [
-                {"certificate": cfg.cert_file, "key": cfg.key_file}
-            ]
+            "load_files": load_files
         }),
     );
     if !cfg.control_plane_url.is_empty() {
@@ -885,6 +894,8 @@ mod tests {
             region: "test".into(),
             cert_file: "/etc/caddy/tls/cert.pem".into(),
             key_file: "/etc/caddy/tls/key.pem".into(),
+            cert_file_2: None,
+            key_file_2: None,
             listen_http: ":80".into(),
             listen_https: ":443".into(),
             refresh_debounce_ms: 1000,
@@ -951,6 +962,58 @@ mod tests {
         assert!(
             cfg_json["apps"]["http"]["automatic_https"].is_null(),
             "render_routes must not emit the removed automatic_https field"
+        );
+    }
+
+    /// Issue #438 — when `TLS_CERT_FILE_2` / `TLS_KEY_FILE_2` are set,
+    /// the multi-label wildcard cert (`*.*.edgecloud.dev`) that covers
+    /// dotted app names like `myapp.v2` is appended to
+    /// `tls.certificates.load_files` alongside the single-level
+    /// `*.edgecloud.dev` cert. Both must be present (one without the
+    /// other is a configuration error).
+    #[test]
+    fn multi_label_wildcard_cert_is_loaded_when_cert_file_2_set() {
+        let cache = TrafficSplitCache::default();
+        let rl_cache = test_rate_limit_cache();
+        let q_cache = test_quota_cache();
+        let mut cfg = test_cfg();
+        cfg.cert_file_2 = Some("/etc/caddy/tls/cert-multi.pem".into());
+        cfg.key_file_2 = Some("/etc/caddy/tls/key-multi.pem".into());
+        let cfg_json = render_routes(&[], &[], &cfg, &cache, &rl_cache, &q_cache);
+
+        let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
+        let arr = load_files
+            .as_array()
+            .expect("load_files must be an array when cert_file_2 is set");
+        assert_eq!(
+            arr.len(),
+            2,
+            "load_files must contain both single- and multi-label wildcard certs"
+        );
+        assert_eq!(arr[0]["certificate"], "/etc/caddy/tls/cert.pem");
+        assert_eq!(arr[0]["key"], "/etc/caddy/tls/key.pem");
+        assert_eq!(arr[1]["certificate"], "/etc/caddy/tls/cert-multi.pem");
+        assert_eq!(arr[1]["key"], "/etc/caddy/tls/key-multi.pem");
+    }
+
+    /// Default config (no second cert) still emits the single-level
+    /// wildcard cert. Dotted hosts will fall through to per-route
+    /// `tls.on_demand: {}` ACME on first hit.
+    #[test]
+    fn single_label_only_when_cert_file_2_unset() {
+        let cache = TrafficSplitCache::default();
+        let rl_cache = test_rate_limit_cache();
+        let q_cache = test_quota_cache();
+        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
+
+        let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
+        let arr = load_files
+            .as_array()
+            .expect("load_files must be an array even without the multi-label cert");
+        assert_eq!(
+            arr.len(),
+            1,
+            "load_files must contain only the single-label cert when cert_file_2 is unset"
         );
     }
 

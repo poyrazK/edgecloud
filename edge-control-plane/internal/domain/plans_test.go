@@ -10,10 +10,10 @@ func TestQuotaForPlan_KnownPlans(t *testing.T) {
 		plan   string
 		expect Quota
 	}{
-		{"free", Quota{MaxDeployments: 10, MaxApps: 5, MaxWorkers: 3, MaxMemoryMB: 256, MaxOutboundMB: 1000, MaxRequestsPerMonth: 100_000, MaxResidentSecondsPerMonth: 2_592_000}},
-		{"pro", Quota{MaxDeployments: 50, MaxApps: 20, MaxWorkers: 10, MaxMemoryMB: 512, MaxOutboundMB: 10_000, MaxRequestsPerMonth: 5_000_000, MaxResidentSecondsPerMonth: 7_776_000}},
-		{"business", Quota{MaxDeployments: 200, MaxApps: 50, MaxWorkers: 30, MaxMemoryMB: 1024, MaxOutboundMB: 100_000, MaxRequestsPerMonth: 50_000_000, MaxResidentSecondsPerMonth: 31_104_000}},
-		{"enterprise", Quota{MaxDeployments: -1, MaxApps: -1, MaxWorkers: -1, MaxMemoryMB: -1, MaxOutboundMB: -1, MaxRequestsPerMonth: -1, MaxResidentSecondsPerMonth: -1}},
+		{"free", Quota{MaxDeployments: 10, MaxApps: 5, MaxWorkers: 3, MaxMemoryMB: 256, MaxOutboundMB: 1000, MaxRequestsPerMonth: 100_000, MaxResidentSecondsPerMonth: 2_592_000, MaxComputeMsPerMonth: 2_592_000_000}},
+		{"pro", Quota{MaxDeployments: 50, MaxApps: 20, MaxWorkers: 10, MaxMemoryMB: 512, MaxOutboundMB: 10_000, MaxRequestsPerMonth: 5_000_000, MaxResidentSecondsPerMonth: 7_776_000, MaxComputeMsPerMonth: 7_776_000_000}},
+		{"business", Quota{MaxDeployments: 200, MaxApps: 50, MaxWorkers: 30, MaxMemoryMB: 1024, MaxOutboundMB: 100_000, MaxRequestsPerMonth: 50_000_000, MaxResidentSecondsPerMonth: 31_104_000, MaxComputeMsPerMonth: 31_104_000_000}},
+		{"enterprise", Quota{MaxDeployments: -1, MaxApps: -1, MaxWorkers: -1, MaxMemoryMB: -1, MaxOutboundMB: -1, MaxRequestsPerMonth: -1, MaxResidentSecondsPerMonth: -1, MaxComputeMsPerMonth: -1}},
 	}
 	for _, tc := range cases {
 		got, err := QuotaForPlan(tc.plan)
@@ -57,7 +57,7 @@ func TestPlanSentinel_UnlimitedValues(t *testing.T) {
 	}
 	if q.MaxDeployments >= 0 || q.MaxApps >= 0 || q.MaxWorkers >= 0 ||
 		q.MaxMemoryMB >= 0 || q.MaxOutboundMB >= 0 || q.MaxRequestsPerMonth >= 0 ||
-		q.MaxResidentSecondsPerMonth >= 0 {
+		q.MaxResidentSecondsPerMonth >= 0 || q.MaxComputeMsPerMonth >= 0 {
 		t.Errorf("enterprise tier should have all Max* = -1 (unlimited), got %+v", q)
 	}
 }

@@ -3149,6 +3149,19 @@ impl Supervisor {
                     } else {
                         None
                     },
+                    // Fourth metered dimension (issue #555): Handler
+                    // (FaaS) request duration in milliseconds. The
+                    // dispatch path stamps
+                    // `meter.record_duration(elapsed)` in each of the
+                    // four terminal arms of `handle_request`. LongRunning
+                    // apps leave this at 0 (the dispatch path never
+                    // stamps for LR) — the control plane applies zero
+                    // contribution via `checkComputeMs` either way.
+                    // Reading from the same `snap` keeps the four
+                    // counters atomically consistent (no TOCTOU at
+                    // heartbeat time), same posture as
+                    // `outbound_bytes`/`resident_seconds`.
+                    duration_ms_total: snap.duration_ms,
                 },
             );
         }
@@ -3195,6 +3208,16 @@ impl Supervisor {
                 // current interval.
                 inst.meter
                     .subtract_resident_seconds(status.resident_seconds.unwrap_or(0));
+                // Fourth metered dimension (issue #555): subtract the
+                // FaaS duration-ms delta we just shipped. LongRunning
+                // apps stamp `duration_ms_total = 0` (the dispatch
+                // path never fires for LR), so the subtract folds
+                // them to a no-op — same shape as the
+                // `resident_seconds.unwrap_or(0)` call above. The
+                // deployment-mismatch guard at line ~2920 already
+                // short-circuits all four subtractions together when
+                // a heartbeat arrives for a stale deployment.
+                inst.meter.subtract_duration_ms(status.duration_ms_total);
             }
         }
     }
@@ -4520,6 +4543,211 @@ mod tests {
         assert_eq!(
             snap.resident_seconds, 60,
             "resident-seconds counter must NOT be reset on deployment_id mismatch (would wrap to u64::MAX)"
+        );
+    }
+
+    // ── issue #555 FaaS duration tests ───────────────────────────────────
+
+    /// Issue #555, fourth metered dimension: `build_heartbeat` must
+    /// stamp `duration_ms_total` from the FaaS duration counter on
+    /// the heartbeat wire. Mirrors
+    /// `reset_meters_after_subtracts_resident_seconds_delta` for the
+    /// new axis — the dispatch path stamps
+    /// `meter.record_duration(elapsed)` per request, and
+    /// `build_heartbeat` reads the running total into
+    /// `AppStatus.duration_ms_total`.
+    #[tokio::test]
+    async fn reset_meters_after_subtracts_duration_ms_delta() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = Some(fixture_pre(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        meter.record_outbound_bytes(100);
+        // Pre-load the duration counter to simulate two FaaS requests
+        // with elapsed wall-clock times summing to 200ms (typical
+        // small-handler workload).
+        meter.record_duration(Duration::from_millis(120));
+        meter.record_duration(Duration::from_millis(80));
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19007,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            resident_ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+        // Sanity check: build_heartbeat stamped 200ms onto the wire.
+        let stamped = hb.apps.get("my-app").expect("app present");
+        assert_eq!(
+            stamped.duration_ms_total, 200,
+            "build_heartbeat must stamp duration_ms_total for Handler app"
+        );
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(snap.request_count, 0);
+        assert_eq!(snap.outbound_bytes, 0);
+        assert_eq!(
+            snap.duration_ms, 0,
+            "duration_ms delta must be subtracted after heartbeat publish"
+        );
+    }
+
+    /// Issue #555 mirror of
+    /// `reset_meters_after_resident_deployment_mismatch_skips`: when
+    /// deployment_id changes between build_heartbeat and
+    /// reset_meters_after, the duration_ms counter must NOT be
+    /// subtracted. fetch_sub would wrap to u64::MAX.
+    #[tokio::test]
+    async fn reset_meters_after_duration_deployment_mismatch_skips() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = Some(fixture_pre(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_outbound_bytes(100);
+        meter.record_duration(Duration::from_millis(150));
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(), // initial deployment
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19008,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            resident_ticker: None,
+            execution_model: ExecutionModel::Handler,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+
+        // Build heartbeat with current state (deployment_id="d1")
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+
+        // Now simulate a new deployment replacing the app (deployment_id changes)
+        // between build_heartbeat and reset_meters_after.
+        {
+            let mut guard = state.write().await;
+            let existing = guard
+                .apps
+                .get_mut(&("t_test".into(), "my-app".into()))
+                .unwrap();
+            let mut inst = existing.lock().await;
+            inst.deployment_id = "d2".into(); // deployment changed!
+        }
+
+        // Reset with the stale heartbeat (which has deployment_id="d1")
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(
+            snap.duration_ms, 150,
+            "duration_ms counter must NOT be reset on deployment_id mismatch (would wrap to u64::MAX)"
+        );
+    }
+
+    /// Issue #555: LongRunning apps leave `duration_ms_total = 0` on
+    /// every heartbeat (the dispatch path never stamps for LR — the
+    /// per-app resident ticker handles LR's metered dimension via
+    /// `resident_seconds`). The reset path must accept the zero as
+    /// a no-op subtract (not wrap to u64::MAX), so the LR app's
+    /// meter stays healthy across heartbeat intervals even though
+    /// the dispatch path never touched `duration_ms`.
+    #[tokio::test]
+    async fn reset_meters_after_long_running_app_skips_duration_subtract() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = Some(fixture_pre(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        // LR app: resident_ticker fired 2× but the dispatch path never
+        // stamped duration. duration_ms stays at 0 — the heartbeat's
+        // duration_ms_total is therefore 0, the subtract is a no-op.
+        meter.record_resident_seconds(60);
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19009,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            resident_ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+        let stamped = hb.apps.get("my-app").expect("app present");
+        assert_eq!(
+            stamped.duration_ms_total, 0,
+            "LongRunning app must stamp duration_ms_total = 0"
+        );
+        assert_eq!(
+            stamped.resident_seconds,
+            Some(60),
+            "LongRunning app must stamp resident_seconds = Some(60)"
+        );
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        // Duration stays at 0 — the heartbeat reported 0, the reset
+        // subtracts 0, the meter doesn't change. This is the
+        // contract being tested.
+        assert_eq!(
+            snap.duration_ms, 0,
+            "LongRunning app's duration_ms stays at 0 — subtract was a no-op"
+        );
+        // Resident-seconds IS subtracted — the heartbeat reported 60,
+        // the reset subtracts 60, the meter drops back to 0 ready
+        // for the next interval. Same posture as
+        // `reset_meters_after_subtracts_resident_seconds_delta`.
+        assert_eq!(
+            snap.resident_seconds, 0,
+            "LongRunning app's resident-seconds delta is subtracted after heartbeat publish"
         );
     }
 }

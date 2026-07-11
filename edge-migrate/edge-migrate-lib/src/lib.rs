@@ -22,7 +22,7 @@ pub mod rust_transformer;
 
 pub use analyzer::CAnalyzer;
 pub use patterns::{
-    is_valid_deployment_app_name, Language, PatternKind, PatternMatch, PosixPattern, RustPattern,
+    is_valid_app_name, Language, PatternKind, PatternMatch, PosixPattern, RustPattern,
     Transformability,
 };
 pub use preprocessor::{ExpandedSource, PreprocessError, Preprocessor, PreprocessorInfo};

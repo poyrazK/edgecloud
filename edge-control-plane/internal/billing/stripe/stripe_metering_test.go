@@ -265,6 +265,18 @@ func TestRecordUsage_stripe_5xx_does_not_wrap_terminal(t *testing.T) {
 // — errors.Is handles the multi-wrap case directly.
 func errorIs(err, target error) bool { return errors.Is(err, target) }
 
+// IMPORTANT — shared-helper convention for this package:
+// When you add a new *_test.go file in package stripe that needs its
+// own backend override (or any other helper that lives at package
+// scope in a _test.go file), suffix the helper with a per-file tag
+// (e.g. `useTestBackendProvider`, `useTestBackendMetering`). The Go
+// test build compiles every _test.go in the package into one binary,
+// so a same-named helper in a sibling file causes a hard build
+// failure (`useTestBackend redeclared in this block`). The provider
+// tests in stripe_test.go use `useTestBackendProvider` for exactly
+// this reason; see that file's helper comment for the parallel
+// pattern.
+
 // useTestBackend reroutes stripe-go's API calls to the test server
 // for the duration of the test. v82 builds a `*stripe.Backends` via
 // NewBackendsWithConfig(URL=...) and installs it through

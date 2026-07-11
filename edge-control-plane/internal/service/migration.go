@@ -1088,14 +1088,14 @@ func isIdentChar(b byte) bool {
 //
 // `entries` paths must be forward-slash-relative to the tree root
 // (the handler validates). The service enforces the same
-// `IsValidDeploymentAppName` regex as a defense-in-depth check.
+// `IsValidAppName` regex as a defense-in-depth check.
 func (s *MigrationService) MigrateTree(
 	ctx context.Context,
 	tenantID, appName, language string,
 	entries []domain.FileEntry,
 ) (*domain.TreeMigrationReport, error) {
 	// Defensive: handler also validates, but reject early here.
-	if !IsValidDeploymentAppName(appName) {
+	if !IsValidAppName(appName) {
 		return nil, fmt.Errorf("invalid app name: %q", appName)
 	}
 	// Belt-and-suspenders: handler rejects unknown languages, but

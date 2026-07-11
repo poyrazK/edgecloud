@@ -145,6 +145,20 @@ const (
 	// Summed from RequestMeter.outbound_bytes at heartbeat time.
 	// Quantity = bytes.
 	MeterKindOutboundBytes MeterKind = "outbound_bytes"
+
+	// MeterKindComputeMs is the FaaS request-duration dimension (issue
+	// #555, fourth metered dimension). Summed from
+	// RequestMeter.duration_ms at heartbeat time. Quantity =
+	// milliseconds. Worker stamps this only on Handler (FaaS) app
+	// heartbeats (the dispatch path captures `Instant::now()` and
+	// stamps `meter.record_duration(elapsed)` in each terminal arm of
+	// `handle_request`'s `receiver.await`); LongRunning apps stamp 0
+	// on the wire. Operator opt-in via `METERING_RATE_COMPUTE_MS`:
+	// when set to 0 (default) the MeteringDrainer marks events
+	// processed without calling RecordUsage, satisfying the
+	// "zero-rate default until pricing enables it" acceptance
+	// criterion.
+	MeterKindComputeMs MeterKind = "compute_ms"
 )
 
 // MeterUsageEvent mirrors a single billing_usage_events row (issue

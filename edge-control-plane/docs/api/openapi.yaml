@@ -437,6 +437,15 @@ components:
           format: uri
           description: Self-service portal URL the tenant's browser should be redirected to.
 
+    BillingWebhookAck:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, ignored]
+          description: "ok when dispatched or replayed; ignored for verified but unsupported event types."
+          example: ok
+
     BillingSubscription:
       type: object
       properties:
@@ -1388,6 +1397,39 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Worker'
+
+    # -------------------------------------------------------------------------
+    # Worker token mint (issue #491)
+    # -------------------------------------------------------------------------
+    WorkerTokenRequest:
+      type: object
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z0-9_-]+$'
+          description: |
+            Tenant ID to mint the per-tenant scoped JWT for. Must
+            match the `^[a-z0-9_-]+$` charset; the wildcard `*` is
+            rejected with 400 (issue #491 refusal-to-mint-wildcard).
+          example: t_abc123
+
+    WorkerTokenResponse:
+      type: object
+      required: [token, expires_at, tenant_id]
+      properties:
+        token:
+          type: string
+          description: HS256-signed JWT carrying tenant_id claim.
+        expires_at:
+          type: integer
+          format: int64
+          description: Unix-seconds expiration. Mirrors `WORKER_TOKEN_TTL` (default 15m).
+        tenant_id:
+          type: string
+          description: Echo of the bound tenant_id for client-side confirmation.
 
     # -------------------------------------------------------------------------
     # Auth
@@ -2720,8 +2762,18 @@ paths:
               properties:
                 app_name:
                   type: string
-                  pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
-                  description: Unique app name (alphanumeric, hyphens, 1-63 chars).
+                  pattern: '^[a-z0-9][a-z0-9.\-_]{0,62}$'
+                  description: |
+                    Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
+                    regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
+                    `[a-z0-9-]` to admit `.` and `_` for semver-ish
+                    names like `myapp.v2` or `app_v2` (issue #438).
+                    Dotted names render as a two-label host under
+                    `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
+                    operators must provision `*.*.edgecloud.dev` DNS and
+                    a matching cert before such names are routable.
+                    Single-label names (`myapp-v2`, `myapp_v2`) work
+                    under the existing `*.edgecloud.dev` wildcard.
                   example: my-app
                 language:
                   type: string
@@ -3151,9 +3203,30 @@ paths:
       security: []
       responses:
         '200':
-          description: Event accepted (or already processed).
+          description: Event accepted, already processed, or intentionally ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingWebhookAck'
+              examples:
+                ok:
+                  value:
+                    status: ok
+                ignored:
+                  value:
+                    status: ignored
         '400':
-          description: Signature failure or tenant unresolved.
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: The event was signature-valid but could not be attributed to a tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: BILLING_TENANT_UNRESOLVED
+                  message: tenant unresolved for event
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -3836,6 +3909,54 @@ paths:
                 $ref: '#/components/schemas/WorkerListResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/internal/tokens/tenant:
+    post:
+      operationId: mintWorkerToken
+      summary: Mint a per-tenant scoped worker JWT (issue #491)
+      description: |
+        Issues a short-lived HS256 JWT scoped to one tenant. Requires
+        a valid worker bearer JWT (any scope, including the
+        bootstrap-issued wildcard). The minted token is signed with
+        the active kid and verifies via the standard
+        WorkerJWTAuth middleware.
+
+        Constraint: only tenants currently in worker_status.apps
+        with status='running' for this worker_id may be requested
+        (issue #491 #2). A worker whose heartbeat has not yet landed
+        cannot mint for ANY tenant.
+
+        Refusal-to-mint-wildcard: tenant_id="*" (and "", and any
+        value failing the charset check) is rejected with 400.
+      security:
+        - WorkerJWTAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerTokenRequest'
+      responses:
+        '200':
+          description: Token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerTokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Worker is not currently hosting the requested tenant
+            (issue #491 constraint #2; body explains denial).
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
         '500':
           $ref: '#/components/responses/InternalError'
 
