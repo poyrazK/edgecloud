@@ -214,6 +214,7 @@ async fn run_test() -> anyhow::Result<()> {
             dedupe_id: None,
             last_error: None,
             resident_seconds: None,
+            duration_ms_total: 0,
         },
     );
     let changed = apply_heartbeat(&table, &with_app).await;
