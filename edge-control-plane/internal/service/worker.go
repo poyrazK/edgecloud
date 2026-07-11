@@ -91,6 +91,10 @@ type workerRepoInterface interface {
 	UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error
 	ListRunningAppTarget(ctx context.Context, tenantID, appName string) ([]domain.AppTarget, error)
 	GetAppStatus(ctx context.Context, tenantID, appName string) (*domain.AppWorkerStatus, error)
+	// TenantsHostedBy returns the deduplicated set of tenant IDs this
+	// worker is currently hosting (issue #491 constraint #2). Backs the
+	// 403 gate on POST /api/internal/tokens/tenant.
+	TenantsHostedBy(ctx context.Context, workerID string) ([]string, error)
 }
 
 // quotaRepoInterface defines the repository methods used by WorkerService.
@@ -343,6 +347,16 @@ func (s *WorkerService) SetDisablePublishWaitPoll(p func(time.Duration) (<-chan 
 // (tenantID, region) pair before calling ReconcileService.BuildFullSync.
 func (s *WorkerService) Get(ctx context.Context, workerID string) (*domain.Worker, error) {
 	return s.workerRepo.GetByID(ctx, workerID)
+}
+
+// TenantsHostedBy returns the deduplicated set of tenant IDs this
+// worker is currently hosting (issue #491 constraint #2). Backs the
+// 403 gate on POST /api/internal/tokens/tenant — a worker can only
+// mint for tenants present in its worker_status.apps with
+// status='running'. Pass-through to the repo; the service layer holds
+// no extra logic so handler → service → repo layering stays clean.
+func (s *WorkerService) TenantsHostedBy(ctx context.Context, workerID string) ([]string, error) {
+	return s.workerRepo.TenantsHostedBy(ctx, workerID)
 }
 
 // SubscribeHeartbeats starts a background NATS subscription to

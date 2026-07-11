@@ -4,6 +4,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -360,7 +361,35 @@ func New(
 	// passes reconcileSvc as both arg 5 (syncRequester) and arg 6
 	// (syncPayloadBuilder) — same *service.ReconcileService satisfies
 	// both interfaces.
-	internalHandler := handler.NewInternalHandler(deploymentSvc, workerSvc, domainSvc, logEntryRepo, reconcileSvc, reconcileSvc, cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret)
+	//
+	// Issue #491: pass workerJWTConfig + workerTokenTTL + issuer +
+	// activeKID + tenantSvc for the POST /api/internal/tokens/tenant
+	// mint endpoint. The four-value tuple of
+	// {JWTConfig + WorkerTokenTTL + Issuer + ActiveKID} mirrors the
+	// workerJWTConfig literal constructed at app.go:649-654 below;
+	// kept as a local struct literal rather than hoisted so the
+	// InternalHandler dependency stays explicit.
+	//
+	// `workerSvc` doubles as the hostingGetter — it has a
+	// TenantsHostedBy(ctx, workerID) method (issue #491 constraint
+	// #2) that the gate uses to refuse tokens for tenants the worker
+	// isn't currently hosting.
+	internalHandler := handler.NewInternalHandler(
+		deploymentSvc, workerSvc, domainSvc, logEntryRepo,
+		reconcileSvc, reconcileSvc,
+		cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret,
+		middleware.WorkerJWTConfig{
+			Secret:    cfg.JWT.Secret,
+			Issuer:    cfg.JWT.Issuer,
+			ActiveKID: cfg.JWT.ActiveKID,
+			Keys:      cfg.JWT.Keys,
+		},
+		cfg.JWT.WorkerTokenTTL,
+		cfg.JWT.Issuer,
+		cfg.JWT.ActiveKID,
+		tenantSvc,
+		workerSvc,
+	)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
@@ -399,6 +428,33 @@ func New(
 	bootstrapLimiter := middleware.NewRateLimiter(2, 5)
 	// Tenant creation limiter: per-IP cap (10 per hour) to prevent DB fill.
 	handler.DefaultTenantCreationLimiter = middleware.NewTenantCreationLimiter(10, 1*time.Hour)
+
+	// workerTokenTenantKey is the per-tenant key-extractor for the
+	// POST /api/internal/tokens/tenant rate limiter (issue #491). It
+	// reads the request body's `tenant_id` JSON field without
+	// consuming the body so the handler's own decode still sees the
+	// full payload.
+	//
+	// Fallback (PR #491 review): if the body is empty / malformed /
+	// missing tenant_id / >128 bytes, fall back to the worker_id
+	// from the JWT context instead of returning "". The
+	// RateLimiter.Middleware treats "" as "skip limiting" (see
+	// middleware/ratelimit.go:135-139), which would let a worker
+	// flood malformed bodies past the per-tenant bucket. Falling
+	// back to worker_id routes those requests into the per-worker
+	// bucket (10/5), which is tight enough to bound the blast while
+	// letting genuine malformed bodies through at a sensible rate.
+	//
+	// Body restoration is necessary because rate limiters run
+	// before the handler — without it, the handler's
+	// json.NewDecoder would see EOF instead of the original bytes.
+	// We use a buffered peek + TeeReader so the limiter's read does
+	// not steal the body from the downstream handler. The buffer is
+	// tiny (128 bytes is enough to span "tenant_id":"<value>" for
+	// any reasonable ID — anything longer falls through to the
+	// worker_id fallback but the handler still verifies length
+	// ≤ 64 chars upstream).
+	workerTokenTenantKey := workerTokenTenantKeyFromBody
 
 	// ── Router ────────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -678,6 +734,26 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	internalMux.HandleFunc("GET /api/internal/workers/{workerID}/sync", internalHandler.Sync)
 	internalMux.HandleFunc("POST /api/internal/logs", internalHandler.IngestLogs)
 	internalMux.HandleFunc("POST /api/internal/apps/{appName}/auto-rollback", internalHandler.AutoRollback)
+	// Per-tenant worker-token mint endpoint (issue #491). Three
+	// rate limiters chain on the route — order matters: per-IP
+	// (cheapest) catches scanner floods first; per-worker is keyed
+	// off the JWT worker_id and bounds runaway clients; per-tenant
+	// is keyed off the request body's tenant_id and bounds a
+	// compromised worker trying to enumerate the tenant space.
+	workerTokenPerIP := middleware.NewRateLimiter(60, 30)
+	workerTokenPerWorker := middleware.NewRateLimiter(10, 5)
+	workerTokenPerTenant := middleware.NewRateLimiter(30, 10)
+	internalMux.Handle("POST /api/internal/tokens/tenant",
+		workerTokenPerIP.Middleware(middleware.ClientIP)(
+			workerTokenPerWorker.Middleware(func(r *http.Request) string {
+				return middleware.GetWorkerID(r.Context())
+			})(
+				workerTokenPerTenant.Middleware(workerTokenTenantKey)(
+					http.HandlerFunc(internalHandler.MintWorkerToken),
+				),
+			),
+		),
+	)
 	// Custom-domain routes (issue #83). All three are gated to RoleIngest ONLY.
 	internalMux.Handle("GET /api/internal/domains", middleware.RequireWorkerRole(
 		middleware.RoleIngest,
@@ -1074,4 +1150,45 @@ func newMeteringProvider(cfg config.BillingConfig) billing.MeteringProvider {
 		// "noop" or empty (no production gate — metering is opt-in).
 		return noop.NewMetering()
 	}
+}
+
+// workerTokenTenantKeyFromBody is the package-level helper extracted
+// from the inline closure at the route mount (issue #491 + PR
+// review). It serves two roles:
+//
+//  1. Production use: bound to POST /api/internal/tokens/tenant as
+//     the key-extractor for the per-tenant RateLimiter.
+//  2. Test use: exercised directly by
+//     TestWorkerTokenTenantKeyFromBody in app_test.go so the
+//     malformed-body / missing-field / oversize-body / nested-shape
+//     edge cases are pinned without standing up the full
+//     WorkerAuth + InternalHandler chain.
+//
+// Buffer size (128 bytes) covers `"tenant_id":"<value>"` for any
+// legal tenant_id (up to 64 chars + 16 chars of JSON syntax +
+// margin). Anything larger is truncated at the peek; the handler's
+// own validator rejects tenant_id > 64 chars upstream, so a
+// truncated peek that misses a >64-char value still falls through
+// to the worker_id fallback (which is the safe behavior).
+//
+// Fallback path: when the body peek cannot produce a tenant_id
+// (empty body / malformed JSON / missing field / oversize), we
+// return the worker_id from the JWT context. This routes
+// malformed-body floods into the per-worker (10/5) bucket instead
+// of the empty-key pass-through in RateLimiter.Middleware
+// (middleware/ratelimit.go:135-139).
+func workerTokenTenantKeyFromBody(r *http.Request) string {
+	var buf [128]byte
+	n, _ := io.ReadFull(io.LimitReader(r.Body, int64(len(buf))), buf[:])
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), r.Body))
+	var peek struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if n == 0 {
+		return middleware.GetWorkerID(r.Context())
+	}
+	if err := json.Unmarshal(buf[:n], &peek); err != nil || peek.TenantID == "" {
+		return middleware.GetWorkerID(r.Context())
+	}
+	return peek.TenantID
 }

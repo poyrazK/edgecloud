@@ -1196,6 +1196,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/internal/tokens/tenant": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint a per-tenant scoped worker JWT (issue
+         * @description Issues a short-lived HS256 JWT scoped to one tenant. Requires
+         *     a valid worker bearer JWT (any scope, including the
+         *     bootstrap-issued wildcard). The minted token is signed with
+         *     the active kid and verifies via the standard
+         *     WorkerJWTAuth middleware.
+         *
+         *     Constraint: only tenants currently in worker_status.apps
+         *     with status='running' for this worker_id may be requested
+         *     (issue #491 #2). A worker whose heartbeat has not yet landed
+         *     cannot mint for ANY tenant.
+         *
+         *     Refusal-to-mint-wildcard: tenant_id="*" (and "", and any
+         *     value failing the charset check) is rejected with 400.
+         */
+        post: operations["mintWorkerToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2296,6 +2328,26 @@ export interface components {
         };
         WorkerListResponse: {
             workers?: components["schemas"]["Worker"][];
+        };
+        WorkerTokenRequest: {
+            /**
+             * @description Tenant ID to mint the per-tenant scoped JWT for. Must
+             *     match the `^[a-z0-9_-]+$` charset; the wildcard `*` is
+             *     rejected with 400 (issue #491 refusal-to-mint-wildcard).
+             * @example t_abc123
+             */
+            tenant_id: string;
+        };
+        WorkerTokenResponse: {
+            /** @description HS256-signed JWT carrying tenant_id claim. */
+            token: string;
+            /**
+             * Format: int64
+             * @description Unix-seconds expiration. Mirrors `WORKER_TOKEN_TTL` (default 15m).
+             */
+            expires_at: number;
+            /** @description Echo of the bound tenant_id for client-side confirmation. */
+            tenant_id: string;
         };
         WhoamiResponse: {
             /** @example t_abc123 */
@@ -4507,6 +4559,45 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["QuotaExceeded"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    mintWorkerToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkerTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description Token issued. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkerTokenResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description Worker is not currently hosting the requested tenant
+             *     (issue #491 constraint #2; body explains denial).
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
             429: components["responses"]["QuotaExceeded"];
             500: components["responses"]["InternalError"];
         };

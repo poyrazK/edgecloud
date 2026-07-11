@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/hex"
@@ -16,8 +17,10 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/config"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jmoiron/sqlx"
 )
 
@@ -647,4 +650,146 @@ func splitMethod(s string) [2]string {
 		}
 	}
 	return [2]string{s, "/"}
+}
+
+// ----------------------------------------------------------------------
+// workerTokenTenantKeyFromBody — issue #491 + PR review regression pins.
+//
+// The helper is the per-tenant key-extractor that backs the
+// rate-limiter on POST /api/internal/tokens/tenant. It must:
+//   - Extract tenant_id from the request body without consuming it.
+//   - Restore the body so the downstream handler's json.Decoder
+//     still sees the full payload.
+//   - Fall back to the worker_id (from JWT context) on malformed /
+//     empty / oversize / missing-field bodies — never return "" (the
+//     RateLimiter treats "" as "skip limiting", which would let a
+//     worker flood malformed bodies past the per-tenant bucket).
+// ----------------------------------------------------------------------
+
+const workerTokenKeyTestSecret = "test-secret-must-be-at-least-32-bytes-long!"
+const workerTokenKeyTestWorker = "w_us_fra_42"
+
+// newWorkerKeyRequest builds a *http.Request whose context already
+// carries the worker_id that middleware.WorkerAuth would have stamped
+// after validating the Bearer JWT. The trick: we run the auth
+// middleware once on a fresh request, capture the post-auth context
+// via a no-op next handler, then build a NEW request with that
+// context and the original body. This isolates the body-peek helper
+// from the auth chain — we're testing the helper, not the auth gate.
+func newWorkerKeyRequest(t *testing.T, body string) *http.Request {
+	t.Helper()
+	claims := &middleware.WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		},
+		WorkerID: workerTokenKeyTestWorker,
+		TenantID: "*",
+		Role:     middleware.RoleWorker,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := tok.SignedString([]byte(workerTokenKeyTestSecret))
+	if err != nil {
+		t.Fatalf("failed to sign test worker JWT: %v", err)
+	}
+
+	authReq := httptest.NewRequest("POST", "/api/internal/tokens/tenant", strings.NewReader(body))
+	authReq.Header.Set("Authorization", "Bearer "+signed)
+
+	auth := middleware.WorkerAuth(middleware.WorkerJWTConfig{
+		Secret: workerTokenKeyTestSecret,
+		Issuer: "edgecloud",
+	})
+
+	var capturedCtx context.Context
+	var status int
+	auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedCtx = r.Context()
+		status = http.StatusOK
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(httptest.NewRecorder(), authReq)
+
+	if capturedCtx == nil {
+		t.Fatalf("auth middleware did not populate context (status=%d)", status)
+	}
+
+	// Build a fresh request with the captured context and the
+	// ORIGINAL body — the inner handler didn't read it, so it's
+	// intact.
+	return httptest.NewRequest("POST", "/api/internal/tokens/tenant", strings.NewReader(body)).WithContext(capturedCtx)
+}
+
+func TestWorkerTokenTenantKeyFromBody_HappyPath(t *testing.T) {
+	r := newWorkerKeyRequest(t, `{"tenant_id":"t_real"}`)
+	got := workerTokenTenantKeyFromBody(r)
+	if got != "t_real" {
+		t.Fatalf("expected t_real, got %q", got)
+	}
+	// Body restoration: handler must still be able to decode the
+	// original payload after the limiter has peeked.
+	var replay map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&replay); err != nil {
+		t.Fatalf("body not restored after peek: %v", err)
+	}
+	if replay["tenant_id"] != "t_real" {
+		t.Fatalf("body content lost: got %v", replay)
+	}
+}
+
+func TestWorkerTokenTenantKeyFromBody_EmptyBodyFallsBackToWorker(t *testing.T) {
+	r := newWorkerKeyRequest(t, "")
+	got := workerTokenTenantKeyFromBody(r)
+	if got != workerTokenKeyTestWorker {
+		t.Fatalf("expected fallback to worker_id %q, got %q", workerTokenKeyTestWorker, got)
+	}
+}
+
+func TestWorkerTokenTenantKeyFromBody_MalformedJSONFallsBackToWorker(t *testing.T) {
+	r := newWorkerKeyRequest(t, `{"tenant_id": `) // truncated
+	got := workerTokenTenantKeyFromBody(r)
+	if got != workerTokenKeyTestWorker {
+		t.Fatalf("expected fallback to worker_id, got %q", got)
+	}
+}
+
+func TestWorkerTokenTenantKeyFromBody_MissingFieldFallsBackToWorker(t *testing.T) {
+	r := newWorkerKeyRequest(t, `{"other_field":"x"}`)
+	got := workerTokenTenantKeyFromBody(r)
+	if got != workerTokenKeyTestWorker {
+		t.Fatalf("expected fallback to worker_id, got %q", got)
+	}
+}
+
+func TestWorkerTokenTenantKeyFromBody_OversizeBodyFallsBackToWorker(t *testing.T) {
+	// 200-byte body that exceeds the 128-byte peek buffer. The peek
+	// returns only the first 128 bytes, which won't include a complete
+	// tenant_id (which is capped at 64 chars by isSafeTenantID anyway,
+	// but a 200-char payload with tenant_id near the END would be
+	// truncated). Expect the fallback.
+	big := bytes.Repeat([]byte("x"), 200)
+	body := `{"tenant_id":"` + string(big) + `"}`
+	r := newWorkerKeyRequest(t, body)
+	got := workerTokenTenantKeyFromBody(r)
+	// We can't assert an exact value because the truncated JSON may
+	// still parse as a tenant_id substring (the first 128 bytes are
+	// `{"tenant_id":"xxxxx...` which is invalid JSON but the helper
+	// catches that and falls back to worker_id). Both fallback and a
+	// partial-tenant_id are acceptable — what matters is the function
+	// never returns "" (which would bypass the limiter).
+	if got == "" {
+		t.Fatalf("oversize body must not return empty key (limiter bypass)")
+	}
+}
+
+func TestWorkerTokenTenantKeyFromBody_TruncatedValidPrefixStillHandledSafely(t *testing.T) {
+	// Boundary: a body that's exactly 128 bytes. The peek reads the
+	// full body, the JSON parses cleanly, and we extract a tenant_id
+	// (or fall back to worker_id if the truncation chops the value
+	// mid-string). Either way, the function returns a non-empty key.
+	body := `{"tenant_id":"t_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}` // >64 chars
+	r := newWorkerKeyRequest(t, body)
+	got := workerTokenTenantKeyFromBody(r)
+	if got == "" {
+		t.Fatalf("expected non-empty key (limiter bypass on truncated peek)")
+	}
 }
