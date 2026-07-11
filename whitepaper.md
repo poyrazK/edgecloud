@@ -353,6 +353,20 @@ CREATE TABLE worker_status (
 | Max memory per worker | 256 MB |
 | Max outbound bandwidth | 1000 MB |
 
+### 4.5 Retention GC (issue #574)
+
+Three append-only tables — `audit_logs`, `webhook_deliveries`, `autoscale_events` — grow without bound otherwise. Each is swept by a dedicated background service:
+
+| Table | Default retention | Service | Index |
+|-------|-------------------|---------|-------|
+| `audit_logs` | 90 days | `AuditGC.Run` | `idx_audit_logs_created_at` (migration 031) |
+| `webhook_deliveries` | 30 days | `WebhookDeliveryGC.Run` | `idx_webhook_deliveries_created_at` (migration 031) |
+| `autoscale_events` | 14 days | `AutoscaleEventGC.Run` | `idx_autoscale_events_created_at` (migration 031) |
+
+All three services follow the same shape as `LogGC.Run` (issue #581 trio precedent): immediate-first-sweep, ticker at interval, refused-to-run on non-positive interval or retention, server-side `NOW() - make_interval(secs => $1)` cutoff (clock-skew safe), paginated 10k rows per batch with a 1000 batches/sweep cap, ctx-cancellation short-circuit. Intervals and retentions are operator-tunable via env: `AUDIT_GC_INTERVAL`, `AUDIT_RETENTION`, `WEBHOOK_DELIVERY_GC_INTERVAL`, `WEBHOOK_DELIVERY_RETENTION`, `AUTOSCALE_EVENT_GC_INTERVAL`, `AUTOSCALE_EVENT_RETENTION`. Default intervals match `LOG_GC_INTERVAL` (1h).
+
+Per-family Prometheus metrics (`edge_audit_log_gc_*`, `edge_webhook_delivery_gc_*`, `edge_autoscale_event_gc_*` — 4 families each: `ticks_total`, `rows_deleted_total`, `errors_total`, `last_tick_timestamp_seconds`) are emitted on every sweep tick via the same `MetricsAggregator` sink pattern used by the existing GCs. Operators should alert on `last_tick_timestamp_seconds` older than `2 × interval` — a "never-ticked" condition means the GC refused to run or is stuck.
+
 ---
 
 ## 5. Worker Supervisor (Rust)
