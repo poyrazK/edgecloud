@@ -110,7 +110,7 @@ func TestEnvService_SetEnv_PublishesIfActive(t *testing.T) {
 			"id", "name", "plan", "allowlisted_destinations",
 		}).AddRow(tenantID, "Test Tenant", "pro", `{}`))
 	// 5. quotaRepo.GetByTenantID
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_memory_mb",
@@ -255,7 +255,7 @@ func TestEnvService_DeleteEnv_PublishesIfActive(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "name", "plan", "allowlisted_destinations",
 		}).AddRow(tenantID, "Test Tenant", "pro", `{}`))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_memory_mb",

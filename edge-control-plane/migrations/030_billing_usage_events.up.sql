@@ -30,7 +30,7 @@
 --     CASCADE: usage rows survive tenant deletion, matching the
 --     audit-retention posture of billing_events.
 --
---   * kind is constrained to the three metered dimensions the CP
+--   * kind is constrained to the four metered dimensions the CP
 --     knows about today. New dimensions require a migration.
 --
 --   * quantity is BIGINT (resident-seconds per heartbeat batch can
@@ -73,7 +73,7 @@
 CREATE TABLE IF NOT EXISTS billing_usage_events (
     id              BIGSERIAL    PRIMARY KEY,
     tenant_id       VARCHAR(64)  NOT NULL REFERENCES tenants(id),
-    kind            VARCHAR(16)  NOT NULL CHECK (kind IN ('resident_seconds','request_count','outbound_bytes')),
+    kind            VARCHAR(16)  NOT NULL CHECK (kind IN ('resident_seconds','request_count','outbound_bytes','compute_ms')),
     quantity        BIGINT       NOT NULL CHECK (quantity >= 0),
     idempotency_key VARCHAR(128) NOT NULL,
     recorded_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS billing_usage_events (
     provider        VARCHAR(32)  NOT NULL,
     UNIQUE (tenant_id, idempotency_key)
 );
+
+-- In-place extension for tables created by the original migration 030
+-- before the fourth dimension landed (issue #555). The CHECK constraint
+-- is named per the legacy sql-migrate convention; drop and re-add it
+-- so existing rows from migrations 030-03x continue to satisfy the new
+-- constraint and new inserts can write kind='compute_ms'. Mirrors the
+-- table-default path above so a fresh migration 030 install still works
+-- (the DROP fails harmlessly when the constraint is missing — guard
+-- with IF EXISTS).
+ALTER TABLE billing_usage_events DROP CONSTRAINT IF EXISTS billing_usage_events_kind_check;
+ALTER TABLE billing_usage_events ADD CONSTRAINT billing_usage_events_kind_check
+    CHECK (kind IN ('resident_seconds','request_count','outbound_bytes','compute_ms'));
 
 CREATE INDEX IF NOT EXISTS idx_billing_usage_events_unprocessed
     ON billing_usage_events (recorded_at)

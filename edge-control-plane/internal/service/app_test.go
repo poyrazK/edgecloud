@@ -118,6 +118,14 @@ func (m *mockQuotaRepoForApps) AddResidentSeconds(_ context.Context, _ string, _
 	return &domain.Quota{}, nil
 }
 
+// AddComputeMs (issue #555) is a no-op for appSvc tests — same
+// rationale as AddResidentSeconds above. The apps-side handler tests
+// don't drive the heartbeat metering path, so they don't need to
+// assert against the FaaS duration accumulator.
+func (m *mockQuotaRepoForApps) AddComputeMs(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+	return &domain.Quota{}, nil
+}
+
 func (m *mockQuotaRepoForApps) SetGraceUntil(_ context.Context, _ string, _ *time.Time) error {
 	return nil
 }

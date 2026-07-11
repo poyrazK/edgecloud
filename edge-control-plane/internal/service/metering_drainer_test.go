@@ -67,6 +67,51 @@ func TestMeteringDrainer_zero_rate_short_circuits(t *testing.T) {
 	}
 }
 
+// TestMeteringDrainer_zero_rate_short_circuits_compute_ms pins the
+// zero-rate contract for the fourth billing dimension (issue #555).
+// The drainer's rate lookup is shared across all kinds — when
+// rates["compute_ms"] is 0 (or the entry is absent, the
+// METERING_RATE_COMPUTE_MS=0 default), processRow short-circuits to
+// MarkProcessed without touching the provider. Without this test a
+// future refactor that filters kinds inside processRow could silently
+// start dropping FaaS duration rows.
+//
+// We drive the explicit "rate=0" branch (not the entry-missing
+// branch) to document the operator opt-in: setting
+// METERING_RATE_COMPUTE_MS=0 produces the same billing-neutral
+// behavior as a fresh install. Idempotency-key shape mirrors what
+// worker_test.go's applyTenantDelta fixture produces for the new
+// dimension ("<tenant>:compute_ms:<dedupe_id>"), so the test catches
+// any drift on either side.
+func TestMeteringDrainer_zero_rate_short_circuits_compute_ms(t *testing.T) {
+	provider := &fakeMeteringProvider{name: domain.ProviderNoop}
+	repo := &fakeRepo{rows: []repository.BillingUsageEventWithID{{
+		ID:             7,
+		TenantID:       "t_x",
+		Kind:           domain.MeterKindComputeMs,
+		Quantity:       150,
+		IdempotencyKey: "t_x:compute_ms:w:d:1",
+		RecordedAt:     time.Unix(1_700_000_000, 0),
+	}}}
+	d := NewMeteringDrainer(repo, provider, time.Second, 50, 10, map[string]float64{
+		// Explicit zero rate for compute_ms — the METERING_RATE_COMPUTE_MS=0
+		// default. request_count / resident_seconds / outbound_bytes stay
+		// off the rate card so the test confirms the compute_ms entry alone
+		// governs dispatch.
+		"compute_ms": 0,
+	})
+
+	d.Tick(context.Background())
+
+	if got := atomic.LoadInt64(&provider.calls); got != 0 {
+		t.Fatalf("provider.RecordUsage calls = %d, want 0 (METERING_RATE_COMPUTE_MS=0 short-circuits)", got)
+	}
+	if repo.markedProcessed != 1 {
+		t.Errorf("MarkProcessed calls = %d, want 1 (zero-rate row marked processed)",
+			repo.markedProcessed)
+	}
+}
+
 // TestMeteringDrainer_calls_provider_when_rate_set is the happy path:
 // rate > 0 → RecordUsage is called with the row's fields. We use a
 // stub repo to avoid spinning up sqlmock for a single-call test; the

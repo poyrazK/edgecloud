@@ -91,6 +91,7 @@ type mockQuotaRepo struct {
 	addOutboundBytesFunc   func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addRequestCountFunc    func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addResidentSecondsFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addComputeMsFunc       func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	setGraceUntilFunc      func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
@@ -122,6 +123,17 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 func (m *mockQuotaRepo) AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	if m.addResidentSecondsFunc != nil {
 		return m.addResidentSecondsFunc(ctx, tenantID, delta)
+	}
+	return &domain.Quota{}, nil
+}
+
+// AddComputeMs (issue #555) routes to the test hook when set.
+// Mirrors AddResidentSeconds — the nil-func default returns a zero
+// Quota so tests that don't drive the FaaS duration axis don't have
+// to plumb this hook.
+func (m *mockQuotaRepo) AddComputeMs(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	if m.addComputeMsFunc != nil {
+		return m.addComputeMsFunc(ctx, tenantID, delta)
 	}
 	return &domain.Quota{}, nil
 }
@@ -1330,6 +1342,190 @@ func TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate(t *testing.T) {
 	}
 }
 
+// TestApplyTenantDelta_ComputeMs_AccumulatesPerTenant (issue #555)
+// verifies the FaaS duration happy path: a Handler app stamps
+// DurationMsTotal=Some(150) (milliseconds), the heartbeat carries
+// TenantID="t_1", and checkComputeMs routes
+// AddComputeMs(ctx, "t_1", 150).
+func TestApplyTenantDelta_ComputeMs_AccumulatesPerTenant(t *testing.T) {
+	var (
+		gotTenantID string
+		gotDelta    uint64
+		gotCalled   bool
+	)
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+			gotTenantID = tenantID
+			gotDelta = delta
+			gotCalled = true
+			return &domain.Quota{MaxComputeMsPerMonth: 1_000_000_000}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"faasapp": {TenantID: "t_1", DurationMsTotal: ptrTo(uint64(150))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if !gotCalled {
+		t.Fatal("AddComputeMs was not called for an FaaS app with DurationMsTotal=150")
+	}
+	if gotTenantID != "t_1" {
+		t.Errorf("AddComputeMs tenantID = %q, want %q", gotTenantID, "t_1")
+	}
+	if gotDelta != 150 {
+		t.Errorf("AddComputeMs delta = %d, want 150", gotDelta)
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_IgnoresLongRunning (issue #555)
+// verifies the LR-vs-FaaS split that mirrors
+// TestApplyTenantDelta_ResidentSeconds_IgnoresFaaS but on the
+// inverted axis: an LR app stamps DurationMsTotal=nil (the dispatch
+// path never stamps for LR), and applyTenantDelta folds it to 0 via
+// DurationMsTotalOrZero and skips the AddComputeMs call. This is the
+// symmetric guard that keeps LR apps from contributing to
+// quotas.used_compute_ms.
+func TestApplyTenantDelta_ComputeMs_IgnoresLongRunning(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"lrapp": {TenantID: "t_1", DurationMsTotal: nil},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for LR app (DurationMsTotal=nil) — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_ZeroSkipsUpdate (issue #555) covers
+// the Some(0) case: a Handler app that finished within sub-millisecond
+// (truncated to 0 in the worker). Symmetric to
+// TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate — the 0-delta
+// short-circuit at applyTenantDelta's first loop drops the DB write.
+func TestApplyTenantDelta_ComputeMs_ZeroSkipsUpdate(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"fastfaas": {TenantID: "t_1", DurationMsTotal: ptrTo(uint64(0))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for Some(0) compute-ms delta — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_LegacyWorkerNoDedupe (issue #555)
+// verifies backward compat: pre-#555 workers don't serialize a
+// DurationMsTotal field. The JSON decoder leaves DurationMsTotal
+// nil, DurationMsTotalOrZero folds it to 0, and the 0-delta
+// short-circuit skips the AddComputeMs call — same shape as the LR
+// case. No dedupe_id path is involved because no delta is contributed.
+func TestApplyTenantDelta_ComputeMs_LegacyWorkerNoDedupe(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	// Pre-#555 worker — neither DurationMsTotal nor ResidentSeconds is set.
+	apps := map[string]domain.AppStatus{
+		"legacyapp": {TenantID: "t_1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for legacy worker (DurationMsTotal omitted) — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_ExceedsCap_Logs (issue #555) verifies
+// the cap-trip log line for the FaaS duration axis. Mirrors
+// TestApplyTenantDelta_Requests_ExceedsCap_Logs (request-count axis)
+// but uses MaxComputeMsPerMonth / UsedComputeMs on the Quota row
+// returned by AddComputeMs.
+func TestApplyTenantDelta_ComputeMs_ExceedsCap_Logs(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			// Cap = 1_000ms; usage after add = 1_500ms → exceeds cap.
+			return &domain.Quota{MaxComputeMsPerMonth: 1_000, UsedComputeMs: 1_500}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"faasapp": {TenantID: "t_free", DurationMsTotal: ptrTo(uint64(500))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if !strings.Contains(buf.String(), "compute ms") || !strings.Contains(buf.String(), "t_free") {
+		t.Errorf("expected cap-trip log mentioning 'compute ms' and tenant 't_free', got:\n%s", buf.String())
+	}
+}
+
 func TestApplyTenantDelta_OutboundBytes_Unlimited_NoLog(t *testing.T) {
 	buf, restore := captureLogger(t)
 	defer restore()
@@ -1968,13 +2164,16 @@ func TestApplyTenantDelta_DualWritesToMeteringLedger(t *testing.T) {
 	}
 }
 
-// TestApplyTenantDelta_DualWrite_AllThreeDimensions exercises each
+// TestApplyTenantDelta_DualWrite_AllFourDimensions exercises each
 // dimension's idempotency_key shape via the dedicated check*
 // functions in WorkerService. The dual-write behavior is identical
-// across all three axes (the metering_repo is dimension-agnostic) so
+// across all four axes (the metering_repo is dimension-agnostic) so
 // the contract test per-axis only needs to assert the kind stamp and
-// the dedupe_id suffix.
-func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
+// the dedupe_id suffix. The fourth axis (compute_ms, issue #555) is
+// the FaaS per-request duration in milliseconds — added so a future
+// refactor that filters kinds on the metering side trips this test
+// rather than silently dropping FaaS duration rows.
+func TestApplyTenantDelta_DualWrite_AllFourDimensions(t *testing.T) {
 	cases := []struct {
 		name      string
 		kind      domain.MeterKind
@@ -1983,25 +2182,32 @@ func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
 		{"resident_seconds", domain.MeterKindResidentSeconds, "t_x:resident_seconds:w:d:1"},
 		{"request_count", domain.MeterKindRequestCount, "t_x:request_count:w:d:1"},
 		{"outbound_bytes", domain.MeterKindOutboundBytes, "t_x:outbound_bytes:w:d:1"},
+		{"compute_ms", domain.MeterKindComputeMs, "t_x:compute_ms:w:d:1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			enqueued := &mockMeteringRepo{}
 			svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
 				addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
-					return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+					return &domain.Quota{MaxComputeMsPerMonth: 1_000_000_000}, nil
 				},
 			})
 			svc.meteringRepo = enqueued
 			apps := map[string]domain.AppStatus{
-				"myapp": {TenantID: "t_x", RequestCount: 1, OutboundBytes: 1, ResidentSeconds: ptrTo(uint64(1)), DedupeID: "w:d:1"},
+				"myapp": {
+					TenantID:        "t_x",
+					RequestCount:    1,
+					OutboundBytes:   1,
+					ResidentSeconds: ptrTo(uint64(1)),
+					DurationMsTotal: ptrTo(uint64(1)), // issue #555
+					DedupeID:        "w:d:1",
+				},
 			}
 			appsRaw, _ := json.Marshal(apps)
 
 			// Each check* function uses a different selector but the
-			// dual-write path is the same — exercise the request_count
-			// branch with the per-kind label so the test name matches
-			// the dimension under test.
+			// dual-write path is the same — exercise the per-dimension
+			// branch with the matching kind label.
 			switch tc.kind {
 			case domain.MeterKindRequestCount:
 				svc.checkRequestCount(context.Background(), appsRaw)
@@ -2009,6 +2215,8 @@ func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
 				svc.checkOutboundQuota(context.Background(), appsRaw)
 			case domain.MeterKindResidentSeconds:
 				svc.checkResidentSeconds(context.Background(), appsRaw)
+			case domain.MeterKindComputeMs:
+				svc.checkComputeMs(context.Background(), appsRaw)
 			}
 
 			if got := len(enqueued.calls); got != 1 {

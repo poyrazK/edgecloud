@@ -154,10 +154,10 @@ func TestActivateDeployment_ConcurrentRace_SameIdempotencyKey_OnePublish(t *test
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until"}).
-			AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, now, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, now, nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -319,10 +319,10 @@ func TestActivateDeployment_ConcurrentRace_NoIdempotencyKey_PreFixBehavior(t *te
 			WillReturnResult(sqlmock.NewResult(1, 1))
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
 			WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 			WithArgs(tenantID).
-			WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until"}).
-				AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, now, nil))
+			WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until"}).
+				AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, now, nil))
 		mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 			WithArgs(tenantID, appName).
 			WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
