@@ -1808,6 +1808,46 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 			return err
 		}
 
+		// Issue #439: Idempotency-Key replay check on the rollback
+		// path. AFTER lockTenantForUpdate (so a replay against a
+		// disabled tenant still returns 409) and BEFORE
+		// txActive.GetForUpdate (which would otherwise return
+		// ErrNoLastGood on a successful rollback retry — the
+		// post-Set last_good is nil, so a retry sees
+		// LastGoodDeploymentID == nil and bails BEFORE the cache
+		// lookup fires; that bug is the reason this lookup lives
+		// here, not at the bottom of the tx).
+		//
+		// On hit, we skip the active-row read, the Set,
+		// ClearStableSince, the deployment GetByID, the quota
+		// GetByTenantID, the buildPublishPayload, the outbox
+		// INSERT, both AddMemoryMB deltas, and the cache Insert
+		// below. Replays don't contend on the active row, which
+		// is the point.
+		//
+		// The cached DeploymentID keys the comparison: a
+		// rollback retry that lands here after the original tx
+		// committed has the same rolled-back-TO deployment id as
+		// the original call (last_good was that id before the
+		// first rollback ran), so the cached row matches.
+		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
+			cached, lookupErr := s.activateIdempotencyRepo.WithTx(tx).Lookup(ctx, tenantID, idempotencyKey)
+			if lookupErr != nil {
+				return fmt.Errorf("rollback idempotency lookup: %w", lookupErr)
+			}
+			if cached != nil {
+				if cached.AppName != appName {
+					return ErrIdempotencyKeyMismatch
+				}
+				// Replay: the active row already reflects this
+				// deployment_id from the original rollback.
+				// Stash the cached id so the caller still gets
+				// the new active id back, then short-circuit.
+				rolledBackID = cached.DeploymentID
+				return nil
+			}
+		}
+
 		current, err := txActive.GetForUpdate(ctx, tenantID, appName)
 		if err != nil {
 			return fmt.Errorf("reading current active deployment: %w", err)
@@ -1898,36 +1938,6 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 		}
 		if err := txActive.ClearStableSince(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("clearing stability clock: %w", err)
-		}
-
-		// Issue #439: Idempotency-Key replay check on the rollback
-		// path. AFTER lockTenantForUpdate (so a replay against a
-		// disabled tenant still returns 409), AFTER txActive.Set
-		// (so we know the rolled-back-to deployment_id is fixed
-		// and can compare it to the cached row), and BEFORE the
-		// outbox INSERT (so a hit short-circuits without
-		// publishing a second task_update).
-		//
-		// The cached (app_name, deployment_id) tuple keys on the
-		// rolled-back-TO deployment_id (not the rolled-back-FROM
-		// one) — that's the deployment that ends up active after
-		// the rollback commits, and that's the deployment a
-		// future rollback replay must verify against.
-		if idempotencyKey != "" && s.activateIdempotencyRepo != nil {
-			cached, lookupErr := s.activateIdempotencyRepo.WithTx(tx).Lookup(ctx, tenantID, idempotencyKey)
-			if lookupErr != nil {
-				return fmt.Errorf("rollback idempotency lookup: %w", lookupErr)
-			}
-			if cached != nil {
-				if cached.AppName != appName || cached.DeploymentID != rolledBackID {
-					return ErrIdempotencyKeyMismatch
-				}
-				// Replay: the active row already reflects this
-				// deployment_id from the original rollback.
-				// Skip buildPublishPayload + outbox INSERT +
-				// AddMemoryMB deltas + the cache Insert below.
-				return nil
-			}
 		}
 
 		// Build the TaskMessage payload inside the tx (issue #42) so

@@ -2171,16 +2171,196 @@ func TestActivateDeployment_IdempotencyKeyExpired_FreshPublish(t *testing.T) {
 	}
 }
 
-// Note: a single-goroutine rollback replay test was attempted but
-// proved brittle to mock against the full rollback UPDATE chain
-// (Set's INSERT ... ON CONFLICT DO UPDATE + ClearStableSince), and
-// a brittleness-free assertion adds little beyond what the
-// activate-side test
-// (TestActivateDeployment_IdempotencyReplay_NoOutboxRow) already
-// proves: both ActivateDeployment and RollbackDeployment share the
-// same `s.activateIdempotencyRepo.WithTx(tx).Lookup` against the
-// same `active_deployment_idempotency_keys` table. The race test
-// in Step 9 (TestActivateDeployment_ConcurrentRace_SameIdempotencyKey_OnePublish)
-// covers the activate scenario at -race fidelity; a parallel
-// rollback replay at the same fidelity is a follow-up that this
-// PR deliberately defers to keep the diff small.
+// TestRollbackDeployment_IdempotencyReplay_NoOutboxRow pins the
+// replay contract on the rollback path: same key + same (app,
+// rolled-back-to deployment) twice → exactly one outbox INSERT
+// (the first call); the second call returns (rolledBackID, nil)
+// without any extra SQL.
+//
+// The Lookup lives AFTER lockTenantForUpdate (a replay against a
+// disabled tenant still 409s) and BEFORE txActive.GetForUpdate
+// (a successful rollback sets last_good=NULL, so a retry would
+// hit ErrNoLastGood before the lookup could fire — that bug is
+// the reason this test exists). The replay short-circuits
+// BEFORE the Set, ClearStableSince, GetByID, GetQuota, buildPublishPayload,
+// outbox INSERT, AddMemoryMB deltas, and cache Insert.
+//
+// sqlmock's strict expectation discipline fails the test if any
+// extra query fires after the replay's empty commit.
+func TestRollbackDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, drainer, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+	svc.SetActivateIdempotencyRepo(repository.NewActiveDeploymentIdempotencyKeyRepo(svc.db))
+
+	const (
+		failedDepID   = "d_failed_rollback_replay"
+		lastGoodDepID = "d_last_good_rollback_replay"
+		appName       = "myapp"
+		tenantID      = "t_idem_replay_rollback"
+		lastGoodHash  = "lastgoodreplayhash"
+		idemKey       = "01234567-89ab-cdef-0123-456789abcdef"
+	)
+	now := time.Now()
+
+	// ---- First call: full rollback tx + cache INSERT ----
+
+	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
+
+	// 1. Cache Lookup (issue #439) — first call sees no row.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, idempotency_key, app_name, deployment_id, created_at FROM active_deployment_idempotency_keys`)).
+		WithArgs(tenantID, idemKey, int64(repository.IdempotencyTTL.Seconds())).
+		WillReturnError(sql.ErrNoRows)
+
+	// 2. GetForUpdate — current active row has last_good = lastGoodDepID.
+	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "app_name", "deployment_id", "last_good_deployment_id",
+			"auto_rollback_enabled", "stable_since", "regions_published",
+			"regions_failed", "regions_cached", "regions_cache_failed",
+			"last_publish_at", "last_publish_attempt_id", "preview_id", "preview_pr_number",
+		}).AddRow(tenantID, appName, failedDepID, lastGoodDepID, true, nil, nil, nil, nil, nil, nil, nil, nil, nil))
+
+	// 3. Re-read rolled-back-TO deployment row.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
+		WithArgs(lastGoodDepID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(lastGoodDepID, tenantID, appName, domain.StatusDeployed, lastGoodHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
+
+	// 4. Quota read for per-app memory capture.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 256, now, nil))
+
+	// 5. Set rewrites deployment_id to lastGoodDepID, clears last_good.
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL`)).
+		WithArgs(tenantID, appName).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 6. buildPublishPayload reads env only (tenant row is already locked).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+
+	// 7. outbox INSERT + memory add (rollback applies both deltas).
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO outbox`)).
+		WithArgs(tenantID, appName, "task_update", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
+		WithArgs(tenantID, int64(256)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 512, now, nil))
+	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
+		WithArgs(tenantID, int64(-256)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"tenant_id", "max_deployments", "max_apps", "max_workers",
+			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"quota_period_start", "quota_lock_grace_until",
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 256, now, nil))
+
+	// 8. Cache Insert (issue #439) lands AFTER the outbox INSERT.
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployment_idempotency_keys`)).
+		WithArgs(tenantID, idemKey, appName, lastGoodDepID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	// Drainer flow.
+	expectDrainerTickSuccess(t, mock, tenantID, appName, lastGoodDepID,
+		[]string{"us-east"}, 256)
+
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey)
+	if err != nil {
+		t.Fatalf("first RollbackDeployment: %v", err)
+	}
+	if rolledBackID != lastGoodDepID {
+		t.Errorf("first call returned rolledBackID = %q, want %q", rolledBackID, lastGoodDepID)
+	}
+	drainer.Tick(context.Background())
+
+	// ---- Second call: replay. Cache hit BEFORE GetForUpdate ----
+	// short-circuits the tx. Only Lookup + Commit fire.
+	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, idempotency_key, app_name, deployment_id, created_at FROM active_deployment_idempotency_keys`)).
+		WithArgs(tenantID, idemKey, int64(repository.IdempotencyTTL.Seconds())).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "idempotency_key", "app_name", "deployment_id", "created_at"}).
+			AddRow(tenantID, idemKey, appName, lastGoodDepID, now))
+	mock.ExpectCommit() // empty tx commits; no Set, no ClearStableSince, no outbox INSERT.
+
+	replayID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey)
+	if err != nil {
+		t.Fatalf("replay RollbackDeployment: %v", err)
+	}
+	// Replay returns the cached deployment_id — the active row
+	// already reflects it from the original rollback.
+	if replayID != lastGoodDepID {
+		t.Errorf("replay returned rolledBackID = %q, want %q", replayID, lastGoodDepID)
+	}
+
+	// Exactly one drainer-driven publish total. A second publish
+	// would mean the replay enqueued a duplicate task_update, which
+	// is the issue #439 bug.
+	if got := pub.regionsCalled(); len(got) != 1 {
+		t.Errorf("regionsCalled = %v after replay, want [us-east] only", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestRollbackDeployment_IdempotencyKeyMismatch_DifferentApp_ReturnsSentinel
+// pins the symmetric branch for rollback: same key, but the cached
+// app_name differs from the request's app_name — the service must
+// return ErrIdempotencyKeyMismatch and roll back the (empty) tx
+// without enqueueing any outbox row.
+//
+// Note: we don't pin a "different rolledBackID" branch because the
+// Lookup now lives BEFORE GetForUpdate (so the rolledBackID isn't
+// computed yet at hit-check time). The cached DeploymentID is
+// what's returned on a hit, so app_name is the only mismatch vector.
+func TestRollbackDeployment_IdempotencyKeyMismatch_DifferentApp_ReturnsSentinel(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+	svc.SetActivateIdempotencyRepo(repository.NewActiveDeploymentIdempotencyKeyRepo(svc.db))
+
+	const (
+		tenantID    = "t_mismatch_app_rollback"
+		cachedApp   = "myapp"
+		incomingApp = "otherapp"
+		idemKey     = "fedcba98-7654-3210-fedc-ba9876543210"
+	)
+	now := time.Now()
+
+	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, idempotency_key, app_name, deployment_id, created_at FROM active_deployment_idempotency_keys`)).
+		WithArgs(tenantID, idemKey, int64(repository.IdempotencyTTL.Seconds())).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "idempotency_key", "app_name", "deployment_id", "created_at"}).
+			AddRow(tenantID, idemKey, cachedApp, "d_last_good", now))
+
+	mock.ExpectRollback()
+
+	_, err := svc.RollbackDeployment(context.Background(), tenantID, incomingApp, idemKey)
+	if !errors.Is(err, ErrIdempotencyKeyMismatch) {
+		t.Fatalf("RollbackDeployment err = %v, want ErrIdempotencyKeyMismatch", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
