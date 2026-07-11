@@ -531,29 +531,14 @@ func makeEnrollmentRequest(t *testing.T, h *handler.InternalHandler, workerID, t
 	return ch, p
 }
 
-// signEnrollmentChallenge computes the Ed25519 signature over
-// sha256(public_key || challenge) that the CP verifies at enroll time.
-func signEnrollmentChallenge(pub ed25519.PublicKey, challenge []byte) []byte {
-	h := sha256.New()
-	h.Write(pub)
-	h.Write(challenge)
-	return ed25519.Sign(mustPrivFromPub(pub), h.Sum(nil))
-}
-
-// mustPrivFromPub is a tiny test helper — tests use a fresh
-// ed25519 keypair per scenario, so we thread the privkey separately.
-// This stub exists only so signEnrollmentChallenge has the right
-// shape; callers always pass the privkey directly via the second
-// return value of makeEnrollmentRequest.
-//
-// We never call this function in practice — see signEnrollmentWithPriv
-// below. Kept as a deliberate guard against accidentally calling
-// signEnrollmentChallenge with a priv that doesn't match the pub.
-func mustPrivFromPub(pub ed25519.PublicKey) ed25519.PrivateKey {
-	panic("mustPrivFromPub: tests should thread priv explicitly via signEnrollmentWithPriv")
-}
-
-// signEnrollmentWithPriv is the real signing helper.
+// signEnrollmentWithPriv computes the Ed25519 signature over
+// sha256(public_key || challenge) that the CP verifies at enroll
+// time. The priv/pub pair is supplied explicitly because each test
+// scenario generates its own keypair — there's no "look up priv by
+// pub" path. Kept separate from makeEnrollmentRequest so other
+// tests can sign challenges without going through the bootstrap
+// phase-1 path (e.g. unit tests on EnrollWorker that want to skip
+// the JWT issuance).
 func signEnrollmentWithPriv(priv ed25519.PrivateKey, pub ed25519.PublicKey, challenge []byte) []byte {
 	h := sha256.New()
 	h.Write(pub)
