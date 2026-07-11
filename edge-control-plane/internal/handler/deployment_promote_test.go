@@ -118,6 +118,66 @@ func TestPromote_TenantDisabled_Returns409(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Promote — 404 (deployment not found, issue #546 follow-up)
+// ---------------------------------------------------------------------------
+//
+// TestPromote_DeploymentNotFound_Returns404 pins the handler-level
+// mapping for service.ErrDeploymentNotFound (typed sentinel at
+// internal/service/deployment.go:227-229). PromoteDeployment returns
+// this sentinel for both "row absent" and "wrong tenant" sub-cases;
+// the handler collapses them into a single 404 with the canonical
+// httperror envelope (code=NOT_FOUND, message="deployment not
+// found"). Symmetric with the activate-side and rollback-side 404
+// mappings at internal/handler/deployment.go:664 (activate) and
+// :975 (rollback).
+//
+// This is the handler-level companion to the service-layer
+// TestPromoteDeployment_DeploymentNotFound_404AtServiceLayer in
+// internal/service/deployment_promote_test.go (PR #638, issue
+// #546). The service test pins that PromoteDeployment returns the
+// typed sentinel; this handler test pins that the handler maps
+// the sentinel to a 404 envelope so the CLI can branch on
+// status code without parsing the message string.
+
+func TestPromote_DeploymentNotFound_Returns404(t *testing.T) {
+	svc := &stubPromoter{err: service.ErrDeploymentNotFound}
+	mux := newPromoteMux(svc)
+
+	req := httptest.NewRequest("POST", "/api/apps/myapp/promote/d_x", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var got map[string]map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal envelope: %v; body: %s", err, rr.Body.String())
+	}
+	if got["error"]["code"] != "NOT_FOUND" {
+		t.Errorf("error.code = %q, want NOT_FOUND; body: %s", got["error"]["code"], rr.Body.String())
+	}
+	if got["error"]["message"] != "deployment not found" {
+		t.Errorf("error.message = %q, want %q; body: %s", got["error"]["message"], "deployment not found", rr.Body.String())
+	}
+	// The service must have been called before the mapping fired —
+	// the mapping only matters if the request actually reaches the
+	// service layer where the sentinel is returned.
+	if !svc.called {
+		t.Error("PromoteDeployment was not called")
+	}
+	// Body must not leak the raw sentinel — CLI parses the message,
+	// not the Go symbol name.
+	if strings.Contains(rr.Body.String(), "ErrDeploymentNotFound") {
+		t.Errorf("body leaks sentinel: %s", rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Promote — Idempotency-Key plumbing (issue #439)
 // ---------------------------------------------------------------------------
 //
