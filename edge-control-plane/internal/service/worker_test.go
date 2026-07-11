@@ -2164,13 +2164,16 @@ func TestApplyTenantDelta_DualWritesToMeteringLedger(t *testing.T) {
 	}
 }
 
-// TestApplyTenantDelta_DualWrite_AllThreeDimensions exercises each
+// TestApplyTenantDelta_DualWrite_AllFourDimensions exercises each
 // dimension's idempotency_key shape via the dedicated check*
 // functions in WorkerService. The dual-write behavior is identical
-// across all three axes (the metering_repo is dimension-agnostic) so
+// across all four axes (the metering_repo is dimension-agnostic) so
 // the contract test per-axis only needs to assert the kind stamp and
-// the dedupe_id suffix.
-func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
+// the dedupe_id suffix. The fourth axis (compute_ms, issue #555) is
+// the FaaS per-request duration in milliseconds — added so a future
+// refactor that filters kinds on the metering side trips this test
+// rather than silently dropping FaaS duration rows.
+func TestApplyTenantDelta_DualWrite_AllFourDimensions(t *testing.T) {
 	cases := []struct {
 		name      string
 		kind      domain.MeterKind
@@ -2179,25 +2182,32 @@ func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
 		{"resident_seconds", domain.MeterKindResidentSeconds, "t_x:resident_seconds:w:d:1"},
 		{"request_count", domain.MeterKindRequestCount, "t_x:request_count:w:d:1"},
 		{"outbound_bytes", domain.MeterKindOutboundBytes, "t_x:outbound_bytes:w:d:1"},
+		{"compute_ms", domain.MeterKindComputeMs, "t_x:compute_ms:w:d:1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			enqueued := &mockMeteringRepo{}
 			svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
 				addRequestCountFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
-					return &domain.Quota{MaxRequestsPerMonth: 1_000_000}, nil
+					return &domain.Quota{MaxComputeMsPerMonth: 1_000_000_000}, nil
 				},
 			})
 			svc.meteringRepo = enqueued
 			apps := map[string]domain.AppStatus{
-				"myapp": {TenantID: "t_x", RequestCount: 1, OutboundBytes: 1, ResidentSeconds: ptrTo(uint64(1)), DedupeID: "w:d:1"},
+				"myapp": {
+					TenantID:        "t_x",
+					RequestCount:    1,
+					OutboundBytes:   1,
+					ResidentSeconds: ptrTo(uint64(1)),
+					DurationMsTotal: ptrTo(uint64(1)), // issue #555
+					DedupeID:        "w:d:1",
+				},
 			}
 			appsRaw, _ := json.Marshal(apps)
 
 			// Each check* function uses a different selector but the
-			// dual-write path is the same — exercise the request_count
-			// branch with the per-kind label so the test name matches
-			// the dimension under test.
+			// dual-write path is the same — exercise the per-dimension
+			// branch with the matching kind label.
 			switch tc.kind {
 			case domain.MeterKindRequestCount:
 				svc.checkRequestCount(context.Background(), appsRaw)
@@ -2205,6 +2215,8 @@ func TestApplyTenantDelta_DualWrite_AllThreeDimensions(t *testing.T) {
 				svc.checkOutboundQuota(context.Background(), appsRaw)
 			case domain.MeterKindResidentSeconds:
 				svc.checkResidentSeconds(context.Background(), appsRaw)
+			case domain.MeterKindComputeMs:
+				svc.checkComputeMs(context.Background(), appsRaw)
 			}
 
 			if got := len(enqueued.calls); got != 1 {
