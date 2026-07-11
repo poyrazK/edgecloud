@@ -497,6 +497,16 @@ async fn l7_per_request_timeout_returns_500() {
 
     let port = ephemeral_port().expect("bind ephemeral port");
 
+    // Issue #555: bind the meter to a local so we can assert on the
+    // FaaS duration stamp after the request. The dispatch path stamps
+    // `meter.record_duration(elapsed)` in the `Err(_dropped)` arm
+    // (epoch deadline exceeded → 500), so this test now also verifies
+    // the duration billing on the trap arm end-to-end.
+    let meter = Arc::new(RequestMeter::new(
+        "test-tenant".to_string(),
+        "l7-deployment".to_string(),
+    ));
+
     let config = HandlerConfig {
         tenant_id: "test-tenant".to_string(),
         egress: Arc::new(EgressPolicy::allow_all()),
@@ -506,10 +516,7 @@ async fn l7_per_request_timeout_returns_500() {
             tenant_id: "test-tenant".to_string(),
             deployment_id: "l7-deployment".to_string(),
         },
-        meter: Arc::new(RequestMeter::new(
-            "test-tenant".to_string(),
-            "l7-deployment".to_string(),
-        )),
+        meter: meter.clone(),
         env: HashMap::new(),
         max_request_body_bytes: 10 * 1024 * 1024,
         metrics_acc: None,
@@ -586,6 +593,28 @@ async fn l7_per_request_timeout_returns_500() {
         elapsed < Duration::from_secs(2),
         "request should have been interrupted at ~100ms, not run for \
          the full busy loop (elapsed: {elapsed:?})"
+    );
+
+    // Issue #555: verify the dispatch path stamped
+    // `meter.record_duration(elapsed)` in the `Err(_dropped)` trap
+    // arm. The guest busy-loops until the epoch deadline fires at
+    // ~100ms; we expect at least one full request_count bump (this
+    // is the only request) and a duration_ms stamp somewhere in
+    // the (50ms, 2s) range — well above the 1ms truncation floor
+    // and well below the 5s natural busy-loop length. We use 50ms
+    // (not 100ms) because the elapsed upper bound is wall-clock,
+    // not guest-busy-time, and there's tokio scheduling latency.
+    let snap = meter.snapshot();
+    assert_eq!(snap.request_count, 1, "exactly one request");
+    assert!(
+        snap.duration_ms >= 50,
+        "duration should reflect ~100ms of busy work; got {}ms",
+        snap.duration_ms
+    );
+    assert!(
+        snap.duration_ms < 2_000,
+        "duration should not exceed the 2s sanity bound; got {}ms",
+        snap.duration_ms
     );
 
     let _ = shutdown_tx.send(());

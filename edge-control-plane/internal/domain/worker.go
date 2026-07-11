@@ -87,6 +87,15 @@ type AppStatus struct {
 	// planes that don't see this field translate to "no contribution"
 	// (delta=0, no AddResidentSeconds call).
 	ResidentSeconds *uint64 `json:"resident_seconds,omitempty"`
+	// DurationMsTotal is the total elapsed wall-clock milliseconds
+	// across all FaaS requests served by this Handler app since the
+	// last heartbeat interval (issue #555, fourth metered dimension).
+	// nil for pre-#555 workers (LongRunning apps always contribute 0
+	// because the dispatch path never stamps for LR — the worker
+	// sends 0 on the wire which Go decodes as a non-nil pointer to 0).
+	// Used by service.WorkerService.checkComputeMs to accumulate into
+	// quotas.used_compute_ms.
+	DurationMsTotal *uint64 `json:"duration_ms_total,omitempty"`
 }
 
 // ResidentSecondsOrZero returns the resident-seconds counter treated as a
@@ -99,6 +108,20 @@ func (a *AppStatus) ResidentSecondsOrZero() uint64 {
 		return 0
 	}
 	return *a.ResidentSeconds
+}
+
+// DurationMsTotalOrZero returns the FaaS duration counter treated as a
+// scalar: nil is folded to 0 so a pre-#555 worker or a LongRunning app
+// contributes nothing to applyTenantDelta. Mirrors ResidentSecondsOrZero
+// (issue #484) but for the fourth metered dimension. Same method-value
+// discipline applies — the field selector passed into applyTenantDelta
+// must remain `func(*AppStatus) uint64` (not a closure) so callers can
+// use the value as a method expression.
+func (a *AppStatus) DurationMsTotalOrZero() uint64 {
+	if a.DurationMsTotal == nil {
+		return 0
+	}
+	return *a.DurationMsTotal
 }
 
 // AppTarget describes a running app reachable on a worker — what the

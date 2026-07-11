@@ -852,6 +852,18 @@ impl HandlerDispatch {
         // snapshot-and-subtract in the heartbeat loop, not here, so
         // the counter only ever moves forward.
         self.config.meter.record_request();
+        // Issue #555: capture the dispatch-accept instant so the
+        // terminal arm of `receiver.await` can stamp
+        // `meter.record_duration(elapsed)` with the user-visible
+        // wall-clock latency (accept → response complete). The body
+        // cap 413 early-return above (lines ~757-762) does NOT stamp
+        // — mirrors `record_request()` not being called there. All
+        // four terminal arms below stamp unconditionally so a guest
+        // trap or `process.exit` still produces a metered duration,
+        // consistent with `request_count` being billed on the same
+        // arms. Billability of hung handlers is captured at the call
+        // site in `record_duration`'s doc-comment.
+        let started_at = std::time::Instant::now();
         let tenant_for_log = self.config.tenant_id.clone();
         let app_name_for_log = self.config.app_ctx.app_name.clone();
 
@@ -880,6 +892,11 @@ impl HandlerDispatch {
         let meter = &self.config.meter;
         match receiver.await {
             Ok(Ok(resp)) => {
+                // Stamp FaaS duration (issue #555). Covers the
+                // success path: guest called
+                // `response-outparam::set(Ok(resp))` and we are about
+                // to return the response to hyper.
+                meter.record_duration(started_at.elapsed());
                 // Wrap the response body in CountingBody so every data
                 // frame's byte length is metered via record_outbound_bytes
                 // (fixes issue #210 — outbound byte metering was lost
@@ -902,6 +919,10 @@ impl HandlerDispatch {
                     err = %error_code,
                     "guest response_outparam::set returned Err"
                 );
+                // Stamp FaaS duration (issue #555). The guest did
+                // call `set` — we got a result, just an error-coded
+                // one. Duration is billable.
+                meter.record_duration(started_at.elapsed());
                 Ok(synthetic_500(
                     &format!("guest returned error-code: {error_code:?}"),
                     meter,
@@ -930,6 +951,10 @@ impl HandlerDispatch {
                         code = exit_code,
                         "guest called process.exit during handler dispatch"
                     );
+                    // Stamp FaaS duration (issue #555). Clean
+                    // process.exit is billable, consistent with
+                    // `request_count` being billed for this arm.
+                    meter.record_duration(started_at.elapsed());
                     return Ok(synthetic_500("guest cleanly exited", meter));
                 }
 
@@ -950,6 +975,11 @@ impl HandlerDispatch {
                     err = %e,
                     "guest trap or hang; returning 500"
                 );
+                // Stamp FaaS duration (issue #555). Hung handlers
+                // (epoch deadline exceeded) ARE billed — there is
+                // no grace period today; see `record_duration`'s
+                // doc-comment in edge-runtime/src/metering.rs.
+                meter.record_duration(started_at.elapsed());
                 Ok(synthetic_500(&format!("{e:#}"), meter))
             }
         }
@@ -1461,6 +1491,72 @@ mod synthetic_response_tests {
         while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
         let snap = meter.snapshot();
         assert_eq!(snap.outbound_bytes, 5);
+    }
+
+    // ── FaaS duration metering tests (issue #555) ─────────────────────────
+    //
+    // The dispatch path stamps `meter.record_duration(elapsed)` in each
+    // of the four terminal arms of `handle_request`'s `receiver.await`
+    // match. These tests verify the meter shape that the dispatch path
+    // stamps into — the production arms are mechanical one-liners, so
+    // testing the meter seam is sufficient (same posture as the
+    // CountingBody tests above for outbound bytes). The
+    // l7_per_request_timeout_returns_500 integration test in
+    // `tests/layer_integration.rs` exercises the real
+    // `Err(_dropped)` trap arm end-to-end.
+
+    #[test]
+    fn duration_meter_initial_state_is_zero() {
+        let meter = test_meter();
+        assert_eq!(meter.snapshot().duration_ms, 0);
+        assert_eq!(meter.get_duration_ms(), 0);
+    }
+
+    #[test]
+    fn duration_meter_accumulates_across_requests() {
+        let meter = test_meter();
+        // Simulate three FaaS requests of varying latencies — the
+        // dispatch arms each call `meter.record_duration(elapsed)`
+        // exactly once.
+        meter.record_duration(Duration::from_millis(120));
+        meter.record_duration(Duration::from_millis(80));
+        meter.record_duration(Duration::from_millis(45));
+        assert_eq!(meter.snapshot().duration_ms, 245);
+    }
+
+    #[test]
+    fn duration_meter_subtract_delta_removes_snapshotted_value() {
+        let meter = test_meter();
+        meter.record_duration(Duration::from_millis(100));
+        let snap = meter.snapshot();
+        // Stamp landing after the snapshot but before reset (race the
+        // heartbeat loop's snapshot-then-reset pattern).
+        meter.record_duration(Duration::from_millis(50));
+        meter.subtract_duration_ms(snap.duration_ms);
+        assert_eq!(meter.snapshot().duration_ms, 50);
+    }
+
+    #[test]
+    fn duration_meter_clone_shares_counter() {
+        let meter = test_meter();
+        let meter2 = meter.clone();
+        meter.record_duration(Duration::from_millis(100));
+        meter2.record_duration(Duration::from_millis(50));
+        // Same Arc — both halves see the full total.
+        assert_eq!(meter.snapshot().duration_ms, 150);
+        assert_eq!(meter2.snapshot().duration_ms, 150);
+    }
+
+    #[test]
+    fn duration_meter_survives_zero_subtract() {
+        // LongRunning apps leave `duration_ms_total = 0` on every
+        // heartbeat (the dispatch path never stamps for LR). The
+        // reset path unconditionally calls
+        // `subtract_duration_ms(status.duration_ms_total)` so the
+        // subtraction must be a no-op for 0, not wrap to u64::MAX.
+        let meter = test_meter();
+        meter.subtract_duration_ms(0);
+        assert_eq!(meter.snapshot().duration_ms, 0);
     }
 
     #[tokio::test]

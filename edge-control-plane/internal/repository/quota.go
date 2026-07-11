@@ -19,13 +19,26 @@ var addColumnAccumulators = map[string]bool{
 	"used_outbound_bytes":   true,
 	"used_request_count":    true,
 	"used_resident_seconds": true,
+	"used_compute_ms":       true,
 }
+
+// quotaColumnList is the canonical column projection used by every query
+// that scans a `quotas` row into a domain.Quota. Keeping a single source
+// of truth means adding the fourth metered dimension (issue #555,
+// used_compute_ms) only requires updating this list — every RETURNING /
+// SELECT that scans into Quota picks it up automatically.
+const quotaColumnList = `tenant_id, max_deployments, max_apps, max_workers,
+	          max_memory_mb, max_outbound_mb, max_requests_per_month,
+	          max_resident_seconds_per_month, max_compute_ms_per_month,
+	          used_outbound_bytes, used_request_count, used_memory_mb,
+	          used_resident_seconds, used_compute_ms,
+	          quota_period_start, quota_lock_grace_until`
 
 // addColumn atomically adds delta to one of the per-month usage counters on
 // the quotas row, with a lazy month rollover against quota_period_start (the
 // counter resets if the stored period is in a past UTC month). Used by
-// AddOutboundBytes, AddRequestCount and AddResidentSeconds — the public
-// wrappers are the only callers.
+// AddOutboundBytes, AddRequestCount, AddResidentSeconds and AddComputeMs —
+// the public wrappers are the only callers.
 func (r *QuotaRepository) addColumn(ctx context.Context, tenantID string, delta int64, col string) (*domain.Quota, error) {
 	if !addColumnAccumulators[col] {
 		return nil, fmt.Errorf("quota repo: refusing to add to non-allowlisted column %q", col)
@@ -47,11 +60,7 @@ func (r *QuotaRepository) addColumn(ctx context.Context, tenantID string, delta 
 				ELSE quota_period_start
 			END
 		WHERE tenant_id = $1
-		RETURNING tenant_id, max_deployments, max_apps, max_workers,
-		          max_memory_mb, max_outbound_mb, max_requests_per_month,
-		          max_resident_seconds_per_month, used_outbound_bytes,
-		          used_request_count, used_memory_mb, used_resident_seconds,
-		          quota_period_start, quota_lock_grace_until`, col, col)
+		RETURNING %s`, col, col, quotaColumnList)
 	err := r.db.GetContext(ctx, &q, query, tenantID, delta)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -81,12 +90,7 @@ func (r *QuotaRepository) Create(ctx context.Context, q *domain.Quota) error {
 
 func (r *QuotaRepository) GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error) {
 	var q domain.Quota
-	query := `SELECT tenant_id, max_deployments, max_apps, max_workers,
-	                 max_memory_mb, max_outbound_mb, max_requests_per_month,
-	                 max_resident_seconds_per_month, used_outbound_bytes,
-	                 used_request_count, used_memory_mb, used_resident_seconds,
-	                 quota_period_start, quota_lock_grace_until
-	          FROM quotas WHERE tenant_id = $1`
+	query := `SELECT ` + quotaColumnList + ` FROM quotas WHERE tenant_id = $1`
 	err := r.db.GetContext(ctx, &q, query, tenantID)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -120,6 +124,19 @@ func (r *QuotaRepository) AddRequestCount(ctx context.Context, tenantID string, 
 // contribute 0 (worker stamps ResidentSeconds=null) and never call this.
 func (r *QuotaRepository) AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	return r.addColumn(ctx, tenantID, int64(delta), "used_resident_seconds")
+}
+
+// AddComputeMs atomically accumulates delta into used_compute_ms and
+// returns the updated quota row (issue #555, fourth metered dimension).
+// Mirrors AddRequestCount / AddResidentSeconds: the lazy month rollover
+// against quota_period_start resets the counter when the stored period
+// is in a past calendar month (UTC). Used by
+// service.WorkerService.checkComputeMs on every heartbeat for every
+// Handler (FaaS) app — LongRunning apps contribute 0 (the dispatch path
+// never stamps, so DurationMsTotal is omitted on the wire and the
+// helper folds it to 0) and never call this.
+func (r *QuotaRepository) AddComputeMs(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	return r.addColumn(ctx, tenantID, int64(delta), "used_compute_ms")
 }
 
 // MemoryQuotaRepository is the transaction-bound variant of QuotaRepository
@@ -158,11 +175,7 @@ func (r *MemoryQuotaRepository) AddMemoryMB(ctx context.Context, tenantID string
 	err := r.tx.GetContext(ctx, &q, `
 		UPDATE quotas SET used_memory_mb = used_memory_mb + $2
 		WHERE tenant_id = $1
-		RETURNING tenant_id, max_deployments, max_apps, max_workers,
-		          max_memory_mb, max_outbound_mb, max_requests_per_month,
-		          max_resident_seconds_per_month, used_outbound_bytes,
-		          used_request_count, used_memory_mb, used_resident_seconds,
-		          quota_period_start, quota_lock_grace_until`,
+		RETURNING `+quotaColumnList,
 		tenantID, delta)
 	if err == sql.ErrNoRows {
 		return nil, nil

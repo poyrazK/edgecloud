@@ -262,8 +262,8 @@ func TestDeploy_RejectsNonWasmBytes(t *testing.T) {
 	// Quota lookup happens first; mock a quota row that allows deploys.
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs after the quota
 	// lookup and before the CountByApp call. Return a single row so
 	// the cap passes.
@@ -325,8 +325,8 @@ func TestDeploy_AcceptsWasmBytes(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs before
 	// CountByApp. Return a single row so the projection (1 request,
 	// 0 bytes) passes the cap.
@@ -559,8 +559,8 @@ func TestDeploy_AtCap_Succeeds(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs before
 	// CountByApp. Return a single row so the projection (1 request,
 	// 0 bytes) passes the cap.
@@ -633,8 +633,8 @@ func TestDeploy_ArtifactSaveFailure_TxRollsBack(t *testing.T) {
 	periodStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs before
 	// CountByApp. Return a single row so the projection (1 request,
 	// 0 bytes) passes the cap.
@@ -712,8 +712,8 @@ func TestDeploy_ArtifactSaveFailure_TxPath_CleansUpAppsRow(t *testing.T) {
 	periodStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs before
 	// CountByApp. Return a single row so the projection (1 request,
 	// 0 bytes) passes the cap.
@@ -790,8 +790,8 @@ func TestDeploy_PersistsSignedAttestation(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "quota_period_start", "quota_lock_grace_until",
-		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, periodStart, nil))
+			"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until",
+		}).AddRow("t_test", 100, 50, 10, 1024, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, periodStart, nil))
 	// Issue #420: deploy-time cap verification runs before
 	// CountByApp. Return a single row so the projection (1 request,
 	// 0 bytes) passes the cap.
@@ -1709,15 +1709,15 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 	// max_resident_seconds_per_month + used_resident_seconds per
 	// migration 029). Main HEAD temporarily dropped these cols
 	// (PR #559 reverted), so the test fixture is back to 14-col here.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"max_resident_seconds_per_month", "used_outbound_bytes",
-			"used_request_count", "used_memory_mb", "used_resident_seconds",
+			"max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes",
+			"used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, now, nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
 		WithArgs(tenantID, appName).
 		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
@@ -1735,10 +1735,10 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"max_resident_seconds_per_month", "used_outbound_bytes",
-			"used_request_count", "used_memory_mb", "used_resident_seconds",
+			"max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes",
+			"used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 512, 0, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 512, 0, 0, 0, 0, now, nil))
 
 	// 6. Commit + drainer flow
 	mock.ExpectCommit()
@@ -1795,15 +1795,15 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 			AddRow("d_last_good", tenantID, appName, domain.StatusDeployed, "lastgoodhash", `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
 
 	// Quota read for per-app memory capture (rollback line 1580)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"max_resident_seconds_per_month", "used_outbound_bytes",
-			"used_request_count", "used_memory_mb", "used_resident_seconds",
+			"max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes",
+			"used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 256, 0, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 0, 256, 0, 0, now, nil))
 
 	// Set last_good → d_last_good (the rollback target). Production
 	// code calls Set then ClearStableSince BEFORE buildPublishPayload.
@@ -1834,19 +1834,19 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"max_resident_seconds_per_month", "used_outbound_bytes",
-			"used_request_count", "used_memory_mb", "used_resident_seconds",
+			"max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes",
+			"used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 512, 0, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 0, 512, 0, 0, now, nil))
 	mock.ExpectQuery(regexp.QuoteMeta(`UPDATE quotas SET used_memory_mb = used_memory_mb + $2 WHERE tenant_id = $1`)).
 		WithArgs(tenantID, int64(-256)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
-			"max_resident_seconds_per_month", "used_outbound_bytes",
-			"used_request_count", "used_memory_mb", "used_resident_seconds",
+			"max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes",
+			"used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 256, 0, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 0, 256, 0, 0, now, nil))
 
 	mock.ExpectCommit()
 

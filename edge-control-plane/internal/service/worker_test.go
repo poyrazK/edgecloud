@@ -91,6 +91,7 @@ type mockQuotaRepo struct {
 	addOutboundBytesFunc   func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addRequestCountFunc    func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	addResidentSecondsFunc func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	addComputeMsFunc       func(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	setGraceUntilFunc      func(ctx context.Context, tenantID string, until *time.Time) error
 }
 
@@ -122,6 +123,17 @@ func (m *mockQuotaRepo) AddRequestCount(ctx context.Context, tenantID string, de
 func (m *mockQuotaRepo) AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
 	if m.addResidentSecondsFunc != nil {
 		return m.addResidentSecondsFunc(ctx, tenantID, delta)
+	}
+	return &domain.Quota{}, nil
+}
+
+// AddComputeMs (issue #555) routes to the test hook when set.
+// Mirrors AddResidentSeconds — the nil-func default returns a zero
+// Quota so tests that don't drive the FaaS duration axis don't have
+// to plumb this hook.
+func (m *mockQuotaRepo) AddComputeMs(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+	if m.addComputeMsFunc != nil {
+		return m.addComputeMsFunc(ctx, tenantID, delta)
 	}
 	return &domain.Quota{}, nil
 }
@@ -1327,6 +1339,190 @@ func TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate(t *testing.T) {
 
 	if called {
 		t.Error("AddResidentSeconds called for Some(0) resident-seconds delta — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_AccumulatesPerTenant (issue #555)
+// verifies the FaaS duration happy path: a Handler app stamps
+// DurationMsTotal=Some(150) (milliseconds), the heartbeat carries
+// TenantID="t_1", and checkComputeMs routes
+// AddComputeMs(ctx, "t_1", 150).
+func TestApplyTenantDelta_ComputeMs_AccumulatesPerTenant(t *testing.T) {
+	var (
+		gotTenantID string
+		gotDelta    uint64
+		gotCalled   bool
+	)
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, tenantID string, delta uint64) (*domain.Quota, error) {
+			gotTenantID = tenantID
+			gotDelta = delta
+			gotCalled = true
+			return &domain.Quota{MaxComputeMsPerMonth: 1_000_000_000}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"faasapp": {TenantID: "t_1", DurationMsTotal: ptrTo(uint64(150))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if !gotCalled {
+		t.Fatal("AddComputeMs was not called for an FaaS app with DurationMsTotal=150")
+	}
+	if gotTenantID != "t_1" {
+		t.Errorf("AddComputeMs tenantID = %q, want %q", gotTenantID, "t_1")
+	}
+	if gotDelta != 150 {
+		t.Errorf("AddComputeMs delta = %d, want 150", gotDelta)
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_IgnoresLongRunning (issue #555)
+// verifies the LR-vs-FaaS split that mirrors
+// TestApplyTenantDelta_ResidentSeconds_IgnoresFaaS but on the
+// inverted axis: an LR app stamps DurationMsTotal=nil (the dispatch
+// path never stamps for LR), and applyTenantDelta folds it to 0 via
+// DurationMsTotalOrZero and skips the AddComputeMs call. This is the
+// symmetric guard that keeps LR apps from contributing to
+// quotas.used_compute_ms.
+func TestApplyTenantDelta_ComputeMs_IgnoresLongRunning(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"lrapp": {TenantID: "t_1", DurationMsTotal: nil},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for LR app (DurationMsTotal=nil) — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_ZeroSkipsUpdate (issue #555) covers
+// the Some(0) case: a Handler app that finished within sub-millisecond
+// (truncated to 0 in the worker). Symmetric to
+// TestApplyTenantDelta_ResidentSeconds_ZeroSkipsUpdate — the 0-delta
+// short-circuit at applyTenantDelta's first loop drops the DB write.
+func TestApplyTenantDelta_ComputeMs_ZeroSkipsUpdate(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"fastfaas": {TenantID: "t_1", DurationMsTotal: ptrTo(uint64(0))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for Some(0) compute-ms delta — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_LegacyWorkerNoDedupe (issue #555)
+// verifies backward compat: pre-#555 workers don't serialize a
+// DurationMsTotal field. The JSON decoder leaves DurationMsTotal
+// nil, DurationMsTotalOrZero folds it to 0, and the 0-delta
+// short-circuit skips the AddComputeMs call — same shape as the LR
+// case. No dedupe_id path is involved because no delta is contributed.
+func TestApplyTenantDelta_ComputeMs_LegacyWorkerNoDedupe(t *testing.T) {
+	called := false
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			called = true
+			return &domain.Quota{}, nil
+		},
+	})
+	// Pre-#555 worker — neither DurationMsTotal nor ResidentSeconds is set.
+	apps := map[string]domain.AppStatus{
+		"legacyapp": {TenantID: "t_1"},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if called {
+		t.Error("AddComputeMs called for legacy worker (DurationMsTotal omitted) — must be skipped")
+	}
+}
+
+// TestApplyTenantDelta_ComputeMs_ExceedsCap_Logs (issue #555) verifies
+// the cap-trip log line for the FaaS duration axis. Mirrors
+// TestApplyTenantDelta_Requests_ExceedsCap_Logs (request-count axis)
+// but uses MaxComputeMsPerMonth / UsedComputeMs on the Quota row
+// returned by AddComputeMs.
+func TestApplyTenantDelta_ComputeMs_ExceedsCap_Logs(t *testing.T) {
+	buf, restore := captureLogger(t)
+	defer restore()
+
+	svc := workerSvcForTest(&mockWorkerRepo{}, &mockQuotaRepo{
+		addComputeMsFunc: func(_ context.Context, _ string, _ uint64) (*domain.Quota, error) {
+			// Cap = 1_000ms; usage after add = 1_500ms → exceeds cap.
+			return &domain.Quota{MaxComputeMsPerMonth: 1_000, UsedComputeMs: 1_500}, nil
+		},
+	})
+	apps := map[string]domain.AppStatus{
+		"faasapp": {TenantID: "t_free", DurationMsTotal: ptrTo(uint64(500))},
+	}
+	appsRaw, _ := json.Marshal(apps)
+
+	svc.applyTenantDelta(context.Background(), appsRaw,
+		(*domain.AppStatus).DurationMsTotalOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxComputeMsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedComputeMs },
+		"compute ms",
+		domain.MeterKindComputeMs,
+		svc.quotaRepo.AddComputeMs,
+		nil,
+	)
+
+	if !strings.Contains(buf.String(), "compute ms") || !strings.Contains(buf.String(), "t_free") {
+		t.Errorf("expected cap-trip log mentioning 'compute ms' and tenant 't_free', got:\n%s", buf.String())
 	}
 }
 
