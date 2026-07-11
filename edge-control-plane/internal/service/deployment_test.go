@@ -2230,14 +2230,16 @@ func TestRollbackDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
 			AddRow(lastGoodDepID, tenantID, appName, domain.StatusDeployed, lastGoodHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
 
 	// 4. Quota read for per-app memory capture.
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, used_outbound_bytes, used_request_count, used_memory_mb, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
 		WithArgs(tenantID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"tenant_id", "max_deployments", "max_apps", "max_workers",
 			"max_memory_mb", "max_outbound_mb", "max_requests_per_month",
+			"max_resident_seconds_per_month",
 			"used_outbound_bytes", "used_request_count", "used_memory_mb",
+			"used_resident_seconds",
 			"quota_period_start", "quota_lock_grace_until",
-		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 256, now, nil))
+		}).AddRow(tenantID, 100, 50, 10, 256, 1024, 100_000, 0, 0, 0, 0, 256, now, nil))
 
 	// 5. Set rewrites deployment_id to lastGoodDepID, clears last_good.
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
