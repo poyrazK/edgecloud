@@ -17,3 +17,4 @@ pub mod state;
 pub mod supervisor;
 pub mod tracing_layer;
 pub mod verifier;
+pub mod worker_key;

@@ -14,9 +14,11 @@ mod port_pool;
 mod state;
 mod supervisor;
 mod verifier;
+mod worker_key;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::signal::unix::{signal, SignalKind};
 
 use tokio::sync::broadcast;
@@ -45,65 +47,54 @@ async fn main() -> anyhow::Result<()> {
     // and every tracing call that follows.
     let config = Config::from_env()?;
 
-    // Resolve the JWT secret: direct env var, or bootstrap handshake.
-    let jwt_secret = if !config.worker_jwt_secret.is_empty() {
-        config.worker_jwt_secret.clone()
-    } else if !config.worker_bootstrap_secret.is_empty() {
-        // Bootstrap handshake (issue #104): exchange the bootstrap
-        // secret for the real JWT secret via the control plane.
-        tracing::info!(
-            "WORKER_JWT_SECRET is empty but WORKER_BOOTSTRAP_SECRET is set; \
-             starting bootstrap handshake with control plane"
-        );
+    // Resolve the worker identity keypair (issue #430). The same
+    // keypair is reused across restarts so the worker's public_key
+    // (and therefore its kid) stays stable; main() never generates
+    // a new identity for the same on-disk path.
+    let identity = crate::worker_key::WorkerIdentity::load_or_create(&config.worker_key_path)
+        .context("loading worker identity keypair")?;
 
-        let bootstrap_client = crate::bootstrap::BootstrapClient::new(
-            config.control_plane_url.clone(),
-            config.worker_bootstrap_secret.as_bytes().to_vec(),
-            config.worker_id.clone(),
-            config.region.clone(),
-            config.worker_tenant_id.clone(),
-        );
-
-        match bootstrap_client.run().await {
-            Ok(secret) => {
-                tracing::info!("bootstrap handshake succeeded; worker can now authenticate");
-                secret
-            }
-            Err(e) => {
-                tracing::error!(
-                    err = %e,
-                    "bootstrap handshake failed — worker cannot authenticate with \
-                     control plane. Log forwarding, artifact downloads, and worker \
-                     registration will all fail with 401. Set WORKER_JWT_SECRET directly \
-                     to bypass the bootstrap. Exiting."
-                );
-                anyhow::bail!("bootstrap handshake failed: {e}");
-            }
-        }
-    } else {
-        tracing::warn!(
-            "Neither WORKER_JWT_SECRET nor WORKER_BOOTSTRAP_SECRET is set; \
-             /api/internal/* calls will return 401 until the secret is provisioned. \
-             NATS heartbeats and the deployment supervisor keep running — only the \
-             log forwarder and downloader are affected. See follow-up issue D for \
-             the bootstrap handshake."
-        );
-        String::new()
-    };
+    // Resolve the JWT secret + kid. Three paths, in priority order:
+    //   1. WORKER_JWT_SECRET set directly (legacy / static-cluster
+    //      mode) — used as-is, no enrollment.
+    //   2. EDGE_WORKER_REENROLL_ON_BOOT=true forces the bootstrap
+    //      handshake even if a persisted secret is on disk.
+    //   3. Persisted identity record at worker_identity_path +
+    //      bootstrap handshake skipped.
+    //   4. No persisted record + WORKER_BOOTSTRAP_SECRET set →
+    //      run the bootstrap handshake + persist for next time.
+    //   5. None of the above → empty secret + warn (same shape as
+    //      pre-#430).
+    let (jwt_secret, jwt_kid) = resolve_jwt_secret(&config, &identity).await?;
 
     let jwt_secret_empty = jwt_secret.is_empty();
 
     // Initialize JWT signer — signs outbound calls to the control plane's
     // /api/internal/* endpoints. Worker is per-tenant in this design; the
     // JWT carries the worker's tenant_id claim.
-    let jwt_signer = WorkerJwtSigner::new(
-        jwt_secret,
-        config.worker_jwt_kid.clone(),
-        config.worker_jwt_issuer.clone(),
-        config.worker_id.clone(),
-        config.region.clone(),
-        config.worker_tenant_id.clone(),
-    );
+    let jwt_signer = if let Some(kid) = jwt_kid {
+        // Build the signer in two steps so we can stamp the kid we
+        // already resolved (worker_jwt_kid env var, or the
+        // persisted/derived wkr_ kid). The empty() constructor
+        // matches the post-#430 split: secret + kid are set together.
+        let signer = WorkerJwtSigner::empty(
+            config.worker_jwt_issuer.clone(),
+            config.worker_id.clone(),
+            config.region.clone(),
+            config.worker_tenant_id.clone(),
+        );
+        signer.set_secret(jwt_secret.clone(), Some(kid));
+        signer
+    } else {
+        WorkerJwtSigner::new(
+            jwt_secret.clone(),
+            config.worker_jwt_kid.clone(),
+            config.worker_jwt_issuer.clone(),
+            config.worker_id.clone(),
+            config.region.clone(),
+            config.worker_tenant_id.clone(),
+        )
+    };
 
     // Initialize disk spool for log durability — failed HTTP batches are
     // persisted here and replayed on the next startup.
@@ -472,6 +463,112 @@ async fn main() -> anyhow::Result<()> {
     // broadcast, stopped apps, published the final heartbeat, and awaited
     // the log forwarder drain. main() returns cleanly.
     Ok(())
+}
+
+/// Resolve the JWT signing secret + kid (issue #430).
+///
+/// Resolution order:
+/// 1. `WORKER_JWT_SECRET` env var set directly → use as-is, kid from
+///    `WORKER_JWT_KID` if any.
+/// 2. `EDGE_WORKER_REENROLL_ON_BOOT=true` → force re-enrollment even
+///    if a persisted identity is on disk.
+/// 3. Persisted identity record present → load it, skip bootstrap.
+/// 4. `WORKER_BOOTSTRAP_SECRET` set → run the enrollment handshake
+///    + persist for next time.
+/// 5. None of the above → empty secret, no kid (legacy warning).
+///
+/// Returned `kid` is `Some(...)` whenever the secret came from the
+/// post-#430 paths (persisted, freshly enrolled, force-reenrolled)
+/// so the signer can stamp it on outbound JWTs. `None` keeps the
+/// legacy `WorkerJwtSigner::new` path live for operators who opt
+/// out of per-worker keys by setting `WORKER_JWT_SECRET` directly.
+async fn resolve_jwt_secret(
+    config: &Config,
+    identity: &crate::worker_key::WorkerIdentity,
+) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+    // 1. Direct env-var path: legacy mode, no enrollment.
+    if !config.worker_jwt_secret.is_empty() {
+        tracing::info!("using WORKER_JWT_SECRET directly; bootstrap enrollment skipped");
+        return Ok((config.worker_jwt_secret.as_bytes().to_vec(), None));
+    }
+
+    // 2. Force re-enrollment: drop any persisted record and run the
+    // handshake. The persisted file (if any) is overwritten by the
+    // post-handshake persist call below.
+    let reenroll = config.worker_reenroll_on_boot;
+
+    // 3. Persisted identity short-circuit.
+    if !reenroll {
+        match crate::auth::load_persisted_identity(&config.worker_identity_path) {
+            Ok(Some(persisted)) => {
+                tracing::info!(
+                    path = %config.worker_identity_path.display(),
+                    kid = %persisted.kid,
+                    "loaded persisted worker identity; bootstrap handshake skipped"
+                );
+                return Ok((persisted.secret, Some(persisted.kid)));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Corrupt identity file — refuse to fall through to
+                // bootstrap because that would let an attacker who
+                // can write to the cache directory forge a worker
+                // identity. The operator must remove the file (or
+                // rotate the keypair) before restarting.
+                tracing::error!(
+                    err = %e,
+                    path = %config.worker_identity_path.display(),
+                    "persisted identity is unreadable; refusing to bootstrap. \
+                     Delete the file or set EDGE_WORKER_REENROLL_ON_BOOT=true to \
+                     force a fresh enrollment."
+                );
+                return Err(e);
+            }
+        }
+    }
+
+    // 4. Bootstrap handshake.
+    if !config.worker_bootstrap_secret.is_empty() {
+        tracing::info!(
+            reenroll,
+            "running bootstrap enrollment handshake with control plane"
+        );
+        let client = crate::bootstrap::BootstrapClient::new(
+            config.control_plane_url.clone(),
+            config.worker_bootstrap_secret.as_bytes().to_vec(),
+            config.worker_id.clone(),
+            config.region.clone(),
+            config.worker_tenant_id.clone(),
+        );
+        let derived = client
+            .run(identity)
+            .await
+            .context("bootstrap enrollment handshake")?;
+
+        // Persist for next restart.
+        let persisted = crate::auth::PersistedIdentity {
+            kid: derived.kid.clone(),
+            secret: derived.secret.clone(),
+            public_key_hex: derived.public_key_hex.clone(),
+        };
+        crate::auth::persist_identity(&config.worker_identity_path, &persisted)
+            .context("persisting worker identity after enrollment")?;
+        tracing::info!(
+            path = %config.worker_identity_path.display(),
+            kid = %derived.kid,
+            "persisted worker identity; subsequent restarts skip bootstrap"
+        );
+        return Ok((derived.secret, Some(derived.kid)));
+    }
+
+    // 5. No secret anywhere — warn + return empty (legacy behavior).
+    tracing::warn!(
+        "Neither WORKER_JWT_SECRET nor WORKER_BOOTSTRAP_SECRET is set; \
+         /api/internal/* calls will return 401 until the secret is provisioned. \
+         NATS heartbeats and the deployment supervisor keep running — only the \
+         log forwarder and downloader are affected."
+    );
+    Ok((Vec::new(), None))
 }
 
 /// DrainOutcome is the typed result of waiting for the log forwarder task
