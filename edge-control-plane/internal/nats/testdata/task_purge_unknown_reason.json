@@ -1,0 +1,7 @@
+{
+  "type": "task_purge",
+  "timestamp": "2026-07-11T10:20:00Z",
+  "tenant_id": "t_acme",
+  "app_name": "myapp",
+  "reason": "scheduled_cleanup"
+}

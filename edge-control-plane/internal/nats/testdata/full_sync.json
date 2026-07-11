@@ -1,0 +1,29 @@
+{
+  "type": "full_sync",
+  "timestamp": "2026-07-11T10:05:00Z",
+  "tenant_id": "t_acme",
+  "apps": {
+    "myapp": {
+      "deployment_id": "d_abc123",
+      "deployment_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "deployment_signature": "kZSd4kQb8zMqOH8Lbq5F7j9W6o4yYfE2tPmI1nVcA3w",
+      "signing_key_id": "k1",
+      "env": {
+        "LOG_LEVEL": "info"
+      },
+      "allowlist": [
+        "api.stripe.com"
+      ],
+      "max_memory_mb": 256,
+      "cpu_budget_ms": 500
+    },
+    "other": {
+      "deployment_id": "d_other",
+      "deployment_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "env": {},
+      "allowlist": [],
+      "max_memory_mb": 64,
+      "cpu_budget_ms": 100
+    }
+  }
+}
