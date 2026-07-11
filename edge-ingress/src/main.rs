@@ -11,6 +11,7 @@ mod config;
 mod domains;
 pub mod heartbeats;
 mod ingress_metrics;
+pub mod l4;
 mod messages;
 mod quota;
 mod ratelimit;
@@ -32,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::caddy::CaddyClient;
 use crate::config::Config;
+use crate::l4::{L4PortPool, L4RoutingTable};
 use crate::routing::RoutingTable;
 
 #[derive(Parser, Debug)]
@@ -86,6 +88,16 @@ async fn main() -> ExitCode {
     ingress_metrics::describe_metrics();
 
     let table = Arc::new(RoutingTable::new());
+    // Issue #548 — L4 (raw-TCP) ingress uses a parallel routing
+    // table and a CP-persistent public-port pool. Both are
+    // ingress-local for now (Commit 9 swaps the pool to a
+    // CP-coordinated allocator via `L4PortCache`).
+    let l4_table = Arc::new(L4RoutingTable::new());
+    let l4_ports = Arc::new(tokio::sync::Mutex::new(L4PortPool::new(
+        cfg.l4_port_range_start,
+        cfg.l4_port_range_end,
+        cfg.l4_port_cooldown_secs,
+    )));
     let caddy = match CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()) {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -132,6 +144,8 @@ async fn main() -> ExitCode {
     let hb_shutdown = shutdown.clone();
     let hb_cfg = cfg.clone();
     let hb_table = table.clone();
+    let hb_l4_table = l4_table.clone();
+    let hb_l4_ports = l4_ports.clone();
     let hb_caddy = caddy.clone();
     let hb_notify = render_notify.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -142,7 +156,7 @@ async fn main() -> ExitCode {
                     tracing::info!("heartbeat loop: shutdown signal received, exiting");
                     break;
                 }
-                result = heartbeats::run(hb_cfg.clone(), hb_table.clone(), hb_caddy.clone(), hb_notify.clone(), hb_shutdown.clone()) => {
+                result = heartbeats::run(hb_cfg.clone(), hb_table.clone(), hb_l4_table.clone(), hb_l4_ports.clone(), hb_caddy.clone(), hb_notify.clone(), hb_shutdown.clone()) => {
                     match result {
                         Ok(()) => {
                             tracing::warn!("heartbeats::run returned cleanly; re-running");
