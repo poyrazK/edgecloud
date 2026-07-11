@@ -226,6 +226,10 @@ pub struct HandlerConfig {
     /// Per-app log sink — guest `emit_log` records flow here.
     pub log_sink: Arc<dyn LogSink>,
     /// App context stamped onto every log record for attribution.
+    /// `app_ctx.app_name` is also threaded into
+    /// `RuntimeState::with_env_and_meter_preview` as the per-app preopen
+    /// subdirectory (issue #558) — keep this populated whenever you
+    /// build a `HandlerConfig`.
     pub app_ctx: AppLogContext,
     /// Per-deployment request meter — incremented per accepted request
     /// so the heartbeat carries the right counts.
@@ -794,6 +798,12 @@ impl HandlerDispatch {
             self.config.env.clone(),
             Some(self.config.meter.clone()),
             self.config.tenant_id.clone(),
+            // Per-app preopen (issue #558): pass app_name through to
+            // scope the EDGE_FS_PATH mount to
+            // `{base}/{tenant_id}/{app_name}/`. Sourced from the
+            // already-populated AppLogContext — no HandlerConfig field
+            // change needed.
+            self.config.app_ctx.app_name.as_str(),
             self.config.preview_id.as_deref(),
             self.config.preview_pr_number,
             self.config.egress.clone(),
