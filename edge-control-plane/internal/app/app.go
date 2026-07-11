@@ -414,6 +414,7 @@ func New(
 		tenantSvc,
 		workerSvc,
 		workerRepo, // issue #430 — per-worker key enrollment (SetPublicKey)
+		metricsAgg.NewWorkerEnrollSink(), // issue #430 — edge_worker_enroll_* metrics
 	)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)

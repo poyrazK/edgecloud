@@ -114,6 +114,10 @@ type InternalHandler struct {
 	// secrets; replaces the cluster-wide /worker-secret leak).
 	workerKeyRepo        workerKeyRepo
 	enrollmentChallenges *enrollmentChallengeStore
+	// enrollSink bumps edge_worker_enroll_* metrics on every
+	// outcome (success or failure). nil-safe — tests pass nil and
+	// the closure falls through to a no-op.
+	enrollSink service.WorkerEnrollSink
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -227,6 +231,44 @@ type EnrollmentChallenge struct {
 	ExpiresAt time.Time
 }
 
+// statusWriter is a minimal http.ResponseWriter wrapper that
+// captures the first non-1xx status code the handler writes so the
+// deferred metric sink can classify success vs. failure. The 1xx
+// codes are informational (100 Continue) — handlers don't emit
+// them, but we still treat them as success if the next write
+// happens to land at 2xx.
+//
+// Used by EnrollWorker (issue #430) to bump
+// edge_worker_enroll_errors_total only when the handler actually
+// returns a non-2xx response, regardless of which return arm
+// fired. Without this, the metric would need to thread through
+// every early-return — fragile and easy to forget.
+type statusWriter struct {
+	http.ResponseWriter
+	code     int
+	wroteHdr bool
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if !s.wroteHdr {
+		s.code = code
+		s.wroteHdr = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	// If the handler wrote body bytes without an explicit
+	// WriteHeader (e.g. http.Error → writes 500 + body), the net/http
+	// package synthesizes a 200 default. Mirror that — record 200
+	// only if WriteHeader was never called.
+	if !s.wroteHdr {
+		s.code = http.StatusOK
+		s.wroteHdr = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
 // enrollmentChallengeStore keeps phase-1 challenges in memory so
 // phase-2 can verify the worker is the same caller that completed
 // phase 1. In-memory + TTL is fine for the threat model: the
@@ -325,6 +367,7 @@ func NewInternalHandler(
 	tenantSvc tenantGetter,
 	workerHostingSvc hostingGetter,
 	workerKeyRepo workerKeyRepo,
+	enrollSink service.WorkerEnrollSink,
 ) *InternalHandler {
 	return &InternalHandler{
 		deploymentSvc:        deploymentSvc,
@@ -344,6 +387,7 @@ func NewInternalHandler(
 		workerHostingSvc:     workerHostingSvc,
 		workerKeyRepo:        workerKeyRepo,
 		enrollmentChallenges: newEnrollmentChallengeStore(),
+		enrollSink:           enrollSink,
 	}
 }
 
@@ -999,6 +1043,24 @@ func (h *InternalHandler) EnrollWorker(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": "bootstrap not configured"}`, http.StatusNotImplemented)
 		return
 	}
+
+	// Wrap the handler body so we bump edge_worker_enroll_* exactly
+	// once per invocation, regardless of which return arm fires.
+	// `wrap` records the first non-1xx status the handler writes
+	// (httperror.XxxCtx, http.Error, or implicit on first Write);
+	// the deferred closure reads `wrap.code` at return time and
+	// reports `hadError = code >= 400`. The wrap is installed AFTER
+	// the bootstrapSecret-not-configured guard above so a 501 from
+	// a misconfigured CP doesn't count toward fleet enrollment
+	// failure metrics (it's an operator problem, not a worker
+	// problem).
+	wrap := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+	w = wrap
+	defer func() {
+		if h.enrollSink != nil {
+			h.enrollSink(wrap.code >= 400)
+		}
+	}()
 
 	workerID := middleware.GetWorkerID(r.Context())
 	tenantID := middleware.GetWorkerTenantID(r.Context())

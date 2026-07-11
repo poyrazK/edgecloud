@@ -69,6 +69,15 @@ type MetricsAggregator struct {
 	autoscaleEventGcRow  int64
 	autoscaleEventGcErr  int64
 	autoscaleEventGcTime int64
+
+	// worker_enroll (3 families, issue #430 per-worker enrollment
+	// observability). Counts every outcome of POST
+	// /api/internal/worker-bootstrap/enroll so an operator can detect
+	// "fleet enrollment failure spike" before any single worker 401s
+	// long enough to alert.
+	workerEnrollTotal int64
+	workerEnrollErrs  int64
+	workerEnrollTime  int64
 }
 
 type appMetrics struct {
@@ -295,6 +304,43 @@ func (a *MetricsAggregator) NewAutoscaleEventGCSink() AutoscaleEventGCSink {
 	}
 }
 
+// WorkerEnrollSink records one outcome of the per-worker enrollment
+// endpoint (POST /api/internal/worker-bootstrap/enroll, issue #430).
+// Pass `hadError=true` for any non-2xx response (challenge replay,
+// signature mismatch, persistence failure, etc.); the success path
+// is implicit (errors_total stays still, total increments).
+//
+// Three families:
+//   - edge_worker_enroll_total (counter)
+//   - edge_worker_enroll_errors_total (counter)
+//   - edge_worker_enroll_last_enroll_timestamp_seconds (gauge)
+//
+// Operators alert on a sustained errors/total ratio > 5% over a 5m
+// window — that's the "fleet can't enroll after a JWT_SECRET
+// rotation" early signal.
+type WorkerEnrollSink func(hadError bool)
+
+// NewWorkerEnrollSink returns a sink that bumps the worker_enroll
+// families. Mirrors the GC sink pattern (issue #581).
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent
+// enrollment attempt.
+func (a *MetricsAggregator) NewWorkerEnrollSink() WorkerEnrollSink {
+	if a == nil {
+		return func(bool) {}
+	}
+	return func(hadError bool) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.workerEnrollTotal++
+		if hadError {
+			a.workerEnrollErrs++
+		}
+		a.workerEnrollTime = time.Now().Unix()
+	}
+}
+
 // RenderTenant returns a Prometheus text-format string containing only the
 // metrics for the given tenant. Returns an empty string when no data has
 // been ingested for that tenant yet.
@@ -436,6 +482,17 @@ func emitGCFamilies(b *strings.Builder, a *MetricsAggregator) {
 	fmt.Fprintf(b, "edge_autoscale_event_gc_errors_total %d\n", a.autoscaleEventGcErr)
 	fmt.Fprintf(b, "# TYPE edge_autoscale_event_gc_last_tick_timestamp_seconds gauge\n")
 	fmt.Fprintf(b, "edge_autoscale_event_gc_last_tick_timestamp_seconds %d\n", a.autoscaleEventGcTime)
+
+	// worker_enroll — issue #430 per-worker enrollment observability.
+	// Operators alert on errors_total > 0 sustained over a 5m window,
+	// or total = 0 over the same window after a JWT_SECRET rotation
+	// (no worker enrolled yet = rotation didn't land).
+	fmt.Fprintf(b, "# TYPE edge_worker_enroll_total counter\n")
+	fmt.Fprintf(b, "edge_worker_enroll_total %d\n", a.workerEnrollTotal)
+	fmt.Fprintf(b, "# TYPE edge_worker_enroll_errors_total counter\n")
+	fmt.Fprintf(b, "edge_worker_enroll_errors_total %d\n", a.workerEnrollErrs)
+	fmt.Fprintf(b, "# TYPE edge_worker_enroll_last_enroll_timestamp_seconds gauge\n")
+	fmt.Fprintf(b, "edge_worker_enroll_last_enroll_timestamp_seconds %d\n", a.workerEnrollTime)
 }
 
 // collectFamilyLines appends series strings for every app in one tenant into

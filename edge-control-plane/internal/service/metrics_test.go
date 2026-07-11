@@ -555,3 +555,40 @@ func TestMetricsAggregator_TimestampUpdatesPerTick(t *testing.T) {
 		t.Errorf("second sink: timestamp %d is in the future (after=%d)", got, after)
 	}
 }
+
+// TestMetricsAggregator_RecordWorkerEnroll (issue #430): the per-worker
+// enrollment sink bumps total on every call and errors_total only when
+// hadError=true. Mirrors the GC sink test shape so a future refactor
+// can't accidentally drop the errors counter.
+func TestMetricsAggregator_RecordWorkerEnroll(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewWorkerEnrollSink()
+	sink(false) // success
+	sink(true)  // failure
+	sink(false) // success
+	sink(true)  // failure
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_worker_enroll_total 4",
+		"edge_worker_enroll_errors_total 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q after sink calls\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestMetricsAggregator_WorkerEnrollNilSinkIsNoop: nil-aggregator
+// sink must not panic, matching the contract used by handler tests
+// that pass nil.
+func TestMetricsAggregator_WorkerEnrollNilSinkIsNoop(t *testing.T) {
+	var nilAgg *MetricsAggregator
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil-aggregator WorkerEnrollSink panicked: %v", r)
+		}
+	}()
+	nilAgg.NewWorkerEnrollSink()(true)
+	nilAgg.NewWorkerEnrollSink()(false)
+}
