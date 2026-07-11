@@ -2720,8 +2720,17 @@ paths:
               properties:
                 app_name:
                   type: string
-                  pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
-                  description: Unique app name (alphanumeric, hyphens, 1-63 chars).
+                  pattern: '^[a-z0-9][a-z0-9.\-_]{0,62}$'
+                  description: |
+                    Unique app name (alphanumeric, dots, underscores, hyphens, 1-63 chars;
+                    regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`). Widened from
+                    `[a-z0-9-]` to admit `.` and `_` for semver-ish
+                    names like `myapp.v2` or `app_v2` (issue #438).
+                    The public hostname `<tenant_id>-<app_name>.edgecloud.dev`
+                    can therefore be deeper than two labels under
+                    `edgecloud.dev` (e.g. `t_acme-myapp.v2.edgecloud.dev`);
+                    downstream tooling must treat `app_name` as a single
+                    opaque label.
                   example: my-app
                 language:
                   type: string

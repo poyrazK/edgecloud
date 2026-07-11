@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use edge_migrate_lib::{
     analyzer::CAnalyzer,
-    is_valid_deployment_app_name,
+    is_valid_app_name,
     preprocessor::{Preprocessor, PreprocessorInfo},
     report::{MigrationReport, TransformOutput, TRANSFORM_OUTPUT_VERSION},
     rust_analyzer::RustAnalyzer,
@@ -518,9 +518,9 @@ async fn run_tree_upload(
         .unwrap_or("app")
         .to_string();
     let app_name = app_name_arg.map(|s| s.to_string()).unwrap_or(derived);
-    if !is_valid_deployment_app_name(&app_name) {
+    if !is_valid_app_name(&app_name) {
         anyhow::bail!(
-            "invalid app name '{}': must match ^[a-z0-9][a-z0-9-]{{0,62}}$",
+            "invalid app name '{}': must match ^[a-z0-9][a-z0-9.\\-_]{{0,62}}$",
             app_name
         );
     }

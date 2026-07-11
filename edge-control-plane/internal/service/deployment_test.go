@@ -1020,21 +1020,69 @@ func TestGetArtifact_TenantMismatch(t *testing.T) {
 	}
 }
 
+// TestIsValidAppName pins the issue #438 unified contract:
+// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics,
+// dots, underscores, hyphens; first char is a lowercase letter or digit.
+// This is the single source of truth for app-name shape across the
+// control plane (deploy/activate/rollback/promote/traffic handlers,
+// AppService.Create, MigrationService.MigrateTree, and
+// MigrationHandler.MigrateTree). The Rust mirror in
+// `edge-migrate-lib/src/patterns.rs::is_valid_app_name` carries the
+// same accept/reject partitions in lockstep.
 func TestIsValidAppName(t *testing.T) {
-	if !IsValidAppName("myapp") {
-		t.Error("expected valid")
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		// Valid — basic charset
+		{"single char", "a", true},
+		{"alphanumeric", "hello", true},
+		{"with hyphen", "hello-world", true},
+		{"with underscore", "hello_world", true},
+		{"with dot", "foo.bar", true},
+		{"semver-ish suffix", "myapp.v2", true},
+		{"underscore suffix", "app_v2", true},
+		{"trailing digit", "app123", true},
+		{"starts with digit", "0app", true},
+
+		// Valid — length boundary
+		{"63 chars", strings.Repeat("a", 63), true},
+		{"63 chars mixed", "a" + strings.Repeat("b", 61) + "c", true},
+
+		// Invalid — length
+		{"empty", "", false},
+		{"64 chars", strings.Repeat("a", 64), false},
+
+		// Invalid — character class
+		{"uppercase", "Hello", false},
+		{"all uppercase", "HELLO", false},
+		{"leading underscore", "_foo", false},
+		{"leading hyphen", "-hello", false},
+		{"leading dot", ".foo", false},
+
+		// Invalid — path-traversal / charset
+		{"slash", "a/b", false},
+		{"backslash", `a\b`, false},
+		{"space", "hello world", false},
+		{"path traversal", "../traversal", false},
+		{"path with bad segment", "a/../b", false},
+
+		// Invalid — middle-of-string `..` passes THIS regex's first-char
+		// check; the handler layer's `containsPathTraversal`
+		// (`internal/handler/deployment.go`) and the storage layer's
+		// `validatePathComponent` (`internal/storage/artifact.go`) are
+		// the defense-in-depth guards that reject it. The validator
+		// alone does not — flag here so the layered contract stays
+		// visible to reviewers.
+		{"double dot middle passes regex alone", "a..b", true},
 	}
-	if !IsValidAppName("a") {
-		t.Error("expected valid for single char")
-	}
-	if IsValidAppName("") {
-		t.Error("expected invalid for empty")
-	}
-	if IsValidAppName("../evil") {
-		t.Error("expected invalid for path traversal")
-	}
-	if IsValidAppName("a/b") {
-		t.Error("expected invalid for slash")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsValidAppName(tt.input); got != tt.want {
+				t.Errorf("IsValidAppName(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
