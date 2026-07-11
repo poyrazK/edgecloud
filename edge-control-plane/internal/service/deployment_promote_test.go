@@ -473,6 +473,113 @@ func TestPromoteDeployment_AppNameSwap_HappyPath(t *testing.T) {
 	}
 }
 
+// TestPromoteDeployment_HappyPath_FansOutToAllRegions is the
+// regression-safety net for the per-region publish loop
+// specifically. PromoteDeployment is a 7-line wrapper around the
+// same activateDeployment helper that ActivateDeployment uses
+// (internal/service/deployment.go:1310-1323), so the per-region
+// fan-out is inherited verbatim — but a future refactor that
+// collapses PromoteDeployment into a separate code path could
+// silently lose the loop. This test fails immediately on such a
+// regression with a clear "promote broke fan-out" message.
+//
+// Near-clone of TestActivateDeployment_FansOutToAllRegions
+// (deployment_regions_test.go:200-318); only deltas are
+// (a) deployment row's AppName is a preview name with preview
+// metadata stamped, and (b) the call uses PromoteDeployment
+// instead of ActivateDeployment. Setup is otherwise identical:
+// 3 regions in, 3 publishes out, identical task message body
+// across all three.
+func TestPromoteDeployment_HappyPath_FansOutToAllRegions(t *testing.T) {
+	pub := newRecordingPublisher()
+	svc, drainer, mock, cleanup := activateSvcForTest(t, pub, "global")
+	defer cleanup()
+
+	const (
+		deploymentID    = "d_canary"
+		tenantID        = "t_test"
+		appName         = "myapp"
+		deploymentHash  = "canaryhash42"
+		previewID       = "pr-42"
+		previewPRNumber = 42
+	)
+	previewExpires := time.Now().Add(1 * time.Hour)
+
+	regionsCol := `{"us-east","eu-west","ap-south"}`
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		WithArgs(deploymentID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+			AddRow(deploymentID, tenantID, "myapp--pr-42", domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", "", []byte{}, 0, previewID, previewPRNumber, previewExpires))
+
+	mock.ExpectBegin()
+	expectTenantForUpdateOK(mock, tenantID)
+	mock.ExpectQuery(`SELECT.*active_deployments.*FOR UPDATE`).
+		WithArgs(tenantID, appName).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO active_deployments`)).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE active_deployments SET stable_since = NULL WHERE tenant_id = $1 AND app_name = $2`)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, max_deployments, max_apps, max_workers, max_memory_mb, max_outbound_mb, max_requests_per_month, max_resident_seconds_per_month, max_compute_ms_per_month, used_outbound_bytes, used_request_count, used_memory_mb, used_resident_seconds, used_compute_ms, quota_period_start, quota_lock_grace_until FROM quotas WHERE tenant_id =`)).
+		WithArgs(tenantID).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "max_deployments", "max_apps", "max_workers", "max_memory_mb", "max_outbound_mb", "max_requests_per_month", "max_resident_seconds_per_month", "max_compute_ms_per_month", "used_outbound_bytes", "used_request_count", "used_memory_mb", "used_resident_seconds", "used_compute_ms", "quota_period_start", "quota_lock_grace_until"}).
+			AddRow(tenantID, 100, 50, 10, 512, 1024, 100_000, 0, 0, 0, 0, 0, 0, 0, time.Now(), nil))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT tenant_id, app_name, env_key, env_value FROM app_env`)).
+		WithArgs(tenantID, appName).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "app_name", "env_key", "env_value"}))
+
+	expectInTxOutboxInsert(mock, tenantID, appName)
+	expectInTxMemoryAdd(mock, tenantID, 512)
+
+	mock.ExpectCommit()
+	expectDrainerTickSuccess(t, mock, tenantID, appName, deploymentID,
+		[]string{"us-east", "eu-west", "ap-south"}, 512)
+
+	if err := svc.PromoteDeployment(context.Background(), tenantID, appName, deploymentID, ""); err != nil {
+		t.Fatalf("PromoteDeployment: %v", err)
+	}
+	if got := pub.regionsCalled(); len(got) != 0 {
+		t.Errorf("post-Promote publisher calls = %v, want [] (durable outbox owns publish)", got)
+	}
+	drainer.Tick(context.Background())
+
+	// 3 publishes, one per region, in deployment row's order.
+	gotRegions := pub.regionsCalled()
+	wantRegions := []string{"us-east", "eu-west", "ap-south"}
+	if !equalStringSlices(gotRegions, wantRegions) {
+		t.Errorf("publish regions = %v, want %v", gotRegions, wantRegions)
+	}
+
+	// All three publishes must use the same TaskMessage body — only
+	// the region arg differs. Specifically: same DeploymentID, hash
+	// (zero here, but the slot is identical), and MaxMemoryMB.
+	if len(pub.calls) != 3 {
+		t.Fatalf("len(pub.calls) = %d, want 3", len(pub.calls))
+	}
+	first := pub.calls[0].msg.Apps[appName]
+	if first.MaxMemoryMB != 512 {
+		t.Errorf("call 0: MaxMemoryMB = %d, want 512", first.MaxMemoryMB)
+	}
+	if first.DeploymentID != deploymentID {
+		t.Errorf("call 0: DeploymentID = %q, want %q", first.DeploymentID, deploymentID)
+	}
+	for i, c := range pub.calls[1:] {
+		app := c.msg.Apps[appName]
+		if app.DeploymentID != first.DeploymentID ||
+			app.DeploymentHash != first.DeploymentHash ||
+			app.MaxMemoryMB != first.MaxMemoryMB {
+			t.Errorf("call %d: msg differs from call 0: got deploymentID=%q hash=%q maxMemoryMB=%d, want %q / %q / %d",
+				i+1, app.DeploymentID, app.DeploymentHash, app.MaxMemoryMB,
+				first.DeploymentID, first.DeploymentHash, first.MaxMemoryMB)
+		}
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
 // silenceUnused pulls in `database/sql` and `errors` only when the
 // file is also built with later tests added; not strictly needed
 // today but keeps the import set honest for the future
