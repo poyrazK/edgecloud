@@ -329,7 +329,10 @@ mod tests {
         // 1 ms exactly bills as 1.
         m.record_duration(Duration::from_millis(1));
         assert_eq!(m.snapshot().duration_ms, 1);
-        // 1.999 ms truncates to 1 (no rounding up).
+        // 1.999 ms truncates to 1 (no rounding up). `Duration::as_millis`
+        // does integer division (1_999_000 ns / 1_000_000 = 1), so the
+        // cast to u64 yields 1 — verified against the Rust stdlib.
+        // Cumulative snapshot: prior 1ms + 1ms (truncated from 1.999ms) = 2.
         m.record_duration(Duration::from_nanos(1_999_000));
         assert_eq!(m.snapshot().duration_ms, 2);
     }
