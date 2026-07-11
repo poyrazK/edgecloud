@@ -253,6 +253,33 @@ enum Command {
         /// cached deployment_id with status 200 instead of 201.
         #[arg(long, value_name = "uuid")]
         idempotency_key: Option<String>,
+
+        /// Maximum number of retries on transient failures (issue
+        /// #571): 5xx, network errors, and 429. The total number of
+        /// attempts is `1 + max_retries` — `--max-retries=3` (the
+        /// default) means up to 4 attempts. Each retry sends the
+        /// **same** `Idempotency-Key` as the first attempt so the
+        /// server's replay path returns the cached `deployment_id`
+        /// (200) instead of minting a duplicate row. `--max-retries=0`
+        /// disables retry (single attempt, fail fast).
+        #[arg(long, default_value_t = 3)]
+        max_retries: u32,
+
+        /// Base backoff in milliseconds (issue #571). The first
+        /// retry sleeps `retry_base_ms × ±25%` jitter; each
+        /// subsequent retry doubles the wait, capped at
+        /// `retry-cap-ms`. Ignored when `--max-retries=0`.
+        #[arg(long, default_value_t = 500)]
+        retry_base_ms: u64,
+
+        /// Maximum backoff in milliseconds (issue #571). Caps the
+        /// exponential backoff so a sustained outage doesn't pin a
+        /// CI job for minutes. Hard-capped at 60_000 (60s) by
+        /// `value_parser` — pass a larger value to get a clear
+        /// clap error instead of a runaway wait. Ignored when
+        /// `--max-retries=0`.
+        #[arg(long, default_value_t = 8_000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        retry_cap_ms: u64,
     },
 
     /// Inspect runtime and deployment status.
@@ -521,6 +548,9 @@ fn main() -> Result<()> {
             promote,
             lang,
             idempotency_key,
+            max_retries,
+            retry_base_ms,
+            retry_cap_ms,
         } => {
             if let Some(dep_id) = promote {
                 return commands::deploy::run_promote(&cli.path, &app, &dep_id);
@@ -570,6 +600,9 @@ fn main() -> Result<()> {
                 lang,
                 preview_opts.as_ref(),
                 idempotency_key.as_deref(),
+                max_retries,
+                retry_base_ms,
+                retry_cap_ms,
             )
         }
         Command::Status { action } => match action.unwrap_or(StatusAction::Deployment) {
