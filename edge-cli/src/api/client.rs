@@ -803,23 +803,24 @@ impl ApiClient {
         }
         let resp = req.multipart(form).send()?;
 
-        // Issue #571: surface `Rejected` as an `anyhow::Error` via
-        // `Error::new` (not `anyhow!()`) so the original `ApiError`
-        // is preserved as the root cause. `commands::deploy`'s
-        // `is_anyhow_retryable` walks the chain with `.chain()` and
-        // `downcast_ref::<ApiError>()` to decide whether to retry;
-        // a fresh `anyhow!()` would drop the type and force the
-        // retry classifier to fall back to the conservative
-        // "retry everything" default (which incorrectly retries
-        // deterministic 4xx like 400/422). The user-facing
-        // `"deploy failed: …"` prefix is preserved by chaining a
-        // `.context("deploy failed")` on top of the wrapped
+        // Issue #571: surface every error as an `anyhow::Error` via
+        // `Error::new(e).context("deploy failed")` so the original
+        // `ApiError` is preserved as the root cause of the chain.
+        // `commands::deploy`'s `is_anyhow_retryable` walks the chain
+        // with `.chain()` and `downcast_ref::<ApiError>()` to decide
+        // whether to retry; a fresh `anyhow!()` would drop the type
+        // and force the retry classifier to fall back to the
+        // conservative default (which previously retried
+        // deterministic 4xx like 400/422 and, after the tightened
+        // fall-through, would now fail to retry transient 5xx
+        // because `Transient`'s `source` field already carries an
+        // `anyhow::Error`, not the wrapping `ApiError`). The
+        // user-facing `"deploy failed: …"` prefix is preserved by
+        // chaining `.context("deploy failed")` on top of the wrapped
         // `ApiError` — anyhow renders both frames in the Display
         // chain, so the printed message stays identical.
-        let resp = check_response(resp).map_err(|e| match e {
-            ApiError::Rejected { .. } => anyhow::Error::new(e).context("deploy failed"),
-            ApiError::Transient { source } => source,
-        })?;
+        let resp =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("deploy failed"))?;
 
         let body: DeployResponse = serde_json::from_reader(resp.take(MAX_SUCCESS_BODY))?;
         Ok(body)

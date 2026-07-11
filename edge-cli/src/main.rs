@@ -276,8 +276,10 @@ enum Command {
         /// exponential backoff so a sustained outage doesn't pin a
         /// CI job for minutes. Hard-capped at 60_000 (60s) by
         /// `value_parser` — pass a larger value to get a clear
-        /// clap error instead of a runaway wait. Ignored when
-        /// `--max-retries=0`.
+        /// clap error instead of a runaway wait. Worst-case total
+        /// retry budget is `retry_cap_ms × max_retries` (plus the
+        /// per-attempt round-trip); defaults `8000 × 3` = 24s.
+        /// Ignored when `--max-retries=0`.
         #[arg(long, default_value_t = 8_000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
         retry_cap_ms: u64,
     },

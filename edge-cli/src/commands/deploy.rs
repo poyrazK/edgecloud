@@ -354,24 +354,53 @@ fn deploy_with_retry(
     }
 }
 
-/// Walk the `anyhow::Error` source chain looking for an
-/// `ApiError`; defer to its `is_retryable()` classifier when
-/// found. Falls back to `true` (retry) when the chain doesn't
-/// contain an `ApiError` — non-API errors (multipart builder,
-/// JSON serialize, IO) are conservative "retry once, the second
-/// attempt will surface the same failure" candidates. Mirrors
-/// the conservative `Transient` default in `ApiError::From<anyhow>`
-/// at `client.rs:39-43`.
+/// Walk the `anyhow::Error` source chain and decide whether the
+/// underlying failure is transient (worth retrying) or deterministic
+/// (retrying won't help).
+///
+/// The happy path is finding an [`ApiError`] in the chain — every
+/// post-send error path inside `ApiClient::deploy` is funneled
+/// through `From<reqwest::Error>`, `From<serde_json::Error>`, or
+/// `From<anyhow::Error>` for `ApiError`, so an `ApiError` is the
+/// canonical "the HTTP round-trip surfaced an error" marker. We
+/// defer to [`ApiError::is_retryable`] for the answer.
+///
+/// When the chain has **no** `ApiError` (typically because
+/// `reqwest::blocking::RequestBuilder::send` failed at the
+/// `?` operator before `check_response` could classify the
+/// response), we inspect the underlying `reqwest::Error`
+/// directly. `reqwest::Error` exposes `is_builder` /
+/// `is_connect` / `is_timeout` / `is_request` / `is_body`
+/// classifiers:
+/// - `is_builder` → URL parse, header validation, multipart
+///   construction. **Deterministic** — inputs are locally
+///   constructed and a retry hits the same failure. Don't retry.
+/// - `is_connect` / `is_timeout` / `is_request` / `is_body` →
+///   network-level failure. **Transient** — a retry may reach
+///   the server. Retry.
+///
+/// Anything else (a stray `serde_json::Error`, a non-reqwest
+/// anyhow cause) is treated as deterministic. Those failures
+/// happen *before* any HTTP traffic — JSON-serializing
+/// `BuildMetadata`, mime-str validation — and a retry hits the
+/// same broken input.
 fn is_anyhow_retryable(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
         if let Some(api) = cause.downcast_ref::<ApiError>() {
             return api.is_retryable();
         }
+        if let Some(req) = cause.downcast_ref::<reqwest::Error>() {
+            // Builder errors are deterministic — bad URL, bad
+            // header, malformed multipart. Everything else
+            // (connect, timeout, request, body, decode) is a
+            // network/transmission failure and worth retrying.
+            return !req.is_builder();
+        }
     }
-    // No ApiError in the chain — a non-HTTP error (multipart
-    // builder, JSON serialize, IO). Retry once; if the second
-    // attempt hits the same failure, the retry budget caps it.
-    true
+    // No ApiError and no reqwest::Error in the chain — a
+    // deterministic pre-send error (JSON serialize of
+    // BuildMetadata, mime-str validation, IO). Don't retry.
+    false
 }
 
 /// Exponential backoff with full jitter (issue #571).
@@ -618,5 +647,54 @@ mod tests {
         // No state.json at all — the caller has nothing to print.
         let got = url_to_print(None, "myapp");
         assert_eq!(got, None);
+    }
+
+    // F13 follow-up (issue #571 review): the `is_anyhow_retryable`
+    // classifier must distinguish transient reqwest errors
+    // (connect refused, timeout, request, body) from deterministic
+    // builder errors (URL parse, header validation, multipart
+    // construction). Pin both halves below — the regression we
+    // want to catch is "treats connection-refused as deterministic
+    // and burns the retry budget on a single attempt" or
+    // "retries URL-parse failures indefinitely."
+
+    #[test]
+    fn is_anyhow_retryable_api_error_defers_to_retryable_classifier() {
+        // Transient ApiError in the chain → retry. Mirrors the
+        // path that fires when wiremock returns 503.
+        let api: ApiError = anyhow::anyhow!("server returned 503").into();
+        let wrapped = anyhow::Error::new(api).context("deploy failed");
+        assert!(is_anyhow_retryable(&wrapped));
+    }
+
+    #[test]
+    fn is_anyhow_retryable_api_error_rejected_400_not_retryable() {
+        // Rejected ApiError in the chain → defer to
+        // ApiError::is_retryable, which returns false for
+        // non-429 4xx. Mirrors the wiremock-400 test path.
+        let api = ApiError::Rejected {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "bad request".into(),
+        };
+        let wrapped = anyhow::Error::new(api).context("deploy failed");
+        assert!(!is_anyhow_retryable(&wrapped));
+    }
+
+    #[test]
+    fn is_anyhow_retryable_no_api_no_reqwest_is_deterministic() {
+        // A pre-send error with no reqwest::Error in the chain
+        // (e.g. a JSON serialize of BuildMetadata failing). The
+        // chain has only the anyhow top frame. Don't retry —
+        // the inputs are locally constructed and a retry hits
+        // the same broken value.
+        //
+        // (The reqwest::Error connect/timeout/request/body
+        // branches are exercised end-to-end by the manual
+        // smoke-test against 127.0.0.1:9 in
+        // `tests/deploy.rs`'s comment header; reqwest 0.13
+        // doesn't expose a public constructor for those error
+        // variants, so we don't try to unit-test them here.)
+        let e = anyhow::anyhow!("invalid base url: relative URL without a base");
+        assert!(!is_anyhow_retryable(&e));
     }
 }
