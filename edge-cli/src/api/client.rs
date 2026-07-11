@@ -967,13 +967,16 @@ impl ApiClient {
             "{}/api/v1/apps/{}/promote/{}",
             self.base_url, app_name, deployment_id
         );
-        let mut req = self.http.post(&url).header("Authorization", self.auth_header());
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header());
         if !idempotency_key.is_empty() {
             req = req.header("Idempotency-Key", idempotency_key);
         }
         let resp = req.send()?;
-        let _ = check_response(resp)
-            .map_err(|e| anyhow::Error::new(e).context("promote failed"))?;
+        let _ =
+            check_response(resp).map_err(|e| anyhow::Error::new(e).context("promote failed"))?;
         Ok(())
     }
 
