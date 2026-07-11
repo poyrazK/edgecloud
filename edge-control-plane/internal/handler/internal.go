@@ -1056,7 +1056,8 @@ func (h *InternalHandler) EnrollWorker(w http.ResponseWriter, r *http.Request) {
 	stored, ok := h.enrollmentChallenges.Pop(req.WorkerID, req.PublicKey, time.Now())
 	if !ok {
 		auditRecord(r, "worker_enroll", "worker", workerID,
-			fmt.Sprintf("worker %s enrollment challenge missing or replayed", workerID),
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment challenge missing or replayed",
+				workerID, tenantID, region),
 			"failure")
 		httperror.UnauthorizedCtx(w, r, "enrollment challenge missing or replayed")
 		return
@@ -1082,7 +1083,8 @@ func (h *InternalHandler) EnrollWorker(w http.ResponseWriter, r *http.Request) {
 	digest := h2.Sum(nil)
 	if !ed25519.Verify(pubBytes, digest, sigBytes) {
 		auditRecord(r, "worker_enroll", "worker", workerID,
-			fmt.Sprintf("worker %s enrollment Ed25519 signature failed to verify", workerID),
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment Ed25519 signature failed to verify",
+				workerID, tenantID, region),
 			"failure")
 		log.Printf("enroll: worker %s Ed25519 signature verification failed", workerID)
 		httperror.UnauthorizedCtx(w, r, "signature verification failed")
@@ -1114,7 +1116,8 @@ func (h *InternalHandler) EnrollWorker(w http.ResponseWriter, r *http.Request) {
 		// separates "worker can identify itself" (register) from
 		// "worker proves identity" (enroll).
 		auditRecord(r, "worker_enroll", "worker", workerID,
-			fmt.Sprintf("worker %s enrollment failed: no registered workers row", workerID),
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment failed: no registered workers row",
+				workerID, tenantID, region),
 			"failure")
 		httperror.BadRequestCtx(w, r, "worker must register before enrolling")
 		return

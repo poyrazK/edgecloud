@@ -77,7 +77,7 @@ import (
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
 // not a strict 2× the migration number.
-const splitFileCount = 84 // 42 .up.sql + 42 .down.sql after issue #439 + #574 + #430 (workers.public_key)
+const splitFileCount = 94 // 47 .up.sql + 47 .down.sql after issue #439 + #574 + #555 + #430 (workers.public_key) + #430 length-cap review follow-up
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -968,6 +968,7 @@ var wantChecks = map[string]string{
 	"quotas.quotas_used_memory_mb_nonneg":                      "CHECK ((used_memory_mb >= 0))",                                                                                             // 027_used_memory_mb (issue #44 part 2)
 	"billing_usage_events.billing_usage_events_kind_check":     "CHECK ((kind = ANY (ARRAY['resident_seconds'::text, 'request_count'::text, 'outbound_bytes'::text, 'compute_ms'::text])))", // 030_billing_usage_events (issue #485, extended for compute_ms in #555)
 	"billing_usage_events.billing_usage_events_quantity_check": "CHECK ((quantity >= 0))",                                                                                                   // 030_billing_usage_events (issue #485)
+	"workers.workers_public_key_length_check":                  "CHECK (((public_key IS NULL) OR (length(public_key) <= 256)))",                                          // 033_workers_public_key_length (issue #430 review follow-up)
 }
 
 // wantDefaults enumerates every public-schema column that has a
