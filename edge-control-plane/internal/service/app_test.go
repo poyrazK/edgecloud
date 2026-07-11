@@ -183,7 +183,12 @@ func TestAppService_Create_AlreadyExists(t *testing.T) {
 }
 
 func TestAppService_Create_InvalidName(t *testing.T) {
-	// IsValidAppName rejects empty strings and path traversal characters.
+	// IsValidAppName (issue #438 unified regex `^[a-z0-9][a-z0-9.\-_]{0,62}$`)
+	// rejects empty strings and path-traversal shapes. Dots, underscores,
+	// and hyphens are accepted in the middle of a name; uppercase,
+	// whitespace, and slashes are not. Dotted names render as a
+	// two-label host (`t_acme-myapp.v2.edgecloud.dev`) that operators
+	// must provision `*.*.edgecloud.dev` DNS + cert to serve.
 	tests := []struct {
 		name    string
 		appName string

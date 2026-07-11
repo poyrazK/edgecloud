@@ -25,38 +25,58 @@ import (
 	"github.com/lib/pq"
 )
 
-// IsValidAppName returns true if the app name is safe for use in paths.
-// Rejects empty strings and strings containing path traversal characters.
-func IsValidAppName(name string) bool {
-	if name == "" {
-		return false
-	}
-	return !strings.ContainsAny(name, "/\\..")
-}
-
-// IsValidDeploymentAppName enforces the public-facing app name format
-// `^[a-z0-9][a-z0-9-]{0,62}$` for endpoints that accept an explicit
-// `app_name` from the client (currently `POST /api/migrate-tree`).
+// IsValidAppName enforces the edgeCloud app-name format
+// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics
+// plus dots, underscores, and hyphens. The first character must be a
+// lowercase letter or digit (rejects `_foo`, `-foo`, `.foo`, and the
+// path-traversal pair `..`).
 //
-// Distinct from `IsValidAppName`, which is a path-safety guard for
-// internal callers. The regex is mirrored in edge-migrate-lib's
-// `is_valid_deployment_app_name` and tested in lockstep — see
-// `edge-migrate/edge-migrate-lib/src/patterns.rs` and
-// `service/migration_test.go::TestIsValidDeploymentAppName`.
-func IsValidDeploymentAppName(name string) bool {
+// Issue #438 unified the previous parallel validators (the old
+// `IsValidAppName` rejected any `.`/`/`/`\`; `IsValidDeploymentAppName`
+// rejected `.` and `_`) into a single rule that allows semver-ish
+// suffixes like `myapp.v2` and `app_v2`.
+//
+// **Operator prerequisite for dotted names:** a dotted app renders as
+// `<tenant>-my.app.edgecloud.dev`, a TWO-label host. The single-level
+// `*.edgecloud.dev` wildcard DNS record and TLS cert do NOT cover it —
+// operators must additionally provision `*.*.edgecloud.dev` (DNS + cert)
+// before deploying dotted apps. The ingress renders Caddy routes that
+// match the literal FQDN atomically and, if `TLS_CERT_FILE_2`/
+// `TLS_KEY_FILE_2` are set, loads the multi-label cert alongside the
+// single-level wildcard; otherwise the per-route `tls.on_demand: {}`
+// fall-through triggers ACME on first hit for the unknown host. Single
+// label wildcard apps (`myapp-v2`, `myapp_v2`) continue to work without
+// any new operator configuration.
+//
+// This is the single source of truth for app-name shape in the control
+// plane — used by the deploy, activate, rollback, promote, and traffic
+// handlers, by `AppService.Create`, by `MigrationService.MigrateTree`,
+// and by `MigrationHandler.MigrateTree` (`POST /api/migrate-tree`).
+// The regex is mirrored in lockstep by `edge-migrate-lib`'s
+// `is_valid_app_name` (`edge-migrate/edge-migrate-lib/src/patterns.rs`),
+// declared in `edge-migrate/docs/design.md` §4.x, and surfaced in
+// `cmd/api/docs/api/openapi.yaml` as the `app_name` pattern.
+//
+// Defense-in-depth: the handler layer's `validateAppName` +
+// `containsPathTraversal` (`internal/handler/deployment.go`) and the
+// storage layer's `validatePathComponent` (`internal/storage/artifact.go`)
+// still reject path-traversal shapes (`..` substring and `/`/`\`)
+// before names reach the filesystem — this validator only enforces
+// the *shape* contract.
+func IsValidAppName(name string) bool {
 	if name == "" || len(name) > 63 {
 		return false
 	}
 	for i, r := range name {
 		isLower := r >= 'a' && r <= 'z'
 		isDigit := r >= '0' && r <= '9'
-		isHyphen := r == '-'
+		isSpecial := r == '.' || r == '_' || r == '-'
 		if i == 0 {
 			if !isLower && !isDigit {
 				return false
 			}
 		} else {
-			if !isLower && !isDigit && !isHyphen {
+			if !isLower && !isDigit && !isSpecial {
 				return false
 			}
 		}

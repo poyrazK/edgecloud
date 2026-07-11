@@ -10,6 +10,20 @@ Hosts are formatted as `<tenant_id>-<app_name>.edgecloud.dev` (e.g.
 `https://t_acme-api.edgecloud.dev`) — the `tenant_id` prefix avoids
 cross-tenant name collisions on the shared wildcard.
 
+> **Note (issue #438):** `app_name` may contain `.` or `_` (the unified
+> validator allows `^[a-z0-9][a-z0-9.\-_]{0,62}$`). For dotted names
+> like `myapp.v2`, the public hostname is a two-label host under
+> `edgecloud.dev` (`https://t_acme-myapp.v2.edgecloud.dev`), which the
+> single-level `*.edgecloud.dev` wildcard DNS record and TLS cert do
+> NOT cover. **Operators must additionally provision
+> `*.*.edgecloud.dev` DNS + a matching multi-label cert** before dotted
+> names are routable. Load the multi-label cert via `TLS_CERT_FILE_2`
+> and `TLS_KEY_FILE_2` env vars on `edge-ingress`; otherwise the
+> per-route `tls.on_demand: {}` fall-through triggers ACME on first hit
+> for the unknown host. Single-label wildcard names (`myapp-v2`,
+> `myapp_v2`) keep working under the existing single-level wildcard
+> with no new operator config.
+
 ## Architecture
 
 ```

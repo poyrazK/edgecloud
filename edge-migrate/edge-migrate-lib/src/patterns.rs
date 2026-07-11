@@ -515,15 +515,27 @@ impl RustPattern {
     }
 }
 
-/// Validate a deployment app name against the public-facing format
-/// `^[a-z0-9][a-z0-9-]{0,62}$`.
+/// Validate an app name against the edgeCloud public-facing format
+/// `^[a-z0-9][a-z0-9.\-_]{0,62}$` — 1–63 chars, lowercase alphanumerics
+/// plus dots, underscores, and hyphens. The first character must be a
+/// lowercase letter or digit.
 ///
-/// Distinct from path-safety checks (no `..`, no `/`). Used by the
-/// `edge-migrate --tree` CLI and the Go control plane's
-/// `IsValidDeploymentAppName` mirror. Keeping the regex in one place
-/// (the shared design doc) — both sides are tested against the same
-/// set of valid / invalid examples.
-pub fn is_valid_deployment_app_name(name: &str) -> bool {
+/// Locks in lockstep with the Go control plane's `IsValidAppName` in
+/// `edge-control-plane/internal/service/deployment.go` (issue #438
+/// unified the parallel validators and widened the regex to admit
+/// semver-ish suffixes like `myapp.v2` and `app_v2`).
+///
+/// **Operator prerequisite for dotted names:** a dotted name renders as
+/// a two-label host under `*.edgecloud.dev` that the single-level
+/// wildcard DNS record and TLS cert do not cover — operators must
+/// additionally provision `*.*.edgecloud.dev` (DNS + cert) before
+/// deploying dotted apps. See the Go doc for details.
+///
+/// Defense-in-depth: the CLI's `--tree` flag and
+/// `MigrationHandler.MigrateTree` both gate on this; the `..` substring
+/// and `/`/`\` characters are additionally rejected by the CLI's
+/// path-safety guards before the artifact is built.
+pub fn is_valid_app_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 63 {
         return false;
@@ -533,9 +545,9 @@ pub fn is_valid_deployment_app_name(name: &str) -> bool {
     if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
         return false;
     }
-    // Remaining chars: lowercase letter, digit, or '-'.
+    // Remaining chars: lowercase letter, digit, '.', '_', or '-'.
     for &b in &bytes[1..] {
-        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'-' {
+        if !b.is_ascii_lowercase() && !b.is_ascii_digit() && b != b'.' && b != b'_' && b != b'-' {
             return false;
         }
     }
@@ -547,34 +559,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_valid_deployment_app_name_accepts_valid() {
-        assert!(is_valid_deployment_app_name("a"));
-        assert!(is_valid_deployment_app_name("hello-world"));
-        assert!(is_valid_deployment_app_name("my-app-123"));
-        assert!(is_valid_deployment_app_name("0"));
-        assert!(is_valid_deployment_app_name("a".repeat(63).as_str()));
+    fn test_is_valid_app_name_accepts_valid() {
+        assert!(is_valid_app_name("a"));
+        assert!(is_valid_app_name("hello-world"));
+        assert!(is_valid_app_name("hello_world"));
+        assert!(is_valid_app_name("foo.bar"));
+        assert!(is_valid_app_name("myapp.v2"));
+        assert!(is_valid_app_name("app_v2"));
+        assert!(is_valid_app_name("my-app-123"));
+        assert!(is_valid_app_name("0"));
+        assert!(is_valid_app_name("a".repeat(63).as_str()));
     }
 
     #[test]
-    fn test_is_valid_deployment_app_name_rejects_invalid() {
+    fn test_is_valid_app_name_rejects_invalid() {
         // Empty
-        assert!(!is_valid_deployment_app_name(""));
+        assert!(!is_valid_app_name(""));
         // Too long (64 chars)
-        assert!(!is_valid_deployment_app_name(&"a".repeat(64)));
+        assert!(!is_valid_app_name(&"a".repeat(64)));
         // Uppercase
-        assert!(!is_valid_deployment_app_name("Hello"));
-        assert!(!is_valid_deployment_app_name("HELLO"));
-        // Starts with non-alnum
-        assert!(!is_valid_deployment_app_name("-hello"));
-        assert!(!is_valid_deployment_app_name("_hello"));
-        // Contains invalid chars
-        assert!(!is_valid_deployment_app_name("hello_world"));
-        assert!(!is_valid_deployment_app_name("hello world"));
-        assert!(!is_valid_deployment_app_name("hello.world"));
-        assert!(!is_valid_deployment_app_name("hello/world"));
-        // Path traversal
-        assert!(!is_valid_deployment_app_name("../traversal"));
-        assert!(!is_valid_deployment_app_name("a/../b"));
+        assert!(!is_valid_app_name("Hello"));
+        assert!(!is_valid_app_name("HELLO"));
+        // Starts with non-alnum (regex first-char constraint)
+        assert!(!is_valid_app_name("-hello"));
+        assert!(!is_valid_app_name("_hello"));
+        assert!(!is_valid_app_name(".foo"));
+        // Whitespace
+        assert!(!is_valid_app_name("hello world"));
+        // Slashes
+        assert!(!is_valid_app_name("hello/world"));
+        assert!(!is_valid_app_name(r"hello\world"));
+        // Path traversal (rejected by both this regex's first-char
+        // rule and the CLI's layered path-safety guards)
+        assert!(!is_valid_app_name("../traversal"));
+        assert!(!is_valid_app_name("a/../b"));
+        // Middle-of-string `..` passes the regex's first-char check;
+        // the CLI's path-safety guard is the second defense. Flagged
+        // for reviewer visibility.
+        assert!(is_valid_app_name("a..b"));
     }
 
     // ─────────────────────────────────────────────────────────────────

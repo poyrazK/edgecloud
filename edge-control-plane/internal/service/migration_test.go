@@ -537,49 +537,6 @@ func TestValidateWasm(t *testing.T) {
 	}
 }
 
-func TestIsValidDeploymentAppName(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  bool
-	}{
-		// Valid
-		{"single char", "a", true},
-		{"alphanumeric", "hello", true},
-		{"with hyphen", "hello-world", true},
-		{"trailing digit", "app123", true},
-		{"starts with digit", "0app", true},
-		{"63 chars", "a" + repeat("b", 62), true},
-		// Invalid
-		{"empty", "", false},
-		{"64 chars", "a" + repeat("b", 63), false},
-		{"uppercase", "Hello", false},
-		{"all uppercase", "HELLO", false},
-		{"starts with hyphen", "-hello", false},
-		{"underscore", "hello_world", false},
-		{"dot", "hello.world", false},
-		{"slash", "hello/world", false},
-		{"space", "hello world", false},
-		{"path traversal", "../traversal", false},
-		{"path with bad segment", "a/../b", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsValidDeploymentAppName(tt.input); got != tt.want {
-				t.Errorf("IsValidDeploymentAppName(%q) = %v, want %v", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
-func repeat(s string, n int) string {
-	out := make([]byte, 0, len(s)*n)
-	for i := 0; i < n; i++ {
-		out = append(out, s...)
-	}
-	return string(out)
-}
-
 func TestClassifyFromPatterns(t *testing.T) {
 	auto := domain.PatternInfo{Transformability: "AutoTransformable"}
 	manual := domain.PatternInfo{Transformability: "NotTransformable"}

@@ -876,6 +876,8 @@ mod tests {
             region: "test".into(),
             cert_file: "/tmp/cert.pem".into(),
             key_file: "/tmp/key.pem".into(),
+            cert_file_2: None,
+            key_file_2: None,
             listen_http: ":80".into(),
             listen_https: ":443".into(),
             refresh_debounce_ms: 1000,

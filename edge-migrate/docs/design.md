@@ -105,13 +105,13 @@ is attached to `MigrationReport.preprocessor` and `TransformResult.preprocessor`
 The CLI supports two upload modes:
 
 1. **Single file** — `edge migrate <file.c>` POSTs the file to `POST /api/migrate`. App name is derived from the file stem (`hello_world.c` → `hello_world`).
-2. **Directory / tree** — `edge-migrate --tree <DIR> [--app-name NAME]` walks the directory for `.c`/`.h` files (skipping `build/`, `target/`, `node_modules/`, etc.) and POSTs the whole tree to `POST /api/migrate-tree`. The developer supplies an explicit `--app-name` that must match `^[a-z0-9][a-z0-9-]{0,62}$`. Without `--app-name`, the dir basename is used.
+2. **Directory / tree** — `edge-migrate --tree <DIR> [--app-name NAME]` walks the directory for `.c`/`.h` files (skipping `build/`, `target/`, `node_modules/`, etc.) and POSTs the whole tree to `POST /api/migrate-tree`. The developer supplies an explicit `--app-name` that must match `^[a-z0-9][a-z0-9.\-_]{0,62}$`. Without `--app-name`, the dir basename is used.
 
 In tree mode, all transformed `.c` files are compiled together in a single clang invocation (`--target=wasm32-wasip2 -nostdlib -I <tmpdir>`) and produce one wasm binary. The server response includes a per-file `FileReport` with the patterns detected, transformations applied, and any errors.
 
 **App name derivation (single-file mode):** The app name is derived from the uploaded filename (without extension). For example, `edge migrate hello_world.c` sets the app name to `hello_world`. This is stored in the deployment record and used by `edge deploy`.
 
-For directory mode, the explicit `--app-name` is required to be a valid `^[a-z0-9][a-z0-9-]{0,62}$` name (defense-in-depth + DNS-safety for the eventual `*.edgecloud.dev` URL). See §6.1.2 for the full request/response shape.
+For directory mode, the explicit `--app-name` is required to be a valid `^[a-z0-9][a-z0-9.\-_]{0,62}$` name (defense-in-depth + DNS-safety for the eventual `*.edgecloud.dev` URL). See §6.1.2 for the full request/response shape.
 
 **Standalone binary:** `edge-migrate` is its own binary, not a subcommand of `edge-cli`. Developers install it separately: `cargo install edge-migrate`.
 
@@ -418,7 +418,7 @@ Authorization: Bearer <api-key>
 Content-Type: multipart/form-data
 
 Fields:
-  - app_name: <string>             (required; regex ^[a-z0-9][a-z0-9-]{0,62}$)
+  - app_name: <string>             (required; regex ^[a-z0-9][a-z0-9.\-_]{0,62}$)
   - language: "c" | "rust"         (required; M3 widens to both)
   - tree: <json string>            (required: {"files": ["src/main.rs", ...]})
   - file: <binary>                 (one per entry in `tree.files`; the
@@ -499,7 +499,7 @@ may still build, but the tree-level status reflects the worst file.
 | Request body | 50 MiB | `maxTreeBodyBytes` in `handler/migration.go` |
 | File count | 256 | `maxTreeFiles` in `handler/migration.go` |
 | Output wasm | 100 MiB | `MaxArtifactSize` in `service/migration.go` |
-| App name length | 1–63 | regex `^[a-z0-9][a-z0-9-]{0,62}$` |
+| App name length | 1–63 | regex `^[a-z0-9][a-z0-9.\-_]{0,62}$` |
 
 **Per-file data sources:**
 
