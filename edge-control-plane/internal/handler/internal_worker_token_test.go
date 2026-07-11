@@ -95,8 +95,13 @@ func disabledTenant(id string) *domain.Tenant {
 // -----------------------------------------------------------------------
 
 const (
-	workerTokenTestSecret       = "test-secret-must-be-at-least-32-bytes-long!"
-	workerTokenTestIssuer       = "edgecloud"
+	workerTokenTestSecret = "test-secret-must-be-at-least-32-bytes-long!"
+	workerTokenTestIssuer = "edgecloud"
+	// workerTokenTestPubkey is the hex-encoded Ed25519 public key
+	// the test server's WorkerKeyCache returns. Tests that need a
+	// different pubkey (e.g. for a kid-mismatch case) override
+	// the cache loader at the call site.
+	workerTokenTestPubkey       = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
 	workerTokenTestDefaultTTL   = 15 * time.Minute
 	workerTokenTestCustomTTL    = 5 * time.Minute
 	workerTokenTestBootstrapped = "w_us_fra_1"
@@ -133,6 +138,15 @@ func bootstrapToken(t *testing.T) string {
 // nilOnMissingTenantGetter, mockHostingGetter, …) without copying
 // the full service-graph setup.
 func newWorkerTokenServer(tg tenantGetter, hg hostingGetter, ttl time.Duration) http.Handler {
+	// Issue #430: every test server needs a WorkerKeyCache backing
+	// the per-worker derivation path. The cache's loader returns
+	// the same pubkey the bootstrap handshake would have persisted
+	// on the workers row, so the derived signing key matches the
+	// production computation byte-for-byte. Tests that need a
+	// non-enrolled worker can override the cache's loader.
+	keyCache := middleware.NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return workerTokenTestPubkey, nil
+	})
 	h := &InternalHandler{
 		tenantSvc:        tg,
 		workerHostingSvc: hg,
@@ -140,15 +154,17 @@ func newWorkerTokenServer(tg tenantGetter, hg hostingGetter, ttl time.Duration) 
 		activeKID:        "",
 		workerTokenTTL:   ttl,
 		workerJWTConfig: middleware.WorkerJWTConfig{
-			Secret: workerTokenTestSecret,
-			Issuer: workerTokenTestIssuer,
+			Secret:         workerTokenTestSecret,
+			Issuer:         workerTokenTestIssuer,
+			WorkerKeyCache: keyCache,
 		},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/internal/tokens/tenant", h.MintWorkerToken)
 	return middleware.WorkerAuth(middleware.WorkerJWTConfig{
-		Secret: workerTokenTestSecret,
-		Issuer: workerTokenTestIssuer,
+		Secret:         workerTokenTestSecret,
+		Issuer:         workerTokenTestIssuer,
+		WorkerKeyCache: keyCache,
 	})(mux)
 }
 
@@ -184,9 +200,17 @@ func postToken(t *testing.T, srv http.Handler, bearer string, req WorkerTokenReq
 // exp/iat present, claims parseable).
 func decodeIssuedToken(t *testing.T, signed string) *middleware.WorkerClaims {
 	t.Helper()
+	// Issue #430: the minted token carries a wkr_ kid, so verify
+	// must use the same WorkerKeyCache the mint path used. The
+	// cache loader returns the test pubkey the mint handler also
+	// saw — derivation is byte-for-byte symmetric.
+	verifyCache := middleware.NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return workerTokenTestPubkey, nil
+	})
 	claims, err := middleware.VerifyWorkerJWT(signed, middleware.WorkerJWTConfig{
-		Secret: workerTokenTestSecret,
-		Issuer: workerTokenTestIssuer,
+		Secret:         workerTokenTestSecret,
+		Issuer:         workerTokenTestIssuer,
+		WorkerKeyCache: verifyCache,
 	})
 	if err != nil {
 		t.Fatalf("issued token failed to verify: %v", err)

@@ -57,7 +57,8 @@ import (
 //     tenants FOR UPDATE + idempotency Lookup (miss) +
 //     active_deployments FOR UPDATE + INSERT active_deployments +
 //     ClearStableSince + quotas + app_env + outbox INSERT + memory add
-//     + idempotency INSERT + Commit) plus (N-1) "cache hit" replays
+//
+//   - idempotency INSERT + Commit) plus (N-1) "cache hit" replays
 //     (Begin + tenants FOR UPDATE + idempotency Lookup (hit) +
 //     Commit). The drainer flow (ClaimDue + per-region publish +
 //     MarkPublished) is staged exactly once because exactly one outbox
