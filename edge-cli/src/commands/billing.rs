@@ -79,8 +79,7 @@ fn portal(path: &Path, return_url: Option<&str>) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let return_url = return_url
         .map(str::to_string)
-        .or_else(|| edge_toml.deployment.api.clone())
-        .unwrap_or_else(|| "https://edgecloud.dev/account".to_string());
+        .unwrap_or_else(|| edge_toml.web_url("https://edgecloud.dev/account"));
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
     let session = client
         .create_billing_portal(&return_url)
@@ -115,22 +114,41 @@ fn open_url(url: &str, label: &str) -> Result<()> {
 }
 
 fn print_subscription(sub: &BillingSubscriptionResponse) {
-    println!("Tenant ID:          {}", sub.tenant_id);
-    println!("Provider:           {}", sub.provider);
-    println!("Plan:               {}", sub.plan);
-    println!("Status:             {}", sub.status);
-    println!("Cancel at period:   {}", sub.cancel_at_period_end);
+    // Compute the widest label so the column stays aligned even when
+    // a future field is added. The label set includes both the
+    // unconditional labels and the longest possible conditional one
+    // — conditional labels are rendered via the same output::kv
+    // helper with the same width, so a missed include only changes
+    // the column width by a few chars (cosmetic, not correctness).
+    let labels = [
+        "Tenant ID:",
+        "Provider:",
+        "Plan:",
+        "Status:",
+        "Cancel at period:",
+        "Current period end:",
+        "Customer ID:",
+        "Subscription ID:",
+        "Created:",
+        "Updated:",
+    ];
+    let width = labels.iter().map(|l| l.len()).max().unwrap_or(0);
+    output::kv("Tenant ID:", &sub.tenant_id, width);
+    output::kv("Provider:", &sub.provider, width);
+    output::kv("Plan:", &sub.plan, width);
+    output::kv("Status:", &sub.status, width);
+    output::kv("Cancel at period:", sub.cancel_at_period_end, width);
     if let Some(v) = sub.current_period_end.as_deref() {
-        println!("Current period end: {v}");
+        output::kv("Current period end:", v, width);
     }
     if let Some(v) = sub.provider_customer_id.as_deref() {
-        println!("Customer ID:        {v}");
+        output::kv("Customer ID:", v, width);
     }
     if let Some(v) = sub.provider_subscription_id.as_deref() {
-        println!("Subscription ID:    {v}");
+        output::kv("Subscription ID:", v, width);
     }
-    println!("Created:            {}", sub.created_at);
-    println!("Updated:            {}", sub.updated_at);
+    output::kv("Created:", &sub.created_at, width);
+    output::kv("Updated:", &sub.updated_at, width);
 }
 
 #[cfg(not(feature = "network"))]

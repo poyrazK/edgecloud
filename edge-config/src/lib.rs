@@ -81,6 +81,41 @@ pub fn read_api_url(fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// Read the developer-facing web URL with precedence: `EDGE_WEB_URL` env
+/// var → config file → `fallback`. Used by `edge billing portal` to
+/// decide where Stripe should send the user when they leave the hosted
+/// portal, and by anything else that links out to the operator's
+/// user-facing console. Kept distinct from `read_api_url` because the
+/// API host and the web console host are usually different subdomains
+/// (e.g. `api.edgecloud.dev` vs `edgecloud.dev`).
+pub fn read_web_url(fallback: &str) -> String {
+    if let Ok(u) = std::env::var("EDGE_WEB_URL") {
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    if let Some(path) = config_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            #[derive(serde::Deserialize)]
+            struct Cfg {
+                default: DefaultSection,
+            }
+            #[derive(serde::Deserialize)]
+            struct DefaultSection {
+                web: Option<String>,
+            }
+            if let Ok(cfg) = toml::from_str::<Cfg>(&content) {
+                if let Some(u) = cfg.default.web {
+                    if !u.is_empty() {
+                        return u;
+                    }
+                }
+            }
+        }
+    }
+    fallback.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +234,33 @@ mod tests {
         let result = read_api_url("fb");
         std::env::remove_var("EDGE_API_URL");
         assert_eq!(result, "fb");
+    }
+
+    #[test]
+    fn read_web_url_env_var_takes_priority() {
+        let _guard = lock_env();
+        std::env::set_var("EDGE_WEB_URL", "https://web.example.com");
+        let result = read_web_url("https://fallback.example.com");
+        assert_eq!(result, "https://web.example.com");
+        std::env::remove_var("EDGE_WEB_URL");
+    }
+
+    #[test]
+    fn read_web_url_env_var_empty_falls_through() {
+        let _guard = lock_env();
+        std::env::set_var("EDGE_WEB_URL", "");
+        let result = read_web_url("https://fallback.example.com");
+        std::env::remove_var("EDGE_WEB_URL");
+        // Empty env + no real config file → falls through to fallback
+        assert_eq!(result, "https://fallback.example.com");
+    }
+
+    #[test]
+    fn read_web_url_no_env_returns_fallback() {
+        let _guard = lock_env();
+        std::env::remove_var("EDGE_WEB_URL");
+        let result = read_web_url("https://default.example.com");
+        std::env::remove_var("EDGE_WEB_URL");
+        assert_eq!(result, "https://default.example.com");
     }
 }
