@@ -11,25 +11,40 @@
 //! `read_dir` entirely. The steady-state hot path is one `stat`-class
 //! syscall (`app_dir.exists()`) instead of `stat` + open + readdir.
 //!
+//! `app_dir.exists()` runs BEFORE `create_dir_all` so the WARN can
+//! observe "dir does not yet exist" — issue #558 shipped the check
+//! after the create, which made `had_app_dir` structurally always-true
+//! and the WARN silently dead code.
+//!
 //! This test asserts the on-the-wire observable: a tracing subscriber
-//! that captures WARN-level records. The first construction for a
-//! fresh (tenant, app) with legacy tenant-root files fires the WARN;
-//! a subsequent construction for the same (tenant, app) does not —
-//! because `had_app_dir` is true and `read_dir` is skipped.
+//! scoped via `tracing::subscriber::with_default` to the test body,
+//! capturing WARN-level records into a shared `Arc<Mutex<Vec<u8>>>`
+//! buffer. We avoid `set_global_default` because cargo runs tests in
+//! parallel within a single binary — a global subscriber would
+//! cross-pollinate buffers between sibling tests. `with_default`
+//! scopes the subscriber to a closure, so the test sees only its own
+//! WARNs.
+//!
+//! The single `#[test]` body covers both branches:
+//!
+//!   - Positive: legacy tenant-root file present → WARN fires on the
+//!     first construction for a fresh (tenant, app), never again.
+//!   - Negative: empty tenant root → WARN does NOT fire, even on the
+//!     first construction.
+//!
+//! Both `(tenant, app)` pairs run in the same `EDGE_FS_PATH` tempdir
+//! because `EDGE_FS_PATH` is read into a process-static `OnceLock` in
+//! `runtime.rs` — once initialized, subsequent `set_var` calls are
+//! ignored. Running positive and negative in the same test body
+//! ensures they share the same OnceLock value.
 //!
 //! Lives in a separate cargo `[[test]]` binary from
-//! `preopen_per_app_migration.rs` because `EDGE_FS_PATH` is read into
-//! a process-static `OnceLock` in `runtime.rs`. Each `tests/*.rs`
-//! integration binary is built separately, so each gets its own
-//! `OnceLock` initialization. A second reason to isolate this test:
-//! `tracing::subscriber::set_global_default` can only be called once
-//! per process, so any WARN-capturing test needs to own the global
-//! subscriber.
+//! `preopen_per_app_migration.rs` for the same reason.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
 use edge_runtime::{EgressPolicy, RuntimeState};
@@ -59,14 +74,8 @@ fn build_state(tenant_id: &str, app_name: &str) -> RuntimeState {
     )
 }
 
-/// Shared captured-output buffer. `MakeWriter` requires `Clone`, so we
-/// store an `Arc<Mutex<Vec<u8>>>` in a `OnceLock` and clone the `Arc`
-/// into each writer instance.
-fn captured() -> Arc<Mutex<Vec<u8>>> {
-    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
-}
-
+/// Writer that appends each `write` call to a shared `Vec<u8>`.
+/// `MakeWriter` requires `Clone`, so we wrap the buffer in an `Arc`.
 #[derive(Clone)]
 struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -88,85 +97,116 @@ impl Write for CaptureGuard {
     }
 }
 
-fn install_capture_subscriber() {
-    let buf = captured();
-    let writer = CaptureWriter(buf.clone());
-    let subscriber = tracing_subscriber::fmt()
+/// Build a fresh subscriber writing into `buf`. Caller is expected to
+/// invoke this subscriber via `tracing::subscriber::with_default(...)`
+/// so it stays scoped to the test body.
+fn make_subscriber(buf: Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send + Sync + 'static {
+    let writer = CaptureWriter(buf);
+    tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .with_writer(writer)
         .with_ansi(false)
-        .finish();
-    // set_global_default returns Err if a subscriber is already set;
-    // ignore that — earlier tests may have installed one and we don't
-    // care for the WARN-presence assertions below (the test relies on
-    // the WARN text being absent on the second construction; if a prior
-    // subscriber swallows the WARN, the assertion is still correct
-    // because `contains("per-app preopen: starting empty")` will be
-    // false on the second read regardless).
-    let _ = tracing::subscriber::set_global_default(subscriber);
+        .finish()
 }
 
-fn warn_lines_for_preopen(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+fn warn_lines_for_preopen(
+    buf: &Arc<Mutex<Vec<u8>>>,
+    tenant_id: &str,
+    app_name: &str,
+) -> Vec<String> {
     let raw = buf.lock().unwrap().clone();
     let s = String::from_utf8_lossy(&raw);
+    // Match WARN lines for the specific (tenant_id, app_name) pair so
+    // earlier-positive or earlier-negative constructions don't leak
+    // across assertions.
+    let tag = format!("tenant_id=\"{}\"", tenant_id);
     s.lines()
-        .filter(|l| l.contains("per-app preopen: starting empty"))
+        .filter(|l| l.contains("per-app preopen: starting empty") && l.contains(&tag))
+        .filter(|l| l.contains(&format!("app_name=\"{}\"", app_name)))
         .map(|l| l.to_string())
         .collect()
 }
 
 #[test]
-fn migration_warn_fires_only_on_first_construction_per_app() {
-    let buf = captured();
-    buf.lock().unwrap().clear();
-    install_capture_subscriber();
+fn migration_warn_fires_once_with_legacy_and_never_without() {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = make_subscriber(buf.clone());
 
-    let base = tempfile::tempdir().expect("tempdir");
-    let base_path: PathBuf = base.path().to_path_buf();
-    std::env::set_var("EDGE_FS_PATH", &base_path);
+    tracing::subscriber::with_default(subscriber, || {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base_path: PathBuf = base.path().to_path_buf();
+        std::env::set_var("EDGE_FS_PATH", &base_path);
 
-    let tenant_id = "tenant-warn-once";
-    let app_name = "fresh-app";
+        // ── POSITIVE: legacy file present ──────────────────────────
+        // Pre-#558 shape: tenant root has files but no per-app subdir.
+        // First construction for a fresh (tenant, app) fires the WARN
+        // exactly once; subsequent constructions must NOT re-fire.
+        let pos_tenant = "tenant-positive";
+        let pos_app = "fresh-app";
+        let pos_root = base_path.join(pos_tenant);
+        std::fs::create_dir_all(&pos_root).expect("create pos tenant root");
+        std::fs::write(pos_root.join("legacy.txt"), b"pre-558 file").expect("write legacy");
 
-    // Pre-existing legacy file at the tenant root (pre-#558 shape).
-    let tenant_root = base_path.join(tenant_id);
-    std::fs::create_dir_all(&tenant_root).expect("create tenant root");
-    std::fs::write(tenant_root.join("legacy.txt"), b"pre-558 file").expect("write legacy");
+        let _state1 = build_state(pos_tenant, pos_app);
+        let pos_after_first = warn_lines_for_preopen(&buf, pos_tenant, pos_app);
+        assert_eq!(
+            pos_after_first.len(),
+            1,
+            "positive: first construction with legacy tenant-root files must fire the migration WARN exactly once; got {} lines:\n{}",
+            pos_after_first.len(),
+            pos_after_first.join("\n")
+        );
 
-    // First construction for this (tenant, app): WARN should fire.
-    let _state1 = build_state(tenant_id, app_name);
-    let after_first = warn_lines_for_preopen(&buf);
-    assert_eq!(
-        after_first.len(),
-        1,
-        "first construction with legacy tenant-root files must fire the migration WARN exactly once; got {} lines:\n{}",
-        after_first.len(),
-        after_first.join("\n")
-    );
+        let _state2 = build_state(pos_tenant, pos_app);
+        let pos_after_second = warn_lines_for_preopen(&buf, pos_tenant, pos_app);
+        assert_eq!(
+            pos_after_second.len(),
+            1,
+            "positive: second construction must NOT re-fire the migration WARN; got {} lines:\n{}",
+            pos_after_second.len(),
+            pos_after_second.join("\n")
+        );
 
-    // Second construction for the SAME (tenant, app): the per-app
-    // subdir now exists, so the new code path skips `read_dir`
-    // entirely and the WARN must NOT re-fire. Before the fix this
-    // assertion would catch a duplicate WARN line because the old
-    // code ran `read_dir` every time and re-checked the condition.
-    let _state2 = build_state(tenant_id, app_name);
-    let after_second = warn_lines_for_preopen(&buf);
-    assert_eq!(
-        after_second.len(),
-        1,
-        "second construction must NOT re-fire the migration WARN; got {} lines:\n{}",
-        after_second.len(),
-        after_second.join("\n")
-    );
+        let _state3 = build_state(pos_tenant, pos_app);
+        let pos_after_third = warn_lines_for_preopen(&buf, pos_tenant, pos_app);
+        assert_eq!(
+            pos_after_third.len(),
+            1,
+            "positive: subsequent constructions must NOT re-fire the migration WARN; got {} lines:\n{}",
+            pos_after_third.len(),
+            pos_after_third.join("\n")
+        );
 
-    // Third construction: still no re-fire.
-    let _state3 = build_state(tenant_id, app_name);
-    let after_third = warn_lines_for_preopen(&buf);
-    assert_eq!(
-        after_third.len(),
-        1,
-        "subsequent constructions must NOT re-fire the migration WARN; got {} lines:\n{}",
-        after_third.len(),
-        after_third.join("\n")
-    );
+        // ── NEGATIVE: empty tenant root ───────────────────────────
+        // The inner guard `if had_tenant_files { warn!() }` must
+        // suppress the WARN when the tenant root has no legacy files.
+        // The per-app subdir does not exist yet, so the outer
+        // `!had_app_dir` branch IS entered — but with no files, no
+        // WARN fires.
+        let neg_tenant = "tenant-negative";
+        let neg_app = "fresh-app";
+        let neg_root = base_path.join(neg_tenant);
+        std::fs::create_dir_all(&neg_root).expect("create neg tenant root");
+        // No legacy file written — tenant root is empty.
+
+        let _state_neg1 = build_state(neg_tenant, neg_app);
+        let neg_after_first = warn_lines_for_preopen(&buf, neg_tenant, neg_app);
+        assert_eq!(
+            neg_after_first.len(),
+            0,
+            "negative: first construction with EMPTY tenant root must NOT fire the migration WARN; got {} lines:\n{}",
+            neg_after_first.len(),
+            neg_after_first.join("\n")
+        );
+
+        let _state_neg2 = build_state(neg_tenant, neg_app);
+        let neg_after_second = warn_lines_for_preopen(&buf, neg_tenant, neg_app);
+        assert_eq!(
+            neg_after_second.len(),
+            0,
+            "negative: subsequent construction with empty tenant root must NOT fire the migration WARN; got {} lines:\n{}",
+            neg_after_second.len(),
+            neg_after_second.join("\n")
+        );
+    });
 }

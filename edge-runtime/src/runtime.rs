@@ -1168,22 +1168,21 @@ fn build_wasi_ctx_for_tenant(
             );
         } else {
             let app_dir = base.join(tenant_id).join(app_name);
-            // Check `app_dir.exists()` BEFORE `create_dir_all` runs so the
-            // migration WARN can observe "dir does not yet exist". After
-            // `create_dir_all` succeeds, `had_app_dir` would always be
-            // true and the WARN would never fire — issue #558 shipped
-            // this check after the create, which silently broke the
-            // intended one-shot WARN.
-            //
             // Issue #606 — this function runs per request on the FaaS
             // path (`RuntimeState::with_env_and_meter` is called once per
-            // accepted HTTP request). The `read_dir(&tenant_root)`
-            // syscall below is wasted work once the per-app subdir
-            // already exists, since the WARN never re-fires
-            // (`had_app_dir` short-circuits the guard). The `exists()`
-            // check we already pay for is the one-shot gate. Steady-
-            // state hot path is now a single `stat`-class syscall
-            // instead of `stat` + open + readdir.
+            // accepted HTTP request). `app_dir.exists()` is the single
+            // gate: when it returns true, the per-app subdir is already
+            // on disk, the WARN cannot re-fire, and `create_dir_all`
+            // would be a wasted `mkdir` syscall. Skip both. Steady-
+            // state hot path is a single `stat`-class syscall
+            // (`exists()`), no `mkdir`, no `readdir`.
+            //
+            // Issue #558 follow-up — when `exists()` returns false we
+            // run the WARN gate before `create_dir_all`. The original
+            // #558 PR ordered these the other way (create first, then
+            // check), which made `had_app_dir` structurally always-true
+            // and silently broke the one-shot WARN. The WARN now lives
+            // in the `!had_app_dir` branch where it can actually fire.
             let had_app_dir = app_dir.exists();
             if !had_app_dir {
                 let tenant_root = base.join(tenant_id);
@@ -1209,7 +1208,18 @@ fn build_wasi_ctx_for_tenant(
                     );
                 }
             }
-            match std::fs::create_dir_all(&app_dir) {
+            // Skip `create_dir_all` entirely on the hot path. When
+            // `had_app_dir` is true the per-app subdir is already on
+            // disk and `mkdir` would only burn a syscall. When it is
+            // false we DO need to create (first request for a fresh
+            // app, or the dir was deleted under us), and any error
+            // path still surfaces via the WARN below.
+            let app_dir_ready = if had_app_dir {
+                Ok(())
+            } else {
+                std::fs::create_dir_all(&app_dir)
+            };
+            match app_dir_ready {
                 Ok(()) => {
                     if let Err(e) =
                         builder.preopened_dir(&app_dir, "/", DirPerms::all(), FilePerms::all())
