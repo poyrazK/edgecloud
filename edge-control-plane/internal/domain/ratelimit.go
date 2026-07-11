@@ -38,10 +38,14 @@ type TenantRateLimitRequest struct {
 // "feature disabled for this tenant" and the renderer skips emitting
 // a rate_limit route (fail-open — same shape as the quota 402 cache
 // at issue #420).
+//
+// `db:` tags mirror the underlying column names so QuotaRepository.GetRateLimit
+// can scan the SELECT result directly into this struct via sqlx.GetContext.
+// Without them, sqlx errors with "missing destination name tenant_id".
 type TenantRateLimitResponse struct {
-	TenantID        string `json:"tenant_id"`
-	RPS             int32  `json:"rps"`
-	Burst           int32  `json:"burst"`
-	ConcurrentLimit int32  `json:"concurrent_limit"`
-	BandwidthBps    int64  `json:"bandwidth_bps"`
+	TenantID        string `db:"tenant_id"        json:"tenant_id"`
+	RPS             int32  `db:"tenant_rate_limit_rps"     json:"rps"`
+	Burst           int32  `db:"tenant_rate_limit_burst"   json:"burst"`
+	ConcurrentLimit int32  `db:"tenant_concurrent_limit"   json:"concurrent_limit"`
+	BandwidthBps    int64  `db:"tenant_bandwidth_bps"      json:"bandwidth_bps"`
 }

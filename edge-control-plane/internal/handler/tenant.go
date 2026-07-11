@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -15,10 +16,26 @@ import (
 // TenantHandler handles tenant HTTP requests.
 type TenantHandler struct {
 	tenantSvc service.TenantServiceInterface
+	// quotaRepo is the per-tenant rate-limit write surface (issue #305).
+	// The service layer is intentionally bypassed for this admin path —
+	// it is a thin write-through with no business logic, and the
+	// existing QuotaOverride pattern keeps the service layer out of
+	// the audit-logged admin hot path. nil is acceptable for handlers
+	// that never call SetTenantRateLimitAdmin; production wiring in
+	// app.New always sets it.
+	quotaRepo QuotaRepoForAdminWrite
 }
 
-func NewTenantHandler(tenantSvc service.TenantServiceInterface) *TenantHandler {
-	return &TenantHandler{tenantSvc: tenantSvc}
+// QuotaRepoForAdminWrite is the narrow slice of *repository.QuotaRepository
+// the admin rate-limit endpoint needs (issue #305). Mirrors the
+// QuotaRepoForRateLimit pattern on QuotaHandler: handler tests inject
+// a mock that satisfies only this one method, no full repo stand-up.
+type QuotaRepoForAdminWrite interface {
+	SetRateLimit(ctx context.Context, tenantID string, req domain.TenantRateLimitRequest) (*domain.TenantRateLimitResponse, error)
+}
+
+func NewTenantHandler(tenantSvc service.TenantServiceInterface, quotaRepo QuotaRepoForAdminWrite) *TenantHandler {
+	return &TenantHandler{tenantSvc: tenantSvc, quotaRepo: quotaRepo}
 }
 
 type CreateTenantRequest struct {
@@ -376,5 +393,81 @@ func (h *TenantHandler) QuotaOverride(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(tq); err != nil {
 		log.Printf("QuotaOverride: failed to encode response: %v", err)
+	}
+}
+
+// SetTenantRateLimitAdmin handles
+// PUT /api/v1/admin/tenants/{tenantID}/rate-limit (issue #305, owner-role
+// admin endpoint for per-tenant data-plane rate limiting). Mirrors the
+// shape of QuotaOverride at internal/handler/tenant.go:304-380 but for
+// the four tenant-rate-limit columns instead of the existing monthly
+// quota caps. Every call is audit-logged via auditRecord.
+//
+// Sentinel semantics match the existing Max* columns on the quotas
+// table: any field < 0 is the unlimited signal; == 0 means "unset /
+// admin-cleared" (skip the cap check); > 0 is the cap. The renderer
+// at edge-ingress/src/caddy.rs treats < 0 as "no cap" identically to
+// == 0 (defensive — both should disable the rate_limit route), so the
+// admin UI is free to send either. We validate >= -1 at the handler
+// boundary so a typo doesn't quietly turn into a large unsigned.
+//
+// Returns 404 when the tenant has no quotas row (callers must
+// provision the tenant first via the existing tenant-create path).
+func (h *TenantHandler) SetTenantRateLimitAdmin(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		httperror.BadRequestCtx(w, r, "invalid tenant id")
+		return
+	}
+
+	var req domain.TenantRateLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+
+	// -1 is the unlimited sentinel for the integer axes. Any other
+	// negative value is rejected so a typo doesn't quietly turn into
+	// a large unsigned when the value crosses the JSON int boundary
+	// into the SQL INTEGER column. BandwidthBPS is int64 — same -1
+	// rule applies.
+	if req.RPS < -1 {
+		httperror.BadRequestCtx(w, r, "rps: must be -1 (unlimited) or >= 0")
+		return
+	}
+	if req.Burst < -1 {
+		httperror.BadRequestCtx(w, r, "burst: must be -1 (unlimited) or >= 0")
+		return
+	}
+	if req.ConcurrentLimit < -1 {
+		httperror.BadRequestCtx(w, r, "concurrent_limit: must be -1 (unlimited) or >= 0")
+		return
+	}
+	if req.BandwidthBPS < -1 {
+		httperror.BadRequestCtx(w, r, "bandwidth_bps: must be -1 (unlimited) or >= 0")
+		return
+	}
+
+	rl, err := h.quotaRepo.SetRateLimit(r.Context(), tenantID, req)
+	if err != nil {
+		log.Printf("SetTenantRateLimitAdmin(%s): %v", tenantID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if rl == nil {
+		// No quotas row — the tenant exists but the platform hasn't
+		// provisioned a quotas row for them yet. Surface as 404 so
+		// operators know to fix the upstream provisioning rather
+		// than retrying.
+		httperror.NotFoundCtx(w, r, "tenant not found")
+		return
+	}
+
+	auditRecord(r, "rate_limit.set", "tenant", tenantID,
+		"per-tenant data-plane rate limit updated for tenant "+tenantID, "success")
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(rl); err != nil {
+		log.Printf("SetTenantRateLimitAdmin(%s): failed to encode response: %v", tenantID, err)
 	}
 }

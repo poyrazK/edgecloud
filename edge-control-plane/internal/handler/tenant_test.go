@@ -112,6 +112,229 @@ func (m *mockTenantSvc) OverrideTenantQuota(ctx context.Context, req service.Quo
 }
 
 // ---------------------------------------------------------------------------
+// SetTenantRateLimitAdmin (issue #305 — admin write path)
+// ---------------------------------------------------------------------------
+//
+// mockTenantRateLimitRepo satisfies the narrow QuotaRepoForAdminWrite
+// interface (just SetRateLimit). Mirrors the narrow-interface mock
+// pattern used by the per-app rate-limit tests at traffic_test.go.
+
+type mockTenantRateLimitRepo struct {
+	rl           *domain.TenantRateLimitResponse
+	rlErr        error
+	calls        int
+	lastReq      domain.TenantRateLimitRequest
+	lastTenantID string
+}
+
+func (m *mockTenantRateLimitRepo) SetRateLimit(ctx context.Context, tenantID string, req domain.TenantRateLimitRequest) (*domain.TenantRateLimitResponse, error) {
+	m.calls++
+	m.lastReq = req
+	m.lastTenantID = tenantID
+	if m.rlErr != nil {
+		return nil, m.rlErr
+	}
+	return m.rl, nil
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_HappyPath pins the
+// happy-path admin PUT (issue #305). Asserts:
+//   - 200 status with the response body echoing the stored row
+//   - repo was called exactly once with the request body verbatim
+//   - audit log entry was attempted via auditRecord (the audit
+//     helper writes to the global DefaultAuditor; the handler
+//     calls it as a side effect).
+func TestTenantHandler_SetTenantRateLimitAdmin_HappyPath(t *testing.T) {
+	repo := &mockTenantRateLimitRepo{
+		rl: &domain.TenantRateLimitResponse{
+			TenantID:        "t_acme",
+			RPS:             100,
+			Burst:           200,
+			ConcurrentLimit: 50,
+			BandwidthBps:    5_000_000,
+		},
+	}
+	svc := &mockTenantSvc{}
+	h := handler.NewTenantHandler(svc, repo)
+
+	body := `{"rps":100,"burst":200,"concurrent_limit":50,"bandwidth_bps":5000000}`
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var rl domain.TenantRateLimitResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &rl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rl.RPS != 100 || rl.Burst != 200 || rl.ConcurrentLimit != 50 || rl.BandwidthBps != 5_000_000 {
+		t.Errorf("response = %+v, want rps=100 burst=200 conc=50 bw=5000000", rl)
+	}
+	if repo.calls != 1 {
+		t.Errorf("repo.SetRateLimit calls = %d, want 1", repo.calls)
+	}
+	if repo.lastTenantID != "t_acme" {
+		t.Errorf("repo tenantID = %q, want t_acme", repo.lastTenantID)
+	}
+	if repo.lastReq.RPS != 100 || repo.lastReq.BandwidthBPS != 5_000_000 {
+		t.Errorf("repo req = %+v, want rps=100 bw=5000000", repo.lastReq)
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_AllZero pins the
+// "feature disabled" path: an admin PUT with all zeros clears the
+// cap (the renderer treats zero as "skip the cap check", same as
+// any other unset quota cap).
+func TestTenantHandler_SetTenantRateLimitAdmin_AllZero(t *testing.T) {
+	repo := &mockTenantRateLimitRepo{
+		rl: &domain.TenantRateLimitResponse{TenantID: "t_acme"},
+	}
+	h := handler.NewTenantHandler(&mockTenantSvc{}, repo)
+
+	body := `{"rps":0,"burst":0,"concurrent_limit":0,"bandwidth_bps":0}`
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if repo.lastReq.RPS != 0 {
+		t.Errorf("repo rps = %d, want 0", repo.lastReq.RPS)
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_UnlimitedSentinel pins
+// the -1 (unlimited) sentinel. The handler accepts -1 on every axis;
+// the renderer at edge-ingress treats both 0 (unset) and -1
+// (unlimited) as "no cap", but the admin UI is free to send either
+// and operators expect their input to round-trip without surprise.
+func TestTenantHandler_SetTenantRateLimitAdmin_UnlimitedSentinel(t *testing.T) {
+	repo := &mockTenantRateLimitRepo{
+		rl: &domain.TenantRateLimitResponse{
+			TenantID: "t_acme", RPS: -1, Burst: -1, ConcurrentLimit: -1, BandwidthBps: -1,
+		},
+	}
+	h := handler.NewTenantHandler(&mockTenantSvc{}, repo)
+
+	body := `{"rps":-1,"burst":-1,"concurrent_limit":-1,"bandwidth_bps":-1}`
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if repo.lastReq.RPS != -1 {
+		t.Errorf("repo rps = %d, want -1 (unlimited)", repo.lastReq.RPS)
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_RejectsNonNegative
+// asserts the validation guard: any axis < -1 is rejected so a typo
+// doesn't quietly turn into a large unsigned. Mirrors the validation
+// at QuotaOverride for max_requests_per_month / max_outbound_mb.
+func TestTenantHandler_SetTenantRateLimitAdmin_RejectsNonNegative(t *testing.T) {
+	for _, bad := range []struct {
+		field string
+		body  string
+	}{
+		{"rps", `{"rps":-2}`},
+		{"burst", `{"burst":-99}`},
+		{"concurrent_limit", `{"concurrent_limit":-3}`},
+		{"bandwidth_bps", `{"bandwidth_bps":-100}`},
+	} {
+		h := handler.NewTenantHandler(&mockTenantSvc{}, &mockTenantRateLimitRepo{})
+		req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(bad.body))
+		req.SetPathValue("tenantID", "t_acme")
+		rr := httptest.NewRecorder()
+		h.SetTenantRateLimitAdmin(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 for value below -1; body: %s", bad.field, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_NoQuotasRow pins the
+// 404 path: the tenant exists but the platform hasn't provisioned
+// a quotas row. Operators must fix upstream provisioning rather
+// than retry.
+func TestTenantHandler_SetTenantRateLimitAdmin_NoQuotasRow(t *testing.T) {
+	repo := &mockTenantRateLimitRepo{rl: nil} // SetRateLimit returns (nil, nil)
+	h := handler.NewTenantHandler(&mockTenantSvc{}, repo)
+
+	body := `{"rps":100}`
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_orphan/rate-limit", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_orphan")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_DBError pins the 500
+// path on transient DB error. Body must not leak the raw error
+// text (mirror QuotaOverride_ServiceError test).
+func TestTenantHandler_SetTenantRateLimitAdmin_DBError(t *testing.T) {
+	repo := &mockTenantRateLimitRepo{rlErr: errors.New("internal database explosion")}
+	h := handler.NewTenantHandler(&mockTenantSvc{}, repo)
+
+	body := `{"rps":100}`
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(body))
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "internal database explosion") {
+		t.Errorf("response leaks raw error: %s", rr.Body.String())
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_InvalidBody asserts
+// the 400 path on malformed JSON body.
+func TestTenantHandler_SetTenantRateLimitAdmin_InvalidBody(t *testing.T) {
+	h := handler.NewTenantHandler(&mockTenantSvc{}, &mockTenantRateLimitRepo{})
+
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/t_acme/rate-limit", strings.NewReader(`{not json}`))
+	req.SetPathValue("tenantID", "t_acme")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTenantHandler_SetTenantRateLimitAdmin_InvalidTenant pins
+// the tenant-id validation (no traversal) at the admin endpoint.
+func TestTenantHandler_SetTenantRateLimitAdmin_InvalidTenant(t *testing.T) {
+	h := handler.NewTenantHandler(&mockTenantSvc{}, &mockTenantRateLimitRepo{})
+
+	req := httptest.NewRequest("PUT", "/api/v1/admin/tenants/../etc/passwd/rate-limit", strings.NewReader(`{}`))
+	req.SetPathValue("tenantID", "../etc/passwd")
+	rr := httptest.NewRecorder()
+	h.SetTenantRateLimitAdmin(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for path-traversal tenant id; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -123,7 +346,7 @@ func TestBootstrap_HappyPath(t *testing.T) {
 		bootstrapTenant: wantTenant,
 		bootstrapRawKey: wantKey,
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"test-tenant","key_name":"my-key"}`)
 	req := httptest.NewRequest("POST", "/api/tenants", body)
@@ -149,7 +372,7 @@ func TestBootstrap_HappyPath(t *testing.T) {
 
 func TestBootstrap_InvalidBody(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`not json`)
 	req := httptest.NewRequest("POST", "/api/tenants", body)
@@ -165,7 +388,7 @@ func TestBootstrap_InvalidBody(t *testing.T) {
 
 func TestBootstrap_MissingName(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"key_name":"my-key"}`)
 	req := httptest.NewRequest("POST", "/api/tenants", body)
@@ -181,7 +404,7 @@ func TestBootstrap_MissingName(t *testing.T) {
 
 func TestBootstrap_ErrorPath(t *testing.T) {
 	svc := &mockTenantSvc{bootstrapErr: errors.New("database connection refused")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"test","key_name":"default"}`)
 	req := httptest.NewRequest("POST", "/api/tenants", body)
@@ -209,7 +432,7 @@ func TestBootstrap_ErrorPath(t *testing.T) {
 func TestCreate_HappyPath(t *testing.T) {
 	wantTenant := &domain.Tenant{ID: "t_new", Name: "new-tenant", Plan: "free"}
 	svc := &mockTenantSvc{createTenantResp: wantTenant}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"new-tenant"}`)
 	req := httptest.NewRequest("POST", "/api/tenants/create", body)
@@ -232,7 +455,7 @@ func TestCreate_HappyPath(t *testing.T) {
 
 func TestCreate_InvalidBody(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{`)
 	req := httptest.NewRequest("POST", "/api/tenants/create", body)
@@ -248,7 +471,7 @@ func TestCreate_InvalidBody(t *testing.T) {
 
 func TestCreate_MissingName(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{}`)
 	req := httptest.NewRequest("POST", "/api/tenants/create", body)
@@ -264,7 +487,7 @@ func TestCreate_MissingName(t *testing.T) {
 
 func TestCreate_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{createTenantErr: errors.New("db write failed")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"new-tenant"}`)
 	req := httptest.NewRequest("POST", "/api/tenants/create", body)
@@ -292,7 +515,7 @@ func TestGet_Found(t *testing.T) {
 		Quota:  domain.Quota{TenantID: "t_xyz"},
 	}
 	svc := &mockTenantSvc{getTenantResp: want}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("GET", "/api/tenants/t_xyz", nil)
 	rr := httptest.NewRecorder()
@@ -313,7 +536,7 @@ func TestGet_Found(t *testing.T) {
 
 func TestGet_NotFound(t *testing.T) {
 	svc := &mockTenantSvc{getTenantResp: nil}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("GET", "/api/tenants/t_missing", nil)
 	rr := httptest.NewRecorder()
@@ -327,7 +550,7 @@ func TestGet_NotFound(t *testing.T) {
 
 func TestGet_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{getTenantErr: errors.New("connection refused")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("GET", "/api/tenants/t_err", nil)
 	rr := httptest.NewRecorder()
@@ -353,7 +576,7 @@ func TestList_HappyPath(t *testing.T) {
 		{ID: "t_2", Name: "tenant-b"},
 	}
 	svc := &mockTenantSvc{listTenantsResp: want}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("GET", "/api/tenants", nil)
 	rr := httptest.NewRecorder()
@@ -374,7 +597,7 @@ func TestList_HappyPath(t *testing.T) {
 
 func TestList_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{listTenantsErr: errors.New("db error")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("GET", "/api/tenants", nil)
 	rr := httptest.NewRecorder()
@@ -400,7 +623,7 @@ func TestUpdate_Found(t *testing.T) {
 		Quota:  domain.Quota{TenantID: "t_upd"},
 	}
 	svc := &mockTenantSvc{getTenantResp: existing}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"new-name"}`)
 	req := httptest.NewRequest("PUT", "/api/tenants/t_upd", body)
@@ -423,7 +646,7 @@ func TestUpdate_Found(t *testing.T) {
 
 func TestUpdate_NotFound(t *testing.T) {
 	svc := &mockTenantSvc{getTenantResp: nil}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"new-name"}`)
 	req := httptest.NewRequest("PUT", "/api/tenants/t_missing", body)
@@ -443,7 +666,7 @@ func TestUpdate_ServiceError(t *testing.T) {
 		Quota:  domain.Quota{TenantID: "t_err"},
 	}
 	svc := &mockTenantSvc{getTenantResp: existing, updateTenantErr: errors.New("update failed")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := strings.NewReader(`{"name":"new-name"}`)
 	req := httptest.NewRequest("PUT", "/api/tenants/t_err", body)
@@ -467,7 +690,7 @@ func TestUpdate_ServiceError(t *testing.T) {
 
 func TestDelete_NoContent(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("DELETE", "/api/tenants/t_del", nil)
 	rr := httptest.NewRecorder()
@@ -481,7 +704,7 @@ func TestDelete_NoContent(t *testing.T) {
 
 func TestDelete_NotFound(t *testing.T) {
 	svc := &mockTenantSvc{deleteTenantErr: errors.New("not found")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("DELETE", "/api/tenants/t_missing", nil)
 	rr := httptest.NewRecorder()
@@ -497,7 +720,7 @@ func TestDelete_NotFound(t *testing.T) {
 
 func TestDelete_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{deleteTenantErr: errors.New("db connection lost")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("DELETE", "/api/tenants/t_err", nil)
 	rr := httptest.NewRecorder()
@@ -528,7 +751,7 @@ func TestBootstrap_RejectsPaidPlan(t *testing.T) {
 	// short-circuits with 400 BEFORE calling the service. So if Bootstrap
 	// returns 400 AND the response body doesn't include the mock's tenant
 	// fields, the gate worked.
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"name":"acme","plan":"pro","key_name":"owner"}`
 	req := httptest.NewRequest("POST", "/api/tenants", strings.NewReader(body))
@@ -550,7 +773,7 @@ func TestBootstrap_AcceptsFreePlan(t *testing.T) {
 		bootstrapTenant: &domain.Tenant{ID: "t_x", Name: "x", Plan: "free"},
 		bootstrapRawKey: "sk_x",
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"name":"acme","plan":"free","key_name":"owner"}`
 	req := httptest.NewRequest("POST", "/api/tenants", strings.NewReader(body))
@@ -567,7 +790,7 @@ func TestCreate_AdminAcceptsProPlan(t *testing.T) {
 	svc := &mockTenantSvc{
 		createTenantResp: &domain.Tenant{ID: "t_x", Name: "acme", Plan: "pro"},
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"name":"acme","plan":"pro"}`
 	req := httptest.NewRequest("POST", "/api/admin/tenants", strings.NewReader(body))
@@ -582,7 +805,7 @@ func TestCreate_AdminAcceptsProPlan(t *testing.T) {
 
 func TestCreate_RejectsUnknownPlan(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"name":"acme","plan":"platinum"}`
 	req := httptest.NewRequest("POST", "/api/admin/tenants", strings.NewReader(body))
@@ -605,7 +828,7 @@ func TestUpdate_PlanChange_AutoAppliesDefaults(t *testing.T) {
 			Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 100_000},
 		},
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"pro"}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -629,7 +852,7 @@ func TestUpdate_PlanChange_PreserveQuotaLimits_KeepsCustom(t *testing.T) {
 			Quota:  domain.Quota{TenantID: "t_x", MaxRequestsPerMonth: 50_000_000},
 		},
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"free","preserve_quota_limits":true}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -650,7 +873,7 @@ func TestUpdate_PlanChange_RejectsUnknownPlan(t *testing.T) {
 		},
 		updateTenantPlanErr: fmt.Errorf("%w: %q", domain.ErrUnknownPlan, "platinum"),
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"platinum"}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -671,7 +894,7 @@ func TestUpdate_PlanChange_TenantNotFound_404(t *testing.T) {
 		},
 		updateTenantPlanErr: service.ErrTenantNotFound,
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"pro"}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -692,7 +915,7 @@ func TestUpdate_PlanChange_QuotaNotFound_404(t *testing.T) {
 		},
 		updateTenantPlanErr: service.ErrQuotaNotFound,
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"pro"}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -723,7 +946,7 @@ func TestUpdate_PlanChange_ResponseShowsNewQuota(t *testing.T) {
 		getTenantResp:      free,
 		getTenantRespAfter: pro,
 	}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"plan":"pro"}`
 	req := httptest.NewRequest("PUT", "/api/admin/tenants/t_x", strings.NewReader(body))
@@ -762,7 +985,7 @@ func TestUpdate_PlanChange_ResponseShowsNewQuota(t *testing.T) {
 // tenant returns 200 and forwards the tenantID to the service.
 func TestEnable_HappyPath(t *testing.T) {
 	svc := &mockTenantSvc{}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/admin/tenants/t_acme/enable", nil)
 	req.SetPathValue("tenantID", "t_acme")
@@ -785,7 +1008,7 @@ func TestEnable_HappyPath(t *testing.T) {
 // service maps to 404.
 func TestEnable_NotFound(t *testing.T) {
 	svc := &mockTenantSvc{enableTenantErr: service.ErrTenantNotFound}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/admin/tenants/t_missing/enable", nil)
 	req.SetPathValue("tenantID", "t_missing")
@@ -802,7 +1025,7 @@ func TestEnable_NotFound(t *testing.T) {
 // service maps to 500 (no leaky information).
 func TestEnable_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{enableTenantErr: errors.New("connection refused")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/admin/tenants/t_x/enable", nil)
 	req.SetPathValue("tenantID", "t_x")
@@ -833,7 +1056,7 @@ func TestTenantHandler_QuotaOverride_HappyPath(t *testing.T) {
 		Quota:  domain.Quota{TenantID: "t_ovr", MaxRequestsPerMonth: maxReq, MaxOutboundMB: maxMB, MaxDeployments: maxDeploy},
 	}
 	svc := &mockTenantSvc{overrideResp: want}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"max_requests_per_month":1000000,"max_outbound_mb":5000,"max_deployments":25,"set_overage_allowed_until":"2026-08-01T00:00:00Z"}`
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
@@ -861,7 +1084,7 @@ func TestTenantHandler_QuotaOverride_HappyPath(t *testing.T) {
 // failure. The handler must short-circuit before calling the service.
 func TestTenantHandler_QuotaOverride_InvalidBody(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader("not-json"))
 	req.SetPathValue("tenantID", "t_ovr")
@@ -879,7 +1102,7 @@ func TestTenantHandler_QuotaOverride_InvalidBody(t *testing.T) {
 // other tenant handlers; we lock the behavior in here.
 func TestTenantHandler_QuotaOverride_PathTraversal(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/..%2Fetc/quota-override", strings.NewReader("{}"))
 	req.SetPathValue("tenantID", "../etc")
@@ -897,7 +1120,7 @@ func TestTenantHandler_QuotaOverride_PathTraversal(t *testing.T) {
 // handler must reject with 400 before the service is called.
 func TestTenantHandler_QuotaOverride_MutuallyExclusive(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"set_overage_allowed_until":"2026-08-01T00:00:00Z","clear_overage_allowed_until":true}`
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
@@ -917,7 +1140,7 @@ func TestTenantHandler_QuotaOverride_MutuallyExclusive(t *testing.T) {
 // the service must not be called.
 func TestTenantHandler_QuotaOverride_BadTimestamp(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: errors.New("service should not be called")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"set_overage_allowed_until":"yesterday"}`
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))
@@ -936,7 +1159,7 @@ func TestTenantHandler_QuotaOverride_BadTimestamp(t *testing.T) {
 // errors so operators get an accurate 404 instead of a 500.
 func TestTenantHandler_QuotaOverride_TenantNotFound(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: service.ErrTenantNotFound}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"clear_disabled_at":true}`
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_missing/quota-override", strings.NewReader(body))
@@ -955,7 +1178,7 @@ func TestTenantHandler_QuotaOverride_TenantNotFound(t *testing.T) {
 // text into the response body.
 func TestTenantHandler_QuotaOverride_ServiceError(t *testing.T) {
 	svc := &mockTenantSvc{overrideErr: errors.New("internal database explosion")}
-	h := handler.NewTenantHandler(svc)
+	h := handler.NewTenantHandler(svc, nil)
 
 	body := `{"clear_grace":true}`
 	req := httptest.NewRequest("POST", "/api/v1/admin/tenants/t_ovr/quota-override", strings.NewReader(body))

@@ -377,7 +377,7 @@ func New(
 	auditor := service.NewAuditor(auditRepo)
 	handler.DefaultAuditor = auditor
 
-	tenantHandler := handler.NewTenantHandler(tenantSvc)
+	tenantHandler := handler.NewTenantHandler(tenantSvc, quotaRepo)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeySvc)
 	deploymentHandler := handler.NewDeploymentHandler(deploymentSvc, workerSvc, trafficSvc, artifactStore, cfg.Migration.Wasm2CwasmPath)
 	envHandler := handler.NewEnvHandler(envSvc)
@@ -419,7 +419,7 @@ func New(
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
 	clusterHandler := handler.NewClusterHandler(clusterSvc)
-	quotaHandler := handler.NewQuotaHandler(tenantSvc)
+	quotaHandler := handler.NewQuotaHandler(tenantSvc, quotaRepo)
 
 	// Usage handler (issue #421): the tenant-facing usage dashboard.
 	// Composes quota + billing reads with a 10s SWR cache so dashboard
@@ -707,6 +707,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	admin.HandleFunc("DELETE /api/v1/admin/tenants/{tenantID}", tenantHandler.Delete)
 	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/enable", tenantHandler.Enable)
 	admin.HandleFunc("POST /api/v1/admin/tenants/{tenantID}/quota-override", tenantHandler.QuotaOverride)
+	// Per-tenant data-plane rate limit write endpoint (issue #305).
+	// Mirrors quota-override above but writes the four
+	// tenant_rate_limit_* columns on the quotas row instead of the
+	// existing monthly cap columns. Owner-role gated by the admin
+	// mux auth chain (authMiddleware.Authenticate + RequireRole).
+	admin.HandleFunc("PUT /api/v1/admin/tenants/{tenantID}/rate-limit", tenantHandler.SetTenantRateLimitAdmin)
 	admin.HandleFunc("DELETE /api/v1/admin/apps/{appName}", appHandler.Delete)
 	admin.HandleFunc("GET /api/v1/admin/cluster", clusterHandler.Get)
 	admin.HandleFunc("GET /api/v1/admin/cluster/events", clusterHandler.Events)
@@ -741,6 +747,16 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// the tenant's apps.
 	mux.HandleFunc("GET /api/v1/internal/quota/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetQuotaInternal)).ServeHTTP(w, r)
+	})
+
+	// Per-tenant data-plane rate limit read endpoint (issue #305).
+	// The edge-ingress TenantRateLimitCache fetcher polls this every
+	// TENANT_RATE_LIMIT_FETCH_INTERVAL (default 30s). Same
+	// X-Internal-Token trust model as the per-app
+	// /rate-limits/{tenantID}/{appName} endpoint at line ~731 and
+	// the /quota/{tenantID} endpoint above.
+	mux.HandleFunc("GET /api/v1/internal/rate-limit/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetTenantRateLimitInternal)).ServeHTTP(w, r)
 	})
 
 	// Secrets admin endpoints (X-Internal-Token auth).

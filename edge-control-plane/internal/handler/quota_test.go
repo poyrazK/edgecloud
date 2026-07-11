@@ -48,7 +48,7 @@ func TestQuotaHandler_GetQuota_Success(t *testing.T) {
 	}
 	q.TenantID = "t_test"
 	q.UsedRequestCount = 25_000 // 25% of 100_000 cap → UsagePct returns ~25.0
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/quotas", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
@@ -81,7 +81,7 @@ func TestQuotaHandler_GetQuota_Enterprise_NoUsagePct(t *testing.T) {
 		MaxOutboundMB:       -1,
 		MaxRequestsPerMonth: -1,
 	}
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/quotas", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_enterprise"))
@@ -97,7 +97,7 @@ func TestQuotaHandler_GetQuota_Enterprise_NoUsagePct(t *testing.T) {
 }
 
 func TestQuotaHandler_GetQuota_NotFound(t *testing.T) {
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: nil})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: nil}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/quotas", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
@@ -133,7 +133,7 @@ func TestQuotaHandler_GetQuotaInternal_Success(t *testing.T) {
 	}
 	q.TenantID = "t_test"
 	q.UsedRequestCount = 50_000 // 50% of 100_000
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_test", nil)
 	req.SetPathValue("tenantID", "t_test")
@@ -168,7 +168,7 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_Requests(t *testing.T) {
 	}
 	q.TenantID = "t_over"
 	q.UsedRequestCount = int64(q.MaxRequestsPerMonth) // 100_000 = 100%
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over", nil)
 	req.SetPathValue("tenantID", "t_over")
@@ -200,7 +200,7 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_Memory(t *testing.T) {
 	}
 	q.TenantID = "t_over_mem"
 	q.UsedMemoryMB = int64(q.MaxMemoryMB) // 256 = 100%
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: &q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over_mem", nil)
 	req.SetPathValue("tenantID", "t_over_mem")
@@ -232,7 +232,7 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_MemoryEnterpriseBypasses(t *testi
 		MaxMemoryMB:         -1,
 		UsedMemoryMB:        9_999_999,
 	}
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_ent", nil)
 	req.SetPathValue("tenantID", "t_ent")
@@ -256,7 +256,7 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_MemoryEnterpriseBypasses(t *testi
 // open on a missing tenant (no 402 injected); the 404 is the
 // observable signal that the tenant row was missing at fetch time.
 func TestQuotaHandler_GetQuotaInternal_NotFound(t *testing.T) {
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: nil})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: nil}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_missing", nil)
 	req.SetPathValue("tenantID", "t_missing")
@@ -277,7 +277,7 @@ func TestQuotaHandler_GetQuotaInternal_NotFound(t *testing.T) {
 // refactors don't accidentally widen the input.
 func TestQuotaHandler_GetQuotaInternal_PathTraversal(t *testing.T) {
 	svc := &mockQuotaTenantSvc{quotaErr: errors.New("service should not be called")}
-	h := NewQuotaHandler(svc)
+	h := NewQuotaHandler(svc, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/..%2Fetc", nil)
 	req.SetPathValue("tenantID", "../etc")
@@ -304,7 +304,7 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_ResidentSeconds(t *testing.T) {
 		MaxResidentSecondsPerMonth: 1000,
 		UsedResidentSeconds:        1000, // 100% of cap
 	}
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over_res", nil)
 	req.SetPathValue("tenantID", "t_over_res")
@@ -323,6 +323,149 @@ func TestQuotaHandler_GetQuotaInternal_OverCap_ResidentSeconds(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// GetTenantRateLimitInternal (issue #305 — ingress fetcher read path)
+// ---------------------------------------------------------------------------
+//
+// mockQuotaRepoForRateLimit satisfies the narrow QuotaRepoForRateLimit
+// interface (just GetRateLimit). Mirrors the AppRepoInterface mock
+// pattern at traffic_test.go.
+
+type mockQuotaRepoForRateLimit struct {
+	rl    *domain.TenantRateLimitResponse
+	rlErr error
+}
+
+func (m *mockQuotaRepoForRateLimit) GetRateLimit(ctx context.Context, tenantID string) (*domain.TenantRateLimitResponse, error) {
+	if m.rlErr != nil {
+		return nil, m.rlErr
+	}
+	return m.rl, nil
+}
+
+// TestQuotaHandler_GetTenantRateLimitInternal_HappyPath covers the
+// ingress TenantRateLimitCache fetcher's expected response shape:
+// the four cap fields plus tenant_id, with no counter/period/grace
+// fields leaked onto the wire (those would just be noise to the
+// ingress — the cache's response is the only source of truth for
+// whether a cap is set).
+func TestQuotaHandler_GetTenantRateLimitInternal_HappyPath(t *testing.T) {
+	repo := &mockQuotaRepoForRateLimit{
+		rl: &domain.TenantRateLimitResponse{
+			TenantID:        "t_test",
+			RPS:             100,
+			Burst:           200,
+			ConcurrentLimit: 50,
+			BandwidthBps:    5_000_000,
+		},
+	}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{}, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/rate-limit/t_test", nil)
+	req.SetPathValue("tenantID", "t_test")
+	rr := httptest.NewRecorder()
+	h.GetTenantRateLimitInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var rl domain.TenantRateLimitResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &rl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rl.TenantID != "t_test" {
+		t.Errorf("TenantID = %q, want t_test", rl.TenantID)
+	}
+	if rl.RPS != 100 {
+		t.Errorf("RPS = %d, want 100", rl.RPS)
+	}
+	if rl.Burst != 200 {
+		t.Errorf("Burst = %d, want 200", rl.Burst)
+	}
+	if rl.ConcurrentLimit != 50 {
+		t.Errorf("ConcurrentLimit = %d, want 50", rl.ConcurrentLimit)
+	}
+	if rl.BandwidthBps != 5_000_000 {
+		t.Errorf("BandwidthBps = %d, want 5000000", rl.BandwidthBps)
+	}
+}
+
+// TestQuotaHandler_GetTenantRateLimitInternal_AllZeroCaps pins the
+// "row exists but feature is disabled" path: a 200 with all-zero
+// caps (the ingress cache treats all-zero as "feature disabled for
+// this tenant" and skips emitting a rate_limit route).
+func TestQuotaHandler_GetTenantRateLimitInternal_AllZeroCaps(t *testing.T) {
+	repo := &mockQuotaRepoForRateLimit{
+		rl: &domain.TenantRateLimitResponse{TenantID: "t_test"},
+	}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{}, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/rate-limit/t_test", nil)
+	req.SetPathValue("tenantID", "t_test")
+	rr := httptest.NewRecorder()
+	h.GetTenantRateLimitInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (zero caps means feature disabled, not not-found); body: %s", rr.Code, rr.Body.String())
+	}
+	var rl domain.TenantRateLimitResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &rl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rl.TenantID != "t_test" || rl.RPS != 0 || rl.Burst != 0 || rl.ConcurrentLimit != 0 || rl.BandwidthBps != 0 {
+		t.Errorf("got %+v, want all-zero except TenantID", rl)
+	}
+}
+
+// TestQuotaHandler_GetTenantRateLimitInternal_NotFound pins the
+// 404 path: no quotas row for the tenant. The ingress treats this as
+// "no caps known" → no rate_limit route emitted (fail-open).
+func TestQuotaHandler_GetTenantRateLimitInternal_NotFound(t *testing.T) {
+	repo := &mockQuotaRepoForRateLimit{rl: nil} // GetRateLimit returns (nil, nil)
+	h := NewQuotaHandler(&mockQuotaTenantSvc{}, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/rate-limit/t_missing", nil)
+	req.SetPathValue("tenantID", "t_missing")
+	rr := httptest.NewRecorder()
+	h.GetTenantRateLimitInternal(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestQuotaHandler_GetTenantRateLimitInternal_InvalidTenant pins
+// the tenant-id validation (no traversal). Mirrors the same guard
+// in GetQuotaInternal and GetTrafficInternal.
+func TestQuotaHandler_GetTenantRateLimitInternal_InvalidTenant(t *testing.T) {
+	h := NewQuotaHandler(&mockQuotaTenantSvc{}, &mockQuotaRepoForRateLimit{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/rate-limit/", nil)
+	req.SetPathValue("tenantID", "../etc/passwd")
+	rr := httptest.NewRecorder()
+	h.GetTenantRateLimitInternal(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for path-traversal tenant id; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestQuotaHandler_GetTenantRateLimitInternal_DBError covers the
+// 500 path on transient DB error.
+func TestQuotaHandler_GetTenantRateLimitInternal_DBError(t *testing.T) {
+	repo := &mockQuotaRepoForRateLimit{rlErr: errors.New("db down")}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{}, repo)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/rate-limit/t_test", nil)
+	req.SetPathValue("tenantID", "t_test")
+	rr := httptest.NewRecorder()
+	h.GetTenantRateLimitInternal(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestQuotaHandler_GetQuotaInternal_ResidentSecondsEnterpriseBypasses
 // (issue #484 / #485): MaxResidentSecondsPerMonth = -1 is the unlimited
 // sentinel and must NOT trip over_cap on the resident-seconds axis.
@@ -337,7 +480,7 @@ func TestQuotaHandler_GetQuotaInternal_ResidentSecondsEnterpriseBypasses(t *test
 		MaxResidentSecondsPerMonth: -1,
 		UsedResidentSeconds:        10_000_000, // absurd — but unlimited ⇒ no trip
 	}
-	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_ent_res", nil)
 	req.SetPathValue("tenantID", "t_ent_res")

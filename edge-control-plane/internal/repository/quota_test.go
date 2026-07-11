@@ -124,6 +124,127 @@ func TestQuotaRepository_GetByTenantID_NotFound(t *testing.T) {
 	}
 }
 
+// TestQuotaRepository_GetRateLimit_HappyPath covers the ingress
+// TenantRateLimitCache fetcher's read path (issue #305). The
+// projection is the five rate-limit columns only — the ingress does
+// not want the counter fields, period start, or grace timestamp.
+func TestQuotaRepository_GetRateLimit_HappyPath(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "tenant_rate_limit_rps", "tenant_rate_limit_burst",
+		"tenant_concurrent_limit", "tenant_bandwidth_bps",
+	}).AddRow("t_1", 100, 200, 50, 5_000_000)
+
+	mock.ExpectQuery(`SELECT tenant_id.*FROM quotas WHERE`).
+		WithArgs("t_1").
+		WillReturnRows(rows)
+
+	rl, err := repo.GetRateLimit(context.Background(), "t_1")
+	if err != nil {
+		t.Fatalf("GetRateLimit: %v", err)
+	}
+	if rl == nil {
+		t.Fatal("got nil, want non-nil TenantRateLimitResponse")
+	}
+	if rl.TenantID != "t_1" {
+		t.Errorf("TenantID = %q, want t_1", rl.TenantID)
+	}
+	if rl.RPS != 100 {
+		t.Errorf("RPS = %d, want 100", rl.RPS)
+	}
+	if rl.Burst != 200 {
+		t.Errorf("Burst = %d, want 200", rl.Burst)
+	}
+	if rl.ConcurrentLimit != 50 {
+		t.Errorf("ConcurrentLimit = %d, want 50", rl.ConcurrentLimit)
+	}
+	if rl.BandwidthBps != 5_000_000 {
+		t.Errorf("BandwidthBps = %d, want 5000000", rl.BandwidthBps)
+	}
+}
+
+// TestQuotaRepository_GetRateLimit_NotFound asserts the (nil, nil)
+// sentinel that the ingress treats as "no caps, feature disabled for
+// this tenant" — same fail-open shape as the quota 402 cache at
+// issue #420.
+func TestQuotaRepository_GetRateLimit_NotFound(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT tenant_id.*FROM quotas WHERE`).
+		WithArgs("t_missing").
+		WillReturnError(sql.ErrNoRows)
+
+	rl, err := repo.GetRateLimit(context.Background(), "t_missing")
+	if err != nil {
+		t.Fatalf("expected nil error for sql.ErrNoRows, got %v", err)
+	}
+	if rl != nil {
+		t.Errorf("got %+v, want nil", rl)
+	}
+}
+
+// TestQuotaRepository_SetRateLimit_HappyPath covers the admin write
+// path (PUT /api/v1/admin/tenants/{id}/rate-limit). The UPDATE
+// RETURNING echoes the new row, which the handler renders back so
+// operators see the exact stored values (including the audit
+// timestamp that this method stamps to NOW()).
+func TestQuotaRepository_SetRateLimit_HappyPath(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	req := domain.TenantRateLimitRequest{
+		RPS:             100,
+		Burst:           200,
+		ConcurrentLimit: 50,
+		BandwidthBPS:    5_000_000,
+	}
+
+	rows := sqlmock.NewRows([]string{
+		"tenant_id", "tenant_rate_limit_rps", "tenant_rate_limit_burst",
+		"tenant_concurrent_limit", "tenant_bandwidth_bps",
+	}).AddRow("t_1", 100, 200, 50, 5_000_000)
+
+	mock.ExpectQuery(`UPDATE quotas SET`).
+		WithArgs("t_1", req.RPS, req.Burst, req.ConcurrentLimit, req.BandwidthBPS).
+		WillReturnRows(rows)
+
+	rl, err := repo.SetRateLimit(context.Background(), "t_1", req)
+	if err != nil {
+		t.Fatalf("SetRateLimit: %v", err)
+	}
+	if rl == nil {
+		t.Fatal("got nil, want non-nil TenantRateLimitResponse")
+	}
+	if rl.RPS != 100 || rl.Burst != 200 || rl.ConcurrentLimit != 50 || rl.BandwidthBps != 5_000_000 {
+		t.Errorf("got %+v, want rps=100 burst=200 conc=50 bw=5000000", rl)
+	}
+}
+
+// TestQuotaRepository_SetRateLimit_NoQuotasRow pins the (nil, nil)
+// sentinel that the handler maps to 404 — tenant exists but the
+// platform hasn't provisioned a quotas row for them yet.
+func TestQuotaRepository_SetRateLimit_NoQuotasRow(t *testing.T) {
+	repo, mock, cleanup := newQuotaMockRepo(t)
+	defer cleanup()
+
+	req := domain.TenantRateLimitRequest{RPS: 100}
+
+	mock.ExpectQuery(`UPDATE quotas SET`).
+		WithArgs("t_orphan", req.RPS, req.Burst, req.ConcurrentLimit, req.BandwidthBPS).
+		WillReturnError(sql.ErrNoRows)
+
+	rl, err := repo.SetRateLimit(context.Background(), "t_orphan", req)
+	if err != nil {
+		t.Fatalf("expected nil error for sql.ErrNoRows, got %v", err)
+	}
+	if rl != nil {
+		t.Errorf("got %+v, want nil", rl)
+	}
+}
+
 func TestQuotaRepository_Update(t *testing.T) {
 	repo, mock, cleanup := newQuotaMockRepo(t)
 	defer cleanup()
