@@ -165,6 +165,16 @@ pub fn load_api_url(fallback: &str) -> String {
     edge_config::read_api_url(fallback)
 }
 
+/// Resolve the developer-facing web URL with precedence: `EDGE_WEB_URL`
+/// env var → `~/.config/edgecloud/config.toml` `[default].web` →
+/// `fallback`. Used by `edge billing portal` to decide where to send the
+/// user when they leave the hosted portal. Distinct from `load_api_url`
+/// because the API host and the web console host are usually different
+/// subdomains (e.g. `api.edgecloud.dev` vs `edgecloud.dev`).
+pub fn load_web_url(fallback: &str) -> String {
+    edge_config::read_web_url(fallback)
+}
+
 fn write_file_atomically(tmp: &Path, final_path: &Path, contents: &[u8]) -> Result<()> {
     {
         let mut f = open_with_secure_mode(tmp)?;
@@ -231,6 +241,8 @@ struct DefaultSection {
     api_key: Option<String>,
     #[allow(dead_code)]
     api: Option<String>,
+    #[allow(dead_code)]
+    web: Option<String>,
 }
 
 #[cfg(test)]

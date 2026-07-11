@@ -271,9 +271,14 @@ func TestStripeWebhook_BadSignature(t *testing.T) {
 	}
 }
 
-// TestStripeWebhook_TenantUnresolved: 422-class (handler maps
-// ErrTenantUnresolved to BadRequestCtx with status 400 — the
-// service-level 422 is communicated via a specific message).
+// TestStripeWebhook_TenantUnresolved: 422 status. Handler maps
+// ErrTenantUnresolved to BillingTenantUnresolvedCtx, which emits
+// http.StatusUnprocessableEntity with the BILLING_TENANT_UNRESOLVED
+// error code. The distinction from 400 matters because Stripe's
+// retry semantics treat 4xx as "stop retrying" — we want 422 (not
+// 400) so the merchant knows the webhook was syntactically valid
+// but the event cannot be attributed to any tenant (and therefore
+// should be inspected, not auto-retried).
 func TestStripeWebhook_TenantUnresolved(t *testing.T) {
 	svc := &mockBillingSvc{handleWebhookErr: billing.ErrTenantUnresolved}
 	h := NewBillingHandler(svc)
@@ -282,16 +287,14 @@ func TestStripeWebhook_TenantUnresolved(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.StripeWebhook(rr, req)
 
-	// We deliberately use 400 (with a clear "tenant unresolved"
-	// message) for the unresolved case so the merchant knows the
-	// event was received but cannot be attributed. The status
-	// could be 422 instead; 400 is consistent with how we treat
-	// "the body was understood but not actionable."
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rr.Code)
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rr.Code)
 	}
 	if !strings.Contains(rr.Body.String(), "tenant unresolved") {
 		t.Errorf("body = %q, want 'tenant unresolved'", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "BILLING_TENANT_UNRESOLVED") {
+		t.Errorf("body = %q, want code 'BILLING_TENANT_UNRESOLVED'", rr.Body.String())
 	}
 }
 

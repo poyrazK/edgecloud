@@ -38,6 +38,16 @@ pub fn section(label: &str) {
     println!("\n{} {}", style("›").cyan(), style(label).bold());
 }
 
+/// Print a `key: value` row, with the key dim-styled and the value
+/// rendered verbatim. Callers pick the key width up-front so a column
+/// of rows lines up regardless of label length. Used by `edge
+/// billing subscription` and any future read-only command that
+/// formats a struct as a small table.
+#[allow(dead_code)]
+pub fn kv(key: &str, value: impl std::fmt::Display, key_width: usize) {
+    println!("{:width$} {}", style(key).dim(), value, width = key_width)
+}
+
 /// Read a `y/N` confirmation. Returns true on "y" or "Y" (after
 /// trim); false on anything else (including EOF and empty input).
 /// Caller is responsible for the `is_terminal()` check.

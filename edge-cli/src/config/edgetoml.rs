@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::config::auth::load_api_url;
+use crate::config::auth::{load_api_url, load_web_url};
 
 /// edge.toml project configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +85,12 @@ pub struct Deployment {
     /// to `EDGE_API_URL` → `~/.config/edgecloud/config.toml` →
     /// `fallback` (typically `https://api.edgecloud.dev`).
     pub api: Option<String>,
+    /// Optional. Used by `edge billing portal` to decide where Stripe
+    /// should send the user when they leave the hosted portal. Kept
+    /// distinct from `api` because the API host and the web console
+    /// host are usually different subdomains (e.g. `api.edgecloud.dev`
+    /// vs `edgecloud.dev`). Resolved via [`EdgeToml::web_url`].
+    pub web: Option<String>,
 }
 
 impl EdgeToml {
@@ -109,6 +115,25 @@ impl EdgeToml {
             .api
             .clone()
             .unwrap_or_else(|| load_api_url(fallback))
+    }
+
+    /// Resolve the developer-facing web URL with precedence:
+    /// 1. `edge.toml` `[deployment].web` (per-project override)
+    /// 2. `EDGE_WEB_URL` env var (per-shell override)
+    /// 3. `~/.config/edgecloud/config.toml` `[default].web`
+    /// 4. `fallback` (typically the production user-console URL)
+    ///
+    /// Distinct from [`EdgeToml::api_url`] because the API host and
+    /// the web console host are usually different subdomains. Today
+    /// only `edge billing portal` consumes this, but any future
+    /// command that links out to the operator's user-facing console
+    /// (status page, account settings, etc.) should call this rather
+    /// than hand-rolling the env+config+fallback chain.
+    pub fn web_url(&self, fallback: &str) -> String {
+        self.deployment
+            .web
+            .clone()
+            .unwrap_or_else(|| load_web_url(fallback))
     }
 }
 
@@ -139,6 +164,73 @@ api = "https://from-toml"
         // SAFETY justification: this is a single-threaded test, env
         // changes are scoped to the test process lifetime.
         assert_eq!(toml.api_url("https://default"), "https://from-toml");
+    }
+
+    #[test]
+    fn web_url_returns_toml_value_when_set() {
+        // [deployment].web is the top-priority source. Independent of
+        // [deployment].api so a project can ship pointing at a
+        // staging API while still linking out to production web UI.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+world = "edge-runtime-handler"
+
+[deployment]
+web = "https://from-toml-web"
+"#,
+        );
+        assert_eq!(toml.web_url("https://default-web"), "https://from-toml-web");
+    }
+
+    #[test]
+    fn web_url_toml_and_api_are_independent() {
+        // Setting only [deployment].api (no web) must NOT bleed into
+        // web_url — they resolve from separate fields and separate
+        // env vars (`EDGE_WEB_URL`).
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+world = "edge-runtime-handler"
+
+[deployment]
+api = "https://api.from-toml"
+"#,
+        );
+        // api is wired to its setter; web_url must NOT see that value
+        // even when env/config have nothing. With no env interference
+        // the loader returns the fallback verbatim.
+        assert_eq!(toml.api_url("https://api-default"), "https://api.from-toml");
+        assert_eq!(
+            toml.web_url("https://web-sentinel-default"),
+            "https://web-sentinel-default"
+        );
+    }
+
+    #[test]
+    fn web_url_accepts_omitted_field() {
+        // Backward-compat: tomls written before [deployment].web
+        // existed must keep parsing, and web_url() must return
+        // *something* non-empty (the env+config+fallback chain).
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+target = "wasm32-wasip2"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        );
+        let resolved = toml.web_url("https://web-sentinel-fallback");
+        assert!(
+            !resolved.is_empty(),
+            "web_url must always return a non-empty URL"
+        );
     }
 
     #[test]

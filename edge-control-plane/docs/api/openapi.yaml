@@ -437,6 +437,15 @@ components:
           format: uri
           description: Self-service portal URL the tenant's browser should be redirected to.
 
+    BillingWebhookAck:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, ignored]
+          description: "ok when dispatched or replayed; ignored for verified but unsupported event types."
+          example: ok
+
     BillingSubscription:
       type: object
       properties:
@@ -3184,9 +3193,30 @@ paths:
       security: []
       responses:
         '200':
-          description: Event accepted (or already processed).
+          description: Event accepted, already processed, or intentionally ignored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingWebhookAck'
+              examples:
+                ok:
+                  value:
+                    status: ok
+                ignored:
+                  value:
+                    status: ignored
         '400':
-          description: Signature failure or tenant unresolved.
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: The event was signature-valid but could not be attributed to a tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: BILLING_TENANT_UNRESOLVED
+                  message: tenant unresolved for event
         '500':
           $ref: '#/components/responses/InternalError'
 

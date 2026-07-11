@@ -485,6 +485,12 @@ enum Command {
     #[command(subcommand)]
     Domains(DomainsCommand),
 
+    /// Manage billing checkout, portal, and subscription state.
+    Billing {
+        #[command(subcommand)]
+        action: commands::billing::BillingAction,
+    },
+
     /// Manage the outbound host allowlist (egress rules).
     Egress {
         #[command(subcommand)]
@@ -715,6 +721,7 @@ fn main() -> Result<()> {
             let action: commands::domains::DomainsAction = cmd.into();
             action.run(&cli.path)
         }
+        Command::Billing { action } => commands::billing::run(&cli.path, action),
         Command::Egress { action } => match action {
             commands::egress::EgressAction::Show => commands::egress::show(&cli.path),
             commands::egress::EgressAction::Set { hosts } => {

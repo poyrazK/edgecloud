@@ -1571,6 +1571,14 @@ export interface components {
              */
             portal_url?: string;
         };
+        BillingWebhookAck: {
+            /**
+             * @description ok when dispatched or replayed; ignored for verified but unsupported event types.
+             * @example ok
+             * @enum {string}
+             */
+            status?: "ok" | "ignored";
+        };
         BillingSubscription: {
             /** @example t_abc123 */
             tenant_id?: string;
@@ -4004,19 +4012,32 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Event accepted (or already processed). */
+            /** @description Event accepted, already processed, or intentionally ignored. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["BillingWebhookAck"];
+                };
             };
-            /** @description Signature failure or tenant unresolved. */
-            400: {
+            400: components["responses"]["BadRequest"];
+            /** @description The event was signature-valid but could not be attributed to a tenant. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "BILLING_TENANT_UNRESOLVED",
+                     *         "message": "tenant unresolved for event"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
             };
             500: components["responses"]["InternalError"];
         };
