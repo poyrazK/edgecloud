@@ -884,7 +884,7 @@ impl ApiClient {
     }
 
     /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
-    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>) -> Result<()> {
+    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>, idempotency_key: &str) -> Result<()> {
         let url = if let Some(w) = weight {
             format!(
                 "{}/api/v1/apps/{}/activate/{}?weight={}",
@@ -896,11 +896,18 @@ impl ApiClient {
                 self.base_url, app_name, deployment_id
             )
         };
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+            .header("Authorization", self.auth_header());
+        // Issue #439: forward the Idempotency-Key header when the
+        // caller supplied one. Empty string = no header, server
+        // runs fresh-publish semantics. Mirrors Deploy's pattern
+        // at api/client.rs:757.
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
 
         let _ = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {
@@ -913,16 +920,19 @@ impl ApiClient {
 
     /// Promote a preview deployment to production.
     /// POST /api/v1/apps/{app_name}/promote/{deployment_id}
-    pub fn promote(&self, app_name: &str, deployment_id: &str) -> Result<()> {
+    pub fn promote(&self, app_name: &str, deployment_id: &str, idempotency_key: &str) -> Result<()> {
         let url = format!(
             "{}/api/v1/apps/{}/promote/{}",
             self.base_url, app_name, deployment_id
         );
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+            .header("Authorization", self.auth_header());
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
         let _ = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {
                 anyhow::anyhow!("promote failed: {status} {body}")
@@ -1007,13 +1017,16 @@ impl ApiClient {
     /// active. If the server returns 409 ("no previous deployment to
     /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
     /// caller can detect that via `body.contains("no previous")`.
-    pub fn rollback(&self, app_name: &str) -> Result<RollbackResponse> {
+    pub fn rollback(&self, app_name: &str, idempotency_key: &str) -> Result<RollbackResponse> {
         let url = format!("{}/api/v1/apps/{}/rollback", self.base_url, app_name);
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
-            .header("Authorization", self.auth_header())
-            .send()?;
+            .header("Authorization", self.auth_header());
+        if !idempotency_key.is_empty() {
+            req = req.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = req.send()?;
 
         let resp = check_response(resp).map_err(|e| match e {
             ApiError::Rejected { status, body } => {

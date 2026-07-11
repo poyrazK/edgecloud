@@ -18,8 +18,12 @@ use crate::state::State;
 /// `live_url` here — refreshing it cleanly would require the server
 /// to return the new URL in the activate response body, which is
 /// deferred to a follow-up (issue #74 follow-up).
+///
+/// `idempotency_key`: caller-supplied Idempotency-Key header. Empty
+/// string = server runs fresh-publish semantics (issue #439). The
+/// CLI auto-mints one when missing — see main.rs.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>) -> Result<()> {
+pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>, idempotency_key: &str) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(&state)?;
 
@@ -27,7 +31,7 @@ pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>) -> Result<()> {
     let base_url = edge_toml.api_url("https://api.edgecloud.dev");
 
     let client = ApiClient::new(base_url)?;
-    client.activate(&app_name, deployment_id, weight)?;
+    client.activate(&app_name, deployment_id, weight, idempotency_key)?;
 
     // Update state.json if it exists for this app. Never overwrite
     // state for a different app.
@@ -62,7 +66,7 @@ fn resolve_app_name(state: &Option<State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _deployment_id: &str, _weight: Option<u8>) -> Result<()> {
+pub fn run(_path: &Path, _deployment_id: &str, _weight: Option<u8>, _idempotency_key: &str) -> Result<()> {
     anyhow::bail!("activate requires network support; rebuild with --features network")
 }
 
