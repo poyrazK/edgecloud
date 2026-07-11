@@ -57,11 +57,11 @@ func TestDeriveWorkerSecret_DistinctInputs(t *testing.T) {
 	}
 
 	cases := []struct {
-		name       string
-		workerID   string
-		tenantID   string
-		region     string
-		publicKey  string
+		name      string
+		workerID  string
+		tenantID  string
+		region    string
+		publicKey string
 	}{
 		{"different worker_id", "w_fra_xyz", "t_acme", "fra",
 			"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"},
@@ -93,9 +93,9 @@ func TestDeriveWorkerSecret_DistinctInputs(t *testing.T) {
 // deterministic prefix — breaking the per-worker isolation.
 func TestDeriveWorkerSecret_LengthAlways32(t *testing.T) {
 	masters := [][]byte{
-		[]byte("a-32-byte-master-secret-here!1"),                          // 32 bytes
+		[]byte("a-32-byte-master-secret-here!1"),                           // 32 bytes
 		[]byte("a-64-byte-master-secret-here-for-good-measure-padding!!!"), // 64 bytes
-		bytes.Repeat([]byte{0xab}, 128),                                   // 128 bytes
+		bytes.Repeat([]byte{0xab}, 128),                                    // 128 bytes
 	}
 	for _, m := range masters {
 		got, err := DeriveWorkerSecret(m, "w_fra_abc", "t_acme", "fra",

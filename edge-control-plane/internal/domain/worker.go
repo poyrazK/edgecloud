@@ -22,7 +22,7 @@ type Worker struct {
 	// Persisted by WorkerRepository.SetPublicKey after the handshake
 	// succeeds; read by the WorkerAuth wkr_-kid verification path and
 	// by the worker_key_cache middleware.
-	PublicKey *string   `db:"public_key"`
+	PublicKey *string `db:"public_key"`
 }
 
 // RegisterWorkerRequest is sent by a worker when registering with the control plane.

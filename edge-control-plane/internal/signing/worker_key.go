@@ -77,16 +77,16 @@ const kidFingerprintHexLen = 8
 // DeriveWorkerSecret computes the per-worker HS256 signing secret.
 // Inputs:
 //   - master:        the cluster-wide HKDF input keying material (today:
-//                    cfg.JWT.Secret; tomorrow: a separate
-//                    WORKER_DERIVATION_KEY if we want to split
-//                    concerns). MUST be at least 32 bytes; callers
-//                    should validate at startup, not here.
+//     cfg.JWT.Secret; tomorrow: a separate
+//     WORKER_DERIVATION_KEY if we want to split
+//     concerns). MUST be at least 32 bytes; callers
+//     should validate at startup, not here.
 //   - workerID:      the worker's identity string (e.g. "w_fra_abc")
 //   - tenantID:      the tenant the worker is bootstrapping for
-//                    (may be "*" for the wildcard case)
+//     (may be "*" for the wildcard case)
 //   - region:        the worker's region
 //   - publicKeyHex:  the worker's Ed25519 public key, hex-encoded
-//                    (64 lowercase ASCII chars)
+//     (64 lowercase ASCII chars)
 //
 // Returns 32 bytes. The output is deterministic: same inputs always
 // produce the same secret, and changing ANY of (workerID, tenantID,

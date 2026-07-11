@@ -874,7 +874,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "billing_usage_events", Name: "idx_billing_usage_events_unprocessed"},               // 030_billing_usage_events (issue #485, partial)
 	{Table: "audit_logs", Name: "idx_audit_logs_created_at"},                                    // 031_gc_retention_indexes (issue #574)
 	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_created_at"},                    // 031_gc_retention_indexes (issue #574)
-	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                         // 031_gc_retention_indexes (issue #574)
+	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                        // 031_gc_retention_indexes (issue #574)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
