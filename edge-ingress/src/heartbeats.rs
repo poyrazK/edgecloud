@@ -764,6 +764,11 @@ mod tests {
             resident_seconds: None,
             observer_metrics: vec![],
             last_error: None,
+            // Issue #548: HTTP-by-default for the existing test suite.
+            // The L4 branch (protocol="tcp") is covered by a follow-up
+            // commit's `apply_heartbeat_tcp_protocol` test once the
+            // L4RoutingTable lands.
+            protocol: "http".to_string(),
             duration_ms_total: 0,
         }
     }

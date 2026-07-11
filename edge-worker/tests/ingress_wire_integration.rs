@@ -217,6 +217,11 @@ async fn run_test() -> anyhow::Result<()> {
             ws_port: None,
             dedupe_id: None,
             last_error: None,
+            // Issue #548: protocol defaults to "http" for legacy
+            // wire-shape integration tests; this test doesn't exercise
+            // the L4 path (covered by edge-ingress/tests/l4_integration.rs
+            // in a follow-up commit).
+            protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
         },

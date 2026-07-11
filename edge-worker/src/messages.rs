@@ -19,6 +19,22 @@ where
     Ok(v.filter(|list| !list.is_empty() && !list.iter().all(|e| e == "*")))
 }
 
+/// Default protocol for `AppStatus.protocol` (issue #548) — HTTP/WS
+/// long-running or FaaS apps. Matches the historical implicit
+/// behaviour pre-#548 so old control planes / ingresses treat missing
+/// fields as HTTP.
+fn default_protocol() -> String {
+    "http".to_string()
+}
+
+/// Skip-serializing predicate for `AppStatus.protocol`. We omit the
+/// field when it equals the default ("http") to keep the on-wire
+/// shape byte-identical for the 99% case (HTTP apps), so old
+/// ingresses don't see a new field they don't know how to render.
+fn is_default_protocol(s: &String) -> bool {
+    s == "http"
+}
+
 /// Deserializes `socket_mode` from the wire string into a
 /// `SocketEgressPolicy`. The wire vocabulary is the same one
 /// `EDGE_EGRESS_SOCKET_MODE` already speaks (see
@@ -324,6 +340,18 @@ pub struct AppStatus {
     /// `edge-control-plane/internal/domain.IngressHost`; the suffix lives
     /// in `edge-ingress::config::INGRESS_HOST_SUFFIX`).
     pub tenant_id: String,
+    /// Wire protocol for this app (issue #548). Either `"http"` (the
+    /// default — HTTP/WS long-running or FaaS apps, served via the
+    /// existing Caddy `reverse_proxy`) or `"tcp"` (raw-TCP long-running
+    /// apps served via the L4 ingress port mapping). The default is
+    /// omitted from the JSON so the wire shape stays byte-identical
+    /// for HTTP apps — old workers / ingresses continue to interoperate.
+    /// Old workers that don't send the field deserialize to "http".
+    #[serde(
+        default = "default_protocol",
+        skip_serializing_if = "is_default_protocol"
+    )]
+    pub protocol: String,
     /// Port the app's HTTP server is listening on, on the worker host.
     /// Used by the public ingress to dial the upstream.
     pub port: u16,
@@ -645,6 +673,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
             observer_metrics: vec![
@@ -712,6 +741,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
             observer_metrics: vec![],
@@ -747,6 +777,7 @@ mod tests {
             dedupe_id: None,
             observer_metrics: vec![],
             last_error: None,
+            protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
         };
@@ -781,6 +812,135 @@ mod tests {
             parsed_old.last_error.is_none(),
             "old workers without last_error must deserialize to None (serde default)"
         );
+    }
+
+    // ── protocol rolling-upgrade contract (issue #548) ─────────────────
+
+    /// `protocol` (issue #548) discriminates HTTP apps from raw-TCP
+    /// L4 apps. The on-wire contract:
+    ///   * "http" (default) MUST be absent from the JSON
+    ///     (`skip_serializing_if`) so old ingresses / control planes
+    ///     don't see a new field they don't know how to render.
+    ///   * "tcp" MUST round-trip verbatim when present.
+    ///   * Old workers that don't send the field MUST deserialize to
+    ///     "http" (`#[serde(default = "default_protocol")]`) so the
+    ///     wire shape stays backward-compatible across the rolling
+    ///     upgrade window.
+    #[test]
+    fn protocol_round_trips_and_skips_when_default() {
+        // HTTP (default): must be absent from the JSON.
+        let none_status = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 0,
+            outbound_bytes: 0,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            observer_metrics: vec![],
+            last_error: None,
+            protocol: "http".to_string(),
+            resident_seconds: None,
+            duration_ms_total: 0,
+        };
+        let json_http = serde_json::to_string(&none_status).expect("serialize");
+        assert!(
+            !json_http.contains("protocol"),
+            "protocol must be absent when \"http\" (skip_serializing_if); got: {json_http}"
+        );
+
+        // TCP: round-trip preserves the value verbatim.
+        let tcp_status = AppStatus {
+            protocol: "tcp".to_string(),
+            ..none_status.clone()
+        };
+        let json_tcp = serde_json::to_string(&tcp_status).expect("serialize");
+        assert!(
+            json_tcp.contains(r#""protocol":"tcp""#),
+            "protocol must serialize verbatim when \"tcp\"; got: {json_tcp}"
+        );
+        let parsed: AppStatus = serde_json::from_str(&json_tcp).expect("deserialize");
+        assert_eq!(parsed.protocol, "tcp", "tcp must round-trip verbatim");
+
+        // HTTP serialized explicitly (not skipped): still round-trips to "http".
+        let http_explicit = serde_json::to_string(&AppStatus {
+            protocol: "http".to_string(),
+            ..none_status.clone()
+        })
+        .expect("serialize");
+        // Note: "http" IS skipped on serialization, so this branch
+        // would normally not be exercised — but if a future change
+        // drops the predicate, the deserialize-default still keeps
+        // us safe. Verify by manually crafting the JSON.
+        let forced_http = r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":0,"outbound_bytes":0,"tenant_id":"t_1","port":8080,"protocol":"http"}"#;
+        let parsed_forced: AppStatus = serde_json::from_str(forced_http).expect("deserialize");
+        assert_eq!(
+            parsed_forced.protocol, "http",
+            "explicit \"http\" must deserialize to \"http\""
+        );
+        // Sanity: don't accidentally serialize "http" — the
+        // serde default + skip predicate must stay in lock-step.
+        assert!(
+            !http_explicit.contains("protocol"),
+            "explicit-http serialization must still skip the field"
+        );
+
+        // Old workers that don't send `protocol` MUST deserialize to "http".
+        let parsed_old: AppStatus = serde_json::from_str(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":0,"tenant_id":"t_1","port":8080}"#,
+        )
+        .expect("deserialize legacy heartbeat");
+        assert_eq!(
+            parsed_old.protocol, "http",
+            "old workers without protocol must deserialize to \"http\" (serde default)"
+        );
+    }
+
+    /// Sanity check: an AppStatus carrying `protocol = "tcp"` round-trips
+    /// through the full HeartbeatMessage envelope without losing the field
+    /// or emitting an `"http"` default that would break the L4 routing
+    /// branch in the ingress.
+    #[test]
+    fn protocol_tcp_survives_heartbeat_envelope() {
+        let mut apps = HashMap::new();
+        apps.insert(
+            "my-tcp-app".to_string(),
+            AppStatus {
+                deployment_id: "d_tcp_1".into(),
+                status: "running".into(),
+                exit_code: None,
+                request_count: 0,
+                outbound_bytes: 0,
+                tenant_id: "t_acme".into(),
+                port: 8081,
+                ws_port: None,
+                dedupe_id: None,
+                observer_metrics: vec![],
+                last_error: None,
+                protocol: "tcp".to_string(),
+                resident_seconds: None,
+                duration_ms_total: 0,
+            },
+        );
+        let hb = HeartbeatMessage {
+            msg_type: "heartbeat".to_string(),
+            timestamp: "0".to_string(),
+            worker_id: "w_fra_1".to_string(),
+            region: "fra".to_string(),
+            worker_addr: Some("10.0.0.1".to_string()),
+            tenant_id: Some("t_acme".to_string()),
+            apps,
+            cluster_headroom: None,
+        };
+        let json = serde_json::to_string(&hb).expect("serialize heartbeat");
+        assert!(
+            json.contains(r#""protocol":"tcp""#),
+            "tcp protocol must survive HeartbeatMessage serialization; got: {json}"
+        );
+        let parsed: HeartbeatMessage = serde_json::from_str(&json).expect("deserialize heartbeat");
+        assert_eq!(parsed.apps["my-tcp-app"].protocol, "tcp");
     }
 
     // ── resident_seconds rolling-upgrade contract (issue #484) ────────────
@@ -824,6 +984,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            protocol: "http".to_string(),
             last_error: None,
             resident_seconds: None,
             duration_ms_total: 0,
@@ -854,6 +1015,7 @@ mod tests {
             port: 8080,
             ws_port: None,
             dedupe_id: None,
+            protocol: "http".to_string(),
             last_error: None,
             resident_seconds: Some(0),
             duration_ms_total: 0,
@@ -913,6 +1075,7 @@ mod tests {
             resident_seconds: None,
             duration_ms_total: 150,
             observer_metrics: vec![],
+            protocol: "http".to_string(),
             last_error: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");

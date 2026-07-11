@@ -299,6 +299,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port,
+            protocol: "http".to_string(),
             last_error: None,
         }))
     }
@@ -888,6 +889,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -944,6 +946,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: Some(10002),
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -1177,6 +1180,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -1225,6 +1229,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: Some(Arc::new(acc)),
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -1297,6 +1302,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
 
@@ -1321,6 +1327,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
 
@@ -1410,6 +1417,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -1525,6 +1533,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -1603,6 +1612,7 @@ mod heartbeat_integration_tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -2388,6 +2398,19 @@ impl Supervisor {
             env.insert("EDGE_WS_PORT".to_string(), ws.to_string());
         }
 
+        // Wire protocol for this app (issue #548). The control plane
+        // stamps `EDGE_PROTOCOL` in `spec.env` based on `[project].protocol`
+        // in the project's edge.toml: `"http"` for HTTP/WS long-running
+        // and FaaS apps, `"tcp"` for raw-TCP L4 apps. We read it here
+        // because the heartbeat needs the value before run_app_loop
+        // starts the guest, and the env isn't visible to the supervisor
+        // after we hand it to wasmtime. Defaults to "http" so legacy
+        // AppSpec payloads without the env entry still work.
+        let protocol = env
+            .get("EDGE_PROTOCOL")
+            .cloned()
+            .unwrap_or_else(|| "http".to_string());
+
         // EgressPolicy from the spec.allowlist. None / empty → allow-all.
         // Spec carries Vec<String>:
         //   * `None` (wire field absent) → permissive default
@@ -2604,6 +2627,13 @@ impl Supervisor {
             dispatch,
             metrics_acc,
             ws_port,
+            // Read from `EDGE_PROTOCOL` env stamped by the control
+            // plane (issue #548). Defaults to "http" via the
+            // `.unwrap_or_else` at the env-merge site above. The
+            // heartbeat builder reads `inst.protocol` to stamp
+            // `AppStatus.protocol` so the ingress can route HTTP vs
+            // L4 apps through the correct Caddy servers.
+            protocol: protocol.clone(),
             last_error: None,
         }));
 
@@ -3367,6 +3397,16 @@ impl Supervisor {
                     tenant_id: inst.tenant_id.clone(),
                     port: inst.port,
                     ws_port: inst.ws_port,
+                    // Wire protocol this app speaks (issue #548). Set
+                    // by `start_app` from the `EDGE_PROTOCOL` env var
+                    // (stamped by the control plane based on
+                    // `[project].protocol` in edge.toml). HTTP apps
+                    // stamp "http"; L4 raw-TCP apps stamp "tcp". The
+                    // ingress reads this to route HTTP apps to the
+                    // existing Caddy `reverse_proxy` and L4 apps to the
+                    // new `apps.layer4` server. Defaults to "http" for
+                    // legacy workers that don't carry the field.
+                    protocol: inst.protocol.clone(),
                     // Stamp the dedupe ID at heartbeat build time so two
                     // redeliveries of the same heartbeat carry the same
                     // ID and the CP can dedupe them (issue #418).
@@ -4160,6 +4200,7 @@ mod tests {
             dispatch: Some(dispatch_a),
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         };
 
@@ -4183,6 +4224,7 @@ mod tests {
             dispatch: Some(dispatch_b),
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         };
 
@@ -4456,6 +4498,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4490,6 +4533,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4573,6 +4617,7 @@ mod tests {
             dispatch: Some(dispatch),
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4613,6 +4658,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4654,6 +4700,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4723,6 +4770,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4780,6 +4828,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4855,6 +4904,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4912,6 +4962,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state
@@ -4980,6 +5031,7 @@ mod tests {
             dispatch: None,
             metrics_acc: None,
             ws_port: None,
+            protocol: "http".to_string(),
             last_error: None,
         }));
         state

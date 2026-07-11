@@ -98,6 +98,15 @@ pub struct AppInstance {
     /// If EDGE_WS_PORT was requested, holds the allocated port number.
     /// Reported in heartbeats so the ingress can route WS traffic.
     pub ws_port: Option<u16>,
+    /// Wire protocol this app speaks (issue #548). Defaults to "http".
+    /// Set from the `EDGE_PROTOCOL` env var (stamped by the control
+    /// plane) at `start_app`. Used by `build_heartbeat` to populate
+    /// `AppStatus.protocol` so the ingress can route HTTP apps to the
+    /// Caddy `reverse_proxy` and L4 apps to the new `apps.layer4`
+    /// server. Stays on the instance (rather than on a supervisor-level
+    /// map) so its lifecycle matches `ws_port` — populated at start,
+    /// read at heartbeat time, gone when the app stops.
+    pub protocol: String,
     /// Last error message from a crash, panic-in-spawn, or wasm trap
     /// (issue #45). Stamped onto the instance by
     /// `Supervisor::stamp_last_error` from the panic-in-spawn arm and
