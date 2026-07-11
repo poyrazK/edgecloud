@@ -1168,31 +1168,59 @@ fn build_wasi_ctx_for_tenant(
             );
         } else {
             let app_dir = base.join(tenant_id).join(app_name);
-            match std::fs::create_dir_all(&app_dir) {
-                Ok(()) => {
-                    // First-time warning if the per-tenant parent exists
-                    // with files but the per-app subdir does not — the
-                    // migration break called out in this function's doc
-                    // comment. This is a clean break: preopens are
+            // Issue #606 — this function runs per request on the FaaS
+            // path (`RuntimeState::with_env_and_meter` is called once per
+            // accepted HTTP request). `app_dir.exists()` is the single
+            // gate: when it returns true, the per-app subdir is already
+            // on disk, the WARN cannot re-fire, and `create_dir_all`
+            // would be a wasted `mkdir` syscall. Skip both. Steady-
+            // state hot path is a single `stat`-class syscall
+            // (`exists()`), no `mkdir`, no `readdir`.
+            //
+            // Issue #558 follow-up — when `exists()` returns false we
+            // run the WARN gate before `create_dir_all`. The original
+            // #558 PR ordered these the other way (create first, then
+            // check), which made `had_app_dir` structurally always-true
+            // and silently broke the one-shot WARN. The WARN now lives
+            // in the `!had_app_dir` branch where it can actually fire.
+            let had_app_dir = app_dir.exists();
+            if !had_app_dir {
+                let tenant_root = base.join(tenant_id);
+                let had_tenant_files = std::fs::read_dir(&tenant_root)
+                    .map(|mut it| it.next().is_some())
+                    .unwrap_or(false);
+                if had_tenant_files {
+                    // First-time warning when the per-tenant parent
+                    // exists with files but the per-app subdir does not
+                    // — the migration break called out in this function's
+                    // doc comment. This is a clean break: preopens are
                     // recent (Phase C-5) and have not seen production
                     // use, so we don't auto-rename. Operators with
                     // existing on-disk state should re-deploy or copy
                     // files manually.
-                    let tenant_root = base.join(tenant_id);
-                    let had_tenant_files = std::fs::read_dir(&tenant_root)
-                        .map(|mut it| it.next().is_some())
-                        .unwrap_or(false);
-                    let had_app_dir = app_dir.exists();
-                    if had_tenant_files && !had_app_dir {
-                        tracing::warn!(
-                            tenant_id,
-                            app_name,
-                            dir = ?app_dir,
-                            "EDGE_FS_PATH per-app preopen: starting empty; \
-                             pre-existing tenant-root files are NOT migrated — \
-                             see issue #558"
-                        );
-                    }
+                    tracing::warn!(
+                        tenant_id,
+                        app_name,
+                        dir = ?app_dir,
+                        "EDGE_FS_PATH per-app preopen: starting empty; \
+                         pre-existing tenant-root files are NOT migrated — \
+                         see issue #558"
+                    );
+                }
+            }
+            // Skip `create_dir_all` entirely on the hot path. When
+            // `had_app_dir` is true the per-app subdir is already on
+            // disk and `mkdir` would only burn a syscall. When it is
+            // false we DO need to create (first request for a fresh
+            // app, or the dir was deleted under us), and any error
+            // path still surfaces via the WARN below.
+            let app_dir_ready = if had_app_dir {
+                Ok(())
+            } else {
+                std::fs::create_dir_all(&app_dir)
+            };
+            match app_dir_ready {
+                Ok(()) => {
                     if let Err(e) =
                         builder.preopened_dir(&app_dir, "/", DirPerms::all(), FilePerms::all())
                     {
