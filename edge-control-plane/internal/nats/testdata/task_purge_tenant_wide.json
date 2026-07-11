@@ -1,0 +1,6 @@
+{
+  "type": "task_purge",
+  "timestamp": "2026-07-11T10:15:00Z",
+  "tenant_id": "t_acme",
+  "reason": "tenant_offboarded"
+}

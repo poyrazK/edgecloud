@@ -1,0 +1,17 @@
+{
+  "type": "heartbeat",
+  "timestamp": "2026-07-11T10:30:00Z",
+  "worker_id": "w_global_dev",
+  "region": "global",
+  "apps": {
+    "myapp": {
+      "status": "running",
+      "exit_code": 0,
+      "deployment_id": "d_abc123",
+      "request_count": 0,
+      "outbound_bytes": 0,
+      "tenant_id": "t_acme",
+      "port": 8081
+    }
+  }
+}

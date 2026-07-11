@@ -1,0 +1,40 @@
+{
+  "type": "task_update",
+  "timestamp": "2026-07-11T10:00:00Z",
+  "tenant_id": "t_acme",
+  "apps": {
+    "myapp": {
+      "deployment_id": "d_abc123",
+      "deployment_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "deployment_signature": "kZSd4kQb8zMqOH8Lbq5F7j9W6o4yYfE2tPmI1nVcA3w",
+      "signing_key_id": "k1",
+      "preview_id": "prev_abc123",
+      "preview_pr_number": 42,
+      "routes": [
+        {
+          "deployment_id": "d_abc123",
+          "deployment_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "deployment_signature": "kZSd4kQb8zMqOH8Lbq5F7j9W6o4yYfE2tPmI1nVcA3w",
+          "signing_key_id": "k1",
+          "weight": 80
+        },
+        {
+          "deployment_id": "d_def456",
+          "deployment_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "weight": 20
+        }
+      ],
+      "env": {
+        "API_KEY": "redacted",
+        "LOG_LEVEL": "info"
+      },
+      "allowlist": [
+        "api.stripe.com",
+        "*.sendgrid.net"
+      ],
+      "max_memory_mb": 256,
+      "cpu_budget_ms": 500,
+      "socket_mode": "hostname-pinned"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "type": "task_update",
+  "timestamp": "2026-07-11T10:00:00Z",
+  "tenant_id": "t_acme",
+  "apps": {
+    "myapp": {
+      "deployment_id": "d_minimal",
+      "deployment_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "env": {},
+      "allowlist": [],
+      "max_memory_mb": 128,
+      "cpu_budget_ms": 250
+    }
+  }
+}

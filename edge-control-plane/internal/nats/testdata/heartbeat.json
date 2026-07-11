@@ -1,0 +1,55 @@
+{
+  "type": "heartbeat",
+  "timestamp": "2026-07-11T10:30:00Z",
+  "worker_id": "w_global_dev",
+  "region": "global",
+  "apps": {
+    "myapp": {
+      "status": "running",
+      "exit_code": 0,
+      "deployment_id": "d_abc123",
+      "request_count": 1024,
+      "outbound_bytes": 4096,
+      "tenant_id": "t_acme",
+      "port": 8081,
+      "observer_metrics": [
+        {
+          "name": "hits",
+          "kind": "counter",
+          "value": 42,
+          "labels": [
+            [
+              "endpoint",
+              "/v1/items"
+            ]
+          ]
+        },
+        {
+          "name": "memory_bytes",
+          "kind": "gauge",
+          "value": 512,
+          "labels": []
+        },
+        {
+          "name": "latency_ms",
+          "kind": "histogram_sample",
+          "value": 12.5,
+          "labels": [
+            [
+              "endpoint",
+              "/v1/items"
+            ]
+          ]
+        }
+      ],
+      "dedupe_id": "w_global_dev:d_abc123:2026-07-11T10:30:00Z",
+      "resident_seconds": 90,
+      "duration_ms_total": 1500
+    }
+  },
+  "cluster_headroom": {
+    "cpu_pct": 0.5,
+    "mem_pct": 0.3,
+    "app_slots": 42
+  }
+}
