@@ -156,3 +156,67 @@ async fn list_propagates_404_for_missing_app() {
         .failure()
         .stderr(predicate::str::contains("404"));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #571 propagation: retry transient 5xx on domains remove.
+//
+// `edge domains remove` is naturally idempotent (DELETE-by-(app,
+// fqdn); second call returns 404 with no side effect). The retry
+// loop uses hardcoded sensible defaults — there's no `--max-retries`
+// flag on the surface. The retry path is exercised end-to-end by
+// mounting a 503-then-200 pair on the DELETE route and asserting
+// both requests landed.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn remove_retries_503_then_succeeds() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/apps/api/domains/api.example.com"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream down"))
+        .named("domains-remove-503")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/apps/api/domains/api.example.com"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200))
+        .named("domains-remove-200")
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.env("EDGE_CLI_RETRY_BASE_MS", "10");
+    cmd.timeout(std::time::Duration::from_secs(15));
+    cmd.arg("domains")
+        .arg("remove")
+        .arg("api")
+        .arg("api.example.com");
+
+    cmd.assert().success();
+    let received = server.received_requests().await.expect("received requests");
+    let delete_count = received
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "DELETE"
+                && r.url.path() == "/api/v1/apps/api/domains/api.example.com"
+        })
+        .count();
+    assert_eq!(
+        delete_count, 2,
+        "expected 503 + 200 = 2 DELETE attempts on /api/v1/apps/api/domains/api.example.com"
+    );
+}
