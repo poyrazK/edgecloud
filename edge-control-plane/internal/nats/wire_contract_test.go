@@ -3,6 +3,7 @@ package nats
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -89,6 +90,19 @@ func TestWireContract_TaskUpdateMinimal_GoRoundTrip(t *testing.T) {
 	}
 	if len(app.Routes) != 0 {
 		t.Errorf("expected no routes, got %d", len(app.Routes))
+	}
+	// Belt-and-braces: the structural round-trip already catches an
+	// `omitempty` flip (re-marshaled bytes gain a key the fixture omits),
+	// but an explicit string-contains check makes the failure message
+	// point at the exact field that drifted.
+	re, err := json.Marshal(&msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, omit := range []string{"deployment_signature", "signing_key_id", "preview_id", "routes", "socket_mode"} {
+		if strings.Contains(string(re), omit) {
+			t.Errorf("omitempty drift: re-marshaled payload unexpectedly contains %q\n  re: %s", omit, re)
+		}
 	}
 }
 
@@ -198,12 +212,20 @@ func TestWireContract_HeartbeatMinimal_GoRoundTrip(t *testing.T) {
 	}
 }
 
-// Sanity check on the domain.AppStatus field order — encoding/json emits
-// struct fields in declaration order, and AppStatus is referenced by the
-// heartbeat fixtures. A field-order drift here would silently fail every
-// Heartbeat round-trip, so we pin the order explicitly via reflect.
+// Pin domain.AppStatus field ORDER, not just the field set. encoding/json
+// emits struct fields in declaration order; a Go-side reorder would still
+// pass the structural round-trip (both sides parse into maps that don't
+// preserve key order) but would change the wire-byte layout. The heartbeats
+// are internal-to-internal traffic today, but if a future feature ever
+// pretty-prints a heartbeat or pipes it into a byte-comparison tool, an
+// order drift here will silently break that consumer.
+//
+// We pin via reflect.StructField.Index (the field's positional offset in
+// the struct), which is what json.Marshal iterates over. A field rename
+// still flips the test red (the JSON tag changes), as does a field
+// reorder or a field insertion in the middle of the struct.
 func TestWireContract_DomainAppStatusFieldOrder(t *testing.T) {
-	want := []string{
+	wantTags := []string{
 		"status",
 		"exit_code",
 		"deployment_id",
@@ -211,41 +233,27 @@ func TestWireContract_DomainAppStatusFieldOrder(t *testing.T) {
 		"outbound_bytes",
 		"tenant_id",
 		"port",
+		"observer_metrics",
 		"dedupe_id",
 		"resident_seconds",
 		"duration_ms_total",
 	}
-	var s domain.AppStatus
-	got, err := json.Marshal(&s)
-	if err != nil {
-		t.Fatal(err)
+	t.Helper()
+	typ := reflect.TypeOf(domain.AppStatus{})
+	if typ.NumField() != len(wantTags) {
+		t.Errorf("AppStatus field count: got %d, want %d (a field was added or removed without updating this test)",
+			typ.NumField(), len(wantTags))
 	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(got, &m); err != nil {
-		t.Fatal(err)
-	}
-	// Marshal produces empty `{}` for a zero struct — that's fine; just
-	// assert the field ORDER when fields are present.
-	raw := []byte(`{"status":"running","exit_code":0,"deployment_id":"d","request_count":1,"outbound_bytes":2,"tenant_id":"t","port":8080,"dedupe_id":"x","resident_seconds":1,"duration_ms_total":1}`)
-	var s2 domain.AppStatus
-	if err := json.Unmarshal(raw, &s2); err != nil {
-		t.Fatal(err)
-	}
-	re, err := json.Marshal(&s2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Decode both into a generic map and verify key set matches `want`.
-	var gotMap map[string]interface{}
-	if err := json.Unmarshal(re, &gotMap); err != nil {
-		t.Fatal(err)
-	}
-	if len(gotMap) != len(want) {
-		t.Errorf("AppStatus field count: got %d, want %d", len(gotMap), len(want))
-	}
-	for _, k := range want {
-		if _, ok := gotMap[k]; !ok {
-			t.Errorf("AppStatus missing field %q after round-trip", k)
+	for i, want := range wantTags {
+		got := typ.Field(i)
+		tag := got.Tag.Get("json")
+		// Strip `,omitempty` etc. — we only care about the JSON key name.
+		if comma := strings.Index(tag, ","); comma >= 0 {
+			tag = tag[:comma]
+		}
+		if tag != want {
+			t.Errorf("AppStatus field %d: got json=%q, want %q (field name=%q, type=%s)",
+				i, tag, want, got.Name, got.Type)
 		}
 	}
 }

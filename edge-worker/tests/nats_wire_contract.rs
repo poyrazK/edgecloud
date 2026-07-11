@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use edge_runtime::socket_egress::SocketEgressPolicy;
-use edge_worker::messages::{DeploymentRoute, HeartbeatMessage, PurgeReason, TaskMessage};
+use edge_worker::messages::{HeartbeatMessage, PurgeReason, TaskMessage};
 
 fn task_update_full() -> &'static str {
     include_str!("../../edge-control-plane/internal/nats/testdata/task_update.json")
@@ -252,6 +252,19 @@ fn heartbeat_full_parses_with_dedupe_id_and_observer_metrics() {
     assert_eq!(headroom.app_slots, 42);
     assert_eq!(headroom.cpu_pct, Some(0.5));
     assert_eq!(headroom.mem_pct, Some(0.3));
+
+    // NOTE: `HeartbeatMessage::worker_addr` / `tenant_id` (issue #297) are
+    // part of the Rust-side envelope but NOT modeled on the Go-side
+    // `HeartbeatMessage` envelope (`internal/nats/publisher.go:178`).
+    // They flow on the wire; the CP derives them from `apps[*].tenant_id`
+    // and the worker's separate register call. They're intentionally
+    // absent from the shared fixtures because adding them would force
+    // the Go envelope to grow to keep the structural round-trip — a
+    // production-code change outside #610's scope. If the Go side ever
+    // gains these fields, add them to the fixtures AND extend both
+    // round-trip tests.
+    assert_eq!(hb.worker_addr, None);
+    assert_eq!(hb.tenant_id, None);
 }
 
 #[test]
@@ -276,11 +289,9 @@ fn heartbeat_minimal_parses_without_optionals() {
     assert_eq!(app.duration_ms_total, 0); // u64 default, not Option
     assert_eq!(app.observer_metrics.len(), 0);
     assert!(hb.cluster_headroom.is_none());
-}
 
-/// Suppress an unused-import warning when the test list is filtered by
-/// the user (e.g. running only a subset of these tests).
-#[allow(dead_code)]
-const _: fn() = || {
-    let _: Option<DeploymentRoute> = None;
-};
+    // See note in `heartbeat_full_parses_with_dedupe_id_and_observer_metrics`
+    // for why worker_addr / tenant_id are not asserted here.
+    assert_eq!(hb.worker_addr, None);
+    assert_eq!(hb.tenant_id, None);
+}
