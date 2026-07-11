@@ -1,4 +1,11 @@
 //! `edge:cache` — in-memory LRU cache with TTL and optional persistence.
+//!
+//! **Per-tenant lifecycle (issue #569):** the on-disk cache file at
+//! `<EDGE_CACHE_PATH>/<tenant_id>/cache.json` and the in-memory
+//! `CACHE_STORES` registry entry follow the same create-on-first-
+//! use, clear-on-`task_purge` contract as `kv_store` (see
+//! `interfaces/kv_store.rs`). Stop / crash / rebalance do NOT
+//! delete state.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;

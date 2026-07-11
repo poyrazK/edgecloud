@@ -28,14 +28,25 @@ import (
 // failFor lets a test inject per-region failures; an empty map means
 // every publish succeeds. PublishHeartbeat and EnsureStream are
 // no-ops because ActivateDeployment never calls them.
+//
+// Issue #569: purgeCalls captures PublishPurge invocations alongside
+// the existing task_update / full_sync capture. The two slices are
+// kept separate so a fan-out assertion like "exactly N task_update
+// publishes and ZERO purges" stays readable.
 type RecordingPublisher struct {
-	calls   []recordedPublish
-	failFor map[string]error
+	calls      []recordedPublish
+	purgeCalls []recordedPurge
+	failFor    map[string]error
 }
 
 type recordedPublish struct {
 	region string
 	msg    *nats.TaskMessage
+}
+
+type recordedPurge struct {
+	region string
+	msg    *nats.PurgePayload
 }
 
 func newRecordingPublisher() *RecordingPublisher {
@@ -77,6 +88,28 @@ func (p *RecordingPublisher) PublishFullSync(region string, msg *nats.TaskMessag
 }
 
 func (p *RecordingPublisher) EnsureStream(nats.StreamConfig) error { return nil }
+
+// PublishPurge is the issue #569 entry point — recorded in purgeCalls
+// for parity with PublishTaskUpdate / PublishFullSync. failFor
+// semantics ARE honored here so the drainer's per-region retry
+// ladder tests can exercise the same shape with purges.
+func (p *RecordingPublisher) PublishPurge(region string, msg *nats.PurgePayload) error {
+	p.purgeCalls = append(p.purgeCalls, recordedPurge{region: region, msg: msg})
+	if err, ok := p.failFor[region]; ok {
+		return err
+	}
+	return nil
+}
+
+// purgeRegionsCalled returns the regions purge was published to, in
+// call order. Mirrors regionsCalled for the task_update path.
+func (p *RecordingPublisher) purgeRegionsCalled() []string {
+	out := make([]string, len(p.purgeCalls))
+	for i, c := range p.purgeCalls {
+		out[i] = c.region
+	}
+	return out
+}
 
 // activateSvcForTest wires a DeploymentService with sqlmock-backed
 // repositories and the given publisher. `defaultRegion` is what
@@ -640,6 +673,7 @@ func equalStringSlices(a, b []string) bool {
 func outboxRowPayload(t *testing.T, tenantID, appName, deploymentID string, maxMemoryMB int) []byte {
 	t.Helper()
 	payload, err := json.Marshal(&nats.TaskMessage{
+		Type:     nats.TaskMessageKindTaskUpdate, // matches Kind='task_update' in the row (issue #569 drainer cross-check)
 		TenantID: tenantID,
 		Apps: map[string]nats.AppConfig{
 			appName: {

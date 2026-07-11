@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -155,14 +157,28 @@ type apiKeyRepoForTenantSvc interface {
 
 // TenantService handles tenant business logic.
 type TenantService struct {
-	db         *sqlx.DB
-	tenantRepo tenantRepoForTenantSvc
-	quotaRepo  quotaRepoForTenantSvc
-	apiKeyRepo apiKeyRepoForTenantSvc
+	db            *sqlx.DB
+	tenantRepo    tenantRepoForTenantSvc
+	quotaRepo     quotaRepoForTenantSvc
+	apiKeyRepo    apiKeyRepoForTenantSvc
+	appRepo       *repository.AppRepository
+	outboxRepo    *repository.OutboxRepository
+	defaultRegion string
 }
 
-func NewTenantService(db *sqlx.DB, tenantRepo tenantRepoForTenantSvc, quotaRepo quotaRepoForTenantSvc, apiKeyRepo apiKeyRepoForTenantSvc) *TenantService {
-	return &TenantService{db: db, tenantRepo: tenantRepo, quotaRepo: quotaRepo, apiKeyRepo: apiKeyRepo}
+func NewTenantService(db *sqlx.DB, tenantRepo tenantRepoForTenantSvc, quotaRepo quotaRepoForTenantSvc, apiKeyRepo apiKeyRepoForTenantSvc, appRepo *repository.AppRepository, outboxRepo *repository.OutboxRepository, defaultRegion string) *TenantService {
+	if defaultRegion == "" {
+		defaultRegion = "global"
+	}
+	return &TenantService{
+		db:            db,
+		tenantRepo:    tenantRepo,
+		quotaRepo:     quotaRepo,
+		apiKeyRepo:    apiKeyRepo,
+		appRepo:       appRepo,
+		outboxRepo:    outboxRepo,
+		defaultRegion: defaultRegion,
+	}
 }
 
 // CreateTenant creates a new tenant with default quota atomically.
@@ -364,8 +380,62 @@ func (s *TenantService) UpdateTenantPlan(ctx context.Context, tenantID, newPlan 
 	})
 }
 
+// DeleteTenant removes a tenant and enqueues a per-app task_purge
+// for each app the tenant owns. The purge tombstone flows through
+// the same issue #42 outbox pipeline that activate uses, so the
+// worker `Supervisor::handle_task_message` clears the per-tenant
+// KV / cache / scheduling state for every app (issue #569).
+//
+// Atomicity: the tenant row delete AND the per-app outbox rows
+// enqueue run inside a single transaction. If tenantRepo.Delete
+// fails, no outbox row is written — workers never receive a
+// phantom purge for a tenant whose CP-side rows still exist.
+//
+// Multi-region: today the per-app purge row targets the CP's
+// own region (cfg.Region). When multi-region ships, the
+// pq.StringArray{s.defaultRegion} line is the seam — wire it
+// to the same regions lookup that DeploymentService uses.
 func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {
-	return s.tenantRepo.Delete(ctx, id)
+	return repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		// List apps BEFORE deleting the tenant — the FK cascade
+		// from `tenants` → `apps` removes the rows inside
+		// tenantRepo.Delete below, so we need the names now to
+		// build the purge payloads. List runs against the same
+		// tx so it sees a consistent snapshot.
+		apps, err := s.appRepo.WithTx(tx).List(ctx, id, 1000, 0)
+		if err != nil {
+			return fmt.Errorf("listing apps for purge: %w", err)
+		}
+
+		if err := s.tenantRepo.WithTx(tx).Delete(ctx, id); err != nil {
+			return fmt.Errorf("deleting tenant: %w", err)
+		}
+
+		outboxRepo := s.outboxRepo.WithTx(tx)
+		for _, app := range apps {
+			payload, err := json.Marshal(nats.PurgePayload{
+				Type:      nats.TaskMessageKindTaskPurge,
+				Timestamp: time.Now().UTC(),
+				TenantID:  id,
+				AppName:   app.Name,
+				Reason:    nats.PurgeReasonTenantOffboarded,
+			})
+			if err != nil {
+				return fmt.Errorf("marshaling tenant purge payload: %w", err)
+			}
+			if err := outboxRepo.Enqueue(ctx, &repository.OutboxRow{
+				TenantID:  id,
+				AppName:   app.Name,
+				Kind:      nats.TaskMessageKindTaskPurge,
+				Payload:   payload,
+				Regions:   pq.StringArray{s.defaultRegion},
+				DedupeKey: "purge:" + id + ":" + app.Name + ":" + uuid.NewString(),
+			}); err != nil {
+				return fmt.Errorf("enqueueing tenant task_purge: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 // EnableTenant clears tenants.disabled_at for a tenant that

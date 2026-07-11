@@ -19,6 +19,14 @@ func NewTenantRepository(db *sqlx.DB) *TenantRepository {
 	return &TenantRepository{db: db}
 }
 
+// NewTenantRepositoryFromDBTX constructs a TenantRepository
+// bound to a DBTX — useful for tests that need to run inside
+// a sqlmock-backed *sqlx.Tx without exposing a real DB
+// connection. Mirrors NewAppRepositoryFromDBTX at app.go.
+func NewTenantRepositoryFromDBTX(dbtx DBTX) *TenantRepository {
+	return &TenantRepository{db: dbtx}
+}
+
 // WithTx returns a new TenantRepository using the provided transaction.
 func (r *TenantRepository) WithTx(tx *sqlx.Tx) *TenantRepository {
 	return &TenantRepository{db: tx}

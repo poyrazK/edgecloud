@@ -17,7 +17,8 @@ use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{
-    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, TaskMessage,
+    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, PurgeReason,
+    TaskMessage,
 };
 use crate::metering_dedupe::dedupe_id;
 use crate::nats::NatsClient;
@@ -510,6 +511,135 @@ mod heartbeat_integration_tests {
         let result = sup.handle_task_message(msg).await;
         assert!(result.is_ok());
         assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    // ── task_purge (issue #569) ─────────────────────────────────────
+    //
+    // These tests cover the worker-side half of the per-tenant
+    // cleanup wire: a `task_purge` TaskMessage carries a
+    // tenant_id + optional app_name + reason. The supervisor
+    // stops the affected apps (per-app or tenant-wide) and then
+    // invokes `edge_runtime::purge_tenant` to clear KV / cache /
+    // scheduler state. The regression guard for "stop_app must
+    // NOT purge" lives in `edge-runtime::runtime::tests` so the
+    // worker-side tests here exercise the wire dispatch, not the
+    // store-clear invariant.
+
+    #[tokio::test]
+    async fn handle_purge_per_app_stops_only_named_app() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        // Two apps for the same tenant.
+        let app_a = make_app(instance_pre.clone(), AppInstanceStatus::Running, None);
+        let app_b = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-a".into()), app_a);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-b".into()), app_b);
+        let sup = build_supervisor(state);
+
+        // task_purge targets app-a only.
+        let msg = TaskMessage::TaskPurge {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            app_name: "app-a".into(),
+            reason: PurgeReason::AppDeleted,
+        };
+        sup.handle_task_message(msg).await.unwrap();
+        // app-b must survive a per-app purge.
+        assert_eq!(sup.state.read().await.apps.len(), 1);
+        assert!(sup
+            .state
+            .read()
+            .await
+            .apps
+            .contains_key(&("t_test".into(), "app-b".into())));
+    }
+
+    #[tokio::test]
+    async fn handle_purge_tenant_wide_stops_all_apps() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app_a = make_app(instance_pre.clone(), AppInstanceStatus::Running, None);
+        let app_b = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-a".into()), app_a);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "app-b".into()), app_b);
+        let sup = build_supervisor(state);
+
+        // task_purge with empty app_name = tenant-wide purge.
+        let msg = TaskMessage::TaskPurge {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            app_name: String::new(),
+            reason: PurgeReason::TenantOffboarded,
+        };
+        sup.handle_task_message(msg).await.unwrap();
+        // All apps for the tenant must be gone.
+        assert!(sup.state.read().await.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_purge_idempotent_when_app_already_gone() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(instance_pre, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+
+        // task_purge for an app we don't host — must be a no-op,
+        // not an error. JetStream redelivery (issue #42) relies
+        // on idempotence.
+        let msg = TaskMessage::TaskPurge {
+            timestamp: String::new(),
+            tenant_id: "t_test".into(),
+            app_name: "missing-app".into(),
+            reason: PurgeReason::AppDeleted,
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_ok());
+        // Existing app still there.
+        assert_eq!(sup.state.read().await.apps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_purge_rejects_unsafe_tenant_id() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let sup = build_supervisor(state);
+
+        // Path-traversal attempt — must be refused, not silently
+        // accepted. (The runtime `purge_tenant` is the second
+        // guard; here we just verify the supervisor short-circuits
+        // before touching the port pool / state map.)
+        let msg = TaskMessage::TaskPurge {
+            timestamp: String::new(),
+            tenant_id: "../etc".into(),
+            app_name: String::new(),
+            reason: PurgeReason::TenantOffboarded,
+        };
+        let result = sup.handle_task_message(msg).await;
+        assert!(result.is_err(), "unsafe tenant_id must be rejected");
     }
 
     // ── process_task_message ack/nack/term tests ────────────────────
@@ -1374,6 +1504,21 @@ impl Supervisor {
     /// in the desired set never causes us to stop another tenant's app
     /// that happens to share the same name.
     pub async fn handle_task_message(&self, msg: TaskMessage) -> anyhow::Result<()> {
+        // Issue #569: `task_purge` tombstones are a distinct wire shape
+        // — no `apps` field, derived from the worker's in-memory state.
+        // Dispatched to `handle_purge` BEFORE the task_update / full_sync
+        // diff path so the stop-then-purge ordering is per-message and
+        // we never race a diff against a tenant that's mid-purge.
+        if let TaskMessage::TaskPurge {
+            ref tenant_id,
+            ref app_name,
+            ref reason,
+            ..
+        } = msg
+        {
+            return self.handle_purge(tenant_id, app_name, *reason).await;
+        }
+
         let (tenant_id, desired_apps) = match msg {
             TaskMessage::TaskUpdate {
                 tenant_id, apps, ..
@@ -1381,6 +1526,8 @@ impl Supervisor {
             TaskMessage::FullSync {
                 tenant_id, apps, ..
             } => (tenant_id, apps),
+            // Exhaustiveness: the `task_purge` arm was handled above.
+            TaskMessage::TaskPurge { .. } => unreachable!("task_purge handled above"),
         };
 
         // Snapshot this tenant's running apps.
@@ -1429,6 +1576,87 @@ impl Supervisor {
             map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
         }
         map
+    }
+
+    /// Issue #569: handle a `task_purge` tombstone. Stops the
+    /// in-flight apps for the tenant first (per-app when `app_name`
+    /// is set, every app when empty for the tenant-wide form), then
+    /// calls `edge_runtime::runtime::purge_tenant` to remove the
+    /// per-tenant dirs and in-memory registry entries.
+    ///
+    /// **Order matters, do not reorder.** Stopping apps first
+    /// achieves two things:
+    ///
+    /// 1. Drains in-flight requests so no KV / cache / scheduler
+    ///    read or write is racing the dir removal.
+    /// 2. Drops every `Arc<KvStore>` / `Arc<Cache>` / `Arc<Scheduler>`
+    ///    clone held by the app, so `purge_tenant`'s
+    ///    `Arc::get_mut` inside `runtime.rs` succeeds and the
+    ///    in-memory registries clear. If a still-running app holds
+    ///    a clone when `purge_tenant` runs, `Arc::get_mut` returns
+    ///    `None` and the registry entry silently survives — the
+    ///    next `start_app` for the tenant then races against a
+    ///    `KvStore` whose on-disk dir has already been `rm`'d,
+    ///    splitting state across two instances until the old `Arc`
+    ///    drops.
+    ///
+    /// The diff-and-reconcile path takes over from the next
+    /// task_update / full_sync — a subsequent activate for the same
+    /// tenant will see no apps (correct) and recreate the dirs
+    /// (forward-compat).
+    ///
+    /// Idempotent: an unknown app is a no-op, an already-empty
+    /// tenant is a no-op. JetStream redelivery (issue #42) is safe.
+    async fn handle_purge(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        reason: PurgeReason,
+    ) -> anyhow::Result<()> {
+        if !edge_runtime::is_safe_tenant_id(tenant_id) {
+            // Mirror the start_app guard — refuse rather than
+            // escape the persistence base via a malformed tenant id.
+            anyhow::bail!("refusing to purge: unsafe tenant_id {:?}", tenant_id);
+        }
+
+        let current = self.snapshot_current_apps(tenant_id).await;
+        let to_stop: Vec<String> = if app_name.is_empty() {
+            current.keys().cloned().collect()
+        } else if current.contains_key(app_name) {
+            vec![app_name.to_string()]
+        } else {
+            tracing::info!(
+                tenant_id = %tenant_id,
+                app_name = %app_name,
+                "task_purge for app that isn't running — no-op"
+            );
+            Vec::new()
+        };
+
+        for app in &to_stop {
+            self.stop_app(tenant_id, app).await?;
+        }
+
+        // purge_tenant is idempotent and best-effort on dir removal;
+        // a failure here is logged but does NOT propagate — the
+        // tombstone has already been ack'd and a future #475 durable
+        // KV tier will add a CP-side BatchDelete retry path.
+        if let Err(e) = edge_runtime::purge_tenant(tenant_id) {
+            tracing::error!(
+                tenant_id = %tenant_id,
+                err = %e,
+                "purge_tenant failed (in-memory cleared; on-disk dirs may be partial)",
+            );
+        }
+
+        tracing::info!(
+            tenant_id = %tenant_id,
+            app_name = %app_name,
+            reason = ?reason,
+            stopped = to_stop.len(),
+            "task_purge handled",
+        );
+        Ok(())
     }
 
     /// Start a new app or restart a changed one.
