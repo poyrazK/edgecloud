@@ -20,15 +20,14 @@ use edge_worker::verifier::{Keyring, SigError};
 use serde::Deserialize;
 
 /// One positive Ed25519 fixture used by both languages. Decoded once
-/// per test (cheap; the JSON is 7 lines).
+/// per test (cheap; the JSON is 7 lines). The Rust field names match
+/// the JSON keys exactly, so no `#[serde(rename = ...)]` is needed —
+/// absence is deliberate, signaling "no field-name transformation."
 #[derive(Debug, Deserialize)]
 struct WellKnownFixture {
     kid: String,
-    #[serde(rename = "pubkey_hex")]
     pubkey_hex: String,
-    #[serde(rename = "deployment_id")]
     deployment_id: String,
-    #[serde(rename = "hash_hex")]
     hash_hex: String,
     signature: String,
 }
@@ -38,14 +37,46 @@ fn signing_fixture() -> &'static str {
 }
 
 fn parse_fixture() -> WellKnownFixture {
-    serde_json::from_str(signing_fixture()).expect("well_known_signature.json must parse")
+    let fx: WellKnownFixture =
+        serde_json::from_str(signing_fixture()).expect("well_known_signature.json must parse");
+    // Belt-and-braces: serde_json by default errors on missing fields
+    // (we get `Error("missing field ...")` at parse time above), but a
+    // field explicitly set to `""` would deserialize as an empty
+    // String and silently slip past the parse step. Assert the
+    // surface string-level invariant so a future fixture edit
+    // (e.g. someone writes `"signature": ""` to silence an unrelated
+    // check) still surfaces a clear diagnostic instead of a confusing
+    // drift message downstream. Mirror the Go loader's empty-field
+    // check.
+    assert!(
+        !fx.kid.is_empty(),
+        "well_known_signature.json: required field 'kid' is empty"
+    );
+    assert!(
+        !fx.pubkey_hex.is_empty(),
+        "well_known_signature.json: required field 'pubkey_hex' is empty"
+    );
+    assert!(
+        !fx.deployment_id.is_empty(),
+        "well_known_signature.json: required field 'deployment_id' is empty"
+    );
+    assert!(
+        !fx.hash_hex.is_empty(),
+        "well_known_signature.json: required field 'hash_hex' is empty"
+    );
+    assert!(
+        !fx.signature.is_empty(),
+        "well_known_signature.json: required field 'signature' is empty"
+    );
+    fx
 }
 
 /// Builds a one-entry keyring whose single key matches the fixture's
 /// `pubkey_hex`. Mirrors `go/control-plane`'s `LoadKeyringFromInline`
-/// file format (`<kid> = <64-hex>`). The fixture's pubkey is the
-/// verifying key derived from the all-zero-seed test keypair
-/// (deterministic across processes).
+/// file format (`<kid> = <64-hex>`) — and the same wire shape the Go
+/// side uses via `allZeroKeyringInline` in `wire_contract_test.go`.
+/// The fixture's pubkey is the verifying key derived from the
+/// all-zero-seed test keypair (deterministic across processes).
 fn keyring_for_fixture(fx: &WellKnownFixture) -> Keyring {
     let raw = format!("{} = {}\n", fx.kid, fx.pubkey_hex);
     Keyring::from_inline(&raw).expect("fixture pubkey must build a valid keyring")

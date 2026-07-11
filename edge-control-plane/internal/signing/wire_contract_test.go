@@ -44,6 +44,25 @@ func loadWellKnownFixture(t *testing.T) wellKnownFixtureJSON {
 	if err := json.Unmarshal(wellKnownSignatureFixture, &f); err != nil {
 		t.Fatalf("decode well_known_signature.json: %v", err)
 	}
+	// A fixture field that's been accidentally dropped would otherwise
+	// produce a confusing "drift" message downstream (e.g. empty
+	// Signature would fail `got != want` on GoProducesWellKnownSignature
+	// instead of pointing at the dropped field). Surface a clear
+	// diagnostic here so a future fixture edit goes red in the obvious
+	// place, not inside an unrelated assertion.
+	for _, c := range []struct {
+		field, value string
+	}{
+		{"kid", f.Kid},
+		{"pubkey_hex", f.PubkeyHex},
+		{"deployment_id", f.DeploymentID},
+		{"hash_hex", f.HashHex},
+		{"signature", f.Signature},
+	} {
+		if c.value == "" {
+			t.Fatalf("well_known_signature.json: required field %q is empty — fixture is malformed", c.field)
+		}
+	}
 	return f
 }
 
@@ -66,15 +85,19 @@ func TestWireContract_GoProducesWellKnownSignature(t *testing.T) {
 }
 
 //  2. Fixture integrity: the pubkey in the fixture must be the one
-//     the all-zero-seed test keypair derives. Pins "this fixture's
-//     pubkey is the one the Rust side will trust", so a future
-//     fixture edit that swaps in a wrong pubkey fails locally
-//     instead of misleading the Rust side.
+//     the all-zero-seed test keypair derives, AND the fixture's kid
+//     must match the kid that TestKey() stamps onto its Signer.
+//     Pins "this fixture's pubkey/kid are the ones the Rust side
+//     will trust", so a future fixture edit that swaps in a wrong
+//     pubkey (or a future testutil.go rename that drifts the kid)
+//     fails locally instead of misleading the Rust side.
 func TestWireContract_FixturePubkeyMatchesAllZeroSeed(t *testing.T) {
 	fx := loadWellKnownFixture(t)
-	got := TestKey(t).PublicKeyHex()
-	if got != fx.PubkeyHex {
+	if got := TestKey(t).PublicKeyHex(); got != fx.PubkeyHex {
 		t.Errorf("fixture pubkey does not match the all-zero-seed derived key\n  got:  %s\n  want: %s", got, fx.PubkeyHex)
+	}
+	if got := TestKey(t).KeyID(); got != fx.Kid {
+		t.Errorf("fixture kid does not match the test signer's kid (testutil.go:46) — rename one or the other\n  got:  %s\n  want: %s", got, fx.Kid)
 	}
 }
 
