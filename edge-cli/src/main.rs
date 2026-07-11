@@ -656,7 +656,10 @@ fn main() -> Result<()> {
                 commands::apps::create(&cli.path, &name, description.as_deref())
             }
         },
-        Command::Rollback { app, idempotency_key } => {
+        Command::Rollback {
+            app,
+            idempotency_key,
+        } => {
             let idem_key_owned: String;
             let idem_key_slice: &str = match idempotency_key.as_deref() {
                 Some(s) if !s.is_empty() => s,

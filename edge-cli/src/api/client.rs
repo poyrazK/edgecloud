@@ -884,7 +884,13 @@ impl ApiClient {
     }
 
     /// Activate a deployment. If `weight` is Some(N), sends ?weight=N for canary.
-    pub fn activate(&self, app_name: &str, deployment_id: &str, weight: Option<u8>, idempotency_key: &str) -> Result<()> {
+    pub fn activate(
+        &self,
+        app_name: &str,
+        deployment_id: &str,
+        weight: Option<u8>,
+        idempotency_key: &str,
+    ) -> Result<()> {
         let url = if let Some(w) = weight {
             format!(
                 "{}/api/v1/apps/{}/activate/{}?weight={}",
@@ -920,7 +926,12 @@ impl ApiClient {
 
     /// Promote a preview deployment to production.
     /// POST /api/v1/apps/{app_name}/promote/{deployment_id}
-    pub fn promote(&self, app_name: &str, deployment_id: &str, idempotency_key: &str) -> Result<()> {
+    pub fn promote(
+        &self,
+        app_name: &str,
+        deployment_id: &str,
+        idempotency_key: &str,
+    ) -> Result<()> {
         let url = format!(
             "{}/api/v1/apps/{}/promote/{}",
             self.base_url, app_name, deployment_id

@@ -23,7 +23,12 @@ use crate::state::State;
 /// string = server runs fresh-publish semantics (issue #439). The
 /// CLI auto-mints one when missing — see main.rs.
 #[cfg(feature = "network")]
-pub fn run(path: &Path, deployment_id: &str, weight: Option<u8>, idempotency_key: &str) -> Result<()> {
+pub fn run(
+    path: &Path,
+    deployment_id: &str,
+    weight: Option<u8>,
+    idempotency_key: &str,
+) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(&state)?;
 
@@ -66,7 +71,12 @@ fn resolve_app_name(state: &Option<State>) -> Result<String> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn run(_path: &Path, _deployment_id: &str, _weight: Option<u8>, _idempotency_key: &str) -> Result<()> {
+pub fn run(
+    _path: &Path,
+    _deployment_id: &str,
+    _weight: Option<u8>,
+    _idempotency_key: &str,
+) -> Result<()> {
     anyhow::bail!("activate requires network support; rebuild with --features network")
 }
 
