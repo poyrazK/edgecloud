@@ -16,7 +16,7 @@ import (
 // std encoding, kid-mismatch — fails the test on whichever side
 // introduced the change, plus the opposite side's acceptance test.
 //
-// The fixture is the determinstic cross-language fixture: a real
+// The fixture is the deterministic cross-language fixture: a real
 // Ed25519 signature over
 // (sha256("") || "d_00000000000000000000") produced by the
 // all-zero-seed test signer (TestKey()). Both the Go signer and
