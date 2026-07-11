@@ -338,8 +338,8 @@ func TestPromoteDeployment_AppNameSwap_HappyPath(t *testing.T) {
 		priorDeploymentID = "d_canary"
 		newDeploymentID   = "d_canary_2"
 		tenantID          = "t_test"
-		appName           = "myapp"            // promote target
-		deployAppName     = "myapp--pr-42"     // preview app name on the deployments row
+		appName           = "myapp"        // promote target
+		deployAppName     = "myapp--pr-42" // preview app name on the deployments row
 		deploymentHash    = "canaryhash42"
 		previewID         = "pr-42"
 		previewPRNumber   = 42
@@ -391,7 +391,6 @@ func TestPromoteDeployment_AppNameSwap_HappyPath(t *testing.T) {
 	//    expectDrainerTickSuccess helper builds a payload with only
 	//    {DeploymentID, MaxMemoryMB, Env}, dropping preview fields;
 	//    we want the realistic wire shape here, so we inline.
-	t.Helper()
 	payload, err := json.Marshal(&nats.TaskMessage{
 		Type:     nats.TaskMessageKindTaskUpdate,
 		TenantID: tenantID,
@@ -580,11 +579,82 @@ func TestPromoteDeployment_HappyPath_FansOutToAllRegions(t *testing.T) {
 	}
 }
 
-// silenceUnused pulls in `database/sql` and `errors` only when the
-// file is also built with later tests added; not strictly needed
-// today but keeps the import set honest for the future
-// negative-coverage commit (which uses `sql.ErrNoRows` and
-// `errors.Is`). Lint-clean without it at present, but having it as a
-// one-line guard avoids "unused import" churn when Test 4 lands.
-var _ = sql.ErrNoRows
-var _ = errors.Is
+// TestPromoteDeployment_DeploymentNotFound_404AtServiceLayer pins
+// issue #546 contract (6): PromoteDeployment surfaces
+// ErrDeploymentNotFound (the typed sentinel at
+// internal/service/deployment.go:227-229) for both "row absent"
+// (GetByID returns (nil, nil) on sql.ErrNoRows) and "wrong tenant"
+// (row exists with mismatched tenant_id). The handler maps this
+// sentinel to 404 via errors.Is at deployment.go:1017. Both
+// branches short-circuit before any tx work — no ExpectBegin.
+//
+// Mirrors the handler-level 404 mapping that is not currently
+// covered by deployment_promote_test.go (only the 409 and
+// idempotency-key paths are). Service-layer coverage is the issue
+// scope; handler-level coverage is a separate gap.
+func TestPromoteDeployment_DeploymentNotFound_404AtServiceLayer(t *testing.T) {
+	t.Run("RowAbsent", func(t *testing.T) {
+		pub := newRecordingPublisher()
+		svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+		defer cleanup()
+
+		const (
+			deploymentID = "d_missing"
+			tenantID     = "t_test"
+			appName      = "myapp"
+		)
+
+		// DeploymentRepository.GetByID returns (nil, nil) on
+		// sql.ErrNoRows (repository/deployment.go:69-71), so the
+		// sentinel is returned on err != nil OR deployment == nil.
+		// sqlmock surfaces the ErrNoRows at the mock level.
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+			WithArgs(deploymentID).
+			WillReturnError(sql.ErrNoRows)
+
+		err := svc.PromoteDeployment(context.Background(), tenantID, appName, deploymentID, "")
+		if !errors.Is(err, ErrDeploymentNotFound) {
+			t.Errorf("err = %v, want ErrDeploymentNotFound", err)
+		}
+		if got := pub.regionsCalled(); len(got) != 0 {
+			t.Errorf("publisher calls = %v, want [] (no tx → no outbox → no publish)", got)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations not met: %v", err)
+		}
+	})
+
+	t.Run("WrongTenant", func(t *testing.T) {
+		pub := newRecordingPublisher()
+		svc, _, mock, cleanup := activateSvcForTest(t, pub, "global")
+		defer cleanup()
+
+		const (
+			deploymentID     = "d_other"
+			callerTenantID   = "t_test"
+			deploymentTenant = "t_other" // different from callerTenantID
+			appName          = "myapp--pr-99"
+		)
+
+		// GetByID returns a real row, but deployment.TenantID !=
+		// callerTenantID → the second branch in PromoteDeployment
+		// returns ErrDeploymentNotFound. Production code intentionally
+		// collapses 'wrong tenant' into 'not found' so a tenant can't
+		// probe deployment ids belonging to other tenants.
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+			WithArgs(deploymentID).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
+				AddRow(deploymentID, deploymentTenant, appName, domain.StatusDeployed, "h", `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
+
+		err := svc.PromoteDeployment(context.Background(), callerTenantID, "myapp", deploymentID, "")
+		if !errors.Is(err, ErrDeploymentNotFound) {
+			t.Errorf("err = %v, want ErrDeploymentNotFound", err)
+		}
+		if got := pub.regionsCalled(); len(got) != 0 {
+			t.Errorf("publisher calls = %v, want [] (no tx → no outbox → no publish)", got)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("sqlmock expectations not met: %v", err)
+		}
+	})
+}
