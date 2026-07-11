@@ -1117,15 +1117,30 @@ func (h *DeploymentHandler) AppIngress(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{
-		"ready":       true,
-		"app_name":    target.AppName,
-		"tenant_id":   target.TenantID,
-		"worker_id":   target.WorkerID,
-		"region":      target.Region,
-		"worker_addr": target.WorkerAddr,
-		"port":        target.Port,
-	}); err != nil {
+	// Build the response as a typed struct rather than a map literal so
+	// the `protocol` field honors `omitempty` semantics — the existing
+	// HTTP/WS wire shape stays byte-identical for the default "http"
+	// value (issue #548 rolling-upgrade contract).
+	resp := struct {
+		Ready      bool   `json:"ready"`
+		AppName    string `json:"app_name"`
+		TenantID   string `json:"tenant_id"`
+		WorkerID   string `json:"worker_id"`
+		Region     string `json:"region"`
+		WorkerAddr string `json:"worker_addr"`
+		Port       int    `json:"port"`
+		Protocol   string `json:"protocol,omitempty"`
+	}{
+		Ready:      true,
+		AppName:    target.AppName,
+		TenantID:   target.TenantID,
+		WorkerID:   target.WorkerID,
+		Region:     target.Region,
+		WorkerAddr: target.WorkerAddr,
+		Port:       target.Port,
+		Protocol:   target.Protocol,
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("AppIngress ready true: failed to encode response: %v", err)
 	}
 }
