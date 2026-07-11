@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -85,4 +86,29 @@ func (r *ActiveDeploymentIdempotencyKeyRepo) Insert(ctx context.Context, k *doma
         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`
 	_, err := r.db.ExecContext(ctx, query, k.TenantID, k.IdempotencyKey, k.AppName, k.DeploymentID)
 	return err
+}
+
+// DeleteOlderThan deletes cache rows whose created_at is older than
+// `now - age`. The cutoff is computed server-side via
+// `NOW() - make_interval(secs => $1)` so the DB clock — not the Go
+// process clock — is the time authority. Used by
+// service.IdempotencyKeyGCService (issue #439 follow-up) to bound
+// table growth over a deployment's lifetime: the Lookup-side TTL
+// filter makes aged-out rows invisible to the replay path, but they
+// still occupy disk and are visited by every INSERT's index update
+// without a sweeper.
+//
+// Returns the number of rows deleted. The caller logs that count for
+// operator visibility (mirrors log_gc.go's deleted-row log line).
+func (r *ActiveDeploymentIdempotencyKeyRepo) DeleteOlderThan(ctx context.Context, age time.Duration) (int64, error) {
+	query := `DELETE FROM active_deployment_idempotency_keys WHERE created_at <= NOW() - make_interval(secs => $1)`
+	res, err := r.db.ExecContext(ctx, query, int64(age.Seconds()))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }

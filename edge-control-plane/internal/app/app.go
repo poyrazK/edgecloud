@@ -64,6 +64,18 @@ type App struct {
 	// invalid interval/retention — PreviewGCService.Run refuses
 	// to start with non-positive values.
 	PreviewGC *service.PreviewGCService
+	// IdempotencyGC (issue #439 follow-up) deletes
+	// active_deployment_idempotency_keys rows whose created_at is
+	// older than the cache TTL (24h — see repository.IdempotencyTTL).
+	// Without a sweeper, the table grows unbounded over a
+	// deployment's lifetime: the Lookup-side TTL filter makes aged-
+	// out rows invisible to the replay path, but they still occupy
+	// disk + are visited by every INSERT's index update.
+	// Tunable via env IDEMPOTENCY_GC_INTERVAL. Disabled by an
+	// invalid interval — IdempotencyKeyGCService.Run refuses to
+	// start on a non-positive value (matches PreviewGC's safety
+	// check).
+	IdempotencyGC *service.IdempotencyKeyGCService
 	// CacheRetrySweep (issue #501) re-attempts per-region
 	// artifact-cache pushes for deployments whose previous push
 	// attempt landed in regions_cache_failed. Tunable via env
@@ -845,6 +857,11 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		// (for blob unlink). See service/preview_gc.go for
 		// the run loop and ordering invariants.
 		PreviewGC: service.NewPreviewGCService(deploymentRepo, artifactStore, metricsAgg.NewPreviewGCSink(), metricsAgg.NewPreviewBlobFailureRecorder()),
+		// Issue #439 idempotency cache sweeper. Wires the same
+		// repo the DeploymentService uses for activate / promote /
+		// rollback replay. The GC runs in its own goroutine from
+		// RunBackground below.
+		IdempotencyGC: service.NewIdempotencyKeyGCService(activateIdempotencyRepo),
 		// Cache-retry sweep (issue #501). Re-attempts cache pushes
 		// that landed in regions_cache_failed. The three getters
 		// read the live pusher + regionArtifactCaches map +
@@ -966,6 +983,16 @@ func (a *App) RunBackground(ctx context.Context) {
 	previewGCInterval := parseDurationEnv("PREVIEW_GC_INTERVAL", 1*time.Hour)
 	previewRetention := parseDurationEnv("PREVIEW_RETENTION", 7*24*time.Hour)
 	go a.PreviewGC.Run(ctx, previewGCInterval, previewRetention)
+
+	// Idempotency-Key cache GC (issue #439 follow-up). Deletes
+	// active_deployment_idempotency_keys rows older than the
+	// cache TTL (24h — matches repository.IdempotencyTTL). Uses
+	// the same raw-goroutine shape as PreviewGC: the sweep is
+	// expected to run forever and a panic in the loop would be
+	// surfaced through the loopHealth wrapper; for now we
+	// follow the established convention.
+	idempotencyGCInterval := parseDurationEnv("IDEMPOTENCY_GC_INTERVAL", 1*time.Hour)
+	go a.IdempotencyGC.Run(ctx, idempotencyGCInterval, repository.IdempotencyTTL)
 
 	// Cache-retry sweep (issue #501). Re-attempts per-region
 	// artifact-cache pushes stranded in regions_cache_failed.
