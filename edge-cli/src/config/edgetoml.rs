@@ -48,6 +48,33 @@ pub struct Project {
     /// `rollback`) keep working on tomls with stale language fields.
     #[serde(default)]
     pub language: Option<String>,
+    /// Wire protocol for this app (issue #548). `None` (and absent
+    /// from pre-#548 edge.toml files) resolves to `"http"` via
+    /// [`Project::protocol_or_default`].
+    ///
+    /// `#[serde(default)]` preserves backward compatibility — tomls
+    /// without a `protocol` key keep parsing as HTTP apps. Allowed
+    /// values at the build step: `"http"` or `"tcp"`. Other values
+    /// surface as a friendly error at `edge build`, not at parse
+    /// time, so read-only commands (`status`, `apps get`) keep
+    /// working on tomls with stale protocol fields.
+    ///
+    /// The CLI/Cargo build step does NOT distinguish between L4 and
+    /// HTTP at the rustc invocation — both paths emit a
+    /// `wasm32-unknown-unknown` cdylib and wrap it via
+    /// `wasm-tools component new` into the declared world. The
+    /// `protocol` knob exists for two downstream consumers:
+    ///   1. `validate_protocol_combo` in `commands/build.rs` —
+    ///      errors early if the user picked `world =
+    ///      "edge-runtime-handler"` + `protocol = "tcp"` (FaaS
+    ///      apps cannot speak raw TCP).
+    ///   2. `edge deploy` — the value is forwarded to the control
+    ///      plane as part of the deployment manifest; the CP
+    ///      stamps `EDGE_PROTOCOL` in the worker's spec.env so a
+    ///      rebuild picks up the L4 path without re-editing the
+    ///      toml.
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 /// Default `[project].target` for projects that omit the key. Picked
@@ -74,6 +101,18 @@ impl Project {
         match self.language.as_deref() {
             Some(s) if !s.is_empty() => s,
             _ => "rust",
+        }
+    }
+
+    /// Resolve the wire protocol (issue #548), defaulting to `"http"`
+    /// for projects whose `edge.toml` was written before the field
+    /// existed. Mirrors [`language_or_default`] — empty string is
+    /// treated as absent so a stray `protocol = ""` does not silently
+    /// fail validation later with a confusing error.
+    pub fn protocol_or_default(&self) -> &str {
+        match self.protocol.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => "http",
         }
     }
 }
@@ -326,6 +365,69 @@ language = ""
         );
         assert_eq!(toml.project.language.as_deref(), Some(""));
         assert_eq!(toml.project.language_or_default(), "rust");
+    }
+
+    // ── protocol field (issue #548) ─────────────────────────────────
+
+    #[test]
+    fn parse_accepts_protocol_field() {
+        // Forward-compat: a toml with `protocol = "tcp"` parses and the
+        // value is exposed on Project::protocol for callers to act on.
+        // Validation against the declared `world` lives in
+        // `commands::build::validate_protocol_combo` (a separate unit
+        // — protocol/world cross-check is a build-time concern, not a
+        // parse-time one).
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+world = "edge-runtime"
+protocol = "tcp"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.protocol.as_deref(), Some("tcp"));
+        assert_eq!(toml.project.protocol_or_default(), "tcp");
+    }
+
+    #[test]
+    fn parse_accepts_missing_protocol_field_for_backcompat() {
+        // Backward-compat: existing tomls written before the field
+        // existed parse unchanged, and protocol_or_default() returns
+        // "http" so the existing HTTP build/ingress path is selected.
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.protocol, None);
+        assert_eq!(toml.project.protocol_or_default(), "http");
+    }
+
+    #[test]
+    fn protocol_or_default_treats_empty_string_as_missing() {
+        // Mirrors `language_or_default_treats_empty_string_as_missing`:
+        // stray `protocol = ""` should fall through to the default
+        // rather than silently propagating an empty string into the
+        // build pipeline (where validate_protocol_combo would
+        // surface a confusing "unsupported protocol" error).
+        let toml = parse(
+            r#"[project]
+name = "x"
+version = "0.1.0"
+world = "edge-runtime-handler"
+protocol = ""
+
+[deployment]
+"#,
+        );
+        assert_eq!(toml.project.protocol.as_deref(), Some(""));
+        assert_eq!(toml.project.protocol_or_default(), "http");
     }
 
     // ── target field (issue #410) ────────────────────────────────────
