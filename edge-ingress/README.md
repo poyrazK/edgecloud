@@ -53,10 +53,15 @@ cert. Generate one with `caddy trust` or
 ```sh
 # 1. Caddy — the reverse-proxy this binary controls. Exposes the JSON
 #    admin API on :2019 and binds the public ports :80/:443.
+#
+#    Issue #548: stock `caddy:2` has no `apps.layer4` (raw TCP).
+#    Use the xcaddy-built image `edgecloud/caddy-l4:latest` (built
+#    from `edge-ingress/Dockerfile.caddy-l4`) which includes the
+#    `mholt/caddy-l4` plugin. The HTTP path is byte-identical.
 docker run --rm -p 2019:2019 -p 80:80 -p 443:443 \
   -v ~/.edgecloud/tls:/etc/caddy/tls:ro \
   -e CADDY_ADMIN_TOKEN=dev-token \
-  caddy:2
+  edgecloud/caddy-l4:latest
 
 # 2. edge-ingress
 #    CADDY_ADMIN_LISTEN keeps Caddy's admin API reachable from the host after

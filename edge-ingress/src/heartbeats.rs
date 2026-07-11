@@ -17,7 +17,7 @@ use tokio::time::{interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::caddy::{render_routes, CaddyClient};
+use crate::caddy::{render_full, render_routes, CaddyClient};
 use crate::config::Config;
 use crate::l4::{L4PortPool, L4RouteEntry, L4RoutingTable};
 use crate::messages::HeartbeatMessage;
@@ -523,9 +523,12 @@ async fn push_now(
 
     match previous.take() {
         None => {
-            // Boot push — full config POST /load.
+            // Boot push — full config POST /load. Issue #548:
+            // always include both HTTP + L4 trees; the HTTP tree
+            // comes from `render_routes` (unchanged) and the L4
+            // tree from `render_l4_routes` (via `render_full`).
             let render_start = std::time::Instant::now();
-            let json = render_routes(
+            let http_payload = render_routes(
                 &snap,
                 &fqdns,
                 cfg,
@@ -534,6 +537,7 @@ async fn push_now(
                 &quota_cache_guard,
                 &tenant_rate_limit_cache_guard,
             );
+            let json = render_full(http_payload, &l4_snap, cfg, &quota_cache_guard);
             let render_dur = render_start.elapsed();
             metrics::histogram!("ingress.caddy.render_duration_seconds")
                 .record(render_dur.as_secs_f64());
@@ -574,9 +578,15 @@ async fn push_now(
             let total = snap.len().max(prev.route_entries.len()).max(1);
 
             // Heuristic: if >20% of routes changed, fall back to full reload.
-            if total_changes * 5 > total {
+            // Issue #548: ANY L4 delta always forces a full reload —
+            // `apps.layer4` only supports `POST /load`, not the
+            // per-id patch path used by the HTTP tree. The HTTP
+            // >20% heuristic above is the *additional* gate that
+            // can trigger a full reload on the HTTP side too.
+            let l4_changed = prev.l4_entries != l4_snap;
+            if l4_changed || total_changes * 5 > total {
                 let render_start = std::time::Instant::now();
-                let json = render_routes(
+                let http_payload = render_routes(
                     &snap,
                     &fqdns,
                     cfg,
@@ -585,6 +595,7 @@ async fn push_now(
                     &quota_cache_guard,
                     &tenant_rate_limit_cache_guard,
                 );
+                let json = render_full(http_payload, &l4_snap, cfg, &quota_cache_guard);
                 let render_dur = render_start.elapsed();
                 metrics::histogram!("ingress.caddy.render_duration_seconds")
                     .record(render_dur.as_secs_f64());

@@ -169,13 +169,22 @@ if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^edgecloud-caddy$';
 fi
 
 echo "[dev-up] starting caddy..." >&2
+# Issue #548 — Caddy image must include mholt/caddy-l4 (stock
+# caddy:2 has no apps.layer4). Build the image if missing, then
+# run it with the same mounts the stock image would use.
+if ! docker image inspect edgecloud/caddy-l4:latest >/dev/null 2>&1; then
+  echo "[dev-up] building edgecloud/caddy-l4:latest (first run; adds mholt/caddy-l4 to caddy:2)..." >&2
+  docker build -t edgecloud/caddy-l4:latest \
+    -f "$SCRIPT_DIR/../edge-ingress/Dockerfile.caddy-l4" \
+    "$SCRIPT_DIR/../edge-ingress" >/dev/null
+fi
 docker run -d \
   --name edgecloud-caddy \
   --network host \
   -v "$SCRIPT_DIR/lib/caddy.json:/etc/caddy/caddy.json:ro" \
   -v "$EDGECLOUD_HOME/caddy/data:/data" \
   -v "$EDGECLOUD_HOME/caddy/config:/config" \
-  caddy:2 \
+  edgecloud/caddy-l4:latest \
   caddy run --config /etc/caddy/caddy.json --adapter "" \
   >/dev/null
 
