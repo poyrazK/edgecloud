@@ -793,6 +793,21 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		weight = parsed
 	}
 
+	// Issue #439 canary gap: the canary path (weight < 100) does
+	// NOT thread Idempotency-Key through to trafficSvc.SetTraffic
+	// because the canary cache row would need to encode weight,
+	// which the active_deployment_idempotency_keys schema doesn't.
+	// Reject Idempotency-Key on canary rather than silently dropping
+	// it — the asymmetric "malformed 400, valid silently ignored"
+	// contract is worse than "this endpoint doesn't support
+	// idempotency, come back with weight=100 or no header". A
+	// proper fix that adds weight to the cache schema is filed as
+	// a follow-up.
+	if weight < 100 && idemKey != "" {
+		httperror.BadRequestCtx(w, r, "Idempotency-Key is not supported on canary activate (weight < 100); use atomic activate (weight=100) for idempotent replay")
+		return
+	}
+
 	// weight == 100 (explicit or omitted): atomic activation. Goes through
 	// deploymentSvc.ActivateDeployment so active_deployments is updated and
 	// rollback / auto-rollback stability evaluation target the right row.
@@ -813,10 +828,8 @@ func (h *DeploymentHandler) Activate(w http.ResponseWriter, r *http.Request) {
 			// different-body path as a 422 so the CLI can distinguish
 			// "you reused a key by mistake" from a generic 500 — same
 			// shape Deploy uses at handler/deployment.go:457.
-			// httperror doesn't export a 422 helper today, so this
-			// mirrors Deploy's bare http.Error(... 422) pattern.
 			if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
-				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
+				httperror.UnprocessableEntityCtx(w, r, err.Error())
 				return
 			}
 			log.Printf("internal error: %v", err)
@@ -938,7 +951,7 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		// "you reused a key by mistake" from a generic 500 — same
 		// shape Deploy uses at handler/deployment.go:457.
 		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
+			httperror.UnprocessableEntityCtx(w, r, err.Error())
 			return
 		}
 		log.Printf("internal error: %v", err)
@@ -1016,7 +1029,7 @@ func (h *DeploymentHandler) Promote(w http.ResponseWriter, r *http.Request) {
 		// different-body path as a 422 — same shape Deploy uses at
 		// handler/deployment.go:457.
 		if errors.Is(err, service.ErrIdempotencyKeyMismatch) {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnprocessableEntity)
+			httperror.UnprocessableEntityCtx(w, r, err.Error())
 			return
 		}
 		log.Printf("internal error: %v", err)
