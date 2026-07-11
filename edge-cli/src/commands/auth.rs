@@ -993,15 +993,17 @@ mod tests {
 
     /// Lock the field set so a future field-add (e.g. a `Region:` row
     /// after a tenancy-region feature lands) is a deliberate test
-    /// change. Doesn't pin the order between unrelated fields — only
-    /// that each expected label appears exactly once.
+    /// change. Counts occurrences (not just `.contains`) so a field
+    /// emitted twice — the kind of bug a copy-paste during a refactor
+    /// produces — fails loudly instead of silently passing.
     #[test]
     fn render_whoami_includes_required_fields() {
         let rendered = render_whoami(&sample_whoami());
         for label in ["Tenant:", "Plan:", "API key:", "Role:", "Created:"] {
-            assert!(
-                rendered.contains(label),
-                "rendered output should contain the {label:?} line; got:\n{rendered}"
+            assert_eq!(
+                rendered.matches(label).count(),
+                1,
+                "{label:?} should appear exactly once in rendered output; got:\n{rendered}"
             );
         }
     }
@@ -1026,9 +1028,18 @@ mod tests {
         // Empty timestamp still gets the UTC label — the wire-format
         // invariant applies even at empty payloads (a malformed server
         // response would fail at deserialize time, not render time).
+        //
+        // Assert against the *line shape* (suffix " UTC") rather than a
+        // whitespace-exact substring, so future label-width refactors
+        // (e.g. widening the "Created:" label to match a longer tenant
+        // ID column) don't break this test with a confusing diff.
+        let created_line = rendered
+            .lines()
+            .find(|l| l.starts_with("  Created:"))
+            .expect("rendered output should contain a Created line");
         assert!(
-            rendered.contains("Created:    UTC"),
-            "empty created_at should still emit a UTC-labeled Created line; got:\n{rendered}"
+            created_line.ends_with(" UTC"),
+            "Created line should end with \" UTC\" even when the timestamp is empty; got: {created_line:?}"
         );
     }
 }
