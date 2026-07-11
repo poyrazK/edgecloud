@@ -278,3 +278,145 @@ func TestWebhookRepository_InsertDelivery(t *testing.T) {
 		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DeleteOlderThanBatched — issue #574 retention GC sweep path.
+// Mirrors log_entry_test.go:25-201 verbatim, against webhook_deliveries
+// and the (created_at) index added in migration 031.
+// ---------------------------------------------------------------------------
+
+// TestWebhookRepository_DeleteOlderThanBatches_PaginatesUntilEmpty
+func TestWebhookRepository_DeleteOlderThanBatches_PaginatesUntilEmpty(t *testing.T) {
+	repo, mock, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectExec(`DELETE FROM webhook_deliveries WHERE id IN \(SELECT id FROM webhook_deliveries WHERE created_at < NOW\(\)`).
+		WithArgs(30*24*60*60.0, 10_000). // 30 days in seconds
+		WillReturnResult(sqlmock.NewResult(0, 10_000))
+	mock.ExpectExec(`DELETE FROM webhook_deliveries WHERE id IN \(SELECT id FROM webhook_deliveries WHERE created_at < NOW\(\)`).
+		WithArgs(30*24*60*60.0, 10_000).
+		WillReturnResult(sqlmock.NewResult(0, 10_000))
+	mock.ExpectExec(`DELETE FROM webhook_deliveries WHERE id IN \(SELECT id FROM webhook_deliveries WHERE created_at < NOW\(\)`).
+		WithArgs(30*24*60*60.0, 10_000).
+		WillReturnResult(sqlmock.NewResult(0, 5_234))
+
+	deleted, err := repo.DeleteOlderThanBatched(
+		context.Background(), 30*24*time.Hour, 10_000, 100)
+	if err != nil {
+		t.Fatalf("DeleteOlderThanBatched: %v", err)
+	}
+	if want := int64(25_234); deleted != want {
+		t.Errorf("deleted = %d, want %d", deleted, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWebhookRepository_DeleteOlderThanBatches_StopsAtMaxBatches
+func TestWebhookRepository_DeleteOlderThanBatches_StopsAtMaxBatches(t *testing.T) {
+	repo, mock, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	for i := 0; i < 3; i++ {
+		mock.ExpectExec(`DELETE FROM webhook_deliveries`).
+			WithArgs(3600.0, 1000).
+			WillReturnResult(sqlmock.NewResult(0, 1000))
+	}
+
+	deleted, err := repo.DeleteOlderThanBatched(
+		context.Background(), 1*time.Hour, 1000, 3)
+	if err != nil {
+		t.Fatalf("DeleteOlderThanBatched: %v", err)
+	}
+	if want := int64(3000); deleted != want {
+		t.Errorf("deleted = %d, want %d", deleted, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWebhookRepository_DeleteOlderThanBatches_HonorsCtxCancellation
+func TestWebhookRepository_DeleteOlderThanBatches_HonorsCtxCancellation(t *testing.T) {
+	repo, mock, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mock.ExpectExec(`DELETE FROM webhook_deliveries`).
+		WithArgs(3600.0, 1000).
+		WillReturnResult(sqlmock.NewResult(0, 1000))
+	mock.ExpectExec(`DELETE FROM webhook_deliveries`).
+		WithArgs(3600.0, 1000).
+		WillReturnResult(sqlmock.NewResult(0, 1000))
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	deleted, err := repo.DeleteOlderThanBatched(
+		ctx, 1*time.Hour, 1000, 100)
+	_ = err // not asserted: timing-dependent
+	if deleted == 0 {
+		t.Errorf("deleted = 0, want >= 1000")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (loop ran more than 2 batches): %v", err)
+	}
+}
+
+// TestWebhookRepository_DeleteOlderThanBatches_RejectsNonPositiveRetention
+func TestWebhookRepository_DeleteOlderThanBatches_RejectsNonPositiveRetention(t *testing.T) {
+	repo, _, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	if _, err := repo.DeleteOlderThanBatched(
+		context.Background(), 0, 1000, 100); err == nil {
+		t.Error("expected error for retention=0, got nil")
+	}
+	if _, err := repo.DeleteOlderThanBatched(
+		context.Background(), -1*time.Hour, 1000, 100); err == nil {
+		t.Error("expected error for retention=-1h, got nil")
+	}
+}
+
+// TestWebhookRepository_DeleteOlderThanBatches_UsesServerNOW
+func TestWebhookRepository_DeleteOlderThanBatches_UsesServerNOW(t *testing.T) {
+	repo, mock, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectExec(`DELETE FROM webhook_deliveries WHERE id IN \(SELECT id FROM webhook_deliveries WHERE created_at < NOW\(\) - make_interval\(secs => \$1\) LIMIT \$2\)`).
+		WithArgs(30*24*60*60.0, int64(10_000)).
+		WillReturnResult(sqlmock.NewResult(0, 100))
+
+	_, err := repo.DeleteOlderThanBatched(
+		context.Background(), 30*24*time.Hour, 10_000, 100)
+	if err != nil {
+		t.Fatalf("DeleteOlderThanBatched: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (SQL shape or args wrong): %v", err)
+	}
+}
+
+// TestWebhookRepository_DeleteOlderThanBatches_BoundInt64
+func TestWebhookRepository_DeleteOlderThanBatches_BoundInt64(t *testing.T) {
+	repo, mock, cleanup := newWebhookMockRepo(t)
+	defer cleanup()
+
+	const wantBatchSize = int64(10_000)
+	mock.ExpectExec(`DELETE FROM webhook_deliveries WHERE id IN \(SELECT id FROM webhook_deliveries WHERE created_at < NOW\(\) - make_interval\(secs => \$1\) LIMIT \$2\)`).
+		WithArgs(30*24*60*60.0, wantBatchSize).
+		WillReturnResult(sqlmock.NewResult(0, 100))
+
+	_, err := repo.DeleteOlderThanBatched(
+		context.Background(), 30*24*time.Hour, int(wantBatchSize), 100)
+	if err != nil {
+		t.Fatalf("DeleteOlderThanBatched: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (LIMIT $2 was not bound as int64): %v", err)
+	}
+}

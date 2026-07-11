@@ -267,6 +267,30 @@ func TestMetricsAggregator_RenderAll_IncludesGCFamilies(t *testing.T) {
 		"edge_cache_retry_sweep_errors_total 0",
 		"# TYPE edge_cache_retry_sweep_last_tick_timestamp_seconds gauge",
 		"edge_cache_retry_sweep_last_tick_timestamp_seconds 0",
+		"# TYPE edge_audit_log_gc_ticks_total counter",
+		"edge_audit_log_gc_ticks_total 0",
+		"# TYPE edge_audit_log_gc_rows_deleted_total counter",
+		"edge_audit_log_gc_rows_deleted_total 0",
+		"# TYPE edge_audit_log_gc_errors_total counter",
+		"edge_audit_log_gc_errors_total 0",
+		"# TYPE edge_audit_log_gc_last_tick_timestamp_seconds gauge",
+		"edge_audit_log_gc_last_tick_timestamp_seconds 0",
+		"# TYPE edge_webhook_delivery_gc_ticks_total counter",
+		"edge_webhook_delivery_gc_ticks_total 0",
+		"# TYPE edge_webhook_delivery_gc_rows_deleted_total counter",
+		"edge_webhook_delivery_gc_rows_deleted_total 0",
+		"# TYPE edge_webhook_delivery_gc_errors_total counter",
+		"edge_webhook_delivery_gc_errors_total 0",
+		"# TYPE edge_webhook_delivery_gc_last_tick_timestamp_seconds gauge",
+		"edge_webhook_delivery_gc_last_tick_timestamp_seconds 0",
+		"# TYPE edge_autoscale_event_gc_ticks_total counter",
+		"edge_autoscale_event_gc_ticks_total 0",
+		"# TYPE edge_autoscale_event_gc_rows_deleted_total counter",
+		"edge_autoscale_event_gc_rows_deleted_total 0",
+		"# TYPE edge_autoscale_event_gc_errors_total counter",
+		"edge_autoscale_event_gc_errors_total 0",
+		"# TYPE edge_autoscale_event_gc_last_tick_timestamp_seconds gauge",
+		"edge_autoscale_event_gc_last_tick_timestamp_seconds 0",
 	} {
 		if !strings.Contains(all, want) {
 			t.Errorf("RenderAll missing %q\ngot:\n%s", want, all)
@@ -385,6 +409,81 @@ func TestMetricsAggregator_NilSinkIsNoop(t *testing.T) {
 	nilAgg.NewPreviewGCSink()(1, 2, 3, false)
 	nilAgg.NewPreviewBlobFailureRecorder()()
 	nilAgg.NewCacheRetrySweepSink()(1, 2, 3, 4, 5, 6, false)
+	// Issue #574 retention GC trio.
+	nilAgg.NewAuditGCSink()(5, false)
+	nilAgg.NewWebhookDeliveryGCSink()(5, false)
+	nilAgg.NewAutoscaleEventGCSink()(5, false)
+}
+
+// TestMetricsAggregator_RecordAuditGC: the audit_gc sink (issue #574)
+// accumulates per-tick counters correctly.
+func TestMetricsAggregator_RecordAuditGC(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewAuditGCSink()
+	sink(7, false)
+	sink(0, true)
+	sink(3, false)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_audit_log_gc_ticks_total 3",
+		"edge_audit_log_gc_rows_deleted_total 10",
+		"edge_audit_log_gc_errors_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q after sink calls\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "edge_audit_log_gc_last_tick_timestamp_seconds 0") {
+		t.Error("edge_audit_log_gc_last_tick_timestamp_seconds must be > 0 after a sink call")
+	}
+}
+
+// TestMetricsAggregator_RecordWebhookDeliveryGC: the webhook_delivery_gc
+// sink (issue #574) accumulates per-tick counters correctly.
+func TestMetricsAggregator_RecordWebhookDeliveryGC(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewWebhookDeliveryGCSink()
+	sink(11, false)
+	sink(4, false)
+	sink(0, true)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_webhook_delivery_gc_ticks_total 3",
+		"edge_webhook_delivery_gc_rows_deleted_total 15",
+		"edge_webhook_delivery_gc_errors_total 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q after sink calls\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "edge_webhook_delivery_gc_last_tick_timestamp_seconds 0") {
+		t.Error("edge_webhook_delivery_gc_last_tick_timestamp_seconds must be > 0 after a sink call")
+	}
+}
+
+// TestMetricsAggregator_RecordAutoscaleEventGC: the autoscale_event_gc
+// sink (issue #574) accumulates per-tick counters correctly.
+func TestMetricsAggregator_RecordAutoscaleEventGC(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewAutoscaleEventGCSink()
+	sink(2, false)
+	sink(1, false)
+
+	out := agg.RenderAll()
+	for _, want := range []string{
+		"edge_autoscale_event_gc_ticks_total 2",
+		"edge_autoscale_event_gc_rows_deleted_total 3",
+		"edge_autoscale_event_gc_errors_total 0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q after sink calls\ngot:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "edge_autoscale_event_gc_last_tick_timestamp_seconds 0") {
+		t.Error("edge_autoscale_event_gc_last_tick_timestamp_seconds must be > 0 after a sink call")
+	}
 }
 
 // TestMetricsAggregator_RenderTenant_IncludesGCFamilies: per the user

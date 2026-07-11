@@ -51,6 +51,24 @@ type MetricsAggregator struct {
 	cacheRetrySweepGivenUp       int64
 	cacheRetrySweepErr           int64
 	cacheRetrySweepTime          int64
+
+	// audit_gc (4 families, issue #574 retention GC trio)
+	auditGcTick int64
+	auditGcRow  int64
+	auditGcErr  int64
+	auditGcTime int64
+
+	// webhook_delivery_gc (4 families, issue #574 retention GC trio)
+	webhookDeliveryGcTick int64
+	webhookDeliveryGcRow  int64
+	webhookDeliveryGcErr  int64
+	webhookDeliveryGcTime int64
+
+	// autoscale_event_gc (4 families, issue #574 retention GC trio)
+	autoscaleEventGcTick int64
+	autoscaleEventGcRow  int64
+	autoscaleEventGcErr  int64
+	autoscaleEventGcTime int64
 }
 
 type appMetrics struct {
@@ -111,6 +129,18 @@ type PreviewBlobFailureRecorder func()
 // The four middle ints are the per-region partition totals from the
 // sweep (success / stillFailing / configMissing / giveUp).
 type CacheRetrySweepSink func(rowsTouched, pushedOK, stillFailing, configMissing, givenUp, batchesSwept int, hadError bool)
+
+// AuditGCSink records one AuditGCService tick outcome. Mirrors
+// LogGCSink (issue #574 retention GC trio).
+type AuditGCSink func(rowsDeleted int64, hadError bool)
+
+// WebhookDeliveryGCSink records one WebhookDeliveryGCService tick
+// outcome. Mirrors LogGCSink (issue #574 retention GC trio).
+type WebhookDeliveryGCSink func(rowsDeleted int64, hadError bool)
+
+// AutoscaleEventGCSink records one AutoscaleEventGCService tick
+// outcome. Mirrors LogGCSink (issue #574 retention GC trio).
+type AutoscaleEventGCSink func(rowsDeleted int64, hadError bool)
 
 // NewLogGCSink returns a sink that bumps the log_gc families. Passing
 // the returned closure to LogGCService records one tick.
@@ -197,6 +227,71 @@ func (a *MetricsAggregator) NewCacheRetrySweepSink() CacheRetrySweepSink {
 			a.cacheRetrySweepErr++
 		}
 		a.cacheRetrySweepTime = time.Now().Unix()
+	}
+}
+
+// NewAuditGCSink returns a sink that bumps the audit_gc families.
+// Mirrors NewLogGCSink (issue #574 retention GC trio).
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent tick.
+func (a *MetricsAggregator) NewAuditGCSink() AuditGCSink {
+	if a == nil {
+		return func(int64, bool) {}
+	}
+	return func(rowsDeleted int64, hadError bool) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.auditGcTick++
+		a.auditGcRow += rowsDeleted
+		if hadError {
+			a.auditGcErr++
+		}
+		a.auditGcTime = time.Now().Unix()
+	}
+}
+
+// NewWebhookDeliveryGCSink returns a sink that bumps the
+// webhook_delivery_gc families. Mirrors NewLogGCSink (issue #574
+// retention GC trio).
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent tick.
+func (a *MetricsAggregator) NewWebhookDeliveryGCSink() WebhookDeliveryGCSink {
+	if a == nil {
+		return func(int64, bool) {}
+	}
+	return func(rowsDeleted int64, hadError bool) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.webhookDeliveryGcTick++
+		a.webhookDeliveryGcRow += rowsDeleted
+		if hadError {
+			a.webhookDeliveryGcErr++
+		}
+		a.webhookDeliveryGcTime = time.Now().Unix()
+	}
+}
+
+// NewAutoscaleEventGCSink returns a sink that bumps the
+// autoscale_event_gc families. Mirrors NewLogGCSink (issue #574
+// retention GC trio).
+//
+// Timestamp is captured inside the closure body so a long-lived sink
+// wired once at boot reflects the actual time of the most recent tick.
+func (a *MetricsAggregator) NewAutoscaleEventGCSink() AutoscaleEventGCSink {
+	if a == nil {
+		return func(int64, bool) {}
+	}
+	return func(rowsDeleted int64, hadError bool) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.autoscaleEventGcTick++
+		a.autoscaleEventGcRow += rowsDeleted
+		if hadError {
+			a.autoscaleEventGcErr++
+		}
+		a.autoscaleEventGcTime = time.Now().Unix()
 	}
 }
 
@@ -311,6 +406,36 @@ func emitGCFamilies(b *strings.Builder, a *MetricsAggregator) {
 	fmt.Fprintf(b, "edge_cache_retry_sweep_errors_total %d\n", a.cacheRetrySweepErr)
 	fmt.Fprintf(b, "# TYPE edge_cache_retry_sweep_last_tick_timestamp_seconds gauge\n")
 	fmt.Fprintf(b, "edge_cache_retry_sweep_last_tick_timestamp_seconds %d\n", a.cacheRetrySweepTime)
+
+	// audit_gc — issue #574 retention GC trio.
+	fmt.Fprintf(b, "# TYPE edge_audit_log_gc_ticks_total counter\n")
+	fmt.Fprintf(b, "edge_audit_log_gc_ticks_total %d\n", a.auditGcTick)
+	fmt.Fprintf(b, "# TYPE edge_audit_log_gc_rows_deleted_total counter\n")
+	fmt.Fprintf(b, "edge_audit_log_gc_rows_deleted_total %d\n", a.auditGcRow)
+	fmt.Fprintf(b, "# TYPE edge_audit_log_gc_errors_total counter\n")
+	fmt.Fprintf(b, "edge_audit_log_gc_errors_total %d\n", a.auditGcErr)
+	fmt.Fprintf(b, "# TYPE edge_audit_log_gc_last_tick_timestamp_seconds gauge\n")
+	fmt.Fprintf(b, "edge_audit_log_gc_last_tick_timestamp_seconds %d\n", a.auditGcTime)
+
+	// webhook_delivery_gc — issue #574 retention GC trio.
+	fmt.Fprintf(b, "# TYPE edge_webhook_delivery_gc_ticks_total counter\n")
+	fmt.Fprintf(b, "edge_webhook_delivery_gc_ticks_total %d\n", a.webhookDeliveryGcTick)
+	fmt.Fprintf(b, "# TYPE edge_webhook_delivery_gc_rows_deleted_total counter\n")
+	fmt.Fprintf(b, "edge_webhook_delivery_gc_rows_deleted_total %d\n", a.webhookDeliveryGcRow)
+	fmt.Fprintf(b, "# TYPE edge_webhook_delivery_gc_errors_total counter\n")
+	fmt.Fprintf(b, "edge_webhook_delivery_gc_errors_total %d\n", a.webhookDeliveryGcErr)
+	fmt.Fprintf(b, "# TYPE edge_webhook_delivery_gc_last_tick_timestamp_seconds gauge\n")
+	fmt.Fprintf(b, "edge_webhook_delivery_gc_last_tick_timestamp_seconds %d\n", a.webhookDeliveryGcTime)
+
+	// autoscale_event_gc — issue #574 retention GC trio.
+	fmt.Fprintf(b, "# TYPE edge_autoscale_event_gc_ticks_total counter\n")
+	fmt.Fprintf(b, "edge_autoscale_event_gc_ticks_total %d\n", a.autoscaleEventGcTick)
+	fmt.Fprintf(b, "# TYPE edge_autoscale_event_gc_rows_deleted_total counter\n")
+	fmt.Fprintf(b, "edge_autoscale_event_gc_rows_deleted_total %d\n", a.autoscaleEventGcRow)
+	fmt.Fprintf(b, "# TYPE edge_autoscale_event_gc_errors_total counter\n")
+	fmt.Fprintf(b, "edge_autoscale_event_gc_errors_total %d\n", a.autoscaleEventGcErr)
+	fmt.Fprintf(b, "# TYPE edge_autoscale_event_gc_last_tick_timestamp_seconds gauge\n")
+	fmt.Fprintf(b, "edge_autoscale_event_gc_last_tick_timestamp_seconds %d\n", a.autoscaleEventGcTime)
 }
 
 // collectFamilyLines appends series strings for every app in one tenant into

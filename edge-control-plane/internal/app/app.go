@@ -50,11 +50,14 @@ type App struct {
 	ArtifactPath    string
 
 	// Background service references. RunBackground starts all three.
-	WorkerSvc    *service.WorkerService
-	ReconcileSvc *service.ReconcileService
-	LogGC        *service.LogGCService
-	WorkerGC     *service.WorkerGCService
-	DeploymentGC *service.DeploymentGCService
+	WorkerSvc         *service.WorkerService
+	ReconcileSvc      *service.ReconcileService
+	LogGC             *service.LogGCService
+	WorkerGC          *service.WorkerGCService
+	DeploymentGC      *service.DeploymentGCService
+	AuditGC           *service.AuditGCService           // issue #574 retention GC
+	WebhookDeliveryGC *service.WebhookDeliveryGCService // issue #574 retention GC
+	AutoscaleEventGC  *service.AutoscaleEventGCService  // issue #574 retention GC
 	// PreviewGC (issue #308) reclaims expired preview deployments
 	// and their artifact blobs. Tunable via env
 	// (PREVIEW_GC_INTERVAL, PREVIEW_RETENTION). Disabled by
@@ -815,15 +818,18 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	)
 
 	return &App{
-		Handler:         wrappedHandler,
-		Region:          cfg.Region,
-		WorkerJWTConfig: workerJWTConfig,
-		ArtifactPath:    cfg.Storage.ArtifactPath,
-		WorkerSvc:       workerSvc,
-		ReconcileSvc:    reconcileSvc,
-		LogGC:           service.NewLogGCService(logEntryRepo, metricsAgg.NewLogGCSink()),
-		WorkerGC:        service.NewWorkerGCService(workerRepo),
-		DeploymentGC:    service.NewDeploymentGCService(deploymentRepo, artifactStore),
+		Handler:           wrappedHandler,
+		Region:            cfg.Region,
+		WorkerJWTConfig:   workerJWTConfig,
+		ArtifactPath:      cfg.Storage.ArtifactPath,
+		WorkerSvc:         workerSvc,
+		ReconcileSvc:      reconcileSvc,
+		LogGC:             service.NewLogGCService(logEntryRepo, metricsAgg.NewLogGCSink()),
+		WorkerGC:          service.NewWorkerGCService(workerRepo),
+		DeploymentGC:      service.NewDeploymentGCService(deploymentRepo, artifactStore),
+		AuditGC:           service.NewAuditGCService(auditRepo, metricsAgg.NewAuditGCSink()),
+		WebhookDeliveryGC: service.NewWebhookDeliveryGCService(webhookRepo, metricsAgg.NewWebhookDeliveryGCSink()),
+		AutoscaleEventGC:  service.NewAutoscaleEventGCService(autoscaleEventRepo, metricsAgg.NewAutoscaleEventGCSink()),
 		// Preview GC (issue #308). Wired with the deployment
 		// repo (for ListExpiredPreviewBlobs +
 		// DeleteExpiredPreviewsByIDs) and the artifact store
@@ -887,6 +893,29 @@ func (a *App) RunBackground(ctx context.Context) {
 	logRetention := parseDurationEnv("LOG_RETENTION", 7*24*time.Hour)
 	a.loopHealth.Run(ctx, "log_gc", "log_gc: ", logPrintf, func(c context.Context) {
 		a.LogGC.Run(c, logGCInterval, logRetention)
+	})
+
+	// Retention GC trio (issue #574). One per append-only table —
+	// audit_logs, webhook_deliveries, autoscale_events. Each runs
+	// an immediate-first-sweep then ticks at its interval; refuses to
+	// run with non-positive values. Defaults match the pre-baked
+	// retention windows documented in the GC service files.
+	auditGCInterval := parseDurationEnv("AUDIT_GC_INTERVAL", time.Hour)
+	auditRetention := parseDurationEnv("AUDIT_RETENTION", 90*24*time.Hour)
+	a.loopHealth.Run(ctx, "audit_gc", "audit_gc: ", logPrintf, func(c context.Context) {
+		a.AuditGC.Run(c, auditGCInterval, auditRetention)
+	})
+
+	webhookGCInterval := parseDurationEnv("WEBHOOK_DELIVERY_GC_INTERVAL", time.Hour)
+	webhookRetention := parseDurationEnv("WEBHOOK_DELIVERY_RETENTION", 30*24*time.Hour)
+	a.loopHealth.Run(ctx, "webhook_delivery_gc", "webhook_delivery_gc: ", logPrintf, func(c context.Context) {
+		a.WebhookDeliveryGC.Run(c, webhookGCInterval, webhookRetention)
+	})
+
+	autoscaleGCInterval := parseDurationEnv("AUTOSCALE_EVENT_GC_INTERVAL", time.Hour)
+	autoscaleRetention := parseDurationEnv("AUTOSCALE_EVENT_RETENTION", 14*24*time.Hour)
+	a.loopHealth.Run(ctx, "autoscale_event_gc", "autoscale_event_gc: ", logPrintf, func(c context.Context) {
+		a.AutoscaleEventGC.Run(c, autoscaleGCInterval, autoscaleRetention)
 	})
 
 	// Periodic full-state reconcile (issue #53). Tunable via RECONCILE_INTERVAL.

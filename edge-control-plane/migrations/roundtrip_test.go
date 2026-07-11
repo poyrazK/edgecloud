@@ -71,11 +71,12 @@ import (
 // (026_active_deployments_activation_attempt_started_at), PR #534
 // (027_used_memory_mb + 028_quota_memory_constraint etc.), and
 // PR #485 (029_quotas_resident_seconds + 030_billing_usage_events):
-// 40 .up.sql + 40 .down.sql = 80 split files. Some numeric prefixes
+// 41 .up.sql + 41 .down.sql = 82 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*), so this is the on-disk file count, not a
-// strict 2× the migration number.
-const splitFileCount = 80 // 40 .up.sql + 40 .down.sql after PR #485 merge
+// strict 2× the migration number. The +2 vs PR #485 is migration 031
+// (issue #574 retention GCs — three (created_at) indexes).
+const splitFileCount = 82 // 41 .up.sql + 41 .down.sql after #574 migration 031
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -863,6 +864,9 @@ var wantIndexes = []IndexExpectation{
 	{Table: "tenants", Name: "idx_tenants_overage_allowed_until"},                               // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "quotas", Name: "idx_quotas_grace_until"},                                           // 025_quotas_grace_columns (issue #420, partial)
 	{Table: "billing_usage_events", Name: "idx_billing_usage_events_unprocessed"},               // 030_billing_usage_events (issue #485, partial)
+	{Table: "audit_logs", Name: "idx_audit_logs_created_at"},                                    // 031_gc_retention_indexes (issue #574)
+	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_created_at"},                    // 031_gc_retention_indexes (issue #574)
+	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                         // 031_gc_retention_indexes (issue #574)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
