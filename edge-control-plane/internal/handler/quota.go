@@ -107,9 +107,19 @@ func (h *QuotaHandler) GetQuotaInternal(w http.ResponseWriter, r *http.Request) 
 	// the cap from below does NOT itself disable the tenant — that is
 	// the heartbeat applyTenantDelta path's job (issue #420) and is not
 	// duplicated here. Over_cap is purely the read-side signal.
+	//
+	// Resident-seconds axis (issue #484 / #485, third metered dimension):
+	// used_resident_seconds is incremented by checkResidentSeconds on each
+	// heartbeat for every LongRunning app. Handler (FaaS) apps contribute
+	// 0 because the worker stamps ResidentSeconds=null (treated as no
+	// contribution by applyTenantDelta). The `> 0` guard mirrors the
+	// existing axes' sentinel semantics (-1 = unlimited, 0 = unset);
+	// `>=` so the gate fires the heartbeat immediately after the cap
+	// lands, matching the other dimensions.
 	overCap := (quota.MaxRequestsPerMonth > 0 && quota.UsedRequestCount >= int64(quota.MaxRequestsPerMonth)) ||
 		(quota.MaxOutboundMB > 0 && quota.UsedOutboundBytes >= int64(quota.MaxOutboundMB)*1024*1024) ||
-		(quota.MaxMemoryMB > 0 && quota.UsedMemoryMB >= int64(quota.MaxMemoryMB))
+		(quota.MaxMemoryMB > 0 && quota.UsedMemoryMB >= int64(quota.MaxMemoryMB)) ||
+		(quota.MaxResidentSecondsPerMonth > 0 && quota.UsedResidentSeconds >= int64(quota.MaxResidentSecondsPerMonth))
 
 	resp := quotaInternalResponse{
 		Quota:       *quota,

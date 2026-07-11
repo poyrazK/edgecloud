@@ -288,3 +288,70 @@ func TestQuotaHandler_GetQuotaInternal_PathTraversal(t *testing.T) {
 		t.Errorf("status = %d, want 400 (body=%s)", rr.Code, rr.Body.String())
 	}
 }
+
+// TestQuotaHandler_GetQuotaInternal_OverCap_ResidentSeconds (issue #484 /
+// #485, third metered dimension): used_resident_seconds at
+// MaxResidentSecondsPerMonth → over_cap=true. Mirrors the Requests /
+// Memory tests above so the third axis behaves identically. Edge-ingress
+// reads this and flips a free-tier long-running app to 402 once a tenant
+// is over the monthly uptime budget.
+func TestQuotaHandler_GetQuotaInternal_OverCap_ResidentSeconds(t *testing.T) {
+	q := &domain.Quota{
+		TenantID:                   "t_over_res",
+		MaxRequestsPerMonth:        100_000,
+		MaxOutboundMB:              1000,
+		MaxMemoryMB:                256,
+		MaxResidentSecondsPerMonth: 1000,
+		UsedResidentSeconds:        1000, // 100% of cap
+	}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_over_res", nil)
+	req.SetPathValue("tenantID", "t_over_res")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.OverCap {
+		t.Errorf("over_cap = false at used_resident_seconds = MaxResidentSecondsPerMonth, want true")
+	}
+}
+
+// TestQuotaHandler_GetQuotaInternal_ResidentSecondsEnterpriseBypasses
+// (issue #484 / #485): MaxResidentSecondsPerMonth = -1 is the unlimited
+// sentinel and must NOT trip over_cap on the resident-seconds axis.
+// Mirrors the enterprise-bypass test for memory (the same reasoning —
+// contract is identical across all four metered dimensions).
+func TestQuotaHandler_GetQuotaInternal_ResidentSecondsEnterpriseBypasses(t *testing.T) {
+	q := &domain.Quota{
+		TenantID:                   "t_ent_res",
+		MaxRequestsPerMonth:        -1,
+		MaxOutboundMB:              -1,
+		MaxMemoryMB:                -1,
+		MaxResidentSecondsPerMonth: -1,
+		UsedResidentSeconds:        10_000_000, // absurd — but unlimited ⇒ no trip
+	}
+	h := NewQuotaHandler(&mockQuotaTenantSvc{quota: q})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/internal/quota/t_ent_res", nil)
+	req.SetPathValue("tenantID", "t_ent_res")
+	rr := httptest.NewRecorder()
+	h.GetQuotaInternal(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	var resp quotaInternalWire
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.OverCap {
+		t.Errorf("over_cap = true with MaxResidentSecondsPerMonth=-1, want false (unlimited sentinel)")
+	}
+}

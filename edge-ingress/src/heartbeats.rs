@@ -611,6 +611,7 @@ mod tests {
             port,
             ws_port: None,
             dedupe_id: None,
+            resident_seconds: None,
             observer_metrics: vec![],
             last_error: None,
         }

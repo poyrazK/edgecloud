@@ -98,10 +98,34 @@ type quotaRepoInterface interface {
 	GetByTenantID(ctx context.Context, tenantID string) (*domain.Quota, error)
 	AddOutboundBytes(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	AddRequestCount(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
+	// AddResidentSeconds accumulates into quotas.used_resident_seconds
+	// (issue #484 / #485, third metered dimension). Mirrors
+	// AddRequestCount but routes through checkResidentSeconds on every
+	// LongRunning heartbeat.
+	AddResidentSeconds(ctx context.Context, tenantID string, delta uint64) (*domain.Quota, error)
 	// SetGraceUntil stamps quotas.quota_lock_grace_until on free-tier
 	// first-cross (issue #420). Bounds the request-time 402 window
 	// after deploys are already blocked.
 	SetGraceUntil(ctx context.Context, tenantID string, until *time.Time) error
+	// AddMemoryMB accumulates into quotas.used_memory_mb (issue #44
+	// part 2). Called from the activate-time quota path; the
+	// heartbeat-side memory billing is intentionally NOT plumbed
+	// through applyTenantDelta (memory is a deploy-time cap, not a
+	// per-heartbeat delta).
+}
+
+// meteringRepoInterface is the metering-ledger surface WorkerService
+// uses for the dual-write call site (issue #485). Lives next to
+// quotaRepoInterface so the heartbeat pipeline's two writes share
+// a constructor signature, but stays separate because the metering
+// ledger has its own dedupe contract (idempotency_key per row vs
+// the additive ADD-column model used by quotas).
+//
+// We take only EnqueueUsageEvent — ClaimDue / MarkProcessed are
+// exclusively the drainer's concern (see
+// internal/service/metering_drainer.go).
+type meteringRepoInterface interface {
+	EnqueueUsageEvent(ctx context.Context, tenantID string, kind domain.MeterKind, quantity uint64, idempotencyKey string) error
 }
 
 // activeRepoInterface defines the active_deployments methods used by
@@ -147,6 +171,7 @@ type WorkerService struct {
 	db           *sqlx.DB
 	workerRepo   workerRepoInterface
 	quotaRepo    quotaRepoInterface
+	meteringRepo meteringRepoInterface
 	activeRepo   activeRepoInterface
 	tenantRepo   tenantRepoInterface
 	nc           *natsio.Conn
@@ -204,6 +229,7 @@ func NewWorkerService(
 	db *sqlx.DB,
 	workerRepo *repository.WorkerRepository,
 	quotaRepo *repository.QuotaRepository,
+	meteringRepo *repository.BillingUsageRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	tenantRepo *repository.TenantRepository,
 	nc *natsio.Conn,
@@ -218,6 +244,7 @@ func NewWorkerService(
 		db:                       db,
 		workerRepo:               workerRepo,
 		quotaRepo:                quotaRepo,
+		meteringRepo:             meteringRepo,
 		activeRepo:               activeRepo,
 		tenantRepo:               tenantRepo,
 		nc:                       nc,
@@ -556,9 +583,16 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	go s.checkOutboundQuota(context.WithoutCancel(ctx), hb.Apps)
 
 	// Same goroutine pattern as checkOutboundQuota above. This is a second
-	// DB round-trip per heartbeat — Phase 2 ticket could batch both writes
-	// into one UPDATE.
+	// DB round-trip per heartbeat — Phase 2 ticket could batch all three
+	// writes into one UPDATE (outbound + request + resident-seconds).
 	go s.checkRequestCount(context.WithoutCancel(ctx), hb.Apps)
+
+	// Third metered dimension (issue #484 / #485): resident-seconds per
+	// LongRunning app. Handler (FaaS) apps stamp ResidentSeconds=null
+	// so ResidentSecondsOrZero() returns 0 and the AddResidentSeconds
+	// wrapper is never called — no quota work for FaaS. Same goroutine
+	// pattern as the other two dimensions above.
+	go s.checkResidentSeconds(context.WithoutCancel(ctx), hb.Apps)
 
 	// Ingest observer metrics into the in-memory aggregator so they are
 	// immediately available at the Prometheus scrape endpoints. Pure
@@ -637,6 +671,17 @@ func (s *WorkerService) ingestMetrics(appsRaw json.RawMessage) {
 // all max_* columns) or "unset / admin-cleared" — either way we skip the
 // breach check rather than false-trip a tenant whose cap hasn't been
 // initialized.
+//
+// Dual-write (issue #485): the same heartbeat also enqueues a row in
+// billing_usage_events via the meterEnqueue callback. The metering
+// ledger row is the source of truth for Stripe billing; the
+// quotas.used_* mirror is the source of truth for the cap-check at
+// request time. Both writes are independent — a failure on the
+// metering path is logged but does NOT roll back the quota write,
+// because the hot-path mirror must not depend on the slow-path
+// dispatch succeeding. The metering row's idempotency_key is
+// "<tenant>:<kind>:<dedupe_id>" — a redelivered heartbeat
+// collapses to one row via the UNIQUE constraint.
 func (s *WorkerService) applyTenantDelta(
 	ctx context.Context,
 	appsRaw json.RawMessage,
@@ -644,7 +689,9 @@ func (s *WorkerService) applyTenantDelta(
 	capField func(*domain.Quota) int64,
 	usedField func(*domain.Quota) int64,
 	capLabel string,
+	meterKind domain.MeterKind,
 	add func(context.Context, string, uint64) (*domain.Quota, error),
+	meterEnqueue func(context.Context, string, domain.MeterKind, uint64, string) error,
 ) {
 	if len(appsRaw) == 0 {
 		return
@@ -655,15 +702,17 @@ func (s *WorkerService) applyTenantDelta(
 		return
 	}
 
-	// Sum this heartbeat's delta per tenant. Must aggregate all apps before
-	// checking — an early check on a partial per-tenant total would false-trip
-	// the quota when the tenant's heaviest app appears first in map iteration.
-	//
-	// Per the issue #418 dedupe contract: apps whose DedupeID is already in
-	// the cache are skipped (their delta is considered already applied).
-	// Apps with no DedupeID (legacy workers) always contribute — backward
-	// compatibility with pre-#418 workers.
+	// Sum this heartbeat's delta per tenant AND remember the first
+	// non-dedupe'd app's DedupeID per tenant — the metering-ledger
+	// idempotency_key is "<tenant>:<kind>:<dedupe_id>" so a
+	// redelivered heartbeat collapses to one row via the UNIQUE
+	// constraint. When a tenant has multiple apps in one heartbeat
+	// we use the FIRST non-dedupe'd app's DedupeID — strictly
+	// correct because the dedupe_id is the heartbeat bucket (issue
+	// #418), not the per-app token; apps that share a bucket share
+	// a dedupe_id.
 	byTenant := make(map[string]uint64)
+	dedupeByTenant := make(map[string]string)
 	skippedDedupe := 0
 	for _, app := range apps {
 		if app.TenantID == "" {
@@ -674,6 +723,9 @@ func (s *WorkerService) applyTenantDelta(
 			continue
 		}
 		byTenant[app.TenantID] += field(&app)
+		if app.DedupeID != "" && dedupeByTenant[app.TenantID] == "" {
+			dedupeByTenant[app.TenantID] = app.DedupeID
+		}
 	}
 	if skippedDedupe > 0 {
 		log.Printf("heartbeat: skipped %d %s app(s) on dedupe (JetStream redelivery / reconcile replay)", skippedDedupe, capLabel)
@@ -688,6 +740,21 @@ func (s *WorkerService) applyTenantDelta(
 		if err != nil {
 			log.Printf("heartbeat: failed to record %s for tenant %s: %v", capLabel, tenantID, err)
 			continue
+		}
+
+		// Dual-write to the metering ledger (issue #485). The
+		// idempotency_key carries the heartbeat bucket so redelivery
+		// collapses. A failure here logs but does NOT roll back the
+		// quota write — the hot-path mirror is the cap-check
+		// authority; the metering path is the slow-path Stripe
+		// reporter.
+		if meterEnqueue != nil {
+			dedupeID := dedupeByTenant[tenantID]
+			idempotencyKey := tenantID + ":" + string(meterKind) + ":" + dedupeID
+			if err := meterEnqueue(ctx, tenantID, meterKind, delta, idempotencyKey); err != nil {
+				log.Printf("heartbeat: failed to enqueue %s usage for tenant %s: %v (cap-check unchanged)",
+					capLabel, tenantID, err)
+			}
 		}
 		if quota == nil {
 			// No quota row — tenant is unlimited; nothing to enforce.
@@ -1112,7 +1179,9 @@ func (s *WorkerService) checkOutboundQuota(ctx context.Context, appsRaw json.Raw
 		func(q *domain.Quota) int64 { return int64(q.MaxOutboundMB) * 1024 * 1024 },
 		func(q *domain.Quota) int64 { return q.UsedOutboundBytes },
 		"outbound bytes",
+		domain.MeterKindOutboundBytes,
 		s.quotaRepo.AddOutboundBytes,
+		s.enqueueMeterEvent,
 	)
 }
 
@@ -1130,8 +1199,57 @@ func (s *WorkerService) checkRequestCount(ctx context.Context, appsRaw json.RawM
 		func(q *domain.Quota) int64 { return int64(q.MaxRequestsPerMonth) },
 		func(q *domain.Quota) int64 { return q.UsedRequestCount },
 		"requests",
+		domain.MeterKindRequestCount,
 		s.quotaRepo.AddRequestCount,
+		s.enqueueMeterEvent,
 	)
+}
+
+// checkResidentSeconds accumulates resident_seconds from this heartbeat
+// into the tenant's running total in the DB (issue #484 / #485). When the
+// cumulative total exceeds the per-month max_resident_seconds_per_month
+// cap, the tenant is disabled and an empty task_update is published to
+// every region where the tenant has active deployments — same shape as
+// checkOutboundQuota / checkRequestCount but for the third metered
+// dimension. Handler (FaaS) apps stamp ResidentSeconds=nil which
+// ResidentSecondsOrZero() folds to 0, so the AddResidentSeconds wrapper
+// is never invoked for FaaS.
+//
+// The field selector is passed as a method value
+// ((*domain.AppStatus).ResidentSecondsOrZero) rather than a closure —
+// do NOT simplify to `func(a *domain.AppStatus) uint64 { return
+// a.ResidentSecondsOrZero() }`; the method-value form satisfies
+// applyTenantDelta's field parameter type without the extra allocation,
+// and keeps the call sites uniform across the three dimensions.
+func (s *WorkerService) checkResidentSeconds(ctx context.Context, appsRaw json.RawMessage) {
+	s.applyTenantDelta(ctx, appsRaw,
+		(*domain.AppStatus).ResidentSecondsOrZero,
+		func(q *domain.Quota) int64 { return int64(q.MaxResidentSecondsPerMonth) },
+		func(q *domain.Quota) int64 { return q.UsedResidentSeconds },
+		"resident seconds",
+		domain.MeterKindResidentSeconds,
+		s.quotaRepo.AddResidentSeconds,
+		s.enqueueMeterEvent,
+	)
+}
+
+// enqueueMeterEvent is the callback applyTenantDelta uses for the
+// metering-ledger dual-write (issue #485). Nil-safe: if meteringRepo
+// is unset (test paths that don't construct one), the call becomes
+// a no-op via the `if meterEnqueue != nil` guard inside
+// applyTenantDelta. The closure captures s.meteringRepo so the
+// per-axis check* call sites stay uniform.
+func (s *WorkerService) enqueueMeterEvent(
+	ctx context.Context,
+	tenantID string,
+	kind domain.MeterKind,
+	quantity uint64,
+	idempotencyKey string,
+) error {
+	if s.meteringRepo == nil {
+		return nil
+	}
+	return s.meteringRepo.EnqueueUsageEvent(ctx, tenantID, kind, quantity, idempotencyKey)
 }
 
 // GetAppTarget returns the running target for a single

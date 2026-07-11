@@ -78,6 +78,27 @@ type AppStatus struct {
 	// on pre-#418 workers — control planes that don't see this field fall
 	// back to the historical behaviour (apply every delivery).
 	DedupeID string `json:"dedupe_id,omitempty"`
+	// ResidentSeconds is the total resident seconds since the last
+	// heartbeat interval. nil for Handler (FaaS) apps that do not
+	// contribute; Some(&0) for a LongRunning app that started within
+	// the current interval. Used by service.WorkerService.checkResidentSeconds
+	// to accumulate into quotas.used_resident_seconds (issue #484 /
+	// #485, third metered dimension). Nil for pre-#484 workers; control
+	// planes that don't see this field translate to "no contribution"
+	// (delta=0, no AddResidentSeconds call).
+	ResidentSeconds *uint64 `json:"resident_seconds,omitempty"`
+}
+
+// ResidentSecondsOrZero returns the resident-seconds counter treated as a
+// scalar: nil is folded to 0 so a Handler (FaaS) app or a pre-#484 worker
+// contributes nothing to applyTenantDelta. This is the field selector
+// passed into applyTenantDelta; it must remain `func(*AppStatus) uint64`
+// (not a closure) so callers can use the value as a method expression.
+func (a *AppStatus) ResidentSecondsOrZero() uint64 {
+	if a.ResidentSeconds == nil {
+		return 0
+	}
+	return *a.ResidentSeconds
 }
 
 // AppTarget describes a running app reachable on a worker — what the

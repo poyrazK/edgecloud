@@ -233,6 +233,33 @@ mod heartbeat_integration_tests {
         status: AppInstanceStatus,
         ws_port: Option<u16>,
     ) -> Arc<Mutex<AppInstance>> {
+        make_app_with_full_opts(
+            instance_pre,
+            status,
+            ws_port,
+            ExecutionModel::Handler,
+            18000,
+        )
+    }
+
+    /// Variant that lets each test pick the execution model — used
+    /// by the resident_seconds build_heartbeat tests (issue #484).
+    fn make_app_with_execution_model(
+        execution_model: ExecutionModel,
+        status: AppInstanceStatus,
+    ) -> Arc<Mutex<AppInstance>> {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let instance_pre = Some(load_handler_fixture(&engine));
+        make_app_with_full_opts(instance_pre, status, None, execution_model, 18000)
+    }
+
+    fn make_app_with_full_opts(
+        instance_pre: Option<wasmtime::component::InstancePre<edge_runtime::RuntimeState>>,
+        status: AppInstanceStatus,
+        ws_port: Option<u16>,
+        execution_model: ExecutionModel,
+        port: u16,
+    ) -> Arc<Mutex<AppInstance>> {
         let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
         meter.record_request();
         meter.record_request();
@@ -240,7 +267,7 @@ mod heartbeat_integration_tests {
             deployment_id: "d1".into(),
             app_name: "my-app".into(),
             tenant_id: "t_test".into(),
-            port: 18000,
+            port,
             status,
             meter,
             shutdown_tx: None,
@@ -248,7 +275,8 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
-            execution_model: ExecutionModel::Handler,
+            resident_ticker: None,
+            execution_model,
             dispatch: None,
             metrics_acc: None,
             ws_port,
@@ -327,6 +355,88 @@ mod heartbeat_integration_tests {
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
         assert_eq!(s.ws_port, Some(19091));
+    }
+
+    // ── resident_seconds build_heartbeat tests (issue #484) ───────
+
+    /// LongRunning app: meter has accumulated 60s of resident time →
+    /// heartbeat stamps `Some(60)`. The `applyTenantDelta` selector
+    /// treats `Some(N)` as N resident seconds for the tenant.
+    #[tokio::test]
+    async fn build_heartbeat_long_running_app_stamps_resident_seconds() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app =
+            make_app_with_execution_model(ExecutionModel::LongRunning, AppInstanceStatus::Running);
+        // Manually accumulate 60 resident seconds (the production
+        // path would do this via the per-app ticker).
+        app.lock().await.meter.record_resident_seconds(60);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(
+            s.resident_seconds,
+            Some(60),
+            "LongRunning app must stamp Some(60); got {:?}",
+            s.resident_seconds
+        );
+    }
+
+    /// Handler (FaaS) app: meter has 0 resident time (no ticker
+    /// was ever spawned) and the build_heartbeat path must stamp
+    /// `None`, NOT `Some(0)`. The wire-shape distinction between
+    /// "FaaS doesn't contribute" (None) and "LR just started"
+    /// (Some(0)) is preserved for downstream debugging.
+    #[tokio::test]
+    async fn build_heartbeat_handler_app_omits_resident_seconds() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app =
+            make_app_with_execution_model(ExecutionModel::Handler, AppInstanceStatus::Running);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert!(
+            s.resident_seconds.is_none(),
+            "Handler (FaaS) app must omit resident_seconds (None); got {:?}",
+            s.resident_seconds
+        );
+    }
+
+    /// LongRunning app that just started: meter has 0 resident time
+    /// but `execution_model == LongRunning` → heartbeat stamps
+    /// `Some(0)`, NOT `None`. Some(0) is the "LR ran for the whole
+    /// interval but started recently" signal distinct from FaaS.
+    #[tokio::test]
+    async fn build_heartbeat_long_running_zero_is_some_zero_not_none() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app =
+            make_app_with_execution_model(ExecutionModel::LongRunning, AppInstanceStatus::Starting);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        let s = hb.apps.get("my-app").expect("app present");
+        assert_eq!(
+            s.resident_seconds,
+            Some(0),
+            "LongRunning just-started app must stamp Some(0); got {:?}",
+            s.resident_seconds
+        );
     }
 
     // ── snapshot_current_apps tests ─────────────────────────────────
@@ -754,6 +864,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -809,6 +920,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -871,6 +983,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: None,
             metrics_acc: None,
@@ -918,6 +1031,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: None,
             metrics_acc: Some(Arc::new(acc)),
@@ -989,6 +1103,7 @@ mod heartbeat_integration_tests {
             instance_pre: instance_pre.clone(),
             handle: Some(Arc::new(panicking_handle)),
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1012,6 +1127,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1100,6 +1216,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1214,6 +1331,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1291,6 +1409,7 @@ mod heartbeat_integration_tests {
             instance_pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -1925,11 +2044,51 @@ impl Supervisor {
             }
         });
 
+        // Spawn the per-app resident-seconds ticker (issue #484).
+        // LongRunning apps only — Handler (FaaS) apps don't contribute
+        // resident time, so their resident_ticker stays None and the
+        // build_heartbeat path stamps `resident_seconds = None`.
+        // Mirrors the epoch ticker above: per-app scope (so a
+        // misbehaving app can't poison another's accounting), abort
+        // on stop (so the counter doesn't drift up after the app is
+        // gone). The 30s cadence matches the default heartbeat
+        // interval — finer granularity would 30× the atomic-op load
+        // with zero new billing-grade signal.
+
         // Create request meter.
         let meter = Arc::new(RequestMeter::new(
             tenant_id.to_string(),
             spec.deployment_id.clone(),
         ));
+
+        // Spawn the per-app resident-seconds ticker (issue #484).
+        // LongRunning apps only — Handler (FaaS) apps don't contribute
+        // resident time, so their resident_ticker stays None and the
+        // build_heartbeat path stamps `resident_seconds = None`.
+        // Mirrors the epoch ticker above: per-app scope (so a
+        // misbehaving app can't poison another's accounting), abort
+        // on stop (so the counter doesn't drift up after the app is
+        // gone).
+        let resident_ticker = if execution_model == ExecutionModel::LongRunning {
+            let resident_meter = meter.clone();
+            // TODO(metering): collapse 3 goroutines when drainer ships.
+            // The resident-seconds ticker below is the third parallel
+            // goroutine on the heartbeat path (alongside the existing
+            // checkOutboundQuota / checkRequestCount goroutines in the
+            // control plane, edge-control-plane/internal/service/worker.go).
+            // Once the metering-ledger drainer replaces the per-axis
+            // UPDATE path, this whole ticker can fold into the existing
+            // per-app heart-beat handle.
+            let resident_tick_secs = self.config.heartbeat_interval_secs;
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(resident_tick_secs)).await;
+                    resident_meter.record_resident_seconds(resident_tick_secs);
+                }
+            }))
+        } else {
+            None
+        };
 
         // Per-app env injected into both branches. For Handler apps
         // this becomes `WasiCtx` env on every per-request state clone;
@@ -2154,6 +2313,7 @@ impl Supervisor {
             instance_pre,
             handle: Some(std::sync::Arc::new(handle)),
             ticker: Some(ticker),
+            resident_ticker,
             execution_model,
             dispatch,
             metrics_acc,
@@ -2219,49 +2379,57 @@ impl Supervisor {
             state.apps.get(&key).cloned()
         };
 
-        let (port, ws_port, handle, ticker, _dispatch) = if let Some(inst) = instance {
-            // Phase 1: set Draining, signal serve() to stop accepting,
-            // then drain in-flight requests.
-            let mut inst = inst.lock().await;
-            inst.status = AppInstanceStatus::Draining;
-            let port = inst.port;
-            let ws_port = inst.ws_port;
-            let handle = inst.handle.clone();
-            let ticker = inst.ticker.take();
-            let broadcast_tx = inst.shutdown_tx_broadcast.take();
-            let dispatch = inst.dispatch.clone();
-            drop(inst);
+        let (port, ws_port, handle, ticker, resident_ticker, _dispatch) =
+            if let Some(inst) = instance {
+                // Phase 1: set Draining, signal serve() to stop accepting,
+                // then drain in-flight requests.
+                let mut inst = inst.lock().await;
+                inst.status = AppInstanceStatus::Draining;
+                let port = inst.port;
+                let ws_port = inst.ws_port;
+                let handle = inst.handle.clone();
+                let ticker = inst.ticker.take();
+                // Take the resident-seconds ticker (issue #484) out of
+                // the locked struct so we can abort it after the app
+                // exits. Without abort, the ticker would keep firing
+                // every 30s on a stopped app, drifting the
+                // `meter.resident_seconds` counter past the heartbeat
+                // already-published value.
+                let resident_ticker = inst.resident_ticker.take();
+                let broadcast_tx = inst.shutdown_tx_broadcast.take();
+                let dispatch = inst.dispatch.clone();
+                drop(inst);
 
-            // Signal serve() to stop accepting new connections.
-            if let Some(tx) = broadcast_tx {
-                let _ = tx.send(());
-            }
-
-            // Phase 2: wait for in-flight requests to drain (up to 30s).
-            if let Some(ref d) = dispatch {
-                let drained = d.drain_in_flight(Duration::from_secs(30)).await;
-                if !drained {
-                    tracing::warn!(
-                        tenant_id = %tenant_id,
-                        app_name = %app_name,
-                        "drain timeout reached — forcing stop"
-                    );
+                // Signal serve() to stop accepting new connections.
+                if let Some(tx) = broadcast_tx {
+                    let _ = tx.send(());
                 }
-            }
 
-            // Set stopping status after drain.
-            {
-                let state = self.state.read().await;
-                if let Some(stopping_inst) = state.apps.get(&key) {
-                    let mut stopping_inst = stopping_inst.lock().await;
-                    stopping_inst.status = AppInstanceStatus::Stopping;
+                // Phase 2: wait for in-flight requests to drain (up to 30s).
+                if let Some(ref d) = dispatch {
+                    let drained = d.drain_in_flight(Duration::from_secs(30)).await;
+                    if !drained {
+                        tracing::warn!(
+                            tenant_id = %tenant_id,
+                            app_name = %app_name,
+                            "drain timeout reached — forcing stop"
+                        );
+                    }
                 }
-            }
 
-            (port, ws_port, handle, ticker, dispatch)
-        } else {
-            return Ok(()); // already gone
-        };
+                // Set stopping status after drain.
+                {
+                    let state = self.state.read().await;
+                    if let Some(stopping_inst) = state.apps.get(&key) {
+                        let mut stopping_inst = stopping_inst.lock().await;
+                        stopping_inst.status = AppInstanceStatus::Stopping;
+                    }
+                }
+
+                (port, ws_port, handle, ticker, resident_ticker, dispatch)
+            } else {
+                return Ok(()); // already gone
+            };
 
         // Remove from the map.
         self.state.write().await.apps.remove(&key);
@@ -2285,6 +2453,15 @@ impl Supervisor {
         // the engine is dropped), wasting CPU and incrementing the epoch
         // for stopped apps.
         if let Some(t) = ticker {
+            t.abort();
+        }
+
+        // Abort the resident-seconds ticker (issue #484). Same
+        // rationale as the epoch ticker above — without abort, the
+        // ticker would keep firing every 30s on a stopped app and
+        // drift `meter.resident_seconds` past the heartbeat delta
+        // we already published.
+        if let Some(t) = resident_ticker {
             t.abort();
         }
 
@@ -2921,6 +3098,20 @@ impl Supervisor {
                     // a redeploy retains the prior error string until
                     // the first crash, which is the safer default).
                     last_error: inst.last_error.clone(),
+                    // Third metered dimension (issue #484): only
+                    // LongRunning apps contribute resident-seconds —
+                    // the per-app resident ticker is only spawned for
+                    // LR. Handler (FaaS) apps stamp None so the CP's
+                    // applyTenantDelta treats them as a zero
+                    // contribution without ever calling
+                    // AddResidentSeconds. Reading from the same
+                    // `snap` keeps the three counters atomically
+                    // consistent (no TOCTOU at heartbeat time).
+                    resident_seconds: if inst.execution_model == ExecutionModel::LongRunning {
+                        Some(snap.resident_seconds)
+                    } else {
+                        None
+                    },
                 },
             );
         }
@@ -2959,6 +3150,14 @@ impl Supervisor {
                 }
                 inst.meter
                     .subtract_delta(status.request_count, status.outbound_bytes);
+                // Third metered dimension (issue #484): subtract the
+                // resident-seconds delta we just shipped. FaaS apps
+                // stamp `resident_seconds = None` so the
+                // `unwrap_or(0)` folds them to a no-op — same
+                // shape as a LongRunning app that started within the
+                // current interval.
+                inst.meter
+                    .subtract_resident_seconds(status.resident_seconds.unwrap_or(0));
             }
         }
     }
@@ -3634,6 +3833,7 @@ mod tests {
             instance_pre: Some(instance_pre.clone()),
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: Some(dispatch_a),
             metrics_acc: None,
@@ -3656,6 +3856,7 @@ mod tests {
             instance_pre: Some(instance_pre.clone()),
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: Some(dispatch_b),
             metrics_acc: None,
@@ -3923,6 +4124,7 @@ mod tests {
             instance_pre: pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::LongRunning,
             dispatch: None,
             metrics_acc: None,
@@ -3956,6 +4158,7 @@ mod tests {
             instance_pre: pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: None,
             metrics_acc: None,
@@ -4038,6 +4241,7 @@ mod tests {
             instance_pre: pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: Some(dispatch),
             metrics_acc: None,
@@ -4077,6 +4281,7 @@ mod tests {
             instance_pre: pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: None,
             metrics_acc: None,
@@ -4117,6 +4322,7 @@ mod tests {
             instance_pre: pre,
             handle: None,
             ticker: None,
+            resident_ticker: None,
             execution_model: ExecutionModel::Handler,
             dispatch: None,
             metrics_acc: None,
@@ -4151,6 +4357,132 @@ mod tests {
         assert_eq!(
             snap.request_count, 2,
             "meter should not be reset due to deployment_id mismatch"
+        );
+    }
+
+    /// Issue #484, third metered dimension: `reset_meters_after` must
+    /// also subtract the resident-seconds delta we just shipped.
+    /// Mirrors `reset_meters_after_subtracts_delta` for the new axis —
+    /// the heartbeat stamps `Some(60)` for a LongRunning app that
+    /// accumulated 60s, and the call must zero the meter.
+    #[tokio::test]
+    async fn reset_meters_after_subtracts_resident_seconds_delta() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = Some(fixture_pre(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_request();
+        meter.record_outbound_bytes(100);
+        // LongRunning apps accumulate resident time via the per-app
+        // ticker. Manually pre-load the counter here to simulate the
+        // ticker having fired twice (2 × heartbeat_interval_secs = 60).
+        meter.record_resident_seconds(60);
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(),
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19005,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            resident_ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+        // Sanity check: build_heartbeat stamped Some(60).
+        let stamped = hb.apps.get("my-app").expect("app present");
+        assert_eq!(
+            stamped.resident_seconds,
+            Some(60),
+            "build_heartbeat must stamp resident_seconds for LR app"
+        );
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(snap.request_count, 0);
+        assert_eq!(snap.outbound_bytes, 0);
+        assert_eq!(
+            snap.resident_seconds, 0,
+            "resident-seconds delta must be subtracted after heartbeat publish"
+        );
+    }
+
+    /// Issue #484 mirror of `reset_meters_after_deployment_mismatch_skips`:
+    /// when deployment_id changes between build_heartbeat and
+    /// reset_meters_after, the resident-seconds counter must NOT be
+    /// subtracted. fetch_sub would wrap to u64::MAX.
+    #[tokio::test]
+    async fn reset_meters_after_resident_deployment_mismatch_skips() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let pre = Some(fixture_pre(&engine));
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let meter = Arc::new(RequestMeter::new("t_test".into(), "d1".into()));
+        meter.record_request();
+        meter.record_outbound_bytes(100);
+        meter.record_resident_seconds(60);
+
+        let app = Arc::new(Mutex::new(AppInstance {
+            deployment_id: "d1".into(), // initial deployment
+            app_name: "my-app".into(),
+            tenant_id: "t_test".into(),
+            port: 19006,
+            status: AppInstanceStatus::Running,
+            meter: meter.clone(),
+            shutdown_tx: None,
+            shutdown_tx_broadcast: None,
+            instance_pre: pre,
+            handle: None,
+            ticker: None,
+            resident_ticker: None,
+            execution_model: ExecutionModel::LongRunning,
+            dispatch: None,
+            metrics_acc: None,
+            ws_port: None,
+            last_error: None,
+        }));
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into()), app);
+
+        // Build heartbeat with current state (deployment_id="d1")
+        let sup = make_supervisor(state.clone());
+        let hb = sup.build_heartbeat().await;
+
+        // Now simulate a new deployment replacing the app (deployment_id changes)
+        // between build_heartbeat and reset_meters_after.
+        {
+            let mut guard = state.write().await;
+            let existing = guard
+                .apps
+                .get_mut(&("t_test".into(), "my-app".into()))
+                .unwrap();
+            let mut inst = existing.lock().await;
+            inst.deployment_id = "d2".into(); // deployment changed!
+        }
+
+        // Reset with the stale heartbeat (which has deployment_id="d1")
+        sup.reset_meters_after(&hb).await;
+        let snap = meter.snapshot();
+        assert_eq!(
+            snap.resident_seconds, 60,
+            "resident-seconds counter must NOT be reset on deployment_id mismatch (would wrap to u64::MAX)"
         );
     }
 }
