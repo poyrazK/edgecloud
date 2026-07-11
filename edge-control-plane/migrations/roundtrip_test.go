@@ -77,7 +77,7 @@ import (
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
 // not a strict 2× the migration number.
-const splitFileCount = 82 // 41 .up.sql + 41 .down.sql after issue #439 + #574
+const splitFileCount = 84 // 42 .up.sql + 42 .down.sql after issue #439 + #574 + #430 (workers.public_key)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The

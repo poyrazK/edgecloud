@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"regexp"
 	"testing"
 	"time"
 
@@ -309,6 +310,136 @@ func TestWorkerRepository_GetAppStatus_PicksLatestHeartbeat(t *testing.T) {
 	}
 	if got.Region != "us-west-2" {
 		t.Errorf("Region = %q, want us-west-2 (latest heartbeat)", got.Region)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_SetPublicKey pins the issue #430 enrollment
+// writer: SetPublicKey issues a single UPDATE keyed by worker_id, sets
+// the column to the hex-encoded pubkey, and reports the affected row
+// count. The handler uses 0 to detect "worker not registered" — a
+// guard against the bootstrap/enroll race.
+func TestWorkerRepository_SetPublicKey(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectExec(`UPDATE workers SET public_key = \$2 WHERE id = \$1`).
+		WithArgs("w_fra_1", "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	rows, err := repo.SetPublicKey(context.Background(),
+		"w_fra_1",
+		"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+	if err != nil {
+		t.Fatalf("SetPublicKey: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("rows = %d, want 1", rows)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_SetPublicKey_WorkerNotRegistered pins the
+// not-affected path: a worker enrolled without ever calling
+// /api/internal/workers (register). The handler surfaces 0 to the
+// EnrollWorker logic, which then refuses to return a derived secret.
+func TestWorkerRepository_SetPublicKey_WorkerNotRegistered(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectExec(`UPDATE workers SET public_key = \$2 WHERE id = \$1`).
+		WithArgs("w_fra_ghost", regexp.MustCompile(`.+`).
+			FindString("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	rows, err := repo.SetPublicKey(context.Background(),
+		"w_fra_ghost",
+		"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+	if err != nil {
+		t.Fatalf("SetPublicKey: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("rows = %d, want 0 (worker not registered)", rows)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_GetPublicKey_Hit pins the happy path: the
+// worker has enrolled and the hex pubkey is returned verbatim. WorkerAuth
+// uses this to recompute the HKDF-derived verification secret.
+func TestWorkerRepository_GetPublicKey_Hit(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"public_key"}).
+		AddRow("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
+	mock.ExpectQuery(`SELECT public_key FROM workers WHERE id = \$1`).
+		WithArgs("w_fra_1").
+		WillReturnRows(rows)
+
+	got, err := repo.GetPublicKey(context.Background(), "w_fra_1")
+	if err != nil {
+		t.Fatalf("GetPublicKey: %v", err)
+	}
+	want := "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+	if got != want {
+		t.Errorf("GetPublicKey = %q, want %q", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_GetPublicKey_NullColumn pins the
+// "row exists but public_key IS NULL" path: a worker has been
+// registered but never enrolled. WorkerAuth treats the empty return
+// as "no verifiable kid" and 401s the request — a pre-#430 worker
+// cannot present a valid wkr_ kid because it never enrolled.
+func TestWorkerRepository_GetPublicKey_NullColumn(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"public_key"}).AddRow(nil)
+	mock.ExpectQuery(`SELECT public_key FROM workers WHERE id = \$1`).
+		WithArgs("w_fra_legacy").
+		WillReturnRows(rows)
+
+	got, err := repo.GetPublicKey(context.Background(), "w_fra_legacy")
+	if err != nil {
+		t.Fatalf("GetPublicKey: %v", err)
+	}
+	if got != "" {
+		t.Errorf("GetPublicKey = %q, want empty (NULL column)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_GetPublicKey_NoRow pins the no-rows path: the
+// worker_id has never been registered. Returns ("", nil) per the
+// GetByID convention so the middleware can treat absence identically
+// to NULL — both reject the kid without surfacing a DB error.
+func TestWorkerRepository_GetPublicKey_NoRow(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT public_key FROM workers WHERE id = \$1`).
+		WithArgs("w_fra_missing").
+		WillReturnRows(sqlmock.NewRows([]string{"public_key"}))
+
+	got, err := repo.GetPublicKey(context.Background(), "w_fra_missing")
+	if err != nil {
+		t.Fatalf("GetPublicKey: %v", err)
+	}
+	if got != "" {
+		t.Errorf("GetPublicKey = %q, want empty (no row)", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations: %v", err)

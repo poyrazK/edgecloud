@@ -1,0 +1,28 @@
+-- +migrate Up
+-- Issue #430: per-worker identity attestation for /worker-bootstrap/enroll.
+-- Each worker now enrolls an Ed25519 public key during the bootstrap
+-- handshake; the CP uses HKDF over (JWT_SECRET, salt=public_key,
+-- info=worker_id:tenant_id:region) to derive a per-worker HS256 signing
+-- secret instead of returning the cluster-wide JWT_SECRET. The public_key
+-- is the only material needed to recompute the verification secret at
+-- WorkerAuth time, so it MUST be persisted on the workers row.
+--
+-- The column is nullable: pre-#430 workers did not enroll a keypair and
+-- never will (they are now legacy / unsupported — see workers public_key
+-- column enforcement below). Once a worker enrolls, public_key is set
+-- and stays set for the worker's lifetime. Re-enrollment with a new
+-- keypair overwrites the value via the (only) writer — see
+-- repository/worker.go::SetPublicKey.
+--
+-- The partial index covers only rows where public_key IS NOT NULL so
+-- pre-#430 workers do not bloat the index. WorkerAuth's wkr_-kid
+-- verification path (issue #430 / commit 4) only ever queries this
+-- column when the JWT carries a wkr_ kid header, and pre-#430 JWTs
+-- carry no kid — so the query path naturally avoids any rows where
+-- public_key IS NULL.
+--
+-- Sister: internal/signing/worker_key.go (HKDF derivation), commit 2
+-- of the issue #430 fix. Worker-side sibling: edge-worker/src/worker_key.rs
+-- (Ed25519 keypair generation and disk persistence), commit 5.
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS public_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_workers_public_key ON workers (public_key) WHERE public_key IS NOT NULL;
