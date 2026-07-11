@@ -191,6 +191,44 @@ func TestWorkerKeyCache_EmptyWorkerID(t *testing.T) {
 	}
 }
 
+// TestWorkerKeyCache_EmptyStringNotCached pins the empty-result
+// path independently of TestWorkerKeyCache_NegativeLookup so the
+// "do not memoize empty" guarantee is documented in the test
+// suite even if NegativeLookup gets re-purposed. The just-
+// enrolled-worker scenario is the load-bearing case: between
+// `EnrollWorker.SetPublicKey` and the next inbound request, the
+// worker has a public_key on disk but the cache entry for that
+// worker_id (if one existed from a stale read) must NOT carry
+// forward an empty answer.
+func TestWorkerKeyCache_EmptyStringNotCached(t *testing.T) {
+	var calls int32
+	pubkey := "deadbeef" + repeat("c", 56) // 64 hex chars (Ed25519 shape)
+	loader := func(ctx context.Context, workerID string) (string, error) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			return "", nil // stale read: worker hadn't enrolled yet
+		}
+		return pubkey, nil // re-read after enrollment landed
+	}
+	c := NewWorkerKeyCache(loader)
+
+	// First read: empty result, not cached.
+	if got, err := c.GetOrLoad(context.Background(), "w_just_enrolled"); err != nil || got != "" {
+		t.Fatalf("first call: got=(%q,%v), want=(\"\",nil)", got, err)
+	}
+	// Second read: re-loads, returns the freshly-enrolled pubkey.
+	got, err := c.GetOrLoad(context.Background(), "w_just_enrolled")
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if got != pubkey {
+		t.Errorf("got %q, want %q (empty must not be cached so the just-enrolled worker verifies)", got, pubkey)
+	}
+	if n := atomic.LoadInt32(&calls); n != 2 {
+		t.Errorf("loader calls = %d, want 2 (empty result must trigger a fresh load on the next call)", n)
+	}
+}
+
 // repeat is a tiny helper to avoid pulling in `strings.Repeat` for
 // a single use in the InvalidatedOnPubkeyChange test. The two
 // calls only need 60+ chars of "a" / "b" to make the comparison
