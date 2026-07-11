@@ -3,11 +3,22 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
+use super::retry::call_with_retry;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
+
+/// Hardcoded sensible defaults for `edge traffic` (read). Matches
+/// `edge deploy`'s defaults — a transient outage on `edge traffic`
+/// is treated the same as on `edge deploy`. The `set` path is
+/// operator-tunable (main.rs wires `--max-retries` /
+/// `--retry-base-ms` / `--retry-cap-ms` to it).
+const HARD_CODED_MAX_RETRIES: u32 = 3;
+const HARD_CODED_RETRY_BASE_MS: u64 = 500;
+const HARD_CODED_RETRY_CAP_MS: u64 = 8_000;
 
 /// Subcommand enum for `edge traffic`. Mirrors the dispatch in
 /// `main.rs::Command::Traffic`. Lives in this module so the
@@ -21,17 +32,53 @@ pub enum TrafficAction {
     Set {
         /// Space-separated `deployment_id=weight` pairs.
         splits: Vec<String>,
+
+        /// Maximum number of retries on transient failures (issue
+        /// #571 propagation): 5xx, network errors, and 429. The
+        /// total number of attempts is `1 + max_retries`.
+        /// `--max-retries=0` (the default) disables retry (single
+        /// attempt, fail fast) — `edge traffic set` is a
+        /// PUT-replaces, but the user is unlikely to want retries
+        /// on a one-shot CLI invocation; this default is tunable
+        /// via the flag.
+        #[arg(long, default_value_t = 3)]
+        max_retries: u32,
+
+        /// Base backoff in milliseconds (issue #571 propagation).
+        /// First retry sleeps `retry_base_ms × ±25%` jitter; each
+        /// subsequent retry doubles the wait, capped at
+        /// `retry-cap-ms`. Ignored when `--max-retries=0`.
+        #[arg(long, default_value_t = 500)]
+        retry_base_ms: u64,
+
+        /// Maximum backoff in milliseconds (issue #571
+        /// propagation). Caps the exponential backoff so a
+        /// sustained outage doesn't pin a CI job for minutes.
+        /// Hard-capped at 60_000 (60s) by `value_parser`. Ignored
+        /// when `--max-retries=0`.
+        #[arg(long, default_value_t = 8_000, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        retry_cap_ms: u64,
     },
 }
 
-/// Get current traffic splits for the app.
+/// Get current traffic splits for the app. Naturally idempotent
+/// (read); the call routes through [`call_with_retry`] with
+/// hardcoded sensible defaults.
 #[cfg(feature = "network")]
 pub fn get(path: &Path) -> Result<()> {
     let state = State::load(path).context("no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let splits = client.get_traffic(&state.app_name)?;
+    let interrupt = AtomicBool::new(false);
+    let splits = call_with_retry(
+        "traffic get",
+        || client.get_traffic(&state.app_name),
+        HARD_CODED_MAX_RETRIES,
+        HARD_CODED_RETRY_BASE_MS,
+        HARD_CODED_RETRY_CAP_MS,
+        &interrupt,
+    )?;
 
     if splits.is_empty() {
         output::info("No traffic splits configured — all traffic goes to the active deployment");
@@ -52,8 +99,20 @@ pub fn get(path: &Path) -> Result<()> {
 
 /// Set traffic splits for the app.
 /// `splits` is a slice of "deployment_id=weight" strings, e.g. ["d_v1=95","d_v2=5"].
+///
+/// Naturally idempotent (PUT-replaces; the same final state
+/// replays). The retry flags are operator-tunable — main.rs
+/// wires `--max-retries` / `--retry-base-ms` / `--retry-cap-ms`
+/// to this function (matches `edge deploy`'s shape) so a CI
+/// script can tune the retry budget without code changes.
 #[cfg(feature = "network")]
-pub fn set(path: &Path, splits: &[(String, u8)]) -> Result<()> {
+pub fn set(
+    path: &Path,
+    splits: &[(String, u8)],
+    max_retries: u32,
+    retry_base_ms: u64,
+    retry_cap_ms: u64,
+) -> Result<()> {
     let state = State::load(path).context("no deployment found — run `edge deploy` first")?;
     let edge_toml = EdgeToml::from_path(path)?;
 
@@ -63,7 +122,15 @@ pub fn set(path: &Path, splits: &[(String, u8)]) -> Result<()> {
     }
 
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    client.set_traffic(&state.app_name, splits)?;
+    let interrupt = AtomicBool::new(false);
+    call_with_retry(
+        "traffic set",
+        || client.set_traffic(&state.app_name, splits),
+        max_retries,
+        retry_base_ms,
+        retry_cap_ms,
+        &interrupt,
+    )?;
 
     output::success(&format!("Traffic splits set for {}", state.app_name));
     for (id, weight) in splits {
@@ -78,6 +145,12 @@ pub fn get(_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(feature = "network"))]
-pub fn set(_path: &Path, _splits: &[(String, u8)]) -> Result<()> {
+pub fn set(
+    _path: &Path,
+    _splits: &[(String, u8)],
+    _max_retries: u32,
+    _retry_base_ms: u64,
+    _retry_cap_ms: u64,
+) -> Result<()> {
     anyhow::bail!("traffic set requires network support; rebuild with --features network")
 }
