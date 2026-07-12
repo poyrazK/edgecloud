@@ -1,0 +1,11 @@
+-- +migrate Up
+-- Issue #548 (L4/TCP ingress): per-app public port persisted on the apps
+-- metadata row. Allocated by the control plane so two edge-ingress instances
+-- in the same region can't both hand out the same port; read back via
+-- GET /api/v1/apps/{appName}/l4-port.
+--
+-- Nullable because HTTP apps never set it; the value is in the L4 port
+-- range configured on the ingress (default 31000-31999) and is selected
+-- by AppService.AllocateL4Port from the same range. Released by the
+-- handler on app deletion (DELETE /api/v1/apps/{appName}).
+ALTER TABLE apps ADD COLUMN l4_public_port INTEGER;

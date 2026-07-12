@@ -32,6 +32,14 @@ type appRepoInterface interface {
 	// review); the lock is held for the caller's tx lifetime.
 	GetForUpdate(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error)
+	// L4 port allocation (issue #548). See repository/app.go for the
+	// atomicity story — AllocateL4Port serializes across racing ingress
+	// instances via `l4_public_port IS NULL` guard, so two callers that
+	// pick different ports converge to the same persisted value.
+	GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error)
+	AllocateL4Port(ctx context.Context, tenantID, appName string, port uint16) (uint16, error)
+	ReleaseL4Port(ctx context.Context, tenantID, appName string) error
+	AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}, error)
 }
 
 // AppService handles app business logic.
@@ -45,6 +53,13 @@ type AppService struct {
 	quotaRepo     quotaRepoInterface
 	outboxRepo    *repository.OutboxRepository
 	defaultRegion string
+	// l4PortRangeStart and l4PortRangeEnd bound the L4/TCP port
+	// range used by AllocateL4Port (issue #548). Configured via
+	// cfg.L4.PortRangeStart / cfg.L4.PortRangeEnd and threaded into
+	// NewAppService from app.New. Must be 1..65535 with start <= end;
+	// validated by config.validateL4Config at startup.
+	l4PortRangeStart uint16
+	l4PortRangeEnd   uint16
 }
 
 func NewAppService(
@@ -57,20 +72,24 @@ func NewAppService(
 	quotaRepo *repository.QuotaRepository,
 	outboxRepo *repository.OutboxRepository,
 	defaultRegion string,
+	l4PortRangeStart uint16,
+	l4PortRangeEnd uint16,
 ) *AppService {
 	if defaultRegion == "" {
 		defaultRegion = "global"
 	}
 	return &AppService{
-		db:            db,
-		appRepo:       appRepo,
-		activeRepo:    activeRepo,
-		appEnvRepo:    appEnvRepo,
-		deployRepo:    deploymentRepo,
-		artifactStore: artifactStore,
-		quotaRepo:     quotaRepo,
-		outboxRepo:    outboxRepo,
-		defaultRegion: defaultRegion,
+		db:               db,
+		appRepo:          appRepo,
+		activeRepo:       activeRepo,
+		appEnvRepo:       appEnvRepo,
+		deployRepo:       deploymentRepo,
+		artifactStore:    artifactStore,
+		quotaRepo:        quotaRepo,
+		outboxRepo:       outboxRepo,
+		defaultRegion:    defaultRegion,
+		l4PortRangeStart: l4PortRangeStart,
+		l4PortRangeEnd:   l4PortRangeEnd,
 	}
 }
 
@@ -394,4 +413,123 @@ func (s *AppService) CreateIfNotExists(ctx context.Context, tenantID, appName st
 // the error and proceed, not fail the request.
 func (s *AppService) DeleteIfNoDeployments(ctx context.Context, tenantID, appName string) (bool, error) {
 	return s.appRepo.DeleteIfNoDeployments(ctx, tenantID, appName)
+}
+
+// Sentinel errors for L4 port allocation (issue #548).
+var (
+	// ErrL4PortRangeExhausted is returned by AllocateL4Port when every
+	// port in [l4PortRangeStart, l4PortRangeEnd] is already allocated.
+	// The operator should widen the range or reduce concurrent L4 apps.
+	ErrL4PortRangeExhausted = fmt.Errorf("L4 public port range exhausted")
+)
+
+// GetL4Port returns the persisted L4 public port for (tenantID,
+// appName), or (0, ErrAppNotFound) if the app does not exist.
+// Returns (0, nil) when the app exists but has no allocated port
+// yet (e.g. HTTP-only app, or L4 app that hasn't been activated
+// since the l4_public_port column was added).
+//
+// Issue #548. The handler layer maps (0, ErrAppNotFound) to 404 and
+// (port, nil) to {"public_port": port}; (0, nil) maps to 404 too
+// because there's nothing meaningful to advertise.
+func (s *AppService) GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	if !IsValidAppName(appName) {
+		return 0, fmt.Errorf("invalid app name: %s", appName)
+	}
+	port, err := s.appRepo.GetL4Port(ctx, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return 0, ErrAppNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("getting L4 port: %w", err)
+	}
+	return port, nil
+}
+
+// AllocateL4Port atomically assigns a free port from
+// [l4PortRangeStart, l4PortRangeEnd] to (tenantID, appName) and
+// persists it on the apps row. If the app already has a port, the
+// existing port is returned unchanged (idempotent — calling twice
+// for the same app is safe and does not hand out a second port).
+// Returns ErrAppNotFound when the app does not exist and
+// ErrL4PortRangeExhausted when no free port is available.
+//
+// Allocation strategy: walk the range from l4PortRangeStart upward,
+// skipping ports already taken (queried once via
+// AllocatedL4Ports). The result is persisted via AllocateL4Port
+// which uses an UPDATE … WHERE l4_public_port IS NULL guard, so
+// two concurrent Allocate calls converge to the same winner (the
+// one whose UPDATE matched; the loser re-reads and returns the
+// winner's port).
+//
+// Issue #548.
+func (s *AppService) AllocateL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	if !IsValidAppName(appName) {
+		return 0, fmt.Errorf("invalid app name: %s", appName)
+	}
+	// Fast path: app already has a port.
+	existing, err := s.appRepo.GetL4Port(ctx, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return 0, ErrAppNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("checking existing L4 port: %w", err)
+	}
+	if existing != 0 {
+		return existing, nil
+	}
+
+	// Slow path: pick a free port from the configured range.
+	allocated, err := s.appRepo.AllocatedL4Ports(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("listing allocated L4 ports: %w", err)
+	}
+	start := s.l4PortRangeStart
+	end := s.l4PortRangeEnd
+	if start == 0 {
+		start = 31000
+	}
+	if end == 0 || end < start {
+		end = start + 999
+	}
+	// Walk from start..end. The range is bounded so the loop
+	// terminates with ErrL4PortRangeExhausted on a saturated fleet.
+	for port := start; ; port++ {
+		if port > end {
+			return 0, ErrL4PortRangeExhausted
+		}
+		p := uint16(port)
+		if _, taken := allocated[p]; taken {
+			continue
+		}
+		persisted, err := s.appRepo.AllocateL4Port(ctx, tenantID, appName, p)
+		if err == sql.ErrNoRows {
+			// App was deleted between the GetL4Port and AllocateL4Port
+			// calls — bail out.
+			return 0, ErrAppNotFound
+		}
+		if err != nil {
+			return 0, fmt.Errorf("allocating L4 port %d: %w", p, err)
+		}
+		// persisted is the port that ended up in the column. It
+		// matches `p` when we won the race; it can be a different
+		// port (from a racing caller) when we lost. Either way,
+		// it's the persisted value to advertise.
+		return persisted, nil
+	}
+}
+
+// ReleaseL4Port clears the L4 public port assignment for
+// (tenantID, appName). Idempotent — safe to call when no port
+// was ever allocated or when the apps row no longer exists
+// (the repo returns nil in both cases).
+//
+// Issue #548. Called by the deploy path's compensating-write
+// sequence and by future app-delete flows that need to free the
+// port for the next app without leaving an orphan allocation.
+func (s *AppService) ReleaseL4Port(ctx context.Context, tenantID, appName string) error {
+	if !IsValidAppName(appName) {
+		return fmt.Errorf("invalid app name: %s", appName)
+	}
+	return s.appRepo.ReleaseL4Port(ctx, tenantID, appName)
 }

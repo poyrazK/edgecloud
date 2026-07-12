@@ -19,7 +19,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::caddy::{render_full, render_routes, CaddyClient};
 use crate::config::Config;
-use crate::l4::{L4PortPool, L4RouteEntry, L4RoutingTable};
+use crate::l4::{L4AppKey, L4PortPool, L4RouteEntry, L4RoutingTable};
+use crate::l4_cache::{spawn_l4_port_cache_fetcher, SharedL4PortCache};
 use crate::messages::HeartbeatMessage;
 use crate::quota::{spawn_quota_fetcher, SharedQuotaCache};
 use crate::ratelimit::SharedRateLimitCache;
@@ -69,6 +70,13 @@ pub async fn run(
     // Disabled when `tenant_rate_limit_fetch_interval` is zero — see
     // `spawn_tenant_rate_limit_fetcher`.
     let tenant_rate_limit_cache: SharedTenantRateLimitCache = Default::default();
+    // L4 public-port cache (issue #548). Polls the control plane
+    // every `L4_PORT_CACHE_FETCH_INTERVAL` (30s) so two ingress
+    // instances in the same region see the same `(tenant, app) →
+    // public_port` mapping. `apply_heartbeat` consults this before
+    // falling back to the ingress-local `L4PortPool` on the cold
+    // path.
+    let l4_port_cache: SharedL4PortCache = Default::default();
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -112,6 +120,7 @@ pub async fn run(
     // inject a Caddy `static_response` 402 when any tenant crosses cap.
     // Disabled when `quota_fetch_interval` is zero — see spawn_quota_fetcher.
     let quota_fetcher_shutdown = shutdown.clone();
+    let http_client_for_l4 = http_client_for_quota.clone();
     spawn_quota_fetcher(
         http_client_for_quota.clone(),
         cfg.control_plane_api_url.clone(),
@@ -136,6 +145,21 @@ pub async fn run(
         table.clone(),
         cfg.tenant_rate_limit_fetch_interval,
         tenant_rl_fetcher_shutdown,
+    );
+    // L4 public-port cache fetcher (issue #548). Polls
+    // `GET /api/v1/internal/l4-port/{tenant}/{app}` every 30s for every
+    // routable L4 app; the cache is consulted by `apply_heartbeat` on
+    // the cold path before we fall back to the ingress-local pool.
+    // Disabled when `control_plane_api_url` is empty — same mode as
+    // the quota/traffic/rate-limit fetchers.
+    let l4_cache_shutdown = shutdown.clone();
+    spawn_l4_port_cache_fetcher(
+        http_client_for_l4,
+        cfg.control_plane_api_url.clone(),
+        l4_port_cache.clone(),
+        cfg.internal_token.clone(),
+        l4_table.clone(),
+        l4_cache_shutdown,
     );
     let renderer_shutdown = shutdown.clone();
     spawn_renderer(
@@ -191,7 +215,9 @@ pub async fn run(
                     .increment(1);
                 metrics::counter!("ingress.heartbeats.apps_total").increment(hb.apps.len() as u64);
                 let mut l4_ports_guard = l4_ports.lock().await;
-                if apply_heartbeat(&table, &l4_table, &mut l4_ports_guard, &hb).await {
+                if apply_heartbeat(&table, &l4_table, &mut l4_ports_guard, &l4_port_cache, &hb)
+                    .await
+                {
                     metrics::counter!("ingress.routes.changed").increment(1);
                     render_notify.notify_one();
                 }
@@ -219,10 +245,19 @@ pub async fn run(
 /// mutations the rest of the system expects. Without `pub`, integration
 /// tests would have to either duplicate `apply_heartbeat`'s logic (drift
 /// risk) or skip the cross-wire assertion entirely.
+///
+/// `l4_port_cache` carries the CP-persisted `(tenant, app) → public_port`
+/// mapping (issue #548). On a cold TCP heartbeat (no entry in `l4_table`
+/// yet), we consult the cache before falling back to the ingress-local
+/// `L4PortPool` — so two ingress instances in the same region that
+/// both see a fresh TCP heartbeat for the same app agree on the public
+/// port by reading it from the cache, instead of independently
+/// allocating from each local pool.
 pub async fn apply_heartbeat(
     table: &RoutingTable,
     l4_table: &L4RoutingTable,
     l4_ports: &mut L4PortPool,
+    l4_port_cache: &SharedL4PortCache,
     hb: &HeartbeatMessage,
 ) -> bool {
     let worker_addr = hb.worker_addr.as_deref().unwrap_or("");
@@ -287,12 +322,21 @@ pub async fn apply_heartbeat(
 
         match protocol {
             "tcp" => {
-                // L4 path (issue #548). Look up the existing entry
-                // first so a re-heartbeat reuses the same public
-                // port; otherwise allocate one from the pool. The
-                // pool is `&mut` because acquire() mutates internal
-                // state; the heartbeat loop runs single-threaded so
-                // no contention arises.
+                // L4 path (issue #548). Resolution order on the cold
+                // path (no existing L4 entry yet):
+                //   1. `l4_table` snapshot — re-heartbeats re-use the
+                //      port they already picked.
+                //   2. `l4_port_cache` — CP-persisted allocation from
+                //      `apps.l4_public_port`. Wins when the CLI
+                //      pre-allocated via `POST /api/v1/apps/{app}/l4-port`
+                //      or when a previous ingress instance already
+                //      ran `AllocateL4Port` and persisted it.
+                //   3. `L4PortPool::acquire()` — local fallback for
+                //      tenants that haven't pre-allocated. Two
+                //      ingresses in one region will *race* on this
+                //      branch; the CP persistence layer eliminates
+                //      the race the moment a port is allocated via
+                //      the API.
                 let existing = l4_table
                     .snapshot()
                     .await
@@ -300,19 +344,37 @@ pub async fn apply_heartbeat(
                     .find(|e| e.tenant_id == app.tenant_id && e.app_name == app_name);
                 let public_port = match existing {
                     Some(entry) => entry.public_port,
-                    None => match l4_ports.acquire() {
-                        Some(p) => p,
-                        None => {
-                            warn!(
-                                tenant = %app.tenant_id,
-                                app = %app_name,
-                                "no L4 public port available — pool exhausted; \
-                                 not registering route. Operator action required: \
-                                 widen L4_PORT_RANGE_END or reduce concurrent L4 apps."
-                            );
-                            continue;
+                    None => {
+                        // Step 2: consult the CP-persisted cache.
+                        // `is_fresh` returns false on miss or on a
+                        // stale entry (older than `L4_PORT_CACHE_STALE_AFTER`);
+                        // both fall through to the local pool.
+                        let cache_key = L4AppKey::new(&app.tenant_id, app_name);
+                        let cached: Option<u16> = {
+                            let r = l4_port_cache.read().await;
+                            if r.is_fresh(&cache_key) {
+                                r.get(&cache_key).map(|e| e.public_port)
+                            } else {
+                                None
+                            }
+                        };
+                        match cached {
+                            Some(p) => p,
+                            None => match l4_ports.acquire() {
+                                Some(p) => p,
+                                None => {
+                                    warn!(
+                                        tenant = %app.tenant_id,
+                                        app = %app_name,
+                                        "no L4 public port available — pool exhausted; \
+                                         not registering route. Operator action required: \
+                                         widen L4_PORT_RANGE_END or reduce concurrent L4 apps."
+                                    );
+                                    continue;
+                                }
+                            },
                         }
-                    },
+                    }
                 };
                 l4_table
                     .upsert(
@@ -894,11 +956,17 @@ mod tests {
     /// heartbeat loop holds a `&mut` reference for the duration of
     /// every message. Tests are single-message so no contention
     /// arises.
-    fn fresh_tables() -> (Arc<RoutingTable>, Arc<L4RoutingTable>, L4PortPool) {
+    fn fresh_tables() -> (
+        Arc<RoutingTable>,
+        Arc<L4RoutingTable>,
+        L4PortPool,
+        SharedL4PortCache,
+    ) {
         (
             Arc::new(RoutingTable::new()),
             Arc::new(L4RoutingTable::new()),
             L4PortPool::new(31000, 31999, 60),
+            Default::default(),
         )
     }
 
@@ -963,12 +1031,12 @@ mod tests {
     /// the Caddy-reload notify.
     #[tokio::test]
     async fn handle_one_skips_when_worker_addr_is_none() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         let hb = hb_no_addr(apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(!changed);
         assert_eq!(table.len().await, 0);
     }
@@ -976,7 +1044,7 @@ mod tests {
     /// Same expectation for an empty-string `worker_addr`.
     #[tokio::test]
     async fn handle_one_skips_when_worker_addr_is_empty_string() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         let hb = HeartbeatMessage {
@@ -991,7 +1059,7 @@ mod tests {
             port_pool_exhausted_count: 0,
         };
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(!changed);
         assert_eq!(table.len().await, 0);
     }
@@ -1000,12 +1068,12 @@ mod tests {
     /// one route per app and returns `true`.
     #[tokio::test]
     async fn handle_one_inserts_route_when_worker_addr_present() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -1022,12 +1090,12 @@ mod tests {
     /// Key with `:` separator sets the deployment_id (canary support).
     #[tokio::test]
     async fn apply_heartbeat_with_canary_key() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api:v2".to_string(), app_status("t_a", "running", 8081));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -1038,12 +1106,12 @@ mod tests {
     /// Non-"running" status removes the entry.
     #[tokio::test]
     async fn apply_heartbeat_with_non_running_status() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "crashed", 8081));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         // The "crashed" app causes an upsert with that status, which
         // the routing table interprets as "remove".
@@ -1053,12 +1121,12 @@ mod tests {
     /// "draining" status keeps the route with weight=0.
     #[tokio::test]
     async fn apply_heartbeat_with_draining_status() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "draining", 8081));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -1070,17 +1138,17 @@ mod tests {
     /// Empty apps map removes all routes for that worker.
     #[tokio::test]
     async fn apply_heartbeat_empty_apps_removes_worker_routes() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         // First insert a route via normal heartbeat.
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         let hb1 = hb_with_addr("203.0.113.10", apps);
-        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb1).await);
+        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb1).await);
         assert_eq!(table.len().await, 1);
 
         // Empty heartbeat from same worker removes all routes.
         let hb2 = hb_with_addr("203.0.113.10", HashMap::new());
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb2).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb2).await;
         assert!(changed);
         assert_eq!(table.len().await, 0);
     }
@@ -1088,9 +1156,9 @@ mod tests {
     /// Unknown worker with empty apps is a no-op.
     #[tokio::test]
     async fn apply_heartbeat_empty_apps_unknown_worker_noop() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let hb = hb_with_addr("203.0.113.10", HashMap::new());
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(!changed);
         assert_eq!(table.len().await, 0);
     }
@@ -1098,13 +1166,13 @@ mod tests {
     /// Multiple apps in a single heartbeat — both upserted.
     #[tokio::test]
     async fn apply_heartbeat_with_multiple_apps() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         apps.insert("worker".to_string(), app_status("t_a", "running", 8082));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 2);
@@ -1113,10 +1181,10 @@ mod tests {
     /// Empty apps map — returns false, no mutation.
     #[tokio::test]
     async fn apply_heartbeat_with_empty_apps() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let hb = hb_with_addr("203.0.113.10", HashMap::new());
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(!changed);
         assert_eq!(table.len().await, 0);
     }
@@ -1124,14 +1192,14 @@ mod tests {
     /// WebSocket port creates a second route entry with `-ws` suffix.
     #[tokio::test]
     async fn apply_heartbeat_with_ws_port_creates_second_route() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.ws_port = Some(9091);
         apps.insert("api".to_string(), status);
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 2);
@@ -1144,14 +1212,14 @@ mod tests {
     /// WebSocket port with canary key — ws entry gets `{deployment_id}-ws`.
     #[tokio::test]
     async fn apply_heartbeat_with_ws_port_and_canary_key() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.ws_port = Some(9091);
         apps.insert("api:v2".to_string(), status);
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 2);
@@ -1167,13 +1235,13 @@ mod tests {
     /// Mixed statuses: one running, one crashed. Only running survives.
     #[tokio::test]
     async fn apply_heartbeat_with_mixed_statuses() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("api".to_string(), app_status("t_a", "running", 8081));
         apps.insert("cron".to_string(), app_status("t_a", "crashed", 8082));
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         let snap = table.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -1186,14 +1254,14 @@ mod tests {
     /// HTTP table. The HTTP table stays empty.
     #[tokio::test]
     async fn apply_heartbeat_tcp_protocol_inserts_l4_route() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.protocol = "tcp".to_string();
         apps.insert("api".to_string(), status);
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         assert_eq!(table.len().await, 0, "HTTP table stays empty");
         let snap = l4_table.snapshot().await;
@@ -1213,13 +1281,13 @@ mod tests {
     /// contract that lets restart-stable port allocation work.
     #[tokio::test]
     async fn apply_heartbeat_tcp_reuses_existing_public_port() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.protocol = "tcp".to_string();
         apps.insert("api".to_string(), status.clone());
         let hb1 = hb_with_addr("203.0.113.10", apps);
-        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb1).await);
+        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb1).await);
         let first_port = l4_table.snapshot().await[0].public_port;
 
         // Second heartbeat for the same app from a different
@@ -1228,7 +1296,7 @@ mod tests {
         let mut apps2 = HashMap::new();
         apps2.insert("api".to_string(), status);
         let hb2 = hb_with_addr("198.51.100.7", apps2);
-        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb2).await;
+        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb2).await;
         let snap = l4_table.snapshot().await;
         assert_eq!(snap.len(), 1);
         assert_eq!(
@@ -1242,14 +1310,14 @@ mod tests {
     /// field.
     #[tokio::test]
     async fn apply_heartbeat_missing_protocol_defaults_to_http() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.protocol = String::new();
         apps.insert("api".to_string(), status);
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         assert_eq!(table.len().await, 1, "missing protocol → HTTP route");
         assert_eq!(l4_table.len().await, 0, "L4 table untouched");
@@ -1259,7 +1327,7 @@ mod tests {
     /// the right table based on its protocol.
     #[tokio::test]
     async fn apply_heartbeat_mixed_http_and_tcp_protocols() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         let mut apps = HashMap::new();
         apps.insert("web".to_string(), app_status("t_a", "running", 8081));
         let mut tcp_app = app_status("t_a", "running", 8082);
@@ -1267,7 +1335,7 @@ mod tests {
         apps.insert("redis".to_string(), tcp_app);
         let hb = hb_with_addr("203.0.113.10", apps);
 
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         assert_eq!(table.len().await, 1);
         assert_eq!(table.snapshot().await[0].app_name, "web");
@@ -1280,7 +1348,7 @@ mod tests {
     /// window so they can be re-acquired after the cooldown elapses.
     #[tokio::test]
     async fn apply_heartbeat_empty_apps_clears_both_tables() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         // Seed both tables with entries for the same worker.
         // For the L4 path, acquire the port properly so the pool's
         // bookkeeping (taken set) is in the same state that
@@ -1297,7 +1365,7 @@ mod tests {
 
         // Empty heartbeat from the same worker → both evicted.
         let hb = hb_with_addr("1.2.3.4", HashMap::new());
-        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb).await;
+        let changed = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
         assert!(changed);
         assert_eq!(table.len().await, 0);
         assert_eq!(l4_table.len().await, 0);
@@ -1310,14 +1378,14 @@ mod tests {
     /// the L4 table — same shape as HTTP non-running statuses.
     #[tokio::test]
     async fn apply_heartbeat_tcp_crashed_removes_l4_entry() {
-        let (table, l4_table, mut l4_ports) = fresh_tables();
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
         // First insert a running L4 route.
         let mut apps = HashMap::new();
         let mut status = app_status("t_a", "running", 8081);
         status.protocol = "tcp".to_string();
         apps.insert("api".to_string(), status);
         let hb1 = hb_with_addr("203.0.113.10", apps);
-        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb1).await);
+        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb1).await);
         assert_eq!(l4_table.len().await, 1);
 
         // Then update with a crashed status → entry removed.
@@ -1326,8 +1394,73 @@ mod tests {
         crashed.protocol = "tcp".to_string();
         apps2.insert("api".to_string(), crashed);
         let hb2 = hb_with_addr("203.0.113.10", apps2);
-        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &hb2).await;
+        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb2).await;
         assert_eq!(l4_table.len().await, 0);
+    }
+
+    // ── L4PortCache-consult tests (issue #548 Commit 9) ───────────────
+
+    /// Pre-populated cache: a TCP heartbeat on the cold path uses the
+    /// CP-persisted public port from the cache instead of allocating
+    /// from the local pool. This is the contract that lets two
+    /// ingress instances in the same region agree on a public port
+    /// when one operator pre-allocates via `POST /api/v1/apps/{app}/l4-port`.
+    #[tokio::test]
+    async fn apply_heartbeat_tcp_uses_cached_public_port() {
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
+        // Pre-seed the cache with a CP-persisted allocation that does NOT
+        // match what the local pool would hand out (the pool starts at
+        // 31000; cache says 31999).
+        {
+            let mut w = l4_port_cache.write().await;
+            w.update(crate::l4::L4AppKey::new("t_a", "api"), 31999);
+        }
+        let mut apps = HashMap::new();
+        let mut status = app_status("t_a", "running", 8081);
+        status.protocol = "tcp".to_string();
+        apps.insert("api".to_string(), status);
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
+        let snap = l4_table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].public_port, 31999,
+            "cache hit must win over local pool"
+        );
+        // The local pool must NOT have been touched — no port was acquired.
+        assert_eq!(
+            l4_ports.taken_count(),
+            0,
+            "cache hit path must skip the local pool"
+        );
+    }
+
+    /// Cache miss (no entry yet) → fallback to local pool's first
+    /// available port. Pre-CLI-pre-allocation tenants still get a
+    /// routable port.
+    #[tokio::test]
+    async fn apply_heartbeat_tcp_falls_back_to_pool_on_cache_miss() {
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
+        // Cache is empty (no allocation yet).
+        let mut apps = HashMap::new();
+        let mut status = app_status("t_a", "running", 8081);
+        status.protocol = "tcp".to_string();
+        apps.insert("api".to_string(), status);
+        let hb = hb_with_addr("203.0.113.10", apps);
+
+        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb).await;
+        let snap = l4_table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].public_port, 31000,
+            "cache miss path acquires the first pool port"
+        );
+        assert_eq!(
+            l4_ports.taken_count(),
+            1,
+            "local pool must have allocated the port"
+        );
     }
 
     // ── push_now tests ────────────────────────────────────────────────
@@ -1397,7 +1530,7 @@ mod tests {
             refresh_debounce_ms: 1, // fast debounce for tests
             ..test_config(&server.uri())
         };
-        let (table, l4_table, _l4_ports) = fresh_tables();
+        let (table, l4_table, _l4_ports, _l4_port_cache) = fresh_tables();
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
@@ -1426,7 +1559,7 @@ mod tests {
             .await;
 
         let cfg = test_config(&server.uri());
-        let (table, l4_table, _l4_ports) = fresh_tables();
+        let (table, l4_table, _l4_ports, _l4_port_cache) = fresh_tables();
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
@@ -1466,7 +1599,7 @@ mod tests {
             refresh_debounce_ms: 1,
             ..test_config(&server.uri())
         };
-        let (table, l4_table, _l4_ports) = fresh_tables();
+        let (table, l4_table, _l4_ports, _l4_port_cache) = fresh_tables();
         let caddy = Arc::new(CaddyClient::new(&server.uri(), None).unwrap());
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();

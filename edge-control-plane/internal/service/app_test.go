@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +27,16 @@ type mockAppRepo struct {
 	updateFunc                func(ctx context.Context, app *domain.App) error
 	getForUpdateFunc          func(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	deleteIfNoDeploymentsFunc func(ctx context.Context, tenantID, appName string) (bool, error)
+	// L4 port allocation (issue #548). getL4PortFunc returns the
+	// persisted port (0 if unallocated, sql.ErrNoRows if app missing).
+	// allocateL4PortFunc returns the port that ended up persisted
+	// (could differ from the input when a racing caller won).
+	// allocatedL4PortsFunc returns the set of currently-taken ports
+	// across all tenants; default empty set.
+	getL4PortFunc      func(ctx context.Context, tenantID, appName string) (uint16, error)
+	allocateL4PortFunc func(ctx context.Context, tenantID, appName string, port uint16) (uint16, error)
+	releaseL4PortFunc  func(ctx context.Context, tenantID, appName string) error
+	allocatedL4PortsFn func(ctx context.Context) (map[uint16]struct{}, error)
 }
 
 func (m *mockAppRepo) Create(ctx context.Context, app *domain.App) error {
@@ -91,6 +102,36 @@ func (m *mockAppRepo) Update(ctx context.Context, app *domain.App) error {
 	return nil
 }
 
+// L4 port allocation methods (issue #548).
+
+func (m *mockAppRepo) GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	if m.getL4PortFunc != nil {
+		return m.getL4PortFunc(ctx, tenantID, appName)
+	}
+	return 0, sql.ErrNoRows
+}
+
+func (m *mockAppRepo) AllocateL4Port(ctx context.Context, tenantID, appName string, port uint16) (uint16, error) {
+	if m.allocateL4PortFunc != nil {
+		return m.allocateL4PortFunc(ctx, tenantID, appName, port)
+	}
+	return port, nil
+}
+
+func (m *mockAppRepo) ReleaseL4Port(ctx context.Context, tenantID, appName string) error {
+	if m.releaseL4PortFunc != nil {
+		return m.releaseL4PortFunc(ctx, tenantID, appName)
+	}
+	return nil
+}
+
+func (m *mockAppRepo) AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}, error) {
+	if m.allocatedL4PortsFn != nil {
+		return m.allocatedL4PortsFn(ctx)
+	}
+	return map[uint16]struct{}{}, nil
+}
+
 // mockQuotaRepoForApps implements quotaRepoInterface for testing.
 type mockQuotaRepoForApps struct {
 	getByTenantIDFunc func(ctx context.Context, tenantID string) (*domain.Quota, error)
@@ -135,8 +176,10 @@ func (m *mockQuotaRepoForApps) SetGraceUntil(_ context.Context, _ string, _ *tim
 // Delete is not testable without a real DB connection for repository.Transaction.
 func appSvcForTest(repo appRepoInterface, quotaRepo quotaRepoInterface) *AppService {
 	return &AppService{
-		appRepo:   repo,
-		quotaRepo: quotaRepo,
+		appRepo:          repo,
+		quotaRepo:        quotaRepo,
+		l4PortRangeStart: 31000,
+		l4PortRangeEnd:   31999,
 	}
 }
 
@@ -788,5 +831,221 @@ func TestAppService_Delete_NoPurgeOnCascadeFailure(t *testing.T) {
 	_ = svc.Delete(context.Background(), "t_test", "myapp")
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met (likely unexpected outbox INSERT after rollback): %v", err)
+	}
+}
+
+// ── L4 port allocation tests (issue #548) ─────────────────────────────
+
+// GetL4Port: existing port returns it, app-missing returns
+// ErrAppNotFound, unallocated returns (0, nil).
+func TestAppService_GetL4Port_Existing(t *testing.T) {
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 31042, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	port, err := svc.GetL4Port(context.Background(), "t_a", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 31042 {
+		t.Errorf("port = %d, want 31042", port)
+	}
+}
+
+func TestAppService_GetL4Port_Unallocated(t *testing.T) {
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	port, err := svc.GetL4Port(context.Background(), "t_a", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 0 {
+		t.Errorf("port = %d, want 0", port)
+	}
+}
+
+func TestAppService_GetL4Port_AppMissing(t *testing.T) {
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, sql.ErrNoRows
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	_, err := svc.GetL4Port(context.Background(), "t_a", "myapp")
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Errorf("err = %v, want ErrAppNotFound", err)
+	}
+}
+
+func TestAppService_GetL4Port_InvalidAppName(t *testing.T) {
+	svc := appSvcForTest(&mockAppRepo{}, &mockQuotaRepoForApps{})
+	_, err := svc.GetL4Port(context.Background(), "t_a", "INVALID NAME!")
+	if err == nil {
+		t.Error("expected error for invalid app name")
+	}
+}
+
+// AllocateL4Port: fast path returns existing port unchanged.
+func TestAppService_AllocateL4Port_AlreadyAllocated(t *testing.T) {
+	var allocated bool
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 31042, nil
+		},
+		allocateL4PortFunc: func(_ context.Context, _, _ string, _ uint16) (uint16, error) {
+			allocated = true
+			return 0, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	port, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 31042 {
+		t.Errorf("port = %d, want 31042", port)
+	}
+	if allocated {
+		t.Error("AllocateL4Port should not be called when port already exists")
+	}
+}
+
+// AllocateL4Port: slow path picks a free port and persists it.
+func TestAppService_AllocateL4Port_FirstAppInRange(t *testing.T) {
+	repo := &mockAppRepo{
+		// App exists but is unallocated (0, nil).
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, nil
+		},
+		allocatedL4PortsFn: func(_ context.Context) (map[uint16]struct{}, error) {
+			return map[uint16]struct{}{}, nil
+		},
+		allocateL4PortFunc: func(_ context.Context, _, _ string, p uint16) (uint16, error) {
+			return p, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	port, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 31000 {
+		t.Errorf("port = %d, want 31000 (first in range)", port)
+	}
+}
+
+// AllocateL4Port: skips already-taken ports.
+func TestAppService_AllocateL4Port_SkipsTaken(t *testing.T) {
+	taken := map[uint16]struct{}{
+		31000: {}, 31001: {}, 31002: {},
+	}
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, nil
+		},
+		allocatedL4PortsFn: func(_ context.Context) (map[uint16]struct{}, error) {
+			return taken, nil
+		},
+		allocateL4PortFunc: func(_ context.Context, _, _ string, p uint16) (uint16, error) {
+			return p, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	port, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if port != 31003 {
+		t.Errorf("port = %d, want 31003 (next free after 31000-31002)", port)
+	}
+}
+
+// AllocateL4Port: range exhausted returns ErrL4PortRangeExhausted.
+func TestAppService_AllocateL4Port_RangeExhausted(t *testing.T) {
+	all := map[uint16]struct{}{}
+	for p := uint16(31000); p <= 31999; p++ {
+		all[p] = struct{}{}
+	}
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, nil
+		},
+		allocatedL4PortsFn: func(_ context.Context) (map[uint16]struct{}, error) {
+			return all, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	_, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if !errors.Is(err, ErrL4PortRangeExhausted) {
+		t.Errorf("err = %v, want ErrL4PortRangeExhausted", err)
+	}
+}
+
+// AllocateL4Port: app-missing on the GetL4Port fast-path returns
+// ErrAppNotFound without calling AllocateL4Port.
+func TestAppService_AllocateL4Port_AppMissing(t *testing.T) {
+	repo := &mockAppRepo{
+		getL4PortFunc: func(_ context.Context, _, _ string) (uint16, error) {
+			return 0, sql.ErrNoRows
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	_, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Errorf("err = %v, want ErrAppNotFound", err)
+	}
+}
+
+// AllocateL4Port: when AllocateL4Port repo returns sql.ErrNoRows
+// (app vanished between GetL4Port and AllocateL4Port), surface
+// ErrAppNotFound.
+func TestAppService_AllocateL4Port_VanishedDuringAllocation(t *testing.T) {
+	repo := &mockAppRepo{
+		allocatedL4PortsFn: func(_ context.Context) (map[uint16]struct{}, error) {
+			return map[uint16]struct{}{}, nil
+		},
+		allocateL4PortFunc: func(_ context.Context, _, _ string, _ uint16) (uint16, error) {
+			return 0, sql.ErrNoRows
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	_, err := svc.AllocateL4Port(context.Background(), "t_a", "myapp")
+	if !errors.Is(err, ErrAppNotFound) {
+		t.Errorf("err = %v, want ErrAppNotFound", err)
+	}
+}
+
+// ReleaseL4Port: just delegates to repo.
+func TestAppService_ReleaseL4Port(t *testing.T) {
+	var called bool
+	repo := &mockAppRepo{
+		releaseL4PortFunc: func(_ context.Context, tenantID, appName string) error {
+			called = true
+			if tenantID != "t_a" || appName != "myapp" {
+				t.Errorf("unexpected args: %q %q", tenantID, appName)
+			}
+			return nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+	if err := svc.ReleaseL4Port(context.Background(), "t_a", "myapp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Error("ReleaseL4Port was not called on the repo")
+	}
+}
+
+// ReleaseL4Port: invalid app name rejected before the repo call.
+func TestAppService_ReleaseL4Port_InvalidAppName(t *testing.T) {
+	svc := appSvcForTest(&mockAppRepo{}, &mockQuotaRepoForApps{})
+	if err := svc.ReleaseL4Port(context.Background(), "t_a", "BAD NAME"); err == nil {
+		t.Error("expected error for invalid app name")
 	}
 }

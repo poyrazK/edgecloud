@@ -23,6 +23,13 @@ type mockAppSvc struct {
 	updateApp *domain.App
 	updateErr error
 	deleteErr error
+	// L4 port accessors (issue #548). getL4Port is the persisted
+	// port (0 = unallocated). allocateL4Port mirrors what the service
+	// returns; if unset, the mock echoes the input port.
+	getL4Port      uint16
+	getL4PortErr   error
+	allocateL4Port uint16
+	allocateL4Err  error
 }
 
 func (m *mockAppSvc) Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error) {
@@ -43,6 +50,12 @@ func (m *mockAppSvc) Update(ctx context.Context, tenantID, appName string, req *
 func (m *mockAppSvc) Delete(ctx context.Context, tenantID, appName string) error {
 	return m.deleteErr
 }
+func (m *mockAppSvc) GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	return m.getL4Port, m.getL4PortErr
+}
+func (m *mockAppSvc) AllocateL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	return m.allocateL4Port, m.allocateL4Err
+}
 
 func newAppMux(svc *mockAppSvc) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -50,6 +63,8 @@ func newAppMux(svc *mockAppSvc) *http.ServeMux {
 	mux.HandleFunc("POST /api/apps/{appName}", h.Create)
 	mux.HandleFunc("GET /api/apps", h.List)
 	mux.HandleFunc("GET /api/apps/{appName}", h.Get)
+	mux.HandleFunc("GET /api/v1/apps/{appName}/l4-port", h.GetL4Port)
+	mux.HandleFunc("POST /api/v1/apps/{appName}/l4-port", h.AllocateL4Port)
 	mux.HandleFunc("PUT /api/apps/{appName}", h.Update)
 	mux.HandleFunc("DELETE /api/apps/{appName}", h.Delete)
 	return mux
@@ -263,6 +278,111 @@ func TestAppHandler_Delete_NotFound(t *testing.T) {
 	mux := newAppMux(svc)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/apps/hello", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+// ── L4 port endpoints (issue #548) ────────────────────────────────────
+
+func TestAppHandler_GetL4Port_Allocated(t *testing.T) {
+	svc := &mockAppSvc{getL4Port: 31042}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/apps/hello/l4-port", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		PublicPort uint16 `json:"public_port"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.PublicPort != 31042 {
+		t.Errorf("public_port = %d, want 31042", resp.PublicPort)
+	}
+}
+
+func TestAppHandler_GetL4Port_Unallocated(t *testing.T) {
+	// Mock returns (0, nil) — app exists but port is unset.
+	svc := &mockAppSvc{getL4Port: 0}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/apps/hello/l4-port", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestAppHandler_GetL4Port_AppNotFound(t *testing.T) {
+	svc := &mockAppSvc{getL4PortErr: service.ErrAppNotFound}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/apps/hello/l4-port", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestAppHandler_AllocateL4Port_HappyPath(t *testing.T) {
+	svc := &mockAppSvc{allocateL4Port: 31042}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/apps/hello/l4-port", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var resp struct {
+		PublicPort uint16 `json:"public_port"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.PublicPort != 31042 {
+		t.Errorf("public_port = %d, want 31042", resp.PublicPort)
+	}
+}
+
+func TestAppHandler_AllocateL4Port_RangeExhausted(t *testing.T) {
+	svc := &mockAppSvc{allocateL4Err: service.ErrL4PortRangeExhausted}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/apps/hello/l4-port", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409", rr.Code)
+	}
+}
+
+func TestAppHandler_AllocateL4Port_AppNotFound(t *testing.T) {
+	svc := &mockAppSvc{allocateL4Err: service.ErrAppNotFound}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/apps/hello/l4-port", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)

@@ -12,6 +12,7 @@ mod domains;
 pub mod heartbeats;
 mod ingress_metrics;
 pub mod l4;
+mod l4_cache;
 mod messages;
 mod quota;
 mod ratelimit;

@@ -45,6 +45,15 @@ type Config struct {
 	// log, no more retries until a new activation resets the
 	// counter). The counter is per-deployment, not per-tenant-app.
 	CacheRetry CacheRetryConfig `yaml:"cache_retry"`
+	// L4 configures the L4/TCP ingress port range (issue #548). The
+	// CP persists per-app L4 port assignments on the `apps` table;
+	// the ingress fetches them via GET /api/v1/apps/{appName}/l4-port.
+	// PortRangeStart/End bound the allocatable range (default
+	// 31000-31999). The CP and ingress MUST share the same range or
+	// allocations can collide across the wire — operators set this
+	// once on both sides via L4_PORT_RANGE_START / L4_PORT_RANGE_END
+	// env vars (config field for ops who prefer YAML).
+	L4 L4Config `yaml:"l4"`
 	// Region is this control plane's own region. Used as the default
 	// `regions` list for deployments that don't explicitly opt into
 	// multi-region — preserves today's "publish one TaskMessage to a
@@ -270,6 +279,24 @@ type CacheRetryConfig struct {
 	// counter to 0 for the new deployment.
 	// Set to 0 (or negative) to disable the cap entirely.
 	MaxAttempts int `yaml:"max_attempts"`
+}
+
+// L4Config configures the L4/TCP ingress port range (issue #548).
+// The CP allocates per-app ports from [PortRangeStart, PortRangeEnd]
+// inclusive on first heartbeat from a worker reporting protocol="tcp",
+// and persists the assignment on the apps row. The ingress reads it
+// back via GET /api/v1/apps/{appName}/l4-port. The CP and ingress MUST
+// share the same range; operators set this once on both sides via
+// L4_PORT_RANGE_START / L4_PORT_RANGE_END env vars.
+type L4Config struct {
+	// PortRangeStart is the inclusive lower bound of the L4 port
+	// range. Default 31000 (matches the ingress-side L4PortPool
+	// default; #548). Must be 1..65535 and <= PortRangeEnd.
+	PortRangeStart int `yaml:"port_range_start"`
+	// PortRangeEnd is the inclusive upper bound. Default 31999
+	// (1000-port range, matches ingress default). Must be >=
+	// PortRangeStart and <= 65535.
+	PortRangeEnd int `yaml:"port_range_end"`
 }
 
 // DSN returns the PostgreSQL connection string.
@@ -590,6 +617,27 @@ func Load(path string) (*Config, error) {
 		cfg.CacheRetry.MaxAttempts = n
 	}
 
+	// L4 port-range env vars (issue #548). The CP and ingress must
+	// share the same range; operators override per-host via
+	// L4_PORT_RANGE_START / L4_PORT_RANGE_END. Defaults below match
+	// the ingress-side L4PortPool default (31000-31999, 1000-port
+	// range). Malformed values fail startup so a typo doesn't
+	// silently truncate the range.
+	if v := os.Getenv("L4_PORT_RANGE_START"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("L4_PORT_RANGE_START must be a valid integer: %w", err)
+		}
+		cfg.L4.PortRangeStart = n
+	}
+	if v := os.Getenv("L4_PORT_RANGE_END"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("L4_PORT_RANGE_END must be a valid integer: %w", err)
+		}
+		cfg.L4.PortRangeEnd = n
+	}
+
 	// Override with migration config env vars
 	if v := os.Getenv("EDGE_MIGRATE_PATH"); v != "" {
 		cfg.Migration.EdgeMigratePath = v
@@ -684,6 +732,21 @@ func Load(path string) (*Config, error) {
 		cfg.CacheRetry.MaxAttempts = 10
 	}
 
+	// Defaults for L4 port range (issue #548). The CP and ingress
+	// MUST share the same range; 31000-31999 (1000-port range)
+	// matches the ingress-side L4PortPool default. Operators widen
+	// or move it via L4_PORT_RANGE_START / L4_PORT_RANGE_END env
+	// vars or `l4.port_range_start` / `l4.port_range_end` YAML.
+	if cfg.L4.PortRangeStart == 0 {
+		cfg.L4.PortRangeStart = 31000
+	}
+	if cfg.L4.PortRangeEnd == 0 {
+		cfg.L4.PortRangeEnd = 31999
+	}
+	if err := validateL4Config(&cfg.L4); err != nil {
+		return nil, err
+	}
+
 	// Reject insecure JWT secrets. Operators frequently ship with the
 	// default `change-me-in-production` placeholder and forget to override
 	// it; failing startup is louder and safer than silently running with a
@@ -752,6 +815,28 @@ func Load(path string) (*Config, error) {
 func validateSigningConfig(s *SigningConfig) error {
 	if s.KeyPath == "" && s.Key == "" && s.KeyringPath == "" && s.Keyring == "" {
 		return fmt.Errorf("signing.key_path (EDGE_SIGNING_KEY_PATH), signing.key (EDGE_SIGNING_KEY), signing.keyring_path (EDGE_SIGNING_KEYRING_PATH), or signing.keyring (EDGE_SIGNING_KEYRING) is required — the CP must be configured with an Ed25519 signing key to issue deployment signatures (issue #307)")
+	}
+	return nil
+}
+
+// validateL4Config enforces the L4/TCP port range invariants
+// (issue #548):
+//   - Start >= 1 and <= 65535 (uint16 valid range).
+//   - End >= Start and <= 65535.
+//   - Range size >= 1 (must be able to allocate at least one port).
+//
+// A misconfigured range here would silently truncate allocations
+// later (AllocateL4Port would never find a free port), so we fail
+// startup with a clear message instead.
+func validateL4Config(l *L4Config) error {
+	if l.PortRangeStart < 1 || l.PortRangeStart > 65535 {
+		return fmt.Errorf("l4.port_range_start %d is out of range (must be 1..65535)", l.PortRangeStart)
+	}
+	if l.PortRangeEnd < 1 || l.PortRangeEnd > 65535 {
+		return fmt.Errorf("l4.port_range_end %d is out of range (must be 1..65535)", l.PortRangeEnd)
+	}
+	if l.PortRangeEnd < l.PortRangeStart {
+		return fmt.Errorf("l4.port_range_end (%d) is less than l4.port_range_start (%d); the range must be non-empty", l.PortRangeEnd, l.PortRangeStart)
 	}
 	return nil
 }

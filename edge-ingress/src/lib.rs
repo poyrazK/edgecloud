@@ -13,6 +13,7 @@ pub mod config;
 pub mod domains;
 pub mod heartbeats;
 pub mod l4;
+pub mod l4_cache;
 pub mod messages;
 pub mod quota;
 pub mod ratelimit;

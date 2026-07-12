@@ -813,6 +813,28 @@ components:
           example: no running app found for this tenant
 
     # -------------------------------------------------------------------------
+    # L4/TCP public-port (issue #548)
+    # -------------------------------------------------------------------------
+    L4PortResponse:
+      type: object
+      required: [public_port]
+      properties:
+        public_port:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 65535
+          description: |
+            Ingress-side port the tenant connects to for raw-TCP traffic to
+            the named app. Allocated by the control plane from the
+            configured L4 port range (default 31000-31999); persisted on
+            the apps row so it survives ingress / worker restarts. Two
+            ingress instances polling the same (tenant, app) see the
+            same value because allocation is atomic via
+            `UPDATE … WHERE l4_public_port IS NULL`.
+          example: 31042
+
+    # -------------------------------------------------------------------------
     # Environment Variables
     # -------------------------------------------------------------------------
     SetEnvRequest:
@@ -2682,6 +2704,77 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   # -------------------------------------------------------------------------
+  # L4/TCP public-port (issue #548)
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/l4-port:
+    get:
+      operationId: getL4Port
+      summary: Get the L4/TCP public port for an app
+      description: |
+        Returns the ingress-side public port allocated to this app for
+        raw-TCP traffic. The port is in the configured L4 range
+        (default 31000-31999) and is what the tenant's TCP clients
+        should connect to. Returns 404 if the app does not exist OR
+        if it exists but no port has been allocated yet (HTTP-only
+        app, or no TCP heartbeat has been processed yet).
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Port allocated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            App not found, or app exists but no L4 port allocated yet.
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: allocateL4Port
+      summary: Allocate the L4/TCP public port for an app
+      description: |
+        Atomically allocates a public port from the configured L4 range
+        if one is not already allocated. Idempotent — calling twice for
+        the same app returns the same port without consuming a second
+        slot. Returns 409 if the configured range is fully allocated
+        (operator should widen L4_PORT_RANGE_END).
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Port (just) allocated, or already-allocated port returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: App not found.
+        '409':
+          description: L4 port range exhausted.
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
   # Environment Variables
   # -------------------------------------------------------------------------
   /api/v1/apps/{appName}/env:
@@ -3849,6 +3942,47 @@ paths:
           description: Invalid tenant ID
         '404':
           description: Tenant not found
+
+  # Issue #548: edge-ingress polls this every QUOTA_FETCH_INTERVAL so
+  # two ingress instances in the same region converge on the same
+  # persisted L4 port for each (tenant, app). Mounted under the same
+  # X-Internal-Token as the other /api/v1/internal/* endpoints.
+  /api/v1/internal/l4-port/{tenantID}/{appName}:
+    get:
+      summary: Per-(tenant, app) L4/TCP public port for the ingress
+      description: |
+        Returns the persisted L4 public port for the named (tenant, app).
+        The ingress `L4PortCache` polls this endpoint every
+        `QUOTA_FETCH_INTERVAL` (default 30s) so two ingress instances in
+        the same region can converge on the same persisted port. 404
+        means either "app not found" or "no port allocated yet" — the
+        ingress treats both as a cache miss and falls back to its local
+        `L4PortPool` + write-back on the next heartbeat.
+      security:
+        - InternalTokenAuth: []
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: appName
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Port assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          description: Invalid app name or tenant ID
+        '404':
+          description: |
+            App not found, or app exists but no port allocated yet.
 
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)

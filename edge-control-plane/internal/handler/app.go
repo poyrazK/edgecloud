@@ -21,6 +21,14 @@ type AppServiceInterface interface {
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error)
 	Delete(ctx context.Context, tenantID, appName string) error
+	// L4 port accessors (issue #548). AllocateL4Port is the
+	// "assign a port if one isn't yet set" entry point used by the
+	// ingress on first TCP heartbeat; GetL4Port is the read-only
+	// fetch used by `GET /api/v1/apps/{appName}/l4-port`. The
+	// handler treats both as tenant-scoped (they take tenantID from
+	// the auth middleware).
+	GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error)
+	AllocateL4Port(ctx context.Context, tenantID, appName string) (uint16, error)
 }
 
 // AppHandler handles app HTTP requests.
@@ -185,4 +193,170 @@ func (h *AppHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNoContent)
 	auditRecord(r, "delete", "app", appName, "app "+appName+" deleted", "success")
+}
+
+// l4PortResponse is the wire shape for GET /api/v1/apps/{appName}/l4-port
+// (issue #548). Typed (vs anonymous map) so the contract is explicit and
+// the test asserts against a struct. `public_port` is the ingress-side
+// port the tenant should connect to for raw-TCP traffic to the named
+// app; `0` is not a valid public port, so any non-error response
+// carries a non-zero value.
+type l4PortResponse struct {
+	PublicPort uint16 `json:"public_port"`
+}
+
+// GetL4Port handles GET /api/v1/apps/{appName}/l4-port — returns the
+// allocated L4/TCP public port for the named app (issue #548).
+//
+// On a fresh TCP-app heartbeat the ingress calls
+// `AllocateL4Port` to atomically assign a port from the
+// configured L4 range and persist it on the apps row. Subsequent
+// heartbeats (and any external observer, including a tenant who
+// wants to know where to point their client) read it back via
+// this endpoint.
+//
+// Status codes:
+//   - 200: `{ "public_port": <uint16> }`.
+//   - 404: app not found, OR app exists but has no allocated L4
+//     port (e.g. it's an HTTP-only app, or the L4 port was never
+//     allocated because no TCP heartbeat has been processed yet).
+//     Both surface as 404 because the caller has nothing useful
+//     to do in either case.
+//   - 500: anything else.
+//
+// Tenant-authenticated (mirrors the rest of /api/v1/apps/*).
+func (h *AppHandler) GetL4Port(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+
+	if appName == "" {
+		httperror.BadRequestCtx(w, r, "app name required")
+		return
+	}
+
+	port, err := h.appSvc.GetL4Port(r.Context(), tenantID, appName)
+	if err != nil {
+		if errors.Is(err, service.ErrAppNotFound) {
+			httperror.NotFoundCtx(w, r, "app not found")
+			return
+		}
+		log.Printf("internal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if port == 0 {
+		// App exists but no port is allocated yet (HTTP-only app
+		// or pre-allocation). 404 because the caller has nothing
+		// to do with an unallocated port — they'd just retry.
+		httperror.NotFoundCtx(w, r, "no L4 public port allocated for this app")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(l4PortResponse{PublicPort: port}); err != nil {
+		log.Printf("GetL4Port: failed to encode response: %v", err)
+	}
+}
+
+// AllocateL4Port handles POST /api/v1/apps/{appName}/l4-port —
+// atomically allocates an L4/TCP public port for the named app
+// if one is not already allocated (issue #548). Idempotent: calling
+// twice returns the same port without allocating a second one.
+//
+// This endpoint exists primarily so the ingress can request a
+// port allocation server-side via the authenticated API rather
+// than triggering the implicit allocation path on first TCP
+// heartbeat. The CLI also uses it as a discovery helper
+// (`edge tcp-info hello-tcp` — a follow-up).
+//
+// Status codes:
+//   - 200: `{ "public_port": <uint16> }`.
+//   - 404: app not found.
+//   - 409: port range exhausted (L4_PORT_RANGE_START..END fully
+//     allocated); caller should retry after widening the range.
+//   - 500: anything else.
+//
+// Tenant-authenticated.
+func (h *AppHandler) AllocateL4Port(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	appName := r.PathValue("appName")
+
+	if appName == "" {
+		httperror.BadRequestCtx(w, r, "app name required")
+		return
+	}
+
+	port, err := h.appSvc.AllocateL4Port(r.Context(), tenantID, appName)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrAppNotFound):
+			httperror.NotFoundCtx(w, r, "app not found")
+		case errors.Is(err, service.ErrL4PortRangeExhausted):
+			httperror.ConflictCtx(w, r, "L4 public port range exhausted; widen L4_PORT_RANGE_END or reduce concurrent L4 apps")
+		default:
+			log.Printf("internal error: %v", err)
+			httperror.InternalErrorCtx(w, r)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(l4PortResponse{PublicPort: port}); err != nil {
+		log.Printf("AllocateL4Port: failed to encode response: %v", err)
+	}
+}
+
+// GetL4PortInternal handles GET /api/v1/internal/l4-port/{tenantID}/{appName} —
+// the ingress-to-CP read endpoint for L4 public-port assignments
+// (issue #548). Mounted under InternalAuth (shared-secret header,
+// same as the other /api/v1/internal/* endpoints the ingress
+// polls), this is what the ingress `L4PortCache` (see
+// edge-ingress/src/l4_cache.rs, follow-up) refreshes from every
+// QUOTA_FETCH_INTERVAL (~30s).
+//
+// Unlike the tenant-authenticated GET /api/v1/apps/{appName}/l4-port,
+// the tenant comes from the URL path — the ingress is a
+// service-to-service caller and does not carry an API key.
+//
+// Status codes:
+//   - 200: `{ "public_port": <uint16> }`.
+//   - 400: invalid app_name or tenant_id.
+//   - 404: app not found, OR app exists but has no allocated L4
+//     port (HTTP-only app, or no TCP heartbeat yet). The ingress
+//     treats both as a cache miss and falls back to the
+//     ingress-local L4PortPool.
+//   - 500: anything else.
+func (h *AppHandler) GetL4PortInternal(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	appName := r.PathValue("appName")
+	if !validateAppName(w, appName) {
+		return
+	}
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		http.Error(w, `{"error": "invalid tenant id"}`, http.StatusBadRequest)
+		return
+	}
+
+	port, err := h.appSvc.GetL4Port(r.Context(), tenantID, appName)
+	if err != nil {
+		if errors.Is(err, service.ErrAppNotFound) {
+			httperror.NotFoundCtx(w, r, "app not found")
+			return
+		}
+		log.Printf("GetL4PortInternal error: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if port == 0 {
+		// App exists but no port allocated. 404 lets the ingress
+		// fall back to its local L4PortPool + write-back (so a
+		// future TCP heartbeat will pick up the assignment).
+		httperror.NotFoundCtx(w, r, "no L4 public port allocated for this app")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(l4PortResponse{PublicPort: port}); err != nil {
+		log.Printf("GetL4PortInternal: failed to encode response: %v", err)
+	}
 }
