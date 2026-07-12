@@ -22,6 +22,7 @@ pub mod rollback;
 pub(crate) mod state_io;
 pub mod status;
 pub mod traffic;
+pub mod webhooks;
 
 /// Shared retry loop for transient-failure mutations across the
 /// CLI (issue #571 propagation follow-up). Lifts the loop, the
