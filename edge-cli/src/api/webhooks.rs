@@ -10,11 +10,15 @@
 //! `secret` is `json:"-"` on the Go side (see
 //! `edge-control-plane/internal/domain/webhook.go:14`) and so is
 //! intentionally absent from the `Webhook` struct here — the server
-//! never echoes it back, so there is no field to deserialize. The
-//! `WebhookDelivery` struct mirrors the `webhook_deliveries` table
-//! shape for forward compatibility; the `webhooks deliveries`
-//! subcommand that consumes it is gated on a follow-up CP route
-//! (filed in the same PR chain).
+//! never echoes it back, so there is no field to deserialize.
+//!
+//! **Note on `WebhookDelivery`:** the `webhook_deliveries` table is
+//! not yet readable via a tenant-scoped HTTP route (only
+//! `WebhookDeliveryGCService` reads it today; see issue #659 for the
+//! planned `GET /api/v1/webhooks/{id}/deliveries` endpoint). The
+//! DTO and its consumer are deferred to the follow-up PR — adding
+//! it here as dead code would let a future refactor drift the wire
+//! shape without any test catching it.
 //!
 //! `WebhookClient` borrows the parent `ApiClient` so the API key
 //! and base URL are shared across all subcommands without cloning
@@ -37,7 +41,11 @@ use super::client::check_response;
 /// read. `enabled` is server-driven on create (`true`) but
 /// tenant-mutable on update; the `Update` method accepts an
 /// `Option<bool>` so callers can distinguish "leave alone" from
-/// "set false".
+/// "set false". `#[serde(default)]` is set defensively so a future
+/// server refactor that omits `enabled` (e.g. via `omitempty`)
+/// decodes as `false` (fail-safe: a webhook you can't tell is
+/// enabled is treated as not delivering) instead of failing with
+/// "missing field `enabled`".
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Webhook {
     pub id: String,
@@ -45,6 +53,7 @@ pub struct Webhook {
     pub url: String,
     pub events: Vec<String>,
     pub description: String,
+    #[serde(default)]
     pub enabled: bool,
     pub created_at: String,
 }
@@ -59,30 +68,6 @@ pub struct Webhook {
 #[derive(Debug, Deserialize)]
 struct WebhookListResponse {
     webhooks: Vec<Webhook>,
-}
-
-/// One row of the `webhook_deliveries` table. Mirrors the Go
-/// `domain.WebhookDelivery` struct field-for-field; the
-/// `request_body` and `response_body` columns are server-redacted
-/// (both `json:"-"`) so they are absent here too. Not yet
-/// consumed by any HTTP method — included so the follow-up
-/// `webhooks deliveries` subcommand is a 30-line addition, not a
-/// full module introduction.
-#[derive(Debug, Deserialize)]
-pub struct WebhookDelivery {
-    pub id: i64,
-    pub webhook_id: String,
-    pub event_type: String,
-    pub status: String,
-    #[serde(default)]
-    pub status_code: Option<i32>,
-    #[serde(default)]
-    pub error_msg: Option<String>,
-    pub attempt: i32,
-    pub max_attempts: i32,
-    pub created_at: String,
-    #[serde(default)]
-    pub completed_at: Option<String>,
 }
 
 /// Borrowed accessor for the webhook endpoints. Constructed via

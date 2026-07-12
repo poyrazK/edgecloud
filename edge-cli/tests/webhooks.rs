@@ -346,6 +346,54 @@ async fn clap_rejects_unknown_event_at_parse_time() {
         .stderr(predicate::str::contains("valid: deploy, activate"));
 }
 
+/// Server-side validation failures (non-HTTPS url, short secret,
+/// invalid event, etc.) should surface as a non-zero exit with
+/// the server's body in stderr so the user can self-correct. The
+/// CLI does not pre-validate URL scheme or secret length in
+/// `WebhooksCommand` (those checks are server-side per
+/// `internal/handler/webhook.go:147-170`), so the wire round-trip
+/// is the only path for those error messages — pin the propagation
+/// here.
+#[tokio::test]
+async fn add_propagates_400_from_server_validation() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("POST"))
+        .and(path("/api/v1/webhooks"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(r#"{"error":"url must use https scheme"}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // http:// slips past clap (no scheme validator), through
+    // acquire_secret (secret is valid length), and lands at the
+    // server's `validateWebhookRequest` which 400s. Pin that the
+    // body reaches the user's stderr.
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("add")
+        .arg("http://hooks.example.com/insecure")
+        .arg("--events")
+        .arg("deploy")
+        .arg("--secret")
+        .arg("sixteen-chars-min-1234");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("400"))
+        .stderr(predicate::str::contains("https"));
+}
+
 // ---------------------------------------------------------------------------
 // update — PUT shape + enabled flag
 // ---------------------------------------------------------------------------
@@ -391,6 +439,45 @@ async fn update_changes_url_and_disables() {
         .stdout(predicate::str::contains("Updated webhook wh_alpha"))
         .stdout(predicate::str::contains("https://new.example.com/in"))
         .stdout(predicate::str::contains("DISABLED"));
+
+    // Pin the wire shape of the PUT body. The server's Update
+    // handler (`internal/handler/webhook.go:101-115`) treats
+    // absent fields as no-ops and present fields as overwrite —
+    // a refactor that accidentally sends `"events": null` or
+    // `"secret": null` would silently zero out the tenant's
+    // existing values. This test fails CI the moment such a
+    // regression lands.
+    let received = server.received_requests().await.expect("received");
+    let put = received
+        .iter()
+        .find(|r| r.method.as_str() == "PUT" && r.url.path() == "/api/v1/webhooks/wh_alpha")
+        .expect("PUT /api/v1/webhooks/wh_alpha not received");
+    let body: serde_json::Value = serde_json::from_slice(&put.body).expect("PUT body must be JSON");
+    assert_eq!(
+        body["url"].as_str(),
+        Some("https://new.example.com/in"),
+        "url must be the new value"
+    );
+    assert_eq!(
+        body["description"].as_str(),
+        Some("rotated"),
+        "description must be the new value"
+    );
+    assert_eq!(
+        body["enabled"].as_bool(),
+        Some(false),
+        "enabled must be sent as false (--disable), not omitted"
+    );
+    assert!(
+        body.get("events").is_none(),
+        "events must be ABSENT (server treats absent as no-op; \
+         sending null/[] would overwrite the existing list)"
+    );
+    assert!(
+        body.get("secret").is_none(),
+        "secret must be ABSENT (sending null/'' would overwrite \
+         the existing HMAC signing key)"
+    );
 }
 
 // ---------------------------------------------------------------------------
