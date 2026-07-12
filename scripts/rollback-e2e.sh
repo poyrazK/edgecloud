@@ -80,10 +80,10 @@ GO_PID=""
 RUST_PID=""
 
 cleanup() {
-  # Tear down whichever half is still alive, then drop sentinels.
-  # The Go half's t.Cleanup blocks tear down Postgres + NATS, so we
-  # MUST wait for it to exit cleanly (or `go test` will leak the
-  # container past this script's exit).
+  # Tear down whichever half is still alive. The sentinel dir is
+  # preserved on failure so the CI post-step can upload the
+  # half-logs (go.log, rust.log) for diagnosis; it's only removed
+  # on success.
   #
   # The `kill ... 2>/dev/null || true` pattern below is intentional:
   # a stale PID, a process that already exited between `kill -0` and
@@ -91,6 +91,7 @@ cleanup() {
   # and would abort this trap under `set -e`. We DON'T want cleanup
   # to fail — the orchestrator's real exit code is set by the
   # explicit fan-out at the bottom of the script, not here.
+  local exit_code=$?
   if [[ -n "${RUST_PID}" ]] && kill -0 "${RUST_PID}" 2>/dev/null; then
     echo "cleanup: killing Rust half pid=${RUST_PID}" >&2
     kill "${RUST_PID}" 2>/dev/null || true
@@ -108,7 +109,15 @@ cleanup() {
     kill -9 "${GO_PID}" 2>/dev/null || true
     wait "${GO_PID}" 2>/dev/null || true
   fi
-  rm -rf "${SENTINEL_DIR}"
+  # Only remove the sentinel dir on success. On failure, the post-step
+  # uploads go.log + rust.log so the artifact path /tmp/edge-e2e/*.log
+  # resolves; the dir is removed by a later manual cleanup or by the
+  # runner's natural cleanup.
+  if [[ "${exit_code}" -eq 0 ]]; then
+    rm -rf "${SENTINEL_DIR}"
+  else
+    echo "cleanup: preserving ${SENTINEL_DIR} for CI artifact upload (exit=${exit_code})" >&2
+  fi
 }
 trap cleanup EXIT
 
