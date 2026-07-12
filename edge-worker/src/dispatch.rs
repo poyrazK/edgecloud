@@ -65,6 +65,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
+// `rustls::pki_types::pem::PemObject` provides the PEM parsing methods
+// (`pem_slice_iter`, `from_pem_slice`) used in `try_load_tls_config`
+// (issue #625: replaced `rustls-pemfile` which is flagged as
+// unmaintained under RUSTSEC-2025-0134).
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::rt::Executor;
@@ -73,6 +77,7 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::Request as HyperRequest;
 use hyper::Response as HyperResponse;
+use rustls::pki_types::pem::PemObject;
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -1009,12 +1014,22 @@ pub fn try_load_tls_config(
         return None;
     }
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert))
+    // PEM parsing uses the in-tree `rustls::pki_types::pem::PemObject`
+    // API (rustls 0.23 re-exports `rustls-pki-types` 1.14) — replaces
+    // `rustls-pemfile` (RUSTSEC-2025-0134 unmaintained) with no new
+    // direct dep. `pem_slice_iter` matches `rustls-pemfile::certs`
+    // semantics: emit every parsed cert, swallow per-section errors
+    // (the historical `filter_map(Result::ok)` shape) so a single bad
+    // block doesn't sink the whole file. Unknown section labels
+    // (`PRIVATE KEY` blocks in the cert file, stray headers, etc.)
+    // are silently skipped by the parser itself.
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
         .filter_map(Result::ok)
         .collect();
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key))
-        .ok()
-        .flatten()?;
+    // `from_pem_slice` on `PrivateKeyDer` dispatches on `SectionKind`
+    // (Pkcs1 / Pkcs8 / Sec1) — matches `rustls-pemfile::private_key`
+    // which tried RSA, then PKCS8, then EC.
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key).ok()?;
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()

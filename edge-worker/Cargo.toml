@@ -58,8 +58,11 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 
 # TLS support for HandlerDispatch FaaS endpoint (issue #209).
+# PEM parsing uses the in-tree `rustls::pki_types::pem::PemObject` API
+# (rustls 0.23.41 re-exports `rustls-pki-types` 1.14) — issue #625,
+# replaces the unmaintained `rustls-pemfile` crate (RUSTSEC-2025-0134)
+# without taking a new direct dep.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-pemfile = "2.2"
 tokio-rustls = "0.26"
 wasmparser = "0.252.0"
 
