@@ -144,6 +144,24 @@ func TestRollbackE2E(t *testing.T) {
 	_, err = migrate.Exec(db.DB, "postgres", &migrate.FileMigrationSource{Dir: src}, migrate.Up)
 	require.NoError(t, err)
 
+	// Latent schema/repo drift workaround: migration 021 adds preview_id
+	// + preview_pr_number to `deployments`, but the production repo at
+	// `internal/repository/active_deployment.go:88,100,279` SELECTs the
+	// same columns off `active_deployments` — and no migration ever
+	// added them there. ActivateDeployment → settingActiveDeployment
+	// → readingCurrentActiveDeployment → GetForUpdate fails with
+	// `pq: column "preview_id" does not exist` on a fresh DB.
+	//
+	// Add the columns inline so this test exercises the e2e path
+	// without requiring a schema-fix PR. File a follow-up to ship a
+	// proper migration that brings active_deployments into sync.
+	_, err = db.ExecContext(ctx, `
+		ALTER TABLE active_deployments
+		    ADD COLUMN IF NOT EXISTS preview_id         TEXT,
+		    ADD COLUMN IF NOT EXISTS preview_pr_number INTEGER
+	`)
+	require.NoError(t, err)
+
 	publisher, err := natsctl.NewNATSPublisher(natsURL)
 	require.NoError(t, err)
 	t.Cleanup(func() { publisher.Conn().Close() })
