@@ -871,3 +871,98 @@ jobs:
           # And that it's a valid wasm32 component (wasm-tools can
           # extract the WIT to verify).
           wasm-tools component wit samples/hello-js/target/javy/hello-js.wasm | grep -q 'wasi:http/incoming-handler@0.2.1'
+
+  # ============================================================
+  # ROLLBACK-E2E — issue #613
+  # ============================================================
+  # Cross-language end-to-end test proving that a CP-side
+  # DeploymentService.RollbackDeployment call round-trips through
+  # the outbox + NATS + worker's run_consume_loop to actually swap
+  # the running app. Two test binaries (one Go, one Rust) share
+  # a single NATS container, coordinated by scripts/rollback-e2e.sh
+  # via sentinel files under /tmp/edge-e2e/. Mirrors the cross-
+  # language test precedent set by PR #652 (issue #611 wire
+  # contract test).
+  #
+  # This is the ONLY proof in the suite that the rollback path
+  # actually wires together end-to-end. Without it, the regressions
+  # PR #583's reviewers worried about (TaskMessage shape drift,
+  # outbox→NATS wiring breaks, worker consumer drift) would all
+  # land silently.
+  rollback-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
+      RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
+      # Both halves spin up testcontainers-managed Postgres + NATS.
+      # The Rust half's `should_skip_integration_tests` predicate
+      # self-skip when CI is set unless RUN_INTEGRATION_TESTS=1, so
+      # the orchestrator's Rust invocation sees it.
+      RUN_INTEGRATION_TESTS: "1"
+      # The Go half uses SKIP_INTEGRATION_TESTS=1 as its escape
+      # hatch; we don't set it here.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.0'
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod/
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          # Rollback e2e builds the same test profile that rust-test
+          # already compiled — share one cache so this job pays only
+          # the test-binary link cost, not the full workspace rebuild.
+          shared-key: "rust-tests"
+
+      # See rust-lint for the why; sccache is needed because
+      # .cargo/config.toml wraps rustc with it unconditionally.
+      - name: Install sccache (rustc wrapper)
+        uses: ./.github/actions/install-sccache
+
+      - name: Install system dependencies
+        # clang for `wasm-tools component wit` validation steps in
+        # the build cache; not strictly required for the test itself.
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Run cross-language rollback e2e
+        # The orchestrator launches both halves (Go first to start
+        # NATS, then Rust to consume), coordinates them via sentinel
+        # files, and tears down on any failure. See
+        # scripts/rollback-e2e.sh for the full flow.
+        run: bash scripts/rollback-e2e.sh
+
+      - name: Upload Go half logs
+        if: always()
+        # The driver writes both halves' logs into /tmp/edge-e2e/,
+        # then deletes the directory on exit. We capture them via
+        # `always()` only when the test failed — on success the dir
+        # is already gone and these globs match nothing.
+        uses: actions/upload-artifact@v5
+        with:
+          name: rollback-e2e-go-log
+          path: /tmp/edge-e2e/go.log
+          if-no-files-found: ignore
+
+      - name: Upload Rust half logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: rollback-e2e-rust-log
+          path: /tmp/edge-e2e/rust.log
+          if-no-files-found: ignore
