@@ -204,6 +204,20 @@ mod heartbeat_integration_tests {
         state: Arc<RwLock<WorkerState>>,
         cooldown_secs: u64,
     ) -> Arc<Supervisor> {
+        build_supervisor_with_cooldown_and_starting_port(state, cooldown_secs, 10000)
+    }
+
+    /// Extends `build_supervisor_with_cooldown_secs` with a custom
+    /// `PortPool` starting port. Used by
+    /// `start_app_returns_err_when_port_pool_exhausted` (#641
+    /// regression) to construct a pool near `u16::MAX` so the 1000-
+    /// iteration sequential fallback wraps around quickly when all
+    /// pre-populated ports are in cooldown.
+    fn build_supervisor_with_cooldown_and_starting_port(
+        state: Arc<RwLock<WorkerState>>,
+        cooldown_secs: u64,
+        starting_port: u16,
+    ) -> Arc<Supervisor> {
         let jwt = WorkerJwtSigner::new(
             String::new(),
             None,
@@ -222,7 +236,7 @@ mod heartbeat_integration_tests {
                 jwt.clone(),
                 None,
             )),
-            port_pool: Arc::new(Mutex::new(PortPool::new(10000, cooldown_secs))),
+            port_pool: Arc::new(Mutex::new(PortPool::new(starting_port, cooldown_secs))),
             nats: nats as Arc<dyn NatsClient>,
             log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
             jwt_signer: jwt,
@@ -965,6 +979,92 @@ mod heartbeat_integration_tests {
         assert!(
             state.read().await.apps.is_empty(),
             "app must be removed from state after stop_app"
+        );
+    }
+
+    /// Issue #641 regression: when the port pool is exhausted, `start_app`
+    /// must return `Err(_)` instead of panicking. The panic would unwind
+    /// the NATS consume loop and kill the worker process, taking every
+    /// other app on the node down with it.
+    #[tokio::test]
+    async fn start_app_returns_err_when_port_pool_exhausted() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        // `u64::MAX` cooldown so any released port never returns — this
+        // gives us a pool that drains to a permanently-cooling-down state
+        // and exercises the exhaustion branch of `acquire` (after the
+        // 100 pre-populated ports + 1000 sequential fallback attempts
+        // have all returned Some(_)).
+        // Issue #641: start_app's port-pool acquire path returns Err when
+        // exhausted instead of unwinding. We use a 100-year cooldown so
+        // released ports stay in `cooling_down` permanently for the
+        // duration of the test. (`u64::MAX` would overflow
+        // `Instant + Duration` arithmetic inside `release()`, so we
+        // pick a very-large-but-finite cooldown instead.)
+        //
+        // We use `drain_available_into_cooldown` (test-only API on
+        // `PortPool`) to construct the exhausted state in O(100) time
+        // without incrementing `next_port` past the cooldown range —
+        // which is what happens when you drain via `acquire()` and
+        // causes the sequential fallback to find free ports in the
+        // wrapped range.
+        let huge_cooldown_secs: u64 = 100 * 365 * 24 * 60 * 60; // 100 years
+        let sup = build_supervisor_with_cooldown_and_starting_port(
+            state.clone(),
+            huge_cooldown_secs,
+            10000,
+        );
+
+        // Drain the pool. `drain_available_into_cooldown` (test-only)
+        // moves the 100 pre-populated ports AND the next 1000
+        // sequential-fallback ports into `cooling_down` so any
+        // subsequent `acquire()` returns None. We do NOT verify
+        // this with an `assert_eq!(pool.acquire(), None)` here
+        // because that would itself trigger the 1000-iteration
+        // sequential fallback against an 1100-entry cooldown
+        // set — O(1.1M) ops, slow under debug builds. Trust the
+        // helper and let `start_app` be the verification.
+        {
+            let mut pool = sup.port_pool.lock().await;
+            let moved = pool.drain_available_into_cooldown();
+            assert_eq!(moved, 100, "expected to drain 100 pre-populated ports");
+        }
+
+        // Build a minimal AppSpec (no EDGE_WS_PORT — exercises the HTTP
+        // branch of the fix). The supervisor's signature check will fire
+        // *after* the port-acquire block, so we don't need a real
+        // signature here — but we DO need to NOT have a signature, which
+        // would make the signature check fail first and mask the bug.
+        // The fix is upstream of the signature check, so a missing
+        // signature is fine for this test: port-exhaustion bails earlier.
+        let spec = AppSpec {
+            deployment_id: "d_test_641".to_string(),
+            deployment_hash: "abc123".to_string(),
+            deployment_signature: None,
+            signing_key_id: None,
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            socket_mode: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
+        };
+
+        let result = sup.start_app("a_test_641", &spec, "t_test_641").await;
+
+        let err = result.expect_err("start_app must return Err when pool is exhausted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("port pool exhausted"),
+            "error message should mention port pool exhaustion; got: {msg}"
+        );
+
+        // The failing app must NOT be registered in state.
+        assert!(
+            state.read().await.apps.is_empty(),
+            "failed start_app must not register the app in state"
         );
     }
 
@@ -1843,19 +1943,55 @@ impl Supervisor {
             self.stop_app(tenant_id, app_name).await?;
         }
 
-        // Acquire an HTTP port.
+        // Acquire an HTTP port. Issue #641: acquire() already returns
+        // Option<u16>; turn None into an Err so the consume loop can
+        // nack-and-continue instead of unwinding the worker process.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
-            pool.acquire().expect("port pool exhausted")
+            let free = pool.free_slots();
+            match pool.acquire() {
+                Some(p) => p,
+                None => {
+                    tracing::error!(
+                        tenant_id,
+                        app_name,
+                        deployment_id = spec.deployment_id,
+                        free_slots = free,
+                        "port pool exhausted; refusing to start app (HTTP port unavailable)"
+                    );
+                    anyhow::bail!(
+                        "port pool exhausted: cannot allocate HTTP port (free_slots={free})"
+                    );
+                }
+            }
         };
 
         // Acquire a WebSocket port if the spec requests one via the
         // EDGE_WS_PORT env var. The guest is expected to listen on this
         // port via wasi:sockets for WebSocket upgrade traffic (issue #312).
+        // Issue #641: on exhaustion we release raw_port so it isn't
+        // leaked into a 60-second cooling-down limbo while the nack
+        // and redeliver cycle runs.
         let wants_ws = spec.env.contains_key("EDGE_WS_PORT");
         let ws_port = if wants_ws {
             let mut pool = self.port_pool.lock().await;
-            Some(pool.acquire().expect("port pool exhausted"))
+            let free = pool.free_slots();
+            match pool.acquire() {
+                Some(p) => Some(p),
+                None => {
+                    pool.release(raw_port);
+                    tracing::error!(
+                        tenant_id,
+                        app_name,
+                        deployment_id = spec.deployment_id,
+                        free_slots = free,
+                        "port pool exhausted; refusing to start app (WS port unavailable, HTTP port released)"
+                    );
+                    anyhow::bail!(
+                        "port pool exhausted: cannot allocate WS port (free_slots={free})"
+                    );
+                }
+            }
         } else {
             None
         };

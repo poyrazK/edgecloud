@@ -111,6 +111,52 @@ impl PortPool {
     pub fn is_in_cooldown(&self, port: u16) -> bool {
         self.cooling_down.iter().any(|(p, _)| *p == port)
     }
+
+    /// Move every port currently in `available` straight into
+    /// `cooling_down` (test-only). Returns the number of ports
+    /// moved. Used by `start_app_returns_err_when_port_pool_exhausted`
+    /// (#641 regression) to construct an exhausted-pool state
+    /// without going through `acquire`/`release` — which would
+    /// increment `next_port` past the cooldown range and let the
+    /// sequential fallback find free ports in the wrapped range.
+    ///
+    /// Also pre-fills the next 1000 sequential-fallback ports (the
+    /// cap inside `acquire`) into `cooling_down`, so subsequent
+    /// `acquire()` calls always return None. `next_port` is
+    /// advanced past the pre-populated range so the sequential
+    /// fallback starts at the post-populated cursor.
+    #[cfg(test)]
+    pub fn drain_available_into_cooldown(&mut self) -> usize {
+        let now = Instant::now();
+        let release_time = now + Duration::from_secs(self.cooldown_secs);
+        let moved = self.available.len();
+        for port in self.available.drain() {
+            self.cooling_down.push((port, release_time));
+        }
+        // Push the next 1000 sequential-fallback ports into cooldown
+        // WITHOUT advancing the cursor past them. After the loop
+        // `next_port` still points to the FIRST port in the
+        // 1000-port cooldown window. The next `acquire` walks the
+        // 1000-iter cap, finds every port in cooldown, returns
+        // None. Repeat `acquire`s keep returning None because the
+        // cursor hasn't moved.
+        let cursor_start = self.next_port;
+        let mut p = cursor_start;
+        let mut i = 0u32;
+        while i < 1000 {
+            self.cooling_down.push((p, release_time));
+            p = if p == u16::MAX {
+                self.starting_port
+            } else {
+                p + 1
+            };
+            i += 1;
+        }
+        // `next_port` is unchanged from `cursor_start` — every
+        // subsequent `acquire` re-walks the same cooldown window
+        // and returns None.
+        moved
+    }
 }
 
 #[cfg(test)]
