@@ -167,6 +167,20 @@ func TestRollbackE2E(t *testing.T) {
 	insertE2EDeployment(t, ctx, db, deploymentIDA, testTenantID, testAppName, sha, sigA)
 	insertE2EDeployment(t, ctx, db, deploymentIDB, testTenantID, testAppName, sha, sigB)
 
+	// Diagnostic: confirm the rows are visible to the same *sqlx.DB
+	// that ActivateDeployment will query. Insertions can succeed
+	// against a different connection / different database than the
+	// SELECT runs on if the test's DB wiring is split (e.g., pgC
+	// returned a working container but newE2EDB connected to the CI
+	// service postgres). Logging the count + ids surfaces this in CI.
+	var count int
+	require.NoError(t, db.GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM deployments WHERE id IN ($1, $2)`,
+		deploymentIDA, deploymentIDB))
+	require.Equal(t, 2, count, "expected 2 deployments rows after insert; got %d", count)
+	t.Logf("e2e: verified %d deployment rows present (ids=%s, %s)",
+		count, deploymentIDA, deploymentIDB)
+
 	// --- 4. Wire DeploymentService + OutboxDrainer against real pub ---
 	deploymentSvc := service.NewDeploymentService(
 		db,
