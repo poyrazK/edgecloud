@@ -25,14 +25,14 @@ func (r *WorkerRepository) WithTx(tx *sqlx.Tx) *WorkerRepository {
 }
 
 func (r *WorkerRepository) Create(ctx context.Context, w *domain.Worker) error {
-	query := `INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-	_, err := r.db.ExecContext(ctx, query, w.ID, w.TenantID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt)
+	query := `INSERT INTO workers (id, tenant_id, region, ip, memory_mb, last_seen, created_at, public_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+	_, err := r.db.ExecContext(ctx, query, w.ID, w.TenantID, w.Region, w.IP, w.MemoryMB, w.LastSeen, w.CreatedAt, w.PublicKey)
 	return err
 }
 
 func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Worker, error) {
 	var w domain.Worker
-	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE id = $1`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at, public_key FROM workers WHERE id = $1`
 	err := r.db.GetContext(ctx, &w, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -42,7 +42,7 @@ func (r *WorkerRepository) GetByID(ctx context.Context, id string) (*domain.Work
 
 func (r *WorkerRepository) List(ctx context.Context) ([]domain.Worker, error) {
 	var workers []domain.Worker
-	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers ORDER BY region, created_at DESC`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at, public_key FROM workers ORDER BY region, created_at DESC`
 	err := r.db.SelectContext(ctx, &workers, query)
 	return workers, err
 }
@@ -56,9 +56,55 @@ func (r *WorkerRepository) CountByTenant(ctx context.Context, tenantID string) (
 
 func (r *WorkerRepository) ListByTenant(ctx context.Context, tenantID string) ([]domain.Worker, error) {
 	var workers []domain.Worker
-	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at FROM workers WHERE tenant_id = $1 ORDER BY region, created_at DESC`
+	query := `SELECT id, tenant_id, region, ip, memory_mb, last_seen, created_at, public_key FROM workers WHERE tenant_id = $1 ORDER BY region, created_at DESC`
 	err := r.db.SelectContext(ctx, &workers, query, tenantID)
 	return workers, err
+}
+
+// SetPublicKey persists the worker's enrolled Ed25519 public key
+// (hex-encoded). Called from the EnrollWorker handler (issue #430) after
+// the challenge-signature verifies successfully. The write is idempotent:
+// re-enrollment with a new keypair overwrites the prior value, which
+// naturally rotates the worker's `kid` (WorkerAuth recomputes the
+// derived secret from the new pubkey on the next request).
+//
+// Returns the number of rows affected — callers may use 0 to detect a
+// missing worker row (which would mean a worker enrolled without ever
+// being registered, a logic error in the handler flow).
+func (r *WorkerRepository) SetPublicKey(ctx context.Context, id, publicKeyHex string) (int64, error) {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE workers SET public_key = $2 WHERE id = $1`,
+		id, publicKeyHex)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// GetPublicKey returns the worker's enrolled Ed25519 public key
+// (hex-encoded), or "" when the worker has not yet enrolled. The empty
+// string return is the contract the WorkerAuth wkr_-kid verification
+// path uses to reject forged kids without a separate `not found` error
+// — a worker with no public_key cannot produce a verifiable kid.
+//
+// Mirrors GetByID's `(nil, nil)` no-rows convention by returning
+// `("", nil)` for both "row missing" and "row exists, public_key IS NULL".
+// The WorkerAuth middleware does not need to distinguish those two
+// cases.
+func (r *WorkerRepository) GetPublicKey(ctx context.Context, id string) (string, error) {
+	var pk sql.NullString
+	err := r.db.GetContext(ctx, &pk,
+		`SELECT public_key FROM workers WHERE id = $1`, id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !pk.Valid {
+		return "", nil
+	}
+	return pk.String, nil
 }
 
 func (r *WorkerRepository) UpdateLastSeen(ctx context.Context, id string) error {

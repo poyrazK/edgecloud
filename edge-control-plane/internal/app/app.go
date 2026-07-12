@@ -413,6 +413,8 @@ func New(
 		cfg.JWT.ActiveKID,
 		tenantSvc,
 		workerSvc,
+		workerRepo,                       // issue #430 — per-worker key enrollment (SetPublicKey)
+		metricsAgg.NewWorkerEnrollSink(), // issue #430 — edge_worker_enroll_* metrics
 	)
 	appHandler := handler.NewAppHandler(appSvc)
 	authHandler := handler.NewAuthHandler(tenantSvc, apiKeySvc)
@@ -794,6 +796,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		Issuer:    cfg.JWT.Issuer,
 		ActiveKID: cfg.JWT.ActiveKID,
 		Keys:      cfg.JWT.Keys,
+		// Issue #430: wire the per-worker public-key cache. The
+		// loader hits workers.public_key (migration 032) once
+		// per cache miss; subsequent inbound requests for the
+		// same worker_id short-circuit and re-derive the
+		// verification secret via HKDF without touching the DB.
+		// EnrollWorker calls Invalidate after a fresh
+		// SetPublicKey, so a worker that just re-enrolled
+		// doesn't have to wait out the 5-minute TTL.
+		WorkerKeyCache: middleware.NewWorkerKeyCache(workerRepo.GetPublicKey),
 	}
 
 	// Bootstrap endpoint (issue #104): no auth middleware — uses HMAC
@@ -806,14 +817,31 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 			),
 		)
 
-		// Worker-secret: protected by BootstrapAuth (separate key from WorkerAuth).
+		// Worker-enroll (issue #430): replaces the cluster-leaking
+		// /worker-secret endpoint. Protected by BootstrapAuth (phase-1
+		// JWT issued above) — the actual authn gating is the Ed25519
+		// signature inside the handler, which closes the
+		// "bootstrap-JWT alone proves nothing" property.
+		//
+		// Rate limiters mirror issue #491's /tokens/tenant posture at
+		// lines 767-779: per-IP first (cheapest, catches scanners),
+		// then per-worker (keyed off the JWT worker_id claim so a
+		// single noisy worker can't exhaust the cluster-wide budget).
 		bootstrapJWTConfig := middleware.BootstrapJWTConfig{
 			BootstrapSecret: cfg.BootstrapSecret,
 			Issuer:          "edgecloud-bootstrap",
 		}
-		mux.Handle("GET /api/internal/worker-secret",
-			middleware.BootstrapAuth(bootstrapJWTConfig)(
-				http.HandlerFunc(internalHandler.WorkerSecret),
+		workerEnrollPerIP := middleware.NewRateLimiter(60, 30)
+		workerEnrollPerWorker := middleware.NewRateLimiter(10, 5)
+		mux.Handle("POST /api/internal/worker-bootstrap/enroll",
+			workerEnrollPerIP.Middleware(middleware.ClientIP)(
+				workerEnrollPerWorker.Middleware(func(r *http.Request) string {
+					return middleware.GetWorkerID(r.Context())
+				})(
+					middleware.BootstrapAuth(bootstrapJWTConfig)(
+						http.HandlerFunc(internalHandler.EnrollWorker),
+					),
+				),
 			),
 		)
 	}

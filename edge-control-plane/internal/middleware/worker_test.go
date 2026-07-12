@@ -1,11 +1,14 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -590,5 +593,201 @@ func TestWorkerAuth_KeyringRoundTrip(t *testing.T) {
 	}
 	if gotTenantID != "t_keyring" {
 		t.Errorf("tenant_id = %s, want t_keyring", gotTenantID)
+	}
+}
+
+// ── Per-worker key derivation tests (issue #430) ──────────────────────────
+
+// perWorkerTestPubkey is a fixed 64-hex-char Ed25519 public key used
+// by the wkr_ kid tests below. The corresponding private key is
+// irrelevant — only the public_key half participates in the HKDF
+// derivation.
+const perWorkerTestPubkey = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+
+// perWorkerTestSecret is the cluster master that HKDF consumes as
+// IKM. Mirrors the test master in signing/worker_key_test.go.
+const perWorkerTestSecret = "test-cluster-master-secret-that-is-long-enough-32-bytes!"
+
+// signWithDerivedSecret is a tiny helper that mints an HS256 JWT
+// signed with the per-worker HKDF-derived secret for a given
+// (workerID, tenantID, region, pubkey). It exists so the verify-side
+// tests don't duplicate the DeriveWorkerSecret call shape.
+func signWithDerivedSecret(t *testing.T, workerID, tenantID, region string, pubkey string) string {
+	t.Helper()
+	derived, err := signing.DeriveWorkerSecret([]byte(perWorkerTestSecret), workerID, tenantID, region, pubkey)
+	if err != nil {
+		t.Fatalf("DeriveWorkerSecret: %v", err)
+	}
+	claims := &WorkerClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "edgecloud",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+		WorkerID: workerID,
+		TenantID: tenantID,
+		Region:   region,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tok.Header["kid"] = signing.WorkerKID(pubkey)
+	signed, err := tok.SignedString(derived)
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+	return signed
+}
+
+// TestVerifyWorkerJWT_WkrKid_Roundtrip pins the issue #430 verify
+// path: a token signed with the per-worker derived secret and
+// carrying the wkr_ kid verifies when WorkerKeyCache is wired.
+func TestVerifyWorkerJWT_WkrKid_Roundtrip(t *testing.T) {
+	cache := NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return perWorkerTestPubkey, nil
+	})
+	cfg := WorkerJWTConfig{
+		Secret:         perWorkerTestSecret,
+		Issuer:         "edgecloud",
+		WorkerKeyCache: cache,
+	}
+	tok := signWithDerivedSecret(t, "w_fra_x", "t_real", "fra", perWorkerTestPubkey)
+	claims, err := VerifyWorkerJWT(tok, cfg)
+	if err != nil {
+		t.Fatalf("VerifyWorkerJWT: %v", err)
+	}
+	if claims.WorkerID != "w_fra_x" {
+		t.Errorf("WorkerID = %q, want w_fra_x", claims.WorkerID)
+	}
+	if claims.TenantID != "t_real" {
+		t.Errorf("TenantID = %q, want t_real", claims.TenantID)
+	}
+}
+
+// TestVerifyWorkerJWT_WkrKid_MissingCache pins the fail-closed
+// posture: a wkr_-kid token without a wired WorkerKeyCache is
+// refused outright. This is the property that prevents an
+// operator from accidentally deploying the verify path with the
+// loader left nil — the failure mode is loud (401s everywhere)
+// rather than silent (every wkr_ token treated as garbage).
+func TestVerifyWorkerJWT_WkrKid_MissingCache(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Secret: perWorkerTestSecret,
+		Issuer: "edgecloud",
+		// no WorkerKeyCache
+	}
+	tok := signWithDerivedSecret(t, "w_fra_x", "t_real", "fra", perWorkerTestPubkey)
+	if _, err := VerifyWorkerJWT(tok, cfg); err == nil {
+		t.Fatal("VerifyWorkerJWT with wkr_ kid but no cache should fail")
+	} else if !strings.Contains(err.Error(), "WorkerKeyCache is not configured") {
+		t.Errorf("err = %v, want it to mention 'WorkerKeyCache is not configured'", err)
+	}
+}
+
+// TestVerifyWorkerJWT_WkrKid_WrongPubkeyRejected pins the swap-defense:
+// a token whose kid claims pubkey A but whose signature was derived
+// from pubkey B fails verify. The kid-vs-pubkey equality check in
+// resolveKey closes this — without it, the cross-worker forgery
+// attack becomes possible.
+func TestVerifyWorkerJWT_WkrKid_WrongPubkeyRejected(t *testing.T) {
+	pubkeyA := perWorkerTestPubkey
+	pubkeyB := "0000000000000000000000000000000000000000000000000000000000000001"
+	cache := NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return pubkeyA, nil // cache says pubkey A
+	})
+	cfg := WorkerJWTConfig{
+		Secret:         perWorkerTestSecret,
+		Issuer:         "edgecloud",
+		WorkerKeyCache: cache,
+	}
+	// Sign with pubkey B (not A) — kid mismatch with cache lookup.
+	tok := signWithDerivedSecret(t, "w_fra_x", "t_real", "fra", pubkeyB)
+	_, err := VerifyWorkerJWT(tok, cfg)
+	if err == nil {
+		t.Fatal("VerifyWorkerJWT with mismatched kid/pubkey should fail")
+	}
+	if !strings.Contains(err.Error(), "kid") {
+		t.Errorf("err = %v, want it to mention 'kid'", err)
+	}
+}
+
+// TestVerifyWorkerJWT_WkrKid_NonexistentWorkerRejected pins the
+// "worker has no enrolled public_key" path: the loader returns "",
+// WorkerAuth refuses.
+func TestVerifyWorkerJWT_WkrKid_NonexistentWorkerRejected(t *testing.T) {
+	cache := NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return "", nil // unenrolled
+	})
+	cfg := WorkerJWTConfig{
+		Secret:         perWorkerTestSecret,
+		Issuer:         "edgecloud",
+		WorkerKeyCache: cache,
+	}
+	tok := signWithDerivedSecret(t, "w_legacy", "t_real", "fra", perWorkerTestPubkey)
+	_, err := VerifyWorkerJWT(tok, cfg)
+	if err == nil {
+		t.Fatal("VerifyWorkerJWT with unenrolled worker should fail")
+	}
+	if !strings.Contains(err.Error(), "no enrolled public_key") {
+		t.Errorf("err = %v, want it to mention 'no enrolled public_key'", err)
+	}
+}
+
+// TestResolveSigningKeyForWorker_HappyPath pins the symmetric
+// mint-side helper: the same cache + secret + pubkey produces the
+// same derived secret that resolveKey recomputes at verify time.
+func TestResolveSigningKeyForWorker_HappyPath(t *testing.T) {
+	cache := NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return perWorkerTestPubkey, nil
+	})
+	cfg := WorkerJWTConfig{
+		Secret:         perWorkerTestSecret,
+		Issuer:         "edgecloud",
+		WorkerKeyCache: cache,
+	}
+	got, err := cfg.ResolveSigningKeyForWorker(context.Background(), "w_mint", "t_tenant", "fra")
+	if err != nil {
+		t.Fatalf("ResolveSigningKeyForWorker: %v", err)
+	}
+	want, err := signing.DeriveWorkerSecret([]byte(perWorkerTestSecret), "w_mint", "t_tenant", "fra", perWorkerTestPubkey)
+	if err != nil {
+		t.Fatalf("DeriveWorkerSecret: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("derived secret mismatch (mint and verify paths diverged)")
+	}
+}
+
+// TestResolveSigningKeyForWorker_NoCache pins the missing-cache
+// error path. Symmetric with the verify-side TestVerifyWorkerJWT_WkrKid_MissingCache.
+func TestResolveSigningKeyForWorker_NoCache(t *testing.T) {
+	cfg := WorkerJWTConfig{
+		Secret: perWorkerTestSecret,
+		Issuer: "edgecloud",
+	}
+	_, err := cfg.ResolveSigningKeyForWorker(context.Background(), "w_mint", "t_tenant", "fra")
+	if err == nil {
+		t.Fatal("ResolveSigningKeyForWorker without WorkerKeyCache should fail")
+	}
+	if !strings.Contains(err.Error(), "WorkerKeyCache not configured") {
+		t.Errorf("err = %v, want it to mention 'WorkerKeyCache not configured'", err)
+	}
+}
+
+// TestResolveSigningKeyForWorker_Unenrolled pins the empty-pubkey
+// error path. The handler should surface this as a 500, not a 401.
+func TestResolveSigningKeyForWorker_Unenrolled(t *testing.T) {
+	cache := NewWorkerKeyCache(func(ctx context.Context, workerID string) (string, error) {
+		return "", nil
+	})
+	cfg := WorkerJWTConfig{
+		Secret:         perWorkerTestSecret,
+		Issuer:         "edgecloud",
+		WorkerKeyCache: cache,
+	}
+	_, err := cfg.ResolveSigningKeyForWorker(context.Background(), "w_unenrolled", "t_tenant", "fra")
+	if err == nil {
+		t.Fatal("ResolveSigningKeyForWorker with unenrolled worker should fail")
+	}
+	if !strings.Contains(err.Error(), "no enrolled public_key") {
+		t.Errorf("err = %v, want it to mention 'no enrolled public_key'", err)
 	}
 }

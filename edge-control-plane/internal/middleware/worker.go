@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/handler/httperror"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -63,6 +64,12 @@ type WorkerJWTConfig struct {
 	// a kid header are verified against the matching key; tokens
 	// without kid fall back to Secret.
 	Keys map[string]string
+	// WorkerKeyCache (issue #430) is the public-key cache that backs
+	// the wkr_ verification branch. When nil, wkr_-kid tokens are
+	// refused outright (fail-closed) — see resolveKey for the
+	// rationale. Production wires this from app.New using
+	// repository.WorkerRepository.GetPublicKey as the loader.
+	WorkerKeyCache *WorkerKeyCache
 }
 
 const (
@@ -111,9 +118,70 @@ func VerifyWorkerJWT(tokenString string, cfg WorkerJWTConfig) (*WorkerClaims, er
 // resolveKey selects the verification key for an incoming JWT.
 // Separate from VerifyWorkerJWT so ResolveSigningKey and this can
 // share the lookup logic without circular calls.
+//
+// Key selection (in priority order):
+//  1. kid header in wkr_ namespace (issue #430) — look up the
+//     worker's public_key via the key cache and re-derive the
+//     per-worker HS256 secret via HKDF.
+//  2. kid header present and Keys configured.
+//  3. Legacy Secret fallback.
+//  4. Keyring configured, no Secret. Use the active key as default.
+//
+// The wkr_ branch takes priority over the legacy keyring so a
+// token signed with a per-worker derived secret can never be
+// accepted by a stale cluster secret — the bug that motivated
+// issue #430 was exactly that the legacy key accepted a token
+// signed by a leaked cluster secret.
 func (cfg *WorkerJWTConfig) resolveKey(token *jwt.Token) ([]byte, error) {
-	// 1. kid header present and Keys configured.
-	if kid, ok := token.Header["kid"].(string); ok && kid != "" && len(cfg.Keys) > 0 {
+	kid, _ := token.Header["kid"].(string)
+
+	// 1. Per-worker derived secret (issue #430). Requires the
+	// key cache to be wired — if it isn't, the wkr_ branch
+	// refuses, which is the correct fail-closed behavior: an
+	// unconfigured cache means the operator hasn't deployed the
+	// schema migration or the loader, and silently falling back
+	// to the legacy key would re-open the original defect.
+	if signing.IsWorkerKID(kid) {
+		if cfg.WorkerKeyCache == nil {
+			return nil, errors.New("per-worker kid presented but WorkerKeyCache is not configured")
+		}
+		claims, ok := token.Claims.(*WorkerClaims)
+		if !ok {
+			return nil, errors.New("per-worker kid requires WorkerClaims")
+		}
+		if claims.WorkerID == "" {
+			return nil, errors.New("per-worker kid requires worker_id claim")
+		}
+		// Use Background ctx for the cache lookup — the inbound
+		// request ctx is fine in principle (the loader is a
+		// single round-trip) but Background decouples the cache
+		// lifetime from any client-side cancellation that might
+		// fire mid-resolve. The middleware should never abandon
+		// a verification it already started.
+		pubkey, err := cfg.WorkerKeyCache.GetOrLoad(context.Background(), claims.WorkerID)
+		if err != nil {
+			return nil, fmt.Errorf("per-worker key lookup for %s: %w", claims.WorkerID, err)
+		}
+		if pubkey == "" {
+			return nil, fmt.Errorf("worker %s has no enrolled public_key", claims.WorkerID)
+		}
+		// Sanity-check the kid matches the claimed pubkey. Without
+		// this, a token minted for kid=wkr_abcdef but signed with
+		// a secret derived from a different pubkey would verify —
+		// exactly the cross-worker forgery we're closing.
+		if kid != signing.WorkerKID(pubkey) {
+			return nil, fmt.Errorf("kid %q does not match worker %s's enrolled pubkey", kid, claims.WorkerID)
+		}
+		derived, err := signing.DeriveWorkerSecret(
+			[]byte(cfg.Secret), claims.WorkerID, claims.TenantID, claims.Region, pubkey)
+		if err != nil {
+			return nil, fmt.Errorf("derive worker secret for %s: %w", claims.WorkerID, err)
+		}
+		return derived, nil
+	}
+
+	// 2. kid header present and Keys configured.
+	if kid != "" && len(cfg.Keys) > 0 {
 		if secret, ok := cfg.Keys[kid]; ok {
 			return []byte(secret), nil
 		}
@@ -122,12 +190,12 @@ func (cfg *WorkerJWTConfig) resolveKey(token *jwt.Token) ([]byte, error) {
 		// is still accepted during the transition window.
 	}
 
-	// 2. Legacy Secret fallback.
+	// 3. Legacy Secret fallback.
 	if cfg.Secret != "" {
 		return []byte(cfg.Secret), nil
 	}
 
-	// 3. Keyring configured, no Secret. Use the active key as default.
+	// 4. Keyring configured, no Secret. Use the active key as default.
 	if len(cfg.Keys) > 0 && cfg.ActiveKID != "" {
 		if secret, ok := cfg.Keys[cfg.ActiveKID]; ok {
 			return []byte(secret), nil
@@ -153,6 +221,39 @@ func (cfg WorkerJWTConfig) ResolveSigningKey() ([]byte, error) {
 		return []byte(cfg.Secret), nil
 	}
 	return nil, errors.New("no signing key configured: set jwt.secret or jwt.keys")
+}
+
+// ResolveSigningKeyForWorker returns the HS256 signing key bound
+// to a specific worker (issue #430). The caller (typically
+// MintWorkerToken) supplies the worker's workerID + tenantID +
+// region; the function looks up the worker's enrolled public_key
+// and returns the HKDF-derived secret.
+//
+// Returns the same shape as ResolveSigningKey so callers can
+// substitute one for the other in `token.SignedString(...)`.
+//
+// Requires cfg.WorkerKeyCache (the same cache WorkerAuth uses
+// for verify). If the worker has not enrolled (no public_key
+// stored), returns an error — MintWorkerToken must surface 500
+// to the operator, because the only way a worker can reach this
+// code path without an enrolled key is if the cluster was
+// configured with WorkerKeyCache=nil (the wkr_ branch is
+// fail-closed) or the worker hasn't run the bootstrap handshake.
+func (cfg WorkerJWTConfig) ResolveSigningKeyForWorker(ctx context.Context, workerID, tenantID, region string) ([]byte, error) {
+	if cfg.WorkerKeyCache == nil {
+		return nil, errors.New("WorkerKeyCache not configured: cannot derive per-worker signing key")
+	}
+	if workerID == "" {
+		return nil, errors.New("workerID required to derive per-worker signing key")
+	}
+	pubkey, err := cfg.WorkerKeyCache.GetOrLoad(ctx, workerID)
+	if err != nil {
+		return nil, fmt.Errorf("worker pubkey lookup for %s: %w", workerID, err)
+	}
+	if pubkey == "" {
+		return nil, fmt.Errorf("worker %s has no enrolled public_key (must complete bootstrap handshake first)", workerID)
+	}
+	return signing.DeriveWorkerSecret([]byte(cfg.Secret), workerID, tenantID, region, pubkey)
 }
 
 // WorkerAuth returns a middleware that verifies Bearer JWT on the request.

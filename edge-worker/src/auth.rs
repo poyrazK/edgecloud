@@ -11,6 +11,7 @@
 //! hot path of every HTTP request while staying well ahead of the clock
 //! skew between worker and control plane.
 
+use anyhow::Context;
 use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -56,9 +57,12 @@ pub struct WorkerClaims {
 ///
 /// When `kid` is `Some(...)`, the JWT header includes a `kid` field so the
 /// control plane can select the correct verification key during rotation.
+/// Issue #430 added the per-worker `wkr_` kid namespace; `set_secret`
+/// swaps the kid + secret together during the bootstrap enrollment
+/// handshake.
 pub struct WorkerJwtSigner {
     secret: Mutex<Vec<u8>>,
-    kid: Option<String>,
+    kid: Mutex<Option<String>>,
     issuer: String,
     worker_id: String,
     region: String,
@@ -85,7 +89,7 @@ impl WorkerJwtSigner {
     ) -> Arc<Self> {
         Arc::new(Self {
             secret: Mutex::new(secret.into()),
-            kid,
+            kid: Mutex::new(kid),
             issuer: issuer.into(),
             worker_id: worker_id.into(),
             region: region.into(),
@@ -133,19 +137,52 @@ impl WorkerJwtSigner {
         *cache = None;
     }
 
-    /// Replace the signing secret and invalidate the token cache.
-    /// Used by the bootstrap handshake (issue #104) to set the real
-    /// JWT_SECRET after bootstrapping, without recreating the signer.
-    /// The next call to `sign()` will re-encode with the new secret.
+    /// Replace the signing secret, invalidate the token cache, and
+    /// (if provided) update the `kid` header. Used by the bootstrap
+    /// handshake (issue #104 + #430) to set the per-worker derived
+    /// secret + kid after enrollment without recreating the signer.
+    /// The next call to `sign()` will re-encode with the new secret
+    /// and `kid`.
     ///
-    /// Currently unused because main.rs resolves the secret before creating
-    /// the signer. Kept for future use cases where the secret needs to be
-    /// rotated at runtime (e.g. key rotation without worker restart).
-    #[allow(dead_code)]
-    pub fn set_secret(&self, new_secret: impl Into<Vec<u8>>) {
+    /// `new_kid` semantics:
+    /// - `Some(kid)` → overwrite the current kid (use this to set the
+    ///   per-worker `wkr_` kid after a successful enrollment).
+    /// - `None` → leave the existing kid untouched.
+    ///
+    /// The split exists so a future "rotate just the secret, keep the
+    /// same kid" call site doesn't have to know the current kid value.
+    pub fn set_secret(&self, new_secret: impl Into<Vec<u8>>, new_kid: Option<String>) {
         *self.secret.lock().unwrap_or_else(|e| e.into_inner()) = new_secret.into();
+        if let Some(kid) = new_kid {
+            *self.kid.lock().unwrap_or_else(|e| e.into_inner()) = Some(kid);
+        }
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         *cache = None;
+    }
+
+    /// Construct a signer with no secret or kid preloaded. The
+    /// resulting signer signs with an empty secret until
+    /// `set_secret` is called. Used by `main.rs` when the JWT
+    /// secret comes from the post-#430 bootstrap enrollment path
+    /// (where the secret + kid are produced together at runtime)
+    /// — the `new` constructor doesn't fit that flow because it
+    /// takes both as static arguments.
+    pub fn empty(
+        issuer: impl Into<String>,
+        worker_id: impl Into<String>,
+        region: impl Into<String>,
+        tenant_id: impl Into<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            secret: Mutex::new(Vec::new()),
+            kid: Mutex::new(None),
+            issuer: issuer.into(),
+            worker_id: worker_id.into(),
+            region: region.into(),
+            tenant_id: tenant_id.into(),
+            ttl: DEFAULT_TTL,
+            cache: Mutex::new(None),
+        })
     }
 
     fn encode(&self) -> String {
@@ -166,7 +203,8 @@ impl WorkerJwtSigner {
         };
 
         let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
-        if let Some(ref kid) = self.kid {
+        let kid_snapshot = self.kid.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(ref kid) = kid_snapshot {
             header.kid = Some(kid.clone());
         }
 
@@ -219,6 +257,174 @@ pub fn verify_for_test_only(
         &validation,
     )?;
     Ok(data.claims)
+}
+
+/// Persisted per-worker signing secret (issue #430).
+///
+/// After a successful `/worker-bootstrap/enroll` handshake the worker
+/// writes `{kid, secret, public_key_hex}` to disk (mode 0600) so
+/// subsequent restarts skip the bootstrap. The format is a tiny
+/// length-prefixed binary record — not JSON — to keep parsing
+/// allocation-free at boot.
+///
+/// Layout (all big-endian):
+/// - u32: magic = `b"EWIS"` (`0x45574953`)
+/// - u8:  version (= 1)
+/// - u32: kid_len
+/// - [u8; kid_len]: kid bytes
+/// - u32: secret_len
+/// - [u8; secret_len]: raw HS256 secret bytes
+/// - u32: pubkey_len
+/// - [u8; pubkey_len]: lowercase hex public_key
+pub const IDENTITY_RECORD_MAGIC: u32 = 0x45574953;
+pub const IDENTITY_RECORD_VERSION: u8 = 1;
+
+/// Persisted identity (kid + secret + pubkey). Owned by the caller;
+/// the on-disk format is rebuilt via `to_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedIdentity {
+    pub kid: String,
+    pub secret: Vec<u8>,
+    pub public_key_hex: String,
+}
+
+impl PersistedIdentity {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let kid = self.kid.as_bytes();
+        let pk = self.public_key_hex.as_bytes();
+        let mut out =
+            Vec::with_capacity(4 + 1 + 4 + kid.len() + 4 + self.secret.len() + 4 + pk.len());
+        out.extend_from_slice(&IDENTITY_RECORD_MAGIC.to_be_bytes());
+        out.push(IDENTITY_RECORD_VERSION);
+        out.extend_from_slice(&(kid.len() as u32).to_be_bytes());
+        out.extend_from_slice(kid);
+        out.extend_from_slice(&(self.secret.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.secret);
+        out.extend_from_slice(&(pk.len() as u32).to_be_bytes());
+        out.extend_from_slice(pk);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(bytes.len() > 4, "identity record too short for header");
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        anyhow::ensure!(
+            magic == IDENTITY_RECORD_MAGIC,
+            "identity record magic mismatch (got {magic:#x}, expected {:#x})",
+            IDENTITY_RECORD_MAGIC
+        );
+        let version = bytes[4];
+        anyhow::ensure!(
+            version == IDENTITY_RECORD_VERSION,
+            "identity record version {version} not supported (expected {IDENTITY_RECORD_VERSION})"
+        );
+        let mut cur = 5usize;
+        let kid = read_length_prefixed(bytes, &mut cur, "kid")?;
+        let secret = read_length_prefixed(bytes, &mut cur, "secret")?;
+        let pk = read_length_prefixed(bytes, &mut cur, "public_key_hex")?;
+        anyhow::ensure!(
+            cur == bytes.len(),
+            "identity record has trailing bytes ({} extra)",
+            bytes.len() - cur
+        );
+        let kid = std::str::from_utf8(&kid)
+            .context("kid is not valid utf-8")?
+            .to_string();
+        let public_key_hex = std::str::from_utf8(&pk)
+            .context("public_key_hex is not valid utf-8")?
+            .to_string();
+        Ok(Self {
+            kid,
+            secret,
+            public_key_hex,
+        })
+    }
+}
+
+fn read_length_prefixed(bytes: &[u8], cur: &mut usize, field: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        bytes.len() >= *cur + 4,
+        "identity record truncated reading {field} length"
+    );
+    let len = u32::from_be_bytes([
+        bytes[*cur],
+        bytes[*cur + 1],
+        bytes[*cur + 2],
+        bytes[*cur + 3],
+    ]) as usize;
+    *cur += 4;
+    anyhow::ensure!(
+        bytes.len() >= *cur + len,
+        "identity record truncated reading {field} body (wanted {len} bytes, have {})",
+        bytes.len() - *cur
+    );
+    let out = bytes[*cur..*cur + len].to_vec();
+    *cur += len;
+    Ok(out)
+}
+
+/// Persist the worker's per-worker signing secret to `path` with
+/// mode 0600. Used by `main.rs` immediately after the bootstrap
+/// enrollment handshake. Overwrites any existing file.
+///
+/// The atomic shape matches `worker_key::write_secret_file`:
+/// write-to-tmp + fsync + rename, then explicit chmod so a crashed
+/// worker can't leave a world-readable secret on disk.
+pub fn persist_identity(
+    path: &std::path::Path,
+    identity: &PersistedIdentity,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating parent dir for persisted identity: {}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    let tmp = path.with_extension("identity.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&identity.to_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Load a previously-persisted per-worker signing secret from
+/// `path`. Returns `Ok(None)` if the file does not exist (the common
+/// first-boot case). Returns `Err` for malformed records — a corrupt
+/// identity file must NOT silently fall through to bootstrap because
+/// that would let an attacker who can write to the cache directory
+/// forge a worker identity.
+pub fn load_persisted_identity(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<PersistedIdentity>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(PersistedIdentity::from_bytes(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "reading persisted identity from {}",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +492,29 @@ mod tests {
         assert_eq!(claims.exp - claims.iat, DEFAULT_TTL.as_secs() as usize);
     }
 
+    /// Issue #430: the JWT header carries a `kid` so the control
+    /// plane can route the verification key. This test parses the
+    /// raw header (the jsonwebtoken crate hides it from `decode`)
+    /// and asserts the kid round-trips.
+    #[test]
+    fn signed_token_includes_kid_header() {
+        let s = signer();
+        let t = s.sign();
+        let header_b64 = t.split('.').next().expect("header segment");
+        let header_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            header_b64,
+        )
+        .expect("header b64");
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&header_bytes).expect("header json");
+        assert_eq!(
+            header_json["kid"].as_str(),
+            Some("test-kid"),
+            "JWT header must carry the configured kid"
+        );
+    }
+
     #[test]
     fn verify_rejects_wrong_secret() {
         let s = signer();
@@ -309,5 +538,208 @@ mod tests {
             "error should mention issuer, got: {}",
             err
         );
+    }
+
+    // ── set_secret (issue #430) ────────────────────────────────────
+    //
+    // The bootstrap enrollment handshake lands here after a
+    // successful /worker-bootstrap/enroll call. set_secret must:
+    //   (1) atomically swap the secret AND (when supplied) the kid,
+    //   (2) invalidate the cached token so the next sign() re-encodes,
+    //   (3) leave the kid untouched when called with `kid = None`.
+
+    /// Swapping the secret invalidates the token cache so the next
+    /// sign() re-encodes under the new secret. Tokens minted before
+    /// the swap must NOT verify under the new secret.
+    #[test]
+    fn set_secret_invalidates_cache_and_rotates_token() {
+        let s = signer();
+        let before = s.sign();
+        s.set_secret(b"rotated-secret".to_vec(), None);
+        let after = s.sign();
+        assert_ne!(
+            before, after,
+            "sign() must produce a fresh token after set_secret"
+        );
+        assert!(
+            verify_for_test_only(b"rotated-secret", "edgecloud", &after).is_ok(),
+            "after-secret token must verify with the rotated secret"
+        );
+        assert!(
+            verify_for_test_only(b"test-secret", "edgecloud", &after).is_err(),
+            "after-secret token must NOT verify with the old secret"
+        );
+    }
+
+    /// Passing `Some(kid)` updates the JWT header's `kid` claim
+    /// starting with the next encoded token.
+    #[test]
+    fn set_secret_updates_kid_header() {
+        let s = signer();
+        // Pre-swap token carries kid="test-kid" (from signer()).
+        let before = s.sign();
+        let before_kid = extract_kid(&before);
+        assert_eq!(before_kid.as_deref(), Some("test-kid"));
+
+        s.set_secret(b"rotated-secret".to_vec(), Some("wkr_deadbeef".to_string()));
+        let after = s.sign();
+        let after_kid = extract_kid(&after);
+        assert_eq!(
+            after_kid.as_deref(),
+            Some("wkr_deadbeef"),
+            "set_secret must propagate the new kid to the JWT header"
+        );
+    }
+
+    /// Passing `kid = None` leaves the existing kid in place. This
+    /// supports a future "rotate only the secret" call site without
+    /// having to know the current kid.
+    #[test]
+    fn set_secret_without_kid_preserves_existing_kid() {
+        let s = signer();
+        s.set_secret(b"rotated-secret".to_vec(), None);
+        let after = s.sign();
+        let after_kid = extract_kid(&after);
+        assert_eq!(
+            after_kid.as_deref(),
+            Some("test-kid"),
+            "kid must NOT change when set_secret is called with new_kid=None"
+        );
+    }
+
+    /// `empty()` constructs a signer with no secret or kid, and
+    /// set_secret brings it to a working state. This is the
+    /// bootstrap-then-set_secret flow that `main.rs` uses when
+    /// `EDGE_WORKER_REENROLL_ON_BOOT=true` and no persisted secret
+    /// exists on disk.
+    #[test]
+    fn empty_then_set_secret_produces_valid_tokens() {
+        let s = WorkerJwtSigner::empty("edgecloud", "w_fra_abc", "fra", "t_tenant1");
+        // Before set_secret, the signer signs with an empty secret.
+        let t = s.sign();
+        assert!(
+            verify_for_test_only(b"", "edgecloud", &t).is_ok(),
+            "empty signer must produce tokens verifying with an empty secret"
+        );
+        // After set_secret, the new secret takes over.
+        s.set_secret(b"new-secret".to_vec(), Some("wkr_cafef00d".to_string()));
+        let t2 = s.sign();
+        assert!(verify_for_test_only(b"new-secret", "edgecloud", &t2).is_ok());
+        assert_eq!(extract_kid(&t2).as_deref(), Some("wkr_cafef00d"));
+    }
+
+    /// Pull the `kid` claim out of a JWT's header segment. Used by
+    /// the set_secret tests above to assert the header rotates.
+    fn extract_kid(token: &str) -> Option<String> {
+        let header_b64 = token.split('.').next()?;
+        let header_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            header_b64,
+        )
+        .ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+        v["kid"].as_str().map(|s| s.to_string())
+    }
+
+    // ── PersistedIdentity round-trip (issue #430) ─────────────────
+    //
+    // The disk-persistence helpers (`persist_identity`,
+    // `load_persisted_identity`) drive the "skip bootstrap on warm
+    // restart" path. Their tests are co-located here because the
+    // format is auth-specific — a different module would own this
+    // record in a larger crate.
+
+    #[test]
+    fn persisted_identity_round_trips() {
+        let id = PersistedIdentity {
+            kid: "wkr_deadbeef".to_string(),
+            secret: b"\x01\x02\x03\x04\x05\x06\x07\x08".to_vec(),
+            public_key_hex: "abcd".repeat(16),
+        };
+        let bytes = id.to_bytes();
+        let back = PersistedIdentity::from_bytes(&bytes).expect("parse");
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn persisted_identity_rejects_bad_magic() {
+        let mut bytes = PersistedIdentity {
+            kid: "k".to_string(),
+            secret: vec![1, 2, 3],
+            public_key_hex: "ab".to_string(),
+        }
+        .to_bytes();
+        bytes[0] = 0;
+        let err = PersistedIdentity::from_bytes(&bytes).expect_err("bad magic");
+        assert!(err.to_string().contains("magic"));
+    }
+
+    #[test]
+    fn persisted_identity_rejects_unknown_version() {
+        let mut bytes = PersistedIdentity {
+            kid: "k".to_string(),
+            secret: vec![1, 2, 3],
+            public_key_hex: "ab".to_string(),
+        }
+        .to_bytes();
+        bytes[4] = 99; // version
+        let err = PersistedIdentity::from_bytes(&bytes).expect_err("bad version");
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn persisted_identity_rejects_truncated_body() {
+        let bytes = PersistedIdentity {
+            kid: "k".to_string(),
+            secret: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            public_key_hex: "ab".to_string(),
+        }
+        .to_bytes();
+        let truncated = &bytes[..bytes.len() - 4];
+        let err = PersistedIdentity::from_bytes(truncated).expect_err("truncated");
+        assert!(
+            err.to_string().contains("trailing") || err.to_string().contains("truncated"),
+            "error must describe truncation: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_and_load_round_trips_to_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("identity.key");
+        let id = PersistedIdentity {
+            kid: "wkr_1234abcd".to_string(),
+            secret: vec![0xAA; 32],
+            public_key_hex: "11".repeat(32),
+        };
+        persist_identity(&path, &id).expect("persist");
+        let loaded = load_persisted_identity(&path)
+            .expect("load")
+            .expect("file exists");
+        assert_eq!(loaded, id);
+    }
+
+    #[test]
+    fn load_persisted_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.key");
+        let got = load_persisted_identity(&path).expect("missing file");
+        assert!(got.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_identity_uses_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("identity.key");
+        let id = PersistedIdentity {
+            kid: "wkr_x".to_string(),
+            secret: vec![0xBB; 32],
+            public_key_hex: "22".repeat(32),
+        };
+        persist_identity(&path, &id).expect("persist");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "identity record must be 0600, got {mode:o}");
     }
 }

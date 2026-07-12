@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -18,6 +22,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/nats"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/signing"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -76,6 +81,15 @@ var _ InternalDomainServiceInterface = (*service.DomainService)(nil)
 // issue #307 follow-up). `tenantSvc` is held as a narrow interface
 // so handler tests can swap in a mock without dragging in the full
 // *service.TenantService (DB + tenant repo + quota repo + api key repo).
+//
+// `workerKeyRepo` and `enrollmentChallenges` are issue #430: the
+// /worker-bootstrap/enroll handler persists the worker's Ed25519
+// public key via workerKeyRepo.SetPublicKey, and the bootstrap phase-1
+// handler stashes a one-shot challenge in enrollmentChallenges that
+// phase-2 must echo back (proving possession of the matching private
+// key). Both are required — the challenge store is what closes the
+// "stolen bootstrap JWT" attack surface even before the Ed25519
+// signature is checked.
 type InternalHandler struct {
 	deploymentSvc   autoRollbacker
 	workerSvc       workerRegisterer
@@ -96,6 +110,14 @@ type InternalHandler struct {
 	// workerHostingSvc answers "which tenants is this worker hosting?"
 	// — the issue #491 constraint #2 gate. See hostingGetter.
 	workerHostingSvc hostingGetter
+	// Issue #430 — per-worker key enrollment (HKDF-derived HS256
+	// secrets; replaces the cluster-wide /worker-secret leak).
+	workerKeyRepo        workerKeyRepo
+	enrollmentChallenges *enrollmentChallengeStore
+	// enrollSink bumps edge_worker_enroll_* metrics on every
+	// outcome (success or failure). nil-safe — tests pass nil and
+	// the closure falls through to a no-op.
+	enrollSink service.WorkerEnrollSink
 }
 
 // autoRollbacker is the narrow contract InternalHandler's endpoints
@@ -178,6 +200,156 @@ type hostingGetter interface {
 	TenantsHostedBy(ctx context.Context, workerID string) ([]string, error)
 }
 
+// workerKeyRepo is the narrow contract /worker-bootstrap/enroll needs
+// (issue #430). Satisfied by *repository.WorkerRepository. Kept as an
+// interface so handler tests can inject a mock without a DB. Set/Get
+// mirror repository/worker.go's SetPublicKey/GetPublicKey — see
+// migration 032 for the column.
+type workerKeyRepo interface {
+	SetPublicKey(ctx context.Context, id, publicKeyHex string) (int64, error)
+}
+
+// EnrollmentChallenge is the server-side record for a single
+// challenge issued during /api/internal/bootstrap phase 1 and
+// consumed by /worker-bootstrap/enroll phase 2 (issue #430).
+//
+// `Challenge` is the random base64-encoded 32 bytes the worker
+// must echo back in phase 2 (after signing it with the worker's
+// Ed25519 private key). `PublicKey` is the worker's claimed pubkey
+// (captured at phase 1 so phase 2 can re-verify the body matches
+// the original request — closes the swap-attack where an attacker
+// supplies their own keypair in phase 2). `ExpiresAt` matches the
+// bootstrap JWT TTL (5 minutes) — see BootstrapClaims.ExpiresAt.
+//
+// Exported so handler_test.go (external test package) can drive
+// the store directly without round-tripping through the HTTP
+// handlers; the type has no sensitive fields (the challenge is a
+// nonce, not a key).
+type EnrollmentChallenge struct {
+	Challenge string
+	PublicKey string
+	ExpiresAt time.Time
+}
+
+// statusWriter is a minimal http.ResponseWriter wrapper that
+// captures the first non-1xx status code the handler writes so the
+// deferred metric sink can classify success vs. failure. The 1xx
+// codes are informational (100 Continue) — handlers don't emit
+// them, but we still treat them as success if the next write
+// happens to land at 2xx.
+//
+// Used by EnrollWorker (issue #430) to bump
+// edge_worker_enroll_errors_total only when the handler actually
+// returns a non-2xx response, regardless of which return arm
+// fired. Without this, the metric would need to thread through
+// every early-return — fragile and easy to forget.
+type statusWriter struct {
+	http.ResponseWriter
+	code     int
+	wroteHdr bool
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if !s.wroteHdr {
+		s.code = code
+		s.wroteHdr = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	// If the handler wrote body bytes without an explicit
+	// WriteHeader (e.g. http.Error → writes 500 + body), the net/http
+	// package synthesizes a 200 default. Mirror that — record 200
+	// only if WriteHeader was never called.
+	if !s.wroteHdr {
+		s.code = http.StatusOK
+		s.wroteHdr = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// enrollmentChallengeStore keeps phase-1 challenges in memory so
+// phase-2 can verify the worker is the same caller that completed
+// phase 1. In-memory + TTL is fine for the threat model: the
+// challenges are single-use nonce-equivalents, and a CP restart
+// simply forces every worker to re-bootstrap (the same recovery
+// path as a stolen bootstrap JWT — the operator just waits 5
+// minutes for the old challenge to expire on its own).
+//
+// `mu` guards the map; reads take a snapshot under the lock so
+// phase-2 verification is consistent against concurrent phase-1
+// writes. Cleanup happens lazily on every read — no background
+// goroutine, no time.Ticker — because the store is bounded by
+// (concurrent workers × 1 entry) and entries self-evict on
+// next access.
+type enrollmentChallengeStore struct {
+	mu         sync.Mutex
+	challenges map[string]EnrollmentChallenge // key: worker_id
+}
+
+func newEnrollmentChallengeStore() *enrollmentChallengeStore {
+	return &enrollmentChallengeStore{challenges: make(map[string]EnrollmentChallenge)}
+}
+
+// NewEnrollmentChallengeStoreForTest returns a fresh store for
+// use in handler_test.go. Production code never calls this — the
+// only constructor in the prod path is newEnrollmentChallengeStore
+// inside NewInternalHandler.
+func NewEnrollmentChallengeStoreForTest() *enrollmentChallengeStore {
+	return newEnrollmentChallengeStore()
+}
+
+// Put records a fresh challenge for workerID, replacing any prior
+// entry (the worker re-bootstrapped and the old challenge is dead).
+func (s *enrollmentChallengeStore) Put(workerID string, ch EnrollmentChallenge) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.challenges[workerID] = ch
+}
+
+// Pop atomically reads and removes the challenge for workerID,
+// returning ok=false when no entry exists, when the entry has
+// expired, or when the caller supplied a mismatching public_key.
+// One-shot consumption is what closes the replay window — a
+// second phase-2 attempt with the same challenge 401s.
+func (s *enrollmentChallengeStore) Pop(workerID, publicKey string, now time.Time) (EnrollmentChallenge, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.challenges[workerID]
+	if !ok {
+		return EnrollmentChallenge{}, false
+	}
+	if !now.Before(ch.ExpiresAt) {
+		delete(s.challenges, workerID)
+		return EnrollmentChallenge{}, false
+	}
+	if ch.PublicKey != publicKey {
+		// Body's public_key does not match phase-1's claim. Don't
+		// consume the challenge — the legitimate worker can retry
+		// with the correct body.
+		return EnrollmentChallenge{}, false
+	}
+	delete(s.challenges, workerID)
+	return ch, true
+}
+
+// GC sweeps expired entries. Called from phase-2 under the lock,
+// so it amortizes to zero extra cost on the steady-state hot
+// path (every Pop is its own tiny GC).
+func (s *enrollmentChallengeStore) GC(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, ch := range s.challenges {
+		if !now.Before(ch.ExpiresAt) {
+			delete(s.challenges, k)
+			removed++
+		}
+	}
+	return removed
+}
+
 func NewInternalHandler(
 	deploymentSvc autoRollbacker,
 	workerSvc workerRegisterer,
@@ -194,23 +366,28 @@ func NewInternalHandler(
 	activeKID string,
 	tenantSvc tenantGetter,
 	workerHostingSvc hostingGetter,
+	workerKeyRepo workerKeyRepo,
+	enrollSink service.WorkerEnrollSink,
 ) *InternalHandler {
 	return &InternalHandler{
-		deploymentSvc:    deploymentSvc,
-		workerSvc:        workerSvc,
-		domainSvc:        domainSvc,
-		logEntryRepo:     logEntryRepo,
-		reconcileSvc:     reconcileSvc,
-		syncBuilder:      syncBuilder,
-		cpRegion:         cpRegion,
-		bootstrapSecret:  bootstrapSecret,
-		jwtSecret:        jwtSecret,
-		workerJWTConfig:  workerJWTConfig,
-		workerTokenTTL:   workerTokenTTL,
-		issuer:           issuer,
-		activeKID:        activeKID,
-		tenantSvc:        tenantSvc,
-		workerHostingSvc: workerHostingSvc,
+		deploymentSvc:        deploymentSvc,
+		workerSvc:            workerSvc,
+		domainSvc:            domainSvc,
+		logEntryRepo:         logEntryRepo,
+		reconcileSvc:         reconcileSvc,
+		syncBuilder:          syncBuilder,
+		cpRegion:             cpRegion,
+		bootstrapSecret:      bootstrapSecret,
+		jwtSecret:            jwtSecret,
+		workerJWTConfig:      workerJWTConfig,
+		workerTokenTTL:       workerTokenTTL,
+		issuer:               issuer,
+		activeKID:            activeKID,
+		tenantSvc:            tenantSvc,
+		workerHostingSvc:     workerHostingSvc,
+		workerKeyRepo:        workerKeyRepo,
+		enrollmentChallenges: newEnrollmentChallengeStore(),
+		enrollSink:           enrollSink,
 	}
 }
 
@@ -632,24 +809,49 @@ func (h *InternalHandler) UpdateDomainStatus(w http.ResponseWriter, r *http.Requ
 }
 
 // WorkerBootstrapRequest is the JSON body for the bootstrap handshake.
+//
+// PublicKey is the hex-encoded Ed25519 public key (64 lowercase ASCII
+// chars) the worker is enrolling. Required as of issue #430 — every
+// worker must present a keypair during bootstrap so the CP can derive
+// a per-worker HS256 secret via HKDF. The HMAC-SHA256 payload now
+// covers the public_key, so a swap-attack between phase 1 and phase 2
+// is detectable at HMAC-verify time.
 type WorkerBootstrapRequest struct {
 	WorkerID  string `json:"worker_id"`
 	Region    string `json:"region"`
 	TenantID  string `json:"tenant_id"`
-	Timestamp string `json:"timestamp"` // RFC3339, for replay protection
-	Nonce     string `json:"nonce"`     // random value for replay protection
-	Signature string `json:"signature"` // HMAC-SHA256 of worker_id+":"+region+":"+tenant_id+":"+timestamp+":"+nonce
+	Timestamp string `json:"timestamp"`  // RFC3339, for replay protection
+	Nonce     string `json:"nonce"`      // random value for replay protection
+	Signature string `json:"signature"`  // HMAC-SHA256 of worker_id:region:tenant_id:timestamp:nonce:public_key
+	PublicKey string `json:"public_key"` // hex-encoded Ed25519 public key (64 ASCII chars)
 }
 
+// enrollmentChallengeLen is the size of the random challenge the CP
+// generates during bootstrap phase 1 and the worker must sign during
+// phase 2. 32 bytes matches the Ed25519 signature size, so the signed
+// payload cannot be smaller than the signature — closes accidental
+// truncation attacks on the signed string.
+const enrollmentChallengeLen = 32
+
 // Bootstrap handles POST /api/internal/bootstrap — the first phase of
-// the bootstrap handshake (issue #104). The worker sends a request
-// signed with the shared BOOTSTRAP_SECRET and receives a short-lived
-// JWT (5 minutes) that it can use to fetch the real JWT_SECRET.
+// the bootstrap handshake (issue #104, hardened by issue #430).
+// The worker sends a request signed with the shared BOOTSTRAP_SECRET
+// and receives:
+//
+//  1. A short-lived JWT (5 minutes) — the bootstrap bearer for phase 2.
+//  2. An enrollment_challenge — a random 32-byte nonce the worker
+//     must sign with its Ed25519 private key in phase 2 to prove
+//     possession of the matching public_key.
+//
+// The challenge is stored server-side (enrollmentChallengeStore) and
+// is single-use: phase 2's Pop atomically removes it. A stolen
+// bootstrap JWT alone is useless — without the challenge that the CP
+// issued in this response, the attacker cannot complete enrollment.
 //
 // Returns 501 when BOOTSTRAP_SECRET is not configured on the CP.
 // Returns 401 on invalid signature.
 // Returns 400 on malformed request.
-// Returns 200 with {"token": "<bootstrap_jwt>"} on success.
+// Returns 200 with {"token", "enrollment_challenge", "challenge_expires_at"} on success.
 func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 	if h.bootstrapSecret == "" {
 		http.Error(w, `{"error": "bootstrap not configured"}`, http.StatusNotImplemented)
@@ -669,6 +871,22 @@ func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		httperror.BadRequestCtx(w, r, "timestamp, nonce, and signature are required")
 		return
 	}
+	if req.PublicKey == "" {
+		httperror.BadRequestCtx(w, r, "public_key is required (issue #430 per-worker enrollment)")
+		return
+	}
+	// Validate the public_key shape now (before HMAC) so a malformed
+	// claim produces a clean 400 rather than a 401 from HMAC failure.
+	// We require 64 lowercase hex chars (32 bytes — the Ed25519
+	// public-key size).
+	if len(req.PublicKey) != 64 {
+		httperror.BadRequestCtx(w, r, "public_key must be 64 lowercase hex chars (32-byte Ed25519 key)")
+		return
+	}
+	if _, err := hex.DecodeString(req.PublicKey); err != nil {
+		httperror.BadRequestCtx(w, r, "public_key must be hex-encoded")
+		return
+	}
 
 	// Verify timestamp is within 5 minutes (replay protection).
 	ts, err := time.Parse(time.RFC3339, req.Timestamp)
@@ -681,9 +899,13 @@ func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify HMAC-SHA256 signature.
-	payload := fmt.Sprintf("%s:%s:%s:%s:%s",
-		req.WorkerID, req.Region, req.TenantID, req.Timestamp, req.Nonce)
+	// Verify HMAC-SHA256 signature. Payload now covers public_key so a
+	// phase-2 swap to a different keypair is detectable here — without
+	// this coverage, an attacker who knows BOOTSTRAP_SECRET could mint
+	// a bootstrap JWT for victim_worker_id, then enroll their own
+	// keypair and walk away with a derived secret.
+	payload := fmt.Sprintf("%s:%s:%s:%s:%s:%s",
+		req.WorkerID, req.Region, req.TenantID, req.Timestamp, req.Nonce, req.PublicKey)
 	mac := hmac.New(sha256.New, []byte(h.bootstrapSecret))
 	mac.Write([]byte(payload))
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
@@ -706,6 +928,25 @@ func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Generate the phase-2 challenge. 32 random bytes — encoded as
+	// base64 (URL-safe, no padding) for inclusion in the JSON response
+	// and the phase-2 request body. The challenge's expires_at matches
+	// the bootstrap JWT TTL so phase-2 cannot outlive the JWT.
+	challengeBytes := make([]byte, enrollmentChallengeLen)
+	if _, err := rand.Read(challengeBytes); err != nil {
+		log.Printf("bootstrap: rand.Read failed: %v", err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	challengeB64 := base64.RawURLEncoding.EncodeToString(challengeBytes)
+	expiresAt := time.Now().Add(5 * time.Minute)
+
+	h.enrollmentChallenges.Put(req.WorkerID, EnrollmentChallenge{
+		Challenge: challengeB64,
+		PublicKey: req.PublicKey,
+		ExpiresAt: expiresAt,
+	})
+
 	// Audit log the bootstrap.
 	auditRecord(r, "bootstrap", "worker", req.WorkerID,
 		fmt.Sprintf("worker %s (tenant=%s, region=%s) bootstrap", req.WorkerID, req.TenantID, req.Region),
@@ -716,39 +957,282 @@ func (h *InternalHandler) Bootstrap(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"token": token,
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":                token,
+		"enrollment_challenge": challengeB64,
+		"challenge_expires_at": expiresAt.Unix(),
 	})
 }
 
-// WorkerSecret handles GET /api/internal/worker-secret — the second
-// phase of the bootstrap handshake (issue #104). The worker presents
-// its short-lived bootstrap JWT (obtained from POST /api/internal/bootstrap)
-// and receives the real JWT_SECRET in return.
+// EnrollmentRequest is the JSON body for POST /worker-bootstrap/enroll
+// (issue #430, phase 2 of the bootstrap handshake).
 //
-// Protected by the BootstrapAuth middleware (separate from WorkerAuth).
-// Returns 200 with {"secret": "<jwt_secret>"} on success.
-func (h *InternalHandler) WorkerSecret(w http.ResponseWriter, r *http.Request) {
-	if h.bootstrapSecret == "" || h.jwtSecret == "" {
+// WorkerID MUST equal the bootstrap JWT's worker_id claim — verified
+// in EnrollWorker. Mismatch is a 400.
+//
+// Challenge is the base64 challenge the CP returned in phase 1. The
+// CP looks it up server-side and refuses the request if it has
+// expired, been consumed, or was issued for a different public_key.
+//
+// PublicKey is the worker's hex-encoded Ed25519 public key. Must
+// equal the public_key from phase 1 (the CP's challenge store
+// re-checks this — see enrollmentChallengeStore.Pop).
+//
+// Signature is the Ed25519 signature over sha256(public_key || challenge),
+// hex-encoded (128 ASCII chars / 64 bytes raw). Verification:
+//
+//	payload = sha256(public_key_bytes || challenge_bytes)
+//	signature = ed25519.Sign(private_key, payload)
+//
+// The CP verifies the signature with the claimed public_key. A
+// successful verification proves the caller knows the private key
+// corresponding to the claimed public_key — which is exactly what
+// issue #430 needs to bind the derived secret to a single worker.
+type EnrollmentRequest struct {
+	WorkerID  string `json:"worker_id"`
+	PublicKey string `json:"public_key"`
+	Challenge string `json:"enrollment_challenge"`
+	Signature string `json:"signature"`
+}
+
+// EnrollmentResponse is the success body for /worker-bootstrap/enroll.
+// `kid` is the per-worker JWT header value ("wkr_" + 8 hex chars of
+// sha256(public_key)) — WorkerAuth's wkr_ branch (commit 4) routes
+// verification through DeriveWorkerSecret. `secret` is base64-encoded
+// 32 bytes — the HS256 signing key. `expires_at` is the worker
+// secret's recommended rotation deadline; the worker persists this
+// alongside (kid, secret) so an upcoming deadline can trigger
+// re-enrollment.
+type EnrollmentResponse struct {
+	Kid       string `json:"kid"`
+	Secret    string `json:"secret"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+// EnrollWorker handles POST /worker-bootstrap/enroll — the second
+// phase of the bootstrap handshake (issue #430). Replaces the
+// cluster-leaking GET /worker-secret endpoint.
+//
+// The worker presents:
+//  1. A valid bootstrap JWT (issued in phase 1) — auth via
+//     BootstrapAuth middleware.
+//  2. The phase-1 enrollment_challenge (single-use, server-side
+//     record bound to worker_id + public_key).
+//  3. An Ed25519 signature over sha256(public_key || challenge),
+//     proving possession of the matching private key.
+//
+// On success the CP:
+//  1. Persists the worker's public_key (idempotent — re-enrollment
+//     with a new keypair overwrites).
+//  2. Derives the worker's HS256 signing secret via HKDF
+//     (signing.DeriveWorkerSecret).
+//  3. Returns the derived secret + KID to the worker. The cluster
+//     master secret never leaves the CP.
+//
+// Status codes:
+//
+//	200 — enrollment succeeded
+//	400 — malformed body, mismatched worker_id, invalid signature
+//	      hex, bad public_key shape
+//	401 — bootstrap JWT invalid (set by BootstrapAuth middleware),
+//	      challenge unknown / expired / replayed, Ed25519 signature
+//	      verification failed
+//	500 — persistence or HKDF failure
+func (h *InternalHandler) EnrollWorker(w http.ResponseWriter, r *http.Request) {
+	if h.bootstrapSecret == "" {
 		http.Error(w, `{"error": "bootstrap not configured"}`, http.StatusNotImplemented)
 		return
 	}
 
+	// Wrap the handler body so we bump edge_worker_enroll_* exactly
+	// once per invocation, regardless of which return arm fires.
+	// `wrap` records the first non-1xx status the handler writes
+	// (httperror.XxxCtx, http.Error, or implicit on first Write);
+	// the deferred closure reads `wrap.code` at return time and
+	// reports `hadError = code >= 400`. The wrap is installed AFTER
+	// the bootstrapSecret-not-configured guard above so a 501 from
+	// a misconfigured CP doesn't count toward fleet enrollment
+	// failure metrics (it's an operator problem, not a worker
+	// problem).
+	wrap := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+	w = wrap
+	defer func() {
+		if h.enrollSink != nil {
+			h.enrollSink(wrap.code >= 400)
+		}
+	}()
+
 	workerID := middleware.GetWorkerID(r.Context())
 	tenantID := middleware.GetWorkerTenantID(r.Context())
+	// region comes from the JWT claim that BootstrapAuth set on
+	// the context. Phase 1 used the body's `region` field to mint
+	// the JWT, so the value here is whatever the worker claimed at
+	// phase 1. Reading from the context (not h.cpRegion, which is the
+	// CP's own region) keeps the derived secret bound to the worker's
+	// claimed region — a worker that lies about its region in phase 1
+	// ends up with a secret that no WorkerAuth resolver can verify,
+	// because the HKDF info string won't match the verify path.
+	region := middleware.GetWorkerRegion(r.Context())
 
-	// Audit log the secret fetch.
-	auditRecord(r, "secret_fetch", "worker", workerID,
-		fmt.Sprintf("worker %s (tenant=%s) fetched JWT secret", workerID, tenantID),
+	var req EnrollmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperror.BadRequestCtx(w, r, "invalid request body")
+		return
+	}
+	if req.WorkerID == "" || req.PublicKey == "" || req.Challenge == "" || req.Signature == "" {
+		httperror.BadRequestCtx(w, r, "worker_id, public_key, enrollment_challenge, and signature are required")
+		return
+	}
+	// The body worker_id must match the bootstrap JWT's worker_id
+	// claim. A swap to a different worker_id in phase 2 means the
+	// attacker has a valid bootstrap JWT for SOME worker and is
+	// trying to enroll for a DIFFERENT one — refuse.
+	if req.WorkerID != workerID {
+		log.Printf("enroll: body worker_id %q != JWT worker_id %q (refused)",
+			req.WorkerID, workerID)
+		httperror.BadRequestCtx(w, r, "worker_id must match the bootstrap JWT")
+		return
+	}
+
+	// Decode public_key (must be 32 raw bytes = 64 hex chars) and
+	// signature (must be 64 raw bytes = 128 hex chars).
+	pubBytes, err := hex.DecodeString(req.PublicKey)
+	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
+		httperror.BadRequestCtx(w, r, "public_key must be 64 lowercase hex chars (32-byte Ed25519 key)")
+		return
+	}
+	sigBytes, err := hex.DecodeString(req.Signature)
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
+		httperror.BadRequestCtx(w, r, "signature must be 128 lowercase hex chars (64-byte Ed25519 signature)")
+		return
+	}
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(req.Challenge)
+	if err != nil {
+		httperror.BadRequestCtx(w, r, "enrollment_challenge must be base64url (no padding)")
+		return
+	}
+
+	// Pop the challenge atomically — closes the replay window. Pop
+	// also re-verifies that the body's public_key matches the one
+	// captured at phase 1.
+	stored, ok := h.enrollmentChallenges.Pop(req.WorkerID, req.PublicKey, time.Now())
+	if !ok {
+		auditRecord(r, "worker_enroll", "worker", workerID,
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment challenge missing or replayed",
+				workerID, tenantID, region),
+			"failure")
+		httperror.UnauthorizedCtx(w, r, "enrollment challenge missing or replayed")
+		return
+	}
+	// Double-check the challenge bytes match (the store stores the
+	// base64 string, but a future change might normalize). Comparing
+	// the decoded bytes closes a tampering vector where the worker
+	// re-encodes a different challenge and slips it past the store.
+	storedBytes, err := base64.RawURLEncoding.DecodeString(stored.Challenge)
+	if err != nil || !bytesEqual(challengeBytes, storedBytes) {
+		httperror.UnauthorizedCtx(w, r, "enrollment challenge mismatch")
+		return
+	}
+
+	// Verify the Ed25519 signature over sha256(public_key || challenge).
+	// The hash binds signature to both inputs — without the hash, an
+	// attacker could lift the signature onto a (public_key', challenge')
+	// pair and (if they controlled public_key') impersonate the
+	// original worker against any verifier that didn't pin both inputs.
+	h2 := sha256.New()
+	h2.Write(pubBytes)
+	h2.Write(challengeBytes)
+	digest := h2.Sum(nil)
+	if !ed25519.Verify(pubBytes, digest, sigBytes) {
+		auditRecord(r, "worker_enroll", "worker", workerID,
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment Ed25519 signature failed to verify",
+				workerID, tenantID, region),
+			"failure")
+		log.Printf("enroll: worker %s Ed25519 signature verification failed", workerID)
+		httperror.UnauthorizedCtx(w, r, "signature verification failed")
+		return
+	}
+
+	// Persist the public key. workers.public_key (migration 032) is
+	// the column WorkerAuth re-derives from at verify time. The
+	// affected-row count lets us detect a worker that enrolled
+	// without ever registering (logic error in the worker flow).
+	affected, err := h.workerKeyRepo.SetPublicKey(r.Context(), workerID, req.PublicKey)
+	if err != nil {
+		log.Printf("enroll: SetPublicKey for worker %s failed: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	// Drop any cached entry so the next inbound request reloads
+	// from the freshly-persisted public_key. Without this a
+	// re-enrolling worker would 401 until the TTL elapsed —
+	// confusing during a planned rotation.
+	if h.workerJWTConfig.WorkerKeyCache != nil {
+		h.workerJWTConfig.WorkerKeyCache.Invalidate(workerID)
+	}
+	if affected == 0 {
+		// No matching workers row — refuse. The worker must register
+		// via POST /api/internal/workers first (a public, unauthenticated
+		// handshake that establishes the worker_id without any
+		// sensitive key material). The CP design intentionally
+		// separates "worker can identify itself" (register) from
+		// "worker proves identity" (enroll).
+		auditRecord(r, "worker_enroll", "worker", workerID,
+			fmt.Sprintf("worker %s (tenant=%s, region=%s) enrollment failed: no registered workers row",
+				workerID, tenantID, region),
+			"failure")
+		httperror.BadRequestCtx(w, r, "worker must register before enrolling")
+		return
+	}
+
+	// Derive the per-worker HS256 secret. Master key is the cluster
+	// JWT_SECRET; salt and info bind the derivation to this specific
+	// worker identity. The output is 32 bytes — the HS256 key size.
+	derived, err := signing.DeriveWorkerSecret(
+		[]byte(h.jwtSecret), workerID, tenantID, region, req.PublicKey)
+	if err != nil {
+		log.Printf("enroll: DeriveWorkerSecret for worker %s failed: %v", workerID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	kid := signing.WorkerKID(req.PublicKey)
+	// Recommended rotation deadline — the worker should re-enroll
+	// before this timestamp. 24h matches the historical bootstrap-
+	// derived JWT TTL (issue #76), so the operational rhythm doesn't
+	// change even though the underlying secret material now rotates.
+	expiresAt := time.Now().Add(24 * time.Hour)
+
+	auditRecord(r, "worker_enroll", "worker", workerID,
+		fmt.Sprintf("worker %s (tenant=%s, region=%s) enrolled kid=%s",
+			workerID, tenantID, region, kid),
 		"success")
-
-	log.Printf("worker-secret: worker %s (tenant=%s) fetched JWT secret", workerID, tenantID)
+	log.Printf("enroll: worker %s (tenant=%s, region=%s) enrolled kid=%s",
+		workerID, tenantID, region, kid)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"secret": h.jwtSecret,
+	_ = json.NewEncoder(w).Encode(EnrollmentResponse{
+		Kid:       kid,
+		Secret:    base64.RawURLEncoding.EncodeToString(derived),
+		ExpiresAt: expiresAt.Unix(),
 	})
+}
+
+// bytesEqual is a tiny local helper to avoid pulling in a `bytes` import
+// for what would otherwise be a one-line use of bytes.Equal. Keeping
+// it local reduces the import surface and makes the
+// "constant-time-ish" intent more visible at the call site.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // WorkerTokenRequest is the body shape for POST /api/internal/tokens/tenant
@@ -859,6 +1343,42 @@ func isSafeTenantID(s string) error {
 //	404 — tenant_id does not exist or is disabled
 //	500 — signing key resolution, hosting lookup, or signature
 //	      construction failure
+//
+// resolvePerWorkerSigningKey returns the (HS256 secret, kid) tuple
+// the MintWorkerToken handler uses to mint a per-tenant, per-worker
+// JWT (issue #430).
+//
+// Failure modes:
+//   - WorkerKeyCache not configured: 500 — operator hasn't wired
+//     the loader. Closing the failure mode in the same way as
+//     WorkerAuth's wkr_ branch keeps the verify path symmetric
+//     with the mint path.
+//   - Worker has no enrolled public_key: 500 — the worker hasn't
+//     completed the bootstrap handshake. This is a defensive
+//     error: the production flow guarantees enrollment happens
+//     before any token-mint call, so a non-enrolled worker is a
+//     logic bug somewhere upstream. 500 (not 401) keeps the
+//     caller from re-trying on what is effectively a server
+//     configuration error.
+func (h *InternalHandler) resolvePerWorkerSigningKey(ctx context.Context, workerID, tenantID string) ([]byte, string, error) {
+	region := middleware.GetWorkerRegion(ctx)
+	signingKey, err := h.workerJWTConfig.ResolveSigningKeyForWorker(ctx, workerID, tenantID, region)
+	if err != nil {
+		return nil, "", err
+	}
+	// Re-derive the kid. We can't rely on the cache key alone —
+	// the kid is the worker's wkr_ fingerprint, which depends on
+	// the public_key, which the cache layer keeps opaque.
+	pubkey, err := h.workerJWTConfig.WorkerKeyCache.GetOrLoad(ctx, workerID)
+	if err != nil {
+		return nil, "", err
+	}
+	if pubkey == "" {
+		return nil, "", fmt.Errorf("worker %s has no enrolled public_key", workerID)
+	}
+	return signingKey, signing.WorkerKID(pubkey), nil
+}
+
 func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request) {
 	workerID := middleware.GetWorkerID(r.Context())
 
@@ -959,7 +1479,14 @@ func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	signingKey, err := h.workerJWTConfig.ResolveSigningKey()
+	// Per-worker signing key (issue #430): the minted per-tenant
+	// token must verify against the same HKDF-derived secret the
+	// WorkerAuth wkr_ branch computes at verify time, otherwise
+	// the worker would 401 on its very next inbound call. The
+	// resolver also stamps the kid header with the worker's
+	// wkr_ fingerprint, so a future WorkerAuth implementation can
+	// rely on the kid for routing without re-running the cache.
+	signingKey, kid, err := h.resolvePerWorkerSigningKey(r.Context(), workerID, req.TenantID)
 	if err != nil {
 		log.Printf("worker-token: failed to resolve signing key for worker %s: %v", workerID, err)
 		httperror.InternalErrorCtx(w, r)
@@ -978,14 +1505,13 @@ func (h *InternalHandler) MintWorkerToken(w http.ResponseWriter, r *http.Request
 		},
 		WorkerID: workerID,
 		TenantID: req.TenantID,
+		Region:   middleware.GetWorkerRegion(r.Context()),
 		Role:     middleware.RoleWorker,
 		// Apps stays empty — per-app scoping is out of scope for this
 		// issue; a follow-up PR extends the claim shape.
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	if h.activeKID != "" {
-		token.Header["kid"] = h.activeKID
-	}
+	token.Header["kid"] = kid
 	signed, err := token.SignedString(signingKey)
 	if err != nil {
 		log.Printf("worker-token: failed to sign token for worker %s tenant=%s: %v", workerID, req.TenantID, err)

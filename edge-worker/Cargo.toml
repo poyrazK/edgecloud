@@ -32,6 +32,11 @@ wasmtime-wasi-http = "=45.0.3"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# Per-worker HS256 secret (issue #430) arrives pre-derived from the
+# control plane (Go-side HKDF over the cluster master + worker
+# `public_key`); the worker just stores it under a `wkr_<hex>` kid in
+# `.worker-cache/identity.key` and feeds it to `WorkerJwtSigner`.
+# The worker never re-derives — see `edge-control-plane/internal/signing/worker_key.go`.
 jsonwebtoken = "9"
 uuid = { version = "1.0", features = ["v4"] }
 # Artifact-signing verifier (issue #307, PR2). Both crates are already
@@ -40,6 +45,11 @@ uuid = { version = "1.0", features = ["v4"] }
 # pin us implicitly, and ed25519-dalek's 2.x → 1.x is a breaking change).
 ed25519-dalek = { version = "2.2", features = ["std"] }
 base64 = "0.22"
+# `rand_core::OsRng` for generating the worker identity seed
+# (issue #430). Version pinned to 0.6 to match ed25519-dalek 2.2's
+# internal rand_core dependency — version skew between
+# rand_core 0.6 and 0.7+ is a breaking change.
+rand_core = "=0.6.4"
 
 # HTTP server for Handler dispatch (C6). axum hosts the public listener;
 # each request drives one `ProxyPre` instance through the guest's

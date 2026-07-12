@@ -121,14 +121,41 @@ pub struct Config {
     /// HandlerDispatch endpoint (issue #209). Both `tls_cert_path`
     /// and `tls_key_path` must be set for TLS to activate.
     pub tls_key_path: Option<String>,
-    /// Optional bootstrap secret for the bootstrap handshake (issue #104).
+    /// Optional bootstrap secret for the bootstrap handshake (issue #104 + #430).
     /// When WORKER_JWT_SECRET is empty AND WORKER_BOOTSTRAP_SECRET is set,
     /// the worker performs the bootstrap handshake on startup:
     ///   1. POST to /api/internal/bootstrap with HMAC-SHA256 signature
-    ///   2. Receive short-lived (5min) bootstrap JWT
-    ///   3. Exchange bootstrap JWT for the real JWT_SECRET at
-    ///      GET /api/internal/worker-secret
+    ///      (covers worker_id, region, tenant_id, timestamp, nonce, public_key)
+    ///   2. Receive short-lived (5min) bootstrap JWT + enrollment challenge
+    ///   3. POST to /api/internal/worker-bootstrap/enroll with an Ed25519
+    ///      signature over sha256(public_key || challenge); receive the
+    ///      per-worker derived HS256 secret + `wkr_<hex>` kid
+    ///   4. Persist {kid, secret, public_key} to disk; restart skips steps 1-3
     pub worker_bootstrap_secret: String,
+
+    /// Path to the worker identity keypair (issue #430).
+    /// 32-byte raw Ed25519 seed, mode 0600. Generated on first boot
+    /// if absent and reused on subsequent boots so the worker's
+    /// `public_key` (and therefore its `kid`) stays stable across
+    /// restarts. The on-disk path can be overridden by
+    /// `EDGE_WORKER_KEY` (inline lowercase-hex seed) — useful for
+    /// containers / immutable images where mounting a per-pod secret
+    /// file is impractical. Default: `.worker-cache/identity.key`.
+    pub worker_key_path: PathBuf,
+    /// Path to the persisted per-worker signing secret (issue #430).
+    /// Written by the bootstrap enrollment handshake on first boot
+    /// and read on subsequent boots to skip the handshake. Default:
+    /// `.worker-cache/identity.key`. (Same default as
+    /// `worker_key_path`; keeping the two fields separate lets the
+    /// operator mount each from a different volume.)
+    pub worker_identity_path: PathBuf,
+    /// Force re-enrollment on every boot (issue #430). When `true`,
+    /// the worker ignores any persisted signing secret and runs the
+    /// bootstrap handshake again. Operators rotate this with
+    /// `EDGE_WORKER_REENROLL_ON_BOOT=true` for a planned rotation;
+    /// the new kid becomes effective on the next restart. Default:
+    /// `false`.
+    pub worker_reenroll_on_boot: bool,
 
     /// Socket-egress mode for `wasi:sockets/{tcp,udp}` (issue #309).
     /// Read **once** at worker startup from `EDGE_EGRESS_SOCKET_MODE`
@@ -299,6 +326,23 @@ impl Config {
             tls_cert_path: std::env::var("EDGE_TLS_CERT_PATH").ok(),
             tls_key_path: std::env::var("EDGE_TLS_KEY_PATH").ok(),
             worker_bootstrap_secret: std::env::var("WORKER_BOOTSTRAP_SECRET").unwrap_or_default(),
+            // Issue #430: per-worker identity keypair + persisted
+            // signing secret. The defaults are colocated in
+            // `.worker-cache/` next to the artifact cache; operators
+            // can split them across volumes by setting both env
+            // vars explicitly. The identity and the secret live in
+            // the same file by default — they're written atomically
+            // together by `auth::persist_identity` — but keeping
+            // the config fields distinct lets future code (e.g. a
+            // planned HMAC-secret-only rotation) reference either
+            // independently.
+            worker_key_path: std::env::var("EDGE_WORKER_KEY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(".worker-cache/identity.key")),
+            worker_identity_path: std::env::var("EDGE_WORKER_IDENTITY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(".worker-cache/identity.key")),
+            worker_reenroll_on_boot: parse_env_bool("EDGE_WORKER_REENROLL_ON_BOOT", false)?,
             socket_mode: SocketEgressPolicy::from_env(),
             hostname_pinning_enabled: parse_env_bool("EDGE_EGRESS_HOSTNAME_PINNING", false)?,
             standby_pool_size: parse_env_usize("EDGE_STANDBY_POOL_SIZE", 10)?,
