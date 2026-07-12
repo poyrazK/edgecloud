@@ -709,9 +709,9 @@ async fn deliveries_empty_set_prints_period_terminated_line() {
         .arg("deliveries")
         .arg("wh_alpha");
 
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("No delivery attempts recorded for webhook wh_alpha."));
+    cmd.assert().success().stdout(predicate::str::contains(
+        "No delivery attempts recorded for webhook wh_alpha.",
+    ));
 }
 
 /// 404: the webhook id doesn't exist OR belongs to a different
@@ -727,7 +727,9 @@ async fn deliveries_propagates_404_from_server() {
 
     common::seed_api_key(&home, "k_seed");
     Mock::given(method("GET"))
-        .and(path_regex(r"^/api/v1/webhooks/wh_does_not_exist/deliveries"))
+        .and(path_regex(
+            r"^/api/v1/webhooks/wh_does_not_exist/deliveries",
+        ))
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(
             ResponseTemplate::new(404).set_body_string(r#"{"error":"webhook not found"}"#),

@@ -292,9 +292,7 @@ impl<'a> WebhookClient<'a> {
             // server ever changes the cursor encoding to something
             // that needs URL-escaping.
             endpoint.push_str("&cursor=");
-            endpoint.push_str(
-                &url_encode(c),
-            );
+            endpoint.push_str(&url_encode(c));
         }
         let resp = self
             .client

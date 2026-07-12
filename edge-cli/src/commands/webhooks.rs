@@ -334,7 +334,10 @@ impl WebhooksAction {
                     // consistency in mixed-output terminals.
                     println!("No delivery attempts recorded for webhook {id}.");
                 } else {
-                    println!("{:<6} {:<14} {:<10} {:<8} CREATED", "ATTEMPT", "EVENT", "STATUS", "CODE");
+                    println!(
+                        "{:<6} {:<14} {:<10} {:<8} CREATED",
+                        "ATTEMPT", "EVENT", "STATUS", "CODE"
+                    );
                     println!("{}", "-".repeat(70));
                     for d in &page.deliveries {
                         let code = d
