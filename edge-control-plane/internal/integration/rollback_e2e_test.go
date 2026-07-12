@@ -97,7 +97,15 @@ func TestRollbackE2E(t *testing.T) {
 		t.Skip(reason)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 15-minute budget covers: container boot (≤30s) + 6 phases ×
+	// ~10s of drain/swap on the worker = ~90s of CP work, plus the
+	// Rust half's cargo build (cold-cache CI can take 2-3 minutes
+	// after rust-cache restores) and ~15s of test runtime. The
+	// orchestrator's RUST_DONE_WAIT (default 6m) is the load-bearing
+	// budget for the wait on rust-done — we need this ctx alive at
+	// least that long, otherwise NATS tears down while the Rust
+	// half is mid-flight.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	// --- 1. Boot testcontainers Postgres (or use the CI service when
@@ -212,7 +220,11 @@ func TestRollbackE2E(t *testing.T) {
 	t.Logf("phase 3 (rollback to %s) drained", rolledBackID)
 
 	// --- 9. Wait for the Rust half's assertions to finish ---
-	waitForSentinel(t, "rust-done", 90*time.Second)
+	// 5 minutes covers the Rust half's cargo build (cold-cache CI
+	// can take 2-3 minutes after rust-cache restores) plus ~15s of
+	// actual test runtime. The orchestrator's RUST_DONE_WAIT
+	// (default 6m) is the outer ceiling.
+	waitForSentinel(t, "rust-done", 5*time.Minute)
 	t.Logf("rust-done received; tearing down")
 }
 
