@@ -951,7 +951,7 @@ pub fn render_l4_routes(entries: &[L4RouteEntry], cfg: &Config, quota_cache: &Qu
     // Caddy server in the layer4 tree.
     let mut servers = serde_json::Map::new();
     let mut sorted_entries: Vec<&L4RouteEntry> = entries.iter().collect();
-    sorted_entries.sort_by(|a, b| a.public_port.cmp(&b.public_port));
+    sorted_entries.sort_by_key(|a| a.public_port);
 
     for entry in &sorted_entries {
         // Build the per-server object. The shape is always:
