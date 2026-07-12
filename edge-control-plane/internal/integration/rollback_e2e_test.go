@@ -167,42 +167,7 @@ func TestRollbackE2E(t *testing.T) {
 	insertE2EDeployment(t, ctx, db, deploymentIDA, testTenantID, testAppName, sha, sigA)
 	insertE2EDeployment(t, ctx, db, deploymentIDB, testTenantID, testAppName, sha, sigB)
 
-	// Diagnostic: confirm the rows are visible to the same *sqlx.DB
-	// that ActivateDeployment will query. Insertions can succeed
-	// against a different connection / different database than the
-	// SELECT runs on if the test's DB wiring is split (e.g., pgC
-	// returned a working container but newE2EDB connected to the CI
-	// service postgres). Logging the count + ids surfaces this in CI.
-	var count int
-	require.NoError(t, db.GetContext(ctx, &count,
-		`SELECT COUNT(*) FROM deployments WHERE id IN ($1, $2)`,
-		deploymentIDA, deploymentIDB))
-	require.Equal(t, 2, count, "expected 2 deployments rows after insert; got %d", count)
-	t.Logf("e2e: verified %d deployment rows present (ids=%s, %s)",
-		count, deploymentIDA, deploymentIDB)
-
 	// --- 4. Wire DeploymentService + OutboxDrainer against real pub ---
-	deploymentRepo := repository.NewDeploymentRepository(db)
-	// Diagnostic: run the exact GetByID call that ActivateDeployment
-	// will run, with full error logging. If the row IS visible via
-	// raw SELECT but NOT via GetByID, the diff is a scan error
-	// (NULL → typed field mismatch) that the test currently hides
-	// behind `if err != nil || deployment == nil { return
-	// "deployment not found" }`.
-	if d, err := deploymentRepo.GetByID(ctx, deploymentIDA); err != nil || d == nil {
-		var rawCount int
-		_ = db.GetContext(ctx, &rawCount,
-			`SELECT COUNT(*) FROM deployments WHERE id = $1`, deploymentIDA)
-		var typedCount int
-		_ = db.GetContext(ctx, &typedCount,
-			`SELECT COUNT(*) FROM deployments WHERE id = $1 AND tenant_id = $2 AND app_name = $3`,
-			deploymentIDA, testTenantID, testAppName)
-		t.Logf("e2e: diagnostic GetByID err=%v d=%v raw_count=%d typed_count=%d tenant=%s app=%s",
-			err, d, rawCount, typedCount, testTenantID, testAppName)
-	} else {
-		t.Logf("e2e: diagnostic GetByID succeeded id=%s tenant=%s app=%s",
-			d.ID, d.TenantID, d.AppName)
-	}
 	deploymentSvc := service.NewDeploymentService(
 		db,
 		repository.NewDeploymentRepository(db),
@@ -467,15 +432,21 @@ func insertE2EDeployment(
 ) {
 	t.Helper()
 	// Schema columns: signature + signing_key_id (017), auto_rollback_enabled (009),
-	// regions (008). Everything else defaults.
+	// regions (008), build_attestation (020). The build_attestation column is
+	// nullable jsonb, but the Go struct field is `json.RawMessage` (not a
+	// pointer), so sqlx refuses to scan NULL into it. We pass the literal
+	// `null` as a non-NULL jsonb value — same shape on the wire, doesn't
+	// trip the scan.
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO deployments (
 			id, tenant_id, app_name, status, hash,
-			signature, signing_key_id, auto_rollback_enabled, regions
+			signature, signing_key_id, auto_rollback_enabled, regions,
+			build_attestation
 		)
 		VALUES (
 			$1, $2, $3, 'deployed', $4,
-			$5, $6, false, ARRAY[$7]
+			$5, $6, false, ARRAY[$7],
+			'null'::jsonb
 		)
 	`,
 		id, tenantID, appName, hash,
