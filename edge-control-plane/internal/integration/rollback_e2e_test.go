@@ -146,7 +146,7 @@ func TestRollbackE2E(t *testing.T) {
 
 	// Latent schema/repo drift workaround: migration 021 adds preview_id
 	// + preview_pr_number to `deployments`, but the production repo at
-	// `internal/repository/active_deployment.go:88,100,279` SELECTs the
+	// `internal/repository/active_deployment.go:88,100,279` reads the
 	// same columns off `active_deployments` — and no migration ever
 	// added them there. ActivateDeployment → settingActiveDeployment
 	// → readingCurrentActiveDeployment → GetForUpdate fails with
