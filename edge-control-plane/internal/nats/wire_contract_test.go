@@ -237,6 +237,12 @@ func TestWireContract_DomainAppStatusFieldOrder(t *testing.T) {
 		"dedupe_id",
 		"resident_seconds",
 		"duration_ms_total",
+		// Issue #548: protocol indicates whether the worker serves
+		// this app via HTTP (default) or raw-TCP. The Rust side uses
+		// `#[serde(default)]` + `skip_serializing_if`, so legacy
+		// fixtures that omit the key round-trip cleanly. Added at
+		// the end so existing fixtures stay byte-compatible.
+		"protocol",
 	}
 	t.Helper()
 	typ := reflect.TypeOf(domain.AppStatus{})
