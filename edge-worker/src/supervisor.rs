@@ -990,24 +990,14 @@ mod heartbeat_integration_tests {
     async fn start_app_returns_err_when_port_pool_exhausted() {
         let engine = edge_runtime::create_engine().expect("engine");
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
-        // `u64::MAX` cooldown so any released port never returns — this
-        // gives us a pool that drains to a permanently-cooling-down state
-        // and exercises the exhaustion branch of `acquire` (after the
-        // 100 pre-populated ports + 1000 sequential fallback attempts
-        // have all returned Some(_)).
-        // Issue #641: start_app's port-pool acquire path returns Err when
-        // exhausted instead of unwinding. We use a 100-year cooldown so
-        // released ports stay in `cooling_down` permanently for the
-        // duration of the test. (`u64::MAX` would overflow
-        // `Instant + Duration` arithmetic inside `release()`, so we
-        // pick a very-large-but-finite cooldown instead.)
-        //
-        // We use `drain_available_into_cooldown` (test-only API on
-        // `PortPool`) to construct the exhausted state in O(100) time
-        // without incrementing `next_port` past the cooldown range —
-        // which is what happens when you drain via `acquire()` and
-        // causes the sequential fallback to find free ports in the
-        // wrapped range.
+        // We use a 100-year cooldown (not `u64::MAX`, which would
+        // overflow `Instant + Duration` arithmetic inside `release()`)
+        // so released ports stay in `cooling_down` permanently for the
+        // duration of the test. The exhausted state is constructed
+        // via `drain_available_into_cooldown` (test-only) instead of
+        // draining via `acquire/release` — which would increment
+        // `next_port` past the cooldown range and let the sequential
+        // fallback find free ports in the wrapped range.
         let huge_cooldown_secs: u64 = 100 * 365 * 24 * 60 * 60; // 100 years
         let sup = build_supervisor_with_cooldown_and_starting_port(
             state.clone(),
@@ -1065,6 +1055,75 @@ mod heartbeat_integration_tests {
         assert!(
             state.read().await.apps.is_empty(),
             "failed start_app must not register the app in state"
+        );
+    }
+
+    /// Issue #641 regression: when the WS-port acquire fails after the
+    /// HTTP-port acquire succeeded, `start_app` must release the
+    /// already-acquired HTTP port before bailing. Otherwise the leaked
+    /// HTTP port sits in a 60-second cooling-down limbo during the
+    /// nack-and-redeliver cycle, silently reducing pool capacity.
+    #[tokio::test]
+    async fn start_app_releases_raw_port_when_ws_port_acquire_fails() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let huge_cooldown_secs: u64 = 100 * 365 * 24 * 60 * 60; // 100 years
+        let sup = build_supervisor_with_cooldown_and_starting_port(
+            state.clone(),
+            huge_cooldown_secs,
+            10000,
+        );
+
+        // Drain the pool leaving exactly ONE port allocatable — enough
+        // for the HTTP acquire to succeed but not enough for the WS
+        // acquire.
+        {
+            let mut pool = sup.port_pool.lock().await;
+            pool.drain_leaving_n_available(1);
+        }
+
+        // Capture which port the HTTP branch will consume so we can
+        // assert it ends up in cooldown after the WS branch fails.
+        let expected_raw_port: u16 = {
+            let mut pool = sup.port_pool.lock().await;
+            pool.acquire().expect("first acquire should succeed")
+        };
+        // Put it back — `start_app` is going to acquire it itself.
+        // `release` is idempotent so it's safe even though the port
+        // isn't technically cooling-down yet.
+        sup.port_pool.lock().await.release(expected_raw_port);
+
+        // Build a spec with EDGE_WS_PORT set so the WS branch runs.
+        let spec = AppSpec {
+            deployment_id: "d_test_641_ws".to_string(),
+            deployment_hash: "abc123".to_string(),
+            deployment_signature: None,
+            signing_key_id: None,
+            routes: None,
+            env: HashMap::from([("EDGE_WS_PORT".to_string(), "1".to_string())]),
+            allowlist: None,
+            socket_mode: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
+        };
+
+        let result = sup.start_app("a_test_641_ws", &spec, "t_test_641_ws").await;
+
+        let err = result.expect_err("start_app must return Err when WS acquire fails");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("port pool exhausted"),
+            "error message should mention port pool exhaustion; got: {msg}"
+        );
+
+        // The leaked HTTP port must have been released by the WS
+        // branch's `pool.release(raw_port)` guard. With a 100-year
+        // cooldown, the port is in `cooling_down` (not `available`).
+        assert!(
+            sup.port_pool.lock().await.is_in_cooldown(expected_raw_port),
+            "HTTP port leaked: expected port {expected_raw_port} to be released into cooldown after WS acquire failed"
         );
     }
 

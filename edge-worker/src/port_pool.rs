@@ -112,50 +112,69 @@ impl PortPool {
         self.cooling_down.iter().any(|(p, _)| *p == port)
     }
 
-    /// Move every port currently in `available` straight into
-    /// `cooling_down` (test-only). Returns the number of ports
-    /// moved. Used by `start_app_returns_err_when_port_pool_exhausted`
-    /// (#641 regression) to construct an exhausted-pool state
-    /// without going through `acquire`/`release` — which would
-    /// increment `next_port` past the cooldown range and let the
-    /// sequential fallback find free ports in the wrapped range.
+    /// Drain the pool, leaving exactly `available_remaining` ports
+    /// allocatable (test-only). Both the pre-populated `available`
+    /// set and the next 1000 sequential-fallback ports are pushed
+    /// into `cooling_down` so `acquire()` only succeeds up to
+    /// `available_remaining` times. `next_port` is intentionally
+    /// not advanced.
     ///
-    /// Also pre-fills the next 1000 sequential-fallback ports (the
-    /// cap inside `acquire`) into `cooling_down`, so subsequent
-    /// `acquire()` calls always return None. `next_port` is
-    /// advanced past the pre-populated range so the sequential
-    /// fallback starts at the post-populated cursor.
+    /// `available_remaining` must be ≤ the pre-populated size (100);
+    /// values > 100 are clamped to 100. After this runs, the next
+    /// `available_remaining` calls to `acquire()` return `Some(_)`
+    /// (consuming the remaining `available` set), and any further
+    /// `acquire()` walks the 1000-iter sequential-fallback cap,
+    /// finds every port in cooldown, returns `None`.
+    ///
+    /// Used by the two #641 regression tests:
+    /// - `start_app_returns_err_when_port_pool_exhausted` calls
+    ///   with `available_remaining=0` to fully exhaust the pool.
+    /// - `start_app_releases_raw_port_when_ws_port_acquire_fails`
+    ///   calls with `available_remaining=1` so the HTTP acquire
+    ///   succeeds and the WS acquire fails.
+    ///
+    /// Assumes `next_port` is far enough from `u16::MAX` that the
+    /// 1000-iteration push loop doesn't wrap. The regression tests
+    /// use `starting_port=10000` so the loop ends at ~11000.
     #[cfg(test)]
-    pub fn drain_available_into_cooldown(&mut self) -> usize {
+    pub fn drain_leaving_n_available(&mut self, available_remaining: usize) {
         let now = Instant::now();
         let release_time = now + Duration::from_secs(self.cooldown_secs);
-        let moved = self.available.len();
-        for port in self.available.drain() {
-            self.cooling_down.push((port, release_time));
+
+        // Drain the pre-populated `available` set, then re-add
+        // `available_remaining` ports at the tail so subsequent
+        // `acquire()` calls can still consume them.
+        let pre_populated: Vec<u16> = self.available.drain().collect();
+        let keep = available_remaining.min(pre_populated.len());
+        for port in &pre_populated[pre_populated.len() - keep..] {
+            self.available.insert(*port);
         }
+        for port in &pre_populated[..pre_populated.len() - keep] {
+            self.cooling_down.push((*port, release_time));
+        }
+
         // Push the next 1000 sequential-fallback ports into cooldown
-        // WITHOUT advancing the cursor past them. After the loop
-        // `next_port` still points to the FIRST port in the
-        // 1000-port cooldown window. The next `acquire` walks the
-        // 1000-iter cap, finds every port in cooldown, returns
-        // None. Repeat `acquire`s keep returning None because the
-        // cursor hasn't moved.
+        // without advancing the cursor. The next `acquire` that
+        // exhausts the remaining `available` slots walks the 1000-iter
+        // cap and returns None.
         let cursor_start = self.next_port;
         let mut p = cursor_start;
         let mut i = 0u32;
         while i < 1000 {
             self.cooling_down.push((p, release_time));
-            p = if p == u16::MAX {
-                self.starting_port
-            } else {
-                p + 1
-            };
+            p += 1;
             i += 1;
         }
-        // `next_port` is unchanged from `cursor_start` — every
-        // subsequent `acquire` re-walks the same cooldown window
-        // and returns None.
-        moved
+    }
+
+    /// Backwards-compatible alias for the existing
+    /// `start_app_returns_err_when_port_pool_exhausted` test —
+    /// drains the pool to fully exhausted.
+    #[cfg(test)]
+    pub fn drain_available_into_cooldown(&mut self) -> usize {
+        let before = self.available.len();
+        self.drain_leaving_n_available(0);
+        before
     }
 }
 
