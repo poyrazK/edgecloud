@@ -974,6 +974,17 @@ jobs:
         # NATS, then Rust to consume), coordinates them via sentinel
         # files, and tears down on any failure. See
         # scripts/rollback-e2e.sh for the full flow.
+        #
+        # RUST_TEST_TIMEOUT=15m covers the cold-cache CI rebuild of
+        # the entire workspace test profile (the orchestrator's
+        # `timeout` will SIGKILL the cargo process if it exceeds
+        # this). Warm-cache runs finish in <1m. RUST_DONE_WAIT=6m
+        # bounds the wall-clock from launch to the rust-done
+        # sentinel — it sits above the test runtime even with
+        # container startup, and below the job's 20m timeout.
+        env:
+          RUST_TEST_TIMEOUT: 15m
+          RUST_DONE_WAIT: 6m
         run: bash scripts/rollback-e2e.sh
 
       - name: Upload Go half logs

@@ -35,9 +35,18 @@ set -euo pipefail
 # ---- knobs ----
 SENTINEL_DIR="${SENTINEL_DIR:-/tmp/edge-e2e}"
 GO_TEST_TIMEOUT="${GO_TEST_TIMEOUT:-5m}"
-RUST_TEST_TIMEOUT="${RUST_TEST_TIMEOUT:-3m}"
+# RUST_TEST_TIMEOUT caps the `cargo test` invocation itself (build +
+# link + run). 15m is generous — cold-cache CI rebuilds the full
+# workspace from source and even with rust-cache + sccache that can
+# take >5m on a fresh runner. Warm-cache runs finish in seconds.
+RUST_TEST_TIMEOUT="${RUST_TEST_TIMEOUT:-15m}"
 NATS_URL_WAIT="${NATS_URL_WAIT:-2m}"
-RUST_DONE_WAIT="${RUST_DONE_WAIT:-3m}"
+# RUST_DONE_WAIT caps the wall-clock from when the Rust half launches
+# to when it must write /tmp/edge-e2e/rust-done. Includes the cargo
+# build (already counted in RUST_TEST_TIMEOUT) plus the actual test
+# runtime — three heartbeat transitions at the 2s tick + ~10s of
+# container/NATS startup, so 6m is well above the floor.
+RUST_DONE_WAIT="${RUST_DONE_WAIT:-6m}"
 
 # ---- preflight ----
 for bin in docker go cargo; do
