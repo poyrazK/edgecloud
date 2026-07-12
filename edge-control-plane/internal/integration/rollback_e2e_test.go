@@ -48,6 +48,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -99,13 +100,23 @@ func TestRollbackE2E(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// --- 1. Boot testcontainers Postgres + NATS (JetStream) ---
+	// --- 1. Boot testcontainers Postgres (or use the CI service when
+	//     DATABASE_HOST is set) + testcontainers NATS (JetStream) ---
+	//
+	// The CI `rollback-e2e` job provides a system Postgres service
+	// (matching `go-test-integration`'s shape) because testcontainers
+	// Postgres occasionally races the runner's Docker daemon on cold
+	// runners (`host port waiting failed`). When DATABASE_HOST is
+	// set, we connect to the service directly; otherwise we spin up
+	// a testcontainer for hermetic local runs.
 	pgC := newE2EPostgres(t, ctx)
-	t.Cleanup(func() {
-		cctx, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = pgC.Terminate(cctx)
-	})
+	if pgC != nil {
+		t.Cleanup(func() {
+			cctx, c := context.WithTimeout(context.Background(), 30*time.Second)
+			defer c()
+			_ = pgC.Terminate(cctx)
+		})
+	}
 
 	natsC := newE2ENATS(t, ctx)
 	t.Cleanup(func() {
@@ -246,8 +257,21 @@ func drainUntilStable(t *testing.T, d *service.OutboxDrainer, ctx context.Contex
 
 // --- container helpers (mirror migrations/roundtrip_test.go shape) ---
 
+// newE2EPostgres returns a testcontainer-managed Postgres when
+// DATABASE_HOST is unset (hermetic local runs) and nil when the
+// CI service postgres is reachable via env vars. Callers MUST check
+// for nil before calling `Terminate`.
+//
+// We don't actually return the *sqlx.DB here because `pgC` is bound
+// to a local var, and we want the env-fallback path to short-circuit
+// before any testcontainer call. The connection string is computed
+// once by `newE2EDB` below.
 func newE2EPostgres(t *testing.T, ctx context.Context) *tcpg.PostgresContainer {
 	t.Helper()
+	if os.Getenv("DATABASE_HOST") != "" {
+		t.Logf("newE2EPostgres: using CI service postgres at %s", os.Getenv("DATABASE_HOST"))
+		return nil
+	}
 	c, err := tcpg.Run(ctx,
 		"postgres:16-alpine",
 		tcpg.WithDatabase("edgecloud_test"),
@@ -275,6 +299,39 @@ func newE2ENATS(t *testing.T, ctx context.Context) *tcnats.NATSContainer {
 
 func newE2EDB(t *testing.T, ctx context.Context, pgC *tcpg.PostgresContainer) *sqlx.DB {
 	t.Helper()
+	// Service-postgres path: assemble the DSN from the CI env vars.
+	// Mirrors what go-test-integration uses for its service block.
+	if pgC == nil {
+		host := os.Getenv("DATABASE_HOST")
+		require.NotEmpty(t, host, "DATABASE_HOST must be set when no Postgres container")
+		port := os.Getenv("DATABASE_PORT")
+		if port == "" {
+			port = "5432"
+		}
+		user := os.Getenv("DATABASE_USER")
+		if user == "" {
+			user = "test"
+		}
+		password := os.Getenv("DATABASE_PASSWORD")
+		if password == "" {
+			password = "test"
+		}
+		name := os.Getenv("DATABASE_NAME")
+		if name == "" {
+			name = "edgecloud_test"
+		}
+		sslmode := os.Getenv("DATABASE_SSLMODE")
+		if sslmode == "" {
+			sslmode = "disable"
+		}
+		connStr := fmt.Sprintf(
+			"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+			host, port, user, password, name, sslmode,
+		)
+		db, err := repository.NewDB(connStr)
+		require.NoError(t, err)
+		return db
+	}
 	connStr, err := pgC.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
 	db, err := repository.NewDB(connStr)

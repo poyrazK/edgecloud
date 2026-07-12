@@ -892,6 +892,29 @@ jobs:
   rollback-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The Go half's testcontainers-managed Postgres occasionally
+    # races the runner's Docker daemon (cold-runner `host port
+    # waiting failed`). Mirror the go-test-integration job's
+    # service block so the Go half can fall back to the system
+    # postgres container (set via DATABASE_* env vars) when the
+    # env is present, and only spin up testcontainers for
+    # hermetic local runs. NATS still comes from testcontainers
+    # — it has no service counterpart, and `tcnats` is more
+    # reliable than `tcpg` on cold runners.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: edgecloud_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d edgecloud_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       CARGO_INCREMENTAL: "0"  # sccache cannot cache incremental compiles
       RUSTFLAGS: "-C opt-level=0 -C debuginfo=0"
@@ -900,6 +923,12 @@ jobs:
       # self-skip when CI is set unless RUN_INTEGRATION_TESTS=1, so
       # the orchestrator's Rust invocation sees it.
       RUN_INTEGRATION_TESTS: "1"
+      DATABASE_HOST: localhost
+      DATABASE_PORT: "5432"
+      DATABASE_USER: test
+      DATABASE_PASSWORD: test
+      DATABASE_NAME: edgecloud_test
+      DATABASE_SSLMODE: disable
       # The Go half uses SKIP_INTEGRATION_TESTS=1 as its escape
       # hatch; we don't set it here.
     steps:
