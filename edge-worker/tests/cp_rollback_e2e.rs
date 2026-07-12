@@ -260,15 +260,19 @@ async fn run_e2e() -> anyhow::Result<()> {
         "final statuses were {:?}, want all 'running'",
         statuses
     );
-    // The rolled-back-to deployment must have acquired a fresh port,
-    // not reused the original (which is in cooling_down with
-    // cooldown=0 — actually released, so a fresh acquire). The
-    // transition between A and B must have changed the port too.
-    anyhow::ensure!(
-        ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2],
-        "expected three distinct ports across transitions, got {:?}",
-        ports
-    );
+    // The deployment_id + status assertions above prove the wire
+    // contract end-to-end (TaskUpdate → handle_task_message →
+    // stop_app → start_app → build_heartbeat → NATS). We deliberately
+    // do NOT assert port-distinctness: with `port_cooldown_secs = 0`,
+    // the pool's reap pass returns a just-released port to the
+    // available set on the next acquire, and `acquire` returns the
+    // SMALLEST available port — so the same port is legitimately
+    // reused across stop/start cycles. The port-cycling invariant the
+    // original plan aimed at (B's port in cooldown, A on a fresh
+    // port) is only observable mid-flight, not in the post-test
+    // snapshot. The deployment_id flip + "running" status together
+    // pin the swap semantics, and the underlying port-pool behavior
+    // is covered by unit tests in `edge-worker/src/port_pool.rs`.
 
     eprintln!(
         "cp_rollback_e2e: PASS — deployment_id transitions {:?} across ports {:?}",
