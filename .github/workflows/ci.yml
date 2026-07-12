@@ -613,6 +613,16 @@ jobs:
       - name: Run migration roundtrip test
         run: go test -tags=integration -v -count=1 ./migrations/... 2>&1 | tee test-logs.txt
 
+      - name: Run worker-cp e2e tests
+        # Closes #612: drive the real app.New().Handler via httptest
+        # against a fresh Postgres container per test, exercising the
+        # bootstrap handshake, the worker-JWT download lane, the
+        # X-Internal-Token download lane, and the auth-mode matrix
+        # (cross-tenant, anonymous, tampered-artifact).  -run
+        # TestWorkerCP scopes the run so unrelated internal/handler
+        # regressions don't get dragged in.
+        run: go test -tags=integration -v -count=1 ./internal/handler/... -run TestWorkerCP 2>&1 | tee -a test-logs.txt
+
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v5
