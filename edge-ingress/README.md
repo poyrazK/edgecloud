@@ -120,6 +120,11 @@ curl http://127.0.0.1:2019/config/ | jq .apps.http.servers.edge_https.routes
 | `TENANT_RATE_LIMIT_FETCH_INTERVAL` | `30s`             | How often the ingress polls `GET /api/v1/internal/rate-limit/{tenantID}` to refresh the per-tenant rate-limit cache. Matches `QUOTA_FETCH_INTERVAL` so both caches refresh on the same beat. `0` disables the fetcher entirely. |
 | `GLOBAL_RATE_LIMIT_RPS` | `0`                          | Platform-wide RPS cap applied before any per-tenant route (issue #305 sub-feature #4). Enforced **per Caddy replica** — with N ingress replicas, the effective cap is N × this value. Multi-replica NATS aggregation is a separate follow-up. `0` disables the global cap. |
 | `GLOBAL_RATE_LIMIT_BURST` | `0`                        | Global RPS burst paired with `GLOBAL_RATE_LIMIT_RPS`. `0` = falls back to the RPS value at the renderer. |
+| `L4_PORT_RANGE_START`  | `31000`                       | Inclusive lower bound of the public-port range reserved for raw-TCP apps. Issue #548. |
+| `L4_PORT_RANGE_END`    | `31999`                       | Inclusive upper bound. Provides 1000 ports by default. The CP allocates per-`(tenant_id, app_name)` atomically via `UPDATE … WHERE l4_public_port IS NULL RETURNING` so two ingress instances in the same region cannot collide; this range is the upper bound the CP allocates from. |
+| `INGRESS_L4_MAX_CONNS_PER_APP` | `1000`                | Per-app DDoS cap on simultaneous TCP connections. Mirrors the HTTP `Config::max_conns` shape. |
+| `INGRESS_L4_MAX_CONNS_PER_IP`  | `100`                 | Per-source-IP cap. Mirrors `Config::max_conns_per_ip`. |
+| `L4_PORT_COOLDOWN_SECS` | `60`                          | Port enters cooldown after release to dodge `TIME_WAIT` collisions. Matches `edge-worker/src/port_pool.rs::release`. |
 
 ### edge-worker (REQUIRED change for #70)
 
@@ -169,10 +174,24 @@ the next heartbeat burst — trigger one with a NATS `pub` if needed).
   500-route Caddyfile is ~50ms; the ingress handles thousands of routes
   fine. If the route count exceeds ~10k, switch to `PUT /id/<id>/apps/http/servers/edge_https/routes/<n>` patches — see the comment in `src/caddy.rs`.
 
-- **Stale routes**: a 60s tick prunes entries that haven't been refreshed in
-  180s (3 missed heartbeats). The route disappears from Caddy on the next
+- **Stale routes**: a 30s tick prunes entries that haven't been refreshed in
+  60s (2 missed heartbeats). The route disappears from Caddy on the next
   render. A worker restart in the same region is "free" — the new worker
-  publishes a heartbeat within 30s and the route is rewritten.
+  publishes a heartbeat within 30s and the route is rewritten. Override
+  with `STALE_TIMEOUT` / `PRUNE_INTERVAL`.
+
+- **L4 routing** (issue #548): a parallel `L4RoutingTable` + `L4PortPool`
+  carry raw-TCP apps. Heartbeats with `protocol:"tcp"` consult the CP's
+  authoritative port allocator (`L4PortCache`, polled every 30s) and
+  fall back to the ingress-local pool on cache miss. Each routable L4
+  app renders as `apps.layer4.servers.<l4_<port>>` with a single
+  `routes[].handle[].handler:"proxy"` forwarder to the worker's
+  upstream `worker_addr:port`. Quota over-cap → empty `routes`, which
+  Caddy interprets as "close immediately". The xcaddy-built Caddy
+  image (`edgecloud/caddy-l4:latest` per `Dockerfile.caddy-l4`,
+  consumes the `mholt/caddy-l4` plugin) is mandatory — stock
+  `caddy:2` does not include `apps.layer4`. The full design is in
+  [`../docs/l4-ingress.md`](../docs/l4-ingress.md).
 
 - **Cross-region reachability**: the ingress runs in a region (typically
   the same as the workers it serves) and must be able to `dial()` every
@@ -192,6 +211,7 @@ the next heartbeat burst — trigger one with a NATS `pub` if needed).
 | #82   | Multi-region ingress, anycast IPs, GeoDNS, second-region failover.   |
 | #83   | Custom domains. Brings per-tenant ACME, DNS-01 challenges, SAN lists. |
 | #85   | Autoscale. When an app runs on N workers, the routing table needs a load-balancing strategy. |
+| L4 v2 | TLS-on-SNI for raw-TCP. v1 is plain-byte forwarding (`mholt/caddy-l4`'s `handler:"proxy"`); TLS terminates at the worker, not the ingress. |
 
 ## Data-plane rate limiting (issue #305)
 
