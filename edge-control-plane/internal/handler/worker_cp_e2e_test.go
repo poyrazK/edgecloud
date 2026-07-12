@@ -679,3 +679,175 @@ func TestWorkerCP_DownloadFormatQuery_WasmDefault(t *testing.T) {
 		})
 	}
 }
+
+// ── Test 6: X-Internal-Token download lane — mirror of #4 via lane 2 ─
+
+// TestWorkerCP_DownloadViaInternalToken_Succeeds exercises the second
+// dual-auth lane at internal.go:217-255 — the `X-Internal-Token`
+// branch that the worker code path never reaches but a peer-CP
+// pull-through (or operator tooling) does. The middleware dispatch
+// at `internal/middleware/internal.go:79-99` checks for an
+// `Authorization` header first; with none present, the request
+// falls through to `InternalAuth`, which then `subtle.ConstantTimeCompare`s
+// against the configured `InternalToken`.
+//
+// As with #4, this test seeds a row with a real CP-produced
+// signature and re-verifies the body via the keyring on the way out,
+// so the dual-auth branch is pinned end-to-end (not just "200 came
+// back").
+func TestWorkerCP_DownloadViaInternalToken_Succeeds(t *testing.T) {
+	srv, db, keyring, internalToken, store := newTestCP(t)
+
+	tenantID := "t_dl_it_ok"
+	appName := "app-it"
+	deploymentID := "d_dl_it_ok_0001"
+	wasmBytes := freshArtifactBytes(0x33, 256)
+	hashHex, sig, kid := seedDeploymentRow(t, db, store, keyring,
+		tenantID, appName, deploymentID, wasmBytes)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Internal-Token", internalToken)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"X-Internal-Token download must 200; body=%s", readBody(resp.Body))
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, wasmBytes, got, "downloaded bytes must equal seeded wasm")
+
+	sum := sha256.Sum256(got)
+	require.Equal(t, hashHex, hex.EncodeToString(sum[:]),
+		"recomputed SHA-256 must match row.hash on the internal-token lane too")
+
+	ok, err := keyring.Verify(hashHex, deploymentID, sig, kid)
+	require.NoError(t, err)
+	require.True(t, ok,
+		"the row's stored signature must verify under the test keyring — independent of which auth lane streamed the bytes")
+}
+
+// ── Test 7: X-Internal-Token with wrong value → 401 ────────────────
+
+// TestWorkerCP_DownloadViaInternalToken_RejectsBadToken asserts that
+// a non-empty but mismatching `X-Internal-Token` value is rejected at
+// the middleware layer with 401. Pins the
+// `subtle.ConstantTimeCompare` mismatch branch in
+// `internal/middleware/internal.go:79-99` — a regression to plain
+// `==` would still pass this test, so the constant-time check is
+// only as strong as its callers; the test still pins the
+// 401-on-mismatch response code.
+func TestWorkerCP_DownloadViaInternalToken_RejectsBadToken(t *testing.T) {
+	srv, _, _, _, _ := newTestCP(t)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/d_anything", nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Internal-Token", "totally-not-the-real-token")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"wrong X-Internal-Token must 401; body=%s", readBody(resp.Body))
+}
+
+// ── Test 8: no auth headers at all → 401 (fail-closed default) ────
+
+// TestWorkerCP_DownloadWithoutAnyAuth_Rejected asserts the
+// fail-closed default: a request to the download endpoint with no
+// `Authorization` header AND no `X-Internal-Token` header must be
+// rejected. Pins the `InternalOrWorkerAuth` fall-through branch —
+// if a future change ever inverts the precedence or accidentally
+// grants an anonymous fallback, this test fires.
+func TestWorkerCP_DownloadWithoutAnyAuth_Rejected(t *testing.T) {
+	srv, _, _, _, _ := newTestCP(t)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/d_anything", nil)
+	require.NoError(t, err)
+	// Deliberately no Authorization and no X-Internal-Token.
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"anonymous download request must 401; body=%s", readBody(resp.Body))
+}
+
+// ── Test 9: JWT for tenant A downloading tenant B's row → 404 ──────
+
+// TestWorkerCP_DownloadWrongTenant_JWT_Returns404 verifies the
+// worker-JWT lane's cross-tenant guard: a JWT minted for `t_a`
+// cannot download a row whose `tenant_id` is `t_b`. The handler
+// applies a `WHERE tenant_id = <jwt.tenant>` filter at
+// `internal.go:223-228`, so the row simply doesn't exist from the
+// JWT's perspective and the response is 404 (not 403, so an
+// unauthorized caller can't probe for "row exists, you just can't
+// see it" — the response shape is indistinguishable from
+// "deployment_id never existed").
+func TestWorkerCP_DownloadWrongTenant_JWT_Returns404(t *testing.T) {
+	srv, db, keyring, _, store := newTestCP(t)
+
+	rowTenantID := "t_row_tenant_b"
+	appName := "app-cross-tenant"
+	deploymentID := "d_cross_tenant_0001"
+	wasmBytes := freshArtifactBytes(0x55, 128)
+	seedDeploymentRow(t, db, store, keyring,
+		rowTenantID, appName, deploymentID, wasmBytes)
+
+	// JWT for a DIFFERENT tenant.
+	jwtTenantID := "t_jwt_tenant_a"
+	tok := issueWorkerJWT(t, e2eJWTSecret, e2eIssuer, middleware.WorkerClaims{
+		WorkerID: "w_cross_tenant",
+		TenantID: jwtTenantID,
+		Region:   "test",
+	})
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"cross-tenant download via JWT must 404, not 403 (indistinguishable from missing row); body=%s", readBody(resp.Body))
+}
+
+// ── Test 10: X-Internal-Token is tenant-agnostic (always 200) ───────
+
+// TestWorkerCP_DownloadWrongTenant_InternalToken_Returns200 pins the
+// asymmetric scoping between the two auth lanes: when the request
+// authenticates via `X-Internal-Token`, the handler bypasses the
+// tenant filter and uses `lookupTenant="*"` so a peer-CP
+// pull-through can fetch any deployment regardless of which
+// `tenant_id` stamped its row. `middleware.IsSharedWorker` returns
+// true for `tenant_id="*"`, which `Download` reads from the
+// (absent) JWT context.
+//
+// This is by design — the internal-token lane is operator-trusted
+// and pulls across tenant boundaries — but it is a sharp edge. A
+// future refactor that "unifies" the lanes and applies the JWT
+// tenant filter to the internal-token path would silently break
+// peer-CP pull-through; this test fires.
+func TestWorkerCP_DownloadWrongTenant_InternalToken_Returns200(t *testing.T) {
+	srv, db, keyring, internalToken, store := newTestCP(t)
+
+	rowTenantID := "t_it_row"
+	appName := "app-it-cross"
+	deploymentID := "d_it_cross_0001"
+	wasmBytes := freshArtifactBytes(0x99, 128)
+	seedDeploymentRow(t, db, store, keyring,
+		rowTenantID, appName, deploymentID, wasmBytes)
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Internal-Token", internalToken)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"X-Internal-Token lane is tenant-agnostic — must 200 regardless of the row's tenant_id; body=%s", readBody(resp.Body))
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, wasmBytes, got,
+		"internal-token lane must stream the bytes for any tenant's row")
+}
