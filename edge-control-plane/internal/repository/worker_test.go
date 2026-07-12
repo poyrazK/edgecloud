@@ -8,6 +8,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 )
 
 // newWorkerMockRepo wires a sqlmock-backed sqlx.DB into a
@@ -443,5 +444,94 @@ func TestWorkerRepository_GetPublicKey_NoRow(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_SumFreeSlotsByRegion_PartialSaturation pins
+// the deploy-time 402 gate (issue #641): one region reports zero
+// free slots, another reports headroom. The map must surface both
+// numbers so DeploymentService.Deploy can short-circuit before
+// any artifact work. The query regex matches the freshness-window
+// clause + GREATEST(free_slots, 0) aggregate + ANY($1) regions
+// filter so a future refactor that drops any of those clauses
+// fails this test.
+func TestWorkerRepository_SumFreeSlotsByRegion_PartialSaturation(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"region", "free_slots"}).
+		AddRow("fra", int64(0)).
+		AddRow("nyc", int64(7))
+	mock.ExpectQuery(`SELECT workers\.region.*SUM\(GREATEST\(worker_status\.free_slots.*workers\.region = ANY\(\$1\)`).
+		WithArgs(pq.Array([]string{"fra", "nyc"})).
+		WillReturnRows(rows)
+
+	got, err := repo.SumFreeSlotsByRegion(context.Background(), []string{"fra", "nyc"})
+	if err != nil {
+		t.Fatalf("SumFreeSlotsByRegion: %v", err)
+	}
+	if got["fra"] != 0 {
+		t.Errorf("fra = %d, want 0 (saturated)", got["fra"])
+	}
+	if got["nyc"] != 7 {
+		t.Errorf("nyc = %d, want 7 (headroom)", got["nyc"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_SumFreeSlotsByRegion_NoWorkers pins the
+// "no rows" path: every target region has zero recently-reporting
+// workers. The repo must return (map, nil), NOT propagate a DB
+// error. The deploy-gate interprets an empty result as
+// "every region saturated" → 402 region_at_capacity.
+func TestWorkerRepository_SumFreeSlotsByRegion_NoWorkers(t *testing.T) {
+	repo, mock, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT workers\.region.*SUM\(GREATEST\(worker_status\.free_slots.*workers\.region = ANY\(\$1\)`).
+		WithArgs(pq.Array([]string{"fra"})).
+		WillReturnRows(sqlmock.NewRows([]string{"region", "free_slots"}))
+
+	got, err := repo.SumFreeSlotsByRegion(context.Background(), []string{"fra"})
+	if err != nil {
+		t.Fatalf("SumFreeSlotsByRegion: %v", err)
+	}
+	if got == nil {
+		t.Errorf("got nil map, want empty (deploy-gate relies on non-nil)")
+	}
+	if v, ok := got["fra"]; ok {
+		t.Errorf("fra key present in empty result: got=%d", v)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestWorkerRepository_SumFreeSlotsByRegion_EmptyInput pins the
+// "no regions asked" short-circuit: the repo must return
+// (empty-map, nil) WITHOUT issuing a SQL query. This is a defensive
+// shape — the deploy path resolves `effectiveRegions` before the
+// call, but a future caller that forgets to default might pass
+// `nil`. The handler iterates the result; ranging over nil is a
+// no-op but `map[k]` on a nil map returns the zero value (which
+// the deploy-gate treats as saturated), so we defensively short-circuit
+// before the SQL fires.
+func TestWorkerRepository_SumFreeSlotsByRegion_EmptyInput(t *testing.T) {
+	repo, _, cleanup := newWorkerMockRepo(t)
+	defer cleanup()
+
+	// No ExpectQuery — if the repo issues SQL the test fails on
+	// unmet expectations via mock cleanup.
+	got, err := repo.SumFreeSlotsByRegion(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("SumFreeSlotsByRegion: %v", err)
+	}
+	if got == nil {
+		t.Errorf("got nil map, want empty (defensive non-nil invariant)")
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
 	}
 }

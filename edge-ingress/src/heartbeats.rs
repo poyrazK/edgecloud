@@ -779,6 +779,7 @@ mod tests {
             tenant_id: None,
             apps,
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         }
     }
 
@@ -792,6 +793,7 @@ mod tests {
             tenant_id: None,
             apps,
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         }
     }
 
@@ -827,6 +829,7 @@ mod tests {
             tenant_id: None,
             apps,
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         };
 
         let changed = apply_heartbeat(&table, &hb).await;

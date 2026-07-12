@@ -563,6 +563,25 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		Apps:       hb.Apps,
 		LastReport: hb.Timestamp,
 	}
+	// Issue #641: extract `free_slots` from ClusterHeadroom so the
+	// deploy-time 402 gate can ask "is this region saturated?" without
+	// scraping the autoscaler's in-memory fleet map. The ClusterHeadroom
+	// itself is also persisted verbatim (jsonb) for future readers.
+	if len(hb.ClusterHeadroom) > 0 {
+		var headroom struct {
+			FreeSlots uint32 `json:"free_slots"`
+		}
+		if err := json.Unmarshal(hb.ClusterHeadroom, &headroom); err == nil {
+			ws.FreeSlots = int32(headroom.FreeSlots)
+		}
+		ws.ClusterHeadroom = hb.ClusterHeadroom
+	}
+	// Stamp `port_pool_exhausted_count` and (conditionally) advance
+	// `last_exhaustion_at` when the worker reports new exhaustion events
+	// since the previous heartbeat. The repo's UPSERT does the
+	// monotonic compare + NOW() stamp atomically; we just pass the
+	// new value here.
+	ws.PortPoolExhaustedCount = int64(hb.PortPoolExhaustedCount)
 	if err := s.workerRepo.UpsertStatus(ctx, ws); err != nil {
 		// The FK constraint `worker_status_worker_id_fkey` fires when
 		// the worker hasn't been registered yet. Auto-register with a

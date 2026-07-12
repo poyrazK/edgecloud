@@ -486,6 +486,17 @@ type outboxRepoForDeploymentSvc interface {
 	WithTx(tx *sqlx.Tx) *repository.OutboxRepository
 }
 
+// workerRepoForDeploymentSvc is the subset of *repository.WorkerRepository
+// methods used by the Deploy-time 402 gate (issue #641). The Deploy
+// path asks "do the target regions have any free port-pool slots
+// right now?" — answering that requires a fleet-wide aggregate, not
+// the per-worker lookups WorkerService uses. Optional — when nil,
+// the capacity gate is skipped and Deploy proceeds (preserves the
+// pre-#641 behavior for test harnesses that don't wire it).
+type workerRepoForDeploymentSvc interface {
+	SumFreeSlotsByRegion(ctx context.Context, regions []string) (map[string]uint64, error)
+}
+
 // DeploymentService handles deployment business logic.
 type DeploymentService struct {
 	db             *sqlx.DB
@@ -536,6 +547,13 @@ type DeploymentService struct {
 	// to pull from the CP's /api/internal/download/. Set via
 	// SetRegionArtifactCaches.
 	regionArtifactCaches map[string]string
+	// workerRepo backs the Deploy-time 402 region_at_capacity gate
+	// (issue #641). Optional; when nil the gate is skipped (preserves
+	// pre-#641 behavior for harnesses that don't wire it). Set via
+	// SetWorkerRepo after construction so existing test code that
+	// doesn't exercise the capacity gate doesn't need an extra
+	// constructor argument.
+	workerRepo workerRepoForDeploymentSvc
 	// keyring signs every new deployment's artifact (issue #307 PR1;
 	// was a single `*signing.Signer` before PR1). Required — set by
 	// the constructor; a nil keyring would cause `Deploy` to return
@@ -699,6 +717,15 @@ func (s *DeploymentService) SetRegionArtifactCaches(m map[string]string) {
 // activate" by treating those rows as configMissing.
 func (s *DeploymentService) GetRegionArtifactCaches() map[string]string {
 	return s.regionArtifactCaches
+}
+
+// SetWorkerRepo injects the worker-repo seam used by the Deploy-time
+// capacity gate (issue #641). Optional — when nil the gate is
+// skipped and every Deploy proceeds without a fleet-wide saturation
+// check. Wired from app.go after construction; test harnesses that
+// don't exercise the gate can leave it nil.
+func (s *DeploymentService) SetWorkerRepo(w workerRepoForDeploymentSvc) {
+	s.workerRepo = w
 }
 
 // SetAppService sets the AppService dependency for auto-creating apps on deploy.
@@ -962,6 +989,47 @@ func (s *DeploymentService) Deploy(ctx context.Context, tenantID, appName string
 		}
 		if !ok {
 			return nil, false, &PaymentRequiredError{Reason: "memory_quota_will_be_exceeded"}
+		}
+	}
+
+	// Pre-check 6: capacity-aware deploy throttle (issue #641). When
+	// the worker-repo seam is wired AND the tenant's effective
+	// regions all report zero free port-pool slots, refuse the
+	// deploy with 402 region_at_capacity. Pre-#641 the worker would
+	// have panicked on port_pool exhaustion; post-#641 it nacks
+	// cleanly and the reconcile loop retries — but a fleet-wide
+	// saturation signal means reconcile will never recover, so
+	// failing fast at the deploy boundary is the right user
+	// experience (developer sees a clear 402 instead of a
+	// stuck-pending deployment).
+	//
+	// Operator rollout order: ship the CP migration (032) FIRST and
+	// upgrade workers AFTER. Until workers send `ClusterHeadroom.
+	// free_slots`, every region's `SumFreeSlotsByRegion` returns 0
+	// and this gate rejects every deploy. The README/CLAUDE.md note
+	// flags this as the expected post-CP-pre-workers window.
+	if s.workerRepo != nil {
+		effectiveRegions := regions
+		if len(effectiveRegions) == 0 {
+			effectiveRegions = []string{s.defaultRegion}
+		}
+		freeByRegion, err := s.workerRepo.SumFreeSlotsByRegion(ctx, effectiveRegions)
+		if err != nil {
+			// Don't block deploys on a transient SUM-failure —
+			// log and continue. Failing closed here would lock
+			// out every tenant on a brief DB hiccup.
+			log.Printf("deploy: SumFreeSlotsByRegion(%v) failed: %v (skipping capacity gate)", effectiveRegions, err)
+		} else {
+			allSaturated := true
+			for _, r := range effectiveRegions {
+				if freeByRegion[r] > 0 {
+					allSaturated = false
+					break
+				}
+			}
+			if allSaturated {
+				return nil, false, &PaymentRequiredError{Reason: "region_at_capacity"}
+			}
 		}
 	}
 
