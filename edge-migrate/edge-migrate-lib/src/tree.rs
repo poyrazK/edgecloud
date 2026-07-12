@@ -267,6 +267,7 @@ pub fn transform_tree_for_language_with_app_name(
                                 message: "edge-migrate-lib was built without the `rust` feature; \
                                           Rust language requested but unavailable"
                                     .to_string(),
+                                code: None,
                             }],
                             preprocessor: None,
                         }

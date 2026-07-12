@@ -70,6 +70,13 @@ type PatternInfo struct {
 type ErrorInfo struct {
 	Line    int    `json:"line"`
 	Message string `json:"message"`
+	// Code is a stable, machine-readable error code (e.g.
+	// "SECURITY_DENY:RUST_MACRO", "SECURITY_DENY:C_INCLUDE").
+	// Optional for backwards compat — pre-deny-list ErrorInfo
+	// payloads have no code. Dashboards grep on the
+	// `SECURITY_DENY:*` prefix to alert on rejected submissions
+	// (issue #622).
+	Code string `json:"code,omitempty"`
 }
 
 // PreprocessorInfo is a mirror of edge-migrate-lib's PreprocessorInfo

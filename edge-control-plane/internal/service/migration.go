@@ -538,6 +538,25 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		patternsTransformed = detectTransformedPatterns(transformed)
 	}
 
+	// Issue #622 — short-circuit guard: if the analyzer's
+	// structured report says `Status: Failed` and carries any
+	// `SECURITY_DENY:*`-coded error, refuse to compile. Without
+	// this, the deny-list would detect the hostile macro but the
+	// downstream `rustc` / `clang` step would still run and bake
+	// the host file / env var into the produced wasm. The
+	// pre-deny-list flow trusted `parseErr == nil` as "OK to
+	// compile"; we add this guard in front of the compile step.
+	denied := false
+	for _, e := range envelope.Report.Errors {
+		if strings.HasPrefix(e.Code, "SECURITY_DENY:") {
+			denied = true
+			break
+		}
+	}
+	if denied {
+		return &envelope.Report, ErrEdgeMigrateFailed
+	}
+
 	// Compile → wasm. C uses wasi-sdk clang (reads from stdin).
 	// Rust writes the transformed source to a temp file and invokes
 	// `rustc --target wasm32-wasip2 --crate-type=cdylib` (rustc

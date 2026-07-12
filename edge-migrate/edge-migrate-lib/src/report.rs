@@ -40,6 +40,14 @@ pub struct ErrorInfo {
     pub line: usize,
     /// Error message.
     pub message: String,
+    /// Stable, machine-readable error code (e.g.
+    /// `"SECURITY_DENY:RUST_MACRO"`, `"SECURITY_DENY:C_INCLUDE"`).
+    /// Optional for backwards compat — pre-deny-list ErrorInfo
+    /// payloads have no code. Dashboards grep on the
+    /// `SECURITY_DENY:*` prefix to alert on rejected submissions
+    /// (issue #622).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// The migration report returned to the developer and used by the CLI.
@@ -247,7 +255,11 @@ impl FileReport {
             patterns_detected: Vec::new(),
             transformations: Vec::new(),
             manual_review: Vec::new(),
-            errors: vec![ErrorInfo { line, message }],
+            errors: vec![ErrorInfo {
+                line,
+                message,
+                code: None,
+            }],
             preprocessor: None,
         }
     }

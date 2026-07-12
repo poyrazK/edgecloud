@@ -93,6 +93,10 @@ type mockArtifactStore struct {
 	deleteCalls []string
 	// deleteErr returns this error from Delete if non-nil.
 	deleteErr error
+	// saveCalls records each Save invocation (key: tenantID/appName/depID).
+	// Used by short-circuit regression tests to assert the
+	// artifact-store write never happened.
+	saveCalls []string
 }
 
 func newMockArtifactStore() *mockArtifactStore {
@@ -100,6 +104,7 @@ func newMockArtifactStore() *mockArtifactStore {
 }
 
 func (m *mockArtifactStore) Save(ctx context.Context, tenantID, appName, deploymentID string, r io.Reader) error {
+	m.saveCalls = append(m.saveCalls, tenantID+"/"+appName+"/"+deploymentID)
 	if m.saveErr != nil {
 		return m.saveErr
 	}
@@ -1474,6 +1479,128 @@ func TestMigrationService_Migrate_RustEdgeMigrateFails(t *testing.T) {
 // submission needs a synthesized Cargo.toml + multi-file
 // src/lib.rs wrapper, which is a follow-up. The handler maps the
 // service error to HTTP 400.
+// TestMigrate_RustAnalyzerFailure_SkipsCompile is the load-bearing
+// regression test for the issue #622 short-circuit guard in
+// MigrationService.Migrate (single-file Rust path). When the
+// `edge-migrate` analyzer emits a structured report with
+// `Status: failed` and an error carrying a `SECURITY_DENY:*` code
+// (the Rust deny-list flagging `include_bytes!`, `env!`, `#[path = ...]`,
+// etc.), the service must refuse to compile the source. Without
+// this guard, the deny-list detects the hostile macro but the
+// downstream `rustc` step still runs and bakes the host file / env
+// var into the produced wasm — the entire reason the deny-list
+// exists.
+//
+// The test points `edgeMigratePath` at a fake shell script that
+// emits the desired envelope and exits 0. It does NOT invoke any
+// real toolchain (no edge-migrate, rustc, cargo, clang, or
+// wasm-tools on PATH is required). The test fails loudly if the
+// compile step was reached: the fake edge-migrate emits
+// `transformed` source that is not valid Rust, so if
+// `compileRustAsComponent` were called the report would carry a
+// rustc error and the `SECURITY_DENY:RUST_MACRO` code would be
+// missing from `errors[0]`.
+//
+// This is the single-file mirror of
+// TestMigrateTree_CAnalyzerFailure_SkipsCompile (issue #622
+// commit 2 / C-side). Adding more deny-list deny-codes to the
+// Rust analyzer must keep this test green as long as the codes
+// still start with `SECURITY_DENY:`.
+func TestMigrate_RustAnalyzerFailure_SkipsCompile(t *testing.T) {
+	// Fake edge-migrate script — emits a deny-coded analyzer
+	// failure envelope, then exits 0. The shell snippet writes to
+	// a sentinel file when invoked so the test can assert the
+	// subprocess WAS called (proving the guard fires AFTER the
+	// analyzer, not in lieu of it).
+	sentinelDir := t.TempDir()
+	sentinelPath := filepath.Join(sentinelDir, "edge-migrate-invoked")
+	fakeBinDir := t.TempDir()
+	fakeBin := filepath.Join(fakeBinDir, "edge-migrate")
+	script := `#!/bin/sh
+echo '` + sentinelPath + `:edge-migrate-was-invoked' > "` + sentinelPath + `"
+cat <<'JSON'
+{"version":1,"report":{"status":"failed","wasm_stored":false,"app_name":"hostile","patterns_detected":[],"patterns_transformed":[],"patterns_manual_review":[],"errors":[{"line":1,"message":"SECURITY: include_bytes!() embeds host file at compile time (issue #622 deny-list)","code":"SECURITY_DENY:RUST_MACRO"}]},"wasi_c":"// not actually compiled because the guard short-circuits"}
+JSON
+exit 0
+`
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake edge-migrate: %v", err)
+	}
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	// Real WIT dir is unnecessary because the short-circuit guard
+	// fires before `injectWitBindgen` / `compileRustAsComponent`.
+	// Use the placeholder like migrationSvcForTest; the test never
+	// reaches `wit_bindgen::generate!`.
+	svc := NewMigrationService(repo, store, fakeBin,
+		"/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo",
+		"/tmp/edge-mock-wit", signing.TestKeyring(t))
+
+	// Source contains a hostile `include_bytes!` against
+	// /etc/passwd. The real analyzer would flag this on the very
+	// first macro encountered; here the fake edge-migrate
+	// reproduces the analyzer's envelope so we test the Go side
+	// guard in isolation.
+	hostile := `fn main() {
+    let _ = include_bytes!("/etc/passwd");
+}
+`
+
+	report, err := svc.Migrate(context.Background(), "tenant-1", "hostile.rs", "rust", hostile)
+
+	// Top-level error must surface the structured sentinel so the
+	// handler's 422 path kicks in.
+	if err == nil {
+		t.Fatal("expected Migrate to fail when analyzer reports SECURITY_DENY, got nil")
+	}
+	if !errors.Is(err, ErrEdgeMigrateFailed) {
+		t.Errorf("expected error to wrap ErrEdgeMigrateFailed; got: %v", err)
+	}
+
+	// Report must carry the deny-coded error — proves the guard
+	// fired AFTER the analyzer envelope was parsed, not before.
+	if report == nil {
+		t.Fatal("expected non-nil report even on short-circuit failure")
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected status=failed, got: %s", report.Status)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false on analyzer-driven short-circuit")
+	}
+	if len(report.Errors) == 0 {
+		t.Fatal("expected at least one error entry on analyzer-driven short-circuit")
+	}
+	if got := report.Errors[0].Code; got != "SECURITY_DENY:RUST_MACRO" {
+		t.Errorf("expected errors[0].code=SECURITY_DENY:RUST_MACRO, got: %q (message=%q)",
+			got, report.Errors[0].Message)
+	}
+	if !strings.Contains(report.Errors[0].Message, "include_bytes") {
+		t.Errorf("expected errors[0].message to reference include_bytes; got: %q",
+			report.Errors[0].Message)
+	}
+
+	// Hard guarantees that the compile step did NOT run:
+	//
+	// 1. No deployment row was written — Create never reached.
+	// 2. No artifact blob was saved — Save never reached.
+	// 3. The analyzer subprocess WAS invoked (so we know the guard
+	//    fired AFTER parsing, not because edge-migrate failed to
+	//    run).
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected no deployment rows (short-circuit must skip DB insert); got %d",
+			len(repo.deployments))
+	}
+	if len(store.saveCalls) != 0 {
+		t.Errorf("expected artifact.Save never called (short-circuit); got %d calls",
+			len(store.saveCalls))
+	}
+	if _, err := os.Stat(sentinelPath); err != nil {
+		t.Errorf("expected fake edge-migrate to have been invoked (sentinel missing): %v", err)
+	}
+}
+
 func TestMigrateTree_RustRejected(t *testing.T) {
 	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 

@@ -15,8 +15,8 @@ use edge_migrate_lib::{
     analyzer::CAnalyzer,
     is_valid_app_name,
     preprocessor::{Preprocessor, PreprocessorInfo},
-    report::{MigrationReport, TransformOutput, TRANSFORM_OUTPUT_VERSION},
-    rust_analyzer::RustAnalyzer,
+    report::{MigrationReport, MigrationStatus, TransformOutput, TRANSFORM_OUTPUT_VERSION},
+    rust_analyzer::{RustAnalyzer, DENY_CODE_RUST_MACRO},
     rust_transformer::RustTransformer,
     transformer::Transformer,
     tree::{transform_tree_for_language_with_app_name, walk_tree_for_language, FileEntry},
@@ -220,11 +220,8 @@ async fn main() -> Result<()> {
             }
             Language::Rust => {
                 let mut analyzer = RustAnalyzer::new();
-                let matches = analyzer.analyze(&source);
-                MigrationReport::from_pattern_matches(
-                    &derive_app_name(source_path, Language::Rust),
-                    matches,
-                )
+                analyzer
+                    .analyze_with_security(&derive_app_name(source_path, Language::Rust), &source)
             }
         };
         // Emit a single JSON document on stdout. No trailing newline;
@@ -270,12 +267,35 @@ async fn main() -> Result<()> {
             Language::Rust => {
                 // No preprocessor for Rust in v1. See the
                 // rust_analyzer.rs header comment for the future
-                // rustc -Zunpretty=expanded hook.
+                // rustc -Zunpretty=expanded hook. The
+                // `analyze_with_security` call applies the
+                // SECURITY_DENY:RUST_MACRO deny-list (issue #622)
+                // and short-circuits with `Status: Failed` before
+                // any pattern detection / transform runs — we then
+                // bail out below so we never feed a denied source
+                // to `rustc`.
                 let mut analyzer = RustAnalyzer::new();
-                let matches = analyzer.analyze(&source);
-                let report = MigrationReport::from_pattern_matches(&app_name, matches.clone());
-                let result = RustTransformer.transform(&source, matches);
-                (report, result.transformed_source)
+                let report = analyzer.analyze_with_security(&app_name, &source);
+                if matches!(report.status, MigrationStatus::Failed)
+                    && report
+                        .errors
+                        .iter()
+                        .any(|e| e.code.as_deref() == Some(DENY_CODE_RUST_MACRO))
+                {
+                    // Return the deny-list report with an empty
+                    // transformed body. The Go service consumes
+                    // `wasi_c` as the source to feed `rustc`; an
+                    // empty body means rustc receives nothing —
+                    // but the Go short-circuit guard (added
+                    // alongside this commit) skips the compile
+                    // entirely when `Status: Failed`, so this
+                    // output is never used.
+                    (report, String::new())
+                } else {
+                    let matches = analyzer.analyze(&source);
+                    let result = RustTransformer.transform(&source, matches);
+                    (report, result.transformed_source)
+                }
             }
         };
 
