@@ -148,6 +148,14 @@ async fn run_e2e() -> anyhow::Result<()> {
         tls_cert_path: None,
         tls_key_path: None,
         worker_bootstrap_secret: String::new(),
+        // Per-worker identity (issue #430): paths are inside the
+        // tempdir so the test never touches a real on-disk key. The
+        // supervisor never reads these in this test (no bootstrap
+        // enrollment happens — the test disables signature
+        // verification).
+        worker_key_path: cache_dir.path().join("identity.key"),
+        worker_identity_path: cache_dir.path().join("identity.key"),
+        worker_reenroll_on_boot: false,
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy::default(),
         hostname_pinning_enabled: false,
         standby_pool_size: 5,
