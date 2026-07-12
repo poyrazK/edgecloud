@@ -1240,6 +1240,17 @@ impl ApiClient {
     pub fn domains(&self) -> crate::api::domains::DomainClient<'_> {
         crate::api::domains::DomainClient { client: self }
     }
+
+    // ---- Tenant webhooks (issue #565) ----
+
+    /// Accessor for the `webhooks` namespace. The returned
+    /// `WebhookClient` borrows this `ApiClient` so the API-key +
+    /// base_url are shared across all subcommands without cloning
+    /// the underlying HTTP client (which is already internally
+    /// `Arc`-shared by reqwest).
+    pub fn webhooks(&self) -> crate::api::webhooks::WebhookClient<'_> {
+        crate::api::webhooks::WebhookClient { client: self }
+    }
 }
 
 /// Tenant-management endpoints. Borrows the parent [`ApiClient`] so

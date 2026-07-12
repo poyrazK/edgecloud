@@ -120,6 +120,139 @@ impl From<DomainsCommand> for commands::domains::DomainsAction {
     }
 }
 
+/// `edge webhooks <add|list|update|remove>` — manage tenant webhook
+/// subscriptions (issue #565). The full subcommand surface is
+/// defined here (clap derives the help text from it) and dispatched
+/// through `commands::webhooks::WebhooksAction::run`. Adding a new
+/// subcommand means one variant here + one match arm.
+///
+/// Webhooks are tenant-scoped (not app-scoped), so the `<app>`
+/// positional from the `domains` group is intentionally absent —
+/// every route on the control plane lives at `/api/v1/webhooks*`
+/// with no app-name path segment.
+#[derive(Subcommand)]
+enum WebhooksCommand {
+    /// Register a new webhook subscription.
+    Add {
+        /// Target URL (https-only; validated server-side).
+        url: String,
+        /// Comma-separated event types (deploy, activate, rollback,
+        /// auto_rollback). See `edge webhooks list` for the
+        /// authoritative set.
+        #[arg(long, value_name = "EVENTS")]
+        events: String,
+        /// Optional human-readable description of the webhook.
+        #[arg(long)]
+        description: Option<String>,
+        /// Signing secret (≥16 chars). Insecure — visible in
+        /// process listings and shell history. Prefer `--no-echo`
+        /// on a TTY or pipe the secret via stdin (no flag).
+        #[arg(long)]
+        secret: Option<String>,
+        /// Read the secret from /dev/tty without echoing. Requires
+        /// a controlling terminal. Ignored when `--secret` is set.
+        #[arg(long, conflicts_with = "secret")]
+        no_echo: bool,
+    },
+    /// List all webhook subscriptions for the current tenant.
+    List,
+    /// Update an existing webhook by id. Each flag is optional —
+    /// omit a flag to leave that field unchanged.
+    Update {
+        /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
+        id: String,
+        /// New target URL (https-only).
+        #[arg(long)]
+        url: Option<String>,
+        /// Replace the event-type list.
+        #[arg(long, value_name = "EVENTS")]
+        events: Option<String>,
+        /// Replace the description (use empty string to clear).
+        #[arg(long)]
+        description: Option<String>,
+        /// Mark the webhook as enabled.
+        #[arg(long, conflicts_with = "disable")]
+        enabled: bool,
+        /// Mark the webhook as disabled (suspends delivery).
+        #[arg(long)]
+        disable: bool,
+        /// Rotate the signing secret. Server does not echo it back.
+        #[arg(long)]
+        secret: Option<String>,
+    },
+    /// Delete a webhook by id.
+    Remove {
+        /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
+        id: String,
+    },
+}
+
+impl From<WebhooksCommand> for commands::webhooks::WebhooksAction {
+    fn from(cmd: WebhooksCommand) -> Self {
+        match cmd {
+            WebhooksCommand::Add {
+                url,
+                events,
+                description,
+                secret,
+                no_echo,
+            } => {
+                // Validate events at the clap boundary so an unknown
+                // token surfaces as a clean clap error (exit 2) rather
+                // than an anyhow chain at runtime. `commands::webhooks`
+                // also validates defensively — single source of truth
+                // for the message text, but clap's required-arg + the
+                // helper give us a 0-RTT reject.
+                let parsed_events =
+                    commands::webhooks::validate_events(&events).unwrap_or_else(|e| {
+                        clap::Error::raw(clap::error::ErrorKind::ValueValidation, format!("{e}\n"))
+                            .exit()
+                    });
+                Self::Add {
+                    url,
+                    events: parsed_events,
+                    description: description.unwrap_or_default(),
+                    secret,
+                    no_echo,
+                }
+            }
+            WebhooksCommand::List => Self::List,
+            WebhooksCommand::Update {
+                id,
+                url,
+                events,
+                description,
+                enabled,
+                disable,
+                secret,
+            } => {
+                let parsed_events = events.as_deref().map(|s| {
+                    commands::webhooks::validate_events(s).unwrap_or_else(|e| {
+                        clap::Error::raw(clap::error::ErrorKind::ValueValidation, format!("{e}\n"))
+                            .exit()
+                    })
+                });
+                let enabled = if enabled {
+                    Some(true)
+                } else if disable {
+                    Some(false)
+                } else {
+                    None
+                };
+                Self::Update {
+                    id,
+                    url,
+                    events: parsed_events,
+                    description,
+                    enabled,
+                    secret,
+                }
+            }
+            WebhooksCommand::Remove { id } => Self::Remove { id },
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Scaffold a new project.
@@ -513,6 +646,10 @@ enum Command {
     #[command(subcommand)]
     Domains(DomainsCommand),
 
+    /// Manage tenant webhook subscriptions (issue #565).
+    #[command(subcommand)]
+    Webhooks(WebhooksCommand),
+
     /// Manage billing checkout, portal, and subscription state.
     Billing {
         #[command(subcommand)]
@@ -765,6 +902,10 @@ fn main() -> Result<()> {
         },
         Command::Domains(cmd) => {
             let action: commands::domains::DomainsAction = cmd.into();
+            action.run(&cli.path)
+        }
+        Command::Webhooks(cmd) => {
+            let action: commands::webhooks::WebhooksAction = cmd.into();
             action.run(&cli.path)
         }
         Command::Billing { action } => commands::billing::run(&cli.path, action),
