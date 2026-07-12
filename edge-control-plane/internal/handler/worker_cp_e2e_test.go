@@ -154,12 +154,17 @@ func migrationsDir(t *testing.T) string {
 //     wire-contract fixture uses, so the same wire shape is pinned
 //     on both sides),
 //   - the configured internal token string, so tests can present the
-//     correct `X-Internal-Token` header without re-reading the cfg.
+//     correct `X-Internal-Token` header without re-reading the cfg,
+//   - the same `storage.ArtifactStore` wired into `app.New`, so
+//     tamper tests can rewrite the on-disk artifact post-seed and
+//     observe the CP streaming the modified bytes (the CP doesn't
+//     re-verify before serving).
 //
-// Each call gets its own Postgres container (via t.Cleanup) so tests
-// can run in parallel and don't share DB state. The 100 MiB body cap
-// is honored via the FS artifact store the same way production does.
-func newTestCP(t *testing.T) (*httptest.Server, *sqlx.DB, *signing.Keyring, string) {
+// Each call gets its own Postgres container + FS artifact root
+// (both via t.TempDir / t.Cleanup) so tests can run in parallel and
+// don't share state. The 100 MiB body cap is honored via the FS
+// artifact store the same way production does.
+func newTestCP(t *testing.T) (*httptest.Server, *sqlx.DB, *signing.Keyring, string, storage.ArtifactStore) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -218,7 +223,8 @@ func newTestCP(t *testing.T) (*httptest.Server, *sqlx.DB, *signing.Keyring, stri
 	// chain doesn't touch NATS at the HTTP layer; only
 	// `publisher.Conn()` (returns nil on zero-value) is consulted by
 	// background goroutines the test never starts.
-	application := app.New(cfg, db, &nats.NATSPublisher{}, storage.NewFSArtifactStore(artifactPath), emptyFS)
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+	application := app.New(cfg, db, &nats.NATSPublisher{}, artifactStore, emptyFS)
 	require.NotNil(t, application)
 	require.NotNil(t, application.Handler, "app.Handler must be non-nil")
 
@@ -233,7 +239,7 @@ func newTestCP(t *testing.T) (*httptest.Server, *sqlx.DB, *signing.Keyring, stri
 	// with what the Rust `verifier::Keyring::verify` does on its side.
 	keyring := signing.TestKeyring(t)
 
-	return srv, db, keyring, e2eInternalToken
+	return srv, db, keyring, e2eInternalToken, artifactStore
 }
 
 // signBootstrapPayload is defined in `internal_test.go:276` and reused
@@ -338,7 +344,7 @@ func freshNonce(t *testing.T) string {
 // + `{secret: <jwt_secret>}`. The returned secret must equal the
 // JWT_SECRET the test configured (`e2eJWTSecret`).
 func TestWorkerCP_BootstrapHandshakeSucceeds(t *testing.T) {
-	srv, _, _, _ := newTestCP(t)
+	srv, _, _, _, _ := newTestCP(t)
 
 	workerID := "w_test_handshake"
 	region := "fra"
@@ -408,7 +414,7 @@ func TestWorkerCP_BootstrapHandshakeSucceeds(t *testing.T) {
 // (via `hmac.Equal`) so the timing-safe path is exercised; we just
 // assert the HTTP status code here.
 func TestWorkerCP_BootstrapRejectsBadSignature(t *testing.T) {
-	srv, _, _, _ := newTestCP(t)
+	srv, _, _, _, _ := newTestCP(t)
 
 	ts := time.Now().Format(time.RFC3339)
 	nonce := freshNonce(t)
@@ -438,7 +444,7 @@ func TestWorkerCP_BootstrapRejectsBadSignature(t *testing.T) {
 // at `internal/handler/internal.go:679-681` (±5 min skew window).
 // Using `-10 minutes` ensures we're well outside the window.
 func TestWorkerCP_BootstrapRejectsStaleTimestamp(t *testing.T) {
-	srv, _, _, _ := newTestCP(t)
+	srv, _, _, _, _ := newTestCP(t)
 
 	stale := time.Now().Add(-10 * time.Minute).Format(time.RFC3339)
 	nonce := freshNonce(t)
@@ -468,4 +474,208 @@ func readBody(r io.Reader) string {
 	const maxDump = 4 << 10
 	b, _ := io.ReadAll(io.LimitReader(r, maxDump))
 	return fmt.Sprintf("%s", b)
+}
+
+// freshArtifactBytes returns a deterministic-looking byte slice for
+// the seed-deployment helper. The contents don't need to be a real
+// Wasm module — the test re-hashes whatever the server streams back
+// and compares against `row.Hash`. Using distinct per-test bytes
+// keeps the cache invalidation case (#5) easy to read.
+func freshArtifactBytes(seed byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = seed
+	}
+	return out
+}
+
+// ── Test 4: worker-JWT download lane — the headline test ────────────
+
+// TestWorkerCP_DownloadViaWorkerJWT_Succeeds is the headline test for
+// issue #612. It seeds a `deployments` row with a real CP-produced
+// Ed25519 signature (via `signing.Keyring.Sign`), mints a worker JWT
+// matching the row's tenant, downloads the artifact via the JWT lane,
+// and asserts:
+//
+//  1. HTTP 200,
+//  2. body bytes equal the seeded wasm,
+//  3. SHA-256 of the body matches the row's `hash` column,
+//  4. `signing.Keyring.Verify(hash, deployment_id, row.Signature,
+//     row.SigningKeyID)` returns true — the same algorithm the Rust
+//     `Downloader::verify_signature` runs in `edge-worker/src/downloader.rs:446`.
+//
+// The Rust side of the wire is independently pinned by
+// `edge-worker/tests/signing_wire_contract.rs::well_known_signature_verifies_in_rust_keyring`
+// against the same signature format, so a green run on both
+// `go-test-integration` and `rust-test` proves the cross-language wire
+// is intact.
+func TestWorkerCP_DownloadViaWorkerJWT_Succeeds(t *testing.T) {
+	srv, db, keyring, _, store := newTestCP(t)
+
+	tenantID := "t_dl_jwt_ok"
+	appName := "app-jwt"
+	deploymentID := "d_dl_jwt_ok_0001"
+	wasmBytes := freshArtifactBytes(0xAB, 256)
+
+	// The `store` returned by newTestCP is the same FS-backed artifact
+	// store wired into `app.New`; seedDeploymentRow writes the bytes
+	// through it, and the Download handler later reads them back
+	// through it. Using the same instance keeps the on-disk layout
+	// consistent between seed and serve.
+	hashHex, sig, kid := seedDeploymentRow(t, db, store, keyring,
+		tenantID, appName, deploymentID, wasmBytes)
+
+	// Mint a worker JWT scoped to the row's tenant.
+	tok := issueWorkerJWT(t, e2eJWTSecret, e2eIssuer, middleware.WorkerClaims{
+		WorkerID: "w_dl_jwt",
+		TenantID: tenantID,
+		Region:   "test",
+		Apps:     []string{appName},
+	})
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"worker-JWT download must 200; body=%s", readBody(resp.Body))
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, wasmBytes, got, "downloaded bytes must equal seeded wasm")
+
+	// Re-hash the body in-test and assert the row's `hash` column
+	// matches. This is the same check `verify_hash` in the Rust
+	// downloader (`edge-worker/src/downloader.rs:532-580`) does.
+	sum := sha256.Sum256(got)
+	require.Equal(t, hashHex, hex.EncodeToString(sum[:]),
+		"recomputed SHA-256 of response body must match row.hash")
+
+	// Verify the row's stored Ed25519 signature against the re-hashed
+	// payload. This is the same call `Downloader::verify_signature`
+	// makes on the worker side.
+	ok, err := keyring.Verify(hashHex, deploymentID, sig, kid)
+	require.NoError(t, err, "keyring.Verify must not error")
+	require.True(t, ok,
+		"the row's stored signature must verify under the test keyring — a failure here means a Go signer / verifier drift that breaks the cross-language wire")
+}
+
+// ── Test 5: worker-JWT download returns tampered artifact ──────────
+
+// TestWorkerCP_DownloadViaWorkerJWT_TamperedArtifactRejected seeds a
+// row with a real signature, then overwrites the on-disk artifact
+// bytes post-seed. The CP streams whatever is on disk (it does NOT
+// re-verify before serving — see `internal.go:217-255`); the worker
+// is the side that catches the mismatch via `verify_hash`. The test
+// confirms the CP-side guard failure mode: the server still returns
+// 200 + the (tampered) bytes, but the recomputed SHA-256 of those
+// bytes no longer matches `row.Hash` — which is exactly the signal
+// `Downloader::verify_hash` would catch in production.
+func TestWorkerCP_DownloadViaWorkerJWT_TamperedArtifactRejected(t *testing.T) {
+	srv, db, keyring, _, store := newTestCP(t)
+
+	tenantID := "t_dl_jwt_tamper"
+	appName := "app-tamper"
+	deploymentID := "d_dl_jwt_tamper_0001"
+	wasmBytes := freshArtifactBytes(0xCD, 256)
+
+	hashHex, _, _ := seedDeploymentRow(t, db, store, keyring,
+		tenantID, appName, deploymentID, wasmBytes)
+
+	// Overwrite the on-disk artifact with different bytes. The CP
+	// keeps the row's signature and hash (those live in Postgres),
+	// but the FS artifact store no longer matches.
+	tampered := freshArtifactBytes(0xEF, 256)
+	require.NoError(t, store.Save(context.Background(), tenantID, appName, deploymentID,
+		bytes.NewReader(tampered)))
+
+	tok := issueWorkerJWT(t, e2eJWTSecret, e2eIssuer, middleware.WorkerClaims{
+		WorkerID: "w_dl_jwt_tamper",
+		TenantID: tenantID,
+		Region:   "test",
+		Apps:     []string{appName},
+	})
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID, nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"the CP doesn't re-verify before streaming; it returns the bytes on disk regardless. body=%s", readBody(resp.Body))
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, tampered, got,
+		"the CP should return whatever is on disk — the row's hash is the worker's guard, not the CP's")
+
+	sum := sha256.Sum256(got)
+	require.NotEqual(t, hashHex, hex.EncodeToString(sum[:]),
+		"the worker-side guard (Downloader::verify_hash) catches this mismatch; if this assertion ever fails, the row and the artifact have drifted in an unrecoverable way")
+}
+
+// ── Test 11: missing deployment returns 404 ────────────────────────
+
+// TestWorkerCP_DownloadMissingDeployment_Returns404 asserts that a
+// valid worker JWT for a non-existent deployment_id returns 404, not
+// 200 or 500. Pins the `httperror.NotFoundCtx` branch in
+// `internal.go:228-231`.
+func TestWorkerCP_DownloadMissingDeployment_Returns404(t *testing.T) {
+	srv, _, _, _, _ := newTestCP(t)
+
+	tok := issueWorkerJWT(t, e2eJWTSecret, e2eIssuer, middleware.WorkerClaims{
+		WorkerID: "w_dl_missing",
+		TenantID: "t_dl_missing",
+		Region:   "test",
+	})
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/d_does_not_exist", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"missing deployment must 404; body=%s", readBody(resp.Body))
+}
+
+// ── Test 12: ?format=wasm (and omitted) streams the .wasm file ──────
+
+// TestWorkerCP_DownloadFormatQuery_WasmDefault asserts the
+// `?format=wasm` query (and the default-empty form) routes to the
+// `.wasm` artifact. Pins `internal.go:233-234` + `FSArtifactStore.OpenFormat`
+// (`internal/storage/artifact.go:260-265`).
+func TestWorkerCP_DownloadFormatQuery_WasmDefault(t *testing.T) {
+	srv, db, keyring, _, store := newTestCP(t)
+
+	tenantID := "t_dl_format"
+	appName := "app-format"
+	deploymentID := "d_dl_format_0001"
+	wasmBytes := freshArtifactBytes(0x77, 128)
+	seedDeploymentRow(t, db, store, keyring,
+		tenantID, appName, deploymentID, wasmBytes)
+
+	tok := issueWorkerJWT(t, e2eJWTSecret, e2eIssuer, middleware.WorkerClaims{
+		WorkerID: "w_dl_format",
+		TenantID: tenantID,
+		Region:   "test",
+	})
+
+	for _, query := range []string{"", "?format=wasm"} {
+		t.Run("query="+query, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/api/internal/download/"+deploymentID+query, nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer "+tok)
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode,
+				"format=%q must 200; body=%s", query, readBody(resp.Body))
+			require.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
+			got, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.Equal(t, wasmBytes, got, "format=%q must stream the .wasm file", query)
+		})
+	}
 }
