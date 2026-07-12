@@ -97,7 +97,6 @@ impl TenantRateLimitCache {
     /// Iterate `(tenant_id, state)` for every tenant with `rps > 0`.
     /// The renderer's hot path: skip zero-rps rows so the route table
     /// only carries tenants that need a route.
-    #[allow(dead_code)] // consumed by the renderer in issue #305 commit 4.
     pub fn active_caps(&self) -> impl Iterator<Item = (&String, &TenantRateLimitState)> {
         self.inner.iter().filter(|(_, s)| s.rps > 0)
     }
