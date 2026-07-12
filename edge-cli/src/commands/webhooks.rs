@@ -163,18 +163,17 @@ impl WebhooksAction {
     /// webhooks before their first deploy.
     ///
     /// **Phase-2 deferred (issue #571 follow-up).** `Add` is a POST
-    /// insert and a retried POST could either 409 (duplicate
-    /// `(tenant, url)` would require a server-side unique
-    /// constraint that doesn't exist today — the Go model has no
-    /// unique index) or insert a duplicate row depending on the
-    /// server's race window. The right fix is CP-side
-    /// `Idempotency-Key` schema extension. Until that lands, `Add`
-    /// does NOT route through `call_with_retry`. Same reasoning
-    /// applies to `Update` (PUT-with-side-effects; replaying a
-    /// successful update with a stale body is worse than failing
-    /// once). `Remove` IS retryable — DELETE is naturally
-    /// idempotent (second call returns 404 with no side effect),
-    /// and `List` is a read.
+    /// insert; a retried POST would silently insert a duplicate
+    /// row since the schema has no unique `(tenant_id, url)`
+    /// constraint today (`edge-control-plane/migrations/` has no
+    /// unique index on the `webhooks` table). The right fix is
+    /// CP-side `Idempotency-Key` schema extension — until that
+    /// lands, `Add` does NOT route through `call_with_retry`.
+    /// Same reasoning applies to `Update` (PUT-with-side-effects;
+    /// replaying a successful update with a stale body is worse
+    /// than failing once). `Remove` IS retryable — DELETE is
+    /// naturally idempotent (second call returns 404 with no side
+    /// effect), and `List` is a read.
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
         let edge_toml = EdgeToml::from_path(path)?;
@@ -303,14 +302,19 @@ impl WebhooksAction {
 
 /// Clip a string to `max` chars; append an ellipsis when truncated
 /// so the table column widths declared in the header line stay
-/// honest. Byte-based clip avoids panicking on multi-byte UTF-8
-/// (rare in URLs / event lists, but a default-build panic is
-/// cheap to avoid).
+/// honest. Single-pass: `chars().nth(max)` short-circuits on
+/// short input (returns `None` → no truncation needed) without
+/// counting the whole string first. Byte-based clip avoids
+/// panicking on multi-byte UTF-8 (rare in URLs / event lists, but
+/// a default-build panic is cheap to avoid).
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    // `nth(max)` returns `None` when the string has at most `max`
+    // chars — short-circuit before allocating. O(max) instead of
+    // O(2n).
+    if s.chars().nth(max).is_none() {
         s.to_string()
     } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
     }
@@ -416,5 +420,79 @@ mod tests {
         let clipped = clip(&s, 10);
         assert_eq!(clipped.chars().count(), 10);
         assert!(clipped.ends_with('…'));
+    }
+
+    // acquire_secret boundary tests. The function has two bail!
+    // arms (empty secret, <16 chars) that cannot be exercised by a
+    // wiremock test — the CLI exits before the wire round-trip.
+    // Pinning them offline catches drift in the server-side length
+    // check at `internal/handler/webhook.go:158` (currently `len
+    // < 16`), which is the contract this helper mirrors.
+
+    #[test]
+    fn acquire_secret_rejects_empty_string() {
+        let err = acquire_secret(Some(""), false).unwrap_err();
+        assert!(
+            format!("{err}").contains("empty"),
+            "expected empty-secret error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_secret_rejects_whitespace_only_string() {
+        // `trim()` runs first, so `"   "` becomes `""` and falls
+        // into the empty-secret arm. Pin the behavior — a future
+        // refactor that drops the trim() would silently accept
+        // whitespace-only secrets.
+        let err = acquire_secret(Some("   "), false).unwrap_err();
+        assert!(
+            format!("{err}").contains("empty"),
+            "expected empty-secret error after trim, got: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_secret_rejects_secret_below_16_chars() {
+        let err = acquire_secret(Some("short"), false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("at least 16"),
+            "expected length-floor error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn acquire_secret_rejects_secret_at_15_chars() {
+        // 15 is below the floor; pin the off-by-one boundary so a
+        // future `len < 15` / `len <= 15` drift on either side
+        // (CLI or server) fails CI here.
+        let err = acquire_secret(Some("abcdefghijklmno"), false).unwrap_err();
+        assert!(
+            format!("{err}").contains("at least 16"),
+            "expected 15-char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_secret_accepts_secret_at_16_chars() {
+        // Exactly 16 chars passes — the floor is inclusive
+        // (`len < 16` bails, `len == 16` succeeds). Pin the
+        // boundary on the success side too.
+        let value = acquire_secret(Some("abcdefghijklmnop"), false).unwrap();
+        assert_eq!(value, "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn acquire_secret_trims_surrounding_whitespace() {
+        // Surrounding whitespace is trimmed before the length
+        // check, so a 14-char secret with a leading + trailing
+        // space (16 chars raw, 14 after trim) is rejected. Pin
+        // this so a future refactor that bypasses trim() and
+        // counts raw bytes is caught.
+        let err = acquire_secret(Some("  twelve-chars  "), false).unwrap_err();
+        assert!(
+            format!("{err}").contains("at least 16"),
+            "expected length-floor error after trim, got: {err}"
+        );
     }
 }
