@@ -285,13 +285,13 @@ func newE2EPostgres(t *testing.T, ctx context.Context) *tcpg.PostgresContainer {
 
 func newE2ENATS(t *testing.T, ctx context.Context) *tcnats.NATSContainer {
 	t.Helper()
+	// Default `RunContainer` already sets `-js` (testcontainers-go
+	// v0.43.0/modules/nats/nats.go default Cmd). Don't pass
+	// `WithArgument("-js", "true")` — it assembles
+	// `nats-server --js true` and NATS treats `true` as an unknown
+	// positional, prints help, and exits with code 0.
 	c, err := tcnats.RunContainer(ctx,
 		tc.WithImage("nats:2.10-alpine"),
-		// Without JetStream, js.Publish in publisher.go returns
-		// "nats: JetStream not enabled" — Activate succeeds (the outbox
-		// row lands in Postgres), but the drainer tick that publishes
-		// to NATS fails. The -js flag enables JetStream on the server.
-		tcnats.WithArgument("-js", "true"),
 	)
 	require.NoError(t, err)
 	return c
