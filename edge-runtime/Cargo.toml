@@ -28,10 +28,12 @@ http = "1"
 
 # Caching
 # Bumped 0.12 → 0.18 (issue #625) to clear RUSTSEC-2026-0002 (unsound
-# IterMut). Our usage is `LruCache::new`/`put`/`get`/`peek`/`pop`/
-# `len`/`contains` only — no `IterMut` — so the unsoundness is
+# IterMut). Pinned to `=0.18` so the security fix doesn't silently
+# regress on the next `cargo update`. Our usage in
+# `interfaces/cache.rs` is `LruCache::new`/`get`/`pop`/`len`/
+# `push`/`clear`/`iter` only — no `IterMut` — so the unsoundness is
 # theoretical for us, but bumping keeps the lockfile clean.
-lru = { version = "0.18", optional = true }
+lru = { version = "=0.18", optional = true }
 parking_lot = "0.12"
 
 # Metrics
@@ -91,8 +93,12 @@ http-body-util = "0.1"
 # Default features gate only modules that still exist in
 # `src/interfaces/`. The v0.2 cleanup dropped `http-client`, `http-server`,
 # `networking`, and `dns`; their deps (`reqwest`, `futures`, `bytes`,
-# `httparse`, `rustls`, `rustls-pemfile`, `tokio-rustls`, `flate2`,
+# `httparse`, `rustls`, `tokio-rustls`, `flate2`,
 # `trust-dns-resolver`) are no longer listed.
+#
+# `rustls-pemfile` was never a direct dep of `edge-runtime` (it lived
+# in `edge-worker` until issue #625 dropped it in favor of the in-tree
+# `rustls::pki_types::pem::PemObject` API).
 default = ["kv-store", "cache", "observe", "time", "scheduling", "process", "egress-tls"]
 kv-store = []
 cache = ["dep:lru"]
