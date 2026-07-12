@@ -41,6 +41,15 @@
 //! serde round-trip — end-to-end. `handle_task_message` bypasses NATS
 //! entirely and is exercised by the unit-level `compute_app_diff`
 //! tests in `supervisor.rs`.
+//!
+//! Why `require_signature = false`: this test deliberately does NOT
+//! exercise Ed25519 signature verification on the wire — the Go half
+//! signs a hash of the literal string `"handler.wasm"` (4 bytes),
+//! but wiremock returns the real `handler.wasm` fixture, so the
+//! verifier would (correctly) reject the mismatch. Signature
+//! verification is covered separately by the cross-language wire-
+//! contract test from PR #652 (issue #611); this test's scope is the
+//! outbox → NATS → consume loop → heartbeat flip path only.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -161,9 +170,9 @@ async fn run_e2e() -> anyhow::Result<()> {
     // 5. Spawn the worker's JetStream consume loop. It will block on
     //    subscribe_tasks; the first message arrives once the CP half
     //    starts publishing (after rust-ready is written). We wire a
-    //    shutdown receiver so the loop can be cleanly aborted at the
-    //    end of the test without leaving the JetStream consumer
-    //    subscribed to the shared NATS container.
+    //    shutdown receiver so the loop has a graceful exit path —
+    //    step 10 sends `(())` before abort() so the consumer can
+    //    tear down cleanly even if the loop is between messages.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let shutdown_rx = shutdown_tx.subscribe();
     let supervisor_for_loop = supervisor.clone();
@@ -219,7 +228,15 @@ async fn run_e2e() -> anyhow::Result<()> {
     std::fs::write(format!("{}/rust-done", SENTINEL_DIR), "ok")
         .context("write rust-done sentinel")?;
 
-    // 10. Clean up the consume loop so it doesn't keep the test alive.
+    // 10. Clean up the consume loop. Send the shutdown signal first
+    //     so `run_consume_loop` exits via its broadcast-receiver arm
+    //     (graceful teardown of the JetStream consumer); fall back to
+    //     abort() if the loop is stuck on a synchronous path that
+    //     doesn't yield to the broadcast for a while (e.g. inside a
+    //     blocking downloader call). Without this two-step pattern,
+    //     abort() can race against an in-flight blocking I/O and the
+    //     consumer subscription leaks past the test exit.
+    let _ = shutdown_tx.send(());
     consume_handle.abort();
     let _ = consume_handle.await;
 

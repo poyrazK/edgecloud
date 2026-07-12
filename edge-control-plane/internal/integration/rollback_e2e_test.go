@@ -179,6 +179,11 @@ func TestRollbackE2E(t *testing.T) {
 	waitForSentinel(t, "rust-ready", 2*time.Minute)
 
 	// --- 6. Phase 1 — activate d_a ---
+	// The fourth parameter is the idempotency key. We pass "" for all
+	// three phases; the production handler (issue #439 / PR #603)
+	// treats "" as "no cache lookup" so reusing it across calls is
+	// safe today. If a future change (e.g. #636) starts caching
+	// empty-string keys, swap each "" for a fresh uuid.New().String().
 	require.NoError(t, deploymentSvc.ActivateDeployment(ctx, testTenantID, testAppName, deploymentIDA, ""))
 	drainUntilStable(t, drainer, ctx, 2*time.Second)
 	t.Logf("phase 1 (activate %s) drained", deploymentIDA)

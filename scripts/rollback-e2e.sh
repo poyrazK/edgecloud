@@ -70,6 +70,13 @@ cleanup() {
   # The Go half's t.Cleanup blocks tear down Postgres + NATS, so we
   # MUST wait for it to exit cleanly (or `go test` will leak the
   # container past this script's exit).
+  #
+  # The `kill ... 2>/dev/null || true` pattern below is intentional:
+  # a stale PID, a process that already exited between `kill -0` and
+  # `kill`, or a `wait` on a cleared job table all return non-zero
+  # and would abort this trap under `set -e`. We DON'T want cleanup
+  # to fail — the orchestrator's real exit code is set by the
+  # explicit fan-out at the bottom of the script, not here.
   if [[ -n "${RUST_PID}" ]] && kill -0 "${RUST_PID}" 2>/dev/null; then
     echo "cleanup: killing Rust half pid=${RUST_PID}" >&2
     kill "${RUST_PID}" 2>/dev/null || true
