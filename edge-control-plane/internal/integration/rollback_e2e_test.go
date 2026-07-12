@@ -195,7 +195,12 @@ func TestRollbackE2E(t *testing.T) {
 	// --- 5. Hand the NATS URL to the Rust half, then wait for rust-ready ---
 	writeSentinel(t, "nats-url", natsURL)
 	t.Logf("wrote nats-url=%s; waiting for rust-ready", natsURL)
-	waitForSentinel(t, "rust-ready", 2*time.Minute)
+	// 10 minutes covers cold-cache cargo build (3-4m on a fresh
+	// runner with rust-cache miss) + test setup + a generous margin.
+	// The orchestrator's RUST_DONE_WAIT (default 6m) sits below
+	// this so a Rust half crash surfaces as "rust-done timeout"
+	// rather than this fatalling first.
+	waitForSentinel(t, "rust-ready", 10*time.Minute)
 
 	// --- 6. Phase 1 — activate d_a ---
 	// The fourth parameter is the idempotency key. We pass "" for all

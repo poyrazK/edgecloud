@@ -34,7 +34,12 @@ set -euo pipefail
 
 # ---- knobs ----
 SENTINEL_DIR="${SENTINEL_DIR:-/tmp/edge-e2e}"
-GO_TEST_TIMEOUT="${GO_TEST_TIMEOUT:-5m}"
+# go test -timeout caps the per-test budget (CI kills the test if it
+# exceeds this). Must sit ABOVE the Go half's own 15m ctx so the ctx
+# fires first and `t.Cleanup` runs — otherwise go's hard kill tears
+# down the NATS container mid-Rust-build and the Rust half panics
+# on Connection refused. 15m matches the in-test ctx.
+GO_TEST_TIMEOUT="${GO_TEST_TIMEOUT:-15m}"
 # RUST_TEST_TIMEOUT caps the `cargo test` invocation itself (build +
 # link + run). 15m is generous — cold-cache CI rebuilds the full
 # workspace from source and even with rust-cache + sccache that can

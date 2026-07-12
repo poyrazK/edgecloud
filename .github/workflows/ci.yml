@@ -983,6 +983,12 @@ jobs:
         # sentinel — it sits above the test runtime even with
         # container startup, and below the job's 20m timeout.
         env:
+          # GO_TEST_TIMEOUT sits above the Go half's 15-minute ctx
+          # so the ctx fires first and `t.Cleanup` runs (NATS
+          # terminate via the testcontainer). Otherwise `go test
+          # -timeout` kills the process hard and the NATS container
+          # is gone before the Rust half finishes its cargo build.
+          GO_TEST_TIMEOUT: 15m
           RUST_TEST_TIMEOUT: 15m
           RUST_DONE_WAIT: 6m
         run: bash scripts/rollback-e2e.sh
