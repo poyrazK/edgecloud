@@ -83,6 +83,21 @@ async fn cp_rollback_e2e() {
         eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
         return;
     }
+    // This test is the Rust half of a two-process cross-language e2e
+    // orchestrated by `scripts/rollback-e2e.sh`. The orchestrator
+    // publishes the shared NATS URL to `/tmp/edge-e2e/nats-url` before
+    // launching us, then blocks on `/tmp/edge-e2e/rust-done`. If
+    // `EDGE_TEST_NATS_URL` is unset we were launched by the bare
+    // `rust-test-integration` job (no Go half, no orchestrator) — skip
+    // rather than panic on the missing sentinel. The dedicated
+    // `rollback-e2e` CI job sets `EDGE_TEST_NATS_URL` explicitly.
+    if std::env::var("EDGE_TEST_NATS_URL").is_err() && std::env::var("SENTINEL_DIR").is_err() {
+        eprintln!(
+            "SKIPPED: cp_rollback_e2e requires scripts/rollback-e2e.sh \
+             orchestrator (EDGE_TEST_NATS_URL or SENTINEL_DIR unset)"
+        );
+        return;
+    }
 
     // `run_e2e` returns `Err` on assertion failure (which `expect`s
     // up into a panic) and `Ok(())` on success. The `timeout` arm
