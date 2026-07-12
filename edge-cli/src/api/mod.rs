@@ -9,4 +9,4 @@ pub use client::{
     EgressAllowlist, IngressResponse, LogEntry, LogListResponse, PreviewOpts, QuotaResponse,
 };
 pub use domains::Domain;
-pub use webhooks::Webhook;
+pub use webhooks::{Webhook, WebhookDelivery, WebhookDeliveryListResponse};

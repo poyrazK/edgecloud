@@ -12,13 +12,19 @@
 //! intentionally absent from the `Webhook` struct here — the server
 //! never echoes it back, so there is no field to deserialize.
 //!
-//! **Note on `WebhookDelivery`:** the `webhook_deliveries` table is
-//! not yet readable via a tenant-scoped HTTP route (only
-//! `WebhookDeliveryGCService` reads it today; see issue #659 for the
-//! planned `GET /api/v1/webhooks/{id}/deliveries` endpoint). The
-//! DTO and its consumer are deferred to the follow-up PR — adding
-//! it here as dead code would let a future refactor drift the wire
-//! shape without any test catching it.
+//! **`WebhookDelivery` (issue #565 follow-up):** mirrors the Go
+//! `domain.WebhookDelivery` struct field-for-field
+//! (`edge-control-plane/internal/domain/webhook.go:31-44`).
+//! `request_body` and `response_body` are `json:"-"` on the server
+//! side (the wire shape is intentionally redacted — the body may
+//! contain tenant secrets in headers) and so are absent from this
+//! DTO. The CLI only ever reads these rows via the `deliveries`
+//! subcommand, so the field set is intentionally read-only.
+//!
+//! The `deliveries` route is `GET /api/v1/webhooks/{id}/deliveries`,
+//! proposed in issue #659. Until that lands on the control plane,
+//! wiremock tests cover the wire shape; a real-server smoke is
+//! blocked on the CP-side PR.
 //!
 //! `WebhookClient` borrows the parent `ApiClient` so the API key
 //! and base URL are shared across all subcommands without cloning
@@ -68,6 +74,73 @@ pub struct Webhook {
 #[derive(Debug, Deserialize)]
 struct WebhookListResponse {
     webhooks: Vec<Webhook>,
+}
+
+/// One row of the `webhook_deliveries` table as seen by the tenant
+/// via `GET /api/v1/webhooks/{id}/deliveries` (issue #565
+/// follow-up, server side: issue #659). Mirrors the Go
+/// `domain.WebhookDelivery` struct field-for-field
+/// (`edge-control-plane/internal/domain/webhook.go:31-44`) minus
+/// `RequestBody` and `ResponseBody` (both `json:"-"` server-side).
+///
+/// Field semantics:
+/// - `id` is the delivery row's primary key (monotonically
+///   increasing). The server's cursor is opaque — clients pass it
+///   back verbatim — so the CLI never inspects the int value.
+/// - `webhook_id` is the subscription this delivery belongs to.
+/// - `event_type` is the event that triggered the delivery
+///   (`deploy`, `activate`, `rollback`, `auto_rollback`).
+/// - `status` is server-defined (`pending`, `delivered`, `failed`).
+///   `#[serde(default)]` is defensive: a future server that adds a
+///   new status decodes as empty string rather than failing the
+///   whole row.
+/// - `status_code` is the HTTP response code from the receiver, or
+///   `null` if the attempt failed before a response (DNS error,
+///   timeout, TLS handshake). `#[serde(default)]` is required
+///   because the Go side is `*int` with `omitempty` — absent on
+///   pre-response failures.
+/// - `error_msg` is server-set on failure (e.g. "connection
+///   refused"), empty string on success. `#[serde(default)]` for
+///   the same `omitempty` reason.
+/// - `attempt` / `max_attempts` distinguish the first try from a
+///   retry (server-side: 3-attempt policy per issue body).
+/// - `created_at` / `completed_at` are RFC3339 strings (the Go
+///   side formats via `time.Time` JSON). `completed_at` may be
+///   `null` for in-flight deliveries — `#[serde(default)]` keeps
+///   the deserializer happy with the `omitempty` Go pattern.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WebhookDelivery {
+    pub id: i64,
+    pub webhook_id: String,
+    pub event_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub status_code: Option<i32>,
+    #[serde(default)]
+    pub error_msg: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    pub created_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// Wire shape for `GET /api/v1/webhooks/{id}/deliveries` (issue
+/// #659). The handler wraps the array in an object so future
+/// fields (totals, filters) can be added without breaking the
+/// CLI, and adds an opaque `next_cursor` token for pagination.
+///
+/// `next_cursor` semantics (per issue #659):
+/// - `None` (decodes as `null` on the wire, `Option<String>` here)
+///   means "no more pages" — the CLI stops paging.
+/// - `Some("...")` means pass it back as `?cursor=...` to fetch
+///   the next page. The CLI never inspects the value; it's opaque
+///   from the client's perspective.
+#[derive(Debug, Deserialize)]
+pub struct WebhookDeliveryListResponse {
+    pub deliveries: Vec<WebhookDelivery>,
+    pub next_cursor: Option<String>,
 }
 
 /// Borrowed accessor for the webhook endpoints. Constructed via
@@ -187,4 +260,74 @@ impl<'a> WebhookClient<'a> {
         check_response(resp).context("remove webhook request failed")?;
         Ok(())
     }
+
+    /// Fetch one page of delivery attempts for a webhook
+    /// subscription (issue #565 follow-up). Server-side route:
+    /// `GET /api/v1/webhooks/{id}/deliveries` (issue #659).
+    ///
+    /// `limit` is sent as `?limit=<N>`. Server clamps to the
+    /// `[1, 200]` range per issue #659; the CLI doesn't enforce
+    /// here (server is source of truth). `cursor` is the opaque
+    /// `next_cursor` returned by the previous page (or `None` on
+    /// the first call). Returns both the page rows AND the
+    /// `next_cursor` — `None` means "no more pages".
+    ///
+    /// The 404 path (unknown `id`, or `id` belonging to a
+    /// different tenant) flows through `check_response` and is
+    /// surfaced as `ApiError::Rejected { status: 404, .. }`.
+    pub fn deliveries(
+        &self,
+        id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<WebhookDeliveryListResponse> {
+        let mut endpoint = format!(
+            "{}/api/v1/webhooks/{}/deliveries?limit={}",
+            self.client.base_url(),
+            id,
+            limit
+        );
+        if let Some(c) = cursor {
+            // Opaque token: percent-encode defensively in case the
+            // server ever changes the cursor encoding to something
+            // that needs URL-escaping.
+            endpoint.push_str("&cursor=");
+            endpoint.push_str(
+                &url_encode(c),
+            );
+        }
+        let resp = self
+            .client
+            .http()
+            .get(&endpoint)
+            .header("Authorization", self.client.auth_header())
+            .send()
+            .context("GET /api/v1/webhooks/{id}/deliveries")?;
+        let resp = check_response(resp).context("list deliveries request failed")?;
+        resp.json()
+            .context("decoding deliveries response (missing 'deliveries' / 'next_cursor' field?)")
+    }
+}
+
+/// Minimal percent-encoder for the opaque `next_cursor` token.
+/// The server's current cursor (per issue #659) is base64
+/// (`A-Z`, `a-z`, `0-9`, `+`, `/`, `=`) so a literal append would
+/// "work today" — but the CLI treats the cursor as opaque on
+/// purpose, so we encode anything outside `[A-Za-z0-9._~-]` to
+/// stay forward-compatible with a server change. Uses a small
+/// pre-allocated `String` instead of pulling a new crate dep for
+/// one call site.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
 }

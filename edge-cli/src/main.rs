@@ -120,11 +120,11 @@ impl From<DomainsCommand> for commands::domains::DomainsAction {
     }
 }
 
-/// `edge webhooks <add|list|update|remove>` — manage tenant webhook
-/// subscriptions (issue #565). The full subcommand surface is
-/// defined here (clap derives the help text from it) and dispatched
-/// through `commands::webhooks::WebhooksAction::run`. Adding a new
-/// subcommand means one variant here + one match arm.
+/// `edge webhooks <add|list|update|remove|deliveries>` — manage
+/// tenant webhook subscriptions (issue #565). The full subcommand
+/// surface is defined here (clap derives the help text from it) and
+/// dispatched through `commands::webhooks::WebhooksAction::run`.
+/// Adding a new subcommand means one variant here + one match arm.
 ///
 /// Webhooks are tenant-scoped (not app-scoped), so the `<app>`
 /// positional from the `domains` group is intentionally absent —
@@ -184,6 +184,21 @@ enum WebhooksCommand {
     Remove {
         /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
         id: String,
+    },
+    /// List recent delivery attempts for a webhook (issue #565
+    /// follow-up; server-side route in #659). Paginated via the
+    /// opaque `next_cursor` token the response carries — pass it
+    /// back via `--cursor` to fetch the next page.
+    Deliveries {
+        /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
+        id: String,
+        /// Page size (1..=200; server-clamped per issue #659).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Opaque pagination cursor returned by the previous page
+        /// as `next_cursor`. Omit for the first page.
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 
@@ -249,6 +264,9 @@ impl From<WebhooksCommand> for commands::webhooks::WebhooksAction {
                 }
             }
             WebhooksCommand::Remove { id } => Self::Remove { id },
+            WebhooksCommand::Deliveries { id, limit, cursor } => {
+                Self::Deliveries { id, limit, cursor }
+            }
         }
     }
 }

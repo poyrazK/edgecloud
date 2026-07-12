@@ -21,7 +21,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod common;
@@ -536,4 +536,293 @@ async fn remove_retries_503_then_succeeds() {
         delete_count, 2,
         "expected 503 + 204 = 2 DELETE attempts on /api/v1/webhooks/wh_alpha"
     );
+}
+
+// ---------------------------------------------------------------------------
+// deliveries — GET shape + cursor pagination (issue #565 follow-up)
+// ---------------------------------------------------------------------------
+//
+// The server-side route (`GET /api/v1/webhooks/{id}/deliveries`)
+// is proposed in issue #659. These tests pin the wire shape the
+// CLI expects; if #659's actual server implementation drifts from
+// the proposed envelope (`{"deliveries": [...], "next_cursor":
+// ...}`), the deserialization or table renderer will fail here
+// before the divergence reaches a real tenant.
+
+/// Happy path: a single page with two delivery rows + a null
+/// `next_cursor`. Pins the wire envelope AND the table
+/// rendering (column headers, status string passthrough,
+/// `--limit` query parameter).
+#[tokio::test]
+async fn deliveries_decodes_envelope_and_renders_table() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_alpha/deliveries"))
+        .and(query_param("limit", "50"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "deliveries": [
+                {
+                    "id": 1,
+                    "webhook_id": "wh_alpha",
+                    "event_type": "deploy",
+                    "status": "delivered",
+                    "status_code": 200,
+                    "error_msg": "",
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "created_at": "2026-07-12T10:00:00Z",
+                    "completed_at": "2026-07-12T10:00:01Z"
+                },
+                {
+                    "id": 2,
+                    "webhook_id": "wh_alpha",
+                    "event_type": "activate",
+                    "status": "failed",
+                    "status_code": 502,
+                    "error_msg": "upstream returned 502",
+                    "attempt": 3,
+                    "max_attempts": 3,
+                    "created_at": "2026-07-12T11:00:00Z",
+                    "completed_at": "2026-07-12T11:00:05Z"
+                }
+            ],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("deliveries")
+        .arg("wh_alpha");
+
+    cmd.assert()
+        .success()
+        // Header line + divider
+        .stdout(predicate::str::contains("ATTEMPT"))
+        .stdout(predicate::str::contains("EVENT"))
+        .stdout(predicate::str::contains("STATUS"))
+        // Two rows
+        .stdout(predicate::str::contains("deploy"))
+        .stdout(predicate::str::contains("activate"))
+        // Status passthrough — both server-defined values must
+        // appear unmodified so a server rename (pending →
+        // in_flight, etc.) fails CI here.
+        .stdout(predicate::str::contains("delivered"))
+        .stdout(predicate::str::contains("failed"))
+        // HTTP status code column — 200 for the success row, 502
+        // for the failure row.
+        .stdout(predicate::str::contains("200"))
+        .stdout(predicate::str::contains("502"))
+        // No "Next page" hint when next_cursor is null.
+        .stdout(predicate::str::contains("Next page").not());
+}
+
+/// Pagination: server returns a `next_cursor` and the CLI must
+/// print the re-run hint with the cursor verbatim. Pin the
+/// opaque-passthrough contract — the CLI must never inspect or
+/// reformat the cursor token.
+#[tokio::test]
+async fn deliveries_emits_next_cursor_hint_when_more_pages() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_alpha/deliveries"))
+        .and(query_param("limit", "2"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "deliveries": [
+                {
+                    "id": 1,
+                    "webhook_id": "wh_alpha",
+                    "event_type": "deploy",
+                    "status": "delivered",
+                    "status_code": 200,
+                    "error_msg": "",
+                    "attempt": 1,
+                    "max_attempts": 3,
+                    "created_at": "2026-07-12T10:00:00Z",
+                    "completed_at": "2026-07-12T10:00:01Z"
+                }
+            ],
+            "next_cursor": "opaque-cursor-token-xyz"
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("deliveries")
+        .arg("wh_alpha")
+        .arg("--limit")
+        .arg("2");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Next page:"))
+        .stdout(predicate::str::contains("opaque-cursor-token-xyz"));
+}
+
+/// Empty set: server returns `{"deliveries": [], "next_cursor":
+/// null}`. Pin the empty-state line so a refactor that drops
+/// the period (or rephrases) fails the visual-consistency pin
+/// (matches `webhooks list`'s "No webhook subscriptions." line).
+#[tokio::test]
+async fn deliveries_empty_set_prints_period_terminated_line() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_alpha/deliveries"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "deliveries": [],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("deliveries")
+        .arg("wh_alpha");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("No delivery attempts recorded for webhook wh_alpha."));
+}
+
+/// 404: the webhook id doesn't exist OR belongs to a different
+/// tenant. Server returns 404; CLI surfaces the error code so
+/// the user can self-correct (typo'd id vs cross-tenant access
+/// — both are 404 from the tenant's POV, server doesn't leak).
+#[tokio::test]
+async fn deliveries_propagates_404_from_server() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_does_not_exist/deliveries"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string(r#"{"error":"webhook not found"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("deliveries")
+        .arg("wh_does_not_exist");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("404"))
+        .stderr(predicate::str::contains("webhook not found"));
+}
+
+/// Pre-flight validation: `--limit 0` and `--limit 99999` should
+/// fail at the command layer (before the wire round-trip) with
+/// the server-clamp message. Pin so a future refactor that
+/// forwards out-of-range limits to the server (relying on the
+/// server's clamp) breaks CI here — the user-facing error
+/// message is part of the CLI contract.
+#[tokio::test]
+async fn deliveries_rejects_limit_outside_server_clamp() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    // Mock below would fail the test if called — confirming the
+    // bail fires before the round-trip.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_alpha/deliveries"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    for bad_limit in ["0", "99999"] {
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("webhooks")
+            .arg("deliveries")
+            .arg("wh_alpha")
+            .arg("--limit")
+            .arg(bad_limit);
+
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("between 1 and 200"));
+    }
+}
+
+/// Cursor passthrough: when `--cursor X` is supplied, the CLI
+/// must forward `X` verbatim as `?cursor=X`. Pin the URL shape
+/// — a refactor that strips/encodes the cursor (or sends it as
+/// a header by mistake) breaks here.
+#[tokio::test]
+async fn deliveries_forwards_cursor_query_param_verbatim() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v1/webhooks/wh_alpha/deliveries"))
+        .and(query_param("limit", "50"))
+        .and(query_param("cursor", "abc==/xyz+"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "deliveries": [],
+            "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("webhooks")
+        .arg("deliveries")
+        .arg("wh_alpha")
+        .arg("--cursor")
+        .arg("abc==/xyz+");
+
+    cmd.assert().success();
 }

@@ -5,6 +5,7 @@
 //! - `list`
 //! - `update <id> [--url <u>] [--events e1,e2] [--description <s>] [--enabled|--disable] [--secret <s>]`
 //! - `remove <id>`
+//! - `deliveries <id> [--limit <N>] [--cursor <c>]` — recent delivery attempts (issue #565 follow-up)
 //!
 //! The CLI does NOT persist webhook state to `.edge/state.json` —
 //! every invocation is a fresh query against the control plane.
@@ -24,7 +25,7 @@
 //! before the prompt window exits; a `output::warn` reminder
 //! follows the create success line.
 //!
-//! Retry-aware paths (`list`, `remove`) route through
+//! Retry-aware paths (`list`, `remove`, `deliveries`) route through
 //! `commands::retry::call_with_retry_no_interrupt`. `add` and
 //! `update` are Phase-2 deferred — see the docstring on `run`.
 
@@ -51,8 +52,9 @@ use crate::output;
 /// so the CLI's error messages list the valid set explicitly.
 pub const VALID_EVENTS: &[&str] = &["deploy", "activate", "rollback", "auto_rollback"];
 
-/// The four subcommands. Mirrors the route table in
-/// `edge-control-plane/internal/handler/webhook.go`.
+/// The five subcommands. Mirrors the route table in
+/// `edge-control-plane/internal/handler/webhook.go` plus the
+/// `deliveries` route proposed in issue #659.
 #[derive(Debug)]
 pub enum WebhooksAction {
     Add {
@@ -73,6 +75,15 @@ pub enum WebhooksAction {
     },
     Remove {
         id: String,
+    },
+    /// List recent delivery attempts for a webhook subscription
+    /// (issue #565 follow-up; server-side route in #659).
+    /// `--limit` is server-clamped to `[1, 200]`; `--cursor` is
+    /// the opaque `next_cursor` returned by the previous page.
+    Deliveries {
+        id: String,
+        limit: usize,
+        cursor: Option<String>,
     },
 }
 
@@ -176,8 +187,9 @@ impl WebhooksAction {
     /// applies to `Update` (PUT-with-side-effects; replaying a
     /// successful update with a stale body is worse than failing
     /// once). The retry umbrella covers `Remove` (DELETE-by-id;
-    /// second call returns 404 with no side effect) and `List`
-    /// (read).
+    /// second call returns 404 with no side effect), `List` (read),
+    /// and `Deliveries` (read; pagination cursor replay is
+    /// idempotent — the second page either advances or stays put).
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
         let edge_toml = EdgeToml::from_path(path)?;
@@ -295,6 +307,56 @@ impl WebhooksAction {
                 )
                 .with_context(|| format!("removing webhook {id}"))?;
                 println!("Removed webhook {id}.");
+                Ok(())
+            }
+            WebhooksAction::Deliveries { id, limit, cursor } => {
+                // Pin the server-clamp range here too — a typo like
+                // `--limit 99999` would otherwise silently hit the
+                // server's clamp and return fewer rows than the
+                // user expected. Server range is `[1, 200]` per
+                // issue #659; clamp on the client so the user gets
+                // an actionable error before the round-trip.
+                if limit == 0 || limit > 200 {
+                    anyhow::bail!(
+                        "--limit must be between 1 and 200 (server-clamped; got {limit})"
+                    );
+                }
+                let page = call_with_retry_no_interrupt(
+                    "webhooks deliveries",
+                    || webhooks.deliveries(&id, limit, cursor.as_deref()),
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
+                )
+                .with_context(|| format!("listing deliveries for webhook {id}"))?;
+                if page.deliveries.is_empty() {
+                    // Period matches `webhooks list` for visual
+                    // consistency in mixed-output terminals.
+                    println!("No delivery attempts recorded for webhook {id}.");
+                } else {
+                    println!("{:<6} {:<14} {:<10} {:<8} CREATED", "ATTEMPT", "EVENT", "STATUS", "CODE");
+                    println!("{}", "-".repeat(70));
+                    for d in &page.deliveries {
+                        let code = d
+                            .status_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        // status_code can be 0 chars; pad to keep
+                        // columns aligned for short rows.
+                        let code = format!("{code:<8}");
+                        println!(
+                            "{:<6} {:<14} {:<10} {} {}",
+                            d.attempt, d.event_type, d.status, code, d.created_at
+                        );
+                    }
+                    if let Some(next) = &page.next_cursor {
+                        // Cursor is opaque; the user re-runs with
+                        // the same flags + this token to fetch the
+                        // next page.
+                        println!();
+                        println!("Next page: edge webhooks deliveries {id} --cursor {next}");
+                    }
+                }
                 Ok(())
             }
         }
