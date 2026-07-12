@@ -37,3 +37,11 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS preview_expires_at  TIMESTAMPTZ
 CREATE INDEX IF NOT EXISTS idx_deployments_preview_expires_at
     ON deployments (preview_expires_at)
     WHERE preview_expires_at IS NOT NULL;
+
+-- active_deployments mirrors the same preview markers: GetForUpdate
+-- and the Set INSERT/UPDATE paths (issue #308, internal/repository/
+-- active_deployment.go:88,100,279) read/write preview_id +
+-- preview_pr_number off this table. Adding them here closes the
+-- schema/repo drift the e2e rollback test surfaced (issue #613).
+ALTER TABLE active_deployments ADD COLUMN IF NOT EXISTS preview_id         TEXT;
+ALTER TABLE active_deployments ADD COLUMN IF NOT EXISTS preview_pr_number INTEGER;

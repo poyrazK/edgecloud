@@ -199,6 +199,8 @@ var wantColumns = map[string][]string{
 		"last_publish_at",               // 010_active_deployments_regions
 		"last_publish_attempt_id",       // 010_active_deployments_regions
 		"activation_attempt_started_at", // 026_active_deployments_activation_attempt_started_at
+		"preview_id",                    // 021_add_preview_columns (issue #308, mirrored for active_deployments — issue #613)
+		"preview_pr_number",             // 021_add_preview_columns (issue #308, mirrored for active_deployments — issue #613)
 	},
 	"app_env": {
 		"tenant_id",
@@ -450,6 +452,8 @@ var wantTypes = map[string]map[string]string{
 		"last_publish_at":               "timestamptz", // 010_active_deployments_regions (nullable)
 		"last_publish_attempt_id":       "uuid",        // 010_active_deployments_regions (nullable)
 		"activation_attempt_started_at": "timestamptz", // 026_active_deployments_activation_attempt_started_at (nullable)
+		"preview_id":                    "text",        // 021_add_preview_columns mirrored (issue #308/#613)
+		"preview_pr_number":             "integer",     // 021_add_preview_columns mirrored (issue #308/#613)
 	},
 	"app_env": {
 		"tenant_id": "text",

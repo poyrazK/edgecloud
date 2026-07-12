@@ -85,8 +85,8 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 	query := `INSERT INTO active_deployments (
 		tenant_id, app_name, deployment_id, last_good_deployment_id, auto_rollback_enabled,
 		regions_published, regions_failed, regions_cached, regions_cache_failed, last_publish_at, last_publish_attempt_id,
-		preview_id, preview_pr_number, activation_attempt_started_at
-	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		preview_id, preview_pr_number, activation_attempt_started_at, desired_replicas
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	ON CONFLICT (tenant_id, app_name) DO UPDATE SET
 		deployment_id = $3,
 		last_good_deployment_id = $4,
@@ -99,7 +99,8 @@ func (r *ActiveDeploymentRepository) Set(ctx context.Context, ad *domain.ActiveD
 		last_publish_attempt_id = $11,
 		preview_id = $12,
 		preview_pr_number = $13,
-		activation_attempt_started_at = $14`
+		activation_attempt_started_at = $14,
+		desired_replicas = $15`
 	// pq.StringArray must be non-nil for the NOT NULL DEFAULT '{}'
 	// columns to take a value rather than a SQL NULL. domain.StringArrayFrom
 	// converts nil → empty pq.StringArray. Same for the *time.Time and
