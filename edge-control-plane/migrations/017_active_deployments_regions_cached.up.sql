@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue #332 (Layer 3: Push-to-Edge Artifact Distribution) — track the
 -- per-region artifact-cache push outcome.
 --

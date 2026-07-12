@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue #316: per-deployment replica count for intra-region HA.
 -- Workers now operate in fan-out mode (no queue group), so every
 -- worker receives every TaskMessage. The desired_replicas column
