@@ -182,6 +182,27 @@ func TestRollbackE2E(t *testing.T) {
 		count, deploymentIDA, deploymentIDB)
 
 	// --- 4. Wire DeploymentService + OutboxDrainer against real pub ---
+	deploymentRepo := repository.NewDeploymentRepository(db)
+	// Diagnostic: run the exact GetByID call that ActivateDeployment
+	// will run, with full error logging. If the row IS visible via
+	// raw SELECT but NOT via GetByID, the diff is a scan error
+	// (NULL → typed field mismatch) that the test currently hides
+	// behind `if err != nil || deployment == nil { return
+	// "deployment not found" }`.
+	if d, err := deploymentRepo.GetByID(ctx, deploymentIDA); err != nil || d == nil {
+		var rawCount int
+		_ = db.GetContext(ctx, &rawCount,
+			`SELECT COUNT(*) FROM deployments WHERE id = $1`, deploymentIDA)
+		var typedCount int
+		_ = db.GetContext(ctx, &typedCount,
+			`SELECT COUNT(*) FROM deployments WHERE id = $1 AND tenant_id = $2 AND app_name = $3`,
+			deploymentIDA, testTenantID, testAppName)
+		t.Logf("e2e: diagnostic GetByID err=%v d=%v raw_count=%d typed_count=%d tenant=%s app=%s",
+			err, d, rawCount, typedCount, testTenantID, testAppName)
+	} else {
+		t.Logf("e2e: diagnostic GetByID succeeded id=%s tenant=%s app=%s",
+			d.ID, d.TenantID, d.AppName)
+	}
 	deploymentSvc := service.NewDeploymentService(
 		db,
 		repository.NewDeploymentRepository(db),
