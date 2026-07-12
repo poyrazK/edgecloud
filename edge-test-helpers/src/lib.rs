@@ -245,6 +245,7 @@ async fn build_supervisor_inner(
         jwt_signer,
         http,
         engine_pool: Arc::new(edge_worker::supervisor::StandbyPool::new(5)?),
+        port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }))
 }
 

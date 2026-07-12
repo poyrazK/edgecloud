@@ -513,6 +513,15 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 		// is automatic because Go's json.Unmarshal ignores unknown
 		// fields by default.
 		ClusterHeadroom json.RawMessage `json:"cluster_headroom"`
+		// Worker-level exhaustion counter (issue #641). Cumulative
+		// since process boot. Persisted into `worker_status` by the
+		// `UpsertStatus` path so the deploy-time 402 gate
+		// (`SumFreeSlotsByRegion`) can ask "has this worker
+		// recently exhausted?" without scraping Prometheus. Absent
+		// on pre-#641 workers — Go's json decoder folds to zero,
+		// which the deploy gate interprets as "no exhaustion
+		// pressure seen".
+		PortPoolExhaustedCount uint64 `json:"port_pool_exhausted_count"`
 	}
 	if err := json.Unmarshal(msg.Data, &hb); err != nil {
 		// Log the raw message preview so operators can diagnose wire format
@@ -633,6 +642,14 @@ func (s *WorkerService) handleHeartbeat(ctx context.Context, msg *natsio.Msg) {
 	// in-memory — no DB round-trip, so we do it inline (cheap).
 	if s.metricsAgg != nil {
 		s.ingestMetrics(hb.Apps)
+		// Issue #641: also ingest the worker-level port-pool
+		// exhaustion counter so operators can see fleet-wide
+		// exhaustion pressure on `/metrics` and `/api/v1/metrics`
+		// without scraping the worker directly. A pre-#641 worker
+		// omits the field, `PortPoolExhaustedCount` decodes to 0,
+		// and the aggregator records `0` — which is harmless (it
+		// matches "no exhaustion seen since this worker booted").
+		s.metricsAgg.IngestWorker(hb.PortPoolExhaustedCount)
 	}
 }
 

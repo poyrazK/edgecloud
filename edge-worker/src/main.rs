@@ -309,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
         engine_pool: Arc::new(crate::supervisor::StandbyPool::new(
             config.standby_pool_size,
         )?),
+        port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     let heartbeat_supervisor = supervisor.clone();

@@ -243,6 +243,7 @@ mod heartbeat_integration_tests {
             jwt_signer: jwt,
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+            port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1057,6 +1058,19 @@ mod heartbeat_integration_tests {
             state.read().await.apps.is_empty(),
             "failed start_app must not register the app in state"
         );
+
+        // Issue #641: the worker-level exhaustion counter must have
+        // been bumped. The CP's deploy-time 402 gate
+        // (`SumFreeSlotsByRegion`, Commit #3) reads this via the
+        // persisted `worker_status.port_pool_exhausted_count` column
+        // — a non-zero bump here proves the wire end-to-end path.
+        let count = sup
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 1,
+            "HTTP-port exhaustion arm must bump port_pool_exhausted_events to 1"
+        );
     }
 
     /// Issue #641 regression: when the WS-port acquire fails after the
@@ -1125,6 +1139,18 @@ mod heartbeat_integration_tests {
         assert!(
             sup.port_pool.lock().await.is_in_cooldown(expected_raw_port),
             "HTTP port leaked: expected port {expected_raw_port} to be released into cooldown after WS acquire failed"
+        );
+
+        // Issue #641: the WS-port exhaustion arm must also bump the
+        // worker-level counter — same observability requirement as the
+        // HTTP-port branch. Both arms are "pool can't take more"
+        // signals; the CP gate sees them uniformly.
+        let count = sup
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 1,
+            "WS-port exhaustion arm must bump port_pool_exhausted_events to 1"
         );
     }
 
@@ -1754,6 +1780,20 @@ pub struct Supervisor {
     /// `edge-test-helpers::build_supervisor_inner` can construct a
     /// Supervisor for tests without separate plumbing.
     pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
+    /// Worker-level exhaustion counter (issue #641). Bumped from the
+    /// two `start_app` exhaustion arms (HTTP-port acquire fails,
+    /// WS-port acquire fails) — covers apps that exhaust the pool on
+    /// first start and never produce an AppStatus row (which is the
+    /// case where a per-app counter would be invisible).
+    /// Persisted into `worker_status` by the CP's heartbeat-ingest
+    /// path so the deploy-time 402 gate (`SumFreeSlotsByRegion`)
+    /// can ask "has any worker in this region recently exhausted?"
+    /// without scraping Prometheus.
+    /// Atomic so the two exhaustion arms can bump without holding the
+    /// port-pool mutex (which is already locked at the bump site).
+    /// Reset on worker process restart (matches `request_count`
+    /// semantics — per-process-boot cumulative).
+    pub port_pool_exhausted_events: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Supervisor {
@@ -2012,6 +2052,12 @@ impl Supervisor {
             match pool.acquire() {
                 Some(p) => p,
                 None => {
+                    // Bump the worker-level exhaustion counter so the
+                    // CP's deploy-time 402 gate can detect saturation
+                    // even for apps that exhausted the pool on first
+                    // start and never produced an AppStatus row.
+                    self.port_pool_exhausted_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(
                         tenant_id,
                         app_name,
@@ -2039,6 +2085,11 @@ impl Supervisor {
             match pool.acquire() {
                 Some(p) => Some(p),
                 None => {
+                    // Same worker-level counter as the HTTP-port arm —
+                    // both branches are "pool can't take more" signals
+                    // that the CP needs to count.
+                    self.port_pool_exhausted_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     pool.release(raw_port);
                     tracing::error!(
                         tenant_id,
@@ -3365,13 +3416,25 @@ impl Supervisor {
             );
         }
 
-        // Populate cluster headroom for the autoscaler (issue #85).
+        // Populate cluster headroom for the autoscaler (issue #85) and the
+        // deploy-time 402 gate (issue #641). `free_slots` is mirrored
+        // onto both `app_slots` (autoscaler) and `free_slots` (deploy
+        // gate) so the two consumers can pick the name that matches
+        // their semantics without coordinating on a rename.
         let free_slots = self.port_pool.lock().await.free_slots();
         msg.cluster_headroom = Some(ClusterHeadroom {
             cpu_pct: None,
             mem_pct: None,
             app_slots: free_slots,
+            free_slots,
         });
+
+        // Stamp the worker-level exhaustion counter (issue #641) so the
+        // CP can persist it onto `worker_status.port_pool_exhausted_count`.
+        // Reset on worker process restart (per-process-boot cumulative).
+        msg.port_pool_exhausted_count = self
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         msg
     }
@@ -4365,6 +4428,7 @@ mod tests {
             jwt_signer: jwt,
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+            port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

@@ -25,6 +25,10 @@ type MetricsAggregator struct {
 	mu sync.RWMutex
 	// tenantID → appName → []sample
 	data map[string]map[string]appMetrics
+	// Fleet-wide, label-free metrics stamped by every heartbeat
+	// (issue #641). Single value across all workers — see
+	// `workerMetrics` for the field list.
+	worker workerMetrics
 
 	// log_gc (4 families)
 	logGcTick int64
@@ -86,6 +90,18 @@ type appMetrics struct {
 	samples       []domain.MetricSample
 }
 
+// workerMetrics holds label-free, fleet-wide metrics stamped by every
+// heartbeat. Today there is just the port-pool exhaustion counter
+// (issue #641); future PRs can add `cpu_pct`, `mem_pct`, etc. without
+// touching the per-app path. Mutated under a.mu.
+type workerMetrics struct {
+	// portPoolExhausted is the cumulative count of `PortPool::acquire() → None`
+	// events across all workers since process boot. Reset on CP restart
+	// (matches the worker's per-process-boot semantics). Surfaced as
+	// `edge_worker_port_pool_exhausted_total` — alert on a non-zero rate.
+	portPoolExhausted uint64
+}
+
 // NewMetricsAggregator returns a ready-to-use aggregator.
 func NewMetricsAggregator() *MetricsAggregator {
 	return &MetricsAggregator{
@@ -107,6 +123,22 @@ func (a *MetricsAggregator) Ingest(tenantID, appName string, requestCount, outbo
 		outboundBytes: outboundBytes,
 		samples:       samples,
 	}
+}
+
+// IngestWorker records the worker-level (label-free) metrics from a
+// single heartbeat. Today's only field is the port-pool exhaustion
+// counter (issue #641); future worker-level metrics land here without
+// touching the per-app path. `portPoolExhaustedCount` is treated as
+// the LATEST worker-stamped value (not a delta) — workers emit their
+// own per-process-boot cumulative, so the CP just renders the most
+// recent value across the fleet.
+func (a *MetricsAggregator) IngestWorker(portPoolExhaustedCount uint64) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.worker.portPoolExhausted = portPoolExhaustedCount
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +393,11 @@ func (a *MetricsAggregator) RenderTenant(tenantID string) string {
 	// GC families are emitted separately from familyLines.emit —
 	// keep the two paths in sync if you add a new GC family.
 	emitGCFamilies(&b, a)
+	// Worker-level families (issue #641) — same fleet-wide visibility
+	// on every per-tenant render as the GC families, so tenants can
+	// see whether the cluster is currently under port-pool pressure
+	// from their own /api/v1/metrics page.
+	emitWorkerFamilies(&b, a)
 	return b.String()
 }
 
@@ -383,6 +420,8 @@ func (a *MetricsAggregator) RenderAll() string {
 	// GC families are emitted separately from familyLines.emit —
 	// keep the two paths in sync if you add a new GC family.
 	emitGCFamilies(&b, a)
+	// Worker-level families (issue #641).
+	emitWorkerFamilies(&b, a)
 	return b.String()
 }
 
@@ -493,6 +532,24 @@ func emitGCFamilies(b *strings.Builder, a *MetricsAggregator) {
 	fmt.Fprintf(b, "edge_worker_enroll_errors_total %d\n", a.workerEnrollErrs)
 	fmt.Fprintf(b, "# TYPE edge_worker_enroll_last_enroll_timestamp_seconds gauge\n")
 	fmt.Fprintf(b, "edge_worker_enroll_last_enroll_timestamp_seconds %d\n", a.workerEnrollTime)
+}
+
+// emitWorkerFamilies writes the worker-level (label-free) metric
+// families stamped by every heartbeat (issue #641). Today there is
+// just the port-pool exhaustion counter; future PRs add to this
+// function. Caller must hold a.mu (read or write) so the counter
+// reads are coherent.
+//
+// `edge_worker_port_pool_exhausted_total` reflects the latest
+// worker-stamped value across the fleet. Workers emit their own
+// per-process-boot cumulative; the CP just renders the most recent
+// value seen. The metric TYPE is `counter` because that is the
+// Prometheus-correct semantic for "count of exhaustion events" and
+// aligns with how operators will alert on it
+// (`rate(edge_worker_port_pool_exhausted_total[5m]) > 0`).
+func emitWorkerFamilies(b *strings.Builder, a *MetricsAggregator) {
+	fmt.Fprintf(b, "# TYPE edge_worker_port_pool_exhausted_total counter\n")
+	fmt.Fprintf(b, "edge_worker_port_pool_exhausted_total %d\n", a.worker.portPoolExhausted)
 }
 
 // collectFamilyLines appends series strings for every app in one tenant into

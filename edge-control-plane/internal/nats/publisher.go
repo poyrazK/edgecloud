@@ -196,10 +196,16 @@ type HeartbeatMessage struct {
 // edge-worker/src/messages.rs. AppSlots is the only field the autoscaler
 // acts on; the rest are pass-through for future PRs that add
 // system-introspection.
+//
+// FreeSlots is the same number as AppSlots duplicated under a second
+// name so the deploy-time 402 gate (issue #641, SumFreeSlotsByRegion)
+// can read it without reaching for the autoscaler's `app_slots`
+// semantics. Both fields stay in lockstep on the wire.
 type ClusterHeadroom struct {
-	CPUPct   *float64 `json:"cpu_pct,omitempty"`
-	MemPct   *float64 `json:"mem_pct,omitempty"`
-	AppSlots uint32   `json:"app_slots"`
+	CPUPct    *float64 `json:"cpu_pct,omitempty"`
+	MemPct    *float64 `json:"mem_pct,omitempty"`
+	AppSlots  uint32   `json:"app_slots"`
+	FreeSlots uint32   `json:"free_slots,omitempty"`
 }
 
 // StreamConfig describes a JetStream stream to be created/verified.
