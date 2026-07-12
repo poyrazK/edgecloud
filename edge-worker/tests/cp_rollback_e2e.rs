@@ -50,13 +50,16 @@
 //! is more eager than production.
 //!
 //! Why `require_signature = false`: this test deliberately does NOT
-//! exercise Ed25519 signature verification on the wire — the Go half
-//! signs a hash of the literal string `"handler.wasm"` (4 bytes),
-//! but wiremock returns the real `handler.wasm` fixture, so the
-//! verifier would (correctly) reject the mismatch. Signature
-//! verification is covered separately by the cross-language wire-
-//! contract test from PR #652 (issue #611); this test's scope is the
-//! outbox → NATS → consume loop → heartbeat flip path only.
+//! exercise Ed25519 signature verification on the wire. The Go half
+//! signs a SHA-256 hash the worker must agree with; both halves
+//! compute that hash over the same `handler.wasm` fixture bytes
+//! (the Go helper reads the fixture from disk; this Rust helper
+//! returns the same bytes from wiremock). The worker still verifies
+//! the SHA-256 (the contract under test here is "hash matches what
+//! the deployment row says"), but the Ed25519 signature check is
+//! relaxed via `require_signature = false` — the cross-language
+//! wire-contract test from PR #652 (issue #611) owns the Ed25519
+//! path end-to-end.
 
 use std::path::PathBuf;
 use std::time::Duration;

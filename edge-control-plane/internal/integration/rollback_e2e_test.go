@@ -81,7 +81,6 @@ const (
 	testRegion    = "test-region"
 	testTenantID  = "t_rollback_e2e"
 	testAppName   = "myapp"
-	testArtifact  = "handler.wasm" // matches edge-worker/tests/fixtures/handler.wasm
 	deploymentIDA = "d_e2e_a"
 	deploymentIDB = "d_e2e_b"
 	testKeyID     = "test-kid"
@@ -381,15 +380,24 @@ func e2eNewKeyring(t *testing.T) *sigpkg.Keyring {
 	return sigpkg.KeyringFromSigner(signer, testKeyID)
 }
 
-// e2eArtifactHash returns the SHA-256 hex of fake artifact bytes. The
-// actual bytes don't matter — the worker's verifier validates the
-// signature against this hash + the deployment_id, and the Go half
-// signs the same (hash, deployment_id) pair. The Rust half's wiremock
-// returns arbitrary bytes; the worker reads the deployment row's
-// hash + signature and verifies against the actual downloaded bytes.
+// e2eArtifactHash returns the SHA-256 hex of the real handler.wasm
+// fixture bytes (mirroring what the Rust half's wiremock serves).
+// The verifier on the worker hashes the downloaded bytes — if the
+// hash the Go half signs doesn't match the worker's computed hash,
+// the worker rejects the artifact with "artifact hash mismatch" and
+// the deployment never starts. We read the actual fixture bytes so
+// both halves hash the same content.
 func e2eArtifactHash(t *testing.T) string {
 	t.Helper()
-	h := sha256.Sum256([]byte(testArtifact))
+	// this file lives at internal/integration/; the fixture is at
+	// <repo>/edge-worker/tests/fixtures/handler.wasm (4 dirs up).
+	_, here, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller failed")
+	repoRoot := filepath.Join(filepath.Dir(here), "..", "..", "..")
+	fixturePath := filepath.Join(repoRoot, "edge-worker", "tests", "fixtures", "handler.wasm")
+	bytes, err := os.ReadFile(fixturePath)
+	require.NoError(t, err, "read handler.wasm fixture; the test requires the file at %s", fixturePath)
+	h := sha256.Sum256(bytes)
 	return hex.EncodeToString(h[:])
 }
 
