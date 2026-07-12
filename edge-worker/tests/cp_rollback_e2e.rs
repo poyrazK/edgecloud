@@ -212,6 +212,19 @@ async fn run_e2e() -> anyhow::Result<()> {
         .context("subscribe_tasks")?;
     eprintln!("cp_rollback_e2e: subscribed to task stream");
 
+    // 5b. JetStream warm-up: `consumer.messages()` returns a stream
+    //     but the underlying push subscription only delivers after
+    //     the server has registered the consumer's interest. Without
+    //     this sleep, messages published immediately after
+    //     rust-ready can land in the stream BEFORE the consumer's
+    //     deliver-subject registration completes, and they're
+    //     silently dropped (the consumer's last-delivered pointer
+    //     advances past them). The fix mirrors
+    //     integration_tests.rs:1093 — a 2s grace period before any
+    //     publisher on the wire.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!("cp_rollback_e2e: 2s JetStream warm-up complete");
+
     // 6. Tell the Go half we're live. After this, it will run
     //    activate(A) → activate(B) → rollback(A), each publishing
     //    a TaskMessage to the task stream we're subscribed to.
@@ -223,12 +236,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     //    dispatch to `handle_task_message`, then build + publish a
     //    fresh heartbeat so the subscriber sees the new deployment_id.
     //    Three TaskMessages → three heartbeat transitions (A, B, A).
-    let observed = drive_consume_and_collect_heartbeats(
-        &supervisor,
-        &mut task_stream,
-        &mut hb_sub,
-    )
-    .await?;
+    let observed =
+        drive_consume_and_collect_heartbeats(&supervisor, &mut task_stream, &mut hb_sub).await?;
     let ports: Vec<u16> = observed.iter().map(|t| t.port).collect();
     let statuses: Vec<String> = observed.iter().map(|t| t.status.clone()).collect();
     let ids: Vec<String> = observed.iter().map(|t| t.deployment_id.clone()).collect();
@@ -313,8 +322,8 @@ async fn drive_consume_and_collect_heartbeats(
             .map_err(|_| anyhow!("task message timed out after 15s"))?
             .ok_or_else(|| anyhow!("task stream ended"))?;
         let payload = raw.payload.clone();
-        let task_msg: TaskMessage = serde_json::from_slice(&payload)
-            .context("parse task message")?;
+        let task_msg: TaskMessage =
+            serde_json::from_slice(&payload).context("parse task message")?;
 
         // 2. Dispatch. Mirrors what `process_task_message` does inside
         //    `run_consume_loop`, but inline so we can publish a
