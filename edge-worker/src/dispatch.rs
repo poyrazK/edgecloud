@@ -65,6 +65,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
+// Replaces `rustls-pemfile` (RUSTSEC-2025-0134 unmaintained) per issue
+// #625 — see `try_load_tls_config`.
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::rt::Executor;
@@ -73,6 +75,7 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::Request as HyperRequest;
 use hyper::Response as HyperResponse;
+use rustls::pki_types::pem::PemObject;
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -1009,12 +1012,17 @@ pub fn try_load_tls_config(
         return None;
     }
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert))
+    // PEM parsing: in-tree `rustls::pki_types::pem::PemObject` API,
+    // replaces `rustls-pemfile` (RUSTSEC-2025-0134 unmaintained) per
+    // issue #625. `pem_slice_iter` emits every parsed cert; per-section
+    // errors are swallowed (`filter_map(Result::ok)`) so one bad block
+    // doesn't sink the whole chain. `from_pem_slice` on `PrivateKeyDer`
+    // returns the first matching kind in file order across Pkcs1 /
+    // Pkcs8 / Sec1.
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
         .filter_map(Result::ok)
         .collect();
-    let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key))
-        .ok()
-        .flatten()?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key).ok()?;
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1208,6 +1216,43 @@ mod tls_tests {
             &Some(key_file.path().to_str().unwrap().into()),
         );
         assert!(result.is_none());
+    }
+
+    /// Cert chain of (leaf, intermediate, key) loads successfully —
+    /// guards the `pem_slice_iter(...).collect()` shape from regressing
+    /// to a `.next().unwrap_or(...)` that would drop the intermediate
+    /// and break every acme.sh `fullchain.pem` deployment.
+    #[test]
+    fn try_load_tls_config_loads_leaf_and_intermediate_chain() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // rcgen 0.13's `CertificateParams` doesn't expose a
+        // `serialize_certificate_pem()` alongside `serialize_pem()`,
+        // so we generate the leaf + key from one self-signed cert and
+        // the intermediate from a second one, then concatenate leaf +
+        // intermediate into the cert file. The leaf's key pairs with
+        // the leaf cert; the intermediate is purely a chain element.
+        let leaf =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
+        let intermediate = rcgen::generate_simple_self_signed(vec!["intermediate.example".into()])
+            .expect("generate intermediate");
+
+        let mut cert_file = NamedTempFile::new().expect("cert tempfile");
+        // Order matters: leaf first, then intermediate.
+        write!(cert_file, "{}{}", leaf.cert.pem(), intermediate.cert.pem())
+            .expect("write cert chain");
+        let mut key_file = NamedTempFile::new().expect("key tempfile");
+        write!(key_file, "{}", leaf.key_pair.serialize_pem()).expect("write key");
+
+        let result = try_load_tls_config(
+            &Some(cert_file.path().to_str().unwrap().into()),
+            &Some(key_file.path().to_str().unwrap().into()),
+        );
+        assert!(
+            result.is_some(),
+            "leaf + intermediate chain must load — `pem_slice_iter(...).collect()` \
+             should preserve every CERTIFICATE block"
+        );
     }
 }
 
