@@ -35,6 +35,8 @@ use edge_worker::messages::HeartbeatMessage;
 use edge_worker::supervisor::Supervisor;
 
 use edge_ingress::heartbeats::apply_heartbeat;
+use edge_ingress::l4::{L4PortPool, L4RoutingTable};
+use edge_ingress::l4_cache::SharedL4PortCache;
 use edge_ingress::routing::RoutingTable;
 use edge_runtime::socket_egress::SocketEgressPolicy;
 
@@ -186,9 +188,18 @@ async fn run_test() -> anyhow::Result<()> {
     // returns false when there was nothing to remove. (The pre-#583
     // behavior of inserting a placeholder port-0 row is gone.)
     let table = Arc::new(RoutingTable::new());
+    // Issue #548: `apply_heartbeat` takes 5 args (HTTP table + L4
+    // table + L4 port pool + L4 port cache + heartbeat). The wire
+    // test doesn't exercise L4 routing (covered by
+    // edge-ingress/tests/l4_integration.rs) — these are empty
+    // stand-ins.
+    let l4_table = Arc::new(L4RoutingTable::new());
+    let mut l4_ports = L4PortPool::new(31000, 31999, 60);
+    let l4_port_cache: SharedL4PortCache = Default::default();
     assert_eq!(table.len().await, 0, "table starts empty");
 
-    let changed = apply_heartbeat(&table, &received).await;
+    let changed =
+        apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &received).await;
     assert!(
         !changed,
         "empty-apps heartbeat against an empty table must be a no-op"
@@ -226,7 +237,8 @@ async fn run_test() -> anyhow::Result<()> {
             duration_ms_total: 0,
         },
     );
-    let changed = apply_heartbeat(&table, &with_app).await;
+    let changed =
+        apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &with_app).await;
     assert!(
         changed,
         "apply_heartbeat must return true for a heartbeat with a running app"
