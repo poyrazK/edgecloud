@@ -123,6 +123,33 @@ pub struct Config {
     /// Number of consecutive failed health checks before marking upstream
     /// unhealthy. Default 2. Override with `HEALTH_CHECK_MAX_FAILS`.
     pub health_check_max_fails: u32,
+    // ── Per-tenant data-plane rate limits (issue #305) ─────────────
+    /// Per-tenant default RPS applied to every tenant that has no
+    /// explicit per-tenant override configured in the control plane.
+    /// 0 = no default cap (operators opt tenants in explicitly).
+    /// Set via `RATE_LIMIT_RPS_TENANT_DEFAULT`.
+    pub rate_limit_rps_tenant_default: u32,
+    /// Per-tenant default burst paired with `rate_limit_rps_tenant_default`.
+    /// 0 = falls back to `rate_limit_rps_tenant_default` at the
+    /// renderer (matches the per-app cache semantics at ratelimit.rs).
+    /// Set via `RATE_LIMIT_BURST_TENANT_DEFAULT`.
+    pub rate_limit_burst_tenant_default: u32,
+    /// How often the ingress polls the control plane for the
+    /// per-tenant rate-limit table (issue #305). Default 30s
+    /// (matches QUOTA_FETCH_INTERVAL — both caches refresh on
+    /// the same beat so a free-tier lockdown and a tenant-rl write
+    /// propagate within one tick). 0 disables the fetcher.
+    /// Set via `TENANT_RATE_LIMIT_FETCH_INTERVAL`.
+    pub tenant_rate_limit_fetch_interval: Duration,
+    /// Global RPS cap applied before any per-tenant route (issue
+    /// #305, sub-feature #4). 0 = disabled. Enforced per Caddy
+    /// replica — multi-replica NATS aggregation is a follow-up.
+    /// Set via `GLOBAL_RATE_LIMIT_RPS`.
+    pub global_rate_limit_rps: u32,
+    /// Global RPS burst paired with `global_rate_limit_rps`. 0 =
+    /// falls back to `global_rate_limit_rps` at the renderer.
+    /// Set via `GLOBAL_RATE_LIMIT_BURST`.
+    pub global_rate_limit_burst: u32,
 }
 
 impl Config {
@@ -260,6 +287,26 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
+            rate_limit_rps_tenant_default: std::env::var("RATE_LIMIT_RPS_TENANT_DEFAULT")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            rate_limit_burst_tenant_default: std::env::var("RATE_LIMIT_BURST_TENANT_DEFAULT")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            tenant_rate_limit_fetch_interval: std::env::var("TENANT_RATE_LIMIT_FETCH_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(crate::tenant_ratelimit::TENANT_RATE_LIMIT_FETCH_INTERVAL),
+            global_rate_limit_rps: std::env::var("GLOBAL_RATE_LIMIT_RPS")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
+            global_rate_limit_burst: std::env::var("GLOBAL_RATE_LIMIT_BURST")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .unwrap_or(0),
         })
     }
 }

@@ -15,6 +15,7 @@ mod messages;
 mod quota;
 mod ratelimit;
 mod routing;
+mod tenant_ratelimit;
 pub mod traffic;
 
 use std::net::SocketAddr;

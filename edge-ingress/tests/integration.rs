@@ -68,6 +68,11 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         health_check_timeout: Duration::from_secs(3),
         health_check_uri: "/healthz".into(),
         health_check_max_fails: 2,
+        rate_limit_rps_tenant_default: 0,
+        rate_limit_burst_tenant_default: 0,
+        tenant_rate_limit_fetch_interval: Duration::from_secs(30),
+        global_rate_limit_rps: 0,
+        global_rate_limit_burst: 0,
     }
 }
 

@@ -19,6 +19,7 @@ use crate::config::{ingress_host, Config};
 use crate::quota::QuotaCache;
 use crate::ratelimit::RateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry};
+use crate::tenant_ratelimit::TenantRateLimitCache;
 use crate::traffic::TrafficSplitCache;
 
 const SERVER_NAME_HTTPS: &str = "edge_https";
@@ -308,6 +309,8 @@ pub fn render_routes(
     traffic_cache: &TrafficSplitCache,
     rate_limit_cache: &RateLimitCache,
     quota_cache: &QuotaCache,
+    #[allow(unused_variables)] // issue #305 commit 4 will consume this.
+    tenant_rate_limit_cache: &TenantRateLimitCache,
 ) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
@@ -843,6 +846,13 @@ mod tests {
         crate::quota::QuotaCache::default()
     }
 
+    /// Default `TenantRateLimitCache` for tests: empty. Tests that
+    /// want to exercise the per-tenant / global rate_limit route
+    /// paths populate this directly (Commit 4 of issue #305).
+    fn test_tenant_rate_limit_cache() -> crate::tenant_ratelimit::TenantRateLimitCache {
+        crate::tenant_ratelimit::TenantRateLimitCache::default()
+    }
+
     fn entry(tenant: &str, app: &str, addr: &str, port: u16) -> RouteEntry {
         RouteEntry {
             tenant_id: tenant.to_string(),
@@ -922,6 +932,11 @@ mod tests {
             health_check_timeout: Duration::from_secs(3),
             health_check_uri: "/healthz".into(),
             health_check_max_fails: 2,
+            rate_limit_rps_tenant_default: 0,
+            rate_limit_burst_tenant_default: 0,
+            tenant_rate_limit_fetch_interval: Duration::from_secs(30),
+            global_rate_limit_rps: 0,
+            global_rate_limit_burst: 0,
         }
     }
 
@@ -936,6 +951,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
@@ -955,7 +971,15 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let rl_cache = test_rate_limit_cache();
         let q_cache = test_quota_cache();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &test_cfg(),
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &test_tenant_rate_limit_cache(),
+        );
         // Caddy 2.11 removed the `app.http.automatic_https` field.
         // The wildcard cert in `tls.certificates.load_files` takes
         // precedence automatically — no need to disable auto-TLS.
@@ -979,7 +1003,15 @@ mod tests {
         let mut cfg = test_cfg();
         cfg.cert_file_2 = Some("/etc/caddy/tls/cert-multi.pem".into());
         cfg.key_file_2 = Some("/etc/caddy/tls/key-multi.pem".into());
-        let cfg_json = render_routes(&[], &[], &cfg, &cache, &rl_cache, &q_cache);
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &cfg,
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &test_tenant_rate_limit_cache(),
+        );
 
         let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
         let arr = load_files
@@ -1004,7 +1036,15 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let rl_cache = test_rate_limit_cache();
         let q_cache = test_quota_cache();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &test_cfg(),
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &test_tenant_rate_limit_cache(),
+        );
 
         let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
         let arr = load_files
@@ -1029,6 +1069,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         assert_eq!(
             cfg_json["admin"]["listen"], "0.0.0.0:2019",
@@ -1053,6 +1094,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1103,6 +1145,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1145,6 +1188,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1170,6 +1214,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
@@ -1193,6 +1238,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1236,6 +1282,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1271,6 +1318,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1312,6 +1360,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1362,6 +1411,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &q_cache,
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1425,7 +1475,15 @@ mod tests {
         let cache = TrafficSplitCache::default();
         let rl_cache = test_rate_limit_cache();
         let q_cache = test_quota_cache();
-        let cfg_json = render_routes(&[], &[], &test_cfg(), &cache, &rl_cache, &q_cache);
+        let cfg_json = render_routes(
+            &[],
+            &[],
+            &test_cfg(),
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &test_tenant_rate_limit_cache(),
+        );
         assert!(
             cfg_json["apps"]["tls"].get("automation").is_none(),
             "no automation block when control_plane_url is empty"
@@ -1446,6 +1504,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         assert_eq!(
             cfg_json["apps"]["tls"]["automation"]["on_demand"]["ask"],
@@ -1472,6 +1531,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1508,6 +1568,7 @@ mod tests {
             &cache,
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1538,6 +1599,7 @@ mod tests {
             &Default::default(),
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1578,6 +1640,7 @@ mod tests {
             &Default::default(),
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1606,6 +1669,7 @@ mod tests {
             &Default::default(),
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert_eq!(server["max_conns"], 1000);
@@ -1626,6 +1690,7 @@ mod tests {
             &Default::default(),
             &test_rate_limit_cache(),
             &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert!(
