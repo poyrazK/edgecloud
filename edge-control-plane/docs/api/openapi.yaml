@@ -1208,6 +1208,73 @@ components:
           example: false
 
     # -------------------------------------------------------------------------
+    # Per-tenant data-plane rate limit (issue #305)
+    # -------------------------------------------------------------------------
+    TenantRateLimitRequest:
+      type: object
+      description: |
+        Per-tenant data-plane rate-limit caps written by
+        `PUT /api/v1/admin/tenants/{tenantID}/rate-limit`. All fields are
+        optional; absent fields are not modified. Every field accepts 0
+        ("no cap"). The ingress cache drops the row when all four caps are
+        zero so the per-tenant `rate_limit` route disappears from Caddy
+        within one `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick.
+
+        Sub-features #2 (concurrent_limit) and #3 (bandwidth_bps) are
+        cached for follow-up render work — neither is consumed by the
+        Caddy renderer in the issue #305 PR.
+      properties:
+        rps:
+          type: integer
+          minimum: 0
+          description: Per-tenant requests-per-second cap. 0 = no cap.
+          example: 100
+        burst:
+          type: integer
+          minimum: 0
+          description: Per-tenant burst paired with `rps`. 0 = falls back to rps at the renderer.
+          example: 200
+        concurrent_limit:
+          type: integer
+          minimum: 0
+          description: Concurrent-request cap per tenant (sub-feature #2, render deferred).
+          example: 50
+        bandwidth_bps:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-tenant bytes-per-second cap (sub-feature #3, render deferred).
+          example: 5000000
+
+    TenantRateLimitResponse:
+      type: object
+      description: |
+        Per-tenant rate-limit row consumed by the edge-ingress
+        `tenant_ratelimit` fetcher via
+        `GET /api/v1/internal/rate-limit/{tenantID}`. Polls every
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s). 404 from
+        this endpoint means "no quotas row" — the cache treats that as
+        "delete any stale entry, emit no route". 200 with all zeros is
+        identical: cache clears on the same tick.
+      properties:
+        tenant_id:
+          type: string
+          example: t_acme
+        rps:
+          type: integer
+          example: 100
+        burst:
+          type: integer
+          example: 200
+        concurrent_limit:
+          type: integer
+          example: 0
+        bandwidth_bps:
+          type: integer
+          format: int64
+          example: 0
+
+    # -------------------------------------------------------------------------
     # Migration
     # -------------------------------------------------------------------------
     MigrationReport:
@@ -3410,6 +3477,62 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/admin/tenants/{tenantID}/rate-limit:
+    put:
+      operationId: adminSetTenantRateLimit
+      summary: Set or clear a tenant's data-plane rate-limit caps (admin only)
+      description: |
+        Writes the four per-tenant rate-limit columns on `quotas`
+        (`tenant_rate_limit_rps`, `tenant_rate_limit_burst`,
+        `tenant_concurrent_limit`, `tenant_bandwidth_bps`) via
+        `UPDATE ... SET ... WHERE tenant_id = $1`. Every field in the
+        request body is optional; absent fields are not modified. The
+        `tenant_rate_limit_set_at` audit column is bumped to
+        `now()` on every write.
+
+        The ingress picks up the change on its next
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick (default 30s):
+        a non-zero rps causes a new per-tenant `rate_limit` route to
+        appear in Caddy; clearing rps back to 0 (or deleting the whole
+        row via all-zero + 404) removes the route on the next tick.
+
+        Records an `audit_logs` row with action `tenant.rate_limit.set`
+        and the full request body as the diff payload.
+
+        Owner role required. Returns 404 when the tenant (or its quota
+        row) doesn't exist; 400 when any field is negative.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantRateLimitRequest'
+      responses:
+        '200':
+          description: Rate-limit row upserted. Returns the post-write values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantRateLimitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/v1/admin/tenants/{tenantID}/enable:
     post:
       operationId: enableTenant
@@ -3652,6 +3775,46 @@ paths:
           description: Invalid app name or tenant ID
         '404':
           description: App not found
+
+  # -------------------------------------------------------------------------
+  # Internal: per-tenant data-plane rate limit (issue #305)
+  # -------------------------------------------------------------------------
+  /api/v1/internal/rate-limit/{tenantID}:
+    get:
+      summary: Per-tenant data-plane rate-limit caps for the ingress
+      description: |
+        Returns the four per-tenant caps consumed by the
+        edge-ingress `tenant_ratelimit` fetcher. Polled every
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s) per tenant
+        in the routing table. Drives the per-tenant `rate_limit`
+        routes in Caddy (sub-feature #1).
+
+        Returns 404 when the tenant has no `quotas` row (fail-open:
+        the cache clears the entry so the renderer stops emitting a
+        route for that tenant). Returns 200 with all-zero caps when
+        the row exists but no caps are configured (same fail-open
+        semantics — the cache drops the entry). 5xx is logged at
+        warn but not treated as a cache invalidation, so the
+        ingress keeps the last-known state.
+      security:
+        - InternalTokenAuth: []
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Per-tenant rate-limit caps (all zeros = no caps).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantRateLimitResponse'
+        '400':
+          description: Invalid tenant ID
+        '404':
+          description: Tenant has no quotas row
 
   # -------------------------------------------------------------------------
   # Internal: per-tenant quota state (issue #420)
