@@ -719,8 +719,12 @@ pub fn render_routes(
     // per Caddy replica: with N ingress replicas, the effective cap is
     // N × global_rate_limit_rps. Multi-replica NATS aggregation is a
     // separate follow-up. Same shape as the per-IP prepend above:
-    // matches `0.0.0.0/0`, `terminal: false` so the per-tenant + per-app
-    // rate_limit handlers layered below still apply.
+    // matches both `0.0.0.0/0` (IPv4) AND `::/0` (IPv6) — review
+    // finding: a single IPv4-only range would let IPv6 traffic
+    // bypass the global cap entirely (Cloudflare origin, Fly.io,
+    // etc. increasingly IPv6-only). `terminal: false` so the
+    // per-tenant + per-app rate_limit handlers layered below still
+    // apply.
     if cfg.global_rate_limit_rps > 0 {
         let burst = if cfg.global_rate_limit_burst > 0 {
             cfg.global_rate_limit_burst
@@ -729,7 +733,7 @@ pub fn render_routes(
         };
         let global_rl_route = json!({
             "@id": "global-rate-limit",
-            "match": [{"remote_ip": {"ranges": ["0.0.0.0/0"]}}],
+            "match": [{"remote_ip": {"ranges": ["0.0.0.0/0", "::/0"]}}],
             "handle": [{
                 "handler": "rate_limit",
                 "rates": { "rps": cfg.global_rate_limit_rps, "burst": burst },
@@ -1913,12 +1917,53 @@ mod tests {
         );
         assert_eq!(
             first["match"][0]["remote_ip"]["ranges"][0], "0.0.0.0/0",
-            "global rate limit must match all IPs"
+            "global rate limit must match IPv4"
+        );
+        assert_eq!(
+            first["match"][0]["remote_ip"]["ranges"][1], "::/0",
+            "global rate limit must match IPv6 (review finding: \
+             0.0.0.0/0 alone lets IPv6 traffic bypass the cap)"
         );
         assert_eq!(
             first["terminal"], false,
             "global rate_limit must NOT be terminal so per-tenant/per-app layers apply"
         );
+    }
+
+    /// Global RPS matches both IPv4 and IPv6. Review finding:
+    /// `0.0.0.0/0` is IPv4-only — IPv6 traffic from Cloudflare
+    /// origins, Fly.io, etc. would bypass the global cap entirely
+    /// without `::/0` alongside.
+    #[test]
+    fn global_rate_limit_matches_ipv4_and_ipv6() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 100;
+        cfg.global_rate_limit_burst = 100;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let ranges = routes[0]["match"][0]["remote_ip"]["ranges"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            ranges.len(),
+            2,
+            "global rate_limit matcher must carry both IPv4 and IPv6 ranges"
+        );
+        let has_v4 = ranges.iter().any(|v| v == "0.0.0.0/0");
+        let has_v6 = ranges.iter().any(|v| v == "::/0");
+        assert!(has_v4, "missing 0.0.0.0/0 (IPv4)");
+        assert!(has_v6, "missing ::/0 (IPv6)");
     }
 
     /// Global RPS is omitted when zero (no cap → no route).

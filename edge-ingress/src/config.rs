@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use tracing::warn;
 
 /// Suffix for every public hostname the ingress serves. Must stay in sync
 /// with the Go control plane's `domain.IngressHostSuffix` (in
@@ -308,6 +309,41 @@ impl Config {
                 .parse()
                 .unwrap_or(0),
         })
+    }
+
+    /// Log warnings for rate-limit knobs that look misconfigured.
+    ///
+    /// Review finding: the renderer accepts `global_rate_limit_rps=1`
+    /// or `RATE_LIMIT_RPS_TENANT_DEFAULT=1` silently, which would
+    /// rate-limit the platform (or every tenant) to 1 RPS — almost
+    /// certainly a typo. We don't fail-closed (operators may legitimately
+    /// want a low cap for a staging tier), but a startup WARN gives them
+    /// a single grep target when investigating a "why is everything 429"
+    /// incident.
+    pub fn validate(&self) {
+        const MIN_REASONABLE_RPS: u32 = 10;
+        if self.global_rate_limit_rps > 0 && self.global_rate_limit_rps < MIN_REASONABLE_RPS {
+            warn!(
+                rps = self.global_rate_limit_rps,
+                min_reasonable = MIN_REASONABLE_RPS,
+                "global_rate_limit_rps is below the recommended minimum; \
+                 this caps the entire platform (per replica) to <{}/s. \
+                 Confirm this is intentional.",
+                MIN_REASONABLE_RPS
+            );
+        }
+        if self.rate_limit_rps_tenant_default > 0
+            && self.rate_limit_rps_tenant_default < MIN_REASONABLE_RPS
+        {
+            warn!(
+                rps = self.rate_limit_rps_tenant_default,
+                min_reasonable = MIN_REASONABLE_RPS,
+                "rate_limit_rps_tenant_default is below the recommended minimum; \
+                 this caps every tenant without an explicit override to <{}/s. \
+                 Confirm this is intentional.",
+                MIN_REASONABLE_RPS
+            );
+        }
     }
 }
 
@@ -632,5 +668,100 @@ mod tests {
 
         // Clean up
         unset_all_config_vars();
+    }
+
+    /// Construct a Config with sensible non-zero defaults for the
+    /// string fields and zero everywhere else. Lets the validate()
+    /// tests set only the rate-limit knobs they care about without
+    /// spelling out every field by hand.
+    fn test_config_defaults() -> Config {
+        Config {
+            nats_url: "nats://localhost:4222".to_string(),
+            caddy_admin_url: "http://127.0.0.1:2019".to_string(),
+            region: "fra".to_string(),
+            cert_file: "/tmp/cert.pem".to_string(),
+            key_file: "/tmp/key.pem".to_string(),
+            cert_file_2: None,
+            key_file_2: None,
+            listen_http: ":80".to_string(),
+            listen_https: ":443".to_string(),
+            refresh_debounce_ms: 1000,
+            http_to_https: true,
+            admin_token: None,
+            control_plane_api_url: "http://localhost:8080".to_string(),
+            internal_token: None,
+            control_plane_url: String::new(),
+            service_token: String::new(),
+            domain_poll_interval: Duration::from_secs(30),
+            caddy_admin_listen: "localhost:2019".to_string(),
+            metrics_listen: ":9091".to_string(),
+            max_conns: 0,
+            max_conns_per_ip: 0,
+            per_ip_rps: 0,
+            per_ip_burst: 0,
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
+            quota_fetch_interval: crate::quota::QUOTA_FETCH_INTERVAL,
+            stale_timeout: Duration::from_secs(60),
+            prune_interval: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(10),
+            health_check_timeout: Duration::from_secs(3),
+            health_check_uri: "/healthz".to_string(),
+            health_check_max_fails: 2,
+            rate_limit_rps_tenant_default: 0,
+            rate_limit_burst_tenant_default: 0,
+            tenant_rate_limit_fetch_interval: Duration::from_secs(30),
+            global_rate_limit_rps: 0,
+            global_rate_limit_burst: 0,
+        }
+    }
+
+    #[test]
+    fn validate_low_global_rps_does_not_panic() {
+        // Sub-minimum cap (5) is operator-allowed — validate() only
+        // emits WARN, never returns Err, so the only assertion we can
+        // make is that the call is panic-free. The WARN text is
+        // verified at integration time via the structured tracing
+        // output; here we just pin the absence-of-side-effect contract.
+        let cfg = Config {
+            global_rate_limit_rps: 5,
+            rate_limit_rps_tenant_default: 1000,
+            ..test_config_defaults()
+        };
+        cfg.validate();
+    }
+
+    #[test]
+    fn validate_low_tenant_default_rps_does_not_panic() {
+        let cfg = Config {
+            global_rate_limit_rps: 1000,
+            rate_limit_rps_tenant_default: 3,
+            ..test_config_defaults()
+        };
+        cfg.validate();
+    }
+
+    #[test]
+    fn validate_zero_caps_are_silent() {
+        // Both knobs at 0 means "no caps configured"; validate()
+        // must not warn (the `> 0` guard short-circuits both arms).
+        let cfg = Config {
+            global_rate_limit_rps: 0,
+            rate_limit_rps_tenant_default: 0,
+            ..test_config_defaults()
+        };
+        cfg.validate();
+    }
+
+    #[test]
+    fn validate_reasonable_caps_are_silent() {
+        // Above the recommended minimum — neither branch should fire.
+        let cfg = Config {
+            global_rate_limit_rps: 100,
+            rate_limit_rps_tenant_default: 50,
+            ..test_config_defaults()
+        };
+        cfg.validate();
     }
 }

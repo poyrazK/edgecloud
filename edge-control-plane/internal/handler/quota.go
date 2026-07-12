@@ -168,7 +168,12 @@ func (h *QuotaHandler) GetQuotaInternal(w http.ResponseWriter, r *http.Request) 
 func (h *QuotaHandler) GetTenantRateLimitInternal(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("tenantID")
 	if tenantID == "" || containsPathTraversal(tenantID) {
-		http.Error(w, `{"error": "invalid tenant id"}`, http.StatusBadRequest)
+		// Review finding: standardize on the httperror.*Ctx family for
+		// shape consistency with the rest of the internal handlers
+		// (GetQuotaInternal / GetRateLimitsInternal) — the prior
+		// raw-http.Error path emitted a different JSON shape that
+		// broke client error-class detection.
+		httperror.BadRequestCtx(w, r, "invalid tenant id")
 		return
 	}
 
@@ -179,7 +184,7 @@ func (h *QuotaHandler) GetTenantRateLimitInternal(w http.ResponseWriter, r *http
 		return
 	}
 	if rl == nil {
-		http.Error(w, `{"error": "tenant not found"}`, http.StatusNotFound)
+		httperror.NotFoundCtx(w, r, "tenant not found")
 		return
 	}
 

@@ -60,6 +60,12 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Review finding: log a warning when the configured rate-limit
+    // caps look like operator typos (sub-10 RPS for the global or
+    // per-tenant-default knobs is almost certainly a missing zero).
+    // Non-fatal — operators may legitimately want a low cap — but
+    // gives them a single grep target when investigating a 429 storm.
+    cfg.validate();
     tracing::info!(
         region = %cfg.region,
         caddy = %cfg.caddy_admin_url,

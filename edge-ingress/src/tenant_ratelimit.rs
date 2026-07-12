@@ -50,8 +50,12 @@ pub struct TenantRateLimitState {
     /// Bandwidth cap per tenant (sub-feature #3). Cached but not
     /// rendered in this PR — needs Caddy 2.8+ `rate_limit.bandwidth`.
     pub bandwidth_bps: u64,
-    /// When this state was last refreshed. Used to detect staleness
-    /// and decide whether to re-fetch.
+    /// When this state was last refreshed. Currently unused on the
+    /// render path; carried for shape parity with
+    /// `crate::quota::QuotaState::fetched_at` and the eventual
+    /// staleness-aware re-fetch work tracked as a follow-up (so the
+    /// next operator metric (`ingress_tenant_rate_limit_cache_age_seconds`)
+    /// can be added without re-plumbing the cache struct).
     pub fetched_at: Option<Instant>,
 }
 
