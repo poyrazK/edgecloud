@@ -127,6 +127,10 @@ pub fn validate_events(input: &str) -> Result<Vec<String>> {
 /// `validateWebhookRequest` length check at
 /// `edge-control-plane/internal/handler/webhook.go:158`).
 fn acquire_secret(secret: Option<&str>, no_echo: bool) -> Result<String> {
+    // `clap` enforces `conflicts_with = "secret"` on `--no-echo` at
+    // parse time, so the `(Some(_), true)` arm is unreachable and
+    // the wildcard on the `Some` arm is intentional (we don't care
+    // about `no_echo` when an explicit `--secret` is passed).
     let value = match (secret, no_echo) {
         (Some(s), _) => s.trim().to_string(),
         (None, true) => rpassword::prompt_password("Paste webhook secret: ")
@@ -163,17 +167,17 @@ impl WebhooksAction {
     /// webhooks before their first deploy.
     ///
     /// **Phase-2 deferred (issue #571 follow-up).** `Add` is a POST
-    /// insert; a retried POST would silently insert a duplicate
-    /// row since the schema has no unique `(tenant_id, url)`
-    /// constraint today (`edge-control-plane/migrations/` has no
-    /// unique index on the `webhooks` table). The right fix is
-    /// CP-side `Idempotency-Key` schema extension — until that
-    /// lands, `Add` does NOT route through `call_with_retry`.
-    /// Same reasoning applies to `Update` (PUT-with-side-effects;
-    /// replaying a successful update with a stale body is worse
-    /// than failing once). `Remove` IS retryable — DELETE is
-    /// naturally idempotent (second call returns 404 with no side
-    /// effect), and `List` is a read.
+    /// insert and a retried POST would silently insert a duplicate
+    /// row (the schema has no unique `(tenant_id, url)` constraint
+    /// today — see `edge-control-plane/migrations/`) depending on
+    /// the server's race window. The right fix is CP-side
+    /// `Idempotency-Key` schema extension. Until that lands, `Add`
+    /// does NOT route through `call_with_retry`. Same reasoning
+    /// applies to `Update` (PUT-with-side-effects; replaying a
+    /// successful update with a stale body is worse than failing
+    /// once). The retry umbrella covers `Remove` (DELETE-by-id;
+    /// second call returns 404 with no side effect) and `List`
+    /// (read).
     #[cfg(feature = "network")]
     pub fn run(self, path: &Path) -> Result<()> {
         let edge_toml = EdgeToml::from_path(path)?;
@@ -218,6 +222,8 @@ impl WebhooksAction {
                 )
                 .context("listing webhooks")?;
                 if rows.is_empty() {
+                    // Period matches `domains list` (issue #83) for
+                    // visual consistency in mixed-output terminals.
                     println!("No webhook subscriptions.");
                 } else {
                     println!(

@@ -185,6 +185,7 @@ async fn add_sends_secret_and_events_in_body() {
     Mock::given(method("POST"))
         .and(path("/api/v1/webhooks"))
         .and(header("Authorization", "Bearer k_seed"))
+        .and(header("content-type", "application/json"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "id": "wh_new",
             "tenant_id": "t_seed",
@@ -263,6 +264,7 @@ async fn add_deserializes_create_response_as_bare_row() {
     common::seed_api_key(&home, "k_seed");
     Mock::given(method("POST"))
         .and(path("/api/v1/webhooks"))
+        .and(header("content-type", "application/json"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "id": "wh_new",
             "tenant_id": "t_seed",
@@ -365,6 +367,7 @@ async fn add_propagates_400_from_server_validation() {
     Mock::given(method("POST"))
         .and(path("/api/v1/webhooks"))
         .and(header("Authorization", "Bearer k_seed"))
+        .and(header("content-type", "application/json"))
         .respond_with(
             ResponseTemplate::new(400).set_body_string(r#"{"error":"url must use https scheme"}"#),
         )
@@ -409,6 +412,7 @@ async fn update_changes_url_and_disables() {
     Mock::given(method("PUT"))
         .and(path("/api/v1/webhooks/wh_alpha"))
         .and(header("Authorization", "Bearer k_seed"))
+        .and(header("content-type", "application/json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "wh_alpha",
             "tenant_id": "t_seed",
