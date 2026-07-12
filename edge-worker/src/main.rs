@@ -271,10 +271,11 @@ async fn main() -> anyhow::Result<()> {
         signature_verifier.clone(),
     ));
 
-    // Initialize port pool
-    let port_pool = Arc::new(tokio::sync::Mutex::new(PortPool::new(
+    // Initialize port pool (issue #641: capacity is env-tunable via EDGE_PORT_POOL_SIZE)
+    let port_pool = Arc::new(tokio::sync::Mutex::new(PortPool::with_capacity(
         config.starting_port,
         config.port_cooldown_secs,
+        config.port_pool_size,
     )));
 
     // Connect to NATS

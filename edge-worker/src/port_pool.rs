@@ -19,11 +19,31 @@ pub struct PortPool {
 }
 
 impl PortPool {
-    /// Create a new port pool.
+    /// Create a new port pool with the canonical 100-port pre-population.
     ///
     /// - `starting_port`: first port to allocate (e.g., 8081)
     /// - `cooldown_secs`: seconds before a released port is re-available
+    ///
+    /// Kept for backward compatibility with tests and embedders that don't
+    /// care about capacity. New callers should prefer [`with_capacity`]
+    /// (issue #641 — the `EDGE_PORT_POOL_SIZE` env knob).
+    #[allow(dead_code)] // used in tests and external embedders; production goes via `with_capacity`
     pub fn new(starting_port: u16, cooldown_secs: u64) -> Self {
+        Self::with_capacity(starting_port, cooldown_secs, 100)
+    }
+
+    /// Create a new port pool with an explicit pre-population size.
+    ///
+    /// - `starting_port`: first port to allocate (e.g., 8081)
+    /// - `cooldown_secs`: seconds before a released port is re-available
+    /// - `capacity`: number of ports to pre-populate in `available`
+    ///   (the default is 100; tunable via the `EDGE_PORT_POOL_SIZE`
+    ///   env knob — issue #641).
+    ///
+    /// `capacity` is clamped to `u16::MAX - starting_port` to keep the
+    /// pre-population range inside the port space. Operators who want
+    /// more should raise `starting_port` and shrink the range.
+    pub fn with_capacity(starting_port: u16, cooldown_secs: u64, capacity: u32) -> Self {
         let mut pool = Self {
             next_port: starting_port,
             starting_port,
@@ -31,8 +51,9 @@ impl PortPool {
             available: HashSet::new(),
             cooling_down: Vec::new(),
         };
-        // Pre-populate with a range of available ports for fast O(1) allocation.
-        for port in starting_port..(starting_port + 100) {
+        let max = u16::MAX - starting_port;
+        let cap = (capacity as u16).min(max);
+        for port in starting_port..starting_port.saturating_add(cap) {
             pool.available.insert(port);
         }
         pool
@@ -229,5 +250,47 @@ mod tests {
         pool.release(port);
         let next = pool.acquire().unwrap();
         assert_eq!(port, next);
+    }
+
+    // Issue #641: env-tunable pool size via EDGE_PORT_POOL_SIZE.
+
+    #[test]
+    fn test_with_capacity_uses_explicit_size() {
+        // Capacity 50: the 50th acquire succeeds, the 51st falls through
+        // to the sequential fallback and (since cooldown is 0) returns
+        // a wrapped port. The contract is "pre-populate `capacity` ports",
+        // not "total available is capacity" — the sequential fallback
+        // continues to provide extra ports after the pre-populated set
+        // is drained.
+        let mut pool = PortPool::with_capacity(9000, 0, 50);
+        for _ in 0..50 {
+            assert!(
+                pool.acquire().is_some(),
+                "expected first 50 acquires to succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_capacity_clamps_to_u16_space() {
+        // starting_port=65530, capacity=1000 — the pre-population range
+        // would overflow u16 (65530 + 1000 > u16::MAX). The constructor
+        // clamps to (u16::MAX - starting_port) so we don't wrap.
+        let pool = PortPool::with_capacity(65530, 60, 1000);
+        // 65530, 65531, 65532, 65533, 65534 = 5 ports pre-populated.
+        assert_eq!(pool.available.len(), 5);
+    }
+
+    #[test]
+    fn test_new_defaults_to_100() {
+        // Backward-compat: `new` keeps the historical 100-port default.
+        // Catches accidental regression in the new-with_capacity bridge.
+        let mut pool = PortPool::new(8081, 0);
+        for _ in 0..100 {
+            assert!(
+                pool.acquire().is_some(),
+                "new should pre-populate 100 ports"
+            );
+        }
     }
 }

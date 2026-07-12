@@ -29,6 +29,13 @@ pub struct Config {
     pub worker_sync_threshold_secs: u64,
     pub port_cooldown_secs: u64,
     pub starting_port: u16,
+    /// Pre-population size of the worker's port pool. Default 100
+    /// (matches the canonical `PortPool::new` default — backward
+    /// compatible). Tune via `EDGE_PORT_POOL_SIZE` (issue #641). The
+    /// field is clamped to `u16::MAX - starting_port` at the pool
+    /// constructor to keep the pre-population range inside the port
+    /// space.
+    pub port_pool_size: u32,
     /// Per-app memory cap in MiB, applied via wasmtime StoreLimits.
     /// Default 256 MiB. Tune via `APP_MAX_MEMORY_MB`.
     pub max_memory_mb: u64,
@@ -310,6 +317,20 @@ impl Config {
                 .unwrap_or(60),
             port_cooldown_secs: 60,
             starting_port: 8081,
+            port_pool_size: {
+                let raw = std::env::var("EDGE_PORT_POOL_SIZE").unwrap_or_else(|_| "100".into());
+                let n: u32 = raw
+                    .parse()
+                    .with_context(|| format!("EDGE_PORT_POOL_SIZE={raw:?} is not a valid u32"))?;
+                if n < 1 || n > u16::MAX as u32 {
+                    anyhow::bail!(
+                        "EDGE_PORT_POOL_SIZE={n} out of range [1, {}]; \
+                         the pool constructor clamps to (u16::MAX - starting_port)",
+                        u16::MAX
+                    );
+                }
+                n
+            },
             max_memory_mb: parse_env_u64("APP_MAX_MEMORY_MB", 256)?,
             epoch_tick_ms: parse_env_u64("EPOCH_TICK_MS", 10)?,
             epoch_deadline_ticks: parse_env_u64("EPOCH_DEADLINE_TICKS", 100)?,
@@ -913,5 +934,76 @@ mod tests {
             !msg.contains("EDGE_SIGNING_PUBKEY") && !msg.contains("EDGE_SIGNING_PUBKEY_PATH"),
             "error must NOT mention the legacy PR2 env vars; got: {msg}"
         );
+    }
+
+    /// Issue #641: EDGE_PORT_POOL_SIZE env-tunes `PortPool` pre-population
+    /// without rebuilding. Without this test the field could regress to
+    /// the hardcoded 100 (the historical default) and the env var would
+    /// become decorative — defeating operators' ability to expand pool
+    /// capacity for high-density regions.
+    #[test]
+    fn config_from_env_reads_port_pool_size() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_pps")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_PORT_POOL_SIZE", Some("200")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_eq!(cfg.port_pool_size, 200, "EDGE_PORT_POOL_SIZE should be 200");
+        // lock_and_set is non-restoring — clean up so the var doesn't
+        // leak into the next test under cargo's parallel runner.
+        unsafe { std::env::remove_var("EDGE_PORT_POOL_SIZE") };
+    }
+
+    /// EDGE_PORT_POOL_SIZE unset → default 100 (backward compatible).
+    /// Pins the issue #641 contract that operators can leave the knob
+    /// unset and see the pre-PR behavior.
+    #[test]
+    fn config_from_env_port_pool_size_defaults_to_100() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_pps")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_PORT_POOL_SIZE", None),
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_eq!(
+            cfg.port_pool_size, 100,
+            "default port_pool_size should be 100"
+        );
+        unsafe { std::env::remove_var("EDGE_PORT_POOL_SIZE") };
+    }
+
+    /// EDGE_PORT_POOL_SIZE=0 must fail with a clear range error rather
+    /// than silently pre-populating 0 ports (which would make every
+    /// `start_app` immediately fail).
+    #[test]
+    fn config_from_env_port_pool_size_zero_is_rejected() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_pps")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_PORT_POOL_SIZE", Some("0")),
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
+        ]);
+        let err = Config::from_env().expect_err("EDGE_PORT_POOL_SIZE=0 must be rejected");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("EDGE_PORT_POOL_SIZE"),
+            "error must name the env var; got: {msg}"
+        );
+        // lock_and_set is non-restoring — explicitly clean up so the
+        // var doesn't leak into the next test (the unset default is
+        // what every other config test relies on).
+        unsafe { std::env::remove_var("EDGE_PORT_POOL_SIZE") };
     }
 }

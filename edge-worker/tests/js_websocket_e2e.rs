@@ -162,6 +162,7 @@ async fn js_websocket_round_trip_inner() {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         starting_port: 21_000, // avoid clashing with handler.wasm tests (18_000)
         max_memory_mb: 256,
         epoch_tick_ms: 10,
