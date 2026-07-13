@@ -12,7 +12,7 @@
 //! preserved as thin aliases for `Language::C`, so existing callers
 //! (the M2 CLI bin, the Go control plane) are unchanged.
 
-use crate::analyzer::CAnalyzer;
+use crate::analyzer::{pre_pass_deny_c, CAnalyzer};
 use crate::patterns::Language;
 use crate::preprocessor::Preprocessor;
 use crate::report::{FileReport, MigrationReport, TreeMigrationReport};
@@ -297,6 +297,24 @@ fn transform_tree_c(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport>
 
     let mut file_reports: Vec<FileReport> = Vec::with_capacity(entries.len());
     for entry in &entries {
+        // Issue #622 commit 2 — short-circuit on host-reach
+        // #include/#embed BEFORE the analyzer runs. Per-file
+        // rejections surface as a `FileReport` with `Status: Failed`
+        // and `code: SECURITY_DENY:C_INCLUDE` entries; the Go
+        // short-circuit guard (parallel to
+        // `MigrationService.Migrate`'s commit-1 guard) prevents the
+        // per-file `clang` invocation from running on a denied file.
+        // Aggregate tree status naturally lands on `Failed` via the
+        // existing `aggregate_status` rule (`failed` if any file is
+        // `failed`).
+        if let Some(denied_report) = c_deny_tree_report(app_name, &entry.source) {
+            file_reports.push(FileReport::from_report(
+                entry.path.clone(),
+                denied_report,
+                &entry.source,
+            ));
+            continue;
+        }
         let (matches, pp_info) = analyzer.analyze_with_preprocessor_info(&entry.source);
         let report = match pp_info {
             Some(info) => {
@@ -311,6 +329,31 @@ fn transform_tree_c(entries: Vec<&FileEntry>, app_name: &str) -> Vec<FileReport>
         ));
     }
     file_reports
+}
+
+/// Issue #622 commit 2: per-file C deny-list pre-pass for the
+/// tree-mode path. Mirrors `c_deny_report` in `edge-migrate-bin`
+/// but lives here in `edge-migrate-lib` because
+/// `transform_tree_for_language_with_app_name` (which the Go
+/// control plane drives via the lib, not the bin) is the canonical
+/// entry point for the CP's `MigrateTree` flow.
+fn c_deny_tree_report(app_name: &str, source: &str) -> Option<MigrationReport> {
+    let errs = pre_pass_deny_c(source);
+    if errs.is_empty() {
+        return None;
+    }
+    let report = MigrationReport {
+        status: crate::report::MigrationStatus::Failed,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: app_name.to_string(),
+        patterns_detected: Vec::new(),
+        patterns_transformed: Vec::new(),
+        patterns_manual_review: Vec::new(),
+        errors: errs,
+        preprocessor: None,
+    };
+    Some(report)
 }
 
 /// Rust path of `transform_tree_for_language_with_app_name`. Builds

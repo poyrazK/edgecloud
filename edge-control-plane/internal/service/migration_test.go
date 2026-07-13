@@ -1601,6 +1601,115 @@ exit 0
 	}
 }
 
+// TestMigrateTree_CAnalyzerFailure_SkipsCompile is the tree-mode
+// load-bearing regression test for the issue #622 commit 2
+// short-circuit guard in `MigrationService.MigrateTree`. When any
+// file in a tree submission contains a host-reach `#include` or
+// `#embed` directive (the C-side deny-list), the per-file
+// `edge-migrate` subprocess MUST be skipped — the analyzer's
+// reason for existing is to keep the toolchain from ever seeing
+// the hostile source. The Go-side pre-pass `cDenyErrors` runs in
+// `MigrateTree`'s per-file loop BEFORE the subprocess is spawned;
+// without it the deny-list would only run on the `analyze-json`
+// envelope after `transform` had already emitted a (benign)
+// `wasi_c`, leaving a tiny window where future compile steps
+// could be tricked.
+//
+// The test points `edgeMigratePath` at a sentinel-writing shell
+// script. If `MigrateTree` skips the pre-pass guard, the shell
+// will be invoked, the sentinel will exist, and the test fails.
+// Conversely, if the short-circuit fires, the sentinel never
+// appears and the structured `FileReport` carries the
+// `SECURITY_DENY:C_INCLUDE` error code on the denied file.
+func TestMigrateTree_CAnalyzerFailure_SkipsCompile(t *testing.T) {
+	sentinelDir := t.TempDir()
+	transformSentinel := filepath.Join(sentinelDir, "transform-invoked")
+	analyzeSentinel := filepath.Join(sentinelDir, "analyze-invoked")
+	fakeBinDir := t.TempDir()
+	fakeBin := filepath.Join(fakeBinDir, "edge-migrate")
+
+	script := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *--analyze-json*) echo 'invoked' > %q ;;
+  *--transform*) echo 'invoked' > %q ;;
+esac
+echo '{"status":"failed","wasm_stored":false,"app_name":"x","errors":[]}'
+`, analyzeSentinel, transformSentinel)
+
+	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake edge-migrate: %v", err)
+	}
+
+	repo := &mockDeploymentRepo{}
+	store := newMockArtifactStore()
+	svc := NewMigrationService(repo, store, fakeBin,
+		"/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo",
+		"/tmp/edge-mock-wit", signing.TestKeyring(t))
+
+	hostile := `#include "/etc/edgecloud/signing.key"
+int main(void) { return 0; }
+`
+
+	report, err := svc.MigrateTree(context.Background(), "tenant-1", "hostile.c", "c", []domain.FileEntry{
+		{Path: "hostile.c", Source: hostile},
+	})
+
+	// Top-level error must be the typed sentinel so the handler's
+	// 422 path kicks in (parallel to ErrEdgeMigrateFailed in
+	// commit 1's test, but tree-mode uses ErrMigrateTreeFailed).
+	if err == nil {
+		t.Fatal("expected ErrMigrateTreeFailed on C deny pre-pass, got nil")
+	}
+	if !errors.Is(err, ErrMigrateTreeFailed) {
+		t.Errorf("expected ErrMigrateTreeFailed, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected non-nil report on tree failure (handler emits 422 with body)")
+	}
+	if report.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected report.Status=Failed, got: %s", report.Status)
+	}
+	if report.WasmStored {
+		t.Error("expected WasmStored=false on analyzer-driven tree short-circuit")
+	}
+
+	if len(report.Files) != 1 {
+		t.Fatalf("expected 1 file report, got: %d", len(report.Files))
+	}
+	fr := report.Files[0]
+	if fr.Status != domain.MigrationStatusFailed {
+		t.Errorf("expected FileReport.Status=Failed, got: %s", fr.Status)
+	}
+	if len(fr.Errors) == 0 {
+		t.Fatal("expected at least one error entry on the offending FileReport")
+	}
+	if got := fr.Errors[0].Code; got != denyCodePrefix+denyCodeCInclude {
+		t.Errorf("expected FileReport.Errors[0].Code=%s%s, got: %q (message=%q)",
+			denyCodePrefix, denyCodeCInclude, got, fr.Errors[0].Message)
+	}
+
+	// Hard guarantees that the compile step did NOT run:
+	// 1. No deployment row was written.
+	// 2. No artifact blob was saved.
+	// 3. The edge-migrate subprocess never launched (the
+	//    pre-pass fires BEFORE the per-file loop; both sentinels
+	//    must be absent).
+	if len(repo.deployments) != 0 {
+		t.Errorf("expected no deployment rows on tree short-circuit; got %d",
+			len(repo.deployments))
+	}
+	if len(store.saveCalls) != 0 {
+		t.Errorf("expected artifact.Save never called (tree short-circuit); got %d calls",
+			len(store.saveCalls))
+	}
+	if _, err := os.Stat(transformSentinel); err == nil {
+		t.Errorf("expected --transform subprocess SKIPPED by pre-pass; sentinel exists (subprocess ran when it shouldn't have)")
+	}
+	if _, err := os.Stat(analyzeSentinel); err == nil {
+		t.Errorf("expected --analyze-json subprocess SKIPPED by pre-pass; sentinel exists (subprocess ran when it shouldn't have)")
+	}
+}
+
 func TestMigrateTree_RustRejected(t *testing.T) {
 	svc := migrationSvcForTest(t, &mockDeploymentRepo{}, newMockArtifactStore())
 

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use edge_migrate_lib::{
     analyzer::CAnalyzer,
-    is_valid_app_name,
+    is_valid_app_name, pre_pass_deny_c,
     preprocessor::{Preprocessor, PreprocessorInfo},
     report::{MigrationReport, MigrationStatus, TransformOutput, TRANSFORM_OUTPUT_VERSION},
     rust_analyzer::{RustAnalyzer, DENY_CODE_RUST_MACRO},
@@ -204,18 +204,25 @@ async fn main() -> Result<()> {
         let source = read_file(source_path).await?;
         let local_report = match language {
             Language::C => {
-                let (mut analyzer, preprocessor_info) = build_c_analyzer_with_preprocessor(&source);
-                let matches = analyzer.analyze(&source);
-                match preprocessor_info {
-                    Some(pp) => MigrationReport::from_pattern_matches_with_preprocessor(
-                        &derive_app_name(source_path, Language::C),
-                        matches,
-                        pp,
-                    ),
-                    None => MigrationReport::from_pattern_matches(
-                        &derive_app_name(source_path, Language::C),
-                        matches,
-                    ),
+                let c_app_name = derive_app_name(source_path, Language::C);
+                // Issue #622 commit 2 — short-circuit on any
+                // host-reach #include/#embed BEFORE the analyzer
+                // runs. Returns a `Status: Failed` report with
+                // `code: SECURITY_DENY:C_INCLUDE` entries.
+                if let Some(denied) = c_deny_report(&c_app_name, &source) {
+                    denied
+                } else {
+                    let (mut analyzer, preprocessor_info) =
+                        build_c_analyzer_with_preprocessor(&source);
+                    let matches = analyzer.analyze(&source);
+                    match preprocessor_info {
+                        Some(pp) => MigrationReport::from_pattern_matches_with_preprocessor(
+                            &c_app_name,
+                            matches,
+                            pp,
+                        ),
+                        None => MigrationReport::from_pattern_matches(&c_app_name, matches),
+                    }
                 }
             }
             Language::Rust => {
@@ -247,22 +254,36 @@ async fn main() -> Result<()> {
         // Build the report + transformed source per language.
         let (report, wasi_source) = match language {
             Language::C => {
-                // When clang is reachable, attach a preprocessor so
-                // patterns hidden behind macros become visible. When
-                // clang is missing, the analyzer falls back to the
-                // unexpanded source silently — no user-visible error.
-                let (mut analyzer, preprocessor_info) = build_c_analyzer_with_preprocessor(&source);
-                let matches = analyzer.analyze(&source);
-                let report = match preprocessor_info.clone() {
-                    Some(pp) => MigrationReport::from_pattern_matches_with_preprocessor(
-                        &app_name,
-                        matches.clone(),
-                        pp,
-                    ),
-                    None => MigrationReport::from_pattern_matches(&app_name, matches.clone()),
-                };
-                let result = Transformer::transform(&source, matches, preprocessor_info);
-                (report, result.transformed_source)
+                // Issue #622 commit 2 — short-circuit on host-reach
+                // #include/#embed BEFORE the analyzer runs. The
+                // returned report carries
+                // `code: SECURITY_DENY:C_INCLUDE` entries; an empty
+                // transformed body means the downstream Go
+                // short-circuit (which this commit adds to
+                // `MigrationService.Migrate`) skips the compile
+                // entirely.
+                if let Some(denied) = c_deny_report(&app_name, &source) {
+                    (denied, String::new())
+                } else {
+                    // When clang is reachable, attach a preprocessor
+                    // so patterns hidden behind macros become
+                    // visible. When clang is missing, the analyzer
+                    // falls back to the unexpanded source silently
+                    // — no user-visible error.
+                    let (mut analyzer, preprocessor_info) =
+                        build_c_analyzer_with_preprocessor(&source);
+                    let matches = analyzer.analyze(&source);
+                    let report = match preprocessor_info.clone() {
+                        Some(pp) => MigrationReport::from_pattern_matches_with_preprocessor(
+                            &app_name,
+                            matches.clone(),
+                            pp,
+                        ),
+                        None => MigrationReport::from_pattern_matches(&app_name, matches.clone()),
+                    };
+                    let result = Transformer::transform(&source, matches, preprocessor_info);
+                    (report, result.transformed_source)
+                }
             }
             Language::Rust => {
                 // No preprocessor for Rust in v1. See the
@@ -335,13 +356,19 @@ async fn main() -> Result<()> {
     // preprocessor in v1.
     let local_report = match language {
         Language::C => {
-            let (mut analyzer, preprocessor_info) = build_c_analyzer_with_preprocessor(&source);
-            let matches = analyzer.analyze(&source);
-            match preprocessor_info {
-                Some(pp) => {
-                    MigrationReport::from_pattern_matches_with_preprocessor(&app_name, matches, pp)
+            // Issue #622 commit 2 — short-circuit on host-reach
+            // #include/#embed before the analyzer runs.
+            if let Some(denied) = c_deny_report(&app_name, &source) {
+                denied
+            } else {
+                let (mut analyzer, preprocessor_info) = build_c_analyzer_with_preprocessor(&source);
+                let matches = analyzer.analyze(&source);
+                match preprocessor_info {
+                    Some(pp) => MigrationReport::from_pattern_matches_with_preprocessor(
+                        &app_name, matches, pp,
+                    ),
+                    None => MigrationReport::from_pattern_matches(&app_name, matches),
                 }
-                None => MigrationReport::from_pattern_matches(&app_name, matches),
             }
         }
         Language::Rust => {
@@ -387,6 +414,38 @@ fn parse_language(s: &str) -> Result<Language> {
         "rust" => Ok(Language::Rust),
         other => anyhow::bail!("invalid --language '{}': must be 'c' or 'rust'", other),
     }
+}
+
+/// Issue #622 (commit 2): apply the C-side compile-time host-reach
+/// deny-list (`pre_pass_deny_c`) to the source. Returns a
+/// fully-populated `MigrationReport` with `Status: Failed` carrying
+/// the deny errors when the source is rejected; returns `None` when
+/// the source is clean and the caller should proceed with the normal
+/// analyze + transform pipeline.
+///
+/// Mirrors the Rust-side `analyze_with_security` short-circuit in
+/// the `--transform` arm below. The `Language::C` arms of every
+/// entry point (`--analyze-json`, `--transform`, `--tree`,
+/// no-flag single-file) call this helper before the analyzer runs,
+/// so a hostile `#include "/etc/..."` upload is rejected with
+/// `code: "SECURITY_DENY:C_INCLUDE"` and never reaches `clang`.
+fn c_deny_report(app_name: &str, source: &str) -> Option<MigrationReport> {
+    let errs = pre_pass_deny_c(source);
+    if errs.is_empty() {
+        return None;
+    }
+    let report = MigrationReport {
+        status: MigrationStatus::Failed,
+        wasm_stored: false,
+        deployment_id: None,
+        app_name: app_name.to_string(),
+        patterns_detected: Vec::new(),
+        patterns_transformed: Vec::new(),
+        patterns_manual_review: Vec::new(),
+        errors: errs,
+        preprocessor: None,
+    };
+    Some(report)
 }
 
 /// Display label for the language — used in report section headers

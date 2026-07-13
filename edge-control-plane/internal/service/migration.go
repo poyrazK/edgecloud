@@ -51,10 +51,22 @@ var ErrWasmToolsFailed = fmt.Errorf("wasm-tools component wrap failed")
 // produced by the migration analyzer's compile-time host-reach deny
 // list (issue #622). The Rust side defines the same string as
 // `DENY_CODE_RUST_MACRO` in `edge-migrate/edge-migrate-lib/src/rust_analyzer.rs`
-// and the C side (commit 2 follow-up) will define a parallel
-// `DENY_CODE_C_INCLUDE`. Mirror any new value here so the production
-// short-circuit guard and the Go tests reference one canonical string.
+// and the C side (commit 2) defines `DENY_CODE_C_INCLUDE` in
+// `edge-migrate/edge-migrate-lib/src/analyzer.rs`. Mirror any new
+// value here so the production short-circuit guard and the Go tests
+// reference one canonical string.
 const denyCodePrefix = "SECURITY_DENY:"
+
+// denyCodeCInclude is the per-reason suffix for the C-side
+// host-reach deny list (commit 2). The full `errors[].code` value
+// produced by the analyzer is `denyCodePrefix + denyCodeCInclude`,
+// matching the Rust side's `SECURITY_DENY:RUST_MACRO` shape. Kept
+// as a separate constant so the production short-circuit guard and
+// any Go-side test assertions branch on the prefix rather than the
+// full string (the prefix is the canonical signal — new reasons
+// like `EMBED` will land without touching either this constant or
+// the prefix).
+const denyCodeCInclude = "C_INCLUDE"
 
 // ErrCargoBuildFailed is returned when the cargo build subprocess
 // fails or the synthesized Cargo project is malformed (issue #415).
@@ -457,6 +469,27 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	}
 	if err := tmpSrc.Close(); err != nil {
 		log.Printf("migration service: failed to close temp file: %v", err)
+	}
+
+	// Issue #622 commit 2 — single-file C pre-pass for host-reach
+	// #include / #embed, BEFORE the edge-migrate subprocess. The
+	// existing commit 1 guard at line ~538 short-circuits AFTER
+	// `edge-migrate` returns; this pre-pass is symmetrical for the
+	// C side and is strictly cheaper (no subprocess, no JSON
+	// parse). When a #include is rejected, the report carries
+	// `code: SECURITY_DENY:C_INCLUDE` with line numbers and the
+	// offending path, the edge-migrate subprocess never launches,
+	// and downstream guard at line ~538 catches any future
+	// regression where edge-migrate itself emits a deny-flag.
+	if language == "c" {
+		if denyErrs := cDenyErrors(tmpSrcPath); len(denyErrs) > 0 {
+			return &domain.MigrationReport{
+				Status:     domain.MigrationStatusFailed,
+				WasmStored: false,
+				AppName:    appName,
+				Errors:     denyErrs,
+			}, ErrEdgeMigrateFailed
+		}
 	}
 
 	// Run `edge-migrate --language <lang> --transform <path> --format json`.
@@ -1194,6 +1227,34 @@ func (s *MigrationService) MigrateTree(
 	for i := range written {
 		wf := &written[i]
 
+		// Issue #622 commit 2 — C-side pre-pass for host-reach
+		// #include/#embed. Mirrors `c_deny_report` in the bin and
+		// `pre_pass_deny_c` in the lib: scan each entry's source
+		// for absolute / traversal `#include` and any `#embed`
+		// BEFORE invoking the per-file edge-migrate subprocess. A
+		// denied file is recorded as a `FileReport{Status: Failed,
+		// Errors: [{Code: SECURITY_DENY:C_INCLUDE, ...}]}` and the
+		// per-file subprocess is skipped — the file's transform
+		// output never reaches clang.
+		if language == "c" {
+			if denyErrs := cDenyErrors(wf.absPath); len(denyErrs) > 0 {
+				fr := domain.FileReport{
+					Status: domain.MigrationStatusFailed,
+					Errors: denyErrs,
+				}
+				// SHA256 of the **original** source for SLSA
+				// materials — same shape as the analyzer path
+				// uses for benign files.
+				if wf.path != "" {
+					fr.Path = wf.path
+				}
+				fr.SHA256 = sha256HexLower([]byte(denyOriginalSource(wf.absPath)))
+				wf.report = fr
+				wf.transformOK = false
+				continue
+			}
+		}
+
 		// 1) `edge-migrate --language <lang> --transform <path>` → WASI output.
 		// We write the transformed source to <path>.wasi.c in the
 		// same dir so the final toolchain invocation can pick them
@@ -1338,6 +1399,51 @@ func (s *MigrationService) MigrateTree(
 				Line:    0,
 				Message: "one or more files failed to transform; no wasm built",
 			}},
+		}, ErrMigrateTreeFailed
+	}
+
+	// Issue #622 commit 2 — analyzer-driven short-circuit (parallel
+	// to commit 1's guard at the top of `Migrate`). If any file's
+	// `--analyze-json` envelope reports `Status: Failed` and carries
+	// a `SECURITY_DENY:*`-coded error, the deny-list detected a
+	// host-reach #include/#embed at parse time. Without this guard
+	// the downstream `clang` invocation would still run and bake
+	// the host file into the produced wasm — so we short-circuit
+	// BEFORE the per-file clang call at the bottom of this
+	// function. Distinct from `anyTransformFailed` above because
+	// (a) the failure was detected at ANALYZE time, not TRANSFORM
+	// time, and (b) the upstream `edge-migrate` subprocess
+	// completed successfully (it just emitted a `Failed` report).
+	anyAnalyzeFailed := false
+	for _, f := range files {
+		if f.Status != domain.MigrationStatusFailed {
+			continue
+		}
+		for _, e := range f.Errors {
+			if strings.HasPrefix(e.Code, denyCodePrefix) {
+				anyAnalyzeFailed = true
+				break
+			}
+		}
+		if anyAnalyzeFailed {
+			break
+		}
+	}
+	if anyAnalyzeFailed {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			// No synthetic tree-level error: per-file
+			// `f.Errors` already carries the structured
+			// `SECURITY_DENY:*` entries with line numbers
+			// and offending paths. Surfacing a duplicate
+			// "tree failed" message would clutter the
+			// response without adding information.
 		}, ErrMigrateTreeFailed
 	}
 
