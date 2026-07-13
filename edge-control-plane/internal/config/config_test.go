@@ -286,14 +286,36 @@ func TestLoad_DBPasswordEnvVarOverridesYAML(t *testing.T) {
 	}
 }
 
+// TestLoad_RejectsShortDBPassword pins the 16-byte length floor added
+// in the issue #626 review follow-up. Sibling to TestLoad_RejectsShortSecret:
+// a non-placeholder password shorter than the minimum must fail with a
+// message that mentions the byte count so operators can fix it.
+func TestLoad_RejectsShortDBPassword(t *testing.T) {
+	short := strings.Repeat("p", 15) // one short of the 16-byte minimum
+	body := "jwt:\n  secret: \"" + validSecret + "\"\n" +
+		"database:\n  password: \"" + short + "\"\n"
+	path := writeConfig(t, body)
+	t.Setenv("DATABASE_PASSWORD", "") // writeConfig's helper sets validSecret; clear so the YAML value reaches Load
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for 15-byte db password, got nil")
+	}
+	if !strings.Contains(err.Error(), "16 bytes") {
+		t.Errorf("error %q should mention the 16-byte minimum", err.Error())
+	}
+}
+
 // TestBundledConfig_FailsStartup_DBPassword is the issue #626
 // regression guard for the bundled config.yaml. The file used to ship
 // with `password: "edgecloud"` hardcoded; we now ship an empty string
-// + comment, and the validator refuses the dev default. If the literal
-// is reintroduced, this test catches it. Note: the JWT placeholder
-// check fires first on the bundled config (the JWT secret is still
-// `change-me-in-production`), so we only assert that Load fails —
-// TestBundledConfig_FailsStartup pins the specific JWT message.
+// + comment, and the validator refuses the dev default. The bundled
+// config also has the JWT placeholder (`change-me-in-production`),
+// which trips the JWT check first — we accept either error message
+// here. The NEW TestLoad_RejectsDBPasswordLiteral_Edgecloud below is
+// the specific guard against re-introducing the literal `edgecloud`:
+// it builds a synthetic config with a valid JWT secret and the literal
+// `edgecloud` password, and pins the "placeholder" error.
 func TestBundledConfig_FailsStartup_DBPassword(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -321,6 +343,37 @@ func TestBundledConfig_FailsStartup_DBPassword(t *testing.T) {
 	if !strings.Contains(err.Error(), "placeholder") && !strings.Contains(err.Error(), "not set") {
 		t.Errorf("error %q should mention either 'placeholder' (JWT) or 'not set' (database)", err.Error())
 	}
+}
+
+// TestLoad_RejectsDBPasswordLiteral_Edgecloud is the SPECIFIC issue #626
+// regression guard against re-introducing `password: "edgecloud"` into
+// the bundled config.yaml. It builds a synthetic config with a valid
+// JWT secret and the literal `edgecloud` DB password, and pins the
+// validator's "placeholder" error. If this test starts passing, the
+// validator's deny-list has lost the literal (or someone changed the
+// bundled config back to the hardcoded dev default).
+func TestLoad_RejectsDBPasswordLiteral_Edgecloud(t *testing.T) {
+	// Synthetic config: valid JWT secret + literal edgecloud DB password.
+	// Same env-var clear pattern as TestLoad_RejectsPlaceholderDBPasswords:
+	// writeConfig's helper sets DATABASE_PASSWORD=validSecret; clear so
+	// the YAML placeholder reaches Load.
+	body := "jwt:\n  secret: \"" + validSecret + "\"\n" +
+		"database:\n  password: \"edgecloud\"\n"
+	path := writeConfig(t, body)
+	t.Setenv("DATABASE_PASSWORD", "")
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded; literal 'edgecloud' DB password must be rejected")
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error %q should mention 'placeholder' (literal edgecloud regression)", err.Error())
+	}
+	// Specifically NOT the length error — the literal 'edgecloud' is 9
+	// bytes, which is below the 16-byte minimum; without the deny-list
+	// check firing first, the validator would still reject on length.
+	// Either error is a valid fail, but the test's primary intent is
+	// the deny-list check.
 }
 
 // TestBundledConfig_FailsStartup is a regression guard: the config.yaml

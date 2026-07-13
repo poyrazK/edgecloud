@@ -902,16 +902,26 @@ var insecureDBPasswordValues = map[string]struct{}{
 	"admin":     {},
 }
 
-// validateDBPassword enforces that the database password is set and is
-// not a known placeholder. Mirrors validateJWTSecret — fail-closed at
-// Load() so the binary refuses to boot rather than silently threading
-// an empty password to libpq (which produces a confusing auth error).
+// validateDBPassword enforces that the database password is set, is
+// not a known placeholder, and meets a minimum length floor. Mirrors
+// validateJWTSecret — fail-closed at Load() so the binary refuses to
+// boot rather than silently threading an empty or trivially-guessable
+// password to libpq (which produces a confusing auth error).
+//
+// Minimum length is 16 bytes — half the JWT validator's 32-byte floor,
+// since password-based DB auth doesn't have the JWT signing-algorithm
+// entropy requirements. The floor catches accidental typos like a
+// single-character password left over from a `.env` copy-paste, while
+// still permitting operators to use a memorable but unique value.
 func validateDBPassword(password string) error {
 	if password == "" {
 		return fmt.Errorf("database.password is not set; set DATABASE_PASSWORD or database.password to a unique value")
 	}
 	if _, ok := insecureDBPasswordValues[password]; ok {
 		return fmt.Errorf("database.password %q is a known placeholder; set DATABASE_PASSWORD to a unique value", password)
+	}
+	if len(password) < 16 {
+		return fmt.Errorf("database.password must be at least 16 bytes (got %d); set DATABASE_PASSWORD to a unique value", len(password))
 	}
 	return nil
 }
