@@ -810,6 +810,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/tenants/{tenantID}/rate-limit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set or clear a tenant's data-plane rate-limit caps (admin only)
+         * @description Writes the four per-tenant rate-limit columns on `quotas`
+         *     (`tenant_rate_limit_rps`, `tenant_rate_limit_burst`,
+         *     `tenant_concurrent_limit`, `tenant_bandwidth_bps`) via
+         *     `UPDATE ... SET ... WHERE tenant_id = $1`. Every field in the
+         *     request body is optional; absent fields are not modified. The
+         *     `tenant_rate_limit_set_at` audit column is bumped to
+         *     `now()` on every write.
+         *
+         *     The ingress picks up the change on its next
+         *     `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick (default 30s):
+         *     a non-zero rps causes a new per-tenant `rate_limit` route to
+         *     appear in Caddy; clearing rps back to 0 (or deleting the whole
+         *     row via all-zero + 404) removes the route on the next tick.
+         *
+         *     Records an `audit_logs` row with action `tenant.rate_limit.set`
+         *     and the full request body as the diff payload.
+         *
+         *     Owner role required. Returns 404 when the tenant (or its quota
+         *     row) doesn't exist; 400 when any field is negative.
+         */
+        put: operations["adminSetTenantRateLimit"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/tenants/{tenantID}/enable": {
         parameters: {
             query?: never;
@@ -1007,6 +1045,73 @@ export interface paths {
                     content?: never;
                 };
                 /** @description App not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/rate-limit/{tenantID}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Per-tenant data-plane rate-limit caps for the ingress
+         * @description Returns the four per-tenant caps consumed by the
+         *     edge-ingress `tenant_ratelimit` fetcher. Polled every
+         *     `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s) per tenant
+         *     in the routing table. Drives the per-tenant `rate_limit`
+         *     routes in Caddy (sub-feature #1).
+         *
+         *     Returns 404 when the tenant has no `quotas` row (fail-open:
+         *     the cache clears the entry so the renderer stops emitting a
+         *     route for that tenant). Returns 200 with all-zero caps when
+         *     the row exists but no caps are configured (same fail-open
+         *     semantics — the cache drops the entry). 5xx is logged at
+         *     warn but not treated as a cache invalidation, so the
+         *     ingress keeps the last-known state.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Per-tenant rate-limit caps (all zeros = no caps). */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["TenantRateLimitResponse"];
+                    };
+                };
+                /** @description Invalid tenant ID */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Tenant has no quotas row */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -2240,6 +2345,65 @@ export interface components {
              * @example false
              */
             clear_grace?: boolean;
+        };
+        /**
+         * @description Per-tenant data-plane rate-limit caps written by
+         *     `PUT /api/v1/admin/tenants/{tenantID}/rate-limit`. All fields are
+         *     optional; absent fields are not modified. Every field accepts 0
+         *     ("no cap"). The ingress cache drops the row when all four caps are
+         *     zero so the per-tenant `rate_limit` route disappears from Caddy
+         *     within one `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick.
+         *
+         *     Sub-features #2 (concurrent_limit) and #3 (bandwidth_bps) are
+         *     cached for follow-up render work — neither is consumed by the
+         *     Caddy renderer in the issue #305 PR.
+         */
+        TenantRateLimitRequest: {
+            /**
+             * @description Per-tenant requests-per-second cap. 0 = no cap.
+             * @example 100
+             */
+            rps?: number;
+            /**
+             * @description Per-tenant burst paired with `rps`. 0 = falls back to rps at the renderer.
+             * @example 200
+             */
+            burst?: number;
+            /**
+             * @description Concurrent-request cap per tenant (sub-feature
+             * @example 50
+             */
+            concurrent_limit?: number;
+            /**
+             * Format: int64
+             * @description Per-tenant bytes-per-second cap (sub-feature
+             * @example 5000000
+             */
+            bandwidth_bps?: number;
+        };
+        /**
+         * @description Per-tenant rate-limit row consumed by the edge-ingress
+         *     `tenant_ratelimit` fetcher via
+         *     `GET /api/v1/internal/rate-limit/{tenantID}`. Polls every
+         *     `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s). 404 from
+         *     this endpoint means "no quotas row" — the cache treats that as
+         *     "delete any stale entry, emit no route". 200 with all zeros is
+         *     identical: cache clears on the same tick.
+         */
+        TenantRateLimitResponse: {
+            /** @example t_acme */
+            tenant_id?: string;
+            /** @example 100 */
+            rps?: number;
+            /** @example 200 */
+            burst?: number;
+            /** @example 0 */
+            concurrent_limit?: number;
+            /**
+             * Format: int64
+             * @example 0
+             */
+            bandwidth_bps?: number;
         };
         MigrationReport: {
             /**
@@ -4204,6 +4368,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Quota"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    adminSetTenantRateLimit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenantID: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TenantRateLimitRequest"];
+            };
+        };
+        responses: {
+            /** @description Rate-limit row upserted. Returns the post-write values. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantRateLimitResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

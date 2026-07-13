@@ -23,6 +23,7 @@ use crate::messages::HeartbeatMessage;
 use crate::quota::{spawn_quota_fetcher, SharedQuotaCache};
 use crate::ratelimit::SharedRateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry, RoutingTable};
+use crate::tenant_ratelimit::{spawn_tenant_rate_limit_fetcher, SharedTenantRateLimitCache};
 use crate::traffic::{spawn_fetcher, SharedCache};
 use reqwest::Client;
 
@@ -57,6 +58,14 @@ pub async fn run(
     // Quota-state cache shared between the quota fetcher and the renderer.
     // Issue #420 — driving the Caddy `static_response` 402 inject.
     let quota_cache: SharedQuotaCache = Default::default();
+    // Per-tenant data-plane rate-limit cache (issue #305). Polls
+    // `GET /api/v1/internal/rate-limit/{tenantID}` every
+    // `cfg.tenant_rate_limit_fetch_interval` (default 30s) so the
+    // renderer can inject per-tenant `rate_limit` routes (sub-feature
+    // #1) and a single global `rate_limit` route (sub-feature #4).
+    // Disabled when `tenant_rate_limit_fetch_interval` is zero — see
+    // `spawn_tenant_rate_limit_fetcher`.
+    let tenant_rate_limit_cache: SharedTenantRateLimitCache = Default::default();
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -67,6 +76,8 @@ pub async fn run(
     let rate_limit_cache_for_push = rate_limit_cache.clone();
     let quota_cache_for_renderer = quota_cache.clone();
     let quota_cache_for_push = quota_cache.clone();
+    let tenant_rate_limit_cache_for_renderer = tenant_rate_limit_cache.clone();
+    let tenant_rate_limit_cache_for_push = tenant_rate_limit_cache.clone();
 
     // Spawn background tasks with the shutdown token.
     let fetcher_shutdown = shutdown.clone();
@@ -99,12 +110,29 @@ pub async fn run(
     // Disabled when `quota_fetch_interval` is zero — see spawn_quota_fetcher.
     let quota_fetcher_shutdown = shutdown.clone();
     spawn_quota_fetcher(
-        http_client_for_quota,
+        http_client_for_quota.clone(),
         cfg.control_plane_api_url.clone(),
         quota_cache.clone(),
         cfg.internal_token.clone(),
         table.clone(),
         quota_fetcher_shutdown,
+    );
+    // Tenant rate-limit fetcher (issue #305). Polls every tenant in
+    // the routing table for `GET /api/v1/internal/rate-limit/{tenant}`
+    // so the renderer can emit per-tenant + global rate_limit routes.
+    // Disabled when `tenant_rate_limit_fetch_interval` is zero — see
+    // `spawn_tenant_rate_limit_fetcher`. The fetcher is intentionally
+    // launched after the quota fetcher so the http_client clone
+    // chain stays obvious to readers (quota -> tenant_rl -> renderer).
+    let tenant_rl_fetcher_shutdown = shutdown.clone();
+    spawn_tenant_rate_limit_fetcher(
+        http_client_for_quota,
+        cfg.control_plane_api_url.clone(),
+        tenant_rate_limit_cache.clone(),
+        cfg.internal_token.clone(),
+        table.clone(),
+        cfg.tenant_rate_limit_fetch_interval,
+        tenant_rl_fetcher_shutdown,
     );
     let renderer_shutdown = shutdown.clone();
     spawn_renderer(
@@ -114,6 +142,7 @@ pub async fn run(
         traffic_cache_for_renderer,
         rate_limit_cache_for_renderer,
         quota_cache_for_renderer,
+        tenant_rate_limit_cache_for_renderer,
         render_notify.clone(),
         renderer_shutdown,
     );
@@ -136,6 +165,7 @@ pub async fn run(
         &traffic_cache_for_push,
         &rate_limit_cache_for_push,
         &quota_cache_for_push,
+        &tenant_rate_limit_cache_for_push,
         &mut boot_previous,
     )
     .await
@@ -275,6 +305,7 @@ fn spawn_renderer(
     traffic_cache: SharedCache,
     rate_limit_cache: SharedRateLimitCache,
     quota_cache: SharedQuotaCache,
+    tenant_rate_limit_cache: SharedTenantRateLimitCache,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
 ) {
@@ -284,7 +315,7 @@ fn spawn_renderer(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("renderer: shutdown signal received; performing final push");
-                    let _ = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache, &quota_cache, &mut previous).await;
+                    let _ = push_now(&cfg, &table, &caddy, &traffic_cache, &rate_limit_cache, &quota_cache, &tenant_rate_limit_cache, &mut previous).await;
                     break;
                 }
                 _ = notify.notified() => {
@@ -297,6 +328,7 @@ fn spawn_renderer(
                         &traffic_cache,
                         &rate_limit_cache,
                         &quota_cache,
+                        &tenant_rate_limit_cache,
                         &mut previous,
                     )
                     .await
@@ -342,6 +374,7 @@ fn spawn_pruner(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn push_now(
     cfg: &Config,
     table: &RoutingTable,
@@ -349,6 +382,7 @@ async fn push_now(
     traffic_cache: &SharedCache,
     rate_limit_cache: &SharedRateLimitCache,
     quota_cache: &SharedQuotaCache,
+    tenant_rate_limit_cache: &SharedTenantRateLimitCache,
     previous: &mut Option<PreviousState>,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
@@ -356,6 +390,7 @@ async fn push_now(
     let traffic_cache_guard = traffic_cache.read().await;
     let rate_limit_cache_guard = rate_limit_cache.read().await;
     let quota_cache_guard = quota_cache.read().await;
+    let tenant_rate_limit_cache_guard = tenant_rate_limit_cache.read().await;
 
     // Set gauges from current state.
     metrics::gauge!("ingress.routes.active").set(snap.len() as f64);
@@ -372,6 +407,7 @@ async fn push_now(
                 &traffic_cache_guard,
                 &rate_limit_cache_guard,
                 &quota_cache_guard,
+                &tenant_rate_limit_cache_guard,
             );
             let render_dur = render_start.elapsed();
             metrics::histogram!("ingress.caddy.render_duration_seconds")
@@ -421,6 +457,7 @@ async fn push_now(
                     &traffic_cache_guard,
                     &rate_limit_cache_guard,
                     &quota_cache_guard,
+                    &tenant_rate_limit_cache_guard,
                 );
                 let render_dur = render_start.elapsed();
                 metrics::histogram!("ingress.caddy.render_duration_seconds")
@@ -531,18 +568,80 @@ async fn push_now(
 }
 
 /// Render a single route for a (tenant, app) group.
+///
+/// Mirrors the per-app handle chain in `caddy.rs:408-429` so the
+/// incremental-push path emits the same per-app `rate_limit`
+/// handler when the bulk `render_routes` does. Without this, an app
+/// updated via `upsert_route` (route changed in `diff_routes`) would
+/// land WITHOUT a `rate_limit` handler even though the equivalent
+/// entry on a full reload would have one — that's the asymmetry
+/// this fix removes. See issue #305 commit 5 for the design.
 fn render_single_route(
     entry: &RouteEntry,
-    _cfg: &Config,
-    _traffic_cache: &crate::traffic::TrafficSplitCache,
-    _rate_limit_cache: &crate::ratelimit::RateLimitCache,
+    cfg: &Config,
+    traffic_cache: &crate::traffic::TrafficSplitCache,
+    rate_limit_cache: &crate::ratelimit::RateLimitCache,
 ) -> serde_json::Value {
     let host = crate::config::ingress_host(&entry.tenant_id, &entry.app_name);
     let dial = format!("{}:{}", entry.worker_addr, entry.port);
+
+    // Resolve the per-app weight from the traffic-split cache when
+    // multiple deployments exist for this (tenant, app); the bulk
+    // path at `caddy.rs:355-377` already does this for the full
+    // reload. Mirroring it here keeps the incremental route shape
+    // identical to the bulk shape so an admin-driven weight update
+    // (canary split) takes effect whether the change rides an
+    // upsert or a full reload.
+    let weight = entry
+        .deployment_id
+        .as_ref()
+        .and_then(|did| traffic_cache.weight(&entry.tenant_id, &entry.app_name, did))
+        .unwrap_or(entry.weight);
+
+    // Resolve effective per-app rate limit (priority: per-app cache
+    // > RouteEntry field > Config default). Same priority chain as
+    // `caddy.rs:382-406`. Keeping this duplicate free of the
+    // multi-deployment grouping logic — the incremental path only
+    // touches a single entry at a time.
+    let cached = rate_limit_cache.get(&entry.tenant_id, &entry.app_name);
+    let rps = cached
+        .map(|e| e.rps)
+        .or(entry.rate_limit_rps)
+        .or_else(|| {
+            let d = cfg.rate_limit_rps_default;
+            if d > 0 {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let burst = cached
+        .map(|e| e.burst)
+        .or(entry.rate_limit_burst)
+        .or_else(|| {
+            let d = cfg.rate_limit_burst_default;
+            if d > 0 {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
     let mut handle_chain = Vec::new();
+    if rps > 0 {
+        let burst = if burst > 0 { burst } else { rps };
+        handle_chain.push(serde_json::json!({
+            "handler": "rate_limit",
+            "rates": { "rps": rps, "burst": burst },
+            "key": "{http.request.host}",
+        }));
+    }
+
     handle_chain.push(serde_json::json!({
         "handler": "reverse_proxy",
-        "upstreams": [{"dial": dial}],
+        "upstreams": [{"dial": dial, "weight": weight}],
         "health_checks": {
             "active": {"uri": "/", "expect_status": 2}
         }
@@ -561,23 +660,74 @@ fn render_single_route(
 }
 
 /// Render a single FQDN route.
+///
+/// Mirrors `render_single_route` so the incremental FQDN upsert
+/// path emits the same per-app `rate_limit` handler chain as the
+/// bulk `render_routes` path. Without this, an admin-driven FQDN
+/// binding update would land WITHOUT a `rate_limit` handler on the
+/// incremental path even though the bulk path would have one.
+/// See issue #305 commit 5 for the design.
 fn render_fqdn_route(
     binding: &FqdnBinding,
     entries: &[RouteEntry],
-    _cfg: &Config,
-    _rate_limit_cache: &crate::ratelimit::RateLimitCache,
+    cfg: &Config,
+    rate_limit_cache: &crate::ratelimit::RateLimitCache,
 ) -> Option<serde_json::Value> {
     let upstream = entries
         .iter()
         .find(|e| e.tenant_id == binding.tenant_id && e.app_name == binding.app_name)?;
     let dial = format!("{}:{}", upstream.worker_addr, upstream.port);
-    let handle_chain = vec![serde_json::json!({
+
+    // Resolve effective per-app rate limit. Same priority chain as
+    // `render_single_route`. The FQDN variant skips the traffic-split
+    // weight lookup because FQDN bindings resolve to a single
+    // (tenant, app) upstream — the bulk path at `caddy.rs:345-432`
+    // groups by app_name before applying traffic weight, so a single
+    // upstream carries `weight: 100` (the heartbeat default) and the
+    // per-app rate limit is what matters here.
+    let cached = rate_limit_cache.get(&upstream.tenant_id, &upstream.app_name);
+    let rps = cached
+        .map(|e| e.rps)
+        .or(upstream.rate_limit_rps)
+        .or_else(|| {
+            let d = cfg.rate_limit_rps_default;
+            if d > 0 {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let burst = cached
+        .map(|e| e.burst)
+        .or(upstream.rate_limit_burst)
+        .or_else(|| {
+            let d = cfg.rate_limit_burst_default;
+            if d > 0 {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let mut handle_chain = Vec::new();
+    if rps > 0 {
+        let burst = if burst > 0 { burst } else { rps };
+        handle_chain.push(serde_json::json!({
+            "handler": "rate_limit",
+            "rates": { "rps": rps, "burst": burst },
+            "key": "{http.request.host}",
+        }));
+    }
+
+    handle_chain.push(serde_json::json!({
         "handler": "reverse_proxy",
         "upstreams": [{"dial": dial}],
         "health_checks": {
             "active": {"uri": "/", "expect_status": 2}
         }
-    })];
+    }));
     Some(serde_json::json!({
         "@id": binding.fqdn,
         "match": [{"host": [binding.fqdn]}],
@@ -905,6 +1055,11 @@ mod tests {
             health_check_timeout: Duration::from_secs(3),
             health_check_uri: "/healthz".into(),
             health_check_max_fails: 2,
+            rate_limit_rps_tenant_default: 0,
+            rate_limit_burst_tenant_default: 0,
+            tenant_rate_limit_fetch_interval: Duration::from_secs(30),
+            global_rate_limit_rps: 0,
+            global_rate_limit_burst: 0,
         }
     }
 
@@ -930,10 +1085,20 @@ mod tests {
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
+        let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
 
-        push_now(&cfg, &table, &caddy, &cache, &rl_cache, &q_cache, &mut None)
-            .await
-            .expect("push_now should succeed");
+        push_now(
+            &cfg,
+            &table,
+            &caddy,
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &tenant_rl_cache,
+            &mut None,
+        )
+        .await
+        .expect("push_now should succeed");
     }
 
     #[tokio::test]
@@ -955,10 +1120,20 @@ mod tests {
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
+        let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
 
-        let err = push_now(&cfg, &table, &caddy, &cache, &rl_cache, &q_cache, &mut None)
-            .await
-            .expect_err("push_now should fail with 502");
+        let err = push_now(
+            &cfg,
+            &table,
+            &caddy,
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &tenant_rl_cache,
+            &mut None,
+        )
+        .await
+        .expect_err("push_now should fail with 502");
         assert!(
             err.to_string().contains("502"),
             "err should mention 502, got: {err}"
@@ -991,6 +1166,7 @@ mod tests {
         let cache: SharedCache = Default::default();
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
+        let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
         let notify = Arc::new(Notify::new());
 
         // Notify BEFORE spawn: tokio::sync::Notify stores a pending
@@ -1005,6 +1181,7 @@ mod tests {
             cache,
             rl_cache,
             q_cache,
+            tenant_rl_cache,
             notify.clone(),
             CancellationToken::new(),
         );
@@ -1045,5 +1222,215 @@ mod tests {
         let removed = table.remove_stale(Duration::from_secs(9999)).await;
         assert!(removed.is_empty());
         assert_eq!(table.len().await, 1);
+    }
+
+    // ── render_single_route / render_fqdn_route tests
+    //    (issue #305 commit 5 — per-app rate-limit handler symmetry). ──
+
+    use crate::ratelimit::RateLimitCache;
+    use crate::ratelimit::RateLimitEntry;
+    use crate::routing::FqdnBinding;
+
+    fn route_entry_with_rl(
+        tenant: &str,
+        app: &str,
+        rps: Option<u32>,
+        burst: Option<u32>,
+    ) -> RouteEntry {
+        RouteEntry {
+            tenant_id: tenant.to_string(),
+            app_name: app.to_string(),
+            deployment_id: None,
+            weight: 100,
+            worker_addr: "1.2.3.4".to_string(),
+            port: 8081,
+            rate_limit_rps: rps,
+            rate_limit_burst: burst,
+            last_seen: std::time::Instant::now(),
+        }
+    }
+
+    /// No cap sources → no `rate_limit` handler. The incremental
+    /// path stays symmetric with the bulk path (caddy.rs:411 — only
+    /// inject when `rps > 0`).
+    #[test]
+    fn render_single_route_omits_rate_limit_when_no_caps() {
+        let entry = route_entry_with_rl("t_a", "api", None, None);
+        let cfg = test_config("http://localhost:2019");
+        let traffic: crate::traffic::TrafficSplitCache = Default::default();
+        let rl: RateLimitCache = Default::default();
+        let route = render_single_route(&entry, &cfg, &traffic, &rl);
+
+        let handle_chain = &route["handle"][0]["routes"][0]["handle"];
+        assert_eq!(handle_chain.as_array().unwrap().len(), 1);
+        assert_eq!(handle_chain[0]["handler"], "reverse_proxy");
+    }
+
+    /// `RouteEntry.rate_limit_rps` set → inject `rate_limit`
+    /// handler before the `reverse_proxy`, with `burst` carried
+    /// verbatim. Mirrors `caddy.rs:411-421`.
+    #[test]
+    fn render_single_route_inlines_rate_limit_handler_from_entry() {
+        let entry = route_entry_with_rl("t_a", "api", Some(100), Some(200));
+        let cfg = test_config("http://localhost:2019");
+        let traffic: crate::traffic::TrafficSplitCache = Default::default();
+        let rl: RateLimitCache = Default::default();
+        let route = render_single_route(&entry, &cfg, &traffic, &rl);
+
+        let handle_chain = &route["handle"][0]["routes"][0]["handle"];
+        let arr = handle_chain.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "expected rate_limit + reverse_proxy");
+        assert_eq!(arr[0]["handler"], "rate_limit");
+        assert_eq!(arr[0]["rates"]["rps"], 100);
+        assert_eq!(arr[0]["rates"]["burst"], 200);
+        assert_eq!(arr[0]["key"], "{http.request.host}");
+        assert_eq!(arr[1]["handler"], "reverse_proxy");
+    }
+
+    /// Cache entry wins over the RouteEntry field (priority:
+    /// cached → entry → cfg default). Mirrors `caddy.rs:382-406`.
+    #[test]
+    fn render_single_route_cache_overrides_entry_field() {
+        let entry = route_entry_with_rl("t_a", "api", Some(50), Some(60));
+        let mut rl = RateLimitCache::default();
+        rl.update(
+            "t_a".into(),
+            "api".into(),
+            RateLimitEntry {
+                rps: 500,
+                burst: 600,
+            },
+        );
+        let cfg = test_config("http://localhost:2019");
+        let traffic: crate::traffic::TrafficSplitCache = Default::default();
+        let route = render_single_route(&entry, &cfg, &traffic, &rl);
+
+        let arr = &route["handle"][0]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr[0]["rates"]["rps"], 500);
+        assert_eq!(arr[0]["rates"]["burst"], 600);
+    }
+
+    /// Config default kicks in when neither cache nor entry supply
+    /// a cap. Mirrors `caddy.rs:387-393`. Without this fallback the
+    /// incremental path would silently drop the default-on cap that
+    /// the bulk path applies — same bug class the asymmetric fix
+    /// targets.
+    #[test]
+    fn render_single_route_uses_config_default_when_no_caps_present() {
+        let entry = route_entry_with_rl("t_a", "api", None, None);
+        let mut cfg = test_config("http://localhost:2019");
+        cfg.rate_limit_rps_default = 25;
+        cfg.rate_limit_burst_default = 50;
+        let traffic: crate::traffic::TrafficSplitCache = Default::default();
+        let rl: RateLimitCache = Default::default();
+        let route = render_single_route(&entry, &cfg, &traffic, &rl);
+
+        let arr = &route["handle"][0]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["rates"]["rps"], 25);
+        assert_eq!(arr[0]["rates"]["burst"], 50);
+    }
+
+    /// `burst == 0` falls back to `rps`, matching the bulk
+    /// `caddy.rs:412` semantics — so a cap with no explicit burst
+    /// still emits a sane Burst value rather than `0` (which Caddy
+    /// would treat as "reject every request").
+    #[test]
+    fn render_single_route_burst_falls_back_to_rps_when_zero() {
+        let entry = route_entry_with_rl("t_a", "api", Some(100), Some(0));
+        let cfg = test_config("http://localhost:2019");
+        let traffic: crate::traffic::TrafficSplitCache = Default::default();
+        let rl: RateLimitCache = Default::default();
+        let route = render_single_route(&entry, &cfg, &traffic, &rl);
+
+        let arr = &route["handle"][0]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr[0]["rates"]["rps"], 100);
+        assert_eq!(
+            arr[0]["rates"]["burst"], 100,
+            "burst=0 should fall back to rps"
+        );
+    }
+
+    /// No caps → no `rate_limit` handler in the FQDN path. Same
+    /// symmetry expectation as the per-app path.
+    #[test]
+    fn render_fqdn_route_omits_rate_limit_when_no_caps() {
+        let binding = FqdnBinding {
+            fqdn: "custom.example.com".into(),
+            tenant_id: "t_a".into(),
+            app_name: "api".into(),
+        };
+        let entry = route_entry_with_rl("t_a", "api", None, None);
+        let cfg = test_config("http://localhost:2019");
+        let rl: RateLimitCache = Default::default();
+        let route = render_fqdn_route(&binding, std::slice::from_ref(&entry), &cfg, &rl)
+            .expect("render_fqdn_route returns Some");
+
+        let handle_chain = &route["handle"][0]["routes"][0]["handle"];
+        assert_eq!(handle_chain.as_array().unwrap().len(), 1);
+        assert_eq!(handle_chain[0]["handler"], "reverse_proxy");
+    }
+
+    /// Caps → inject the `rate_limit` handler in the FQDN path.
+    /// Same expectation as `render_single_route`.
+    #[test]
+    fn render_fqdn_route_inlines_rate_limit_handler() {
+        let binding = FqdnBinding {
+            fqdn: "custom.example.com".into(),
+            tenant_id: "t_a".into(),
+            app_name: "api".into(),
+        };
+        let entry = route_entry_with_rl("t_a", "api", Some(100), Some(200));
+        let cfg = test_config("http://localhost:2019");
+        let rl: RateLimitCache = Default::default();
+        let route = render_fqdn_route(&binding, std::slice::from_ref(&entry), &cfg, &rl)
+            .expect("render_fqdn_route returns Some");
+
+        let arr = &route["handle"][0]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["handler"], "rate_limit");
+        assert_eq!(arr[0]["rates"]["rps"], 100);
+        assert_eq!(arr[0]["rates"]["burst"], 200);
+        // FQDN variant must carry the on_demand TLS block so ACME
+        // still kicks in for unknown hosts.
+        assert_eq!(route["tls"]["on_demand"], serde_json::json!({}));
+    }
+
+    /// FQDN variant cache priority: cached → entry → cfg default.
+    /// Mirrors the per-app chain.
+    #[test]
+    fn render_fqdn_route_cache_overrides_entry_field() {
+        let binding = FqdnBinding {
+            fqdn: "custom.example.com".into(),
+            tenant_id: "t_a".into(),
+            app_name: "api".into(),
+        };
+        let entry = route_entry_with_rl("t_a", "api", Some(50), Some(60));
+        let mut rl = RateLimitCache::default();
+        rl.update(
+            "t_a".into(),
+            "api".into(),
+            RateLimitEntry {
+                rps: 999,
+                burst: 1999,
+            },
+        );
+        let cfg = test_config("http://localhost:2019");
+        let route = render_fqdn_route(&binding, std::slice::from_ref(&entry), &cfg, &rl)
+            .expect("render_fqdn_route returns Some");
+
+        let arr = &route["handle"][0]["routes"][0]["handle"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr[0]["rates"]["rps"], 999);
+        assert_eq!(arr[0]["rates"]["burst"], 1999);
     }
 }

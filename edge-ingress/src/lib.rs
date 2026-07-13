@@ -16,4 +16,5 @@ pub mod messages;
 pub mod quota;
 pub mod ratelimit;
 pub mod routing;
+pub mod tenant_ratelimit;
 pub mod traffic;

@@ -27,12 +27,22 @@ var addColumnAccumulators = map[string]bool{
 // of truth means adding the fourth metered dimension (issue #555,
 // used_compute_ms) only requires updating this list — every RETURNING /
 // SELECT that scans into Quota picks it up automatically.
+//
+// The five trailing rate-limit columns (issue #305) live on the same
+// row and are scanned into the matching fields on domain.Quota. sqlx
+// requires every `db:` tagged column on the struct to appear in the
+// projection; if you add a new field here without extending the list,
+// GetByTenantID / addColumn / AddMemoryMB / SetRateLimit's RETURNING
+// clause all fail at scan time with "missing destination name".
 const quotaColumnList = `tenant_id, max_deployments, max_apps, max_workers,
 	          max_memory_mb, max_outbound_mb, max_requests_per_month,
 	          max_resident_seconds_per_month, max_compute_ms_per_month,
 	          used_outbound_bytes, used_request_count, used_memory_mb,
 	          used_resident_seconds, used_compute_ms,
-	          quota_period_start, quota_lock_grace_until`
+	          quota_period_start, quota_lock_grace_until,
+	          tenant_rate_limit_rps, tenant_rate_limit_burst,
+	          tenant_concurrent_limit, tenant_bandwidth_bps,
+	          tenant_rate_limit_set_at`
 
 // addColumn atomically adds delta to one of the per-month usage counters on
 // the quotas row, with a lazy month rollover against quota_period_start (the
@@ -295,4 +305,66 @@ func (r *QuotaRepository) SetGraceUntil(ctx context.Context, tenantID string, un
 		`UPDATE quotas SET quota_lock_grace_until = $2 WHERE tenant_id = $1`,
 		tenantID, v)
 	return err
+}
+
+// GetRateLimit fetches the per-tenant rate-limit columns (issue #305)
+// for the ingress TenantRateLimitCache fetcher. Returns (nil, nil)
+// when the tenant has no quotas row — the ingress treats that as
+// "no caps, feature disabled for this tenant" and the renderer skips
+// emitting a rate_limit route (fail-open, same shape as the quota
+// 402 cache at issue #420). The ingress does NOT want the full
+// domain.Quota projection (counter fields, period start, grace
+// timestamp — all noise to it), so this query projects only the five
+// rate-limit columns the wire shape carries.
+func (r *QuotaRepository) GetRateLimit(ctx context.Context, tenantID string) (*domain.TenantRateLimitResponse, error) {
+	var rl domain.TenantRateLimitResponse
+	err := r.db.GetContext(ctx, &rl, `
+		SELECT tenant_id,
+		       tenant_rate_limit_rps,
+		       tenant_rate_limit_burst,
+		       tenant_concurrent_limit,
+		       tenant_bandwidth_bps
+		  FROM quotas
+		 WHERE tenant_id = $1`, tenantID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &rl, err
+}
+
+// SetRateLimit upserts the per-tenant rate-limit columns (issue #305).
+// The handler validates that all four fields are non-negative before
+// reaching this method; the WHERE clause enforces the row must exist
+// (a tenant with no quotas row cannot be rate-limit-configured — the
+// handler must call QuotaRepository.Create or provision the tenant
+// via the existing tenant-create path first). Returns the post-write
+// row, which the handler echoes back in the response body so the
+// operator sees the exact stored values (including the
+// tenant_rate_limit_set_at audit timestamp that this method stamps
+// to NOW()).
+//
+// audit-log writing is the caller's responsibility (handler-level,
+// not repo-level — same shape as the existing quota-override flow at
+// internal/handler/tenant.go). The repo intentionally does not touch
+// audit_logs.
+func (r *QuotaRepository) SetRateLimit(ctx context.Context, tenantID string, req domain.TenantRateLimitRequest) (*domain.TenantRateLimitResponse, error) {
+	var rl domain.TenantRateLimitResponse
+	err := r.db.GetContext(ctx, &rl, `
+		UPDATE quotas SET
+		       tenant_rate_limit_rps     = $2,
+		       tenant_rate_limit_burst   = $3,
+		       tenant_concurrent_limit   = $4,
+		       tenant_bandwidth_bps      = $5,
+		       tenant_rate_limit_set_at  = NOW()
+		 WHERE tenant_id = $1
+		 RETURNING tenant_id,
+		           tenant_rate_limit_rps,
+		           tenant_rate_limit_burst,
+		           tenant_concurrent_limit,
+		           tenant_bandwidth_bps`,
+		tenantID, req.RPS, req.Burst, req.ConcurrentLimit, req.BandwidthBPS)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &rl, err
 }

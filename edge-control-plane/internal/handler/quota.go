@@ -18,13 +18,29 @@ type QuotaServiceInterface interface {
 	GetQuotaForInternal(ctx context.Context, tenantID string) (*domain.Quota, error)
 }
 
+// QuotaRepoForRateLimit is the narrow slice of *repository.QuotaRepository
+// the new per-tenant rate-limit internal endpoint needs (issue #305).
+// Mirrors the AppRepoInterface precedent at traffic.go:30-32 — the
+// handler test injects a mock that satisfies only these two methods
+// without standing up a full repository.QuotaRepository. The service
+// layer is intentionally bypassed here: the endpoint is a thin
+// read-through with no business logic, and the existing GetQuotaInternal
+// pattern keeps the service layer out of the ingress-poll hot path.
+type QuotaRepoForRateLimit interface {
+	GetRateLimit(ctx context.Context, tenantID string) (*domain.TenantRateLimitResponse, error)
+}
+
 // QuotaHandler handles quota HTTP requests.
 type QuotaHandler struct {
 	tenantSvc QuotaServiceInterface
+	// quotaRepo is the per-tenant rate-limit read surface (issue #305).
+	// nil is acceptable for handlers that never call GetTenantRateLimitInternal
+	// — production wiring in app.New always sets it.
+	quotaRepo QuotaRepoForRateLimit
 }
 
-func NewQuotaHandler(tenantSvc QuotaServiceInterface) *QuotaHandler {
-	return &QuotaHandler{tenantSvc: tenantSvc}
+func NewQuotaHandler(tenantSvc QuotaServiceInterface, quotaRepo QuotaRepoForRateLimit) *QuotaHandler {
+	return &QuotaHandler{tenantSvc: tenantSvc, quotaRepo: quotaRepo}
 }
 
 // quotaResponse wraps domain.Quota with the derived usage_pct field.
@@ -129,5 +145,51 @@ func (h *QuotaHandler) GetQuotaInternal(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("GetQuotaInternal: failed to encode response: %v", err)
+	}
+}
+
+// GetTenantRateLimitInternal handles
+// GET /api/v1/internal/rate-limit/{tenantID} (issue #305, sub-feature
+// #1+#2+#3+#4+#5 read path). Mounted under the `internalAuth`
+// middleware (shared-secret header) — same trust model as
+// GetQuotaInternal / GetRateLimitsInternal / GetTrafficInternal. The
+// edge-ingress TenantRateLimitCache fetcher polls this endpoint every
+// TENANT_RATE_LIMIT_FETCH_INTERVAL (default 30s) to learn the per-tenant
+// caps that the Caddy renderer emits as rate_limit routes.
+//
+// Wire shape is the five rate-limit columns on the quotas row (issue
+// #305 storage), not the full domain.Quota — the ingress does not want
+// the counter fields, period start, or grace timestamp on this path.
+//
+// 404 when no quotas row exists (treated by the ingress as "no caps
+// known for this tenant" → no rate_limit route emitted, fail-open same
+// shape as the quota 402 cache at issue #420). 200 with all-zero caps
+// when the row exists but the tenant has never been rate-limit-configured.
+func (h *QuotaHandler) GetTenantRateLimitInternal(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("tenantID")
+	if tenantID == "" || containsPathTraversal(tenantID) {
+		// Review finding: standardize on the httperror.*Ctx family for
+		// shape consistency with the rest of the internal handlers
+		// (GetQuotaInternal / GetRateLimitsInternal) — the prior
+		// raw-http.Error path emitted a different JSON shape that
+		// broke client error-class detection.
+		httperror.BadRequestCtx(w, r, "invalid tenant id")
+		return
+	}
+
+	rl, err := h.quotaRepo.GetRateLimit(r.Context(), tenantID)
+	if err != nil {
+		log.Printf("GetTenantRateLimitInternal(%s): %v", tenantID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+	if rl == nil {
+		httperror.NotFoundCtx(w, r, "tenant not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(rl); err != nil {
+		log.Printf("GetTenantRateLimitInternal(%s): failed to encode response: %v", tenantID, err)
 	}
 }

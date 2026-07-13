@@ -71,13 +71,21 @@ import (
 // (026_active_deployments_activation_attempt_started_at), PR #534
 // (027_used_memory_mb + 028_quota_memory_constraint etc.), PR #485
 // (029_quotas_resident_seconds + 030_billing_usage_events), PR #439
-// (031_active_deployment_idempotency_keys), and issue #574 retention
-// GCs (additional (created_at) indexes landed on existing migrations):
-// 41 .up.sql + 41 .down.sql = 82 split files. Some numeric prefixes
+// (031_active_deployment_idempotency_keys), issue #574 retention
+// GCs (additional (created_at) indexes landed on existing migrations),
+// and issue #305 (032_tenant_rate_limits — per-tenant data-plane rate
+// limit storage):
+// 42 .up.sql + 42 .down.sql = 84 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
 // not a strict 2× the migration number.
-const splitFileCount = 94 // 47 .up.sql + 47 .down.sql after issue #439 + #574 + #555 + #430 (workers.public_key) + #430 length-cap review follow-up
+// After rebasing PR #661 (issue #305, 032_tenant_rate_limits) onto
+// main, the post-#430 figure is 47 .up.sql + 47 .down.sql + the
+// #305 pair = 48 pairs (issue #305 adds 032_tenant_rate_limits).
+// Some numeric prefixes collide (005_*, 009_*, 010_*, 017_*, 018_*,
+// 025_*, 026_*, 027_*, 028_*, 029_*, 030_*, 031_*, 033_*), so this
+// is the on-disk file count, not a strict 2× the migration number.
+const splitFileCount = 96 // 48 .up.sql + 48 .down.sql after issue #305 + #430 (workers.public_key + length-cap)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -155,6 +163,11 @@ var wantColumns = map[string][]string{
 		"used_resident_seconds",          // 029_quotas_resident_seconds (issue #485)
 		"max_compute_ms_per_month",       // 031_quotas_compute_ms (issue #555)
 		"used_compute_ms",                // 031_quotas_compute_ms (issue #555)
+		"tenant_rate_limit_rps",          // 032_tenant_rate_limits (issue #305)
+		"tenant_rate_limit_burst",        // 032_tenant_rate_limits (issue #305)
+		"tenant_concurrent_limit",        // 032_tenant_rate_limits (issue #305)
+		"tenant_bandwidth_bps",           // 032_tenant_rate_limits (issue #305)
+		"tenant_rate_limit_set_at",       // 032_tenant_rate_limits (issue #305)
 	},
 	"api_keys": {
 		"id",

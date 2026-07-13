@@ -110,6 +110,11 @@ curl http://127.0.0.1:2019/config/ | jq .apps.http.servers.edge_https.routes
 | `INGRESS_LISTEN_HTTPS` | `:443`                        | Bind address for the :443 server.       |
 | `REFRESH_DEBOUNCE_MS`  | `1000`                        | Coalesce bursty heartbeat/stale-cleanup notifications into one Caddy reload. |
 | `HTTP_TO_HTTPS`        | `true`                        | If `true`, also listen on :80 and 308-redirect to HTTPS. Set to `false` in environments that handle the redirect elsewhere (e.g. behind another proxy). |
+| `RATE_LIMIT_RPS_TENANT_DEFAULT` | `0`                  | Per-tenant default RPS applied to every tenant with no explicit per-tenant override (issue #305 sub-feature #1). `0` = no default cap. |
+| `RATE_LIMIT_BURST_TENANT_DEFAULT` | `0`                | Per-tenant default burst paired with `RATE_LIMIT_RPS_TENANT_DEFAULT`. `0` = falls back to the RPS value at the renderer. |
+| `TENANT_RATE_LIMIT_FETCH_INTERVAL` | `30s`             | How often the ingress polls `GET /api/v1/internal/rate-limit/{tenantID}` to refresh the per-tenant rate-limit cache. Matches `QUOTA_FETCH_INTERVAL` so both caches refresh on the same beat. `0` disables the fetcher entirely. |
+| `GLOBAL_RATE_LIMIT_RPS` | `0`                          | Platform-wide RPS cap applied before any per-tenant route (issue #305 sub-feature #4). Enforced **per Caddy replica** — with N ingress replicas, the effective cap is N × this value. Multi-replica NATS aggregation is a separate follow-up. `0` disables the global cap. |
+| `GLOBAL_RATE_LIMIT_BURST` | `0`                        | Global RPS burst paired with `GLOBAL_RATE_LIMIT_RPS`. `0` = falls back to the RPS value at the renderer. |
 
 ### edge-worker (REQUIRED change for #70)
 
@@ -182,6 +187,44 @@ the next heartbeat burst — trigger one with a NATS `pub` if needed).
 | #82   | Multi-region ingress, anycast IPs, GeoDNS, second-region failover.   |
 | #83   | Custom domains. Brings per-tenant ACME, DNS-01 challenges, SAN lists. |
 | #85   | Autoscale. When an app runs on N workers, the routing table needs a load-balancing strategy. |
+
+## Data-plane rate limiting (issue #305)
+
+Per-tenant + global rate limits are enforced at Caddy before traffic
+reaches workers. The control plane writes per-tenant caps to the
+`quotas` table; the ingress polls
+`GET /api/v1/internal/rate-limit/{tenantID}` every
+`TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s) and renders one
+`rate_limit` route per capped tenant plus (optionally) a single
+global `rate_limit` route when `GLOBAL_RATE_LIMIT_RPS > 0`.
+
+**Response headers.** Caddy's stock `rate_limit` handler emits
+`RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`
+(no `X-` prefix). This matches the modern IETF
+`draft-ietf-httpapi-ratelimit-headers` convention; the legacy
+`X-RateLimit-*` prefix is intentionally not emitted.
+
+**Sub-features in scope of the rendered Caddy config:**
+- #1 Per-tenant RPS — `<tenant>-<app>.edgecloud.dev` matched by
+  `host_regexp`, capped at the value of `tenant_rate_limit_rps`.
+- #4 Global platform RPS — single route keyed on
+  `0.0.0.0/0`, capped at `GLOBAL_RATE_LIMIT_RPS`.
+- #5 `RateLimit-*` headers — emitted natively by Caddy's
+  `rate_limit` handler.
+
+**Sub-features cached but not rendered in this PR** (follow-ups
+filed):
+- #2 Concurrent-request cap per tenant — needs a custom Caddy
+  module (stock `caddy:2` has no concurrency limiter).
+- #3 Per-tenant bandwidth throttling — needs Caddy 2.8+ for
+  the `rate_limit.bandwidth` field; the `caddy:2` Docker tag is
+  a floating tag so this is verification-deferred until the
+  production deployment pins a minimum version.
+
+**Per-replica semantics.** `GLOBAL_RATE_LIMIT_RPS` is enforced
+per Caddy process. With N ingress replicas, the effective cap is
+`N × GLOBAL_RATE_LIMIT_RPS`. Multi-replica NATS aggregation is
+a separate follow-up.
 
 ## Development
 

@@ -105,6 +105,40 @@ type Quota struct {
 	// to flip the blast-radius lever, which kills all running apps.
 	// Operators clear it via the admin quota-override endpoint.
 	QuotaLockGraceUntil *time.Time `db:"quota_lock_grace_until" json:"quota_lock_grace_until,omitempty"`
+	// TenantRateLimitRPS is the data-plane (ingress) per-tenant
+	// request-per-second cap (issue #305, sub-feature #1). Sentinel
+	// matches the other Max* columns on this struct: < 0 means
+	// "unlimited at the service layer" (mirrored on the renderer as
+	// "no cap"), 0 means "unset / admin-cleared" (skip the cap check),
+	// > 0 is the cap. Stored on the quotas row because rate-limit
+	// policy is a tenant-scoped concept, not per-app.
+	TenantRateLimitRPS int32 `db:"tenant_rate_limit_rps" json:"tenant_rate_limit_rps"`
+	// TenantRateLimitBurst is the burst allowance paired with
+	// TenantRateLimitRPS. 0 falls back to TenantRateLimitRPS at the
+	// ingress renderer (same shape as the per-app rate_limit_burst
+	// column on apps introduced in migration 017).
+	TenantRateLimitBurst int32 `db:"tenant_rate_limit_burst" json:"tenant_rate_limit_burst"`
+	// TenantConcurrentLimit caps in-flight requests per tenant
+	// (issue #305, sub-feature #2 — resource-starvation prevention).
+	// Rendered layer is intentionally deferred: stock `caddy:2` does
+	// not ship a concurrency limiter. Column + cache + admin endpoint
+	// wired today so the follow-up render-layer change is a pure
+	// caddy.rs delta with no schema or handler churn.
+	TenantConcurrentLimit int32 `db:"tenant_concurrent_limit" json:"tenant_concurrent_limit"`
+	// TenantBandwidthBPS caps per-tenant bytes/sec (issue #305,
+	// sub-feature #3). Rendered layer deferred — needs Caddy 2.8+
+	// `rate_limit.bandwidth` field; the floating `caddy:2` Docker tag
+	// makes "does this work today" a probe, not a guarantee.
+	TenantBandwidthBPS int64 `db:"tenant_bandwidth_bps" json:"tenant_bandwidth_bps"`
+	// TenantRateLimitSetAt is the audit timestamp: when an admin last
+	// wrote this row's tenant-rate-limit columns via
+	// PUT /api/v1/admin/tenants/{id}/rate-limit. Read by
+	// audithelper.AuditLog when the admin handler emits its audit
+	// event; intentionally NOT part of the public GET /api/v1/quotas
+	// response (json:"-") because it's an internal audit trail, not
+	// a customer-visible field. NULL on rows that have never been
+	// written.
+	TenantRateLimitSetAt *time.Time `db:"tenant_rate_limit_set_at" json:"-"`
 }
 
 // UsagePct returns the highest usage percentage across the three monthly caps
