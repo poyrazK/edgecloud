@@ -205,15 +205,20 @@ async fn get_propagates_404_for_missing_app() {
 }
 
 // Issue #573: `edge apps delete` — owner-role only, --yes required,
-// irreversible cascade. Five regression tests below pin the wire
-// shape + UX guarantees.
+// irreversible cascade. Six regression tests below pin the wire
+// shape + UX guarantees (issue ACs: --yes path + confirmation +
+// 404 custom message + 401 auth guidance).
 
-/// Without `--yes`/`-y`, the CLI must bail with an actionable
-/// error before any DELETE round-trip. The `expect(0)` mock on
-/// the admin DELETE acts as a fence: a regression that bypasses
-/// the `--yes` gate and fires anyway would otherwise be absorbed
-/// by wiremock's default 404 fallback and surface as a generic
-/// failure.
+/// Without `--yes`/`-y` and without a TTY, the CLI must bail with
+/// an actionable error before any DELETE round-trip. The
+/// `expect(0)` mock on the admin DELETE acts as a fence: a
+/// regression that bypasses the gate and fires anyway would
+/// otherwise be absorbed by wiremock's default 404 fallback and
+/// surface as a generic failure. Note: `assert_cmd` pipes stderr,
+/// so `is_terminal()` is always false here — this test exercises
+/// the non-TTY bail arm, not the TTY prompt arm (the TTY path is
+/// covered by `keys_revoke`'s equivalent test, since both share
+/// the same `output::confirm` helper).
 #[tokio::test]
 async fn apps_delete_requires_yes_flag() {
     let home = common::isolated_home();
@@ -245,8 +250,8 @@ async fn apps_delete_requires_yes_flag() {
 
     cmd.assert()
         .failure()
-        .stderr(predicate::str::contains("--yes"))
-        .stderr(predicate::str::contains("irreversible"));
+        .stderr(predicate::str::contains("pass --yes"))
+        .stderr(predicate::str::contains("non-interactive shells"));
 }
 
 /// Happy path: whoami returns owner, DELETE returns 204, the CLI
@@ -431,9 +436,9 @@ async fn apps_delete_retries_503_then_succeeds() {
 }
 
 /// Server-side 404 (app already deleted) must surface as a
-/// non-zero exit with the status code visible, not silently
-/// succeed. Matches `get_propagates_404_for_missing_app` at the
-/// top of the file.
+/// non-zero exit with the actionable "app not found" message,
+/// not the generic `rejected by server: 404 ...` from
+/// `ApiError::Display`. Issue #573 AC: "404 → 'app not found'".
 #[tokio::test]
 async fn apps_delete_propagates_404_for_missing_app() {
     let home = common::isolated_home();
@@ -478,5 +483,62 @@ async fn apps_delete_propagates_404_for_missing_app() {
 
     cmd.assert()
         .failure()
-        .stderr(predicate::str::contains("404"));
+        .stderr(predicate::str::contains("'nonexistent' not found"))
+        .stderr(predicate::str::contains("404"))
+        .stderr(predicate::str::contains("edge apps"));
+}
+
+/// Server-side 401 (expired/invalid bearer) on the DELETE call
+/// surfaces dedicated auth-guidance rather than the bare
+/// `rejected by server: 401 ...`. Issue #573 AC: "401 → auth
+/// guidance". whoami succeeds with role=owner (the bearer is
+/// fine for that scope but the DELETE rejects it — could happen
+/// if a key was downgraded server-side between calls).
+#[tokio::test]
+async fn apps_delete_401_surfaces_auth_guidance() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_seed",
+            "api_key_name": "default",
+            "role": "owner",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/admin/apps/myapp"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"unauthorized"}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri())
+        .arg("apps")
+        .arg("delete")
+        .arg("myapp")
+        .arg("--yes");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("authentication failed"))
+        .stderr(predicate::str::contains("401"))
+        .stderr(predicate::str::contains("edge auth login"));
 }

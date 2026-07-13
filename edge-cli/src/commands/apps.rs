@@ -8,12 +8,13 @@
 //!   required; irreversible cascade on the server side).
 
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::Path;
 
 use super::retry::{
     call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
 };
-use crate::api::ApiClient;
+use crate::api::{ApiClient, ApiError};
 use crate::config::EdgeToml;
 use crate::output;
 
@@ -104,20 +105,28 @@ pub fn get(_path: &Path, _name: &str) -> Result<()> {
 /// — same justification as `edge webhooks remove`. Issue #573.
 #[cfg(feature = "network")]
 pub fn delete(path: &Path, name: &str, yes: bool) -> Result<()> {
-    // Flat --yes bail (NOT a TTY confirm prompt like `keys_revoke`):
-    // the cascade reaches beyond the CP — the task_purge outbox
-    // row tears down worker in-memory + on-disk dirs on every
-    // region, with no rollback path. A confirm prompt on a TTY
-    // would still let a fat-fingered `y` through; the explicit
-    // flag forces the user to type it on the command line where
-    // it shows up in shell history and CI logs.
+    // Confirmation prompt. Matches the `keys_revoke` UX (commands/
+    // auth.rs:520-532): non-TTY shells must pass --yes (no stdin
+    // to read from); on a TTY we prompt for `y/N`. The cascade
+    // reaches beyond the CP — task_purge tears down worker
+    // in-memory + on-disk dirs on every region — but the prompt
+    // is the established project UX, so we mirror it. The `--yes`
+    // flag still works for CI / scripting where a confirm would
+    // hang the pipeline.
     if !yes {
-        anyhow::bail!(
-            "apps delete is irreversible — re-run with --yes (or -y) to confirm.\n\
-             This will:\n  - delete the app row + all deployment rows\n  - delete env vars\n\
-              - delete active deployments + artifact blobs\n  - publish a task_purge to every worker \
-             (which tears down per-app KV/cache/scheduler dirs)"
-        );
+        if !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "apps delete is irreversible — pass --yes (or -y) in non-interactive shells.\n\
+                 This will:\n  - delete the app row + all deployment rows\n  - delete env vars\n\
+                  - delete active deployments + artifact blobs\n  - publish a task_purge to every worker \
+                 (which tears down per-app KV/cache/scheduler dirs)"
+            );
+        }
+        let confirmed = output::confirm(&format!("Delete app '{name}'? [y/N] "))?;
+        if !confirmed {
+            output::info("aborted");
+            return Ok(());
+        }
     }
 
     let edge_toml = EdgeToml::from_path(path)?;
@@ -139,7 +148,22 @@ pub fn delete(path: &Path, name: &str, yes: bool) -> Result<()> {
         DEFAULT_RETRY_BASE_MS,
         DEFAULT_RETRY_CAP_MS,
     )
-    .with_context(|| format!("deleting app '{name}'"))?;
+    .map_err(|e| match find_api_error(&e) {
+        Some(ApiError::Rejected { status, .. }) if status.as_u16() == 404 => anyhow::anyhow!(
+            "app '{name}' not found (404)\n  hint: run `edge apps` to list your apps, or check spelling"
+        ),
+        Some(ApiError::Rejected { status, .. }) if status.as_u16() == 401 => anyhow::anyhow!(
+            "authentication failed (401) — your API key is invalid or expired\n  \
+             hint: run `edge auth login` to re-authenticate, or `edge auth keys create` to mint a new key"
+        ),
+        Some(ApiError::Rejected { status, body }) => {
+            anyhow::anyhow!("apps delete rejected by server ({status}): {body}")
+        }
+        Some(ApiError::Transient { source }) => {
+            anyhow::anyhow!("apps delete failed after retries: {source}")
+        }
+        None => e.context(format!("deleting app '{name}'")),
+    })?;
 
     println!("Deleted app '{name}'.");
     Ok(())
@@ -171,4 +195,15 @@ fn check_owner_role(client: &ApiClient) -> Result<()> {
          or re-run `edge auth login` with an existing owner key",
         role = info.role
     )
+}
+
+/// Walk `e.chain()` and return the first `ApiError` found. The
+/// `call_with_retry_no_interrupt` wrapper preserves the typed
+/// `ApiError` through the chain (we wrap with
+/// `anyhow::Error::new(api_err)` per `commands/retry.rs:143`),
+/// so this downcast is reliable. Used by `delete()` to surface
+/// dedicated 404/401 messages instead of the generic
+/// `rejected by server: <status> <body>` from `ApiError::Display`.
+fn find_api_error(e: &anyhow::Error) -> Option<&ApiError> {
+    e.chain().find_map(|c| c.downcast_ref::<ApiError>())
 }
