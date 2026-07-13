@@ -69,12 +69,16 @@ fi
 ( cd "$SAMPLE_DIR" && "$CLI_BIN" build ) \
     || fail "edge build failed for $SAMPLE_DIR"
 
-# 4. Deploy. `edge deploy --manifest edge.toml` posts the artifact +
-#    asks the CP to allocate the L4 port.
+# 4. Deploy. The CLI reads `edge.toml` from cwd by default — no
+#    `--manifest` flag exists (issue #548 review finding H). The
+#    sample's edge.toml carries `protocol = "tcp"`, which the
+#    CP-side activate path picks up via `apps.value->>'protocol'`
+#    and stamps as `socket_mode="allow-all"` on the wire (see
+#    edge-control-plane/internal/nats/publisher.go::BuildAppConfig).
 ( cd "$SAMPLE_DIR" && \
   EDGE_API_KEY="$EDGE_API_KEY" EDGE_API_URL="$EDGE_API_URL" \
-  "$CLI_BIN" deploy --manifest edge.toml ) \
-    || fail "edge deploy --manifest failed"
+  "$CLI_BIN" deploy ) \
+    || fail "edge deploy failed"
 
 # 5. Wait for the heartbeat pipeline to settle — the worker has to
 #    start, mark the app Running, publish a heartbeat, and the ingress

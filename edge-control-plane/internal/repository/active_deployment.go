@@ -336,14 +336,27 @@ type JoinedActiveDeployment struct {
 	// rows (NULL column) — workers treat empty as "default key".
 	SigningKeyID sql.NullString `db:"signing_key_id"`
 	Regions      pq.StringArray `db:"regions"`
+	// Protocol (issue #548) is the wire protocol — "http" (default)
+	// or "tcp" — read from the `apps.value->>'protocol'` JSON column
+	// on the JOIN. Reconciler threads this into `nats.BuildAppConfig`
+	// so an L4 deployment lands with `socket_mode="allow-all"` on the
+	// wire. Empty string means "no protocol set" (legacy rows or
+	// orphan rows where the apps join miss) → `SocketModeForProtocol`
+	// resolves to the worker-wide default. Matches the same COALESCE
+	// used in repository/deployment.go so pre-#548 deployments don't
+	// need a migration just to keep working.
+	Protocol string `db:"protocol"`
 }
 
 // ListByTenantWithDeployment returns one row per active deployment
 // for the tenant, with the deployment's hash and regions joined in.
 //
-//	SELECT ad.*, d.hash, d.regions
+//	SELECT ad.*, d.hash, d.regions, apps.value->>'protocol'
 //	FROM active_deployments ad
 //	LEFT JOIN deployments d ON d.id = ad.deployment_id
+//	LEFT JOIN apps
+//	  ON apps.value->>'tenant_id' = ad.tenant_id
+//	 AND apps.value->>'app_name'  = ad.app_name
 //	WHERE ad.tenant_id = $1
 //
 // LEFT JOIN semantics (was INNER JOIN in the earlier draft): an
@@ -355,6 +368,13 @@ type JoinedActiveDeployment struct {
 // active row). The previous log-and-continue on this case in the
 // pre-N+1 reconcile loop is preserved here, just centralised at the
 // service layer.
+//
+// The apps JOIN (issue #548) fetches the wire protocol so the
+// reconciler can stamp `socket_mode="allow-all"` on the AppConfig
+// when protocol="tcp". apps.value->>'protocol' is keyed on
+// (tenant_id, app_name) — the apps table is the source of truth for
+// app-level configuration (rate limits, env, etc.) so the protocol
+// lives there too.
 func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Context, tenantID string) ([]JoinedActiveDeployment, error) {
 	var rows []JoinedActiveDeployment
 	query := `
@@ -363,9 +383,13 @@ func (r *ActiveDeploymentRepository) ListByTenantWithDeployment(ctx context.Cont
 		       ad.regions_failed, ad.regions_cached, ad.regions_cache_failed,
 		       ad.last_publish_at, ad.last_publish_attempt_id,
 		       ad.preview_id, ad.preview_pr_number, ad.activation_attempt_started_at,
-		       d.hash, d.signature, d.signing_key_id, d.regions
+		       d.hash, d.signature, d.signing_key_id, d.regions,
+		       COALESCE(apps.value->>'protocol', '') AS protocol
 		FROM active_deployments ad
 		LEFT JOIN deployments d ON d.id = ad.deployment_id
+		LEFT JOIN apps
+		  ON apps.value->>'tenant_id' = ad.tenant_id
+		 AND apps.value->>'app_name'  = ad.app_name
 		WHERE ad.tenant_id = $1
 	`
 	err := r.db.SelectContext(ctx, &rows, query, tenantID)

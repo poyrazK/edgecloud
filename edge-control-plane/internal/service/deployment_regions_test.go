@@ -211,7 +211,7 @@ func TestActivateDeployment_FansOutToAllRegions(t *testing.T) {
 
 	// 1. deploymentRepo.GetByID returns a row with 3 regions.
 	regionsCol := `{"us-east","eu-west","ap-south"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -332,7 +332,7 @@ func TestActivateDeployment_DefaultFallback(t *testing.T) {
 	const deploymentID = "d_legacy"
 	const tenantID = "t_test"
 	const appName = "myapp"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -408,7 +408,7 @@ func TestActivateDeployment_NonGlobalDefaultFallback(t *testing.T) {
 	const deploymentID = "d_x"
 	const tenantID = "t_test"
 	const appName = "myapp"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -480,7 +480,7 @@ func TestActivateDeployment_PartialFailure(t *testing.T) {
 	const deploymentID = "d_partial"
 	const tenantID = "t_test"
 	const appName = "myapp"
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", `{"us-east","eu-west","ap-south"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -557,7 +557,7 @@ func TestActivateDeployment_QuotaMaxMemoryZero_FallsBackToDefault(t *testing.T) 
 	const tenantID = "t_test"
 	const appName = "myapp"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -624,7 +624,7 @@ func TestActivateDeployment_NilQuota_FallsBackToDefault(t *testing.T) {
 	const tenantID = "t_test"
 	const appName = "myapp"
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, "h", regionsCol, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -1528,7 +1528,7 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	// publishSwap is non-empty. Use the Postgres array literal text
 	// form — lib/pq auto-decodes into pq.StringArray; passing a
 	// bare []string panics in sqlmock (issue #543 upstream).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(lastGoodID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions",
@@ -1697,7 +1697,7 @@ func TestActivateDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
 	// Pre-tx read inside ActivateDeployment — needed before the tx
 	// can enter. Returns a single-region deployment so activate
 	// would otherwise publish to "us-east".
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deployHash, `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))
@@ -1745,7 +1745,7 @@ func TestActivateDeployment_TenantNotFound_NoPublish(t *testing.T) {
 		deployHash   = "h_missing"
 	)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deployHash, `{"us-east"}`, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil))

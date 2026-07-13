@@ -13,6 +13,21 @@ type Deployment struct {
 	TenantID string `db:"tenant_id"`
 	AppName  string `db:"app_name"`
 	Status   string `db:"status"`
+	// Protocol is the wire protocol this deployment serves
+	// (issue #548). Either "http" (the default — long-running
+	// HTTP/WS apps or FaaS apps) or "tcp" (raw-TCP long-running
+	// apps served via the L4 ingress). Read from the
+	// `apps.value->>'protocol'` JSONB column on the activate path;
+	// missing on pre-#548 deployments and the empty default maps
+	// to "http" via `nats.SocketModeForProtocol`. The CP does not
+	// interpret the protocol — it threads the value through to the
+	// worker, which uses it to select the per-app egress policy
+	// (tcp → "allow-all"; http → empty default).
+	//
+	// Populated by the activate queries that join `apps` (see
+	// repository/app.go and repository/worker.go); not stored on
+	// the `deployments` row itself.
+	Protocol string `db:"protocol"`
 	Hash     string `db:"hash"` // SHA-256 of Wasm payload
 	// Signature is the base64url(no-pad) Ed25519 signature over
 	// `sha256(artifact_bytes) || deployment_id` (issue #307). Empty

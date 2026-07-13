@@ -238,6 +238,37 @@ impl Config {
         let domain_poll_interval =
             parse_duration_env("DOMAIN_POLL_INTERVAL").unwrap_or(DEFAULT_DOMAIN_POLL_INTERVAL);
 
+        // Issue #548 review finding #30: validate L4 port range at
+        // config-load time. An inverted range (L4_PORT_RANGE_START >
+        // L4_PORT_RANGE_END) would otherwise produce a L4PortPool
+        // that silently hands out zero usable ports — `acquire()`
+        // returns `None` immediately and every L4 app gets logged
+        // as "pool exhausted" without an obvious cause. Failing fast
+        // here turns a confusing runtime condition into a clear
+        // startup error.
+        let l4_port_range_start = std::env::var("L4_PORT_RANGE_START")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(31000);
+        let l4_port_range_end = std::env::var("L4_PORT_RANGE_END")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(31999);
+        if l4_port_range_start == 0 || l4_port_range_end == 0 {
+            anyhow::bail!(
+                "L4_PORT_RANGE_START and L4_PORT_RANGE_END must both be non-zero (got start={}, end={})",
+                l4_port_range_start,
+                l4_port_range_end
+            );
+        }
+        if l4_port_range_start > l4_port_range_end {
+            anyhow::bail!(
+                "L4_PORT_RANGE_START ({}) must be <= L4_PORT_RANGE_END ({})",
+                l4_port_range_start,
+                l4_port_range_end
+            );
+        }
+
         Ok(Config {
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
             caddy_admin_url: std::env::var("CADDY_ADMIN_URL")
@@ -349,14 +380,8 @@ impl Config {
                 .unwrap_or_else(|_| "0".into())
                 .parse()
                 .unwrap_or(0),
-            l4_port_range_start: std::env::var("L4_PORT_RANGE_START")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(31000),
-            l4_port_range_end: std::env::var("L4_PORT_RANGE_END")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(31999),
+            l4_port_range_start,
+            l4_port_range_end,
             l4_max_conns_per_app: std::env::var("INGRESS_L4_MAX_CONNS_PER_APP")
                 .ok()
                 .and_then(|v| v.parse().ok())

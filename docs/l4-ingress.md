@@ -189,7 +189,7 @@ docker build -t edgecloud/caddy-l4:latest -f edge-ingress/Dockerfile.caddy-l4 .
 docker compose up -d caddy
 ( cd samples/hello-tcp && ../../target/release/edge build )
 EDGE_API_KEY=dev-key EDGE_API_URL=http://localhost:8080 \
-    edge deploy --manifest samples/hello-tcp/edge.toml
+    edge deploy
 sleep 5
 public_port=$(curl -sH "Authorization: Bearer $EDGE_API_KEY" \
   http://localhost:8080/api/v1/apps/hello-tcp/l4-port | jq -r .public_port)

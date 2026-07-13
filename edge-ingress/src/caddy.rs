@@ -981,29 +981,20 @@ pub fn render_l4_routes(entries: &[L4RouteEntry], cfg: &Config, quota_cache: &Qu
         };
         server_obj.insert("routes".to_string(), routes_value);
 
-        // Wrap with the per-app DDoS caps when set (mirror HTTP
-        // route caps). Caddy's layer4 doesn't have a first-class
-        // `max_conns` knob; the closest analogue is
-        // `layer4.match.connection_policies` but the
-        // mholt/caddy-l4 README defers to a separate `conn_limit`
-        // plugin. For v1 we just emit a `connection_policies`
-        // block so operators can grep.
-        if cfg.l4_max_conns_per_app > 0 || cfg.l4_max_conns_per_ip > 0 {
-            let mut caps = serde_json::Map::new();
-            if cfg.l4_max_conns_per_app > 0 {
-                caps.insert(
-                    "max_conns_per_app".to_string(),
-                    json!(cfg.l4_max_conns_per_app),
-                );
-            }
-            if cfg.l4_max_conns_per_ip > 0 {
-                caps.insert(
-                    "max_conns_per_ip".to_string(),
-                    json!(cfg.l4_max_conns_per_ip),
-                );
-            }
-            server_obj.insert("connection_policies".to_string(), json!(caps));
-        }
+        // Issue #548 review finding #32: the per-app DDoS caps were
+        // originally emitted as a `connection_policies` block, but
+        // mholt/caddy-l4 doesn't recognise the `max_conns_per_app`
+        // / `max_conns_per_ip` keys we emitted — the real
+        // connection-cap plugin is `caddy-l4`'s `conn_limit`
+        // sub-module, which uses a different schema. Until that
+        // plugin is wired in (out of v1 scope), emitting a
+        // `connection_policies` block creates the illusion of
+        // protection while doing nothing. Drop it; leave the
+        // `l4_max_conns_*` config fields in place for the future
+        // conn_limit plugin to consume without a second config
+        // migration. `cfg.l4_max_conns_per_app/_per_ip` are still
+        // validated by `test_cfg()` to catch typos at config-load
+        // time.
         servers.insert(entry.server_id(), Value::Object(server_obj));
     }
 
@@ -2583,20 +2574,26 @@ mod tests {
     }
 
     #[test]
-    fn render_l4_routes_includes_connection_policies_when_caps_set() {
+    fn render_l4_routes_omits_connection_policies_until_conn_limit_plugin_wired() {
+        // Issue #548 review finding #32: the previous `connection_policies`
+        // emission created the illusion of DDoS protection while
+        // doing nothing (mholt/caddy-l4 doesn't recognise the
+        // `max_conns_per_app` / `max_conns_per_ip` keys — the real
+        // cap is the `conn_limit` sub-plugin with a different
+        // schema). Until that plugin is added, the rendered
+        // `apps.layer4` payload MUST NOT carry a `connection_policies`
+        // block — operators reading Caddy config shouldn't be
+        // misled into thinking protection is active.
         let cfg = l4_test_cfg();
         let entry = l4_entry("t_a", "redis", 31000);
         let payload = render_l4_routes(&[entry], &cfg, &empty_quota_cache());
-        let policies = payload
-            .pointer("/apps/layer4/servers/l4_31000/connection_policies")
-            .expect("caps when configured");
-        assert_eq!(
-            policies.get("max_conns_per_app"),
-            Some(&json!(cfg.l4_max_conns_per_app))
-        );
-        assert_eq!(
-            policies.get("max_conns_per_ip"),
-            Some(&json!(cfg.l4_max_conns_per_ip))
+        let server = payload
+            .pointer("/apps/layer4/servers/l4_31000")
+            .expect("server block");
+        assert!(
+            server.get("connection_policies").is_none(),
+            "rendered L4 server must not carry connection_policies until caddy-l4 conn_limit plugin is wired; got: {:?}",
+            server
         );
     }
 

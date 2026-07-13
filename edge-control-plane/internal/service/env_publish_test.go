@@ -98,7 +98,7 @@ func TestEnvService_SetEnv_PublishesIfActive(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
 	// 3. deploymentRepo.GetByID
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -191,7 +191,7 @@ func TestEnvService_SetEnv_DisabledTenant(t *testing.T) {
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -245,7 +245,7 @@ func TestEnvService_DeleteEnv_PublishesIfActive(t *testing.T) {
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -306,7 +306,7 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 	quota := &domain.Quota{TenantID: tenantID, MaxMemoryMB: 256}
 	envMap := map[string]string{"LOG_LEVEL": "trace"}
 	payload, err := b.buildPublishPayload(context.Background(), tenantID, appName,
-		deploymentID, dep, tenant, []string{}, quota, envMap, "")
+		deploymentID, dep, tenant, []string{}, quota, envMap)
 	if err != nil {
 		t.Fatalf("buildPublishPayload: %v", err)
 	}
@@ -343,12 +343,13 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 
 // TestBuildPublishPayload_SocketModePropagated locks the issue #548
 // wiring: when an activate path calls buildPublishPayload with a
-// non-empty socketMode (computed from nats.SocketModeForProtocol),
-// the value MUST appear on the marshaled AppConfig. Without this
-// regression guard, a future refactor of the helper that drops the
-// arg would silently regress the entire L4 chain — the worker
-// would BlockAll-bind a tcp server and the failure mode would be
-// "no traffic, no error".
+// deployment whose Protocol="tcp", the marshaled AppConfig MUST
+// carry `socket_mode:"allow-all"` (computed via
+// nats.SocketModeForProtocol). Without this regression guard, a
+// future refactor of buildPublishPayload / BuildAppConfig that
+// drops the protocol-driven stamping would silently regress the
+// entire L4 chain — the worker would BlockAll-bind a tcp server
+// and the failure mode would be "no traffic, no error".
 func TestBuildPublishPayload_SocketModePropagated(t *testing.T) {
 	tenantID, appName, deploymentID := "t_l4", "hello-tcp", "d_l4"
 
@@ -357,6 +358,9 @@ func TestBuildPublishPayload_SocketModePropagated(t *testing.T) {
 		Hash:         "h",
 		Signature:    "sig",
 		SigningKeyID: "default",
+		// Issue #548: protocol="tcp" is the activate-path input that
+		// drives nats.SocketModeForProtocol → "allow-all".
+		Protocol: "tcp",
 	}
 	tenant := &domain.Tenant{
 		ID:                      tenantID,
@@ -367,7 +371,6 @@ func TestBuildPublishPayload_SocketModePropagated(t *testing.T) {
 	quota := &domain.Quota{TenantID: tenantID, MaxMemoryMB: 256}
 	payload, err := b.buildPublishPayload(context.Background(), tenantID, appName,
 		deploymentID, dep, tenant, []string{"fra"}, quota, map[string]string{},
-		"allow-all", // <-- the issue #548 input: activate stamped this from protocol="tcp"
 	)
 	if err != nil {
 		t.Fatalf("buildPublishPayload: %v", err)

@@ -337,11 +337,17 @@ pub async fn apply_heartbeat(
                 //      branch; the CP persistence layer eliminates
                 //      the race the moment a port is allocated via
                 //      the API.
-                let existing = l4_table
-                    .snapshot()
-                    .await
-                    .into_iter()
-                    .find(|e| e.tenant_id == app.tenant_id && e.app_name == app_name);
+                let existing = l4_table.lookup(&app.tenant_id, app_name).await;
+                // `Some(entry)` means the public port is already
+                // mapped, but if the worker_addr on the cached entry
+                // differs from the current heartbeat's worker_addr,
+                // the existing route is stale (worker restarted with
+                // a new IP / moved region) and we must re-resolve via
+                // the cache + pool path below. Without this guard,
+                // traffic would keep flowing to the OLD worker_addr
+                // for up to STALE_TIMEOUT (60s) until pruner
+                // catches up. See issue #548 review finding #29.
+                let existing = existing.filter(|e| e.worker_addr == worker_addr);
                 let public_port = match existing {
                     Some(entry) => entry.public_port,
                     None => {
@@ -436,21 +442,21 @@ pub async fn apply_heartbeat(
 /// Snapshot of the routing table and FQDN bindings from the last
 /// successful Caddy config push. Used to compute incremental diffs.
 ///
-/// `l4_entries` is tracked separately (issue #548) so a Caddy
-/// reload triggered by an HTTP-only delta can still take the
-/// "small change" fast-path for the HTTP tree, but the L4 tree is
-/// always rendered into the `render_full` payload since L4 only
-/// supports `POST /load`. The HTTP-only incremental patch path is
-/// still gated on `previous` being `Some(_)`.
-#[allow(dead_code)] // l4_entries is consumed by render_full in Commit 8
+/// `l4_entries` is tracked separately (issue #548) so the diff
+/// logic can compare the last-pushed L4 snapshot against the
+/// current one (`prev.l4_entries != l4_snap`). When L4 changes,
+/// the renderer falls back to the full `render_full` path
+/// (caddy-l4 only supports `POST /load`, no incremental L4 patch
+/// path). Without this field the renderer would always take the
+/// full path even when only HTTP routes moved, doubling the
+/// rendered payload size on every HTTP-only delta.
 struct PreviousState {
     route_entries: Vec<RouteEntry>,
     fqdn_bindings: Vec<FqdnBinding>,
-    /// Last-pushed L4 entries. Currently informational — Commit 8
-    /// will thread this into `render_full`. Until then `render_routes`
-    /// is invoked unchanged and L4 entries are not yet rendered to
-    /// Caddy, but the table population work in `apply_heartbeat` is
-    /// already correct.
+    /// Last-pushed L4 entries (issue #548). Compared against the
+    /// current `l4_table.snapshot()` on every render tick; if the
+    /// sets differ, `render_full` re-emits the entire `apps.layer4`
+    /// block.
     l4_entries: Vec<L4RouteEntry>,
 }
 
@@ -526,12 +532,20 @@ fn spawn_pruner(
                 _ = ticker.tick() => {
                     let removed_http = table.remove_stale(cfg.stale_timeout).await;
                     // Issue #548: prune the L4 table in lock-step
-                    // with the HTTP table, and release the
-                    // corresponding public ports back into the
-                    // pool's cooldown window so the slots can be
-                    // re-acquired within `l4_port_cooldown_secs`.
-                    let removed_l4 = l4_table.remove_stale(cfg.stale_timeout).await;
+                    // with the HTTP table. CRITICAL: snapshot the
+                    // L4 table BEFORE remove_stale runs — once
+                    // remove_stale mutates the table, snapshot()
+                    // returns only the SURVIVING entries, so any
+                    // port-release loop over the post-remove snapshot
+                    // would never see the entries we just removed
+                    // and the public ports would leak (the pool's
+                    // cooldown window never fires → no slot is
+                    // reclaimable until restart). The bug previously
+                    // left L4 ports stuck forever after a worker
+                    // disappeared, masking as "ports got tight but
+                    // the worker came back".
                     let l4_snapshot_before = l4_table.snapshot().await;
+                    let removed_l4 = l4_table.remove_stale(cfg.stale_timeout).await;
                     let mut l4_ports_guard = l4_ports.lock().await;
                     for entry in l4_snapshot_before.iter() {
                         if removed_l4
@@ -1290,12 +1304,15 @@ mod tests {
         assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb1).await);
         let first_port = l4_table.snapshot().await[0].public_port;
 
-        // Second heartbeat for the same app from a different
-        // worker_addr (e.g. after a worker restart with the same
-        // public port handed out). The public_port is reused.
+        // Second heartbeat for the same app from the SAME
+        // worker_addr. The public_port is reused. Note (issue #548
+        // review finding #29): a heartbeat from a DIFFERENT
+        // worker_addr falls through to the cache + pool path and
+        // gets a FRESH port — covered by
+        // `apply_heartbeat_tcp_worker_addr_change_allocates_new_port`.
         let mut apps2 = HashMap::new();
         apps2.insert("api".to_string(), status);
-        let hb2 = hb_with_addr("198.51.100.7", apps2);
+        let hb2 = hb_with_addr("203.0.113.10", apps2);
         let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb2).await;
         let snap = l4_table.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -1303,6 +1320,41 @@ mod tests {
             snap[0].public_port, first_port,
             "public port preserved across heartbeat"
         );
+    }
+
+    /// When the worker_addr changes between heartbeats (worker
+    /// restart with a new IP), the lookup no longer matches —
+    /// issue #548 review finding #29. The ingress allocates a FRESH
+    /// port instead of reusing the stale one, so traffic
+    /// immediately flows to the new worker instead of dangling on
+    /// the dead address for up to STALE_TIMEOUT. The old port is
+    /// released into cooldown via the subsequent remove_worker
+    /// path (covered separately).
+    #[tokio::test]
+    async fn apply_heartbeat_tcp_worker_addr_change_allocates_new_port() {
+        let (table, l4_table, mut l4_ports, l4_port_cache) = fresh_tables();
+        let mut apps = HashMap::new();
+        let mut status = app_status("t_a", "running", 8081);
+        status.protocol = "tcp".to_string();
+        apps.insert("api".to_string(), status.clone());
+        let hb1 = hb_with_addr("203.0.113.10", apps);
+        assert!(apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb1).await);
+        let first_port = l4_table.snapshot().await[0].public_port;
+
+        // Second heartbeat from a DIFFERENT worker_addr. The existing
+        // entry is invalidated (worker restart with new IP), so a
+        // fresh port is allocated.
+        let mut apps2 = HashMap::new();
+        apps2.insert("api".to_string(), status);
+        let hb2 = hb_with_addr("198.51.100.7", apps2);
+        let _ = apply_heartbeat(&table, &l4_table, &mut l4_ports, &l4_port_cache, &hb2).await;
+        let snap = l4_table.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_ne!(
+            snap[0].public_port, first_port,
+            "worker_addr change must allocate a fresh port (issue #548 #29)"
+        );
+        assert_eq!(snap[0].worker_addr, "198.51.100.7");
     }
 
     /// `protocol = ""` (missing) is treated as `"http"` — backwards

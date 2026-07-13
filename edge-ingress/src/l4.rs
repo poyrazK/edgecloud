@@ -107,6 +107,19 @@ impl L4RoutingTable {
         }
     }
 
+    /// O(1) lookup for the route mapped to `(tenant_id, app_name)`.
+    /// Issue #548 review finding #31: the hot path (the render loop
+    /// in `heartbeats.rs::push_now`) used to scan `snapshot()` and
+    /// `find()` linearly per (tenant, app), which is O(n) per render
+    /// and O(n²) over the full table — fine at 10 entries, miserable
+    /// at 1000. Use this accessor in the render loop; reserve
+    /// `snapshot()` for callers that genuinely need a coherent view
+    /// (render output, the L4 port release loop in the pruner).
+    pub async fn lookup(&self, tenant_id: &str, app_name: &str) -> Option<L4RouteEntry> {
+        let inner = self.by_app.read().await;
+        inner.get(&L4AppKey::new(tenant_id, app_name)).cloned()
+    }
+
     /// Upsert a route under `(tenant_id, app_name)`. Only
     /// `status == "running"` apps are routable; other statuses
     /// remove the entry under this key. `public_port` is the

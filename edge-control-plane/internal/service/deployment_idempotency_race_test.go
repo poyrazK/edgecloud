@@ -132,7 +132,7 @@ func TestActivateDeployment_ConcurrentRace_SameIdempotencyKey_OnePublish(t *test
 	// goroutine gets its own.
 
 	for i := 0; i < N; i++ {
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 			WithArgs(deploymentID).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 				AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -307,7 +307,7 @@ func TestActivateDeployment_ConcurrentRace_NoIdempotencyKey_PreFixBehavior(t *te
 	// idempotencyKey == "" skips the cache path entirely).
 
 	for i := 0; i < N; i++ {
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id =`)).
 			WithArgs(deploymentID).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 				AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))

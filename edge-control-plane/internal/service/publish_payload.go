@@ -78,13 +78,13 @@ func NewPublishBuilder() *publishBuilder {
 // the outbound stream. Including it here would be redundant
 // with the publisher's stream-config region set.
 //
-// `socketMode` is the per-app egress-policy selector the worker
-// applies (issue #412). Empty string omits the field from the
-// wire (`omitempty`) — pre-#548 callers pass "" to preserve the
-// worker-wide default. The activate path computes this from the
-// deployment's resolved `protocol` via `nats.SocketModeForProtocol`
-// (issue #548 — tcp → "allow-all"); env write passes "" because the
-// env change path doesn't alter the protocol.
+// Issue #548: `deployment.Protocol` is read by `nats.BuildAppConfig`
+// to derive the per-app `socket_mode` override (`"allow-all"` for
+// tcp, empty for http). Previously this was a separate `socketMode`
+// parameter that every caller forgot to pass — adding the
+// `protocol` parameter to `BuildAppConfig` itself forces every
+// call site to think about the protocol, eliminating the
+// forgotten-override bug.
 func (b *publishBuilder) buildPublishPayload(
 	_ context.Context,
 	tenantID, appName, deploymentID string,
@@ -93,7 +93,6 @@ func (b *publishBuilder) buildPublishPayload(
 	regions []string,
 	quota *domain.Quota,
 	envMap map[string]string,
-	socketMode string,
 ) ([]byte, error) {
 	if tenantID == "" || appName == "" || deploymentID == "" {
 		return nil, fmt.Errorf("buildPublishPayload: tenantID, appName, deploymentID must be non-empty (got %q,%q,%q)", tenantID, appName, deploymentID)
@@ -117,11 +116,8 @@ func (b *publishBuilder) buildPublishPayload(
 		envMap,
 		tenant.AllowlistedDestinations,
 		maxMemoryMB,
+		deployment.Protocol, // issue #548 — drives per-app socket_mode
 	)
-	// Issue #548: per-app egress policy override. Empty string is
-	// dropped from the wire (AppConfig.SocketMode has `omitempty`)
-	// so pre-#548 callers preserve the worker-wide setting.
-	cfg.SocketMode = socketMode
 
 	msg := &nats.TaskMessage{
 		Type:      "task_update",

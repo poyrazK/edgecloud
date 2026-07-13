@@ -255,6 +255,17 @@ func applyTypeOverride(msg *TaskMessage, typeField string) *TaskMessage {
 // the worker's default key" — see `verifier::Keyring` on the
 // worker side. The `omitempty` JSON tag means an empty string is
 // dropped from the wire so pre-PR1 workers ignore it.
+//
+// `protocol` is the app's wire protocol (issue #548). Empty string
+// is the legacy default ("http"). The function threads this value
+// through to `cfg.SocketMode` via `SocketModeForProtocol` so an
+// L4 (`protocol="tcp"`) app is auto-stamped with `socket_mode:
+// "allow-all"` and an HTTP app stays on the worker-wide default.
+// Issue #548 wiring: without this argument the worker-side
+// `SocketEgressPolicy::BlockAll` would deny the L4 guest's
+// `wasi:sockets/tcp` bind, so every caller MUST pass the resolved
+// protocol value (read from the active_deployments row or the
+// `apps.value->>'protocol'` JSON column).
 func BuildAppConfig(
 	deploymentID, deploymentHash, deploymentSignature, signingKeyID string,
 	previewID string,
@@ -262,6 +273,7 @@ func BuildAppConfig(
 	env map[string]string,
 	allowlist []string,
 	maxMemoryMB int,
+	protocol string,
 	routes ...DeploymentRoute,
 ) AppConfig {
 	cfg := AppConfig{
@@ -278,6 +290,25 @@ func BuildAppConfig(
 	}
 	if len(routes) > 0 {
 		cfg.Routes = routes
+	}
+	cfg.SocketMode = SocketModeForProtocol(protocol)
+	// Issue #548: the worker reads `EDGE_PROTOCOL` from `spec.env`
+	// (`edge-worker/src/supervisor.rs:2159`) so it can stamp the
+	// per-app protocol on the heartbeat before run_app_loop
+	// starts. We add it here so every activate / env-write / republish
+	// / canary path — all of which funnel through BuildAppConfig —
+	// gets the env entry. Default to "http" when the caller passed
+	// an empty / unknown protocol (legacy apps and the pre-#548
+	// rolling-upgrade contract). Never overwrite a tenant-supplied
+	// EDGE_PROTOCOL — tenant env takes precedence.
+	if cfg.Env == nil {
+		cfg.Env = map[string]string{}
+	}
+	if _, ok := cfg.Env["EDGE_PROTOCOL"]; !ok {
+		cfg.Env["EDGE_PROTOCOL"] = protocol
+		if cfg.Env["EDGE_PROTOCOL"] == "" {
+			cfg.Env["EDGE_PROTOCOL"] = "http"
+		}
 	}
 	return cfg
 }
@@ -337,7 +368,10 @@ func BuildAppConfigWithSocketMode(
 		//     preview-aware callers must use BuildAppConfig directly so they
 		//     pass preview_id + preview_pr_number explicitly.
 		0, // preview_pr_number — same reasoning as preview_id above.
-		env, allowlist, maxMemoryMB, routes...,
+		env, allowlist, maxMemoryMB,
+		"", // protocol — this sibling takes a raw socketMode; protocol-driven
+		// stamping is the caller's job (or use BuildAppConfig directly).
+		routes...,
 	)
 	cfg.SocketMode = socketMode
 	return cfg

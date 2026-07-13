@@ -68,7 +68,7 @@ required.
 
 ```sh
 EDGE_API_KEY=... EDGE_API_URL=https://api.edgecloud.dev \
-  edge deploy --manifest edge.toml
+  edge deploy
 ```
 
 The CLI calls `POST /api/v1/apps/hello-tcp/l4-port` (issue #548, Commit 9)
