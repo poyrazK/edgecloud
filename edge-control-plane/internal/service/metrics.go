@@ -82,6 +82,15 @@ type MetricsAggregator struct {
 	workerEnrollTotal int64
 	workerEnrollErrs  int64
 	workerEnrollTime  int64
+
+	// migrate_preflight (issue #622 commit 6) — a bounded-cardinality
+	// counter keyed by (language, reason). Labels are sourced from
+	// the closed `migratePreflightReasons` slice + the
+	// preflightLanguage set ({"c","rust"}); anything outside the
+	// closed slice is coalesced onto a default bucket so a future
+	// reason that ships without updating the slice still surfaces
+	// in the metric.
+	migratePreflight map[[2]string]int64
 }
 
 type appMetrics struct {
@@ -105,7 +114,8 @@ type workerMetrics struct {
 // NewMetricsAggregator returns a ready-to-use aggregator.
 func NewMetricsAggregator() *MetricsAggregator {
 	return &MetricsAggregator{
-		data: make(map[string]map[string]appMetrics),
+		data:             make(map[string]map[string]appMetrics),
+		migratePreflight: make(map[[2]string]int64),
 	}
 }
 
@@ -373,6 +383,104 @@ func (a *MetricsAggregator) NewWorkerEnrollSink() WorkerEnrollSink {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Migration preflight metric (issue #622 commit 6).
+//
+// Distinct from the GC sinks because the L1 preflight rejection
+// happens at the HTTP boundary and carries two labels (language,
+// reason). Bounded-cardinality: the reason slice is closed (any
+// future reason must add a row here AND update the
+// TestMigratePreflightSink_AllReasonsCovered test), and language
+// is filtered to {"c","rust"} — anything else falls into a default
+// bucket so a misbehaving caller can't blow up Prometheus
+// cardinality.
+//
+// Counter semantics: cumulative since process boot (each upload
+// that the preflight rejects bumps the counter by len(matches)).
+// An operator watching a dashboard sees the rejection rate via
+// Prometheus `rate()` over a window; the raw counter is for
+// debugging single-event spikes.
+// ---------------------------------------------------------------------------
+
+// migratePreflightReasons is the closed set of preflight reason
+// labels shipped to Prometheus. Must stay in sync with the
+// `preflightReason*` constants in
+// internal/handler/migration_preflight.go. Drift between the two
+// surfaces is caught by TestMigratePreflightSink_AllReasonsCovered.
+//
+// Adding a new reason is a deliberate security decision: a new
+// pattern class is being denied at the HTTP boundary. Update the
+// preflight scanner, the reason constant, this slice, the handler
+// test, AND the runbook — keep them all in lockstep.
+var migratePreflightReasons = []string{
+	"include_bytes",     // include_bytes!(...)
+	"include_str",       // include_str!(...)
+	"include_macro",     // include!(...)
+	"env_macro",         // env!(...)
+	"option_env",        // option_env!(...)
+	"compile_error",     // compile_error!(...)
+	"path_attr",         // #[path = "..."]
+	"include_attr",      // #[include = "..."]
+	"absolute_include",  // #include "/etc/..." / "<...:>"
+	"traversal_include", // #include "../..." or "../..."
+	"embed",             // #embed "..."
+}
+
+// MigratePreflightSink is the sink signature the preflight
+// handler calls for each rejected upload. The handler iterates
+// the match slice and invokes the sink once per (language,
+// reason) pair — a single multi-pattern upload bumps multiple
+// counters.
+type MigratePreflightSink func(language, reason string)
+
+// NewMigratePreflightSink returns a sink that bumps the
+// edge_migrate_preflight_rejected_total counter on every preflight
+// rejection. nil-receiver safe — returns a no-op closure so tests
+// can pass `nil`.
+//
+// Reason values outside the closed migratePreflightReasons slice
+// are coalesced onto "unknown" so a future scanner drift can't
+// blow up Prometheus cardinality by emitting arbitrary string
+// labels. Language values outside {"c","rust"} are coerced the
+// same way. See TestMigratePreflightSink_UnknownReasonCoalesced
+// for the regression-guard invariant.
+func (a *MetricsAggregator) NewMigratePreflightSink() MigratePreflightSink {
+	if a == nil {
+		return func(string, string) {}
+	}
+	return func(language, reason string) {
+		language = normalizePreflightLanguage(language)
+		reason = normalizePreflightReason(reason)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.migratePreflight[[2]string{language, reason}]++
+	}
+}
+
+// normalizePreflightLanguage whitelists the language label to the
+// bounded {"c","rust"} set. Anything else becomes "unknown" so
+// label cardinality stays bounded regardless of caller input.
+func normalizePreflightLanguage(s string) string {
+	switch s {
+	case "c", "rust":
+		return s
+	default:
+		return "unknown"
+	}
+}
+
+// normalizePreflightReason whitelists the reason label to the
+// closed migratePreflightReasons slice. Anything else becomes
+// "unknown".
+func normalizePreflightReason(s string) string {
+	for _, r := range migratePreflightReasons {
+		if r == s {
+			return s
+		}
+	}
+	return "unknown"
+}
+
 // RenderTenant returns a Prometheus text-format string containing only the
 // metrics for the given tenant. Returns an empty string when no data has
 // been ingested for that tenant yet.
@@ -532,6 +640,31 @@ func emitGCFamilies(b *strings.Builder, a *MetricsAggregator) {
 	fmt.Fprintf(b, "edge_worker_enroll_errors_total %d\n", a.workerEnrollErrs)
 	fmt.Fprintf(b, "# TYPE edge_worker_enroll_last_enroll_timestamp_seconds gauge\n")
 	fmt.Fprintf(b, "edge_worker_enroll_last_enroll_timestamp_seconds %d\n", a.workerEnrollTime)
+
+	// migrate_preflight_rejected_total — issue #622 commit 6.
+	// Labeled counter. TYPE line is emitted ONLY when at least one
+	// series has a non-zero value, so the scrape response stays
+	// empty for environments that have never seen a rejection
+	// (the operator's dashboard then fails closed on
+	// `absent() == true` rather than reading a misleading `0`).
+	if len(a.migratePreflight) > 0 {
+		fmt.Fprintf(b, "# TYPE edge_migrate_preflight_rejected_total counter\n")
+		// Iterate in declared order so the scrape output is
+		// deterministic (Prometheus doesn't require ordering,
+		// but stable ordering makes test assertions simpler).
+		// The "unknown" reason bucket sorts last per language
+		// so the closed set is enumerated first.
+		for _, lang := range []string{"c", "rust", "unknown"} {
+			for _, reason := range migratePreflightReasons {
+				if v := a.migratePreflight[[2]string{lang, reason}]; v > 0 {
+					fmt.Fprintf(b, "edge_migrate_preflight_rejected_total{language=%q,reason=%q} %d\n", lang, reason, v)
+				}
+			}
+			if v := a.migratePreflight[[2]string{lang, "unknown"}]; v > 0 {
+				fmt.Fprintf(b, "edge_migrate_preflight_rejected_total{language=%q,reason=%q} %d\n", lang, "unknown", v)
+			}
+		}
+	}
 }
 
 // emitWorkerFamilies writes the worker-level (label-free) metric

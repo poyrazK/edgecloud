@@ -644,3 +644,164 @@ func TestMetricsAggregator_IngestWorker_NilReceiverIsNoop(t *testing.T) {
 	var agg *MetricsAggregator // nil
 	agg.IngestWorker(99)       // must not panic
 }
+
+// TestMetricsAggregator_NilPreflightSinkIsNoop — the new
+// preflight sink (issue #622 commit 6) must follow the
+// nil-receiver safe contract that the GC sinks established. A
+// non-nil closure returned from a nil receiver must not panic
+// when called.
+func TestMetricsAggregator_NilPreflightSinkIsNoop(t *testing.T) {
+	var nilAgg *MetricsAggregator
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("nil-aggregator preflight sink panicked: %v", r)
+		}
+	}()
+	nilAgg.NewMigratePreflightSink()("c", "embed")
+	nilAgg.NewMigratePreflightSink()("rust", "include_bytes")
+	nilAgg.NewMigratePreflightSink()("bogus", "anything")
+}
+
+// TestMetricsAggregator_RecordMigratePreflight — the preflight
+// sink accumulates per-(language,reason) counters correctly. A
+// multi-pattern upload bumps one counter per match (the handler
+// iterates the match slice and invokes the sink once per
+// match); this test pins that the aggregator behaves as expected.
+func TestMetricsAggregator_RecordMigratePreflight(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewMigratePreflightSink()
+
+	// Three rejections over two languages, two distinct reasons.
+	sink("rust", "include_bytes")
+	sink("rust", "include_bytes") // second hit — counter doubles
+	sink("rust", "env_macro")
+	sink("c", "embed")
+	sink("c", "absolute_include")
+	sink("c", "absolute_include")
+	sink("c", "absolute_include")
+
+	out := agg.RenderAll()
+	wantSubstrs := []string{
+		"# TYPE edge_migrate_preflight_rejected_total counter",
+		`edge_migrate_preflight_rejected_total{language="rust",reason="include_bytes"} 2`,
+		`edge_migrate_preflight_rejected_total{language="rust",reason="env_macro"} 1`,
+		`edge_migrate_preflight_rejected_total{language="c",reason="embed"} 1`,
+		`edge_migrate_preflight_rejected_total{language="c",reason="absolute_include"} 3`,
+	}
+	for _, want := range wantSubstrs {
+		if !strings.Contains(out, want) {
+			t.Errorf("RenderAll missing %q\nfull output:\n%s", want, out)
+		}
+	}
+}
+
+// TestMetricsAggregator_RecordMigratePreflight_UnknownReasonCoalesced —
+// regression guard: a reason value not in migratePreflightReasons
+// must coalesce onto the "unknown" bucket. Without this guard, a
+// scanner drift in the future could emit unbounded label
+// cardinality and OOM Prometheus.
+func TestMetricsAggregator_RecordMigratePreflight_UnknownReasonCoalesced(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewMigratePreflightSink()
+	sink("rust", "totally_made_up_reason")
+	sink("rust", "another_fake")
+	out := agg.RenderAll()
+	if !strings.Contains(out, `reason="unknown"`) {
+		t.Errorf("expected coalesced \"unknown\" reason bucket; got:\n%s", out)
+	}
+	// Belt-and-suspenders: the literal bogus reason must NOT
+	// appear as a label value in the output.
+	for _, leak := range []string{"totally_made_up_reason", "another_fake"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("bogus reason %q leaked into Prometheus output", leak)
+		}
+	}
+}
+
+// TestMetricsAggregator_RecordMigratePreflight_UnknownLanguageCoalesced —
+// language is also bounded to {"c","rust"}. Anything else → "unknown".
+// The drift guard mirrors the reason case.
+func TestMetricsAggregator_RecordMigratePreflight_UnknownLanguageCoalesced(t *testing.T) {
+	agg := NewMetricsAggregator()
+	sink := agg.NewMigratePreflightSink()
+	sink("javascript", "embed")
+	sink("", "embed")
+	sink("\x00", "embed")
+	out := agg.RenderAll()
+	if !strings.Contains(out, `language="unknown"`) {
+		t.Errorf("expected coalesced \"unknown\" language bucket; got:\n%s", out)
+	}
+}
+
+// TestMetricsAggregator_MigratePreflight_OmittedWhenZero — the
+// render block guards: when no rejection has ever been recorded,
+// the TYPE line is omitted from the scrape output. A
+// dashboard-side `absent() == true` fails closed; "0" would
+// falsely report a healthy bucket.
+func TestMetricsAggregator_MigratePreflight_OmittedWhenZero(t *testing.T) {
+	agg := NewMetricsAggregator()
+	out := agg.RenderAll()
+	if strings.Contains(out, "edge_migrate_preflight_rejected_total") {
+		t.Errorf("expected no preflight output when no rejection has been recorded\ngot:\n%s", out)
+	}
+}
+
+// TestMetricsAggregator_MigratePreflight_AppearsInTenantRender — the
+// preflight metric is a global aggregate (operators track fleet-wide
+// attack signal on /metrics), but it must also show up on the
+// per-tenant /api/v1/metrics endpoint so a tenant under attack
+// can see its own hits. Mirror of the GC-family rule from
+// CLAUDE.md (the global GC families are appended to per-tenant
+// renders).
+func TestMetricsAggregator_MigratePreflight_AppearsInTenantRender(t *testing.T) {
+	agg := NewMetricsAggregator()
+	agg.NewMigratePreflightSink()("rust", "embed")
+	out := agg.RenderTenant("t_acme")
+	if !strings.Contains(out, `edge_migrate_preflight_rejected_total{language="rust",reason="embed"} 1`) {
+		t.Errorf("preflight metric missing from per-tenant render\ngot:\n%s", out)
+	}
+}
+
+// TestMigratePreflight_AllReasonsCovered is the drift-guard that
+// catches a future contributor who adds a preflight reason to the
+// scanner (migration_preflight.go) without registering it in the
+// Prometheus label set (migratePreflightReasons) — the silent
+// drift would cause every new reason to be coalesced onto
+// "unknown" and lose its semantic meaning in dashboards.
+//
+// The test walks migratePreflightReasons and confirms the set
+// matches the canonical reason constants in
+// internal/handler/migration_preflight.go. If you add a new
+// reason, add its constant here in lockstep.
+func TestMigratePreflight_AllReasonsCovered(t *testing.T) {
+	want := map[string]bool{
+		"include_bytes":     true,
+		"include_str":       true,
+		"include_macro":     true,
+		"env_macro":         true,
+		"option_env":        true,
+		"compile_error":     true,
+		"path_attr":         true,
+		"include_attr":      true,
+		"absolute_include":  true,
+		"traversal_include": true,
+		"embed":             true,
+	}
+	have := make(map[string]bool, len(migratePreflightReasons))
+	for _, r := range migratePreflightReasons {
+		have[r] = true
+	}
+	// Diff in both directions so a future drift (added without
+	// updating this test, or removed without updating this
+	// test) fails loudly.
+	for r := range want {
+		if !have[r] {
+			t.Errorf("migratePreflightReasons missing %q — the preflight scanner emits this reason but the metric label set doesn't include it. Add the constant to migratePreflightReasons AND update this test.", r)
+		}
+	}
+	for r := range have {
+		if !want[r] {
+			t.Errorf("migratePreflightReasons has unexpected %q — remove it from the slice AND update this test if it was a deliberate removal, or update this test if the slice is the new source of truth.", r)
+		}
+	}
+}

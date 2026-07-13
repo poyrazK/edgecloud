@@ -77,11 +77,26 @@ func isClientMigrationError(err error) bool {
 // MigrationHandler handles migration requests.
 type MigrationHandler struct {
 	migrationSvc *service.MigrationService
+	// preflightSink is called once per preflight match — a
+	// multi-pattern upload bumps multiple counters. issue #622
+	// commit 6. nil-safe (the ctor wires a no-op so existing
+	// callers don't have to provide one).
+	preflightSink func(language, reason string)
 }
 
 // NewMigrationHandler creates a MigrationHandler.
-func NewMigrationHandler(migrationSvc *service.MigrationService) *MigrationHandler {
-	return &MigrationHandler{migrationSvc: migrationSvc}
+//
+// preflightSink is optional — pass nil to disable the metric
+// (every existing call site in the codebase constructs a no-op
+// sink so the field is always non-nil in practice).
+func NewMigrationHandler(migrationSvc *service.MigrationService, preflightSink func(language, reason string)) *MigrationHandler {
+	if preflightSink == nil {
+		preflightSink = func(string, string) {}
+	}
+	return &MigrationHandler{
+		migrationSvc:  migrationSvc,
+		preflightSink: preflightSink,
+	}
 }
 
 // Migrate handles POST /api/migrate — accepts a C source file, transforms it,
@@ -158,6 +173,9 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	// from the analyzer path so the SDK can branch on
 	// "rejected_at: preflight" vs the structured report body.
 	if matches := preflightMigrateSource(language[0], "", string(source)); len(matches) > 0 {
+		for _, m := range matches {
+			h.preflightSink(language[0], m.Pattern)
+		}
 		httperror.PreflightDeniedCtx(w, r,
 			"compile-time host-reach pattern detected",
 			preflightDetailsFor(language[0], matches))
@@ -364,6 +382,9 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 	// file and retry, rather than receiving a partial report.
 	for _, e := range entries {
 		if matches := preflightMigrateSource(language[0], e.Path, e.Source); len(matches) > 0 {
+			for _, m := range matches {
+				h.preflightSink(language[0], m.Pattern)
+			}
 			httperror.PreflightDeniedCtx(w, r,
 				"compile-time host-reach pattern detected",
 				preflightDetailsFor(language[0], matches))
