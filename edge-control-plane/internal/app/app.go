@@ -776,6 +776,8 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// the /quota/{tenantID} endpoint above.
 	mux.HandleFunc("GET /api/v1/internal/rate-limit/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetTenantRateLimitInternal)).ServeHTTP(w, r)
+	})
+
 	// Per-(tenant,app) L4/TCP public-port assignment (issue #548).
 	// The ingress `L4PortCache` polls this every QUOTA_FETCH_INTERVAL
 	// so two ingress instances in the same region can converge on

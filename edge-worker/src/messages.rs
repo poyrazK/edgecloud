@@ -933,6 +933,7 @@ mod tests {
             tenant_id: Some("t_acme".to_string()),
             apps,
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         };
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(

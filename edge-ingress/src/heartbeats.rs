@@ -1590,8 +1590,15 @@ mod tests {
         let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
 
         push_now(
-            &cfg, &table, &l4_table, &caddy, &cache, &rl_cache, &q_cache,
-            &tenant_rl_cache, &mut None,
+            &cfg,
+            &table,
+            &l4_table,
+            &caddy,
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &tenant_rl_cache,
+            &mut None,
         )
         .await
         .expect("push_now should succeed");
@@ -1619,8 +1626,15 @@ mod tests {
         let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
 
         let err = push_now(
-            &cfg, &table, &l4_table, &caddy, &cache, &rl_cache, &q_cache,
-            &tenant_rl_cache, &mut None,
+            &cfg,
+            &table,
+            &l4_table,
+            &caddy,
+            &cache,
+            &rl_cache,
+            &q_cache,
+            &tenant_rl_cache,
+            &mut None,
         )
         .await
         .expect_err("push_now should fail with 502");
