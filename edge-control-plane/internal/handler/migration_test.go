@@ -913,3 +913,307 @@ func TestMigrate_RejectsOversizedBody(t *testing.T) {
 		t.Errorf("expected 'request body too large' in body, got: %s", rr.Body.String())
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// L1 handler preflight tests (issue #622, commit 3)
+//
+// These tests cover the HTTP-level wiring of the preflight scanner
+// to /api/v1/migrate and /api/v1/migrate-tree. They assert the
+// response shape (HTTP 422 + code=PREFLIGHT_DENIED + details envelope)
+// and that the migration service is NOT invoked — the regex fires
+// before any subprocess would spawn. The pre-pass unit tests in
+// migration_preflight_test.go cover the regex set; these tests
+// cover the HTTP boundary.
+//
+// Service invocation is asserted indirectly: a preflight reject
+// returns BEFORE the service is called, so the body shape carries
+// `rejected_at: "preflight"` and there is no `MigrationReport`
+// envelope. If a future refactor accidentally wires the preflight
+// after the service, these tests fail because the service either
+// returns its own 422 (analyzer-rejected, with SECURITY_DENY:* in
+// errors[]) or returns 200 with a structured report.
+// ─────────────────────────────────────────────────────────────────────
+
+// assertPreflightRejected decodes the 422 body and asserts the
+// preflight envelope shape (code=PREFLIGHT_DENIED, rejected_at:
+// "preflight", matches non-empty). Returns the decoded
+// `matches` array so the caller can assert pattern-specific
+// details.
+func assertPreflightRejected(t *testing.T, rr *httptest.ResponseRecorder, expectedLang string) []map[string]any {
+	t.Helper()
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected status 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v: %s", err, rr.Body.String())
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing 'error' object in body: %+v", body)
+	}
+	if errObj["code"] != "PREFLIGHT_DENIED" {
+		t.Errorf("error.code = %v, want PREFLIGHT_DENIED", errObj["code"])
+	}
+	if body["rejected_at"] != "preflight" {
+		t.Errorf("rejected_at = %v, want preflight", body["rejected_at"])
+	}
+	if body["language"] != expectedLang {
+		t.Errorf("language = %v, want %s", body["language"], expectedLang)
+	}
+	matches, ok := body["matches"].([]any)
+	if !ok {
+		t.Fatalf("matches is not an array: %T (%v)", body["matches"], body["matches"])
+	}
+	if len(matches) == 0 {
+		t.Fatalf("matches is empty: %+v", body)
+	}
+	out := make([]map[string]any, len(matches))
+	for i, m := range matches {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("matches[%d] is not an object: %T", i, m)
+		}
+		out[i] = mm
+	}
+	return out
+}
+
+// newHandlerWithMockSvc builds a MigrationHandler with a real
+// MigrationService pointed at a fake `edge-migrate` path. The fake
+// path doesn't matter for the preflight tests because the handler
+// must short-circuit before invoking the service — but the
+// constructor still requires a non-empty binary path. We point at
+// `/bin/false` so a future regression that skips preflight surfaces
+// as a service-level error (5xx) instead of an unrelated crash.
+func newHandlerWithMockSvc(t *testing.T) *MigrationHandler {
+	t.Helper()
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "/bin/false", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
+	return NewMigrationHandler(svc)
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsIncludeBytes_Rust(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `const LEAK: &[u8] = include_bytes!("/etc/edgecloud/signing.key");
+fn main() {}
+`
+	req, err := makeMigrationReq("evil.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "rust")
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(matches))
+	}
+	if matches[0]["pattern"] != preflightReasonIncludeBytes {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonIncludeBytes)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsEnvMacro(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `const JWT: &str = env!("JWT_SECRET");
+fn main() {}
+`
+	req, err := makeMigrationReq("evil.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "rust")
+	if matches[0]["pattern"] != preflightReasonEnvMacro {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonEnvMacro)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsEmbed_C(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `#embed "/etc/edgecloud/signing.key"
+int main(void) { return 0; }
+`
+	req, err := makeMigrationReq("evil.c", "c", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	if matches[0]["pattern"] != preflightReasonEmbed {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonEmbed)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsAbsoluteInclude_C(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `#include "/etc/passwd"
+int main(void) { return 0; }
+`
+	req, err := makeMigrationReq("evil.c", "c", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	if matches[0]["pattern"] != preflightReasonAbsoluteIncl {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonAbsoluteIncl)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsBenignRust(t *testing.T) {
+	// Benign source must NOT short-circuit at preflight — the
+	// response should be something OTHER than 422 PREFLIGHT_DENIED.
+	// We don't assert 200 here because the service is wired to
+	// /bin/false and will fail; the test just confirms preflight
+	// didn't fire.
+	h := newHandlerWithMockSvc(t)
+
+	source := `fn main() { println!("hi"); }`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	// Anything other than a 422 PREFLIGHT_DENIED envelope is fine.
+	// The /bin/false edge-migrate will return 500 because the
+	// service tries to spawn it. What we MUST NOT see is the
+	// preflight envelope.
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("benign source should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsComment(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `// include_bytes!("/etc/passwd") is forbidden.
+fn main() {}
+`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("comment-only text should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsVariableNamedEnv(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `fn main() {
+    let env = "rust_var_named_env";
+    println!("{}", env);
+}
+`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("bare identifier `env` should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_MigrateTree_PreflightRejectsAcrossTree(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	manifest := `{"files":["main.c","evil.c"]}`
+	files := map[string]string{
+		"main.c": `int main(void) { return 0; }
+`,
+		"evil.c": `#include "/etc/edgecloud/signing.key"
+`,
+	}
+	req := makeTreeReq(t, "evilapp", "c", manifest, files)
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	// The exact match count depends on how many per-file hits we
+	// surface; we bail on the first file with a hit, so we expect
+	// at least one match with the offending path populated.
+	if len(matches) == 0 {
+		t.Fatalf("expected at least one match, got 0")
+	}
+	if matches[0]["path"] == nil || matches[0]["path"] == "" {
+		t.Errorf("expected path populated for tree match, got %v", matches[0])
+	}
+	if matches[0]["pattern"] != preflightReasonAbsoluteIncl {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonAbsoluteIncl)
+	}
+}
+
+func TestMigrationHandler_MigrateTree_PreflightAllowsBenign(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	manifest := `{"files":["main.c","util.c"]}`
+	files := map[string]string{
+		"main.c": `int main(void) { return 0; }
+`,
+		"util.c": `#include <stdio.h>
+`,
+	}
+	req := makeTreeReq(t, "benignapp", "c", manifest, files)
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("benign tree should not preflight-reject: %+v", body)
+		}
+	}
+}

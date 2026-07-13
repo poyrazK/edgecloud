@@ -151,6 +151,19 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// L1 preflight (issue #622, commit 3): cheap regex scan at the
+	// HTTP boundary so obvious exfiltration payloads (include_bytes!,
+	// env!, #[path = "..."], #embed "...", absolute #include) are
+	// rejected before any subprocess spawns. Distinct response shape
+	// from the analyzer path so the SDK can branch on
+	// "rejected_at: preflight" vs the structured report body.
+	if matches := preflightMigrateSource(language[0], "", string(source)); len(matches) > 0 {
+		httperror.PreflightDeniedCtx(w, r,
+			"compile-time host-reach pattern detected",
+			preflightDetailsFor(language[0], matches))
+		return
+	}
+
 	report, err := h.migrationSvc.Migrate(r.Context(), tenantID, filename[0], language[0], string(source))
 	if err != nil {
 		if isClientMigrationError(err) {
@@ -339,6 +352,22 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			entries = append(entries, domain.FileEntry{Path: p, Source: string(body)})
+		}
+	}
+
+	// L1 preflight (issue #622, commit 3): per-file scan across the
+	// tree before any subprocess spawns. Same regex set as the
+	// single-file /api/v1/migrate path; the SDK gets one merged
+	// `matches` array with `path` populated per hit so the offending
+	// file is identifiable. We bail on the first file with a hit to
+	// keep the response deterministic — the caller can fix that one
+	// file and retry, rather than receiving a partial report.
+	for _, e := range entries {
+		if matches := preflightMigrateSource(language[0], e.Path, e.Source); len(matches) > 0 {
+			httperror.PreflightDeniedCtx(w, r,
+				"compile-time host-reach pattern detected",
+				preflightDetailsFor(language[0], matches))
+			return
 		}
 	}
 

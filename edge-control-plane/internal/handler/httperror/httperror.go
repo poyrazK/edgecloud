@@ -32,6 +32,18 @@ const (
 	// are "request was understood but cannot be processed", but the
 	// SDK branches on the code, so the distinction matters.
 	CodeBillingTenantUnresolved ErrorCode = "BILLING_TENANT_UNRESOLVED"
+	// CodePreflightDenied is the L1 handler preflight reject on
+	// /api/v1/migrate* (issue #622, commit 3): the request body
+	// contained a compile-time host-reach pattern (include_bytes!, env!,
+	// #[path = "..."], #embed "...", absolute #include) that the cheap
+	// regex scanner caught at the HTTP boundary. Distinct from the
+	// analyzer's 422 path (which carries a structured report body with
+	// errors[].code = SECURITY_DENY:*): the SDK branches on this code
+	// to surface "rejected at preflight, never reached the toolchain"
+	// vs "rejected by the analyzer after a toolchain subprocess ran".
+	// HTTP 422 because the request was well-formed but the server-side
+	// invariant forbids the payload.
+	CodePreflightDenied ErrorCode = "PREFLIGHT_DENIED"
 )
 
 // ErrorResponse is the canonical JSON error envelope.
@@ -230,6 +242,27 @@ func BadGateway(w http.ResponseWriter, message string, details map[string]any) {
 // BadGatewayCtx reports an upstream-dependency failure with trace context (HTTP 502).
 func BadGatewayCtx(w http.ResponseWriter, r *http.Request, message string, details map[string]any) {
 	writeWithDetails(w, CodeBadGateway, message, http.StatusBadGateway,
+		requestIDFromContext(r.Context()), details)
+}
+
+// PreflightDeniedCtx reports a /api/v1/migrate* upload that the
+// L1 handler preflight rejected (HTTP 422). The details map is
+// merged at the envelope top level alongside the typed error block
+// (same shape as BadGatewayCtx). The convention for callers is to
+// pass:
+//
+//	{
+//	    "rejected_at": "preflight",
+//	    "matches":     []map[string]any{{"pattern": "include_bytes", "line": 1}, ...},
+//	}
+//
+// so the SDK can render "your upload was rejected before it reached
+// the toolchain" without needing to parse the structured analyzer
+// report body. Distinct from CodeUnprocessableEntity / 422 because
+// the rejection is policy-driven (compile-time host-reach pattern),
+// not state-driven (Idempotency-Key replay).
+func PreflightDeniedCtx(w http.ResponseWriter, r *http.Request, message string, details map[string]any) {
+	writeWithDetails(w, CodePreflightDenied, message, http.StatusUnprocessableEntity,
 		requestIDFromContext(r.Context()), details)
 }
 
