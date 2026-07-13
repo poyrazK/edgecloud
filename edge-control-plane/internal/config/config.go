@@ -692,6 +692,16 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Reject insecure database passwords (issue #626). Same shape as the
+	// JWT check above — `docker-compose.yml` no longer hardcodes
+	// POSTGRES_PASSWORD, so the literal default cannot reach this binary
+	// via the compose path. This validator closes the operator-shell
+	// failure mode (`DATABASE_PASSWORD=edgecloud`) that an env-only fix
+	// would miss.
+	if err := validateDBPassword(cfg.Database.Password); err != nil {
+		return nil, err
+	}
+
 	// Validate bootstrap secret if configured. Same strength requirements
 	// as JWT_SECRET — must be ≥32 bytes, not a known placeholder.
 	// Optional: when empty, workers must use the direct JWT secret.
@@ -869,6 +879,49 @@ func validateJWTSecret(secret string, activeKID string, keys map[string]string) 
 	}
 	if len(secret) < 32 {
 		return fmt.Errorf("jwt.secret must be at least 32 bytes (got %d)", len(secret))
+	}
+	return nil
+}
+
+// insecureDBPasswordValues is the set of well-known placeholder Postgres
+// passwords that must not be accepted. The dev default `edgecloud` and
+// the upstream `postgres` default are both in here; the curator-controlled
+// map keeps typo-resistance identical to the JWT validator.
+//
+// Issue #626: docker-compose.yml previously hardcoded POSTGRES_PASSWORD=edgecloud;
+// lifting it to a gitignored `.env` left a hole where an operator who
+// copied `.env.example` verbatim into a non-local environment would still
+// boot the CP with a publicly-known password. This set + the empty-string
+// check close that hole.
+var insecureDBPasswordValues = map[string]struct{}{
+	"edgecloud": {},
+	"postgres":  {},
+	"password":  {},
+	"changeme":  {},
+	"default":   {},
+	"admin":     {},
+}
+
+// validateDBPassword enforces that the database password is set, is
+// not a known placeholder, and meets a minimum length floor. Mirrors
+// validateJWTSecret — fail-closed at Load() so the binary refuses to
+// boot rather than silently threading an empty or trivially-guessable
+// password to libpq (which produces a confusing auth error).
+//
+// Minimum length is 16 bytes — half the JWT validator's 32-byte floor,
+// since password-based DB auth doesn't have the JWT signing-algorithm
+// entropy requirements. The floor catches accidental typos like a
+// single-character password left over from a `.env` copy-paste, while
+// still permitting operators to use a memorable but unique value.
+func validateDBPassword(password string) error {
+	if password == "" {
+		return fmt.Errorf("database.password is not set; set DATABASE_PASSWORD or database.password to a unique value")
+	}
+	if _, ok := insecureDBPasswordValues[password]; ok {
+		return fmt.Errorf("database.password %q is a known placeholder; set DATABASE_PASSWORD to a unique value", password)
+	}
+	if len(password) < 16 {
+		return fmt.Errorf("database.password must be at least 16 bytes (got %d); set DATABASE_PASSWORD to a unique value", len(password))
 	}
 	return nil
 }

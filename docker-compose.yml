@@ -9,23 +9,24 @@
 # vice versa.
 #
 # Usage:
-#   docker compose up -d    # start Postgres + NATS in the background
-#   make infra-up          # same, via the Makefile wrapper
+#   cp .env.example .env    # one-time (`.env` is gitignored)
+#   make infra-up           # sources .env, starts Postgres + NATS
+#   docker compose up -d    # same, without the Makefile wrapper
 #
-# The control plane binary (`edge-control-plane/cmd/api`) and the
-# worker (`edge-worker`) read their database/NATS settings from
-# `edge-control-plane/config.yaml` and env vars. The defaults in that
-# config match the host/port/user/password/db/url below, so neither
-# binary needs env-var overrides for the typical happy-path setup.
+# `POSTGRES_PASSWORD` is intentionally NOT set here — compose strict-
+# fails via `${VAR:?msg}` if it's missing from the environment, so
+# the literal default cannot leak into a non-local deployment. The
+# control plane binary additionally rejects known-placeholder
+# passwords at startup (see edge-control-plane/internal/config/config.go).
 
 services:
   postgres:
     image: postgres:16-alpine
     container_name: edgecloud-postgres
     environment:
-      POSTGRES_USER: edgecloud
-      POSTGRES_PASSWORD: edgecloud
-      POSTGRES_DB: edgecloud
+      POSTGRES_USER: ${POSTGRES_USER:-edgecloud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set; copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-edgecloud}
     ports:
       - "5432:5432"
     volumes:
@@ -33,7 +34,7 @@ services:
     healthcheck:
       # pg_isready is built into the official postgres image. Same
       # check the CI healthcheck uses (services: postgres in ci.yml).
-      test: ["CMD-SHELL", "pg_isready -U edgecloud -d edgecloud"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edgecloud} -d ${POSTGRES_DB:-edgecloud}"]
       interval: 5s
       timeout: 3s
       retries: 10

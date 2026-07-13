@@ -2,7 +2,7 @@ database:
   host: "localhost"
   port: 5432
   user: "edgecloud"
-  password: "edgecloud"
+  password: ""   # set via DATABASE_PASSWORD env var (Makefile sources .env); control plane fails-closed if unset or known-placeholder
   name: "edgecloud"
   sslmode: "disable"
 

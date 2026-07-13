@@ -20,3 +20,8 @@
 .DS_Store
 node_modules/
 internal/config/testdata/*.key
+
+# Local env (sourced by Makefile; populated from .env.example at repo root)
+# Also covered by the repo-root .gitignore, listed here for sparse-checkout
+# and moved-file resilience (issue #626).
+.env

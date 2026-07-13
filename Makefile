@@ -12,6 +12,21 @@
         migrate run-api run-worker help \
         dev dev-prereqs dev-install dev-config dev-down dev-clean
 
+# Load .env at parse time so DATABASE_PASSWORD/POSTGRES_* survive into
+# every recipe shell AND into recursive $(MAKE) invocations (e.g. the
+# `$(MAKE) migrate` call from infra-reset). `-include` (not `include`)
+# so a missing .env is non-fatal here; infra-up / infra-reset print the
+# "copy .env.example" error before any compose / migrate work runs.
+#
+# Only DATABASE_* and POSTGRES_* are exported — the rest of `.env`
+# (JWT_*, BOOTSTRAP_*, NATS_*) is set explicitly via `set -a; . ./.env`
+# inside infra-up so `docker compose` reads them as its env file
+# semantics (substitution + strict-fail) without polluting Make's
+# variable namespace.
+-include .env
+export DATABASE_USER DATABASE_PASSWORD DATABASE_NAME DATABASE_HOST DATABASE_PORT DATABASE_SSLMODE
+export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
+
 help:                   ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "Targets:\n"} \
 	/^[a-zA-Z_-]+:.*?##/ {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -19,9 +34,17 @@ help:                   ## Show this help.
 # ----- Infrastructure (Postgres + NATS) -----
 
 infra-up:              ## Start Postgres + NATS in the background.
-	docker compose up -d
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
+	@if grep -Eq '^POSTGRES_PASSWORD=(edgecloud|postgres|password|changeme|default|admin)([[:space:]]|$$)' .env; then \
+		echo "warning: POSTGRES_PASSWORD in .env is a known placeholder; override before any non-local use."; \
+	fi
+	set -a; . ./.env; set +a; \
+	  docker compose up -d
 	@echo ""
-	@echo "Postgres: localhost:5432  (user/pass/db: edgecloud)"
+	@echo "Postgres: localhost:5432  (user/db from .env; password from .env — dev default if unchanged)"
 	@echo "NATS:      nats://localhost:4222  (JetStream enabled; monitoring on :8222)"
 
 infra-down:            ## Stop the infra containers (keeps the Postgres volume).
@@ -38,10 +61,17 @@ infra-ps:              ## Show container status.
 # a clean slate (e.g. adding a NOT NULL on a column with existing
 # rows in your dev DB).
 infra-reset:           ## Stop infra, wipe Postgres volume, re-apply migrations.
-	docker compose down -v
-	docker compose up -d
-	@echo "Waiting for Postgres to accept connections..."
-	@until docker compose exec -T postgres pg_isready -U edgecloud -d edgecloud; do sleep 1; done
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
+	@if grep -Eq '^POSTGRES_PASSWORD=(edgecloud|postgres|password|changeme|default|admin)([[:space:]]|$$)' .env; then \
+		echo "warning: POSTGRES_PASSWORD in .env is a known placeholder; override before any non-local use."; \
+	fi
+	set -a; . ./.env; set +a; \
+	  docker compose down -v && \
+	  docker compose up -d && \
+	  until docker compose exec -T postgres pg_isready -U $${POSTGRES_USER:-edgecloud} -d $${POSTGRES_DB:-edgecloud}; do sleep 1; done
 	$(MAKE) migrate
 
 # ----- Migrations (against the running infra) -----
@@ -50,7 +80,13 @@ infra-reset:           ## Stop infra, wipe Postgres volume, re-apply migrations.
 # control plane expects on first start (it doesn't auto-migrate).
 # JWT_SECRET is set to a stable dev-only 64-char value to bypass the
 # config.Load placeholder check; rotate for any non-local use.
+# DATABASE_PASSWORD is sourced from `.env` via the top-level `-include`
+# so the CP's validateDBPassword (issue #626) sees a valid value.
 migrate:               ## Apply all pending migrations against the running Postgres.
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
 	cd edge-control-plane && \
 	  JWT_SECRET=$$(printf 'dev-only-do-not-use-in-production-%s' $$(date +%s) | head -c 64) \
 	  go run ./cmd/migrate --up
@@ -59,8 +95,14 @@ migrate:               ## Apply all pending migrations against the running Postg
 
 # Foreground control plane on :8080. JWT_SECRET is set to a dev-only
 # 64-char value to bypass the config.Load placeholder check; rotate
-# for any non-local use.
+# for any non-local use. DATABASE_PASSWORD is sourced from `.env` via
+# the top-level `-include` so the CP's validateDBPassword (issue #626)
+# sees a valid value.
 run-api:               ## Run the control plane in the foreground.
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
 	cd edge-control-plane && \
 	  JWT_SECRET=$$(printf 'dev-only-do-not-use-in-production-%s' $$(date +%s) | head -c 64) \
 	  go run ./cmd/api

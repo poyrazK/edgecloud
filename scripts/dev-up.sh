@@ -116,6 +116,21 @@ fi
 # shellcheck source=/dev/null
 source "$EDGECLOUD_ENV_FILE"
 
+# Source the repo-root .env so docker compose (POSTGRES_PASSWORD strict-
+# fail) and the CP's config.Load validator (DATABASE_PASSWORD) both see
+# the dev defaults. Issue #626: docker-compose.yml no longer hardcodes
+# the literal, and the CP's validateDBPassword rejects empty / known-
+# placeholder passwords, so any path that spawns docker compose or
+# `go run ./cmd/api` must surface .env into its environment.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  # shellcheck source=/dev/null
+  set -a; source "$REPO_ROOT/.env"; set +a
+else
+  echo "[dev-up] .env not found at $REPO_ROOT/.env; 'cp .env.example .env' first (issue #626)" >&2
+  trap '' INT TERM EXIT
+  exit 1
+fi
+
 # ── Phase 6: bring up postgres + nats containers ────────────────────────
 
 echo "[dev-up] starting postgres + nats..." >&2
