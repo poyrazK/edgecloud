@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -315,7 +314,7 @@ codegen-units = 1
 		return "", dir, fmt.Errorf("compileRustAsComponent: write src/lib.rs: %w", wErr)
 	}
 
-	cmd := exec.CommandContext(ctx, s.cargoPath,
+	cmd := s.newToolCmd(ctx, s.cargoPath,
 		"build",
 		"--target", "wasm32-unknown-unknown",
 		"--release",
@@ -349,7 +348,7 @@ func (s *MigrationService) wrapAsComponent(
 	ctx context.Context,
 	coreWasmPath string,
 ) error {
-	cmd := exec.CommandContext(ctx, s.wasmToolsPath,
+	cmd := s.newToolCmd(ctx, s.wasmToolsPath,
 		"component", "new",
 		"--world", "edge-runtime-handler",
 		coreWasmPath,
@@ -498,7 +497,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	// analyzer (C default; rust is required for Rust sources). The
 	// envelope's `WasiC` (or future equivalent) carries the transformed
 	// source; `Report` carries the structured per-pattern fields.
-	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath,
+	edgeMigCmd := s.newToolCmd(ctx, s.edgeMigratePath,
 		"--language", language, "--transform", tmpSrcPath, "--format", "json")
 	var edgeMigOut bytes.Buffer
 	edgeMigCmd.Stdout = &edgeMigOut
@@ -658,7 +657,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		// success — compileErrMsg stays empty
 	default: // "c"
 		clangBin := filepath.Join(s.wasiSdkPath, "clang")
-		clangCmd := exec.CommandContext(ctx, clangBin,
+		clangCmd := s.newToolCmd(ctx, clangBin,
 			"--target=wasm32-wasip2", "-nostdlib",
 			"-o", tmpWasmPath, "-")
 		clangCmd.Stdin = strings.NewReader(transformed)
@@ -1262,7 +1261,7 @@ func (s *MigrationService) MigrateTree(
 		// era; for Rust the file contains Rust source. The compile
 		// step dispatches on `language` and treats the file
 		// accordingly.)
-		edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--transform", wf.absPath)
+		edgeMigCmd := s.newToolCmd(ctx, s.edgeMigratePath, "--language", language, "--transform", wf.absPath)
 		var edgeMigOut bytes.Buffer
 		edgeMigCmd.Stdout = &edgeMigOut
 		var edgeMigErr bytes.Buffer
@@ -1297,7 +1296,7 @@ func (s *MigrationService) MigrateTree(
 		// On failure (older binary), fall back to a heuristic that's
 		// language-aware: C → detectTransformedPatterns, Rust →
 		// detectTransformedPatternsRust.
-		analyzeCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--analyze-json", wf.absPath)
+		analyzeCmd := s.newToolCmd(ctx, s.edgeMigratePath, "--language", language, "--analyze-json", wf.absPath)
 		var analyzeOut bytes.Buffer
 		analyzeCmd.Stdout = &analyzeOut
 		var analyzeErr bytes.Buffer
@@ -1474,7 +1473,7 @@ func (s *MigrationService) MigrateTree(
 	for _, wf := range written {
 		args = append(args, wf.wasiCPath)
 	}
-	clangCmd := exec.CommandContext(ctx, clangBin, args...)
+	clangCmd := s.newToolCmd(ctx, clangBin, args...)
 	var clangErrBuf bytes.Buffer
 	clangCmd.Stderr = &clangErrBuf
 	if err := clangCmd.Run(); err != nil {
