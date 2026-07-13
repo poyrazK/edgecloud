@@ -433,6 +433,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/apps/{appName}/l4-port": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the L4/TCP public port for an app
+         * @description Returns the ingress-side public port allocated to this app for
+         *     raw-TCP traffic. The port is in the configured L4 range
+         *     (default 31000-31999) and is what the tenant's TCP clients
+         *     should connect to. Returns 404 if the app does not exist OR
+         *     if it exists but no port has been allocated yet (HTTP-only
+         *     app, or no TCP heartbeat has been processed yet).
+         */
+        get: operations["getL4Port"];
+        put?: never;
+        /**
+         * Allocate the L4/TCP public port for an app
+         * @description Atomically allocates a public port from the configured L4 range
+         *     if one is not already allocated. Idempotent — calling twice for
+         *     the same app returns the same port without consuming a second
+         *     slot. Returns 409 if the configured range is fully allocated
+         *     (operator should widen L4_PORT_RANGE_END).
+         */
+        post: operations["allocateL4Port"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/apps/{appName}/env": {
         parameters: {
             query?: never;
@@ -1173,6 +1206,68 @@ export interface paths {
                     content?: never;
                 };
                 /** @description Tenant not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/internal/l4-port/{tenantID}/{appName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Per-(tenant, app) L4/TCP public port for the ingress
+         * @description Returns the persisted L4 public port for the named (tenant, app).
+         *     The ingress `L4PortCache` polls this endpoint every
+         *     `QUOTA_FETCH_INTERVAL` (default 30s) so two ingress instances in
+         *     the same region can converge on the same persisted port. 404
+         *     means either "app not found" or "no port allocated yet" — the
+         *     ingress treats both as a cache miss and falls back to its local
+         *     `L4PortPool` + write-back on the next heartbeat.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    tenantID: string;
+                    appName: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Port assigned. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["L4PortResponse"];
+                    };
+                };
+                /** @description Invalid app name or tenant ID */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description App not found, or app exists but no port allocated yet. */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -1977,6 +2072,20 @@ export interface components {
             app_name?: string;
             /** @example no running app found for this tenant */
             reason?: string;
+        };
+        L4PortResponse: {
+            /**
+             * Format: int32
+             * @description Ingress-side port the tenant connects to for raw-TCP traffic to
+             *     the named app. Allocated by the control plane from the
+             *     configured L4 port range (default 31000-31999); persisted on
+             *     the apps row so it survives ingress / worker restarts. Two
+             *     ingress instances polling the same (tenant, app) see the
+             *     same value because allocation is atomic via
+             *     `UPDATE … WHERE l4_public_port IS NULL`.
+             * @example 31042
+             */
+            public_port: number;
         };
         SetEnvRequest: {
             /** @example LOG_LEVEL */
@@ -3570,6 +3679,79 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["IngressResponseNotReady"];
                 };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getL4Port: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Port allocated. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["L4PortResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description App not found, or app exists but no L4 port allocated yet. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    allocateL4Port: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique name of the app within the tenant. */
+                appName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Port (just) allocated, or already-allocated port returned. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["L4PortResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description App not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description L4 port range exhausted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             500: components["responses"]["InternalError"];
         };

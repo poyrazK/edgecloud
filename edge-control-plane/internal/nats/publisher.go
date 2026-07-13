@@ -282,6 +282,41 @@ func BuildAppConfig(
 	return cfg
 }
 
+// SocketModeForProtocol maps an app's wire protocol value (issue #548)
+// to the worker-side `SocketEgressPolicy` selector that the per-app
+// field on AppConfig carries (issue #412). The CP does NOT interpret
+// the policy — it threads the string through and the worker owns the
+// decision — but the policy itself is dictated by the protocol:
+//   - "http" (the default — long-running HTTP/WS apps or FaaS apps):
+//     keep the worker-wide default (empty `socket_mode`); the per-app
+//     override only takes effect when it is set, so we explicitly do
+//     NOT stamp "block-all" or any other restrictive policy here.
+//   - "tcp" (raw-TCP long-running apps): stamp "allow-all". An L4
+//     server MUST `bind()` and `accept()` inbound TCP sockets from
+//     arbitrary workers; `BlockAll` denies bind, `AllowList` requires
+//     operators to enumerate destinations the L4 app cannot predict.
+//     "allow-all" is the only policy compatible with the L4 model
+//     (still subject to the URL-level `EgressPolicy::check` and
+//     DNS-rebinding guard at the wasi:http/* layer for any outbound
+//     HTTP the L4 app itself makes).
+//
+// Empty / unknown protocol values resolve to the empty default — pre-
+// #548 deployments keep seeing the worker-wide setting, the rolling-
+// upgrade contract that #412 already committed to. Note: this helper
+// is called from the activate path on the deployment's resolved
+// protocol value (forwarded by the CLI as part of the deploy
+// manifest; see Commit 9 where the value lands on the active
+// deployments row). New in commit 4.
+func SocketModeForProtocol(protocol string) string {
+	switch protocol {
+	case "tcp":
+		return "allow-all"
+	default:
+		// "http" or empty/unknown — defer to worker-wide setting.
+		return ""
+	}
+}
+
 // BuildAppConfigWithSocketMode is the issue #412 sibling of
 // BuildAppConfig — same shape, plus a `socketMode` per-app selector
 // for the worker's `SocketEgressPolicy`. The CP doesn't interpret the

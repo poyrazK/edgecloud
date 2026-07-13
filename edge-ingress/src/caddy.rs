@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::{ingress_host, Config};
+use crate::l4::L4RouteEntry;
 use crate::quota::QuotaCache;
 use crate::ratelimit::RateLimitCache;
 use crate::routing::{FqdnBinding, RouteEntry};
@@ -913,6 +914,146 @@ pub(crate) fn diff_fqdns(prev: &[FqdnBinding], curr: &[FqdnBinding]) -> (Vec<Str
     (added, removed)
 }
 
+// ── L4 (raw-TCP) rendering ───────────────────────────────────────────
+//
+// Issue #548. Caddy's `mholt/caddy-l4` plugin (the only way to proxy
+// raw TCP with Caddy) does NOT support per-id `PUT/DELETE /id/<id>`
+// for layer-4 servers — only the top-level `POST /load` accepts a
+// full `apps.layer4` config. So L4 routing changes always go through
+// the full `render_full` path. The HTTP tree still has incremental
+// per-id patches for the small-change fast path; only L4 is
+// forced-full.
+//
+// `apps.layer4.servers.<name>` JSON shape per `mholt/caddy-l4` README:
+//   listen:    [":31000"]
+//   routes[0]:
+//     match:    [{"subroute": "..."}]
+//     handle[0]:
+//       handler:   "proxy"
+//       upstreams: [{"dial": "10.0.0.1:8082"}]
+//
+// `subroute` is left implicit by using `match: []` (matches every
+// connection) and the proxy handler is the only handler.
+
+/// Build the Caddy `apps.layer4` tree for `entries`. Returns a
+/// complete Caddyfile-JSON payload (admin + apps.layer4); the HTTP
+/// tree is intentionally absent so the caller can merge it in via
+/// [`render_full`].
+pub fn render_l4_routes(entries: &[L4RouteEntry], cfg: &Config, quota_cache: &QuotaCache) -> Value {
+    let mut root = serde_json::Map::new();
+    root.insert(
+        "admin".to_string(),
+        json!({"listen": cfg.caddy_admin_listen}),
+    );
+
+    // Group by public_port (which is also the Caddy server_id —
+    // see `L4RouteEntry::server_id`). Each public port owns one
+    // Caddy server in the layer4 tree.
+    let mut servers = serde_json::Map::new();
+    let mut sorted_entries: Vec<&L4RouteEntry> = entries.iter().collect();
+    sorted_entries.sort_by_key(|a| a.public_port);
+
+    for entry in &sorted_entries {
+        // Build the per-server object. The shape is always:
+        //   { listen: [":<port>"], routes: [...] }
+        // For over-cap tenants, `routes` is `[]` (close-on-cap —
+        // Caddy's layer4 matches nothing when routes is empty and
+        // closes the connection). Otherwise `routes` contains a
+        // single proxy route.
+        let mut server_obj = serde_json::Map::new();
+        server_obj.insert(
+            "listen".to_string(),
+            json!([format!(":{}", entry.public_port)]),
+        );
+        let routes_value = if quota_cache.is_over_cap(&entry.tenant_id) {
+            // Caddy's layer4 matches nothing when `routes: []` and
+            // closes the connection immediately — the close-on-cap
+            // behaviour from the issue #548 design.
+            Value::Array(Vec::new())
+        } else {
+            let dial = format!("{}:{}", entry.worker_addr, entry.upstream_port);
+            json!([{
+                "handle": [{
+                    "handler": "proxy",
+                    "upstreams": [{"dial": dial}],
+                }],
+            }])
+        };
+        server_obj.insert("routes".to_string(), routes_value);
+
+        // Issue #548 review finding #32: the per-app DDoS caps were
+        // originally emitted as a `connection_policies` block, but
+        // mholt/caddy-l4 doesn't recognise the `max_conns_per_app`
+        // / `max_conns_per_ip` keys we emitted — the real
+        // connection-cap plugin is `caddy-l4`'s `conn_limit`
+        // sub-module, which uses a different schema. Until that
+        // plugin is wired in (out of v1 scope), emitting a
+        // `connection_policies` block creates the illusion of
+        // protection while doing nothing. Drop it; leave the
+        // `l4_max_conns_*` config fields in place for the future
+        // conn_limit plugin to consume without a second config
+        // migration. `cfg.l4_max_conns_per_app/_per_ip` are still
+        // validated by `test_cfg()` to catch typos at config-load
+        // time.
+        servers.insert(entry.server_id(), Value::Object(server_obj));
+    }
+
+    // If there are no L4 entries, the Caddy admin API still needs
+    // an empty `apps.layer4` block (an absent `apps.layer4` means
+    // the plugin is not configured and Caddy returns a 404 on
+    // /apps/layer4). The block is harmless when empty.
+    let mut apps_block = serde_json::Map::new();
+    let mut layer4 = serde_json::Map::new();
+    layer4.insert("servers".to_string(), Value::Object(servers));
+    apps_block.insert("layer4".to_string(), Value::Object(layer4));
+    root.insert("apps".to_string(), Value::Object(apps_block));
+
+    Value::Object(root)
+}
+
+/// Merge the HTTP tree from [`render_routes`] with the L4 tree from
+/// [`render_l4_routes`] into one Caddy admin `/load` payload. The
+/// HTTP block is the pre-#548 shape verbatim; the L4 block lives
+/// under `apps.layer4` per the `mholt/caddy-l4` JSON schema.
+///
+/// When `l4_entries` is empty, the L4 block is emitted with
+/// `servers: {}` rather than omitted — Caddy's admin API tolerates
+/// both, but emitting the empty block is friendlier to operators
+/// debugging the live config (`curl localhost:2019/config/apps/layer4`
+/// returns `{"servers":{}}` rather than a 404).
+///
+/// When `http_payload` is from a cache hit (a previous successful
+/// push that hasn't been invalidated by an HTTP-side delta), the
+/// `admin` key from `http_payload` wins — it's identical between
+/// the two renderers by construction.
+pub fn render_full(
+    http_payload: Value,
+    l4_entries: &[L4RouteEntry],
+    cfg: &Config,
+    quota_cache: &QuotaCache,
+) -> Value {
+    let l4_payload = render_l4_routes(l4_entries, cfg, quota_cache);
+
+    // Merge the two trees. The HTTP payload is the "base" — we
+    // splice the L4 `apps.layer4` block in alongside `apps.http`.
+    let mut http_obj = http_payload
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    let mut merged_apps = http_obj
+        .remove("apps")
+        .and_then(|a| a.as_object().cloned())
+        .unwrap_or_else(serde_json::Map::new);
+
+    if let Some(l4_apps) = l4_payload.get("apps").and_then(|a| a.as_object()) {
+        for (k, v) in l4_apps {
+            merged_apps.insert(k.clone(), v.clone());
+        }
+    }
+    http_obj.insert("apps".to_string(), Value::Object(merged_apps));
+    Value::Object(http_obj)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1165,11 @@ mod tests {
             tenant_rate_limit_fetch_interval: Duration::from_secs(30),
             global_rate_limit_rps: 0,
             global_rate_limit_burst: 0,
+            l4_port_range_start: 31000,
+            l4_port_range_end: 31999,
+            l4_max_conns_per_app: 1000,
+            l4_max_conns_per_ip: 100,
+            l4_port_cooldown_secs: 60,
         }
     }
 
@@ -2332,5 +2478,187 @@ mod tests {
             err.to_string().contains("transport error"),
             "err should mention transport error, got: {err}"
         );
+    }
+
+    // ── L4 rendering tests (issue #548) ──────────────────────────────
+
+    use crate::l4::L4RouteEntry;
+
+    fn l4_test_cfg() -> Config {
+        Config {
+            nats_url: "nats://localhost:4222".into(),
+            caddy_admin_url: "http://localhost:2019".into(),
+            region: "test".into(),
+            cert_file: "/tmp/cert.pem".into(),
+            key_file: "/tmp/key.pem".into(),
+            cert_file_2: None,
+            key_file_2: None,
+            listen_http: ":80".into(),
+            listen_https: ":443".into(),
+            refresh_debounce_ms: 1000,
+            http_to_https: true,
+            admin_token: None,
+            control_plane_api_url: "http://localhost:8080".into(),
+            internal_token: None,
+            control_plane_url: String::new(),
+            service_token: String::new(),
+            domain_poll_interval: Duration::from_secs(30),
+            caddy_admin_listen: "localhost:2019".into(),
+            metrics_listen: ":9091".into(),
+            max_conns: 0,
+            max_conns_per_ip: 0,
+            per_ip_rps: 0,
+            per_ip_burst: 0,
+            rate_limit_rps_default: 0,
+            rate_limit_burst_default: 0,
+            rate_limit_fetch_interval: Duration::from_secs(60),
+            quota_fetch_interval: Duration::from_secs(30),
+            stale_timeout: Duration::from_secs(60),
+            prune_interval: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(10),
+            health_check_timeout: Duration::from_secs(3),
+            health_check_uri: "/healthz".into(),
+            health_check_max_fails: 2,
+            rate_limit_rps_tenant_default: 0,
+            rate_limit_burst_tenant_default: 0,
+            tenant_rate_limit_fetch_interval: Duration::from_secs(30),
+            global_rate_limit_rps: 0,
+            global_rate_limit_burst: 0,
+            l4_port_range_start: 31000,
+            l4_port_range_end: 31999,
+            l4_max_conns_per_app: 1000,
+            l4_max_conns_per_ip: 100,
+            l4_port_cooldown_secs: 60,
+        }
+    }
+
+    fn empty_quota_cache() -> QuotaCache {
+        QuotaCache::default()
+    }
+
+    fn l4_entry(tenant: &str, app: &str, public_port: u16) -> L4RouteEntry {
+        L4RouteEntry {
+            tenant_id: tenant.to_string(),
+            app_name: app.to_string(),
+            public_port,
+            worker_addr: "10.0.0.1".to_string(),
+            upstream_port: 8082,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn render_l4_routes_empty_emits_empty_servers_block() {
+        let cfg = l4_test_cfg();
+        let payload = render_l4_routes(&[], &cfg, &empty_quota_cache());
+        let servers = payload
+            .pointer("/apps/layer4/servers")
+            .and_then(|v| v.as_object())
+            .expect("layer4/servers object");
+        assert!(servers.is_empty(), "no entries → empty servers map");
+    }
+
+    #[test]
+    fn render_l4_routes_single_entry_emits_proxy() {
+        let cfg = l4_test_cfg();
+        let entry = l4_entry("t_a", "redis", 31000);
+        let payload = render_l4_routes(&[entry], &cfg, &empty_quota_cache());
+        let server = payload
+            .pointer("/apps/layer4/servers/l4_31000")
+            .expect("l4_31000 server");
+        assert_eq!(
+            server.pointer("/listen").and_then(|v| v.as_array()),
+            Some(&vec![json!(":31000")])
+        );
+        let proxy = server.pointer("/routes/0/handle/0").expect("proxy handler");
+        assert_eq!(proxy.get("handler"), Some(&json!("proxy")));
+        assert_eq!(
+            proxy.pointer("/upstreams/0/dial"),
+            Some(&json!("10.0.0.1:8082"))
+        );
+    }
+
+    #[test]
+    fn render_l4_routes_omits_connection_policies_until_conn_limit_plugin_wired() {
+        // Issue #548 review finding #32: the previous `connection_policies`
+        // emission created the illusion of DDoS protection while
+        // doing nothing (mholt/caddy-l4 doesn't recognise the
+        // `max_conns_per_app` / `max_conns_per_ip` keys — the real
+        // cap is the `conn_limit` sub-plugin with a different
+        // schema). Until that plugin is added, the rendered
+        // `apps.layer4` payload MUST NOT carry a `connection_policies`
+        // block — operators reading Caddy config shouldn't be
+        // misled into thinking protection is active.
+        let cfg = l4_test_cfg();
+        let entry = l4_entry("t_a", "redis", 31000);
+        let payload = render_l4_routes(&[entry], &cfg, &empty_quota_cache());
+        let server = payload
+            .pointer("/apps/layer4/servers/l4_31000")
+            .expect("server block");
+        assert!(
+            server.get("connection_policies").is_none(),
+            "rendered L4 server must not carry connection_policies until caddy-l4 conn_limit plugin is wired; got: {:?}",
+            server
+        );
+    }
+
+    #[test]
+    fn render_l4_routes_over_cap_tenant_renders_empty_routes() {
+        let cfg = l4_test_cfg();
+        let entry = l4_entry("t_a", "redis", 31000);
+        let mut quota_cache = empty_quota_cache();
+        quota_cache.update(
+            "t_a".to_string(),
+            crate::quota::QuotaState {
+                over_cap: true,
+                ..Default::default()
+            },
+        );
+        let payload = render_l4_routes(&[entry], &cfg, &quota_cache);
+        let routes = payload
+            .pointer("/apps/layer4/servers/l4_31000/routes")
+            .and_then(|v| v.as_array())
+            .expect("routes array");
+        assert!(routes.is_empty(), "over-cap → empty routes (close-on-cap)");
+    }
+
+    #[test]
+    fn render_full_merges_http_and_l4_trees() {
+        let cfg = l4_test_cfg();
+        let http_payload = json!({
+            "admin": {"listen": "localhost:2019"},
+            "apps": {
+                "http": {"servers": {"srv": {"listen": [":443"]}}},
+                "tls":  {"automation": {"policies": []}}
+            }
+        });
+        let l4_entry = l4_entry("t_a", "redis", 31000);
+        let merged = render_full(http_payload, &[l4_entry], &cfg, &empty_quota_cache());
+        // HTTP tree preserved
+        assert!(merged.pointer("/apps/http/servers/srv/listen/0").is_some());
+        assert!(merged.pointer("/apps/tls").is_some());
+        // L4 tree appended
+        assert!(merged
+            .pointer("/apps/layer4/servers/l4_31000/routes/0/handle")
+            .is_some());
+        // admin block preserved (HTTP wins)
+        assert_eq!(
+            merged.pointer("/admin/listen"),
+            Some(&json!("localhost:2019"))
+        );
+    }
+
+    #[test]
+    fn render_full_with_empty_l4_still_emits_layer4_block() {
+        let cfg = l4_test_cfg();
+        let http_payload = json!({
+            "apps": {"http": {"servers": {}}}
+        });
+        let merged = render_full(http_payload, &[], &cfg, &empty_quota_cache());
+        let servers = merged
+            .pointer("/apps/layer4/servers")
+            .and_then(|v| v.as_object())
+            .expect("layer4 present even when empty");
+        assert!(servers.is_empty());
     }
 }

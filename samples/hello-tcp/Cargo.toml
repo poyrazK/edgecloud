@@ -1,0 +1,29 @@
+[package]
+name = "hello-tcp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "edgeCloud hello-world L4/TCP server — minimal RESP echo over `wasi:sockets/tcp` that responds to PING\r\n with PONG\r\n"
+
+# Isolated workspace: without this, cargo would walk up to the parent
+# edgeCloud workspace and try to resolve `hello-tcp` against the
+# host repo's members (edge-runtime, edge-cli, edge-worker, …).
+# Those are host-only crates that can't be cross-compiled to
+# wasm32-unknown-unknown.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Same wit-bindgen major as edge-worker/tests/fixtures/handler/Cargo.toml.
+# wasmtime 45.0.3 (the runtime version this repo ships) expects a
+# wasi:http@0.2.1 component, which wit-bindgen 0.45 emits. The
+# `wasi:sockets/tcp` types we use here were stable at 0.45 too.
+wit-bindgen = "0.45"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

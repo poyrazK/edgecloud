@@ -80,7 +80,7 @@ import (
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*, 031_*, 032_*, 033_*), so this is the on-disk
 // file count, not a strict 2× the migration number.
-const splitFileCount = 96 // 48 .up.sql + 48 .down.sql after issue #305 + #430 (workers.public_key + length-cap) + #641 (renumbered 032 → 034)
+const splitFileCount = 100 // 50 .up.sql + 50 .down.sql after issue #305 + #430 (workers.public_key + length-cap) + #641 (renumbered 032 → 034) + #548 (035_l4_public_port adds 1 .up + 1 .down — renumbered from 032 to dodge the 3-way 031/032 collision in rubenv/sql-migrate v1.8.1's Less() comparator)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -488,11 +488,12 @@ var wantTypes = map[string]map[string]string{
 		"last_exhaustion_at":        "timestamptz", // 034_worker_status_capacity (issue #641)
 	},
 	"apps": {
-		"id":          "text",
-		"tenant_id":   "text",
-		"name":        "text",
-		"description": "text", // nullable
-		"created_at":  "timestamptz",
+		"id":             "text",
+		"tenant_id":      "text",
+		"name":           "text",
+		"description":    "text", // nullable
+		"created_at":     "timestamptz",
+		"l4_public_port": "integer", // 035_l4_public_port (issue #548)
 	},
 	"logs": {
 		"id":            "int8", // BIGSERIAL — serial-ness in default, type is int8

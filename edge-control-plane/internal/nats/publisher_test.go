@@ -404,6 +404,43 @@ func TestBuildAppConfigWithSocketMode_DefaultsToEmpty(t *testing.T) {
 	}
 }
 
+// ── Issue #548: SocketModeForProtocol ───────────────────────────────
+
+// TestSocketModeForProtocol_TCP_ReturnsAllowAll locks the L4 path:
+// tcp is the only protocol that overrides the worker-wide egress
+// default. Without this mapping, an L4 app's inbound socket would
+// silently fail to bind (worker-wide default is BlockAll) and the
+// failure mode would be "traffic doesn't flow and we don't know why".
+func TestSocketModeForProtocol_TCP_ReturnsAllowAll(t *testing.T) {
+	if got := SocketModeForProtocol("tcp"); got != "allow-all" {
+		t.Errorf("SocketModeForProtocol(\"tcp\") = %q, want \"allow-all\"", got)
+	}
+}
+
+// TestSocketModeForProtocol_HTTP_EmptyWorkerWideDefault locks the
+// rolling-upgrade path: an HTTP app MUST NOT have a socket_mode
+// stamped on it by the CP, otherwise pre-#548 deployments would
+// inherit a phantom override on the worker and operators would
+// have to debug a surprise policy change.
+func TestSocketModeForProtocol_HTTP_EmptyWorkerWideDefault(t *testing.T) {
+	if got := SocketModeForProtocol("http"); got != "" {
+		t.Errorf("SocketModeForProtocol(\"http\") = %q, want \"\"", got)
+	}
+}
+
+// TestSocketModeForProtocol_EmptyOrUnknown_DefaultsToWorkerWide: the
+// helper must be robust against (a) a missing protocol field on a
+// pre-#548 deployments row, (b) a typo'd value forwarded by an
+// older CLI. Both must resolve to the worker-wide default rather
+// than stamping an unintended policy.
+func TestSocketModeForProtocol_EmptyOrUnknown_DefaultsToWorkerWide(t *testing.T) {
+	for _, in := range []string{"", "tcp4", "HTTP", "websocket"} {
+		if got := SocketModeForProtocol(in); got != "" {
+			t.Errorf("SocketModeForProtocol(%q) = %q, want \"\" (worker-wide default)", in, got)
+		}
+	}
+}
+
 // ── Issue #569: task_purge wire format ──────────────────────────────
 //
 // The worker (edge-worker/src/messages.rs) deserializes these payloads

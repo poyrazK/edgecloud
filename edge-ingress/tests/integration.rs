@@ -24,6 +24,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use edge_ingress::caddy::CaddyClient;
 use edge_ingress::config::Config;
 use edge_ingress::heartbeats;
+use edge_ingress::l4::{L4PortPool, L4RoutingTable};
 use edge_ingress::routing::RoutingTable;
 
 // Shared test harness: NATS container startup + skip predicate, imported
@@ -73,6 +74,11 @@ fn test_config(nats_url: String, caddy_admin_url: String) -> Config {
         tenant_rate_limit_fetch_interval: Duration::from_secs(30),
         global_rate_limit_rps: 0,
         global_rate_limit_burst: 0,
+        l4_port_range_start: 31000,
+        l4_port_range_end: 31999,
+        l4_max_conns_per_app: 1000,
+        l4_max_conns_per_ip: 100,
+        l4_port_cooldown_secs: 60,
     }
 }
 
@@ -117,6 +123,17 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
 
     let cfg = test_config(nats_url.clone(), mock_server.uri());
     let table = std::sync::Arc::new(RoutingTable::new());
+    // Issue #548 — also stand up the L4 routing table + port pool.
+    // The integration test does not exercise the L4 path yet (no
+    // `protocol: "tcp"` heartbeats published), but the wiring must
+    // be present so `heartbeats::run` compiles against the v1
+    // signature.
+    let l4_table = std::sync::Arc::new(L4RoutingTable::new());
+    let l4_ports = std::sync::Arc::new(tokio::sync::Mutex::new(L4PortPool::new(
+        cfg.l4_port_range_start,
+        cfg.l4_port_range_end,
+        cfg.l4_port_cooldown_secs,
+    )));
     let caddy = std::sync::Arc::new(
         CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
     );
@@ -125,6 +142,8 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
     // NATS subscription ends — we want it to keep running while we publish.
     let run_cfg = cfg.clone();
     let run_table = table.clone();
+    let run_l4_table = l4_table.clone();
+    let run_l4_ports = l4_ports.clone();
     let run_caddy = caddy.clone();
     // Pass a fresh Notify — the integration test doesn't have a
     // second task to coordinate with, so this Notify is just to
@@ -138,6 +157,8 @@ async fn heartbeat_pipeline_drives_a_caddy_reload() {
             heartbeats::run(
                 run_cfg,
                 run_table,
+                run_l4_table,
+                run_l4_ports,
                 run_caddy,
                 pipe_n,
                 CancellationToken::new(),
@@ -233,6 +254,12 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
 
     let cfg = test_config(nats_url.clone(), mock_server.uri());
     let table = std::sync::Arc::new(RoutingTable::new());
+    let l4_table = std::sync::Arc::new(L4RoutingTable::new());
+    let l4_ports = std::sync::Arc::new(tokio::sync::Mutex::new(L4PortPool::new(
+        cfg.l4_port_range_start,
+        cfg.l4_port_range_end,
+        cfg.l4_port_cooldown_secs,
+    )));
     let caddy = std::sync::Arc::new(
         CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
     );
@@ -241,9 +268,22 @@ async fn metrics_are_recorded_through_heartbeat_pipeline() {
     let pipeline = tokio::spawn({
         let run_cfg = cfg.clone();
         let run_table = table.clone();
+        let run_l4_table = l4_table.clone();
+        let run_l4_ports = l4_ports.clone();
         let run_caddy = caddy.clone();
         let n = pipeline_notify.clone();
-        async move { heartbeats::run(run_cfg, run_table, run_caddy, n, CancellationToken::new()).await }
+        async move {
+            heartbeats::run(
+                run_cfg,
+                run_table,
+                run_l4_table,
+                run_l4_ports,
+                run_caddy,
+                n,
+                CancellationToken::new(),
+            )
+            .await
+        }
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -359,18 +399,28 @@ async fn heartbeat_without_worker_addr_is_ignored() {
 
     let cfg = test_config(nats_url.clone(), mock_server.uri());
     let table = std::sync::Arc::new(RoutingTable::new());
+    let l4_table = std::sync::Arc::new(L4RoutingTable::new());
+    let l4_ports = std::sync::Arc::new(tokio::sync::Mutex::new(L4PortPool::new(
+        cfg.l4_port_range_start,
+        cfg.l4_port_range_end,
+        cfg.l4_port_cooldown_secs,
+    )));
     let caddy = std::sync::Arc::new(
         CaddyClient::new(&cfg.caddy_admin_url, cfg.admin_token.clone()).expect("caddy client"),
     );
 
     let run_cfg = cfg.clone();
     let run_table = table.clone();
+    let run_l4_table = l4_table.clone();
+    let run_l4_ports = l4_ports.clone();
     let run_caddy = caddy.clone();
     let pipeline_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let pipeline = tokio::spawn(async move {
         heartbeats::run(
             run_cfg,
             run_table,
+            run_l4_table,
+            run_l4_ports,
             run_caddy,
             pipeline_notify,
             CancellationToken::new(),

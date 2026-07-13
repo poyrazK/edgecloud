@@ -1,0 +1,29 @@
+# edgeCloud project config consumed by `edge deploy` / `edge build`.
+#
+# `[project].protocol` selects the wire protocol the listener speaks:
+#   "http" (default) — HTTP/HTTPS routed by ingress as
+#                     `<tenant>-<app>.edgecloud.dev`; world must be
+#                     `edge-runtime-handler` (FaaS) or
+#                     `edge-runtime` (long-running HTTP).
+#   "tcp"            — Raw TCP routed by ingress via a dedicated
+#                     public port in the 31000-31999 range (or the
+#                     operator-configured `INGRESS_L4_*` range);
+#                     world MUST be `edge-runtime` (long-running) —
+#                     the FaaS world doesn't expose wasi:sockets to
+#                     the guest, so a TCP listener can't bind from
+#                     inside a per-request call. The CLI rejects
+#                     `world = "edge-runtime-handler" + protocol = "tcp"`
+#                     at build time (see
+#                     `edge-cli/src/commands/build.rs::validate_protocol_combo`).
+
+[project]
+name = "hello-tcp"
+version = "0.1.0"
+target = "wasm32-unknown-unknown"
+world = "edge-runtime"
+protocol = "tcp"
+
+[deployment]
+# Default API. Override with `EDGE_API_URL` env var or pass
+# `--api-url https://api.<region>.edgecloud.dev` to the CLI.
+api = "https://api.edgecloud.dev"

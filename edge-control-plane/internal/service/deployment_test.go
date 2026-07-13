@@ -1754,7 +1754,7 @@ func TestActivateDeployment_IncrementsMemoryCounter(t *testing.T) {
 
 	// 1. GetByID
 	regionsCol := `{"us-east"}`
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, regionsCol, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -1985,7 +1985,7 @@ func TestActivateDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
 	// ---- First call: full activate tx + cache INSERT ----
 
 	// 1. GetByID
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -2046,7 +2046,7 @@ func TestActivateDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
 	// activateDeployment. On a replay this still fires — the
 	// pre-tx GetByID is required to validate that the cached
 	// deployment_id still exists and belongs to (tenant, app).
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -2097,7 +2097,7 @@ func TestActivateDeployment_IdempotencyKeyMismatch_DifferentDeployment_ReturnsSe
 	now := time.Now()
 
 	// GetByID on the INCOMING deployment
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(incomingDepID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(incomingDepID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -2145,7 +2145,7 @@ func TestActivateDeployment_IdempotencyKeyMismatch_DifferentApp_ReturnsSentinel(
 	)
 	now := time.Now()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, incomingApp, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))
@@ -2192,7 +2192,7 @@ func TestActivateDeployment_IdempotencyKeyExpired_FreshPublish(t *testing.T) {
 	)
 	now := time.Now()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id =`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = `)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at", "auto_rollback_enabled", "signature", "signing_key_id", "build_attestation", "desired_replicas", "preview_id", "preview_pr_number", "preview_expires_at"}).
 			AddRow(deploymentID, tenantID, appName, domain.StatusDeployed, deploymentHash, `{"us-east"}`, now, false, "", "", []byte{}, 0, nil, nil, nil))

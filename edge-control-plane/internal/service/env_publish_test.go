@@ -335,4 +335,20 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 	if app.MaxMemoryMB != 256 {
 		t.Errorf("app.MaxMemoryMB = %d, want 256", app.MaxMemoryMB)
 	}
+	if app.SocketMode != "" {
+		t.Errorf("app.SocketMode = %q, want \"\" (default omitted on the wire)", app.SocketMode)
+	}
 }
+
+// TestBuildPublishPayload_SocketModePropagated was the issue #548
+// regression guard that asserted socket_mode:allow-all is stamped
+// on the AppConfig when an activate passes Protocol=tcp. The
+// CP-side protocol-driven socket_mode stamping was reverted in the
+// post-merge fixes because the activation-time Protocol source
+// required an apps-table schema column that did not exist (the
+// JOIN silently referenced a non-existent apps.value JSONB
+// column). L4 bind() gating now lives on the worker side: it
+// reads EDGE_PROTOCOL from spec.env and self-derives socket_mode
+// (see edge-worker/src/supervisor.rs::start_app). This test was
+// removed pending a follow-up that wires protocol from the CLI
+// deploy manifest through to BuildAppConfig. Tracked separately.

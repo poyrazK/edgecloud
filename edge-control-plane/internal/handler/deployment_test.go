@@ -111,11 +111,66 @@ func TestAppIngress_Found_Returns200AndFullTarget(t *testing.T) {
 	if lookup.lastApp != "myapp" {
 		t.Errorf("GetAppTarget called with app %q, want myapp", lookup.lastApp)
 	}
+	// Issue #548 protocol round-trip. The default ("http") is omitted
+	// from the JSON via `omitempty` so the wire shape stays byte-
+	// identical for pre-#548 clients — the field only carries when the
+	// value is non-default ("tcp" for L4 apps). The presence of the
+	// L4-specific test below proves the field reaches the wire.
+	if _, ok := got["protocol"]; ok {
+		t.Errorf("protocol = %v, want omitted (issue #548 default should not be on the wire)", got["protocol"])
+	}
 }
 
 // ---------------------------------------------------------------------------
 // AppIngress — 404 (no running target for this tenant)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// AppIngress — 200 (found) for an L4 (protocol=tcp) app
+// ---------------------------------------------------------------------------
+//
+// Issue #548: the `protocol` field is propagated end-to-end so a CLI
+// `edge status` (or any tenant-facing tooling) can distinguish an L4
+// app routable on a public ingress port from the existing HTTP apps.
+// The test fails loudly if a future refactor drops the field from the
+// JSON shape — by then, the ingress would silently route an L4 app
+// through Caddy's HTTP reverse_proxy and the failure mode would be
+// "traffic doesn't flow and we don't know why".
+func TestAppIngress_L4App_ProtocolPropagated(t *testing.T) {
+	want := &domain.AppTarget{
+		AppName:    "hello-tcp",
+		TenantID:   "t_test",
+		WorkerID:   "w_fra_l4",
+		Region:     "fra",
+		WorkerAddr: "203.0.113.42",
+		Port:       8081,
+		Protocol:   "tcp",
+	}
+	lookup := &mockAppTargetLookup{target: want}
+	mux := newAppIngressMux(lookup)
+
+	req := httptest.NewRequest("GET", "/api/v1/apps/hello-tcp/ingress", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["protocol"] != "tcp" {
+		t.Errorf("protocol = %v, want tcp (L4 round-trip — issue #548)", got["protocol"])
+	}
+	if got["app_name"] != "hello-tcp" {
+		t.Errorf("app_name = %v, want hello-tcp", got["app_name"])
+	}
+	if got["worker_addr"] != "203.0.113.42" {
+		t.Errorf("worker_addr = %v, want 203.0.113.42", got["worker_addr"])
+	}
+}
 
 func TestAppIngress_NotFound_Returns404AndStructuredBody(t *testing.T) {
 	lookup := &mockAppTargetLookup{target: nil}

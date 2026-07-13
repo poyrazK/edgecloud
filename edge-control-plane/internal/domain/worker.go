@@ -131,6 +131,16 @@ type AppStatus struct {
 	// Used by service.WorkerService.checkComputeMs to accumulate into
 	// quotas.used_compute_ms.
 	DurationMsTotal *uint64 `json:"duration_ms_total,omitempty"`
+	// Protocol is the wire protocol this app speaks (issue #548).
+	// Either "http" (the default — long-running HTTP/WS apps or FaaS
+	// apps served via the existing Caddy reverse_proxy) or "tcp"
+	// (raw-TCP long-running apps served via Caddy's layer4 plugin via
+	// a public port mapping). The default is omitted from the JSON
+	// (`omitempty`) so old workers, old ingresses, and the existing
+	// HTTP Caddy route configuration interop cleanly during the
+	// rolling-upgrade window — the field only becomes load-bearing on
+	// the ingress side once it is observed AND its value is non-default.
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // ResidentSecondsOrZero returns the resident-seconds counter treated as a
@@ -162,6 +172,14 @@ func (a *AppStatus) DurationMsTotalOrZero() uint64 {
 // AppTarget describes a running app reachable on a worker — what the
 // public ingress needs to render a route. Extracted from the JSONB apps
 // blob on `worker_status` joined with `workers.ip`.
+//
+// `Protocol` carries the wire protocol value the worker is currently
+// publishing on its heartbeats (issue #548). Either "http" (the default
+// — long-running HTTP/WS apps or FaaS apps served via the existing
+// Caddy reverse_proxy) or "tcp" (raw-TCP long-running apps served via
+// the layer4 plugin). When an L4 app's tenant is over quota the ingress
+// closes the public-port mapping on cap; pre-#548 rows present a bare
+// AppTarget the ingress routes through the existing HTTP tree.
 type AppTarget struct {
 	AppName    string `json:"app_name"`
 	TenantID   string `json:"tenant_id"`
@@ -169,6 +187,7 @@ type AppTarget struct {
 	Region     string `json:"region"`
 	WorkerAddr string `json:"worker_addr"`
 	Port       int    `json:"port"`
+	Protocol   string `json:"protocol,omitempty"`
 }
 
 // AppWorkerStatus is the tenant-facing projection of one app's current

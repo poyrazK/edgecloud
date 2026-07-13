@@ -142,7 +142,8 @@ func (r *WorkerRepository) ListRunningAppTarget(ctx context.Context, tenantID, a
 			workers.id                                  AS worker_id,
 			workers.region                              AS region,
 			COALESCE(workers.ip, '')                    AS worker_addr,
-			COALESCE((apps.value->>'port')::int, 0)     AS port
+			COALESCE((apps.value->>'port')::int, 0)     AS port,
+			COALESCE(apps.value->>'protocol', 'http')   AS protocol
 		FROM workers
 		JOIN worker_status ON worker_status.worker_id = workers.id
 		CROSS JOIN LATERAL jsonb_each(worker_status.apps) AS apps

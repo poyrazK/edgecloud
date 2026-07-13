@@ -151,6 +151,47 @@ pub struct Config {
     /// falls back to `global_rate_limit_rps` at the renderer.
     /// Set via `GLOBAL_RATE_LIMIT_BURST`.
     pub global_rate_limit_burst: u32,
+    // ── L4 (raw-TCP) ingress (issue #548) ───────────────────────────
+    /// First port in the L4 public-port range. Each raw-TCP app gets
+    /// a dedicated port in `[l4_port_range_start, l4_port_range_end]`
+    /// on the ingress host; bytes flowing into that port are proxied
+    /// raw to the worker's upstream port. Set via `L4_PORT_RANGE_START`
+    /// (default `31000`). Picked deliberately above IANA's registered
+    /// range (1024-49151) and well below the dynamic/private range
+    /// (49152-65535) so an operator firewall can carve it out without
+    /// colliding with the worker app-port range (configurable via
+    /// `EDGE_WORKER_PORT_RANGE_START`).
+    pub l4_port_range_start: u16,
+    /// Last port in the L4 public-port range (inclusive). Set via
+    /// `L4_PORT_RANGE_END` (default `31999`). At 1000 ports the
+    /// ingress can host ~1000 raw-TCP apps per region before it has
+    /// to expand the range — adequate for v1, an operator can widen
+    /// the range by setting both vars without code changes.
+    pub l4_port_range_end: u16,
+    /// Max concurrent connections on a single L4 (raw-TCP) server
+    /// (issue #548 DDoS cap). 0 = unlimited. Set via
+    /// `INGRESS_L4_MAX_CONNS_PER_APP` (default `1000`). Mapped
+    /// directly onto Caddy's layer4 `connection_pools` field. Reuses
+    /// the same DDoS cap philosophy as the HTTP `max_conns_per_ip`
+    /// knob above so a DDoS'd public port can't drag down the
+    /// ingress for unrelated apps.
+    pub l4_max_conns_per_app: u32,
+    /// Max concurrent connections per remote IP on a single L4 server
+    /// (issue #548 DDoS cap). 0 = unlimited. Set via
+    /// `INGRESS_L4_MAX_CONNS_PER_IP` (default `100`). TCP has no
+    /// request concept to key a per-IP RPS limiter on, so this is
+    /// the only per-IP backpressure the L4 path applies at Caddy
+    /// level. Per-app rate-limit overrides are NOT applied on the L4
+    /// path; the HTTP `RATE_LIMIT_*` knobs are HTTP-only.
+    pub l4_max_conns_per_ip: u32,
+    /// Cooldown after an L4 public port is released back to the
+    /// `L4PortPool` (matches `edge-worker/src/port_pool.rs`'s 60s
+    /// worker-side cooldown so the same TIME_WAIT guard rationale
+    /// applies: a port that just closed can still see stray
+    /// retransmits from the kernel, and reassigning it within the
+    /// cooldown opens a silent-takeover footgun). Default 60s.
+    /// Override with `L4_PORT_COOLDOWN_SECS`.
+    pub l4_port_cooldown_secs: u64,
 }
 
 impl Config {
@@ -196,6 +237,37 @@ impl Config {
         }
         let domain_poll_interval =
             parse_duration_env("DOMAIN_POLL_INTERVAL").unwrap_or(DEFAULT_DOMAIN_POLL_INTERVAL);
+
+        // Issue #548 review finding #30: validate L4 port range at
+        // config-load time. An inverted range (L4_PORT_RANGE_START >
+        // L4_PORT_RANGE_END) would otherwise produce a L4PortPool
+        // that silently hands out zero usable ports — `acquire()`
+        // returns `None` immediately and every L4 app gets logged
+        // as "pool exhausted" without an obvious cause. Failing fast
+        // here turns a confusing runtime condition into a clear
+        // startup error.
+        let l4_port_range_start = std::env::var("L4_PORT_RANGE_START")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(31000);
+        let l4_port_range_end = std::env::var("L4_PORT_RANGE_END")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(31999);
+        if l4_port_range_start == 0 || l4_port_range_end == 0 {
+            anyhow::bail!(
+                "L4_PORT_RANGE_START and L4_PORT_RANGE_END must both be non-zero (got start={}, end={})",
+                l4_port_range_start,
+                l4_port_range_end
+            );
+        }
+        if l4_port_range_start > l4_port_range_end {
+            anyhow::bail!(
+                "L4_PORT_RANGE_START ({}) must be <= L4_PORT_RANGE_END ({})",
+                l4_port_range_start,
+                l4_port_range_end
+            );
+        }
 
         Ok(Config {
             nats_url: std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into()),
@@ -308,6 +380,20 @@ impl Config {
                 .unwrap_or_else(|_| "0".into())
                 .parse()
                 .unwrap_or(0),
+            l4_port_range_start,
+            l4_port_range_end,
+            l4_max_conns_per_app: std::env::var("INGRESS_L4_MAX_CONNS_PER_APP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+            l4_max_conns_per_ip: std::env::var("INGRESS_L4_MAX_CONNS_PER_IP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            l4_port_cooldown_secs: std::env::var("L4_PORT_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
         })
     }
 
@@ -520,6 +606,11 @@ mod tests {
             "DOMAIN_POLL_INTERVAL",
             "CADDY_ADMIN_LISTEN",
             "INGRESS_METRICS_LISTEN",
+            "L4_PORT_RANGE_START",
+            "L4_PORT_RANGE_END",
+            "INGRESS_L4_MAX_CONNS_PER_APP",
+            "INGRESS_L4_MAX_CONNS_PER_IP",
+            "L4_PORT_COOLDOWN_SECS",
         ] {
             unset_var(v);
         }
@@ -666,6 +757,31 @@ mod tests {
         assert_eq!(cfg.per_ip_rps, 50);
         assert_eq!(cfg.per_ip_burst, 100);
 
+        // 18. L4 defaults (issue #548).
+        unset_all_config_vars();
+        set_required_vars();
+        let cfg = Config::from_env().expect("l4 defaults test");
+        assert_eq!(cfg.l4_port_range_start, 31000);
+        assert_eq!(cfg.l4_port_range_end, 31999);
+        assert_eq!(cfg.l4_max_conns_per_app, 1000);
+        assert_eq!(cfg.l4_max_conns_per_ip, 100);
+        assert_eq!(cfg.l4_port_cooldown_secs, 60);
+
+        // 19. L4 overrides
+        unset_all_config_vars();
+        set_required_vars();
+        set_var("L4_PORT_RANGE_START", "40000");
+        set_var("L4_PORT_RANGE_END", "40999");
+        set_var("INGRESS_L4_MAX_CONNS_PER_APP", "500");
+        set_var("INGRESS_L4_MAX_CONNS_PER_IP", "10");
+        set_var("L4_PORT_COOLDOWN_SECS", "120");
+        let cfg = Config::from_env().expect("l4 override test");
+        assert_eq!(cfg.l4_port_range_start, 40000);
+        assert_eq!(cfg.l4_port_range_end, 40999);
+        assert_eq!(cfg.l4_max_conns_per_app, 500);
+        assert_eq!(cfg.l4_max_conns_per_ip, 10);
+        assert_eq!(cfg.l4_port_cooldown_secs, 120);
+
         // Clean up
         unset_all_config_vars();
     }
@@ -714,6 +830,11 @@ mod tests {
             tenant_rate_limit_fetch_interval: Duration::from_secs(30),
             global_rate_limit_rps: 0,
             global_rate_limit_burst: 0,
+            l4_port_range_start: 31000,
+            l4_port_range_end: 31999,
+            l4_max_conns_per_app: 1000,
+            l4_max_conns_per_ip: 100,
+            l4_port_cooldown_secs: 60,
         }
     }
 

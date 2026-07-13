@@ -57,12 +57,23 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
     };
 
     println!(
-        "Building '{}' (target: {}, world: {}, language: {})...",
+        "Building '{}' (target: {}, world: {}, language: {}, protocol: {})...",
         project_name,
         edge_toml.project.target,
         edge_toml.project.world,
         effective.as_str(),
+        edge_toml.project.protocol_or_default(),
     );
+
+    // Issue #548 protocol/world cross-check. Lives in `run` rather
+    // than `build_rust` because the gate is language-agnostic — the
+    // constraint is on the user's edge.toml, not on which builder
+    // runs afterwards. Failure here is a friendly "fix your toml"
+    // error, not a `wasm-tools` mid-pipeline "world not found".
+    validate_protocol_combo(
+        &edge_toml.project.world,
+        edge_toml.project.protocol_or_default(),
+    )?;
 
     match effective {
         LangArg::Rust => build_rust(
@@ -72,6 +83,44 @@ pub fn run(path: &Path, lang: Option<LangArg>) -> Result<()> {
             &edge_toml.project.world,
         ),
         LangArg::Js => build_js(path, project_name),
+    }
+}
+
+/// Cross-check `[project].protocol` against `[project].world`
+/// (issue #548). The rules:
+///
+/// - `protocol = "tcp"` REQUIRES `world = "edge-runtime"`. FaaS
+///   (handler) components export `wasi:http/incoming-handler` and
+///   the worker dispatches them per-request via
+///   `wasmtime_wasi_http::ProxyPre` — there is no TCP listener to
+///   route to. Surfaced here at build time so the user finds the
+///   mistake in `edge build` output instead of after `edge deploy`
+///   yields a worker that hangs forever.
+/// - `protocol = "http"` (or absent) is allowed with either world.
+///   HTTP FaaS is the existing path; HTTP long-running apps stay
+///   supported.
+/// - Any other `protocol` value is rejected so a typo (e.g.
+///   `"tcp4"`) does not silently fall through to the existing HTTP
+///   pipeline.
+fn validate_protocol_combo(world: &str, protocol: &str) -> Result<()> {
+    match protocol {
+        "http" => Ok(()),
+        "tcp" => {
+            if world == "edge-runtime" {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "`[project] protocol = \"tcp\"` requires `world = \"edge-runtime\"` in edge.toml \
+                     (raw-TCP apps must be long-running — FaaS exports wasi:http/incoming-handler, \
+                     which has no TCP listener). Got `world = \"{world}\"`. Fix the toml and re-run \
+                     `edge build`."
+                )
+            }
+        }
+        other => anyhow::bail!(
+            "unsupported protocol {other:?} in `[project] protocol` in edge.toml. \
+             Supported values: `http`, `tcp`."
+        ),
     }
 }
 
@@ -665,6 +714,47 @@ mod tests {
     /// mutations (`EDGE_JS_WASI_ADAPTER`, `CARGO_HOME`, `HOME`) don't
     /// race across parallel test threads.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // ── validate_protocol_combo (issue #548) ─────────────────────────
+
+    #[test]
+    fn validate_protocol_http_with_either_world_is_ok() {
+        // http + edge-runtime (HTTP long-running): valid.
+        assert!(validate_protocol_combo("edge-runtime", "http").is_ok());
+        // http + edge-runtime-handler (FaaS): valid — the existing
+        // HTTP FaaS path is unchanged.
+        assert!(validate_protocol_combo("edge-runtime-handler", "http").is_ok());
+    }
+
+    #[test]
+    fn validate_protocol_tcp_requires_edge_runtime() {
+        // tcp + edge-runtime: valid — the L4 path is long-running.
+        assert!(validate_protocol_combo("edge-runtime", "tcp").is_ok());
+        // tcp + edge-runtime-handler: invalid — FaaS has no TCP
+        // listener. This is the constraint that locks the gate;
+        // a worker would otherwise never see any bytes.
+        let err = validate_protocol_combo("edge-runtime-handler", "tcp")
+            .expect_err("tcp + FaaS must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("requires `world = \"edge-runtime\"`")
+                && msg.contains("world = \"edge-runtime-handler\""),
+            "expected a pointful protocol/world mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_protocol_unknown_value_is_rejected() {
+        // Catches typos like `protocol = "tcp4"` so they don't
+        // silently fall through to the http pipeline.
+        let err = validate_protocol_combo("edge-runtime", "tcp4")
+            .expect_err("unknown protocol must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported protocol") && msg.contains("tcp4"),
+            "expected a pointful unsupported-protocol error, got: {msg}"
+        );
+    }
 
     #[test]
     fn path_for_returns_rust_component_wasm() {

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/jmoiron/sqlx"
@@ -167,4 +168,133 @@ func (r *AppRepository) GetRateLimit(ctx context.Context, tenantID, appName stri
 		return nil, nil
 	}
 	return &rl, err
+}
+
+// GetL4Port returns the persisted L4 public port for (tenantID, appName),
+// or (0, nil) if the app has no allocated port yet. Issue #548.
+//
+// Returns (0, sql.ErrNoRows) ONLY when the app itself does not exist
+// (the caller can distinguish app-missing from port-unset by also
+// calling Exists; in practice callers always call this AFTER Exists
+// because the route is gated on the app existing).
+func (r *AppRepository) GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	var port *int
+	query := `SELECT l4_public_port FROM apps WHERE tenant_id = $1 AND name = $2`
+	err := r.db.GetContext(ctx, &port, query, tenantID, appName)
+	if err == sql.ErrNoRows {
+		return 0, err
+	}
+	if err != nil {
+		return 0, err
+	}
+	if port == nil {
+		return 0, nil
+	}
+	if *port < 0 || *port > 65535 {
+		return 0, fmt.Errorf("invalid l4_public_port in db: %d", *port)
+	}
+	return uint16(*port), nil
+}
+
+// AllocateL4Port atomically sets `l4_public_port = $1` for (tenantID,
+// appName) IF AND ONLY IF the column is currently NULL. Returns the
+// persisted port on success. Returns (existingPort, nil) when another
+// caller raced and won — the caller's input port is dropped and the
+// stored one is returned so the caller converges to the same value the
+// racing caller wrote.
+//
+// Issue #548. Atomicity is the point: with two edge-ingress instances
+// polling the same /l4-port endpoint, both can race to write different
+// ports. The `l4_public_port IS NULL` guard in the UPDATE means only
+// one wins; the loser re-reads and returns the winner's port.
+//
+// Returns (0, sql.ErrNoRows) when the app itself does not exist.
+func (r *AppRepository) AllocateL4Port(ctx context.Context, tenantID, appName string, port uint16) (uint16, error) {
+	if port == 0 {
+		return 0, fmt.Errorf("invalid l4_public_port: 0 is reserved")
+	}
+	const query = `
+		UPDATE apps
+		   SET l4_public_port = $1
+		 WHERE tenant_id = $2 AND name = $3
+		   AND l4_public_port IS NULL
+		RETURNING l4_public_port`
+	var written *int
+	err := r.db.GetContext(ctx, &written, query, port, tenantID, appName)
+	if err == sql.ErrNoRows {
+		// Either the app does not exist OR another caller won the race.
+		// Re-read the row to distinguish. sqlx returns ErrNoRows on
+		// zero-row RETURNING for both cases.
+		existing, getErr := r.GetL4Port(ctx, tenantID, appName)
+		if getErr == sql.ErrNoRows {
+			return 0, sql.ErrNoRows
+		}
+		if getErr != nil {
+			return 0, getErr
+		}
+		if existing == 0 {
+			// Column is still NULL — that means the app doesn't exist
+			// (the only way a non-existent row yields zero-row RETURNING
+			// from the UPDATE above AND a NULL column on the SELECT
+			// below). Surface as ErrNoRows for the caller's branch.
+			return 0, sql.ErrNoRows
+		}
+		// Lost the race; another caller wrote a port first.
+		return existing, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if written == nil {
+		return 0, fmt.Errorf("unexpected nil RETURNING from AllocateL4Port")
+	}
+	return uint16(*written), nil
+}
+
+// ReleaseL4Port clears the persisted L4 public port for (tenantID,
+// appName). Called by AppService.Delete after the apps row is removed
+// (the column goes away with the row), so this is primarily a no-op
+// safety net for the case where a future migration keeps orphan
+// ports. Returns nil even when the row does not exist (idempotent).
+//
+// Issue #548.
+func (r *AppRepository) ReleaseL4Port(ctx context.Context, tenantID, appName string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE apps SET l4_public_port = NULL WHERE tenant_id = $1 AND name = $2`,
+		tenantID, appName)
+	return err
+}
+
+// AllocatedL4Ports returns the set of L4 public ports currently
+// allocated across all tenants. Used by AppService.AllocateL4Port to
+// skip ports already taken when picking a fresh one for an app.
+// Returns a map keyed by port (uint16) for O(1) lookup; empty when no
+// L4 apps exist yet.
+//
+// Issue #548.
+func (r *AppRepository) AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}, error) {
+	rows, err := r.db.QueryxContext(ctx,
+		`SELECT l4_public_port FROM apps WHERE l4_public_port IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[uint16]struct{})
+	for rows.Next() {
+		var port *int
+		if err := rows.Scan(&port); err != nil {
+			return nil, err
+		}
+		if port == nil {
+			continue
+		}
+		if *port < 0 || *port > 65535 {
+			continue
+		}
+		out[uint16(*port)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

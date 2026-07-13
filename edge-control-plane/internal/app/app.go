@@ -198,6 +198,7 @@ func New(
 	appSvc := service.NewAppService(
 		db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo,
 		outboxRepo, cfg.Region,
+		uint16(cfg.L4.PortRangeStart), uint16(cfg.L4.PortRangeEnd),
 	)
 	deploymentSvc := service.NewDeploymentService(
 		db, deploymentRepo, activeDeploymentRepo, appEnvRepo,
@@ -627,6 +628,8 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	mux.HandleFunc("DELETE /api/apps/{appName}", redirectTo("/api/v1/apps/"+"{appName}"))
 	mux.HandleFunc("GET /api/apps/{appName}/active", redirectTo("/api/v1/apps/"+"{appName}/active"))
 	mux.HandleFunc("GET /api/apps/{appName}/ingress", redirectTo("/api/v1/apps/"+"{appName}/ingress"))
+	mux.HandleFunc("GET /api/apps/{appName}/l4-port", redirectTo("/api/v1/apps/"+"{appName}/l4-port"))
+	mux.HandleFunc("POST /api/apps/{appName}/l4-port", redirectTo("/api/v1/apps/"+"{appName}/l4-port"))
 	mux.HandleFunc("GET /api/apps/{appName}/env", redirectTo("/api/v1/apps/"+"{appName}/env"))
 	mux.HandleFunc("POST /api/apps/{appName}/env", redirectTo("/api/v1/apps/"+"{appName}/env"))
 	mux.HandleFunc("DELETE /api/apps/{appName}/env/{key}", redirectTo("/api/v1/apps/"+"{appName}/env/"+"{key}"))
@@ -677,6 +680,14 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("PUT /api/v1/apps/{appName}", appHandler.Update)
 	api.HandleFunc("POST /api/v1/keys", apiKeyHandler.Create)
 	api.HandleFunc("GET /api/v1/apps/{appName}/ingress", deploymentHandler.AppIngress)
+	// L4/TCP public-port surface (issue #548). Both endpoints are
+	// tenant-authenticated — the ingress uses GET to refresh its
+	// L4PortCache (every 30s) and POST to force allocation on
+	// demand when the implicit-on-first-heartbeat path doesn't fire
+	// (e.g. the app has been seen by an ingress before any
+	// heartbeat ran the L4 branch).
+	api.HandleFunc("GET /api/v1/apps/{appName}/l4-port", appHandler.GetL4Port)
+	api.HandleFunc("POST /api/v1/apps/{appName}/l4-port", appHandler.AllocateL4Port)
 	api.HandleFunc("GET /api/v1/apps/{appName}/traffic", trafficHandler.GetTraffic)
 	api.HandleFunc("PUT /api/v1/apps/{appName}/traffic", trafficHandler.SetTraffic)
 	api.HandleFunc("GET /api/v1/keys", apiKeyHandler.List)
@@ -765,6 +776,15 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	// the /quota/{tenantID} endpoint above.
 	mux.HandleFunc("GET /api/v1/internal/rate-limit/{tenantID}", func(w http.ResponseWriter, r *http.Request) {
 		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(quotaHandler.GetTenantRateLimitInternal)).ServeHTTP(w, r)
+	})
+
+	// Per-(tenant,app) L4/TCP public-port assignment (issue #548).
+	// The ingress `L4PortCache` polls this every QUOTA_FETCH_INTERVAL
+	// so two ingress instances in the same region can converge on
+	// the same persisted port for each app. Mounted under
+	// InternalAuth like the other /api/v1/internal/* endpoints.
+	mux.HandleFunc("GET /api/v1/internal/l4-port/{tenantID}/{appName}", func(w http.ResponseWriter, r *http.Request) {
+		middleware.InternalAuth(cfg.InternalToken)(http.HandlerFunc(appHandler.GetL4PortInternal)).ServeHTTP(w, r)
 	})
 
 	// Secrets admin endpoints (X-Internal-Token auth).

@@ -77,6 +77,14 @@ func NewPublishBuilder() *publishBuilder {
 // publisher in nats/publisher.go fans it out to every region in
 // the outbound stream. Including it here would be redundant
 // with the publisher's stream-config region set.
+//
+// Issue #548: `deployment.Protocol` is read by `nats.BuildAppConfig`
+// to derive the per-app `socket_mode` override (`"allow-all"` for
+// tcp, empty for http). Previously this was a separate `socketMode`
+// parameter that every caller forgot to pass — adding the
+// `protocol` parameter to `BuildAppConfig` itself forces every
+// call site to think about the protocol, eliminating the
+// forgotten-override bug.
 func (b *publishBuilder) buildPublishPayload(
 	_ context.Context,
 	tenantID, appName, deploymentID string,
@@ -98,22 +106,24 @@ func (b *publishBuilder) buildPublishPayload(
 
 	maxMemoryMB := int(perAppMemoryMB(quota))
 
+	cfg := nats.BuildAppConfig(
+		deploymentID,
+		deployment.Hash,
+		deployment.Signature,
+		deployment.SigningKeyID, // issue #307 PR1: per-key kid
+		previewIDFromDeployment(deployment),
+		previewPRNumberFromDeployment(deployment),
+		envMap,
+		tenant.AllowlistedDestinations,
+		maxMemoryMB,
+	)
+
 	msg := &nats.TaskMessage{
 		Type:      "task_update",
 		Timestamp: time.Now().UTC(),
 		TenantID:  tenantID,
 		Apps: map[string]nats.AppConfig{
-			appName: nats.BuildAppConfig(
-				deploymentID,
-				deployment.Hash,
-				deployment.Signature,
-				deployment.SigningKeyID, // issue #307 PR1: per-key kid
-				previewIDFromDeployment(deployment),
-				previewPRNumberFromDeployment(deployment),
-				envMap,
-				tenant.AllowlistedDestinations,
-				maxMemoryMB,
-			),
+			appName: cfg,
 		},
 	}
 

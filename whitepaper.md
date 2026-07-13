@@ -69,6 +69,19 @@ The platform is NOT for running frontend assets at CDN edge locations. It is for
      └───────────┘ └───────────┘ └───────────┘
 ```
 
+End-users reach deployed apps through a region-local `edge-ingress`
+process that fronts a Caddy instance — `caddy:2` for HTTP(S) and an
+xcaddy-built image (`edgecloud/caddy-l4:latest`, with the
+`mholt/caddy-l4` plugin) for **raw-TCP apps**. HTTP apps are routed
+by hostname (`<tenant>-<app>.edgecloud.dev`); raw-TCP apps (Redis,
+MQTT, custom protocols — issue #548) are routed by public port in
+the `L4_PORT_RANGE_*` window (`31000..=31999` by default). The
+ingress is the only component that knows the public→private
+mapping; the worker stamps the private upstream port onto
+`EDGE_HTTP_SERVER_PORT`, and the ingress learns the address from
+NATS heartbeats. The full L4 design is in
+[`docs/l4-ingress.md`](docs/l4-ingress.md).
+
 ### 2.2 Component Responsibilities
 
 | Component | Language | Role |
@@ -78,6 +91,7 @@ The platform is NOT for running frontend assets at CDN edge locations. It is for
 | **Worker Supervisor** | Rust | Process lifecycle, resource limits, health monitoring |
 | **edge Runtime** | Rust | Wasmtime-based runtime exposing WASI Preview 2 interfaces |
 | **NATS JetStream** | — | Task distribution to workers across regions |
+| **edge-ingress** (per region) | Rust | NATS heartbeat-driven Caddy controller. Maps `<tenant>-<app>.edgecloud.dev` to `http://<worker>:<port>`. The L4 path (`apps.layer4`) routes raw-TCP apps (Redis, MQTT, custom protocols) by public port (issue #548). |
 | **PostgreSQL** | — | Persistent state: tenants, deployments, API keys, quotas |
 
 ---
