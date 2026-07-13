@@ -1572,9 +1572,9 @@ exit 0
 	if len(report.Errors) == 0 {
 		t.Fatal("expected at least one error entry on analyzer-driven short-circuit")
 	}
-	if got := report.Errors[0].Code; got != "SECURITY_DENY:RUST_MACRO" {
-		t.Errorf("expected errors[0].code=SECURITY_DENY:RUST_MACRO, got: %q (message=%q)",
-			got, report.Errors[0].Message)
+	if got := report.Errors[0].Code; got != denyCodePrefix+"RUST_MACRO" {
+		t.Errorf("expected errors[0].code=%sRUST_MACRO, got: %q (message=%q)",
+			denyCodePrefix, got, report.Errors[0].Message)
 	}
 	if !strings.Contains(report.Errors[0].Message, "include_bytes") {
 		t.Errorf("expected errors[0].message to reference include_bytes; got: %q",

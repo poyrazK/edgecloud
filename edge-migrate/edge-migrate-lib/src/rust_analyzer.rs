@@ -176,32 +176,23 @@ impl RustAnalyzer {
                 })
             }
             "attribute_item" | "inner_attribute_item" => {
+                // Same `attr_name = identifier` convention as the macro
+                // branch above. Dashboards branch on the structured
+                // `code` (always `SECURITY_DENY:RUST_MACRO`) and ignore
+                // the human-readable message.
                 let attr_name = self.attribute_name(source, node)?;
-                let reason = match attr_name.as_str() {
-                    "path" => "path_attr",
-                    "include" => "include_attr",
-                    _ => return None,
-                };
+                if !matches!(attr_name.as_str(), "path" | "include") {
+                    return None;
+                }
                 let line = node.start_position().row + 1;
                 let snippet = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                 Some(ErrorInfo {
                     line,
                     message: format!(
-                        "attribute `#[{} = \"...\"]` is not permitted in migrated Rust source — it redirects module resolution to host files at rustc compile time (issue #622)",
-                        attr_name
+                        "compile-time host-reach attribute `#[{} = ...]` is not permitted in migrated Rust source — `{}` would exfiltrate host files at rustc compile time (issue #622)",
+                        attr_name, snippet
                     ),
                     code: Some(DENY_CODE_RUST_MACRO.to_string()),
-                })
-                .map(|mut e| {
-                    // Encode the reason into the message so callers
-                    // that branch on the human-readable string still
-                    // see the difference. The structured `code` is
-                    // what dashboards grep on.
-                    e.message = format!(
-                        "compile-time host-reach attribute `#[{} = ...]` is not permitted in migrated Rust source — `{}` would exfiltrate host files at rustc compile time (issue #622, reason={})",
-                        attr_name, snippet, reason
-                    );
-                    e
                 })
             }
             _ => None,
@@ -793,6 +784,55 @@ fn main() {}
         assert!(
             report.errors.is_empty(),
             "comment with macro name must not match, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_scoped_env_identifier() {
+        // A scoped macro invocation whose identifier contains the
+        // banned name as a SUFFIX (e.g. `std::env!(...)`) must NOT
+        // match. `std::env!` is a runtime function (not a
+        // compile-time macro) — even if it were a macro, scoping
+        // keeps the deny-list's exact-match semantics intact.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+fn main() {
+    let _ = std::env!("PATH");
+}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "scoped identifier `std::env!` must not match the deny-list, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_macro_invocation_inside_macro_rules_body() {
+        // A `macro_rules!` body is tokenized by tree-sitter-rust
+        // 0.24 (not parsed into structured macro_invocation nodes),
+        // so a hostile `include_bytes!("...")` buried inside a
+        // macro_rules body must NOT be flagged — it never expands
+        // unless the outer macro is invoked, which a separate
+        // follow-up compile-time guard can cover. This test pins
+        // the current "tokenize-don't-parse" behavior so a future
+        // tree-sitter bump that starts parsing macro_rules bodies
+        // is caught explicitly.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+macro_rules! bury_it {
+    () => { include_bytes!("/etc/passwd") };
+}
+fn main() {
+    let _ = bury_it!();
+}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "include_bytes! inside macro_rules! body must not match (tokenized, not parsed), got {:?}",
             report.errors
         );
     }

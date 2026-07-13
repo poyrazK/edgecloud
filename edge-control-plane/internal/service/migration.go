@@ -47,6 +47,15 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // operators can grep for wrap-vs-compile failures separately.
 var ErrWasmToolsFailed = fmt.Errorf("wasm-tools component wrap failed")
 
+// denyCodePrefix is the shared prefix emitted on every `errors[].code`
+// produced by the migration analyzer's compile-time host-reach deny
+// list (issue #622). The Rust side defines the same string as
+// `DENY_CODE_RUST_MACRO` in `edge-migrate/edge-migrate-lib/src/rust_analyzer.rs`
+// and the C side (commit 2 follow-up) will define a parallel
+// `DENY_CODE_C_INCLUDE`. Mirror any new value here so the production
+// short-circuit guard and the Go tests reference one canonical string.
+const denyCodePrefix = "SECURITY_DENY:"
+
 // ErrCargoBuildFailed is returned when the cargo build subprocess
 // fails or the synthesized Cargo project is malformed (issue #415).
 // Bare rustc cannot resolve the wit_bindgen::generate! proc-macro
@@ -548,7 +557,7 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 	// compile"; we add this guard in front of the compile step.
 	denied := false
 	for _, e := range envelope.Report.Errors {
-		if strings.HasPrefix(e.Code, "SECURITY_DENY:") {
+		if strings.HasPrefix(e.Code, denyCodePrefix) {
 			denied = true
 			break
 		}
