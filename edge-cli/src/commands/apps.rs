@@ -104,6 +104,13 @@ pub fn get(_path: &Path, _name: &str) -> Result<()> {
 /// — same justification as `edge webhooks remove`. Issue #573.
 #[cfg(feature = "network")]
 pub fn delete(path: &Path, name: &str, yes: bool) -> Result<()> {
+    // Flat --yes bail (NOT a TTY confirm prompt like `keys_revoke`):
+    // the cascade reaches beyond the CP — the task_purge outbox
+    // row tears down worker in-memory + on-disk dirs on every
+    // region, with no rollback path. A confirm prompt on a TTY
+    // would still let a fat-fingered `y` through; the explicit
+    // flag forces the user to type it on the command line where
+    // it shows up in shell history and CI logs.
     if !yes {
         anyhow::bail!(
             "apps delete is irreversible — re-run with --yes (or -y) to confirm.\n\
