@@ -199,8 +199,9 @@ preflight::detect_wasi_sdk() {
 # have been minted so we capture the (possibly reused) values.
 preflight::write_env_file() {
   local env_file="${EDGECLOUD_HOME}/env.sh"
-  local signing_seed="$1"   # 64-char hex
-  local wasi_sdk="$2"       # path or empty
+  local repo_root="$1"      # absolute path to repo root (for .env lookup)
+  local signing_seed="$2"   # 64-char hex
+  local wasi_sdk="$3"       # path or empty
 
   local jwt_secret bootstrap_secret internal_token
   jwt_secret="$(preflight::mint_or_reuse_secret jwt.secret)"
@@ -212,6 +213,30 @@ preflight::write_env_file() {
 # Re-running dev-up.sh will regenerate this file; secrets in
 # ~/.edgecloud/keys/ are reused (only this file's exported paths and
 # flags are rewritten).
+
+# ── Database (issue #626) ──────────────────────────────────────────────
+# Pulled from the repo-root .env (copied from .env.example once on first
+# run). dev-up.sh sources .env separately; the exports here mirror those
+# values so any helper that ONLY sources env.sh still gets a valid
+# DATABASE_PASSWORD (the CP's validateDBPassword rejects empty / known-
+# placeholder values at startup).
+EOF
+  if [[ -f "$repo_root/.env" ]]; then
+    # Extract the relevant keys without sourcing (avoids set -a bleed).
+    while IFS='=' read -r key value; do
+      case "$key" in
+        POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|\
+        DATABASE_USER|DATABASE_PASSWORD|DATABASE_NAME|DATABASE_HOST|DATABASE_PORT|DATABASE_SSLMODE)
+          # Strip optional surrounding quotes from the value.
+          value="${value%\"}"; value="${value#\"}"
+          value="${value%\'}"; value="${value#\'}"
+          echo "export ${key}='${value}'" >>"$env_file"
+          ;;
+      esac
+    done <"$repo_root/.env"
+  else
+    echo "# .env not found at repo root — run 'cp .env.example .env' once" >>"$env_file"
+  fi
 
 # ── Auth ──────────────────────────────────────────────────────────────
 export JWT_SECRET='${jwt_secret}'
@@ -347,7 +372,7 @@ preflight::all() {
     edge_migrate_path=""
   fi
 
-  preflight::write_env_file "$signing_seed" "$EDGECLOUD_WASI_SDK_PATH"
+  preflight::write_env_file "$repo_root" "$signing_seed" "$EDGECLOUD_WASI_SDK_PATH"
   preflight::write_cp_local_config "$repo_root" "$EDGECLOUD_WASI_SDK_PATH" "$edge_migrate_path"
 
   EDGECLOUD_ENV_FILE="${EDGECLOUD_HOME}/env.sh"
