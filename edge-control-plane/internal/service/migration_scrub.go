@@ -131,8 +131,8 @@ var scrubbedEnvDenyPatterns = []string{
 // The fail-closed default is intentional: the alternative —
 // "keep everything not explicitly denied" — would leak every new
 // env var introduced after this code shipped. The deny-pattern
-// substring match is a coarse safety net for typos like
-// `EDGE_SIGNIGN_KEY`; the explicit list is the authoritative
+// substring match is a coarse safety net for typos in the
+// config-side var name; the explicit list is the authoritative
 // denylist.
 func scrubbedEnv() []string {
 	in := os.Environ()
