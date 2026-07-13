@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Issue #332 (Layer 3: Push-to-Edge Artifact Distribution) — track
 -- per-region cache-push failures so a client retry can re-attempt the
 -- failed cache push without re-doing the NATS publish.
