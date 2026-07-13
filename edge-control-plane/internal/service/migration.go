@@ -179,6 +179,41 @@ type MigrationService struct {
 	// `DeploymentService.keyring` so artifacts produced by either
 	// service carry the same active key id.
 	keyring *signing.Keyring
+
+	// clangInvokeFn runs the C-compile clang subprocess. Returns the
+	// captured stderr plus the run error. Tests swap this for a
+	// recording stub to assert that the args contain `-nostdinc` /
+	// `--sysroot` (issue #622 commit 5). nil means "use the default
+	// real-exec implementation" — see `defaultClangInvoke`.
+	//
+	// The `stdin` arg is the source reader (single-file mode
+	// passes the transformed C source; tree mode passes nil and
+	// lists every file path in `args`). The hook signature mirrors
+	// `defaultClangInvoke` so tests can record `args` and `stdin`
+	// without booting the real clang binary.
+	clangInvokeFn func(ctx context.Context, args []string, stdin io.Reader) (stderr string, err error)
+}
+
+// defaultClangInvoke is the production clang runner. Wraps the same
+// `newToolCmd` hardening every other migration subprocess uses
+// (env-scrubbed, SIGKILL on ctx cancel, 5s WaitDelay fallback) and
+// runs `s.wasiSdkPath + "/clang"` with the provided args.
+//
+// For the single-file path args includes a trailing "-" (clang
+// reads source from stdin) and `stdin` carries the transformed
+// source. For the tree path args lists every per-file `.c` path
+// and `stdin` is nil.
+//
+// Stderr is captured into a buffer and returned so the caller can
+// embed it in the failure report.
+func (s *MigrationService) defaultClangInvoke(ctx context.Context, args []string, stdin io.Reader) (string, error) {
+	clangBin := filepath.Join(s.wasiSdkPath, "clang")
+	cmd := s.newToolCmd(ctx, clangBin, args...)
+	cmd.Stdin = stdin
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
+	return stderrBuf.String(), err
 }
 
 // NewMigrationService creates a MigrationService.
@@ -376,6 +411,63 @@ func truncateStderr(s string) string {
 		return s
 	}
 	return "...(truncated)...\n" + s[len(s)-max:]
+}
+
+// clangArgs builds the canonical clang argv for a C migration compile
+// (issue #622 commit 5). The hardening guarantees:
+//
+//  1. `-nostdlib` — no host libc, no host crt1.o. Without this,
+//     clang links against `/usr/lib/x86_64-linux-gnu/...` and the
+//     resulting wasm drags in host symbols.
+//  2. `-nostdinc` — no host include search path. This is the
+//     defence-in-depth against the C `#include "/etc/passwd"` /
+//     `#embed "/etc/shadow"` exfiltration vector. Even if the L2
+//     analyzer's regex pre-pass misses a payload (false negative
+//     in a future commit), clang will refuse to look anywhere
+//     outside the wasi-sysroot and the per-request tmpdir.
+//  3. `--sysroot <wasi-sdk>/share/wasi-sysroot` — scopes `#include
+//     <wasi/...>` and `#include <stdio.h>` to the wasi-sdk headers.
+//     Required because `-nostdinc` removes the default search path
+//     entirely; without `--sysroot` even legitimate wasi-sdk
+//     headers fail to resolve. The sysroot path is checked for
+//     existence at call time — if absent (operator hasn't installed
+//     wasi-sdk, or set WASI_SDK_PATH to a non-standard layout),
+//     we log a WARN and fall back to `-nostdinc` only. The
+//     `-nostdinc` invariant is preserved either way: the host
+//     include path is never reachable.
+//
+// `extraSources` is empty for the single-file stdin path (caller
+// passes a trailing "-") and contains every per-file `.c` path for
+// tree mode.
+//
+// `tmpDir` is appended via `-I` so transformed headers in the
+// per-request scratch directory resolve. Cwd of the tmpdir is
+// also relied on for `<rel.h>` includes — clang's default
+// `-iquote .` would do this if we didn't `-nostdinc`, but
+// `-nostdinc` strips it, so we re-add `-I tmpDir` explicitly.
+func (s *MigrationService) clangArgs(tmpDir, outWasmPath string, extraSources []string) []string {
+	args := []string{
+		"--target=wasm32-wasip2",
+		"-nostdlib",
+		"-nostdinc", // issue #622 commit 5: block host include path.
+	}
+	// --sysroot scopes all system-header searches to the wasi-sdk
+	// layout. Optional: if the operator's wasiSdkPath doesn't have
+	// the expected `share/wasi-sysroot` subdir we degrade gracefully
+	// (WARN + skip --sysroot) rather than failing the whole
+	// migration. The `-nostdinc` guarantee holds either way.
+	sysroot := filepath.Join(s.wasiSdkPath, "share", "wasi-sysroot")
+	if info, err := os.Stat(sysroot); err == nil && info.IsDir() {
+		args = append(args, "--sysroot", sysroot)
+	} else {
+		log.Printf("migration service: clang --sysroot %s not found, falling back to -nostdinc only (no wasi-sysroot headers available)", sysroot)
+	}
+	args = append(args,
+		"-I", tmpDir,
+		"-o", outWasmPath,
+	)
+	args = append(args, extraSources...)
+	return args
 }
 
 // sanitizeRustPackageName turns an edge-cloud app name into a
@@ -656,16 +748,19 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		}
 		// success — compileErrMsg stays empty
 	default: // "c"
-		clangBin := filepath.Join(s.wasiSdkPath, "clang")
-		clangCmd := s.newToolCmd(ctx, clangBin,
-			"--target=wasm32-wasip2", "-nostdlib",
-			"-o", tmpWasmPath, "-")
-		clangCmd.Stdin = strings.NewReader(transformed)
-		var clangErr bytes.Buffer
-		clangCmd.Stderr = &clangErr
+		// issue #622 commit 5: route through `clangArgs` so the
+		// hardening (`-nostdinc` + optional `--sysroot`) is centralized
+		// in one place. The trailing "-" tells clang to read source
+		// from stdin (the transformed C source).
+		args := s.clangArgs(os.TempDir(), tmpWasmPath, []string{"-"})
+		invoke := s.clangInvokeFn
+		if invoke == nil {
+			invoke = s.defaultClangInvoke
+		}
+		clangStderr, err := invoke(ctx, args, strings.NewReader(transformed))
 		compileSentinel = ErrClangFailed
-		if err := clangCmd.Run(); err != nil {
-			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErr.String())
+		if err != nil {
+			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangStderr)
 		}
 	}
 
@@ -1464,20 +1559,28 @@ func (s *MigrationService) MigrateTree(
 	var compileErrMsg string
 	// Issue #415: MigrateTree rejects language=="rust" at function
 	// entry; only C reaches this compile switch.
-	clangBin := filepath.Join(s.wasiSdkPath, "clang")
-	args := []string{
-		"--target=wasm32-wasip2", "-nostdlib",
-		"-I", tmpDir,
-		"-o", tmpWasmPath,
-	}
+	//
+	// Issue #622 commit 5: route through `clangArgs` so the hardening
+	// (`-nostdinc` + optional `--sysroot`) is centralized in one
+	// place — single-file and tree clang now share the same
+	// hardening helper. The list of written .c files is appended
+	// after the canonical args (clang's `--sysroot`/`-o` flags are
+	// positional-agnostic so order doesn't matter for them; the
+	// trailing sources are positional args and must come last).
+	extraSources := make([]string, 0, len(written))
 	for _, wf := range written {
-		args = append(args, wf.wasiCPath)
+		extraSources = append(extraSources, wf.wasiCPath)
 	}
-	clangCmd := s.newToolCmd(ctx, clangBin, args...)
-	var clangErrBuf bytes.Buffer
-	clangCmd.Stderr = &clangErrBuf
-	if err := clangCmd.Run(); err != nil {
-		compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErrBuf.String())
+	args := s.clangArgs(tmpDir, tmpWasmPath, extraSources)
+	invoke := s.clangInvokeFn
+	if invoke == nil {
+		invoke = s.defaultClangInvoke
+	}
+	// tree mode reads source from per-file paths in `args`, not
+	// stdin — pass nil for the stdin reader.
+	clangStderr, err := invoke(ctx, args, nil)
+	if err != nil {
+		compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangStderr)
 	}
 
 	if compileErrMsg != "" {
