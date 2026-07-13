@@ -313,6 +313,14 @@ func New(
 	deploymentSvc.SetWebhookService(webhookSvc)
 	deploymentSvc.SetIdempotencyRepo(idempotencyRepo)
 	deploymentSvc.SetActivateIdempotencyRepo(activateIdempotencyRepo)
+	// Issue #641: wire the worker repo into the DeploymentService so
+	// the Pre-check 6 region_at_capacity gate can ask "is the target
+	// region's port pool saturated?" before opening the deploy tx.
+	// The seam is optional — SetWorkerRepo(nil) skips the gate —
+	// but in production we always want the gate wired so a
+	// fleet-wide saturation signal surfaces as a 402 rather than a
+	// stuck-pending deployment that the reconcile loop can't recover.
+	deploymentSvc.SetWorkerRepo(workerRepo)
 	webhookHandler := handler.NewWebhookHandler(webhookSvc)
 
 	// Billing service (issue #419). The provider is selected by

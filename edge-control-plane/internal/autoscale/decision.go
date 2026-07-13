@@ -10,16 +10,15 @@ import (
 
 // legacyAssumedAppSlots is the fallback used when a worker's
 // heartbeat pre-dates #85 (no ClusterHeadroom). Without the field we
-// can't measure capacity, so we assume a conservative 50 slots —
-// matching the historical default `PortPool` pre-population count
-// before the 100-slot bump landed in PR #1.
+// can't measure capacity, so we assume 100 slots — matching the
+// canonical `PortPool` pre-population count post-#641 (PR #657).
 //
-// Picking 50 (vs. 0 or 100) biases the autoscaler toward *not*
-// scale-up on legacy workers: under-counting capacity means we'd
-// scale up sooner, over-counting means we'd never scale up. 50 is
-// the midpoint that matches the pre-#85 default and is documented in
-// the migration notes.
-const legacyAssumedAppSlots = 50
+// Picking 100 (vs. 0 or 200) matches the worker's actual pool size,
+// so the autoscaler's totalFreeSlots is accurate for legacy workers
+// without under- or over-counting capacity. The previous value of 50
+// was a pre-#85 midpoint; issue #641's port-pool end-to-end resilience
+// work confirms the 100-port default is the correct assumption.
+const legacyAssumedAppSlots = 100
 
 // WorkerHeadroom is the autoscaler's per-worker view. It is
 // reconstructed from every heartbeat the service receives. LastSeen

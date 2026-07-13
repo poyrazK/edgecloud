@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -213,6 +214,29 @@ func (m *mockDeployBillingRepo) GetSubscriptionStatus(ctx context.Context, tenan
 		return m.getSubscriptionStatusFn(ctx, tenantID)
 	}
 	return domain.SubscriptionActive, nil
+}
+
+// mockDeployWorkerRepo satisfies workerRepoForDeploymentSvc for the
+// Pre-check 6 region_at_capacity gate (issue #641). The seeded
+// `freeByRegion` map short-circuits the SQL aggregate so the test
+// can drive "region saturated" / "region has headroom" scenarios
+// without spinning up sqlmock. `err` (when set) makes every call
+// fail with that error — useful for the "transient SUM failure
+// shouldn't block deploys" assertion.
+type mockDeployWorkerRepo struct {
+	freeByRegion map[string]uint64
+	err          error
+}
+
+func (m *mockDeployWorkerRepo) SumFreeSlotsByRegion(_ context.Context, regions []string) (map[string]uint64, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	out := make(map[string]uint64, len(regions))
+	for _, r := range regions {
+		out[r] = m.freeByRegion[r]
+	}
+	return out, nil
 }
 
 // errIsPaymentRequired confirms the error from Deploy is a
@@ -2414,5 +2438,179 @@ func TestRollbackDeployment_IdempotencyKeyMismatch_DifferentApp_ReturnsSentinel(
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("sqlmock expectations not met: %v", err)
+	}
+}
+
+// TestDeploy_RegionAtCapacity_Returns402 covers Pre-check 6 (issue #641):
+// every target region reports zero free port-pool slots → 402
+// PAYMENT_REQUIRED, reason="region_at_capacity". The mockDeployWorkerRepo
+// short-circuits the SQL aggregate so the test focuses on the gate
+// logic rather than the repo wiring. The 402 must short-circuit BEFORE
+// any artifact-save or DB writes happen — the post-check assertions
+// (no expectations on mock) implicitly verify this.
+func TestDeploy_RegionAtCapacity_Returns402(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	w := &mockDeployWorkerRepo{
+		freeByRegion: map[string]uint64{
+			"fra": 0,
+			"nyc": 0,
+		},
+	}
+	svc := &DeploymentService{
+		db:              db,
+		quotaRepo:       q,
+		billingRepo:     b,
+		tenantRepo:      &mockDeployTenantRepo{},
+		deploymentRepo:  &mockDeployDeploymentRepo{},
+		artifactStore:   storage.NewFSArtifactStore(t.TempDir()),
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+		workerRepo:      w,
+	}
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra", "nyc"}, false, 0, nil, nil, "", [32]byte{})
+	reason, ok := errIsPaymentRequired(t, err)
+	if !ok {
+		t.Fatalf("expected PaymentRequiredError, got %v", err)
+	}
+	if reason != "region_at_capacity" {
+		t.Errorf("reason = %q, want %q", reason, "region_at_capacity")
+	}
+}
+
+// TestDeploy_RegionHasHeadroom_Proceeds covers Pre-check 6 (issue #641):
+// at least one target region reports > 0 free slots → Deploy proceeds
+// past the capacity gate (and fails later for some unrelated reason;
+// the assertion is "not 402 region_at_capacity"). We don't assert the
+// post-gate error because that requires a full sqlmock setup and the
+// gate's pass-through behavior is the contract under test.
+func TestDeploy_RegionHasHeadroom_Proceeds(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	w := &mockDeployWorkerRepo{
+		freeByRegion: map[string]uint64{
+			"fra": 5,
+			"nyc": 0,
+		},
+	}
+	svc := &DeploymentService{
+		db:              db,
+		quotaRepo:       q,
+		billingRepo:     b,
+		tenantRepo:      &mockDeployTenantRepo{},
+		deploymentRepo:  &mockDeployDeploymentRepo{},
+		artifactStore:   storage.NewFSArtifactStore(t.TempDir()),
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+		workerRepo:      w,
+	}
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra", "nyc"}, false, 0, nil, nil, "", [32]byte{})
+	if err == nil {
+		t.Fatalf("expected later error (no DB tx setup), got nil")
+	}
+	if reason, ok := errIsPaymentRequired(t, err); ok && reason == "region_at_capacity" {
+		t.Fatalf("got 402 region_at_capacity when region had free slots")
+	}
+}
+
+// TestDeploy_RegionGate_SumFailureIsNonBlocking covers Pre-check 6
+// (issue #641): a transient SUM-failure (DB hiccup) must NOT lock
+// out every tenant. The gate logs and continues when SumFreeSlotsByRegion
+// returns an error; a deploy that would otherwise be allowed must
+// proceed past the capacity check.
+func TestDeploy_RegionGate_SumFailureIsNonBlocking(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	w := &mockDeployWorkerRepo{
+		err: fmt.Errorf("transient db hiccup"),
+	}
+	svc := &DeploymentService{
+		db:              db,
+		quotaRepo:       q,
+		billingRepo:     b,
+		tenantRepo:      &mockDeployTenantRepo{},
+		deploymentRepo:  &mockDeployDeploymentRepo{},
+		artifactStore:   storage.NewFSArtifactStore(t.TempDir()),
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+		workerRepo:      w,
+	}
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
+	if err == nil {
+		t.Fatalf("expected later error (no DB tx setup), got nil")
+	}
+	if reason, ok := errIsPaymentRequired(t, err); ok && reason == "region_at_capacity" {
+		t.Fatalf("got 402 region_at_capacity despite SUM-failure (gate should fail-open on transient errors)")
+	}
+}
+
+// TestDeploy_RegionGate_NilRepoSkipsGate covers Pre-check 6 (issue #641):
+// when the workerRepo seam is nil (pre-#641 test harnesses, or
+// future configs that opt out), the gate is skipped and Deploy
+// proceeds past the capacity check.
+func TestDeploy_RegionGate_NilRepoSkipsGate(t *testing.T) {
+	db, _, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+	q := &mockDeployQuotaRepo{
+		getByTenantIDFn: func(_ context.Context, _ string) (*domain.Quota, error) {
+			return &domain.Quota{MaxDeployments: 100}, nil
+		},
+	}
+	b := &mockDeployBillingRepo{
+		getSubscriptionStatusFn: func(_ context.Context, _ string) (domain.SubscriptionStatus, error) {
+			return domain.SubscriptionActive, nil
+		},
+	}
+	svc := &DeploymentService{
+		db:              db,
+		quotaRepo:       q,
+		billingRepo:     b,
+		tenantRepo:      &mockDeployTenantRepo{},
+		deploymentRepo:  &mockDeployDeploymentRepo{},
+		artifactStore:   storage.NewFSArtifactStore(t.TempDir()),
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+		// workerRepo intentionally nil — gate must skip.
+	}
+	_, _, err := svc.Deploy(context.Background(), "t_test", "myapp",
+		bytes.NewReader(validWasmBytes),
+		[]string{"fra"}, false, 0, nil, nil, "", [32]byte{})
+	if err == nil {
+		t.Fatalf("expected later error (no DB tx setup), got nil")
+	}
+	if reason, ok := errIsPaymentRequired(t, err); ok && reason == "region_at_capacity" {
+		t.Fatalf("got 402 region_at_capacity despite nil workerRepo (gate should skip)")
 	}
 }

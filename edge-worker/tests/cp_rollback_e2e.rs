@@ -188,6 +188,9 @@ async fn run_e2e() -> anyhow::Result<()> {
         require_signature: false,
         signing_keyring: None,
         signing_keyring_path: None,
+        // PR #641: pre-populate 100 port-pool slots (matches the
+        // canonical worker shape; rollback-e2e never drains the pool).
+        port_pool_size: 100,
     };
     let supervisor = build_supervisor_from_url(&nats_url, config)
         .await

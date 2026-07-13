@@ -73,19 +73,14 @@ import (
 // (029_quotas_resident_seconds + 030_billing_usage_events), PR #439
 // (031_active_deployment_idempotency_keys), issue #574 retention
 // GCs (additional (created_at) indexes landed on existing migrations),
-// and issue #305 (032_tenant_rate_limits — per-tenant data-plane rate
-// limit storage):
-// 42 .up.sql + 42 .down.sql = 84 split files. Some numeric prefixes
+// and PR #661 (issue #305, 032_tenant_rate_limits) + PR #641
+// (034_worker_status_capacity — PR #641 originally claimed 032 but
+// PR #661 won the number when it shipped first on main):
+// 48 .up.sql + 48 .down.sql = 96 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
-// 028_*, 029_*, 030_*, 031_*), so this is the on-disk file count,
-// not a strict 2× the migration number.
-// After rebasing PR #661 (issue #305, 032_tenant_rate_limits) onto
-// main, the post-#430 figure is 47 .up.sql + 47 .down.sql + the
-// #305 pair = 48 pairs (issue #305 adds 032_tenant_rate_limits).
-// Some numeric prefixes collide (005_*, 009_*, 010_*, 017_*, 018_*,
-// 025_*, 026_*, 027_*, 028_*, 029_*, 030_*, 031_*, 033_*), so this
-// is the on-disk file count, not a strict 2× the migration number.
-const splitFileCount = 96 // 48 .up.sql + 48 .down.sql after issue #305 + #430 (workers.public_key + length-cap)
+// 028_*, 029_*, 030_*, 031_*, 032_*, 033_*), so this is the on-disk
+// file count, not a strict 2× the migration number.
+const splitFileCount = 96 // 48 .up.sql + 48 .down.sql after issue #305 + #430 (workers.public_key + length-cap) + #641 (renumbered 032 → 034)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -484,9 +479,13 @@ var wantTypes = map[string]map[string]string{
 		"tenant_id":  "text", // 003_workers_tenant_id
 	},
 	"worker_status": {
-		"worker_id":   "text",
-		"apps":        "jsonb",
-		"last_report": "timestamptz",
+		"worker_id":                 "text",
+		"apps":                      "jsonb",
+		"last_report":               "timestamptz",
+		"free_slots":                "int4",        // 034_worker_status_capacity (issue #641)
+		"cluster_headroom":          "jsonb",       // 034_worker_status_capacity (issue #641)
+		"port_pool_exhausted_count": "int8",        // 034_worker_status_capacity (issue #641)
+		"last_exhaustion_at":        "timestamptz", // 034_worker_status_capacity (issue #641)
 	},
 	"apps": {
 		"id":          "text",
@@ -715,6 +714,14 @@ var wantNotNull = map[string][]string{
 		"worker_id",
 		"apps",
 		"last_report",
+		// free_slots / port_pool_exhausted_count / last_exhaustion_at
+		// are NOT NULL — 034_worker_status_capacity (issue #641).
+		// cluster_headroom is nullable: workers that didn't send the
+		// field have NULL until the first post-#641 heartbeat
+		// overwrites it.
+		"free_slots",
+		"port_pool_exhausted_count",
+		"last_exhaustion_at",
 	},
 	"apps": {
 		"id",
@@ -892,6 +899,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "audit_logs", Name: "idx_audit_logs_created_at"},                                    // 031_gc_retention_indexes (issue #574)
 	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_created_at"},                    // 031_gc_retention_indexes (issue #574)
 	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                        // 031_gc_retention_indexes (issue #574)
+	{Table: "worker_status", Name: "idx_worker_status_region_free_slots"},                       // 034_worker_status_capacity (issue #641, partial)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
@@ -1079,7 +1087,9 @@ var wantDefaults = map[string]map[string]string{
 		"events":      "'{}'::text[]", // 015
 	},
 	"worker_status": {
-		"apps": "'{}'::jsonb", // 001
+		"apps":                      "'{}'::jsonb", // 001
+		"free_slots":                "-1",          // 034_worker_status_capacity (issue #641); -1 = "no heartbeat yet"
+		"port_pool_exhausted_count": "0",           // 034_worker_status_capacity (issue #641)
 	},
 	"workers": {
 		"memory_mb": "4096", // 001

@@ -592,3 +592,55 @@ func TestMetricsAggregator_WorkerEnrollNilSinkIsNoop(t *testing.T) {
 	nilAgg.NewWorkerEnrollSink()(true)
 	nilAgg.NewWorkerEnrollSink()(false)
 }
+
+// Issue #641: the worker-level port-pool exhaustion counter is
+// rendered on every /metrics scrape (both /metrics operator endpoint
+// and /api/v1/metrics per-tenant). The value is the latest
+// worker-stamped count; the metric TYPE is `counter`.
+func TestMetricsAggregator_IngestWorker_PortPoolExhausted(t *testing.T) {
+	agg := NewMetricsAggregator()
+
+	// 1. Pre-ingest: no port-pool-exhausted family emitted (zero value
+	//    suppresses the TYPE line? No — we emit the family even at 0
+	//    so operators can scrape an empty fleet without surprise). Pin
+	//    the initial 0.
+	if !strings.Contains(agg.RenderAll(), "edge_worker_port_pool_exhausted_total 0") {
+		t.Fatalf("initial render must show port_pool_exhausted_total 0\ngot:\n%s", agg.RenderAll())
+	}
+
+	// 2. Ingest a heartbeat with a non-zero exhaustion count.
+	agg.IngestWorker(7)
+
+	for _, want := range []string{
+		"# TYPE edge_worker_port_pool_exhausted_total counter",
+		"edge_worker_port_pool_exhausted_total 7",
+	} {
+		if !strings.Contains(agg.RenderAll(), want) {
+			t.Errorf("RenderAll missing %q\ngot:\n%s", want, agg.RenderAll())
+		}
+	}
+
+	// 3. Per-tenant render also includes the family (matches the GC
+	//    family precedent — fleet-wide health on /api/v1/metrics).
+	tenantOut := agg.RenderTenant("t_acme")
+	if !strings.Contains(tenantOut, "edge_worker_port_pool_exhausted_total 7") {
+		t.Errorf("RenderTenant missing port_pool_exhausted_total 7\ngot:\n%s", tenantOut)
+	}
+
+	// 4. A second heartbeat with a different value updates the gauge.
+	//    Note this is intentionally NOT additive — workers emit their
+	//    own per-process-boot cumulative, and the CP just renders the
+	//    most recent value seen.
+	agg.IngestWorker(42)
+	if !strings.Contains(agg.RenderAll(), "edge_worker_port_pool_exhausted_total 42") {
+		t.Errorf("RenderAll missing port_pool_exhausted_total 42\ngot:\n%s", agg.RenderAll())
+	}
+}
+
+// Issue #641: nil-receiver guard for IngestWorker mirrors the GC sink
+// nil-guard at NewLogGCSink. A nil aggregator should be a no-op so
+// callers can pass `nil` to constructors without crashing on shutdown.
+func TestMetricsAggregator_IngestWorker_NilReceiverIsNoop(t *testing.T) {
+	var agg *MetricsAggregator // nil
+	agg.IngestWorker(99)       // must not panic
+}

@@ -141,6 +141,7 @@ mod heartbeat_integration_tests {
             worker_sync_threshold_secs: 30,
             port_cooldown_secs: 1,
             starting_port: 10000,
+            port_pool_size: 100,
             max_memory_mb: 256,
             epoch_tick_ms: 10,
             epoch_deadline_ticks: 100,
@@ -204,6 +205,20 @@ mod heartbeat_integration_tests {
         state: Arc<RwLock<WorkerState>>,
         cooldown_secs: u64,
     ) -> Arc<Supervisor> {
+        build_supervisor_with_cooldown_and_starting_port(state, cooldown_secs, 10000)
+    }
+
+    /// Extends `build_supervisor_with_cooldown_secs` with a custom
+    /// `PortPool` starting port. Used by
+    /// `start_app_returns_err_when_port_pool_exhausted` (#641
+    /// regression) to construct a pool near `u16::MAX` so the 1000-
+    /// iteration sequential fallback wraps around quickly when all
+    /// pre-populated ports are in cooldown.
+    fn build_supervisor_with_cooldown_and_starting_port(
+        state: Arc<RwLock<WorkerState>>,
+        cooldown_secs: u64,
+        starting_port: u16,
+    ) -> Arc<Supervisor> {
         let jwt = WorkerJwtSigner::new(
             String::new(),
             None,
@@ -222,12 +237,13 @@ mod heartbeat_integration_tests {
                 jwt.clone(),
                 None,
             )),
-            port_pool: Arc::new(Mutex::new(PortPool::new(10000, cooldown_secs))),
+            port_pool: Arc::new(Mutex::new(PortPool::new(starting_port, cooldown_secs))),
             nats: nats as Arc<dyn NatsClient>,
             log_forwarder: LogForwarder::new("http://localhost:0", "w_test", "fra", jwt.clone()),
             jwt_signer: jwt,
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+            port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -968,6 +984,176 @@ mod heartbeat_integration_tests {
         );
     }
 
+    /// Issue #641 regression: when the port pool is exhausted, `start_app`
+    /// must return `Err(_)` instead of panicking. The panic would unwind
+    /// the NATS consume loop and kill the worker process, taking every
+    /// other app on the node down with it.
+    #[tokio::test]
+    async fn start_app_returns_err_when_port_pool_exhausted() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        // We use a 100-year cooldown (not `u64::MAX`, which would
+        // overflow `Instant + Duration` arithmetic inside `release()`)
+        // so released ports stay in `cooling_down` permanently for the
+        // duration of the test. The exhausted state is constructed
+        // via `drain_available_into_cooldown` (test-only) instead of
+        // draining via `acquire/release` — which would increment
+        // `next_port` past the cooldown range and let the sequential
+        // fallback find free ports in the wrapped range.
+        let huge_cooldown_secs: u64 = 100 * 365 * 24 * 60 * 60; // 100 years
+        let sup = build_supervisor_with_cooldown_and_starting_port(
+            state.clone(),
+            huge_cooldown_secs,
+            10000,
+        );
+
+        // Drain the pool. `drain_available_into_cooldown` (test-only)
+        // moves the 100 pre-populated ports AND the next 1000
+        // sequential-fallback ports into `cooling_down` so any
+        // subsequent `acquire()` returns None. We do NOT verify
+        // this with an `assert_eq!(pool.acquire(), None)` here
+        // because that would itself trigger the 1000-iteration
+        // sequential fallback against an 1100-entry cooldown
+        // set — O(1.1M) ops, slow under debug builds. Trust the
+        // helper and let `start_app` be the verification.
+        {
+            let mut pool = sup.port_pool.lock().await;
+            let moved = pool.drain_available_into_cooldown();
+            assert_eq!(moved, 100, "expected to drain 100 pre-populated ports");
+        }
+
+        // Build a minimal AppSpec (no EDGE_WS_PORT — exercises the HTTP
+        // branch of the fix). The supervisor's signature check will fire
+        // *after* the port-acquire block, so we don't need a real
+        // signature here — but we DO need to NOT have a signature, which
+        // would make the signature check fail first and mask the bug.
+        // The fix is upstream of the signature check, so a missing
+        // signature is fine for this test: port-exhaustion bails earlier.
+        let spec = AppSpec {
+            deployment_id: "d_test_641".to_string(),
+            deployment_hash: "abc123".to_string(),
+            deployment_signature: None,
+            signing_key_id: None,
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            socket_mode: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
+        };
+
+        let result = sup.start_app("a_test_641", &spec, "t_test_641").await;
+
+        let err = result.expect_err("start_app must return Err when pool is exhausted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("port pool exhausted"),
+            "error message should mention port pool exhaustion; got: {msg}"
+        );
+
+        // The failing app must NOT be registered in state.
+        assert!(
+            state.read().await.apps.is_empty(),
+            "failed start_app must not register the app in state"
+        );
+
+        // Issue #641: the worker-level exhaustion counter must have
+        // been bumped. The CP's deploy-time 402 gate
+        // (`SumFreeSlotsByRegion`, Commit #3) reads this via the
+        // persisted `worker_status.port_pool_exhausted_count` column
+        // — a non-zero bump here proves the wire end-to-end path.
+        let count = sup
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 1,
+            "HTTP-port exhaustion arm must bump port_pool_exhausted_events to 1"
+        );
+    }
+
+    /// Issue #641 regression: when the WS-port acquire fails after the
+    /// HTTP-port acquire succeeded, `start_app` must release the
+    /// already-acquired HTTP port before bailing. Otherwise the leaked
+    /// HTTP port sits in a 60-second cooling-down limbo during the
+    /// nack-and-redeliver cycle, silently reducing pool capacity.
+    #[tokio::test]
+    async fn start_app_releases_raw_port_when_ws_port_acquire_fails() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let huge_cooldown_secs: u64 = 100 * 365 * 24 * 60 * 60; // 100 years
+        let sup = build_supervisor_with_cooldown_and_starting_port(
+            state.clone(),
+            huge_cooldown_secs,
+            10000,
+        );
+
+        // Drain the pool leaving exactly ONE port allocatable — enough
+        // for the HTTP acquire to succeed but not enough for the WS
+        // acquire.
+        {
+            let mut pool = sup.port_pool.lock().await;
+            pool.drain_leaving_n_available(1);
+        }
+
+        // Capture which port the HTTP branch will consume so we can
+        // assert it ends up in cooldown after the WS branch fails.
+        let expected_raw_port: u16 = {
+            let mut pool = sup.port_pool.lock().await;
+            pool.acquire().expect("first acquire should succeed")
+        };
+        // Put it back — `start_app` is going to acquire it itself.
+        // `release` is idempotent so it's safe even though the port
+        // isn't technically cooling-down yet.
+        sup.port_pool.lock().await.release(expected_raw_port);
+
+        // Build a spec with EDGE_WS_PORT set so the WS branch runs.
+        let spec = AppSpec {
+            deployment_id: "d_test_641_ws".to_string(),
+            deployment_hash: "abc123".to_string(),
+            deployment_signature: None,
+            signing_key_id: None,
+            routes: None,
+            env: HashMap::from([("EDGE_WS_PORT".to_string(), "1".to_string())]),
+            allowlist: None,
+            socket_mode: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
+        };
+
+        let result = sup.start_app("a_test_641_ws", &spec, "t_test_641_ws").await;
+
+        let err = result.expect_err("start_app must return Err when WS acquire fails");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("port pool exhausted"),
+            "error message should mention port pool exhaustion; got: {msg}"
+        );
+
+        // The leaked HTTP port must have been released by the WS
+        // branch's `pool.release(raw_port)` guard. With a 100-year
+        // cooldown, the port is in `cooling_down` (not `available`).
+        assert!(
+            sup.port_pool.lock().await.is_in_cooldown(expected_raw_port),
+            "HTTP port leaked: expected port {expected_raw_port} to be released into cooldown after WS acquire failed"
+        );
+
+        // Issue #641: the WS-port exhaustion arm must also bump the
+        // worker-level counter — same observability requirement as the
+        // HTTP-port branch. Both arms are "pool can't take more"
+        // signals; the CP gate sees them uniformly.
+        let count = sup
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count, 1,
+            "WS-port exhaustion arm must bump port_pool_exhausted_events to 1"
+        );
+    }
+
     #[tokio::test]
     async fn stop_app_handler_with_broadcast_sends_signal() {
         let engine = edge_runtime::create_engine().expect("engine");
@@ -1594,6 +1780,20 @@ pub struct Supervisor {
     /// `edge-test-helpers::build_supervisor_inner` can construct a
     /// Supervisor for tests without separate plumbing.
     pub jwt_signer: Arc<crate::auth::WorkerJwtSigner>,
+    /// Worker-level exhaustion counter (issue #641). Bumped from the
+    /// two `start_app` exhaustion arms (HTTP-port acquire fails,
+    /// WS-port acquire fails) — covers apps that exhaust the pool on
+    /// first start and never produce an AppStatus row (which is the
+    /// case where a per-app counter would be invisible).
+    /// Persisted into `worker_status` by the CP's heartbeat-ingest
+    /// path so the deploy-time 402 gate (`SumFreeSlotsByRegion`)
+    /// can ask "has any worker in this region recently exhausted?"
+    /// without scraping Prometheus.
+    /// Atomic so the two exhaustion arms can bump without holding the
+    /// port-pool mutex (which is already locked at the bump site).
+    /// Reset on worker process restart (matches `request_count`
+    /// semantics — per-process-boot cumulative).
+    pub port_pool_exhausted_events: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Supervisor {
@@ -1843,19 +2043,66 @@ impl Supervisor {
             self.stop_app(tenant_id, app_name).await?;
         }
 
-        // Acquire an HTTP port.
+        // Acquire an HTTP port. Issue #641: acquire() already returns
+        // Option<u16>; turn None into an Err so the consume loop can
+        // nack-and-continue instead of unwinding the worker process.
         let raw_port = {
             let mut pool = self.port_pool.lock().await;
-            pool.acquire().expect("port pool exhausted")
+            let free = pool.free_slots();
+            match pool.acquire() {
+                Some(p) => p,
+                None => {
+                    // Bump the worker-level exhaustion counter so the
+                    // CP's deploy-time 402 gate can detect saturation
+                    // even for apps that exhausted the pool on first
+                    // start and never produced an AppStatus row.
+                    self.port_pool_exhausted_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        tenant_id,
+                        app_name,
+                        deployment_id = spec.deployment_id,
+                        free_slots = free,
+                        "port pool exhausted; refusing to start app (HTTP port unavailable)"
+                    );
+                    anyhow::bail!(
+                        "port pool exhausted: cannot allocate HTTP port (free_slots={free})"
+                    );
+                }
+            }
         };
 
         // Acquire a WebSocket port if the spec requests one via the
         // EDGE_WS_PORT env var. The guest is expected to listen on this
         // port via wasi:sockets for WebSocket upgrade traffic (issue #312).
+        // Issue #641: on exhaustion we release raw_port so it isn't
+        // leaked into a 60-second cooling-down limbo while the nack
+        // and redeliver cycle runs.
         let wants_ws = spec.env.contains_key("EDGE_WS_PORT");
         let ws_port = if wants_ws {
             let mut pool = self.port_pool.lock().await;
-            Some(pool.acquire().expect("port pool exhausted"))
+            let free = pool.free_slots();
+            match pool.acquire() {
+                Some(p) => Some(p),
+                None => {
+                    // Same worker-level counter as the HTTP-port arm —
+                    // both branches are "pool can't take more" signals
+                    // that the CP needs to count.
+                    self.port_pool_exhausted_events
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    pool.release(raw_port);
+                    tracing::error!(
+                        tenant_id,
+                        app_name,
+                        deployment_id = spec.deployment_id,
+                        free_slots = free,
+                        "port pool exhausted; refusing to start app (WS port unavailable, HTTP port released)"
+                    );
+                    anyhow::bail!(
+                        "port pool exhausted: cannot allocate WS port (free_slots={free})"
+                    );
+                }
+            }
         } else {
             None
         };
@@ -3169,13 +3416,25 @@ impl Supervisor {
             );
         }
 
-        // Populate cluster headroom for the autoscaler (issue #85).
+        // Populate cluster headroom for the autoscaler (issue #85) and the
+        // deploy-time 402 gate (issue #641). `free_slots` is mirrored
+        // onto both `app_slots` (autoscaler) and `free_slots` (deploy
+        // gate) so the two consumers can pick the name that matches
+        // their semantics without coordinating on a rename.
         let free_slots = self.port_pool.lock().await.free_slots();
         msg.cluster_headroom = Some(ClusterHeadroom {
             cpu_pct: None,
             mem_pct: None,
             app_slots: free_slots,
+            free_slots,
         });
+
+        // Stamp the worker-level exhaustion counter (issue #641) so the
+        // CP can persist it onto `worker_status.port_pool_exhausted_count`.
+        // Reset on worker process restart (per-process-boot cumulative).
+        msg.port_pool_exhausted_count = self
+            .port_pool_exhausted_events
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         msg
     }
@@ -4131,6 +4390,7 @@ mod tests {
                 worker_sync_threshold_secs: 30,
                 port_cooldown_secs: 1,
                 starting_port: 10000,
+                port_pool_size: 100,
                 max_memory_mb: 256,
                 epoch_tick_ms: 10,
                 epoch_deadline_ticks: 100,
@@ -4168,6 +4428,7 @@ mod tests {
             jwt_signer: jwt,
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
+            port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

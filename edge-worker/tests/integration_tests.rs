@@ -86,6 +86,7 @@ fn test_config(
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         starting_port: 18_000,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
@@ -191,6 +192,7 @@ impl TestHarness {
             worker_sync_threshold_secs: 60,
             health_check_timeout_secs: 60,
             port_cooldown_secs: 60,
+            port_pool_size: 100,
             starting_port: 18_000,
             max_memory_mb: 256,
             epoch_tick_ms: 10,
@@ -440,6 +442,7 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         heartbeat_interval_secs: 30,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         starting_port: 18_000,
         max_memory_mb: 256,
         epoch_tick_ms: 10,
@@ -990,6 +993,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         // Unique port range: most TestHarness-based tests in this binary
         // bind Handler apps at 18_000, and nextest runs tests
         // concurrently — sharing 18_000 makes this test lose the OS bind
@@ -1033,6 +1037,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         // Distinct from worker A's 23_000 so an accidental double-start
         // (pinning regression) fails the total==1 assert below instead
         // of masking itself behind an intra-process bind conflict.
@@ -1897,6 +1902,7 @@ async fn build_supervisor_only_with_cp(
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         starting_port: 19_500,
         max_memory_mb: 256,
         epoch_tick_ms: 10,

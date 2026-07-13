@@ -34,10 +34,37 @@ type RegisterWorkerRequest struct {
 }
 
 // WorkerStatus holds the running app state reported by a worker.
+//
+// Fields beyond WorkerID/Apps/LastReport (issue #641) are populated
+// from the heartbeat's ClusterHeadroom + port_pool_exhausted_count
+// fields. The deploy-time 402 gate (`SumFreeSlotsByRegion`) reads
+// `FreeSlots` to detect region-wide saturation; `PortPoolExhaustedCount`
+// is the cumulative exhaustion-event counter since process boot and
+// is also surfaced as `edgecloud_worker_port_pool_exhausted_total`
+// via the MetricsAggregator path.
 type WorkerStatus struct {
 	WorkerID   string          `db:"worker_id"`
 	Apps       json.RawMessage `db:"apps"` // { app_name: { status, exit_code, deployment_id } }
 	LastReport time.Time       `db:"last_report"`
+	// FreeSlots mirrors ClusterHeadroom.free_slots at heartbeat time.
+	// The repository layer writes -1 as the "no heartbeat yet"
+	// sentinel; the SQL SUM uses GREATEST(free_slots, 0) so uninitialized
+	// rows contribute 0 to the region total without being filtered out
+	// (which would silently undercount a region whose first heartbeat
+	// is in flight).
+	FreeSlots int32 `db:"free_slots"`
+	// ClusterHeadroom is the verbatim ClusterHeadroom object from
+	// the heartbeat, kept on disk so future readers can pull cpu_pct
+	// / mem_pct / app_slots without a schema migration. Nullable:
+	// pre-#641 workers don't send the field.
+	ClusterHeadroom json.RawMessage `db:"cluster_headroom"`
+	// PortPoolExhaustedCount is the worker's cumulative count of
+	// `PortPool::acquire() → None` events since process boot.
+	// Matches the heartbeat field of the same name. LastExhaustionAt
+	// is stamped when this counter advances so the deploy gate can
+	// filter out workers that haven't reported recently.
+	PortPoolExhaustedCount int64      `db:"port_pool_exhausted_count"`
+	LastExhaustionAt       *time.Time `db:"last_exhaustion_at"`
 }
 
 // MetricKind is the kind of metric in a MetricSample.

@@ -218,3 +218,37 @@ func TestComputeDecision(t *testing.T) {
 		})
 	}
 }
+
+// TestLegacyAssumedAppSlotsIs100 pins issue #641's autoscaler
+// contract: legacy (pre-#85 / pre-#641) workers with no ClusterHeadroom
+// must be assumed to have 100 free slots — matching the canonical
+// PortPool pre-population count post-#641 (PR #657). If this value
+// regresses to 50, the autoscaler will under-count capacity and
+// scale up sooner than necessary; if it regresses to 200, it will
+// over-count and never scale up. Catches accidental regression at
+// the constant site.
+func TestLegacyAssumedAppSlotsIs100(t *testing.T) {
+	if legacyAssumedAppSlots != 100 {
+		t.Errorf("legacyAssumedAppSlots = %d, want 100 (issue #641)", legacyAssumedAppSlots)
+	}
+}
+
+// TestComputeDecision_LegacyWorkerUses100Slots pins the downstream
+// effect: a fleet of one legacy-headroom worker (Headroom=nil) must
+// be treated as having 100 free slots, not 50 (pre-#641) or 0/200
+// (over/under-counting). With DesiredApps=10 and MinWorkers=1,
+// totalFreeSlots=100 ≥ needed=11, so the decision must be noop,
+// not scale_up.
+func TestComputeDecision_LegacyWorkerUses100Slots(t *testing.T) {
+	state := FleetState{
+		Workers: []WorkerHeadroom{
+			{WorkerID: "w_legacy", Region: "fra", Headroom: nil}, // pre-#85 worker
+		},
+		DesiredApps: 10,
+	}
+	cfg := Config{MinWorkers: 1, MaxWorkers: 10, TargetHeadroomPct: 10}
+	got := ComputeDecision(state, cfg)
+	if got.Action != domain.AutoscaleNoop {
+		t.Errorf("Action = %q, want %q (legacy worker should report 100 slots, plenty for 10 apps)", got.Action, domain.AutoscaleNoop)
+	}
+}

@@ -58,6 +58,7 @@ fn wire_test_config(
         worker_sync_threshold_secs: 60,
         health_check_timeout_secs: 60,
         port_cooldown_secs: 60,
+        port_pool_size: 100,
         starting_port: 19_000,
         max_memory_mb: 256,
         epoch_tick_ms: 10,

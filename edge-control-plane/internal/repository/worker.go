@@ -333,19 +333,99 @@ func (r *WorkerRepository) DeleteOlderThan(ctx context.Context, age time.Duratio
 }
 
 func (r *WorkerRepository) UpsertStatus(ctx context.Context, ws *domain.WorkerStatus) error {
-	query := `INSERT INTO worker_status (worker_id, apps, last_report) VALUES ($1, $2, $3) ON CONFLICT (worker_id) DO UPDATE SET apps = $2, last_report = $3`
-	_, err := r.db.ExecContext(ctx, query, ws.WorkerID, ws.Apps, ws.LastReport)
+	// Issue #641: persist the worker's cluster_headroom + free_slots +
+	// port_pool_exhausted_count + last_exhaustion_at. The last_exhaustion_at
+	// stamp advances only when the worker reports a strictly-greater
+	// exhaustion count than what's on disk (handles same-tick duplicate
+	// heartbeats gracefully without skewing the freshness window).
+	//
+	// On the initial INSERT (no existing row), last_exhaustion_at is
+	// stamped only when the worker actually reports exhaustion > 0,
+	// otherwise it stays NULL — keeping the deploy-gate's freshness
+	// predicate tight on workers that have never exhausted.
+	query := `
+		INSERT INTO worker_status (worker_id, apps, last_report, free_slots, cluster_headroom, port_pool_exhausted_count, last_exhaustion_at)
+		VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::BIGINT > 0 THEN $3 ELSE NULL END)
+		ON CONFLICT (worker_id) DO UPDATE SET
+			apps                    = EXCLUDED.apps,
+			last_report             = EXCLUDED.last_report,
+			free_slots              = EXCLUDED.free_slots,
+			cluster_headroom        = EXCLUDED.cluster_headroom,
+			port_pool_exhausted_count = EXCLUDED.port_pool_exhausted_count,
+			last_exhaustion_at      = CASE
+				WHEN EXCLUDED.port_pool_exhausted_count > worker_status.port_pool_exhausted_count
+					THEN EXCLUDED.last_report
+				ELSE worker_status.last_exhaustion_at
+			END`
+	_, err := r.db.ExecContext(ctx, query,
+		ws.WorkerID,
+		ws.Apps,
+		ws.LastReport,
+		ws.FreeSlots,
+		ws.ClusterHeadroom,
+		ws.PortPoolExhaustedCount,
+	)
 	return err
 }
 
 func (r *WorkerRepository) GetStatus(ctx context.Context, workerID string) (*domain.WorkerStatus, error) {
 	var ws domain.WorkerStatus
-	query := `SELECT worker_id, apps, last_report FROM worker_status WHERE worker_id = $1`
+	query := `SELECT worker_id, apps, last_report, free_slots, cluster_headroom, port_pool_exhausted_count, last_exhaustion_at FROM worker_status WHERE worker_id = $1`
 	err := r.db.GetContext(ctx, &ws, query, workerID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return &ws, err
+}
+
+// SumFreeSlotsByRegion returns a map from region → total free port-pool
+// slots across that region's recently-reporting workers (issue #641).
+//
+// The deploy-time 402 gate (DeploymentService.Deploy Pre-check 6) calls
+// this with the tenant's target regions; if every region sums to 0,
+// the deploy is rejected with PaymentRequiredError{Reason:
+// "region_at_capacity"} rather than letting the worker panic (pre-#641)
+// or nack-and-retry forever (post-#641).
+//
+// Freshness window is 90 seconds (matches the worker's 30s heartbeat
+// cadence × 3) so a single dropped heartbeat doesn't immediately
+// surface a false-positive saturation signal. Workers that haven't
+// reported yet still contribute `GREATEST(free_slots, 0)` which folds
+// -1 → 0, matching the migration default.
+//
+// The query is GROUP BY region and uses the partial index
+// `idx_worker_status_region_free_slots` (filter `free_slots >= 0`)
+// so a fleet of mostly-fresh rows reads O(fleet) pages instead of
+// O(fleet × regions).
+func (r *WorkerRepository) SumFreeSlotsByRegion(ctx context.Context, regions []string) (map[string]uint64, error) {
+	out := make(map[string]uint64, len(regions))
+	if len(regions) == 0 {
+		return out, nil
+	}
+	const query = `
+		SELECT workers.region AS region,
+		       SUM(GREATEST(worker_status.free_slots, 0))::BIGINT AS free_slots
+		FROM worker_status
+		JOIN workers ON workers.id = worker_status.worker_id
+		WHERE workers.region = ANY($1)
+		  AND worker_status.last_report > NOW() - INTERVAL '90 seconds'
+		GROUP BY workers.region`
+	var rows []struct {
+		Region    string `db:"region"`
+		FreeSlots int64  `db:"free_slots"`
+	}
+	if err := r.db.SelectContext(ctx, &rows, query, pq.Array(regions)); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if row.FreeSlots < 0 {
+			// Defensive: GREATEST guarantees non-negative, but guard
+			// against a future migration that flips the sign.
+			continue
+		}
+		out[row.Region] = uint64(row.FreeSlots)
+	}
+	return out, nil
 }
 
 // GetLatestStatuses returns the most-recent worker_status row for each
@@ -363,7 +443,7 @@ func (r *WorkerRepository) GetLatestStatuses(ctx context.Context, workerIDs []st
 	var rows []domain.WorkerStatus
 	// sqlx + the pgx driver accept []string as a Postgres text[] array,
 	// which binds to ANY($1) directly.
-	query := `SELECT DISTINCT ON (worker_id) worker_id, apps, last_report FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`
+	query := `SELECT DISTINCT ON (worker_id) worker_id, apps, last_report, free_slots, cluster_headroom, port_pool_exhausted_count, last_exhaustion_at FROM worker_status WHERE worker_id = ANY($1) ORDER BY worker_id, last_report DESC`
 	if err := r.db.SelectContext(ctx, &rows, query, pq.Array(workerIDs)); err != nil {
 		return nil, err
 	}

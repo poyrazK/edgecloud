@@ -271,10 +271,11 @@ async fn main() -> anyhow::Result<()> {
         signature_verifier.clone(),
     ));
 
-    // Initialize port pool
-    let port_pool = Arc::new(tokio::sync::Mutex::new(PortPool::new(
+    // Initialize port pool (issue #641: capacity is env-tunable via EDGE_PORT_POOL_SIZE)
+    let port_pool = Arc::new(tokio::sync::Mutex::new(PortPool::with_capacity(
         config.starting_port,
         config.port_cooldown_secs,
+        config.port_pool_size,
     )));
 
     // Connect to NATS
@@ -308,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
         engine_pool: Arc::new(crate::supervisor::StandbyPool::new(
             config.standby_pool_size,
         )?),
+        port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     let heartbeat_supervisor = supervisor.clone();

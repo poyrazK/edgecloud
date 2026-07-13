@@ -245,6 +245,14 @@ pub struct AppSpec {
 /// only field the autoscaler acts on — the number of free port slots
 /// this worker can allocate (i.e., not in cooldown). `cpu_pct` and
 /// `mem_pct` are observability-only for now.
+///
+/// `free_slots` is the same value as `app_slots` duplicated under a
+/// second name so the deploy-time 402 gate (issue #641) can read it
+/// without reaching for the autoscaler's `app_slots` semantics. Both
+/// fields stay in lockstep — pre-#641 control planes that only read
+/// `app_slots` continue to work; new control planes preferring
+/// `free_slots` read the same number. `#[serde(default)]` keeps
+/// pre-#641 workers (no field) parseable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterHeadroom {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +260,8 @@ pub struct ClusterHeadroom {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_pct: Option<f64>,
     pub app_slots: u32,
+    #[serde(default)]
+    pub free_slots: u32,
 }
 
 /// HeartbeatMessage: published to `edgecloud.heartbeats.<region>` every 30s.
@@ -280,6 +290,17 @@ pub struct HeartbeatMessage {
     /// workers via their fallback (50 assumed slots).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_headroom: Option<ClusterHeadroom>,
+    /// Cumulative worker-level `PortPool::acquire() → None` events
+    /// since process boot (issue #641). Surfaces apps that exhaust the
+    /// pool on first start and never produce an AppStatus row — the
+    /// case where a per-app counter would be invisible. Persisted by
+    /// the CP's heartbeat-ingest path into
+    /// `worker_status.port_pool_exhausted_count`; the deploy-time 402
+    /// gate (`SumFreeSlotsByRegion`) reads it to detect fleet-wide
+    /// saturation. Reset on worker process restart.
+    /// `#[serde(default)]` keeps pre-#641 workers parseable.
+    #[serde(default)]
+    pub port_pool_exhausted_count: u64,
 }
 
 /// AppStatus: status of a single app within a heartbeat.
@@ -395,6 +416,7 @@ impl HeartbeatMessage {
             tenant_id: Some(tenant_id),
             apps: HashMap::new(),
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         }
     }
 }
@@ -459,11 +481,119 @@ mod tests {
             tenant_id: None,
             apps: HashMap::new(),
             cluster_headroom: None,
+            port_pool_exhausted_count: 0,
         };
         let json = serde_json::to_string(&hb).expect("serialize heartbeat");
         assert!(
             !json.contains("worker_addr"),
             "None worker_addr must be omitted from the wire; got: {json}"
+        );
+    }
+
+    // ── ClusterHeadroom.free_slots rolling-upgrade contract (issue #641) ──
+
+    /// Old workers that don't send `free_slots` on the heartbeat's
+    /// `cluster_headroom` must deserialize to 0 (not fail). The
+    /// deploy-time 402 gate (`SumFreeSlotsByRegion`, Commit #3) reads
+    /// `free_slots` from the CP's persisted `worker_status` row; a
+    /// legacy worker (no field on the wire) appears as `free_slots=0`
+    /// and is treated as saturated for safety.
+    #[test]
+    fn cluster_headroom_free_slots_absent_deserializes_to_zero() {
+        let hb: HeartbeatMessage = serde_json::from_str(
+            r#"{
+                "type":"heartbeat",
+                "timestamp":"2026-07-12T00:00:00Z",
+                "worker_id":"w_fra",
+                "region":"fra",
+                "apps":{},
+                "cluster_headroom":{"cpu_pct":null,"mem_pct":null,"app_slots":42}
+            }"#,
+        )
+        .expect("deserialize heartbeat");
+        let ch = hb.cluster_headroom.expect("cluster_headroom present");
+        assert_eq!(ch.free_slots, 0, "absent free_slots → 0 default");
+        assert_eq!(ch.app_slots, 42, "legacy app_slots preserved");
+    }
+
+    /// Explicit value round-trips correctly — `free_slots=7` survives
+    /// a serialize+deserialize cycle and the legacy `app_slots` field
+    /// continues to read 42 (both are stamped by the worker).
+    #[test]
+    fn cluster_headroom_free_slots_present_round_trips() {
+        let hb: HeartbeatMessage = serde_json::from_str(
+            r#"{
+                "type":"heartbeat",
+                "timestamp":"2026-07-12T00:00:00Z",
+                "worker_id":"w_fra",
+                "region":"fra",
+                "apps":{},
+                "cluster_headroom":{"cpu_pct":null,"mem_pct":null,"app_slots":42,"free_slots":7}
+            }"#,
+        )
+        .expect("deserialize heartbeat");
+        let ch = hb.cluster_headroom.expect("cluster_headroom present");
+        assert_eq!(ch.free_slots, 7);
+        assert_eq!(ch.app_slots, 42);
+    }
+
+    // ── HeartbeatMessage.port_pool_exhausted_count rolling-upgrade (issue #641) ──
+
+    /// Old workers (pre-#641) don't send `port_pool_exhausted_count`
+    /// on the heartbeat; the field must default to 0 so legacy workers
+    /// continue to parse. The CP's deploy-time 402 gate sees `0` and
+    /// treats the worker as having no recent exhaustion pressure.
+    #[test]
+    fn port_pool_exhausted_count_absent_deserializes_to_zero() {
+        let hb: HeartbeatMessage = serde_json::from_str(
+            r#"{
+                "type":"heartbeat",
+                "timestamp":"2026-07-12T00:00:00Z",
+                "worker_id":"w_fra",
+                "region":"fra",
+                "apps":{}
+            }"#,
+        )
+        .expect("deserialize legacy heartbeat");
+        assert_eq!(
+            hb.port_pool_exhausted_count, 0,
+            "absent port_pool_exhausted_count must default to 0"
+        );
+    }
+
+    /// Explicit value round-trips correctly — 7 survives a
+    /// serialize+deserialize cycle.
+    #[test]
+    fn port_pool_exhausted_count_present_round_trips() {
+        let hb: HeartbeatMessage = serde_json::from_str(
+            r#"{
+                "type":"heartbeat",
+                "timestamp":"2026-07-12T00:00:00Z",
+                "worker_id":"w_fra",
+                "region":"fra",
+                "apps":{},
+                "port_pool_exhausted_count":7
+            }"#,
+        )
+        .expect("deserialize heartbeat");
+        assert_eq!(hb.port_pool_exhausted_count, 7);
+    }
+
+    /// `HeartbeatMessage::new` must initialise the field to 0 so a
+    /// freshly-built heartbeat (before `build_heartbeat` runs the
+    /// atomic load) doesn't accidentally report phantom exhaustion
+    /// to the CP.
+    #[test]
+    fn heartbeat_new_initializes_port_pool_exhausted_count_to_zero() {
+        let hb = HeartbeatMessage::new(
+            "w_fra".to_string(),
+            "fra".to_string(),
+            "203.0.113.10".to_string(),
+            "t_test".to_string(),
+        );
+        assert_eq!(
+            hb.port_pool_exhausted_count, 0,
+            "HeartbeatMessage::new must initialise the worker-level counter to 0"
         );
     }
 
