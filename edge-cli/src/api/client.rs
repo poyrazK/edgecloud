@@ -1144,6 +1144,26 @@ impl ApiClient {
         Ok(body)
     }
 
+    /// DELETE `/api/v1/admin/apps/{appName}` — hard-delete an app.
+    /// Owner-role gated on the server side (`RequireRole("owner")`).
+    /// Returns `Ok(())` on 204 No Content, `Err(ApiError::Rejected)`
+    /// on 4xx (notably 403 on a non-owner key, 404 on unknown app),
+    /// and `Err(ApiError::Transient)` on 5xx or network failure.
+    /// Caller is responsible for the owner-role pre-flight check
+    /// (see `commands/apps.rs::check_owner_role`) so the user gets
+    /// an actionable role-mismatch message before the round-trip.
+    /// Issue #573.
+    pub fn delete_app(&self, app_name: &str) -> Result<(), ApiError> {
+        let url = format!("{}/api/v1/admin/apps/{}", self.base_url, app_name);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()?;
+        check_response(resp)?;
+        Ok(())
+    }
+
     /// GET `/api/v1/quotas` — get tenant quota and usage.
     pub fn get_quota(&self) -> Result<QuotaResponse> {
         self.get_json_anyhow("get quota", |base| format!("{base}/api/v1/quotas"))

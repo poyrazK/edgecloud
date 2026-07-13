@@ -503,11 +503,13 @@ enum Command {
         idempotency_key: Option<String>,
     },
 
-    /// List all apps, create an app, or show details for one.
+    /// List all apps, create an app, show details for one, or
+    /// delete an app (owner-role only).
     ///
     /// `edge apps` lists all apps for the tenant.
     /// `edge apps create <name>` creates a new app.
     /// `edge apps get <name>` shows details for a specific app.
+    /// `edge apps delete <name> --yes` hard-deletes an app (irreversible).
     Apps {
         #[command(subcommand)]
         action: Option<AppsCommand>,
@@ -713,6 +715,25 @@ enum AppsCommand {
         #[arg(long)]
         description: Option<String>,
     },
+    /// Hard-delete an app and all its deployments.
+    ///
+    /// Owner-role only (the CP's `RequireRole("owner")` middleware
+    /// gates `DELETE /api/v1/admin/apps/{appName}`). The CLI does
+    /// an additional pre-flight `whoami` so a non-owner bearer
+    /// gets a clear "your key has role {role}; mint an owner key
+    /// with `edge auth keys create --role owner`" message instead
+    /// of a generic 403. `--yes` is required to confirm — the
+    /// cascade is irreversible (artifact blobs, env rows, active
+    /// deployments, plus a `task_purge` outbox row that tears
+    /// down per-app KV/cache/scheduler dirs on every worker,
+    /// per issue #569). Issue #573.
+    Delete {
+        /// Name of the app to delete.
+        name: String,
+        /// Confirm destructive action (irreversible cascade).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -838,6 +859,9 @@ fn main() -> Result<()> {
             Some(AppsCommand::Get { name }) => commands::apps::get(&cli.path, &name),
             Some(AppsCommand::Create { name, description }) => {
                 commands::apps::create(&cli.path, &name, description.as_deref())
+            }
+            Some(AppsCommand::Delete { name, yes }) => {
+                commands::apps::delete(&cli.path, &name, yes)
             }
         },
         Command::Rollback {
