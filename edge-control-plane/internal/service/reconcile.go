@@ -381,7 +381,6 @@ func (s *ReconcileService) reconcileTenant(ctx context.Context, tenantID string,
 			envMap,
 			allowlist,
 			maxMemoryMB,
-			j.Protocol, // issue #548: read from apps.value->>'protocol' JOIN; empty → HTTP default
 		)
 
 		regions := []string(j.Regions)
@@ -564,7 +563,6 @@ func (s *ReconcileService) BuildFullSync(ctx context.Context, tenantID, region s
 			envMap,
 			allowlist,
 			maxMemoryMB,
-			j.Protocol, // issue #548 — see sibling call site above
 		)
 	}
 	return out, nil

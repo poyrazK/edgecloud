@@ -116,7 +116,6 @@ func (b *publishBuilder) buildPublishPayload(
 		envMap,
 		tenant.AllowlistedDestinations,
 		maxMemoryMB,
-		deployment.Protocol, // issue #548 — drives per-app socket_mode
 	)
 
 	msg := &nats.TaskMessage{

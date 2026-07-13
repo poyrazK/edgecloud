@@ -493,7 +493,7 @@ var wantTypes = map[string]map[string]string{
 		"name":           "text",
 		"description":    "text", // nullable
 		"created_at":     "timestamptz",
-		"l4_public_port": "int4", // 035_l4_public_port (issue #548)
+		"l4_public_port": "integer", // 035_l4_public_port (issue #548)
 	},
 	"logs": {
 		"id":            "int8", // BIGSERIAL — serial-ness in default, type is int8

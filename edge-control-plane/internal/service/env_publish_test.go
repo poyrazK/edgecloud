@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -98,7 +97,7 @@ func TestEnvService_SetEnv_PublishesIfActive(t *testing.T) {
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
 	// 3. deploymentRepo.GetByID
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -191,7 +190,7 @@ func TestEnvService_SetEnv_DisabledTenant(t *testing.T) {
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -245,7 +244,7 @@ func TestEnvService_DeleteEnv_PublishesIfActive(t *testing.T) {
 			"tenant_id", "app_name", "deployment_id",
 			"last_good_deployment_id", "auto_rollback_enabled",
 		}).AddRow(tenantID, appName, deploymentID, nil, false))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at, COALESCE(apps.value->>'protocol', 'http') AS protocol FROM deployments d LEFT JOIN apps ON apps.value->>'tenant_id' = d.tenant_id AND apps.value->>'app_name' = d.app_name WHERE d.id = $1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`)).
 		WithArgs(deploymentID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "app_name", "status", "hash", "regions", "created_at",
@@ -341,56 +340,15 @@ func TestBuildPublishPayload_Shape(t *testing.T) {
 	}
 }
 
-// TestBuildPublishPayload_SocketModePropagated locks the issue #548
-// wiring: when an activate path calls buildPublishPayload with a
-// deployment whose Protocol="tcp", the marshaled AppConfig MUST
-// carry `socket_mode:"allow-all"` (computed via
-// nats.SocketModeForProtocol). Without this regression guard, a
-// future refactor of buildPublishPayload / BuildAppConfig that
-// drops the protocol-driven stamping would silently regress the
-// entire L4 chain — the worker would BlockAll-bind a tcp server
-// and the failure mode would be "no traffic, no error".
-func TestBuildPublishPayload_SocketModePropagated(t *testing.T) {
-	tenantID, appName, deploymentID := "t_l4", "hello-tcp", "d_l4"
-
-	b := NewPublishBuilder()
-	dep := &domain.Deployment{
-		Hash:         "h",
-		Signature:    "sig",
-		SigningKeyID: "default",
-		// Issue #548: protocol="tcp" is the activate-path input that
-		// drives nats.SocketModeForProtocol → "allow-all".
-		Protocol: "tcp",
-	}
-	tenant := &domain.Tenant{
-		ID:                      tenantID,
-		Name:                    "T",
-		Plan:                    "pro",
-		AllowlistedDestinations: nil,
-	}
-	quota := &domain.Quota{TenantID: tenantID, MaxMemoryMB: 256}
-	payload, err := b.buildPublishPayload(context.Background(), tenantID, appName,
-		deploymentID, dep, tenant, []string{"fra"}, quota, map[string]string{},
-	)
-	if err != nil {
-		t.Fatalf("buildPublishPayload: %v", err)
-	}
-	var msg nats.TaskMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		t.Fatalf("unmarshal TaskMessage: %v", err)
-	}
-	app, ok := msg.Apps[appName]
-	if !ok {
-		t.Fatalf("msg.Apps[%q] missing; got %v", appName, msg.Apps)
-	}
-	if app.SocketMode != "allow-all" {
-		t.Errorf("app.SocketMode = %q, want %q (issue #548 L4 stamping)", app.SocketMode, "allow-all")
-	}
-	// And it should also be visible on the raw JSON — the worker
-	// decoder only sees what hits the wire, not just the Go struct
-	// (regression guard against an `omitempty` regression that would
-	// silently drop the field for non-empty values).
-	if !strings.Contains(string(payload), `"socket_mode":"allow-all"`) {
-		t.Errorf("marshaled payload missing socket_mode=allow-all: %s", payload)
-	}
-}
+// TestBuildPublishPayload_SocketModePropagated was the issue #548
+// regression guard that asserted socket_mode:allow-all is stamped
+// on the AppConfig when an activate passes Protocol=tcp. The
+// CP-side protocol-driven socket_mode stamping was reverted in the
+// post-merge fixes because the activation-time Protocol source
+// required an apps-table schema column that did not exist (the
+// JOIN silently referenced a non-existent apps.value JSONB
+// column). L4 bind() gating now lives on the worker side: it
+// reads EDGE_PROTOCOL from spec.env and self-derives socket_mode
+// (see edge-worker/src/supervisor.rs::start_app). This test was
+// removed pending a follow-up that wires protocol from the CLI
+// deploy manifest through to BuildAppConfig. Tracked separately.

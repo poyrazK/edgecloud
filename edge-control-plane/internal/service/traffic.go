@@ -247,7 +247,6 @@ func (s *TrafficService) publishClearTaskUpdate(ctx context.Context, tenantID, a
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
-				dep.Protocol, // issue #548: thread through to per-app socket_mode
 				// no routes — legacy single-deployment shape
 			),
 		},
@@ -315,7 +314,6 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 	// routes share the same env/allowlist/max_memory from the app config.
 	var primaryHash string
 	var primarySigningKeyID string // issue #307 PR1
-	var primaryProtocol string     // issue #548: stamp socket_mode for the primary canary route
 	routes := make([]nats.DeploymentRoute, len(splits))
 	for i, sp := range splits {
 		d, ok := deployments[sp.DeploymentID]
@@ -335,12 +333,6 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 			// SigningKeyID reflects the same key used for the
 			// primary route (issue #307 PR1).
 			primarySigningKeyID = d.SigningKeyID
-			// Capture the primary's protocol so the top-level
-			// AppConfig gets the right per-app socket_mode. Canary
-			// splits are homogeneous by deployment (issue #294
-			// constrains deployments[sp.DeploymentID] to one app),
-			// so reading from the primary is sufficient.
-			primaryProtocol = d.Protocol
 		}
 	}
 
@@ -376,7 +368,6 @@ func (s *TrafficService) publishTaskUpdate(ctx context.Context, tenantID, appNam
 				envMap,
 				tenant.AllowlistedDestinations,
 				maxMemoryMB,
-				primaryProtocol, // issue #548: canary primary carries the protocol; secondary routes inherit
 				routes...,
 			),
 		},

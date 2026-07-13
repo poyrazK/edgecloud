@@ -2208,7 +2208,6 @@ func (s *DeploymentService) RepublishActiveDeployments(ctx context.Context, tena
 					envMap,
 					tenant.AllowlistedDestinations,
 					maxMemoryMB,
-					deployment.Protocol, // issue #548: threaded via GetByID JOIN on apps
 				),
 			},
 		}

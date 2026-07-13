@@ -55,19 +55,7 @@ func (r *DeploymentRepository) Create(ctx context.Context, d *domain.Deployment)
 
 func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.Deployment, error) {
 	var d domain.Deployment
-	// Issue #548: join apps to fetch the app's protocol so the
-	// activate / env-write paths can stamp `socket_mode="allow-all"`
-	// for L4 deployments via `nats.SocketModeForProtocol`. The
-	// join matches `apps.value->>'deployment_id'` (= our `id`) so
-	// the same deployment always sees the same protocol even if
-	// the active_deployments row has moved on.
-	query := `SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at,
-		         COALESCE(apps.value->>'protocol', 'http') AS protocol
-		    FROM deployments d
-		    LEFT JOIN apps
-		      ON apps.value->>'tenant_id' = d.tenant_id
-		     AND apps.value->>'app_name'  = d.app_name
-		   WHERE d.id = $1`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE id = $1`
 	err := r.db.GetContext(ctx, &d, query, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -77,28 +65,14 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id string) (*domain.
 
 func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at,
-		         COALESCE(apps.value->>'protocol', 'http') AS protocol
-		    FROM deployments d
-		    LEFT JOIN apps
-		      ON apps.value->>'tenant_id' = d.tenant_id
-		     AND apps.value->>'app_name'  = d.app_name
-		   WHERE d.tenant_id = $1 AND d.app_name = $2
-		   ORDER BY d.created_at DESC`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName)
 	return deployments, err
 }
 
 func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT d.id, d.tenant_id, d.app_name, d.status, d.hash, d.regions, d.created_at, d.auto_rollback_enabled, d.signature, d.signing_key_id, d.build_attestation, d.desired_replicas, d.preview_id, d.preview_pr_number, d.preview_expires_at,
-		         COALESCE(apps.value->>'protocol', 'http') AS protocol
-		    FROM deployments d
-		    LEFT JOIN apps
-		      ON apps.value->>'tenant_id' = d.tenant_id
-		     AND apps.value->>'app_name'  = d.app_name
-		   WHERE d.tenant_id = $1 AND d.app_name = $2
-		   ORDER BY d.created_at DESC LIMIT $3 OFFSET $4`
+	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
 	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
 	return deployments, err
 }
