@@ -19,9 +19,17 @@ help:                   ## Show this help.
 # ----- Infrastructure (Postgres + NATS) -----
 
 infra-up:              ## Start Postgres + NATS in the background.
-	docker compose up -d
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
+	@if grep -Eq '^POSTGRES_PASSWORD=edgecloud([[:space:]]|$$)' .env; then \
+		echo "warning: POSTGRES_PASSWORD in .env is the dev default; override before any non-local use."; \
+	fi
+	set -a; . ./.env; set +a; \
+	  docker compose up -d
 	@echo ""
-	@echo "Postgres: localhost:5432  (user/pass/db: edgecloud)"
+	@echo "Postgres: localhost:5432  (user/db from .env; password from .env — dev default if unchanged)"
 	@echo "NATS:      nats://localhost:4222  (JetStream enabled; monitoring on :8222)"
 
 infra-down:            ## Stop the infra containers (keeps the Postgres volume).
@@ -38,10 +46,15 @@ infra-ps:              ## Show container status.
 # a clean slate (e.g. adding a NOT NULL on a column with existing
 # rows in your dev DB).
 infra-reset:           ## Stop infra, wipe Postgres volume, re-apply migrations.
+	@if [ ! -f .env ]; then \
+		echo "error: .env not found. Copy .env.example:  cp .env.example .env" >&2; \
+		exit 1; \
+	fi
+	set -a; . ./.env; set +a
 	docker compose down -v
 	docker compose up -d
 	@echo "Waiting for Postgres to accept connections..."
-	@until docker compose exec -T postgres pg_isready -U edgecloud -d edgecloud; do sleep 1; done
+	@until docker compose exec -T postgres pg_isready -U ${POSTGRES_USER:-edgecloud} -d ${POSTGRES_DB:-edgecloud}; do sleep 1; done
 	$(MAKE) migrate
 
 # ----- Migrations (against the running infra) -----

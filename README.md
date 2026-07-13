@@ -105,6 +105,9 @@ Integration tests self-skip without Docker — see [CLAUDE.md](./CLAUDE.md#build
 
 **Terminal 1 — Infrastructure:**
 ```sh
+# First run only: copy the dev defaults (`.env` is gitignored).
+cp .env.example .env
+
 make infra-up      # Postgres :5432 + NATS :4222 in the background
 ```
 
@@ -134,6 +137,18 @@ make run-worker    # starts edge-worker
 # Ingress (separate terminal):
 cargo run --bin edge-ingress
 ```
+
+### Local Postgres password
+
+The Postgres password is no longer hardcoded. On first run:
+
+```sh
+cp .env.example .env       # one-time; .env is gitignored
+# (optional) edit .env and change POSTGRES_PASSWORD / DATABASE_PASSWORD
+make infra-up              # Makefile auto-sources .env via `set -a; . ./.env; set +a`
+```
+
+`docker compose` will refuse to start without `POSTGRES_PASSWORD` set in `.env` (strict-fail via `${VAR:?msg}`). The control plane binary additionally fails closed at startup if `DATABASE_PASSWORD` is empty or matches a known placeholder (`edgecloud`, `postgres`, `changeme`, ...) — this catches the case where `.env.example` was copied verbatim into a non-local environment. CI uses its own ephemeral `POSTGRES_PASSWORD=test` and is unaffected.
 
 ### Seeding test data
 
