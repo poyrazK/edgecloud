@@ -147,7 +147,7 @@ func TestMigrationHandler_Migrate_Success(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	source := `#include <stdio.h>
 int main() { return 0; }`
@@ -176,7 +176,7 @@ func TestMigrationHandler_Migrate_MissingFile(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	// Build multipart without a "file" field
 	body := &bytes.Buffer{}
@@ -216,7 +216,7 @@ func TestMigrationHandler_Migrate_AcceptsRustLanguage(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	source := `fn main() {}`
 	req, err := makeMigrationReq("hello.rs", "rust", source)
@@ -237,7 +237,7 @@ func TestMigrationHandler_Migrate_RejectsUnknownLanguage(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -271,7 +271,7 @@ func TestMigrationHandler_Migrate_NoMultipart(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	req := httptest.NewRequest("POST", "/api/migrate", strings.NewReader("not multipart"))
 	req.Header.Set("Content-Type", "text/plain")
@@ -289,7 +289,7 @@ func TestMigrationHandler_Migrate_MissingTenantID(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	source := `#include <stdio.h>
 int main() { return 0; }`
@@ -311,7 +311,7 @@ func TestMigrationHandler_Migrate_PathTraversalFilename(t *testing.T) {
 	repo := &mockDeploymentRepo{}
 	store := &mockArtifactStore{}
 	svc := service.NewMigrationService(repo, store, "edge-migrate", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	source := `#include <stdio.h>
 int main() { return 0; }`
@@ -381,7 +381,7 @@ func withTenantID(req *http.Request, tenantID string) *http.Request {
 
 func TestMigrateTree_RejectsMissingTenantID(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`, map[string]string{"main.c": "int main(){}"})
 	rr := httptest.NewRecorder()
 	h.MigrateTree(rr, req)
@@ -392,7 +392,7 @@ func TestMigrateTree_RejectsMissingTenantID(t *testing.T) {
 
 func TestMigrateTree_RejectsBadAppName(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	for _, bad := range []string{"../traversal", "Bad-Name", "a/b", ""} {
 		req := makeTreeReq(t, bad, "c", `{"files":["main.c"]}`, map[string]string{"main.c": "x"})
 		req = withTenantID(req, "t_1")
@@ -406,7 +406,7 @@ func TestMigrateTree_RejectsBadAppName(t *testing.T) {
 
 func TestMigrateTree_RejectsMissingAppName(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// Make a request without an app_name field.
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
@@ -435,7 +435,7 @@ func TestMigrateTree_RejectsRustLanguage(t *testing.T) {
 	// /api/v1/migrate (TestMigrationHandler_Migrate_AcceptsRustLanguage
 	// above).
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "rust", `{"files":["main.rs"]}`, map[string]string{"main.rs": "fn main(){}"})
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
@@ -450,7 +450,7 @@ func TestMigrateTree_RejectsRustLanguage(t *testing.T) {
 
 func TestMigrateTree_RejectsUnknownLanguage(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "python", `{"files":["main.py"]}`, map[string]string{"main.py": "x"})
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
@@ -470,7 +470,7 @@ func TestMigrateTree_AcceptsRsInZipVariant(t *testing.T) {
 	// the service is stubbed and will 500 if it tries to run the
 	// toolchain, which is acceptable for this assertion).
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	var zipBuf bytes.Buffer
 	zw := zip.NewWriter(&zipBuf)
@@ -513,7 +513,7 @@ func TestMigrateTree_AcceptsRsInZipVariant(t *testing.T) {
 
 func TestMigrateTree_RejectsManifestMismatch(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// Manifest declares 2 files, but only 1 file part.
 	req := makeTreeReq(t, "hello", "c",
 		`{"files":["main.c","helper.c"]}`,
@@ -528,7 +528,7 @@ func TestMigrateTree_RejectsManifestMismatch(t *testing.T) {
 
 func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// Manifest references a path with `..`.
 	req := makeTreeReq(t, "hello", "c",
 		`{"files":["../etc/passwd"]}`,
@@ -543,7 +543,7 @@ func TestMigrateTree_RejectsPathTraversal(t *testing.T) {
 
 func TestMigrateTree_RejectsTooManyFiles(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// Build a manifest with maxTreeFiles+1 entries. We don't actually
 	// upload that many file parts — the mismatch is caught first, so
 	// we use a count over the limit in a valid manifest.
@@ -586,7 +586,7 @@ func itoa(i int) string {
 
 func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// Build a valid multipart body that's over the cap, but stream
 	// it through io.Pipe + zeroReader so we never allocate the full
 	// ~50 MiB up front. The multipart envelope (form fields + part
@@ -620,7 +620,7 @@ func TestMigrateTree_RejectsOversizedBody(t *testing.T) {
 
 func TestMigrateTree_RejectsMissingTree(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// No `tree` field, no `file` parts.
 	req := makeTreeReq(t, "hello", "c", "", nil)
 	req = withTenantID(req, "t_1")
@@ -633,7 +633,7 @@ func TestMigrateTree_RejectsMissingTree(t *testing.T) {
 
 func TestMigrateTree_RejectsInvalidManifestJSON(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "c", "not json", map[string]string{"main.c": "x"})
 	req = withTenantID(req, "t_1")
 	rr := httptest.NewRecorder()
@@ -658,7 +658,7 @@ func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
 		&mockDeploymentRepo{}, &mockArtifactStore{},
 		"/this/binary/does/not/exist", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit",
 		signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "c", `{"files":["main.c"]}`,
 		map[string]string{"main.c": "int main(){return 0;}\n"})
 	req = withTenantID(req, "t_1")
@@ -693,7 +693,7 @@ func TestMigrateTree_PerFileTransformFailure_Status422(t *testing.T) {
 // in line.
 func TestMigrateTree_RejectsUnknownExtensionMultipartPart(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	// .txt is not a recognized source extension — the handler
 	// must reject it before reaching the service.
 	req := makeTreeReq(t, "hello", "c", `{"files":["notes.txt"]}`,
@@ -716,7 +716,7 @@ func TestMigrateTree_RejectsUnknownExtensionMultipartPart(t *testing.T) {
 // also says `foo.txt`).
 func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	req := makeTreeReq(t, "hello", "c", `{"files":["main.py"]}`,
 		map[string]string{"main.py": "print('hi')"})
 	req = withTenantID(req, "t_1")
@@ -738,7 +738,7 @@ func TestMigrateTree_RejectsUnknownExtensionInManifest(t *testing.T) {
 // before the per-file manifest mismatch check runs.
 func TestMigrateTree_RejectsOversizedPart(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	// Build a multipart request with a single file part of 6 MiB.
 	body := &bytes.Buffer{}
@@ -777,7 +777,7 @@ func TestMigrateTree_RejectsOversizedPart(t *testing.T) {
 // 50 MiB cap. Same threat model as the multipart per-part cap.
 func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	// Build a zip with a single 6 MiB entry.
 	var zipBuf bytes.Buffer
@@ -829,7 +829,7 @@ func TestMigrateTree_RejectsOversizedZipEntry(t *testing.T) {
 // outside the temp dir.
 func TestMigrateTree_ZipSlip(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 
 	// Build a zip containing a path-traversal entry. The zip
 	// library happily stores these names; isSafeFilePath is what
@@ -890,7 +890,7 @@ func TestMigrateTree_ZipSlip(t *testing.T) {
 // the streaming pattern's rationale.
 func TestMigrate_RejectsOversizedBody(t *testing.T) {
 	svc := service.NewMigrationService(&mockDeploymentRepo{}, &mockArtifactStore{}, "edge-migrate", "/wasi-sdk", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
-	h := NewMigrationHandler(svc)
+	h := NewMigrationHandler(svc, nil)
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
@@ -911,5 +911,309 @@ func TestMigrate_RejectsOversizedBody(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "request body too large") {
 		t.Errorf("expected 'request body too large' in body, got: %s", rr.Body.String())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// L1 handler preflight tests (issue #622, commit 3)
+//
+// These tests cover the HTTP-level wiring of the preflight scanner
+// to /api/v1/migrate and /api/v1/migrate-tree. They assert the
+// response shape (HTTP 422 + code=PREFLIGHT_DENIED + details envelope)
+// and that the migration service is NOT invoked — the regex fires
+// before any subprocess would spawn. The pre-pass unit tests in
+// migration_preflight_test.go cover the regex set; these tests
+// cover the HTTP boundary.
+//
+// Service invocation is asserted indirectly: a preflight reject
+// returns BEFORE the service is called, so the body shape carries
+// `rejected_at: "preflight"` and there is no `MigrationReport`
+// envelope. If a future refactor accidentally wires the preflight
+// after the service, these tests fail because the service either
+// returns its own 422 (analyzer-rejected, with SECURITY_DENY:* in
+// errors[]) or returns 200 with a structured report.
+// ─────────────────────────────────────────────────────────────────────
+
+// assertPreflightRejected decodes the 422 body and asserts the
+// preflight envelope shape (code=PREFLIGHT_DENIED, rejected_at:
+// "preflight", matches non-empty). Returns the decoded
+// `matches` array so the caller can assert pattern-specific
+// details.
+func assertPreflightRejected(t *testing.T, rr *httptest.ResponseRecorder, expectedLang string) []map[string]any {
+	t.Helper()
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected status 422, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v: %s", err, rr.Body.String())
+	}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing 'error' object in body: %+v", body)
+	}
+	if errObj["code"] != "PREFLIGHT_DENIED" {
+		t.Errorf("error.code = %v, want PREFLIGHT_DENIED", errObj["code"])
+	}
+	if body["rejected_at"] != "preflight" {
+		t.Errorf("rejected_at = %v, want preflight", body["rejected_at"])
+	}
+	if body["language"] != expectedLang {
+		t.Errorf("language = %v, want %s", body["language"], expectedLang)
+	}
+	matches, ok := body["matches"].([]any)
+	if !ok {
+		t.Fatalf("matches is not an array: %T (%v)", body["matches"], body["matches"])
+	}
+	if len(matches) == 0 {
+		t.Fatalf("matches is empty: %+v", body)
+	}
+	out := make([]map[string]any, len(matches))
+	for i, m := range matches {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("matches[%d] is not an object: %T", i, m)
+		}
+		out[i] = mm
+	}
+	return out
+}
+
+// newHandlerWithMockSvc builds a MigrationHandler with a real
+// MigrationService pointed at a fake `edge-migrate` path. The fake
+// path doesn't matter for the preflight tests because the handler
+// must short-circuit before invoking the service — but the
+// constructor still requires a non-empty binary path. We point at
+// `/bin/false` so a future regression that skips preflight surfaces
+// as a service-level error (5xx) instead of an unrelated crash.
+func newHandlerWithMockSvc(t *testing.T) *MigrationHandler {
+	t.Helper()
+	repo := &mockDeploymentRepo{}
+	store := &mockArtifactStore{}
+	svc := service.NewMigrationService(repo, store, "/bin/false", "/usr/local/wasi-sdk/bin", "rustc", "wasm-tools", "cargo", "/tmp/edge-mock-wit", signing.TestKeyring(t))
+	return NewMigrationHandler(svc, nil)
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsIncludeBytes_Rust(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `const LEAK: &[u8] = include_bytes!("/etc/edgecloud/signing.key");
+fn main() {}
+`
+	req, err := makeMigrationReq("evil.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "rust")
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(matches))
+	}
+	if matches[0]["pattern"] != preflightReasonIncludeBytes {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonIncludeBytes)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsEnvMacro(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `const JWT: &str = env!("JWT_SECRET");
+fn main() {}
+`
+	req, err := makeMigrationReq("evil.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "rust")
+	if matches[0]["pattern"] != preflightReasonEnvMacro {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonEnvMacro)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsEmbed_C(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `#embed "/etc/edgecloud/signing.key"
+int main(void) { return 0; }
+`
+	req, err := makeMigrationReq("evil.c", "c", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	if matches[0]["pattern"] != preflightReasonEmbed {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonEmbed)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightRejectsAbsoluteInclude_C(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `#include "/etc/passwd"
+int main(void) { return 0; }
+`
+	req, err := makeMigrationReq("evil.c", "c", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	if matches[0]["pattern"] != preflightReasonAbsoluteIncl {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonAbsoluteIncl)
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsBenignRust(t *testing.T) {
+	// Benign source must NOT short-circuit at preflight — the
+	// response should be something OTHER than 422 PREFLIGHT_DENIED.
+	// We don't assert 200 here because the service is wired to
+	// /bin/false and will fail; the test just confirms preflight
+	// didn't fire.
+	h := newHandlerWithMockSvc(t)
+
+	source := `fn main() { println!("hi"); }`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	// Anything other than a 422 PREFLIGHT_DENIED envelope is fine.
+	// The /bin/false edge-migrate will return 500 because the
+	// service tries to spawn it. What we MUST NOT see is the
+	// preflight envelope.
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("benign source should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsComment(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `// include_bytes!("/etc/passwd") is forbidden.
+fn main() {}
+`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("comment-only text should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_Migrate_PreflightAllowsVariableNamedEnv(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	source := `fn main() {
+    let env = "rust_var_named_env";
+    println!("{}", env);
+}
+`
+	req, err := makeMigrationReq("benign.rs", "rust", source)
+	if err != nil {
+		t.Fatalf("makeMigrationReq: %v", err)
+	}
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.Migrate(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("bare identifier `env` should not preflight-reject: %+v", body)
+		}
+	}
+}
+
+func TestMigrationHandler_MigrateTree_PreflightRejectsAcrossTree(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	manifest := `{"files":["main.c","evil.c"]}`
+	files := map[string]string{
+		"main.c": `int main(void) { return 0; }
+`,
+		"evil.c": `#include "/etc/edgecloud/signing.key"
+`,
+	}
+	req := makeTreeReq(t, "evilapp", "c", manifest, files)
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+
+	matches := assertPreflightRejected(t, rr, "c")
+	// The exact match count depends on how many per-file hits we
+	// surface; we bail on the first file with a hit, so we expect
+	// at least one match with the offending path populated.
+	if len(matches) == 0 {
+		t.Fatalf("expected at least one match, got 0")
+	}
+	if matches[0]["path"] == nil || matches[0]["path"] == "" {
+		t.Errorf("expected path populated for tree match, got %v", matches[0])
+	}
+	if matches[0]["pattern"] != preflightReasonAbsoluteIncl {
+		t.Errorf("pattern = %v, want %s", matches[0]["pattern"], preflightReasonAbsoluteIncl)
+	}
+}
+
+func TestMigrationHandler_MigrateTree_PreflightAllowsBenign(t *testing.T) {
+	h := newHandlerWithMockSvc(t)
+
+	manifest := `{"files":["main.c","util.c"]}`
+	files := map[string]string{
+		"main.c": `int main(void) { return 0; }
+`,
+		"util.c": `#include <stdio.h>
+`,
+	}
+	req := makeTreeReq(t, "benignapp", "c", manifest, files)
+	req = req.WithContext(middleware.WithTenantID(context.Background(), "tenant-test"))
+
+	rr := httptest.NewRecorder()
+	h.MigrateTree(rr, req)
+
+	if rr.Code == http.StatusUnprocessableEntity {
+		var body map[string]any
+		_ = json.NewDecoder(rr.Body).Decode(&body)
+		if body["rejected_at"] == "preflight" {
+			t.Errorf("benign tree should not preflight-reject: %+v", body)
+		}
 	}
 }

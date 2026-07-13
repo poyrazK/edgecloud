@@ -23,6 +23,7 @@ func TestWrite_StatusCodeMapping(t *testing.T) {
 		{"InternalError", CodeInternalError, http.StatusInternalServerError},
 		{"PayloadTooLarge", CodePayloadTooLarge, http.StatusRequestEntityTooLarge},
 		{"BadGateway", CodeBadGateway, http.StatusBadGateway},
+		{"PreflightDenied", CodePreflightDenied, http.StatusUnprocessableEntity},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,6 +107,10 @@ func TestCtxVariants_PopulateRequestID(t *testing.T) {
 		{
 			"BadGatewayCtx",
 			func(w http.ResponseWriter) { BadGatewayCtx(w, r, "upstream down", nil) },
+		},
+		{
+			"PreflightDeniedCtx",
+			func(w http.ResponseWriter) { PreflightDeniedCtx(w, r, "compile-time host-reach macro detected", nil) },
 		},
 	}
 	for _, tt := range tests {

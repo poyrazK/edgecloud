@@ -11,6 +11,7 @@
 
 use crate::patterns::{BoundVarDecl, PatternKind, PatternMatch, PosixPattern, Transformability};
 use crate::preprocessor::{Preprocessor, PreprocessorInfo};
+use crate::report::ErrorInfo;
 use tree_sitter::Parser;
 
 /// Filename hint passed to `Preprocessor::expand` so clang's
@@ -819,6 +820,378 @@ fn classify_socket_declaration_context(
 impl Default for CAnalyzer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Stable, machine-readable error code emitted by
+/// [`pre_pass_deny_c`] on every rejection. Mirrors
+/// `DENY_CODE_RUST_MACRO` on the Rust side (issue #622). The Go control
+/// plane mirrors the constant in
+/// `edge-control-plane/internal/service/migration.go::denyCodeCInclude`
+/// and the production short-circuit guard branches on the
+/// `SECURITY_DENY:*` prefix (commit 1's contract).
+pub const DENY_CODE_C_INCLUDE: &str = "SECURITY_DENY:C_INCLUDE";
+
+/// C pre-pass deny scan for issue #622 — block all host-reach
+/// `#include` and `#embed` directives before tree-sitter parsing
+/// (which would otherwise run unblocked against `clang`'s stdin via
+/// `--analyze-json` or the single-file `--transform` path).
+///
+/// Returns one [`ErrorInfo`] per violation. An empty `Vec` means
+/// the source is clean — callers proceed with `CAnalyzer::analyze`
+/// as usual.
+///
+/// Policy (fail-closed):
+/// - **`<…>` and `"…"` includes** that resolve to an **absolute
+///   path** (`/etc/passwd`, `C:\…`) — denied.
+/// - **`<…>` and `"…"` includes** that contain a `..` segment
+///   (`../foo`, `foo/../bar`, `foo/..`) — denied. The `..` form
+///   escapes any project-relative base, even if the leading
+///   component looks innocuous.
+/// - **`<…>` includes** that don't start with `/` and don't contain
+///   `..` — ALLOWED (system header lookup is fine on wasi-sdk
+///   sysroot once commit 5 lands `-nostdinc --sysroot`).
+/// - **`"…"` includes** that are project-relative (no leading `/`,
+///   no `..`) — ALLOWED. Tree mode's per-tree tmpdir mount makes
+///   these safe.
+/// - **Any `#embed`** — denied. The C23 `#embed` form was designed
+///   for relative resource files; allowing it in the analyzer would
+///   let a hostile tenant exfiltrate host files before L4 hardening
+///   lands in commit 5.
+///
+/// Implementation note: a hand-rolled line scan, not regex, so the
+/// crate stays dep-light (the workspace already pulls `regex` for
+/// other crates, but this lib does not need it). Cheaper, faster,
+/// and (for a single-line directive grammar) no less correct. The
+/// `unsafe` is bounded to `#`-directive lines, not arbitrary text.
+///
+/// **Limitation (v1):** directives hidden inside multi-line macros
+/// (`#define INCLUDE_FILE "/etc/passwd"\n#include INCLUDE_FILE`)
+/// are not caught here — the preprocessor would have to expand
+/// first, and v1 was deliberately conservative (no clang
+/// preprocessor in this lib's deny path; commit 4's env-scrub +
+/// commit 5's clang hardening are independent defenses).
+pub fn pre_pass_deny_c(source: &str) -> Vec<ErrorInfo> {
+    let mut errors: Vec<ErrorInfo> = Vec::new();
+    for (idx, raw_line) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        // Strip the leading `#` and whitespace so we can tokenize
+        // the directive keyword. `#  include   "/etc/passwd"` is
+        // legal C.
+        let after_hash = trimmed[1..].trim_start();
+
+        // Match `#include` (any whitespace between `#`, `include`,
+        // and the path argument).
+        if let Some(rest) = strip_directive_keyword(after_hash, "include") {
+            if let Some((path, kind)) = extract_include_path(rest) {
+                if let Some(err) = check_include_path(line_no, path, kind, raw_line) {
+                    errors.push(err);
+                }
+            }
+            continue;
+        }
+
+        // Match `#embed` — any `#embed` directive is denied; the
+        // path argument (if present) is irrelevant.
+        if strip_directive_keyword(after_hash, "embed").is_some() {
+            errors.push(embed_deny(line_no, raw_line));
+        }
+    }
+    errors
+}
+
+/// If `s` starts with `keyword` followed by ASCII whitespace or the
+/// end of string, return the suffix past the keyword + its
+/// separator. Otherwise return `None`. Case-sensitive — C
+/// preprocessor keywords are case-sensitive (ISO C 9899:2018 §6.10).
+fn strip_directive_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    if !s.starts_with(keyword) {
+        return None;
+    }
+    let after = &s[keyword.len()..];
+    let next = after.chars().next();
+    match next {
+        None => Some(after),
+        Some(c) if c.is_whitespace() => Some(after),
+        _ => None,
+    }
+}
+
+/// Parse the include path argument out of a directive tail. Returns
+/// the path string and `Some("quoted")` for `"foo"` or
+/// `Some("angled")` for `<foo>`; returns `None` if the directive
+/// doesn't carry a recognizable path token (e.g. macro-include
+/// `#include FOO`).
+fn extract_include_path(rest: &str) -> Option<(&str, &'static str)> {
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    let (close, kind) = match bytes.first()? {
+        b'"' => (b'"', "quoted"),
+        b'<' => (b'>', "angled"),
+        _ => return None,
+    };
+    let tail = &rest.as_bytes()[1..];
+    let close_pos = tail.iter().position(|&b| b == close).map(|p| p + 1)?;
+    let path = &rest[1..close_pos];
+    Some((path, kind))
+}
+
+/// Decide whether an include path should be denied. Returns
+/// `Some(ErrorInfo)` if the path violates the policy, `None` if it
+/// passes.
+fn check_include_path(line_no: usize, path: &str, kind: &str, raw_line: &str) -> Option<ErrorInfo> {
+    if is_deny_c_path(path) {
+        Some(include_deny(line_no, path, kind, raw_line))
+    } else {
+        None
+    }
+}
+
+/// True iff the path is an absolute reference or contains a `..`
+/// segment that escapes the project-relative root.
+fn is_deny_c_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // Absolute path — `/etc/passwd` on POSIX, `C:\foo` on Windows.
+    // The control plane runs on POSIX, but be liberal in what we
+    // reject: a hostile tenant could craft a path that resolves
+    // differently on operator hosts. Reject any leading `/` or a
+    // drive-letter prefix.
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        return true;
+    }
+    // Traversal — any path component equal to `..` (POSIX path
+    // canonicalization treats `./..`, `..`, and `a/..` all the
+    // same). We split on `/` AND `\` for portability.
+    let mut saw_traversal = false;
+    for component in path.split(['/', '\\']) {
+        if component == ".." {
+            saw_traversal = true;
+            break;
+        }
+    }
+    saw_traversal
+}
+
+fn include_deny(line_no: usize, path: &str, kind: &str, raw_line: &str) -> ErrorInfo {
+    ErrorInfo {
+        line: line_no,
+        message: format!(
+            "host-reach #include ({} form) of `{}` is not permitted in migrated C source — the path would resolve against the host filesystem at compile time (issue #622). Source line: `{}`",
+            kind, path, raw_line.trim()
+        ),
+        code: Some(DENY_CODE_C_INCLUDE.to_string()),
+    }
+}
+
+fn embed_deny(line_no: usize, raw_line: &str) -> ErrorInfo {
+    ErrorInfo {
+        line: line_no,
+        message: format!(
+            "host-reach `#embed` is not permitted in migrated C source — it resolves against the host filesystem at compile time (issue #622). Source line: `{}`",
+            raw_line.trim()
+        ),
+        code: Some(DENY_CODE_C_INCLUDE.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod deny_tests {
+    use super::*;
+
+    #[test]
+    fn test_deny_absolute_quoted_include() {
+        let src = r#"#include "/etc/edgecloud/signing.key""#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+        assert!(errs[0].message.contains("/etc/edgecloud/signing.key"));
+    }
+
+    #[test]
+    fn test_deny_absolute_angled_include() {
+        let src = r#"#include </etc/passwd>"#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_traversal_include_double_dot() {
+        let src = r#"#include "../../etc/shadow""#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+        assert!(errs[0].message.contains(".."));
+    }
+
+    #[test]
+    fn test_deny_traversal_in_angled_include() {
+        let src = r#"#include <../stdlib.h>"#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_any_embed() {
+        let src = r#"#embed "/etc/edgecloud/jwt_secret""#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_relative_embed_also_caught() {
+        // Even a project-relative embed is denied — #embed was
+        // designed for bundling binary resources; on the migration
+        // tree path the per-tree mount makes it safe in theory, but
+        // v1 policy is "deny all embeds" until tree-mode scoping
+        // lands (mirrors include_str! follow-up #672).
+        let src = r#"#embed "data.bin""#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_multiple_sites_all_reported() {
+        let src = r#"
+#include <stdio.h>
+#include "/etc/passwd"
+#include "../shadow"
+#include <wasi/sockets.h>
+#embed "config.json"
+"#;
+        let errs = pre_pass_deny_c(src);
+        // Three denies: absolute + traversal + embed. The stdio/wasi
+        // includes are allowed (system-header lookups).
+        let deny_lines: Vec<usize> = errs.iter().map(|e| e.line).collect();
+        assert_eq!(
+            deny_lines.len(),
+            3,
+            "expected three errors at the offending lines, got {:?}",
+            errs
+        );
+        assert!(errs
+            .iter()
+            .all(|e| e.code.as_deref() == Some(DENY_CODE_C_INCLUDE)));
+    }
+
+    #[test]
+    fn test_deny_system_header_angled_is_allowed() {
+        let src = r#"#include <stdio.h>"#;
+        let errs = pre_pass_deny_c(src);
+        assert!(
+            errs.is_empty(),
+            "stdio.h must not trigger the deny-list, got {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_deny_relative_quoted_include_is_allowed() {
+        let src = r#"#include "relative.h""#;
+        let errs = pre_pass_deny_c(src);
+        assert!(
+            errs.is_empty(),
+            "relative quoted include must not trigger the deny-list, got {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_comment_with_include_keyword() {
+        // // #include "/etc/passwd" — comment line, must NOT match.
+        // Our line scan keys off `trimmed.starts_with('#')` so a
+        // leading `//` keeps us from even entering the directive
+        // path. Confirms the v1 limitation does not over-match.
+        let src = r#"// #include "/etc/passwd""#;
+        let errs = pre_pass_deny_c(src);
+        assert!(
+            errs.is_empty(),
+            "comment line must not trigger, got {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_string_literal_with_include_text() {
+        // A printf that mentions "/etc/passwd" — must NOT match.
+        let src = r#"printf("would have been #include \"/etc/passwd\" if unquoted");"#;
+        let errs = pre_pass_deny_c(src);
+        assert!(
+            errs.is_empty(),
+            "string literal must not trigger, got {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_deny_macros_hidden_in_ifdef_zero_block() {
+        // In `#if 0 ... #endif` blocks, the directive is still
+        // checked at this layer. That is conservative — v1's policy
+        // is to deny on first sight, even if a future `--force`
+        // would have removed it. The operator can either rewrite
+        // the source or accept the rejection.
+        let src = r#"
+#if 0
+#include "/etc/passwd"
+#endif
+int main(void) { return 0; }
+"#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(
+            errs.len(),
+            1,
+            "even inside #if 0 the directive is checked, got {:?}",
+            errs
+        );
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_negative_include_macro_argument() {
+        // #include MACRO — macro reference, not a literal path. We
+        // can't statically resolve. v1 still passes it (no path to
+        // check). The independent clang -E preprocessor would
+        // resolve, but we deliberately DO NOT call clang here so a
+        // missing toolchain doesn't open a hole. The companion
+        // env-scrub (commit 4) + clang -nostdinc --sysroot
+        // hardening (commit 5) are the second/third lines of
+        // defense for this case.
+        let src = r#"#include MY_HEADER"#;
+        let errs = pre_pass_deny_c(src);
+        assert!(
+            errs.is_empty(),
+            "macro-include must not trigger, got {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_deny_whitespace_between_hash_and_keyword() {
+        // `#  include "/etc/passwd"` — legal C, must still match.
+        let src = "#   include   \"/etc/passwd\"";
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
+    }
+
+    #[test]
+    fn test_deny_windows_drive_letter_path() {
+        let src = r#"#include "C:\Users\admin\signing.key""#;
+        let errs = pre_pass_deny_c(src);
+        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
+        assert_eq!(errs[0].code.as_deref(), Some(DENY_CODE_C_INCLUDE));
     }
 }
 

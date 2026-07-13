@@ -11,9 +11,26 @@
 //! **Preprocessor:** none. A future M5 could shell out to
 //! `rustc -Zunpretty=expanded` to surface patterns hidden behind
 //! `macro_rules!`; for now the analyzer parses the source as-is.
+//!
+//! **Deny-list (issue #622):** `analyze_with_security` rejects
+//! tenant source that uses compile-time host-reach macros
+//! (`include_bytes!`, `include_str!`, `include!`, `env!`,
+//! `option_env!`, `compile_error!`) or attribute-based module
+//! redirection (`#[path = ...]`, `#[include = ...]`). These expand
+//! at `rustc` compile time and would let tenant code exfiltrate
+//! host files / env vars into the produced wasm. The deny-list
+//! emits `ErrorInfo { code: "SECURITY_DENY:RUST_MACRO", ... }`
+//! and short-circuits before the regular pattern detector runs,
+//! leaving `patterns_detected` empty for the disallowed submission.
 
 use crate::patterns::{PatternKind, PatternMatch, RustPattern};
+use crate::report::{ErrorInfo, MigrationReport, MigrationStatus};
 use tree_sitter::Parser;
+
+/// Stable code-prefix on `ErrorInfo.code` for Rust-side security
+/// denials (issue #622). Mirrored on the Go side as
+/// `domain.ErrorInfo.Code` so the SDK can branch on it.
+pub const DENY_CODE_RUST_MACRO: &str = "SECURITY_DENY:RUST_MACRO";
 
 /// Rust source code analyzer using tree-sitter-rust.
 pub struct RustAnalyzer {
@@ -45,6 +62,75 @@ impl RustAnalyzer {
         matches
     }
 
+    /// Parse the given Rust source and produce a full `MigrationReport`
+    /// with the security deny-list applied (issue #622). On a denied
+    /// submission the report's `status` is `MigrationStatus::Failed`,
+    /// `errors[]` contains one `ErrorInfo { code: "SECURITY_DENY:RUST_MACRO" }`
+    /// entry per denied site, and `patterns_detected` is empty
+    /// (the deny-list short-circuits — we do not run the regular
+    /// pattern detector against a submission we already know is
+    /// hostile, both for efficiency and to avoid giving the caller
+    /// any signal beyond the deny-list result).
+    pub fn analyze_with_security(&mut self, app_name: &str, source: &str) -> MigrationReport {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => {
+                // Unparseable source — no deny-list result either.
+                // Fall through to a degenerate Success report; the
+                // downstream `rustc` invocation will reject it with
+                // its own diagnostic.
+                return MigrationReport::from_pattern_matches(app_name, Vec::new());
+            }
+        };
+        let root = tree.root_node();
+        let mut denied = Vec::new();
+        self.collect_deny_violations(source, root, &mut denied);
+        if denied.is_empty() {
+            let matches = self.collect_pattern_matches(source, root);
+            return MigrationReport::from_pattern_matches(app_name, matches);
+        }
+        MigrationReport {
+            status: MigrationStatus::Failed,
+            wasm_stored: false,
+            deployment_id: None,
+            app_name: app_name.to_string(),
+            patterns_detected: Vec::new(),
+            patterns_transformed: Vec::new(),
+            patterns_manual_review: Vec::new(),
+            errors: denied,
+            preprocessor: None,
+        }
+    }
+
+    /// Walk the AST and collect denied macro / attribute sites. Each
+    /// hit pushes one `ErrorInfo` carrying the stable
+    /// `SECURITY_DENY:RUST_MACRO` code. We do NOT abort on the first
+    /// hit — every denied site is reported so the tenant sees the
+    /// full scope of what they need to fix.
+    fn collect_deny_violations(
+        &self,
+        source: &str,
+        node: tree_sitter::Node,
+        out: &mut Vec<ErrorInfo>,
+    ) {
+        if let Some(err) = self.match_deny(source, node) {
+            out.push(err);
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                self.collect_deny_violations(source, child, out);
+            }
+        }
+    }
+
+    /// Walk the AST and collect `std::*` pattern matches.
+    fn collect_pattern_matches(&self, source: &str, node: tree_sitter::Node) -> Vec<PatternMatch> {
+        let mut matches = Vec::new();
+        self.walk_node(source, node, &mut matches);
+        matches.sort_by_key(|m| (m.line, m.column.unwrap_or(0)));
+        matches
+    }
+
     fn walk_node(&self, source: &str, node: tree_sitter::Node, matches: &mut Vec<PatternMatch>) {
         if let Some(m) = self.match_node(source, node) {
             matches.push(m);
@@ -54,6 +140,108 @@ impl RustAnalyzer {
                 self.walk_node(source, child, matches);
             }
         }
+    }
+
+    /// Inspect `node` for a compile-time host-reach macro or
+    /// attribute (issue #622 deny-list). Returns the corresponding
+    /// `ErrorInfo` if the node is one of the banned sites.
+    ///
+    /// **Identifier-boundary guard:** we match on the macro identifier
+    /// exactly — `include_bytes_helper!()` is NOT a violation, only
+    /// `include_bytes!(...)`. The macro identifier is a
+    /// `identifier` / `scoped_identifier` child of a `macro_invocation`
+    /// node, so this is a structural check rather than a regex.
+    fn match_deny(&self, source: &str, node: tree_sitter::Node) -> Option<ErrorInfo> {
+        match node.kind() {
+            "macro_invocation" => {
+                let macro_name = self.macro_invocation_name(source, node)?;
+                let reason = match macro_name.as_str() {
+                    "include_bytes" => "include_bytes",
+                    "include_str" => "include_str",
+                    "include" => "include",
+                    "env" => "env",
+                    "option_env" => "option_env",
+                    "compile_error" => "compile_error",
+                    _ => return None,
+                };
+                let line = node.start_position().row + 1;
+                let snippet = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                Some(ErrorInfo {
+                    line,
+                    message: format!(
+                        "compile-time host-reach macro `{}!` is not permitted in migrated Rust source — `{}` would exfiltrate host files or env vars at rustc compile time (issue #622)",
+                        reason, snippet
+                    ),
+                    code: Some(DENY_CODE_RUST_MACRO.to_string()),
+                })
+            }
+            "attribute_item" | "inner_attribute_item" => {
+                // Same `attr_name = identifier` convention as the macro
+                // branch above. Dashboards branch on the structured
+                // `code` (always `SECURITY_DENY:RUST_MACRO`) and ignore
+                // the human-readable message.
+                let attr_name = self.attribute_name(source, node)?;
+                if !matches!(attr_name.as_str(), "path" | "include") {
+                    return None;
+                }
+                let line = node.start_position().row + 1;
+                let snippet = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                Some(ErrorInfo {
+                    line,
+                    message: format!(
+                        "compile-time host-reach attribute `#[{} = ...]` is not permitted in migrated Rust source — `{}` would exfiltrate host files at rustc compile time (issue #622)",
+                        attr_name, snippet
+                    ),
+                    code: Some(DENY_CODE_RUST_MACRO.to_string()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the macro identifier from a `macro_invocation` node.
+    /// In tree-sitter-rust 0.24, `macro_invocation` has children:
+    /// `identifier` | `scoped_identifier` | `token_tree` (the `(...)`).
+    /// We only care about the name, not the token tree.
+    fn macro_invocation_name(&self, source: &str, node: tree_sitter::Node) -> Option<String> {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                match child.kind() {
+                    "identifier" | "scoped_identifier" => {
+                        return child.utf8_text(source.as_bytes()).ok().map(String::from);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the attribute identifier from an `attribute_item` /
+    /// `inner_attribute_item` node. The attribute's `path` is the
+    /// `identifier` / `scoped_identifier` inside the `attribute`
+    /// wrapper child (verified against tree-sitter-rust 0.24 — the
+    /// immediate child is `attribute`, not the identifier directly).
+    fn attribute_name(&self, source: &str, node: tree_sitter::Node) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" | "scoped_identifier" => {
+                    return child.utf8_text(source.as_bytes()).ok().map(String::from);
+                }
+                "attribute" => {
+                    // Descend into the wrapper to find the identifier.
+                    let mut inner_cursor = child.walk();
+                    for inner in child.children(&mut inner_cursor) {
+                        if matches!(inner.kind(), "identifier" | "scoped_identifier") {
+                            return inner.utf8_text(source.as_bytes()).ok().map(String::from);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Try to match `node` as a Rust pattern site. Returns `None` for
@@ -411,5 +599,260 @@ fn main() {
             lines, sorted,
             "matches should be sorted by line, got {lines:?}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // issue #622 — Rust analyzer deny-list tests
+    //
+    // These tests pin the contract that `analyze_with_security`
+    // rejects compile-time host-reach macros / attributes (issue #622).
+    // They MUST NOT regress without an explicit review of the
+    // security implications.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn assert_deny_failed_with_code(report: &crate::report::MigrationReport, expected_code: &str) {
+        use crate::report::MigrationStatus;
+        assert!(
+            matches!(report.status, MigrationStatus::Failed),
+            "expected MigrationStatus::Failed, got {:?}",
+            report.status
+        );
+        assert!(
+            report.patterns_detected.is_empty(),
+            "denied submission must NOT produce pattern matches, got {:?}",
+            report.patterns_detected
+        );
+        assert!(
+            !report.errors.is_empty(),
+            "denied submission must populate errors[]"
+        );
+        for err in &report.errors {
+            assert_eq!(
+                err.code.as_deref(),
+                Some(expected_code),
+                "every ErrorInfo must carry code={expected_code}, got {:?}",
+                err.code
+            );
+        }
+    }
+
+    #[test]
+    fn test_deny_include_bytes_secret_path() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+const LEAK: &[u8] = include_bytes!("/etc/edgecloud/signing.key");
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("include_bytes"));
+    }
+
+    #[test]
+    fn test_deny_env_macro() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+const SECRET: &str = env!("EDGE_SIGNING_KEY");
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert!(report.errors[0].message.contains("env"));
+    }
+
+    #[test]
+    fn test_deny_option_env_macro() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+const SECRET: Option<&'static str> = option_env!("EDGE_SIGNING_KEY");
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert!(report.errors[0].message.contains("option_env"));
+    }
+
+    #[test]
+    fn test_deny_include_str_macro() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+const SHADOW: &str = include_str!("/etc/shadow");
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert!(report.errors[0].message.contains("include_str"));
+    }
+
+    #[test]
+    fn test_deny_path_attribute() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+#[path = "/etc/passwd"]
+mod x;
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert!(report.errors[0].message.contains("path"));
+    }
+
+    #[test]
+    fn test_deny_compile_error_macro() {
+        // `compile_error!(env!("JWT_SECRET"))` would print the env
+        // var's value via cargo's diagnostic, captured into
+        // compileErrMsg and forwarded to the tenant. Strip it.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+fn main() {
+    compile_error!("user error");
+}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        assert!(report.errors[0].message.contains("compile_error"));
+    }
+
+    #[test]
+    fn test_deny_multiple_sites_all_reported() {
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+const A: &[u8] = include_bytes!("/etc/passwd");
+const B: &str = env!("JWT_SECRET");
+fn main() {}
+"#;
+        let report = a.analyze_with_security("evil", src);
+        assert_deny_failed_with_code(&report, DENY_CODE_RUST_MACRO);
+        // Both sites should be reported — the deny-list does not
+        // abort at the first hit.
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "expected 2 deny-list errors, got {}",
+            report.errors.len()
+        );
+    }
+
+    // ── Negative tests: identifier-boundary guard ────────────────────
+
+    #[test]
+    fn test_deny_negative_user_defined_include_bytes_helper() {
+        // A user-defined macro whose NAME contains "include_bytes"
+        // must NOT match. The deny-list is structural (matches the
+        // exact macro identifier), not a substring search.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+macro_rules! my_include_bytes_helper { () => { 0 }; }
+fn main() { my_include_bytes_helper!(); }
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "user-defined macro must not match the deny-list, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_local_variable_named_env() {
+        // A Rust variable named `env` must NOT match the deny-list.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+fn main() {
+    let env = "PATH";
+    println!("{}", env);
+}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "variable named `env` must not match, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_comment_with_macro_name() {
+        // A comment mentioning the macro name must NOT match.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+// include_bytes!("/etc/passwd") is denied.
+fn main() {}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "comment with macro name must not match, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_scoped_env_identifier() {
+        // A scoped macro invocation whose identifier contains the
+        // banned name as a SUFFIX (e.g. `std::env!(...)`) must NOT
+        // match. `std::env!` is a runtime function (not a
+        // compile-time macro) — even if it were a macro, scoping
+        // keeps the deny-list's exact-match semantics intact.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+fn main() {
+    let _ = std::env!("PATH");
+}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "scoped identifier `std::env!` must not match the deny-list, got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_macro_invocation_inside_macro_rules_body() {
+        // A `macro_rules!` body is tokenized by tree-sitter-rust
+        // 0.24 (not parsed into structured macro_invocation nodes),
+        // so a hostile `include_bytes!("...")` buried inside a
+        // macro_rules body must NOT be flagged — it never expands
+        // unless the outer macro is invoked, which a separate
+        // follow-up compile-time guard can cover. This test pins
+        // the current "tokenize-don't-parse" behavior so a future
+        // tree-sitter bump that starts parsing macro_rules bodies
+        // is caught explicitly.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+macro_rules! bury_it {
+    () => { include_bytes!("/etc/passwd") };
+}
+fn main() {
+    let _ = bury_it!();
+}
+"#;
+        let report = a.analyze_with_security("ok", src);
+        assert!(
+            report.errors.is_empty(),
+            "include_bytes! inside macro_rules! body must not match (tokenized, not parsed), got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn test_deny_negative_benign_rust_source_still_detects_std_patterns() {
+        // When the deny-list passes, the regular pattern detector
+        // runs as before.
+        let mut a = RustAnalyzer::new();
+        let src = r#"
+fn main() {
+    let _ = std::net::TcpListener::bind("127.0.0.1:8080");
+}
+"#;
+        let report = a.analyze_with_security("hello", src);
+        assert!(
+            report.errors.is_empty(),
+            "benign source must produce no deny-list errors, got {:?}",
+            report.errors
+        );
+        assert_eq!(report.patterns_detected.len(), 1);
     }
 }

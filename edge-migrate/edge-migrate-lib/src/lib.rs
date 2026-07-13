@@ -20,7 +20,7 @@ pub mod rust_analyzer;
 #[cfg(feature = "rust")]
 pub mod rust_transformer;
 
-pub use analyzer::CAnalyzer;
+pub use analyzer::{pre_pass_deny_c, CAnalyzer, DENY_CODE_C_INCLUDE};
 pub use patterns::{
     is_valid_app_name, Language, PatternKind, PatternMatch, PosixPattern, RustPattern,
     Transformability,

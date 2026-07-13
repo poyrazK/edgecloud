@@ -352,7 +352,7 @@ func New(
 		cfg.Billing.Metering.Rates,
 	)
 
-	migrationHandler := handler.NewMigrationHandler(migrationSvc)
+	migrationHandler := handler.NewMigrationHandler(migrationSvc, metricsAgg.NewMigratePreflightSink())
 	logSvc := service.NewLogService(logEntryRepo)
 	domainSvc := service.NewDomainService(db, domainRepo, appRepo)
 

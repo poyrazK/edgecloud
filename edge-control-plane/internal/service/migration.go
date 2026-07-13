@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -46,6 +45,27 @@ var ErrRustcFailed = fmt.Errorf("rustc compilation failed")
 // subprocess fails (issue #415). Distinct from ErrRustcFailed so
 // operators can grep for wrap-vs-compile failures separately.
 var ErrWasmToolsFailed = fmt.Errorf("wasm-tools component wrap failed")
+
+// denyCodePrefix is the shared prefix emitted on every `errors[].code`
+// produced by the migration analyzer's compile-time host-reach deny
+// list (issue #622). The Rust side defines the same string as
+// `DENY_CODE_RUST_MACRO` in `edge-migrate/edge-migrate-lib/src/rust_analyzer.rs`
+// and the C side (commit 2) defines `DENY_CODE_C_INCLUDE` in
+// `edge-migrate/edge-migrate-lib/src/analyzer.rs`. Mirror any new
+// value here so the production short-circuit guard and the Go tests
+// reference one canonical string.
+const denyCodePrefix = "SECURITY_DENY:"
+
+// denyCodeCInclude is the per-reason suffix for the C-side
+// host-reach deny list (commit 2). The full `errors[].code` value
+// produced by the analyzer is `denyCodePrefix + denyCodeCInclude`,
+// matching the Rust side's `SECURITY_DENY:RUST_MACRO` shape. Kept
+// as a separate constant so the production short-circuit guard and
+// any Go-side test assertions branch on the prefix rather than the
+// full string (the prefix is the canonical signal — new reasons
+// like `EMBED` will land without touching either this constant or
+// the prefix).
+const denyCodeCInclude = "C_INCLUDE"
 
 // ErrCargoBuildFailed is returned when the cargo build subprocess
 // fails or the synthesized Cargo project is malformed (issue #415).
@@ -159,6 +179,41 @@ type MigrationService struct {
 	// `DeploymentService.keyring` so artifacts produced by either
 	// service carry the same active key id.
 	keyring *signing.Keyring
+
+	// clangInvokeFn runs the C-compile clang subprocess. Returns the
+	// captured stderr plus the run error. Tests swap this for a
+	// recording stub to assert that the args contain `-nostdinc` /
+	// `--sysroot` (issue #622 commit 5). nil means "use the default
+	// real-exec implementation" — see `defaultClangInvoke`.
+	//
+	// The `stdin` arg is the source reader (single-file mode
+	// passes the transformed C source; tree mode passes nil and
+	// lists every file path in `args`). The hook signature mirrors
+	// `defaultClangInvoke` so tests can record `args` and `stdin`
+	// without booting the real clang binary.
+	clangInvokeFn func(ctx context.Context, args []string, stdin io.Reader) (stderr string, err error)
+}
+
+// defaultClangInvoke is the production clang runner. Wraps the same
+// `newToolCmd` hardening every other migration subprocess uses
+// (env-scrubbed, SIGKILL on ctx cancel, 5s WaitDelay fallback) and
+// runs `s.wasiSdkPath + "/clang"` with the provided args.
+//
+// For the single-file path args includes a trailing "-" (clang
+// reads source from stdin) and `stdin` carries the transformed
+// source. For the tree path args lists every per-file `.c` path
+// and `stdin` is nil.
+//
+// Stderr is captured into a buffer and returned so the caller can
+// embed it in the failure report.
+func (s *MigrationService) defaultClangInvoke(ctx context.Context, args []string, stdin io.Reader) (string, error) {
+	clangBin := filepath.Join(s.wasiSdkPath, "clang")
+	cmd := s.newToolCmd(ctx, clangBin, args...)
+	cmd.Stdin = stdin
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	err := cmd.Run()
+	return stderrBuf.String(), err
 }
 
 // NewMigrationService creates a MigrationService.
@@ -294,7 +349,7 @@ codegen-units = 1
 		return "", dir, fmt.Errorf("compileRustAsComponent: write src/lib.rs: %w", wErr)
 	}
 
-	cmd := exec.CommandContext(ctx, s.cargoPath,
+	cmd := s.newToolCmd(ctx, s.cargoPath,
 		"build",
 		"--target", "wasm32-unknown-unknown",
 		"--release",
@@ -328,7 +383,7 @@ func (s *MigrationService) wrapAsComponent(
 	ctx context.Context,
 	coreWasmPath string,
 ) error {
-	cmd := exec.CommandContext(ctx, s.wasmToolsPath,
+	cmd := s.newToolCmd(ctx, s.wasmToolsPath,
 		"component", "new",
 		"--world", "edge-runtime-handler",
 		coreWasmPath,
@@ -356,6 +411,63 @@ func truncateStderr(s string) string {
 		return s
 	}
 	return "...(truncated)...\n" + s[len(s)-max:]
+}
+
+// clangArgs builds the canonical clang argv for a C migration compile
+// (issue #622 commit 5). The hardening guarantees:
+//
+//  1. `-nostdlib` — no host libc, no host crt1.o. Without this,
+//     clang links against `/usr/lib/x86_64-linux-gnu/...` and the
+//     resulting wasm drags in host symbols.
+//  2. `-nostdinc` — no host include search path. This is the
+//     defence-in-depth against the C `#include "/etc/passwd"` /
+//     `#embed "/etc/shadow"` exfiltration vector. Even if the L2
+//     analyzer's regex pre-pass misses a payload (false negative
+//     in a future commit), clang will refuse to look anywhere
+//     outside the wasi-sysroot and the per-request tmpdir.
+//  3. `--sysroot <wasi-sdk>/share/wasi-sysroot` — scopes `#include
+//     <wasi/...>` and `#include <stdio.h>` to the wasi-sdk headers.
+//     Required because `-nostdinc` removes the default search path
+//     entirely; without `--sysroot` even legitimate wasi-sdk
+//     headers fail to resolve. The sysroot path is checked for
+//     existence at call time — if absent (operator hasn't installed
+//     wasi-sdk, or set WASI_SDK_PATH to a non-standard layout),
+//     we log a WARN and fall back to `-nostdinc` only. The
+//     `-nostdinc` invariant is preserved either way: the host
+//     include path is never reachable.
+//
+// `extraSources` is empty for the single-file stdin path (caller
+// passes a trailing "-") and contains every per-file `.c` path for
+// tree mode.
+//
+// `tmpDir` is appended via `-I` so transformed headers in the
+// per-request scratch directory resolve. Cwd of the tmpdir is
+// also relied on for `<rel.h>` includes — clang's default
+// `-iquote .` would do this if we didn't `-nostdinc`, but
+// `-nostdinc` strips it, so we re-add `-I tmpDir` explicitly.
+func (s *MigrationService) clangArgs(tmpDir, outWasmPath string, extraSources []string) []string {
+	args := []string{
+		"--target=wasm32-wasip2",
+		"-nostdlib",
+		"-nostdinc", // issue #622 commit 5: block host include path.
+	}
+	// --sysroot scopes all system-header searches to the wasi-sdk
+	// layout. Optional: if the operator's wasiSdkPath doesn't have
+	// the expected `share/wasi-sysroot` subdir we degrade gracefully
+	// (WARN + skip --sysroot) rather than failing the whole
+	// migration. The `-nostdinc` guarantee holds either way.
+	sysroot := filepath.Join(s.wasiSdkPath, "share", "wasi-sysroot")
+	if info, err := os.Stat(sysroot); err == nil && info.IsDir() {
+		args = append(args, "--sysroot", sysroot)
+	} else {
+		log.Printf("migration service: clang --sysroot %s not found, falling back to -nostdinc only (no wasi-sysroot headers available)", sysroot)
+	}
+	args = append(args,
+		"-I", tmpDir,
+		"-o", outWasmPath,
+	)
+	args = append(args, extraSources...)
+	return args
 }
 
 // sanitizeRustPackageName turns an edge-cloud app name into a
@@ -450,13 +562,34 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		log.Printf("migration service: failed to close temp file: %v", err)
 	}
 
+	// Issue #622 commit 2 — single-file C pre-pass for host-reach
+	// #include / #embed, BEFORE the edge-migrate subprocess. The
+	// existing commit 1 guard at line ~538 short-circuits AFTER
+	// `edge-migrate` returns; this pre-pass is symmetrical for the
+	// C side and is strictly cheaper (no subprocess, no JSON
+	// parse). When a #include is rejected, the report carries
+	// `code: SECURITY_DENY:C_INCLUDE` with line numbers and the
+	// offending path, the edge-migrate subprocess never launches,
+	// and downstream guard at line ~538 catches any future
+	// regression where edge-migrate itself emits a deny-flag.
+	if language == "c" {
+		if denyErrs := cDenyErrors(tmpSrcPath); len(denyErrs) > 0 {
+			return &domain.MigrationReport{
+				Status:     domain.MigrationStatusFailed,
+				WasmStored: false,
+				AppName:    appName,
+				Errors:     denyErrs,
+			}, ErrEdgeMigrateFailed
+		}
+	}
+
 	// Run `edge-migrate --language <lang> --transform <path> --format json`.
 	// The binary emits a `transformEnvelope` with the structured report and
 	// the transformed (WASI) source. The `--language` flag selects the
 	// analyzer (C default; rust is required for Rust sources). The
 	// envelope's `WasiC` (or future equivalent) carries the transformed
 	// source; `Report` carries the structured per-pattern fields.
-	edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath,
+	edgeMigCmd := s.newToolCmd(ctx, s.edgeMigratePath,
 		"--language", language, "--transform", tmpSrcPath, "--format", "json")
 	var edgeMigOut bytes.Buffer
 	edgeMigCmd.Stdout = &edgeMigOut
@@ -538,6 +671,25 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		patternsTransformed = detectTransformedPatterns(transformed)
 	}
 
+	// Issue #622 — short-circuit guard: if the analyzer's
+	// structured report says `Status: Failed` and carries any
+	// `SECURITY_DENY:*`-coded error, refuse to compile. Without
+	// this, the deny-list would detect the hostile macro but the
+	// downstream `rustc` / `clang` step would still run and bake
+	// the host file / env var into the produced wasm. The
+	// pre-deny-list flow trusted `parseErr == nil` as "OK to
+	// compile"; we add this guard in front of the compile step.
+	denied := false
+	for _, e := range envelope.Report.Errors {
+		if strings.HasPrefix(e.Code, denyCodePrefix) {
+			denied = true
+			break
+		}
+	}
+	if denied {
+		return &envelope.Report, ErrEdgeMigrateFailed
+	}
+
 	// Compile → wasm. C uses wasi-sdk clang (reads from stdin).
 	// Rust writes the transformed source to a temp file and invokes
 	// `rustc --target wasm32-wasip2 --crate-type=cdylib` (rustc
@@ -596,16 +748,19 @@ func (s *MigrationService) Migrate(ctx context.Context, tenantID, filename, lang
 		}
 		// success — compileErrMsg stays empty
 	default: // "c"
-		clangBin := filepath.Join(s.wasiSdkPath, "clang")
-		clangCmd := exec.CommandContext(ctx, clangBin,
-			"--target=wasm32-wasip2", "-nostdlib",
-			"-o", tmpWasmPath, "-")
-		clangCmd.Stdin = strings.NewReader(transformed)
-		var clangErr bytes.Buffer
-		clangCmd.Stderr = &clangErr
+		// issue #622 commit 5: route through `clangArgs` so the
+		// hardening (`-nostdinc` + optional `--sysroot`) is centralized
+		// in one place. The trailing "-" tells clang to read source
+		// from stdin (the transformed C source).
+		args := s.clangArgs(os.TempDir(), tmpWasmPath, []string{"-"})
+		invoke := s.clangInvokeFn
+		if invoke == nil {
+			invoke = s.defaultClangInvoke
+		}
+		clangStderr, err := invoke(ctx, args, strings.NewReader(transformed))
 		compileSentinel = ErrClangFailed
-		if err := clangCmd.Run(); err != nil {
-			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErr.String())
+		if err != nil {
+			compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangStderr)
 		}
 	}
 
@@ -1166,6 +1321,34 @@ func (s *MigrationService) MigrateTree(
 	for i := range written {
 		wf := &written[i]
 
+		// Issue #622 commit 2 — C-side pre-pass for host-reach
+		// #include/#embed. Mirrors `c_deny_report` in the bin and
+		// `pre_pass_deny_c` in the lib: scan each entry's source
+		// for absolute / traversal `#include` and any `#embed`
+		// BEFORE invoking the per-file edge-migrate subprocess. A
+		// denied file is recorded as a `FileReport{Status: Failed,
+		// Errors: [{Code: SECURITY_DENY:C_INCLUDE, ...}]}` and the
+		// per-file subprocess is skipped — the file's transform
+		// output never reaches clang.
+		if language == "c" {
+			if denyErrs := cDenyErrors(wf.absPath); len(denyErrs) > 0 {
+				fr := domain.FileReport{
+					Status: domain.MigrationStatusFailed,
+					Errors: denyErrs,
+				}
+				// SHA256 of the **original** source for SLSA
+				// materials — same shape as the analyzer path
+				// uses for benign files.
+				if wf.path != "" {
+					fr.Path = wf.path
+				}
+				fr.SHA256 = sha256HexLower([]byte(denyOriginalSource(wf.absPath)))
+				wf.report = fr
+				wf.transformOK = false
+				continue
+			}
+		}
+
 		// 1) `edge-migrate --language <lang> --transform <path>` → WASI output.
 		// We write the transformed source to <path>.wasi.c in the
 		// same dir so the final toolchain invocation can pick them
@@ -1173,7 +1356,7 @@ func (s *MigrationService) MigrateTree(
 		// era; for Rust the file contains Rust source. The compile
 		// step dispatches on `language` and treats the file
 		// accordingly.)
-		edgeMigCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--transform", wf.absPath)
+		edgeMigCmd := s.newToolCmd(ctx, s.edgeMigratePath, "--language", language, "--transform", wf.absPath)
 		var edgeMigOut bytes.Buffer
 		edgeMigCmd.Stdout = &edgeMigOut
 		var edgeMigErr bytes.Buffer
@@ -1208,7 +1391,7 @@ func (s *MigrationService) MigrateTree(
 		// On failure (older binary), fall back to a heuristic that's
 		// language-aware: C → detectTransformedPatterns, Rust →
 		// detectTransformedPatternsRust.
-		analyzeCmd := exec.CommandContext(ctx, s.edgeMigratePath, "--language", language, "--analyze-json", wf.absPath)
+		analyzeCmd := s.newToolCmd(ctx, s.edgeMigratePath, "--language", language, "--analyze-json", wf.absPath)
 		var analyzeOut bytes.Buffer
 		analyzeCmd.Stdout = &analyzeOut
 		var analyzeErr bytes.Buffer
@@ -1313,6 +1496,51 @@ func (s *MigrationService) MigrateTree(
 		}, ErrMigrateTreeFailed
 	}
 
+	// Issue #622 commit 2 — analyzer-driven short-circuit (parallel
+	// to commit 1's guard at the top of `Migrate`). If any file's
+	// `--analyze-json` envelope reports `Status: Failed` and carries
+	// a `SECURITY_DENY:*`-coded error, the deny-list detected a
+	// host-reach #include/#embed at parse time. Without this guard
+	// the downstream `clang` invocation would still run and bake
+	// the host file into the produced wasm — so we short-circuit
+	// BEFORE the per-file clang call at the bottom of this
+	// function. Distinct from `anyTransformFailed` above because
+	// (a) the failure was detected at ANALYZE time, not TRANSFORM
+	// time, and (b) the upstream `edge-migrate` subprocess
+	// completed successfully (it just emitted a `Failed` report).
+	anyAnalyzeFailed := false
+	for _, f := range files {
+		if f.Status != domain.MigrationStatusFailed {
+			continue
+		}
+		for _, e := range f.Errors {
+			if strings.HasPrefix(e.Code, denyCodePrefix) {
+				anyAnalyzeFailed = true
+				break
+			}
+		}
+		if anyAnalyzeFailed {
+			break
+		}
+	}
+	if anyAnalyzeFailed {
+		return &domain.TreeMigrationReport{
+			Status:            status,
+			WasmStored:        false,
+			AppName:           appName,
+			Files:             files,
+			FilesTotal:        filesTotal,
+			FilesTransformed:  filesTransformed,
+			FilesManualReview: filesManualReview,
+			// No synthetic tree-level error: per-file
+			// `f.Errors` already carries the structured
+			// `SECURITY_DENY:*` entries with line numbers
+			// and offending paths. Surfacing a duplicate
+			// "tree failed" message would clutter the
+			// response without adding information.
+		}, ErrMigrateTreeFailed
+	}
+
 	// Compile all transformed files in a single toolchain invocation.
 	tmpWasm, err := os.CreateTemp("", "migrate-tree-*.wasm")
 	if err != nil {
@@ -1331,20 +1559,28 @@ func (s *MigrationService) MigrateTree(
 	var compileErrMsg string
 	// Issue #415: MigrateTree rejects language=="rust" at function
 	// entry; only C reaches this compile switch.
-	clangBin := filepath.Join(s.wasiSdkPath, "clang")
-	args := []string{
-		"--target=wasm32-wasip2", "-nostdlib",
-		"-I", tmpDir,
-		"-o", tmpWasmPath,
-	}
+	//
+	// Issue #622 commit 5: route through `clangArgs` so the hardening
+	// (`-nostdinc` + optional `--sysroot`) is centralized in one
+	// place — single-file and tree clang now share the same
+	// hardening helper. The list of written .c files is appended
+	// after the canonical args (clang's `--sysroot`/`-o` flags are
+	// positional-agnostic so order doesn't matter for them; the
+	// trailing sources are positional args and must come last).
+	extraSources := make([]string, 0, len(written))
 	for _, wf := range written {
-		args = append(args, wf.wasiCPath)
+		extraSources = append(extraSources, wf.wasiCPath)
 	}
-	clangCmd := exec.CommandContext(ctx, clangBin, args...)
-	var clangErrBuf bytes.Buffer
-	clangCmd.Stderr = &clangErrBuf
-	if err := clangCmd.Run(); err != nil {
-		compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangErrBuf.String())
+	args := s.clangArgs(tmpDir, tmpWasmPath, extraSources)
+	invoke := s.clangInvokeFn
+	if invoke == nil {
+		invoke = s.defaultClangInvoke
+	}
+	// tree mode reads source from per-file paths in `args`, not
+	// stdin — pass nil for the stdin reader.
+	clangStderr, err := invoke(ctx, args, nil)
+	if err != nil {
+		compileErrMsg = fmt.Sprintf("clang failed: %s — %s", err, clangStderr)
 	}
 
 	if compileErrMsg != "" {

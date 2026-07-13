@@ -77,11 +77,26 @@ func isClientMigrationError(err error) bool {
 // MigrationHandler handles migration requests.
 type MigrationHandler struct {
 	migrationSvc *service.MigrationService
+	// preflightSink is called once per preflight match — a
+	// multi-pattern upload bumps multiple counters. issue #622
+	// commit 6. nil-safe (the ctor wires a no-op so existing
+	// callers don't have to provide one).
+	preflightSink func(language, reason string)
 }
 
 // NewMigrationHandler creates a MigrationHandler.
-func NewMigrationHandler(migrationSvc *service.MigrationService) *MigrationHandler {
-	return &MigrationHandler{migrationSvc: migrationSvc}
+//
+// preflightSink is optional — pass nil to disable the metric
+// (every existing call site in the codebase constructs a no-op
+// sink so the field is always non-nil in practice).
+func NewMigrationHandler(migrationSvc *service.MigrationService, preflightSink func(language, reason string)) *MigrationHandler {
+	if preflightSink == nil {
+		preflightSink = func(string, string) {}
+	}
+	return &MigrationHandler{
+		migrationSvc:  migrationSvc,
+		preflightSink: preflightSink,
+	}
 }
 
 // Migrate handles POST /api/migrate — accepts a C source file, transforms it,
@@ -148,6 +163,22 @@ func (h *MigrationHandler) Migrate(w http.ResponseWriter, r *http.Request) {
 	source, err := io.ReadAll(srcFile)
 	if err != nil {
 		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	// L1 preflight (issue #622, commit 3): cheap regex scan at the
+	// HTTP boundary so obvious exfiltration payloads (include_bytes!,
+	// env!, #[path = "..."], #embed "...", absolute #include) are
+	// rejected before any subprocess spawns. Distinct response shape
+	// from the analyzer path so the SDK can branch on
+	// "rejected_at: preflight" vs the structured report body.
+	if matches := preflightMigrateSource(language[0], "", string(source)); len(matches) > 0 {
+		for _, m := range matches {
+			h.preflightSink(language[0], m.Pattern)
+		}
+		httperror.PreflightDeniedCtx(w, r,
+			"compile-time host-reach pattern detected",
+			preflightDetailsFor(language[0], matches))
 		return
 	}
 
@@ -339,6 +370,25 @@ func (h *MigrationHandler) MigrateTree(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			entries = append(entries, domain.FileEntry{Path: p, Source: string(body)})
+		}
+	}
+
+	// L1 preflight (issue #622, commit 3): per-file scan across the
+	// tree before any subprocess spawns. Same regex set as the
+	// single-file /api/v1/migrate path; the SDK gets one merged
+	// `matches` array with `path` populated per hit so the offending
+	// file is identifiable. We bail on the first file with a hit to
+	// keep the response deterministic — the caller can fix that one
+	// file and retry, rather than receiving a partial report.
+	for _, e := range entries {
+		if matches := preflightMigrateSource(language[0], e.Path, e.Source); len(matches) > 0 {
+			for _, m := range matches {
+				h.preflightSink(language[0], m.Pattern)
+			}
+			httperror.PreflightDeniedCtx(w, r,
+				"compile-time host-reach pattern detected",
+				preflightDetailsFor(language[0], matches))
+			return
 		}
 	}
 
