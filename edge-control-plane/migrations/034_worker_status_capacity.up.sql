@@ -29,6 +29,11 @@
 -- `WHERE region = ANY($1) AND last_report > NOW() - INTERVAL '90 seconds'
 --  AND free_slots >= 0`. The `free_slots >= 0` filter is what
 -- excludes the "no heartbeat yet" sentinel rows from the index.
+-- Note: `region` lives on the `workers` table — the deploy gate
+-- joins `worker_status` to `workers` on `worker_id`. So the index
+-- here is keyed on `worker_id` (to accelerate the join side) and
+-- carries `free_slots` so the partial filter narrows the scan
+-- to "have data" rows only.
 ALTER TABLE worker_status
     ADD COLUMN free_slots                INTEGER     NOT NULL DEFAULT -1,
     ADD COLUMN cluster_headroom          JSONB,
@@ -36,5 +41,5 @@ ALTER TABLE worker_status
     ADD COLUMN last_exhaustion_at        TIMESTAMPTZ;
 
 CREATE INDEX idx_worker_status_region_free_slots
-    ON worker_status (region, free_slots)
+    ON worker_status (worker_id, free_slots)
     WHERE free_slots >= 0;
