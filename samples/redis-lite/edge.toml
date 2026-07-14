@@ -1,0 +1,20 @@
+# edgeCloud project config consumed by `edge deploy` / `edge build`.
+#
+# `protocol = "tcp"` means the listener speaks raw TCP, routed by
+# edge-ingress's L4 path (Caddy's `apps.layer4`). `world = "edge-runtime"`
+# is required because the FaaS world (`edge-runtime-handler`) doesn't
+# expose wasi:sockets to the guest — a TCP listener can't bind from
+# inside a per-request call. The CLI rejects the inverse combination
+# at build time (see edge-cli/src/commands/build.rs::validate_protocol_combo).
+
+[project]
+name = "redis-lite"
+version = "0.1.0"
+target = "wasm32-unknown-unknown"
+world = "edge-runtime"
+protocol = "tcp"
+
+[deployment]
+# Default API. Override with `EDGE_API_URL` env var or pass
+# `--api-url https://api.<region>.edgecloud.dev` to the CLI.
+api = "https://api.edgecloud.dev"

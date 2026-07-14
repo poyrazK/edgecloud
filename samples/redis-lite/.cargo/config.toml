@@ -1,0 +1,29 @@
+# Override the workspace `.cargo/config.toml` for this sample.
+#
+# Why this exists: the workspace config (at the repo root) sets
+#   build.target-dir     = "../target-cache/edgecloud"
+#   build.rustc-wrapper  = "sccache"
+# to share build artifacts across git worktrees and cache rustc
+# invocations on developer machines and CI. Both choices assume
+# the consuming project is a member of the workspace.
+#
+# This sample (`samples/redis-lite`) is intentionally a SECOND
+# workspace — see `[workspace]` at the top of its own Cargo.toml.
+# Cargo builds it stand-alone (CD-only, no host-side deps) and reads
+# the parent workspace's `.cargo/config.toml` for default settings.
+# With the workspace settings in force:
+#   - target-dir resolves to `samples/redis-lite/../target-cache/edgecloud`
+#     on a developer box, which lands in `samples/target-cache/...` —
+#     the test harness (edge-cli/tests/build_rust_wit_version.rs)
+#     asserts the artifact lands at `samples/redis-lite/target/...`
+#     and fails.
+#   - rustc-wrapper = "sccache" requires sccache on PATH; for a
+#     guest-only wasm32 build there's no compile cache win anyway.
+#
+# Net effect: opt out of both settings in the sample's own config.
+# Cargo's hierarchical merging (deeper wins) means these overrides
+# apply without touching the workspace's shared config.
+
+[build]
+target-dir = "target"
+rustc-wrapper = ""
