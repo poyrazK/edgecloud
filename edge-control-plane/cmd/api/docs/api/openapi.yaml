@@ -1762,12 +1762,50 @@ paths:
   /health:
     get:
       operationId: health
-      summary: Health check
-      description: Returns 200 if the control plane is running. No auth required.
+      summary: Liveness probe
+      description: |
+        Returns 200 if the control plane process is running and able to
+        respond to HTTP. Does NOT check downstream dependencies — for a
+        deep readiness check see `GET /ready`. K8s `livenessProbe` should
+        point here. No auth required.
       security: []
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                    example: ok
+                required: [status]
+
+  /ready:
+    get:
+      operationId: ready
+      summary: Readiness probe
+      description: |
+        Deep readiness check. Pings the database, flushes the NATS
+        connection (2s timeout), and snapshots every background loop
+        tracked by `internal/loophealth`. Returns `200` with `status=ok`
+        when everything is healthy, `200` with `status=degraded` when one
+        or more loops are unhealthy (DB+NATS still healthy — the CP can
+        still serve reads), or `503` with `status=unhealthy` when DB or
+        NATS connectivity failed. K8s `readinessProbe` should point here.
+        No auth required.
+      security: []
+      responses:
+        '200':
+          description: OK or degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Unhealthy
           content:
             application/json:
               schema:

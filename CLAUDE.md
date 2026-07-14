@@ -186,7 +186,7 @@ A request flows through the system like this:
 IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<region>_`.
 
 **Control-plane HTTP surface** (see `edge-control-plane/internal/app/app.go` for the full route table):
-- **Public**: `POST /api/v1/tenants` (self-signup, IP-rate-limited), `GET /health` (pings DB + NATS), `GET /docs/` (Swagger UI).
+- **Public**: `POST /api/v1/tenants` (self-signup, IP-rate-limited), `GET /health` (liveness probe — process liveness only), `GET /ready` (readiness probe — DB ping + NATS flush + per-loop snapshot), `GET /docs/` (Swagger UI).
 - **Tenant-authenticated** (Bearer API key, SHA-256-hashed in `api_keys`): `/api/v1/deploy/{appName}`, `/api/v1/apps/{appName}/activate/{deploymentID}`, `/api/v1/apps/{appName}/rollback`, `/api/v1/apps/{appName}/promote/{deploymentID}`, `/api/v1/apps/{appName}/env*`, `/api/v1/keys*`, `/api/v1/webhooks*`, `/api/v1/apps/{appName}/domains*`, `/api/v1/egress*`, `/api/v1/metrics`, etc.
 - **Admin (owner role only)**: `/api/v1/admin/tenants*`, `DELETE /api/v1/admin/apps/{appName}`, `/api/v1/admin/cluster*`, `/api/v1/admin/secrets/*`, `POST /api/v1/admin/tenants/{id}/quota-override` (issue #420 — operator escape hatch for the billing umbrella).
 - **Internal, worker JWT (HMAC-SHA256, 24h TTL per whitepaper §9.3 — keys live in `cfg.JWT.Keys`, `cfg.JWT.ActiveKID` selects the current kid)**: `/api/internal/workers*`, `/api/internal/logs`, `/api/internal/apps/{appName}/auto-rollback`, `/api/internal/domains*`, `/api/internal/tls-allowed`. The worker JWT is gated by role (`ingest` for domains/TLS, default for the rest).
