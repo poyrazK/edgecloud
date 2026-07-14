@@ -8,6 +8,6 @@
 //!      longer counted; matches the "missed second tolerated" invariant).
 //!
 //! The actual sliding-window implementation lands in PR B (tests 8.a/8.b
-//! in the plan at `/Users/poyrazk/.claude/plans/lets-create-imp-plan-curried-feigenbaum.md`).
+//! in the issue #665 plan).
 
 #![allow(dead_code)]

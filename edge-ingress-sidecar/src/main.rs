@@ -10,9 +10,7 @@
 //! recorder, prints a startup banner, and waits for SIGTERM/SIGINT.
 //! PR B fills the publisher / consumer / window-sum / UDS-expose
 //! modules and replaces the placeholder loops with real work.
-//!
-//! See `/Users/poyrazk/.claude/plans/lets-create-imp-plan-curried-feigenbaum.md`
-//! for the full design and PR breakdown.
+//! See issue #665 for the full design and PR breakdown.
 
 mod aggregate;
 mod caddy_metrics;
@@ -70,6 +68,20 @@ async fn main() -> ExitCode {
         "edge-ingress-sidecar starting (PR A skeleton; PR B wires the JetStream sum-side)"
     );
 
+    // Review finding (PR #695): if `replica_id` is the skeleton default,
+    // the binary is running with no publisher wired. An operator who
+    // accidentally deploys PR A to a production pod would otherwise get
+    // a process that listens on :9091, says "skeleton loop" in debug
+    // logs, and never publishes a delta — silently. A startup WARN is
+    // cheap insurance; operators grep for "skeleton" to find these pods.
+    if cfg.replica_id == "ingress-skeleton" {
+        tracing::warn!(
+            "edge-ingress-sidecar is running the PR A skeleton binary; \
+             no JetStream publisher or consumer is wired. \
+             Do NOT deploy this build to production — install PR B+ first."
+        );
+    }
+
     // Install the Prometheus metrics recorder. The `/metrics` HTTP listener
     // is the operator's checkpoint: a missing endpoint tells them the
     // sidecar isn't running. PR B registers Prometheus descriptions for
@@ -95,7 +107,6 @@ async fn main() -> ExitCode {
     let tick_shutdown = shutdown.clone();
     let tick_handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = tick_shutdown.cancelled() => break,
@@ -124,7 +135,11 @@ async fn main() -> ExitCode {
     tracing::info!(%signal_name, "received signal, initiating graceful shutdown");
 
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), tick_handle).await;
+    // 10s mirrors `edge-ingress/src/main.rs:207` — the sidecar's
+    // JetStream reconnect (PR B) can take longer than the 5s previously
+    // used here; match the ingress process so operator scripts that
+    // budget a 10s drain window keep working.
+    let _ = tokio::time::timeout(Duration::from_secs(10), tick_handle).await;
 
     tracing::info!("graceful shutdown complete");
     ExitCode::SUCCESS
