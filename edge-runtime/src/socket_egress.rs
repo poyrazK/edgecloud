@@ -49,7 +49,7 @@ use crate::egress::EgressPolicy;
 ///
 /// - [`BlockAll`] (default): closure always returns `false`. Same posture
 ///   as wasmtime's `SocketAddrCheck::default()` — guests cannot use
-///   `wasi:sockets` for ANY operation: every `SocketAddrUse` variant
+///   `wasi:sockets` for any operation: every `SocketAddrUse` variant
 ///   (`TcpBind`, `TcpConnect`, `UdpBind`, `UdpConnect`,
 ///   `UdpOutgoingDatagram`) returns `access-denied`.
 /// - [`AllowList`]: closure consults `EgressPolicy::check_address` for
