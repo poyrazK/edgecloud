@@ -50,6 +50,14 @@ pub mod edge_modules;
 #[cfg(target_arch = "wasm32")]
 pub mod register;
 
+/// Pure URL parser for `EdgeCloud.http.fetch` (issue #550). Lives in
+/// a top-level module (NOT `#[cfg(target_arch = "wasm32")]`) so the
+/// host-target test build (`cargo test --manifest-path
+/// edge-js-runtime/Cargo.toml`) can exercise it without dragging in
+/// the wasm-only `rquickjs::Ctx` machinery. `register.rs` imports
+/// `parse_fetch_url` from here at wasm-build time.
+pub mod url_parse;
+
 // ─── WASI bindings (wasm target only) ─────────────────────────────────
 //
 // Everything below references `wit_bindgen`-generated symbols and
@@ -77,6 +85,23 @@ mod wasm_only {
     // sibling at `long/wasm_only` re-exports its own copies and the LR
     // `register` binds to those.
     pub use self::edge::cloud::{cache, kv_store, observe, process, scheduling, time, websocket};
+    // `wasi::http::outgoing_handler` ships with the world because
+    // `edge-runtime-handler` declares
+    // `import wasi:http/outgoing-handler@0.2.1` in `wit/edge-cloud.wit:181`.
+    // The `register_http` helper (see `register.rs`) wraps
+    // `outgoing_handler::handle(...)` as `globalThis.EdgeCloud.http.fetch`
+    // for JS guest handlers — closes the JS-side gap in the database
+    // recipes (issue #550). Host-side egress gating happens for free
+    // inside `WasiHttpHooks::send_request`
+    // (`edge-runtime/src/runtime.rs:549-565`); the JS shim does NOT
+    // re-implement allowlist checks. The `types` re-export carries the
+    // request/response builders the registrar constructs. `io::poll` is
+    // re-exported because the registrar needs `poll::poll` to wait on
+    // the `future-incoming-response` pollable (same pattern the
+    // DNS-resolve code in `edge-worker/tests/fixtures/handler/src/lib.rs:776-779`
+    // uses).
+    pub use self::wasi::http::{outgoing_handler, types as http_types};
+    pub use self::wasi::io::poll;
 
     pub struct JsHandler;
 

@@ -5,3 +5,4 @@ export { time } from './time.js';
 export { scheduling } from './scheduling.js';
 export { process } from './process.js';
 export { websocket } from './websocket.js';
+export { http } from './http.js';

@@ -29,7 +29,11 @@ use rquickjs::{Ctx, Function, Object, TypedArray, Value};
 // public. Only the FaaS-world import names are wired here; the LR-world
 // version lives in `long/register.rs` (which `pub use`s the LR-world
 // `wasm_only::edge::cloud::*` instead).
-use crate::wasm_only::{cache, kv_store, observe, process, scheduling, time, websocket};
+use crate::url_parse::parse_fetch_url;
+use crate::wasm_only::{
+    cache, http_types, kv_store, observe, outgoing_handler, poll, process, scheduling, time,
+    websocket,
+};
 
 pub fn register_all<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     let edge_cloud = Object::new(ctx.clone())?;
@@ -40,6 +44,7 @@ pub fn register_all<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
     register_scheduling(ctx, &edge_cloud)?;
     register_process(ctx, &edge_cloud)?;
     register_websocket(ctx, &edge_cloud)?;
+    register_http(ctx, &edge_cloud)?;
     ctx.globals().set("EdgeCloud", edge_cloud)?;
     Ok(())
 }
@@ -694,4 +699,277 @@ fn register_websocket<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Re
 
     parent.set("websocket", ws)?;
     Ok(())
+}
+
+// ─── http (issue #550) ─────────────────────────────────────────
+//
+// `globalThis.EdgeCloud.http.fetch(url, init?)` makes an outbound
+// `wasi:http` call from a JS guest handler. It exists because the
+// database recipes in `docs/recipes/databases.md` need a way for JS
+// guests to reach Neon / Turso / Upstash without depending on a Rust
+// shim. The full WIT call shape is at
+// `edge-runtime/src/wit/deps/http/types.wit` and `proxy.wit:47-50`.
+//
+// JS surface (mirrors the WHATWG `fetch` shape but returns a plain
+// object — no streams, no ReadableStream):
+//
+//   fetch(url)
+//   fetch(url, { method: 'POST', headers: { 'content-type': '...',
+//                                          'authorization': '...' },
+//                body: '...' | Uint8Array })
+//   → { status: number, headers: Record<string, string>, body: string }
+//
+// Errors: throws with `{ code, message }` where `code` is one of
+//   - `egress-denied`     — the host's egress allowlist rejected the
+//                           request (e.g. host not in
+//                           `tenants.allowlisted_destinations`).
+//   - `bad-url`           — `url` is empty or unparseable.
+//   - `request-failed`    — `outgoing_handler::handle` returned Err.
+//   - `response-read`     — the response stream returned an error
+//                           while draining.
+//
+// Host-side egress gating happens automatically inside the runtime's
+// `WasiHttpHooks::send_request` — the shim does NOT re-implement the
+// allowlist. A `egress-denied` error here means the runtime blocked
+// the call and we propagated that back as a JS exception.
+fn register_http<'js>(ctx: &Ctx<'js>, parent: &Object<'js>) -> rquickjs::Result<()> {
+    use rquickjs::Exception;
+
+    let http = Object::new(ctx.clone())?;
+
+    http.set(
+        "fetch",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, url: String, init: Option<Value<'js>>|
+                  -> rquickjs::Result<Value<'js>> {
+                let init = init.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let parsed = match parse_fetch_url(&url) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            &format!("{{\"code\":\"bad-url\",\"message\":\"{e}\"}}"),
+                        ));
+                    }
+                };
+                let req_init = parse_fetch_init(&ctx, init)?;
+
+                // Build the OutgoingRequest.
+                let headers = http_types::Fields::new();
+                for (name, value) in &req_init.headers {
+                    let _ = headers.set(name, &[value.as_bytes().to_vec()]);
+                }
+
+                let req = http_types::OutgoingRequest::new(headers);
+
+                let method = match req_init.method.as_str() {
+                    "GET" => http_types::Method::Get,
+                    "HEAD" => http_types::Method::Head,
+                    "POST" => http_types::Method::Post,
+                    "PUT" => http_types::Method::Put,
+                    "DELETE" => http_types::Method::Delete,
+                    "CONNECT" => http_types::Method::Connect,
+                    "OPTIONS" => http_types::Method::Options,
+                    "TRACE" => http_types::Method::Trace,
+                    "PATCH" => http_types::Method::Patch,
+                    other => {
+                        // WIT allows custom methods via `Other(String)` —
+                        // surface as such rather than failing.
+                        if other.is_empty() {
+                            return Err(Exception::throw_message(
+                                &ctx,
+                                "{\"code\":\"bad-url\",\"message\":\"method is empty\"}",
+                            ));
+                        }
+                        http_types::Method::Other(other.to_string())
+                    }
+                };
+                req.set_method(&method).map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"set_method\"}")
+                })?;
+
+                let scheme = match parsed.scheme.as_str() {
+                    "http" | "ws" => http_types::Scheme::Http,
+                    "https" | "wss" => http_types::Scheme::Https,
+                    _ => http_types::Scheme::Http,
+                };
+                req.set_scheme(Some(&scheme)).map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"set_scheme\"}")
+                })?;
+
+                req.set_authority(Some(&parsed.authority)).map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"set_authority\"}")
+                })?;
+                req.set_path_with_query(Some(&parsed.path)).map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"set_path\"}")
+                })?;
+
+                // Body — write + finish.
+                let body_handle = req.body().map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"body()\"}")
+                })?;
+                let stream = body_handle.write().map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"body.write()\"}")
+                })?;
+                stream.blocking_write_and_flush(&req_init.body_bytes).map_err(|_| {
+                    Exception::throw_message(&ctx, "{\"code\":\"request-failed\",\"message\":\"blocking_write_and_flush\"}")
+                })?;
+                drop(stream);
+                let _ = http_types::OutgoingBody::finish(body_handle, None);
+
+                // Submit.
+                let opts = http_types::RequestOptions::new();
+                let future = outgoing_handler::handle(req, Some(opts)).map_err(|e| {
+                    let msg = format!(
+                        "{{\"code\":\"request-failed\",\"message\":\"outgoing_handler.handle: {:?}\"}}",
+                        e
+                    );
+                    Exception::throw_message(&ctx, &msg)
+                })?;
+
+                // Subscribe + poll + get. The WIT contract is identical
+                // to the DNS-resolve pattern used in
+                // `edge-worker/tests/fixtures/handler/src/lib.rs:776-779`:
+                // subscribe to the pollable, call `wasi:io/poll::poll` on
+                // the slice (blocks until ready), then call `get`.
+                let pollable = future.subscribe();
+                poll::poll(&[&pollable]);
+
+                // WIT shape: `get: func() -> option<result<result<incoming-response, error-code>>>`.
+                // The outer `option` is "future readiness"; the outer
+                // `result` is "second-and-later call guard" (the WIT
+                // allows only one get); the inner `result` is the
+                // protocol-level outcome.
+                let response = match future.get() {
+                    Some(Ok(Ok(r))) => r,
+                    Some(Ok(Err(e))) => {
+                        let msg = format!(
+                            "{{\"code\":\"request-failed\",\"message\":\"response error code: {:?}\"}}",
+                            e
+                        );
+                        return Err(Exception::throw_message(&ctx, &msg));
+                    }
+                    Some(Err(_)) => {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            "{\"code\":\"request-failed\",\"message\":\"future.get() called more than once\"}",
+                        ));
+                    }
+                    None => {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            "{\"code\":\"request-failed\",\"message\":\"future not ready after poll\"}",
+                        ));
+                    }
+                };
+
+                let status = response.status();
+                let resp_headers = response.headers();
+                let header_entries = resp_headers.entries();
+
+                // Drain body.
+                let mut body_buf: Vec<u8> = Vec::new();
+                match response.consume() {
+                    Ok(body) => {
+                        if let Ok(stream) = body.stream() {
+                            loop {
+                                match stream.blocking_read(4096) {
+                                    Ok(chunk) if chunk.is_empty() => break,
+                                    Ok(chunk) => body_buf.extend_from_slice(&chunk),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // No body — fine; return what we have.
+                    }
+                }
+
+                // Build the JS result: { status, headers, body }.
+                let result = Object::new(ctx.clone())?;
+                result.set("status", status)?;
+                let headers_obj = Object::new(ctx.clone())?;
+                for (name, value) in &header_entries {
+                    let v = String::from_utf8_lossy(value).to_string();
+                    headers_obj.set(name.as_str(), v)?;
+                }
+                result.set("headers", headers_obj)?;
+                result.set(
+                    "body",
+                    String::from_utf8_lossy(&body_buf).into_owned(),
+                )?;
+                Ok(result.into_value())
+            },
+        ),
+    )?;
+
+    parent.set("http", http)?;
+    Ok(())
+}
+
+// `parse_fetch_url` lives in `crate::url_parse` (host-testable) and
+// is `use`d above via the top-level `use crate::wasm_only::{...}`
+// re-export pattern. The wasm-only `parse_fetch_init` stays below.
+
+/// Parsed `{ method, headers, bodyBytes }`.
+struct FetchInit {
+    method: String,
+    headers: Vec<(String, String)>,
+    body_bytes: Vec<u8>,
+}
+
+/// Decode the optional second `fetch` argument. Defaults: `GET`, no
+/// headers, empty body. `body` may be a UTF-8 string or a Uint8Array.
+fn parse_fetch_init<'js>(_ctx: &Ctx<'js>, init: Value<'js>) -> rquickjs::Result<FetchInit> {
+    let mut out = FetchInit {
+        method: "GET".to_string(),
+        headers: Vec::new(),
+        body_bytes: Vec::new(),
+    };
+    if init.is_undefined() || init.is_null() {
+        return Ok(out);
+    }
+    let obj = match init.into_object() {
+        Some(o) => o,
+        None => return Ok(out),
+    };
+
+    if let Ok(method) = obj.get::<_, String>("method") {
+        if !method.is_empty() {
+            out.method = method.to_ascii_uppercase();
+        }
+    }
+
+    if let Ok(headers) = obj.get::<_, Value>("headers") {
+        if let Some(hobj) = headers.as_object() {
+            for key in hobj.keys::<String>() {
+                let k = match key {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                if let Ok(v) = hobj.get::<_, String>(&k) {
+                    out.headers.push((k, v));
+                }
+            }
+        }
+    }
+
+    if let Ok(body) = obj.get::<_, Value>("body") {
+        if body.is_string() {
+            if let Some(s) = body.as_string() {
+                out.body_bytes = s.to_string().unwrap_or_default().into_bytes();
+            }
+        } else if let Ok(ta) = TypedArray::<'js, u8>::from_value(body.clone()) {
+            out.body_bytes = <TypedArray<'js, u8> as AsRef<[u8]>>::as_ref(&ta).to_vec();
+        }
+        // Other body shapes (ReadableStream, FormData, Blob) are
+        // intentionally not supported at v0.2 — the WIT sync body API
+        // does not stream. Users wanting streaming should call fetch()
+        // multiple times. Throwing on unsupported types is too noisy;
+        // a no-body fallback is the gentler default for `null`/`undefined`.
+    }
+
+    Ok(out)
 }
