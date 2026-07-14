@@ -152,7 +152,7 @@ func (h *WebhookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // breaking the wire.
 type webhookDeliveriesResponse struct {
 	Deliveries []domain.WebhookDelivery `json:"deliveries"`
-	Limit      int                     `json:"limit"`
+	Limit      int                      `json:"limit"`
 	NextCursor *string                  `json:"next_cursor"`
 }
 

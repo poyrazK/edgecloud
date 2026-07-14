@@ -60,8 +60,8 @@ func TestWebhookHandler_ListDeliveries_Success(t *testing.T) {
 	}
 	var resp struct {
 		Deliveries []domain.WebhookDelivery `json:"deliveries"`
-		Limit      int                     `json:"limit"`
-		NextCursor *string                 `json:"next_cursor"`
+		Limit      int                      `json:"limit"`
+		NextCursor *string                  `json:"next_cursor"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
