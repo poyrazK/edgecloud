@@ -76,6 +76,11 @@ pub(crate) fn xorshift_uniform_u64() -> u64 {
 /// - `main::run_consume_loop` reconnect — `base_ms = backoff`,
 ///   `cap_ms = 60_000`, per-iteration `attempt = 1` (jitter only);
 ///   exponential doubling lives at the call site. (Issue #47.)
+///
+/// `attempt = 0` is **equivalent to `attempt = 1`** — the
+/// `saturating_sub(1)` clamps zero to a zero shift, so the pre-jitter
+/// value is just `base_ms`. Don't pass zero expecting a smaller backoff;
+/// the contract is `attempt ≥ 1`.
 pub(crate) fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let exp = attempt.saturating_sub(1).min(31);
     let raw = base_ms.saturating_mul(1u64 << exp);
