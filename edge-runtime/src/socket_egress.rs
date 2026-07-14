@@ -48,8 +48,10 @@ use crate::egress::EgressPolicy;
 /// # Mode semantics
 ///
 /// - [`BlockAll`] (default): closure always returns `false`. Same posture
-///   as wasmtime's `SocketAddrCheck::default()` — guests effectively
-///   cannot use `wasi:sockets/tcp-connect` / `wasi:sockets/udp-send`.
+///   as wasmtime's `SocketAddrCheck::default()` — guests cannot use
+///   `wasi:sockets` for ANY operation: every `SocketAddrUse` variant
+///   (`TcpBind`, `TcpConnect`, `UdpBind`, `UdpConnect`,
+///   `UdpOutgoingDatagram`) returns `access-denied`.
 /// - [`AllowList`]: closure consults `EgressPolicy::check_address` for
 ///   connect-side operations; allows all binds. `Bind` (local-only) is
 ///   always permitted. **Asymmetry vs. HTTP:** because the closure only
