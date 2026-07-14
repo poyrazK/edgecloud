@@ -121,6 +121,33 @@ impl Downloader {
     /// hash-mismatch path. When the worker is configured without a
     /// keyring, `expected_signature` MUST be `None` (the
     /// supervisor's `require_signature` guard enforces this).
+    ///
+    /// **Transient-download retry contract (issue #46).** The fresh-
+    /// download path delegates to
+    /// [`Downloader::fetch_body_with_retry`], which retries up to
+    /// `MAX_DOWNLOAD_ATTEMPTS` times (3 by default) with exponential
+    /// backoff `RETRY_BASE_MS × 2^(attempt-1)` saturated at
+    /// `RETRY_CAP_MS` (3 200 ms) and ±25% jitter. Retry classifiers:
+    ///
+    /// - 5xx server responses and `408 Request Timeout` → retry.
+    /// - Transport-level `reqwest::Error`s (connect/timeout/etc.,
+    ///   `!is_builder`) → retry.
+    /// - All other 4xx (404, 409, 429, …) and builder errors →
+    ///   do NOT retry (deterministic).
+    /// - Body-cap `bail!`s (Content-Length pre-check + streaming
+    ///   accumulator; issue #451) → do NOT retry (permanent wire-
+    ///   contract violation).
+    ///
+    /// The post-retry pipeline (`verify_hash` → `verify_signature`
+    /// → cache write) runs **once** on the final body, outside the
+    /// retry loop. A tampered body that survives 3 retries is still
+    /// caught by `verify_hash`; the classifier does not weaken the
+    /// integrity check. Each attempt signs a fresh JWT via
+    /// `self.jwt_signer.sign()` so a single baked token cannot
+    /// expire mid-flight across the 200 + 800 + 3 200 ms budget.
+    /// The full non-goal list (no `log_forwarder` retry, no per-
+    /// attempt `tokio::time::timeout` budget, no cross-crate
+    /// extraction) lives in the PR description for #46.
     pub async fn get_artifact(
         &self,
         deployment_id: &str,
