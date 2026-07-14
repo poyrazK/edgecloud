@@ -3,6 +3,7 @@
 //! Re-exports public types for integration tests and external consumers.
 
 pub mod auth;
+pub mod backoff;
 pub mod bootstrap;
 pub mod config;
 pub mod detect;
