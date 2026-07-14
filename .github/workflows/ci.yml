@@ -233,10 +233,15 @@ jobs:
         # Build context is the repo root (note the trailing `.`)
         # because xcaddy's local-path form
         # `--with ...=./caddy-modules/tenant_concurrent` resolves
-        # relative to the build context. The Dockerfile itself
-        # does not COPY source — xcaddy fetches the Go module via
-        # go get and overrides the local source with the path
-        # specified.
+        # relative to the build context. The Dockerfile
+        # `COPY caddy-modules/ /usr/bin/caddy-modules/` is required
+        # because xcaddy's CWD inside `caddy:2-builder` is
+        # `/usr/bin/`; without the COPY the local-path form would
+        # resolve to `/usr/bin/caddy-modules/tenant_concurrent` and
+        # the build would fail with `replacement directory does
+        # not exist`. Once the repo publishes tagged releases of
+        # edgecloud-caddy-modules/tenant_concurrent, switch
+        # `--with` to the GitHub ref form and drop the COPY.
         run: |
           docker build \
             -t edgecloud/caddy-concurrent:test \
