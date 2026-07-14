@@ -5,6 +5,16 @@ edition = "2021"
 rust-version = "1.85"
 publish = false
 
+# `cargo-udeps` flags every dep as "unused" until PR B wires them — the
+# skeleton placeholder modules only carry `#![allow(dead_code)]` stubs.
+# Schema is nested (see CLAUDE.md "Cargo udeps ignore-list schema"):
+# `normal` covers `[dependencies]`, `development` covers `[dev-dependencies]`.
+# Update this list as PRs B/C/D/E land — the goal is to delete entries
+# once each dep has a real call site.
+[package.metadata.cargo-udeps.ignore]
+normal = ["async-nats", "futures", "humantime", "serde_json", "thiserror"]
+development = ["edge-test-helpers", "testcontainers", "testcontainers-modules"]
+
 [[bin]]
 name = "edge-ingress-sidecar"
 path = "src/main.rs"
