@@ -1,6 +1,7 @@
 //! edge-worker — Worker Supervisor entry point.
 
 mod auth;
+mod backoff;
 mod bootstrap;
 mod config;
 mod detect;
