@@ -104,8 +104,18 @@ func (tc *TenantConcurrent) CaddyModule() caddy.ModuleInfo {
 
 // Provision lazily allocates the per-key bucket map. Caddy has
 // already unmarshaled `Key` and `Limit` from the route JSON by the
-// time this runs.
+// time this runs. We validate `Limit` here as defense-in-depth: the
+// renderer (edge-ingress) only emits a route when
+// `concurrent_limit > 0`, but a hand-edited Caddyfile-JSON or a
+// future renderer regression could ship a 0/negative value. Without
+// this check, `make(chan struct{}, 0)` would create an unbuffered
+// channel that always rejects — turning the limiter into a
+// hard-deny-everything block that would be very confusing to debug
+// in production.
 func (tc *TenantConcurrent) Provision(_ caddy.Context) error {
+	if tc.Limit <= 0 {
+		return fmt.Errorf("tenant_concurrent: limit must be > 0, got %d", tc.Limit)
+	}
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	tc.buckets = make(map[string]chan struct{})

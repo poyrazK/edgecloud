@@ -55,6 +55,27 @@ func TestProvisionLazyAllocatesBuckets(t *testing.T) {
 	}
 }
 
+// TestProvisionRejectsNonPositiveLimit pins defense-in-depth: the
+// renderer only emits a route when concurrent_limit > 0, but a
+// hand-edited Caddyfile-JSON or a future renderer regression could
+// ship 0/negative. Without this check, `make(chan struct{}, 0)`
+// would build an unbuffered channel that always rejects, silently
+// turning the limiter into a hard-deny-everything block.
+func TestProvisionRejectsNonPositiveLimit(t *testing.T) {
+	for _, limit := range []int{0, -1, -50} {
+		tc := &TenantConcurrent{Key: "tenant-t_acme", Limit: limit}
+		var ctx caddy.Context
+		if err := tc.Provision(ctx); err == nil {
+			t.Fatalf("Provision with limit=%d must return an error, got nil", limit)
+		}
+		// Provision must not have allocated the buckets map on failure —
+		// a partial init would be worse than a clean reject.
+		if tc.buckets != nil {
+			t.Fatalf("Provision with limit=%d must not initialize buckets, got %v", limit, tc.buckets)
+		}
+	}
+}
+
 func TestCleanupDropsBuckets(t *testing.T) {
 	tc := newKeyed("tenant-t_acme", 5)
 	// Trigger one request to materialize a bucket.
