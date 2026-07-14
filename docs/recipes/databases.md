@@ -703,20 +703,57 @@ directory (`build_wasi_ctx_for_tenant` at `runtime.rs:1121`).
 
 ## When HTTP drivers aren't enough
 
-### The JS gap
+### JS outbound HTTP (issue #550 + #677)
 
-The TypeScript SDK (`@edgecloud/sdk`) currently exposes no `fetch`,
-and `edge-js-runtime` does not yet import
-`wasi:http::outgoing_handler::handle`. As a result, **these recipes
-are Rust-only at this revision**. JS guests needing a Neon / Turso /
-Upstash call have to either (a) shell out to a Rust shim over
-`wasi:ipc`, or (b) wait for the JS shim tracked in issue #677.
+The earlier revision of this recipe was Rust-only because
+`@edgecloud/sdk` exposed no `fetch` and `edge-js-runtime` did not yet
+import `wasi:http::outgoing_handler`. That gap is closed — the SDK
+now ships an `http` namespace, and the runtime wires the WIT
+`outgoing_handler::handle` into `globalThis.EdgeCloud.http.fetch(url,
+init)`. JS guests can call Neon / Turso / Upstash the same way a Rust
+guest does. The host-side egress allowlist enforcement is identical
+(handled by `WasiHttpHooks::send_request` inside the runtime, not by
+the JS shim).
 
-That shim is the right next step — wiring `wasi::http::outgoing_handler`
-into `edge-js-runtime/src/lib.rs:65-79` and exposing an
-`EdgeCloud.http.fetch(url, init)` namespace via `register.rs`. The
-recipe's Rust code sample is the shape a JS `fetch` polyfill would
-wrap.
+The JS shape:
+
+```js
+import { http } from "@edgecloud/sdk";
+
+const res = http.fetch("https://ep-xyz.aws.neon.tech/sql", {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    "authorization": `Bearer ${process.env("NEON_API_KEY")}`,
+  },
+  body: JSON.stringify({ query: "SELECT 1", params: [] }),
+});
+return { status: 200, body: res.body, contentType: "application/json" };
+```
+
+The same code works for Turso (path `/v2/pipeline`, body
+`{statements:[{q:"..."}]}`, no auth header if using a JWT-as-query
+string instead) and Upstash (path `/`, body `["PING"]`, header
+`authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}`).
+
+Two caveats the Rust recipes don't have:
+
+- **Sync only.** `EdgeCloud.http.fetch` blocks the QuickJS event
+  loop until the full body drains. There is no `Response.body`
+  stream; bodies come back as UTF-8 strings (lossy). For very large
+  responses, prefer chunked server-side processing.
+- **Errors are re-shaped JS `Error`s.** The host emits
+  `{"code":"<reason>","message":"<text>"}` on failure; the SDK
+  `http.js` shim parses that and throws a real `Error` whose
+  `.code` matches the host reason (`egress-denied`,
+  `bad-url`, `request-failed`, `response-read`). The original
+  message is preserved as `err.message`; the host envelope is on
+  `err.cause`.
+
+The three Provider sections above (Neon / Turso / Upstash) describe
+the protocol-level details — body shape, header names, auth model —
+that apply equally to Rust and JS. The same `edge egress set` /
+`edge env set` flow wires both languages.
 
 ### The socket-TLS follow-up
 
@@ -755,6 +792,7 @@ shape of problem one layer down.
   (the reason `edge deploy` follows `edge env set`).
 - Issue #494 — the data-gravity objection these recipes partially
   defuse.
-- Future: tracking issue #677 for the JS outbound-HTTP shim
-  (`edge-js-runtime` + `@edgecloud/sdk`); the doc's "JS gap" section
-  explains the scope and points at the same issue.
+- Issue #677 (closed by this PR) — wired
+  `wasi:http::outgoing_handler` into `edge-js-runtime` and exposed
+  `globalThis.EdgeCloud.http.fetch` plus `@edgecloud/sdk/http`. The
+  JS recipes in this doc depend on that work.
