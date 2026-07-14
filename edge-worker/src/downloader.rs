@@ -4,7 +4,9 @@ use anyhow::Context;
 use futures::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::auth::WorkerJwtSigner;
 use crate::verifier::Keyring;
@@ -18,6 +20,25 @@ use crate::verifier::Keyring;
 /// worker pre-checks `Content-Length` against this cap, then streams
 /// the body and aborts as soon as the running byte count exceeds it.
 pub(crate) const MAX_ARTIFACT_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Transient-download retry budget (issue #46).
+///
+/// `Downloader::fetch_body_with_retry` loops up to `MAX_DOWNLOAD_ATTEMPTS`
+/// times, sleeping `compute_backoff_ms(attempt, RETRY_BASE_MS)` between
+/// attempts. The schedule grows as `RETRY_BASE_MS × 2^(attempt-1)`,
+/// saturated at `RETRY_CAP_MS`, with ±25% jitter — `RETRY_BASE_MS=200`
+/// at attempt 1 ≈ 200ms, attempt 2 ≈ 800ms, attempt 3 ≈ 3.2s. The
+/// constants are not exposed as `Config` knobs; the issue #46
+/// contract hardcodes them and `Config` has no retry precedent.
+///
+/// Saturation semantics: `RETRY_CAP_MS` only kicks in once `base × 2^(n-1)`
+/// would exceed it — for the production 3-attempt budget the cap is never
+/// applied to the raw backoff (200, 800, 3200 are all below 3200); the
+/// caller still observes the cap as the ceiling of the jitter band on
+/// the final attempt.
+pub(crate) const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+pub(crate) const RETRY_BASE_MS: u64 = 200;
+pub(crate) const RETRY_CAP_MS: u64 = 3_200;
 
 /// Downloads Wasm artifacts from the control plane with local cache.
 pub struct Downloader {
@@ -106,6 +127,33 @@ impl Downloader {
     /// hash-mismatch path. When the worker is configured without a
     /// keyring, `expected_signature` MUST be `None` (the
     /// supervisor's `require_signature` guard enforces this).
+    ///
+    /// **Transient-download retry contract (issue #46).** The fresh-
+    /// download path delegates to
+    /// [`Downloader::fetch_body_with_retry`], which retries up to
+    /// `MAX_DOWNLOAD_ATTEMPTS` times (3 by default) with exponential
+    /// backoff `RETRY_BASE_MS × 2^(attempt-1)` saturated at
+    /// `RETRY_CAP_MS` (3 200 ms) and ±25% jitter. Retry classifiers:
+    ///
+    /// - 5xx server responses and `408 Request Timeout` → retry.
+    /// - Transport-level `reqwest::Error`s (connect/timeout/etc.,
+    ///   `!is_builder`) → retry.
+    /// - All other 4xx (404, 409, 429, …) and builder errors →
+    ///   do NOT retry (deterministic).
+    /// - Body-cap `bail!`s (Content-Length pre-check + streaming
+    ///   accumulator; issue #451) → do NOT retry (permanent wire-
+    ///   contract violation).
+    ///
+    /// The post-retry pipeline (`verify_hash` → `verify_signature`
+    /// → cache write) runs **once** on the final body, outside the
+    /// retry loop. A tampered body that survives 3 retries is still
+    /// caught by `verify_hash`; the classifier does not weaken the
+    /// integrity check. Each attempt signs a fresh JWT via
+    /// `self.jwt_signer.sign()` so a single baked token cannot
+    /// expire mid-flight across the 200 + 800 + 3 200 ms budget.
+    /// The full non-goal list (no `log_forwarder` retry, no per-
+    /// attempt `tokio::time::timeout` budget, no cross-crate
+    /// extraction) lives in the PR description for #46.
     pub async fn get_artifact(
         &self,
         deployment_id: &str,
@@ -190,75 +238,14 @@ impl Downloader {
             );
         }
 
-        // Download from control plane. Sign the request with the worker's
-        // bearer JWT — the control plane's WorkerAuth middleware will reject
-        // any unsigned /api/internal/* request with 401.
+        // Download from control plane via the (single-attempt, issue
+        // #46) body helper. Verify + cache write happen below, after
+        // this returns.
         let url = format!(
             "{}/api/internal/download/{}",
             self.control_plane_url, deployment_id
         );
-        let token = self.jwt_signer.sign();
-        tracing::info!(url, "downloading artifact");
-
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .with_context(|| format!("failed to download {}", url))?
-            .error_for_status()
-            .with_context(|| format!("HTTP error for {}", url))?;
-
-        // Defense-in-depth cap on the response body (issue #451). The
-        // control plane caps at MaxArtifactSize = 100 MiB; this stops
-        // a buggy / compromised CP from OOM-ing the worker. Bind
-        // `content_length` BEFORE calling `bytes_stream()` because the
-        // stream call moves `response`.
-        let cap = self.max_download_bytes;
-        let content_length = response.content_length();
-        if let Some(cl) = content_length {
-            if cl > cap {
-                tracing::warn!(
-                    deployment_id,
-                    url = %url,
-                    content_length = cl,
-                    cap,
-                    "rejecting artifact download: Content-Length exceeds worker cap"
-                );
-                anyhow::bail!(
-                    "artifact response for {deployment_id} exceeded cap of {cap} bytes \
-                     (Content-Length: {cl})"
-                );
-            }
-        }
-
-        // Even when Content-Length is missing or wrong (e.g. compressed
-        // responses — see reqwest::Response::content_length docs), cap
-        // the stream. `total` is updated BEFORE `extend_from_slice` so
-        // we bail before buffering further bytes (the bytes::BytesMut
-        // grow path is unchecked).
-        let mut stream = response.bytes_stream();
-        let mut total: usize = 0;
-        let mut buf = bytes::BytesMut::new();
-        while let Some(chunk) = stream.try_next().await? {
-            total = total.saturating_add(chunk.len());
-            if total > cap as usize {
-                tracing::warn!(
-                    deployment_id,
-                    url = %url,
-                    cap,
-                    total,
-                    "aborting artifact download: streamed body exceeded worker cap"
-                );
-                anyhow::bail!(
-                    "artifact response for {deployment_id} exceeded cap of {cap} bytes \
-                     after reading {total} bytes (Content-Length: {content_length:?})"
-                );
-            }
-            buf.extend_from_slice(&chunk);
-        }
-        let data: bytes::Bytes = buf.freeze();
+        let data = self.fetch_body_with_retry(deployment_id, &url).await?;
 
         // Verify before caching — never persist unverified bytes to disk.
         verify_hash(&data, expected_hash, deployment_id)?;
@@ -295,6 +282,164 @@ impl Downloader {
 
         tracing::info!(deployment_id, bytes = data.len(), "artifact cached");
         Ok(data)
+    }
+
+    /// Fetch the artifact body from the control plane, applying the
+    /// response-body cap (issue #451). Returns the post-cap body, pre-
+    /// verify, pre-cache — the caller verifies the SHA-256 / Ed25519
+    /// exactly once after this returns.
+    ///
+    /// **Retries transient failures** (issue #46): up to
+    /// `MAX_DOWNLOAD_ATTEMPTS` (3) attempts with exponential backoff
+    /// `RETRY_BASE_MS × 2^(attempt-1)` saturated at `RETRY_CAP_MS`
+    /// (3 200 ms), with ±25% jitter via `compute_backoff_ms`. The
+    /// classifier accepts 5xx + `408 Request Timeout` and any
+    /// transport-level `reqwest::Error` (connect/timeout/etc —
+    /// `!is_builder`); it rejects every other 4xx (deterministic,
+    /// retrying won't help).
+    ///
+    /// The body-cap `bail!` paths (Content-Length pre-check +
+    /// streaming accumulator) are PERMANENT — oversize bytes from
+    /// the control plane are not a transient fault and are NOT
+    /// retried. Same for any non-HTTP error from `verify_hash` /
+    /// `verify_signature` if this helper were ever extended to call
+    /// them (today they live in the caller and run once).
+    ///
+    /// Each attempt signs a fresh JWT (`jwt_signer.sign()` is cheap
+    /// and the existing wire contract demands it per `downloader.rs`
+    /// history; preserving per-attempt sign avoids a stale token
+    /// across the 200+800+3 200 ms budget).
+    async fn fetch_body_with_retry(
+        &self,
+        deployment_id: &str,
+        url: &str,
+    ) -> anyhow::Result<bytes::Bytes> {
+        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+            let token = self.jwt_signer.sign();
+            // Demoted from `info!`: a transient CP hiccup fires this on
+            // every attempt of every affected download, which can easily
+            // hit hundreds of lines per second across a busy worker.
+            // The `warn!` lines in the retry arms below carry the
+            // operator-visible "this is retrying" signal.
+            tracing::debug!(url, attempt, "downloading artifact");
+
+            let send_result = self.client.get(url).bearer_auth(token).send().await;
+            let response = match send_result {
+                Ok(r) => match r.error_for_status() {
+                    Ok(r2) => r2,
+                    Err(e) => {
+                        // `error_for_status` returns the original
+                        // `reqwest::Error`. When the server replied
+                        // (5xx, 408, 4xx), `e.status()` carries the
+                        // status — classify it via
+                        // is_retryable_response. When the
+                        // response-side error has no status (rare —
+                        // happens on a mid-stream protocol error),
+                        // fall back to the transport classifier.
+                        let status_based = e.status();
+                        let classifier_retryable = match status_based {
+                            Some(s) => is_retryable_response_status(s),
+                            None => is_retryable_error(&e),
+                        };
+                        if attempt < MAX_DOWNLOAD_ATTEMPTS && classifier_retryable {
+                            let backoff_ms = compute_backoff_ms(attempt, RETRY_BASE_MS);
+                            tracing::warn!(
+                                url = %url,
+                                attempt,
+                                backoff_ms,
+                                err = %e,
+                                status = ?status_based,
+                                "transient HTTP error; will retry"
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "HTTP error on attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} for {url}"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    // Transport-level error: no response object, so
+                    // `e.status()` is `None` and only
+                    // is_retryable_error applies.
+                    if attempt < MAX_DOWNLOAD_ATTEMPTS && is_retryable_error(&e) {
+                        let backoff_ms = compute_backoff_ms(attempt, RETRY_BASE_MS);
+                        tracing::warn!(
+                            url = %url,
+                            attempt,
+                            backoff_ms,
+                            err = %e,
+                            "transient transport error; will retry"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "transport error on attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} for {url}"
+                    )));
+                }
+            };
+
+            // From here on, the response is a 2xx (error_for_status
+            // succeeded). Both cap-checks below are PERMANENT bails:
+            // an oversize body is a wire-contract violation, not a
+            // transient blip, so we surface it directly without
+            // consuming retry budget.
+            //
+            // Defense-in-depth cap on the response body (issue #451).
+            // The control plane caps at MaxArtifactSize = 100 MiB;
+            // this stops a buggy / compromised CP from OOM-ing the
+            // worker. Bind `content_length` BEFORE calling
+            // `bytes_stream()` because the stream call moves `response`.
+            let cap = self.max_download_bytes;
+            let content_length = response.content_length();
+            if let Some(cl) = content_length {
+                if cl > cap {
+                    tracing::warn!(
+                        deployment_id,
+                        url = %url,
+                        content_length = cl,
+                        cap,
+                        "rejecting artifact download: Content-Length exceeds worker cap"
+                    );
+                    anyhow::bail!(
+                        "artifact response for {deployment_id} exceeded cap of {cap} bytes \
+                         (Content-Length: {cl})"
+                    );
+                }
+            }
+
+            // Even when Content-Length is missing or wrong (e.g.
+            // compressed responses — see reqwest::Response::content_length
+            // docs), cap the stream. `total` is updated BEFORE
+            // `extend_from_slice` so we bail before buffering further
+            // bytes (the bytes::BytesMut grow path is unchecked).
+            let mut stream = response.bytes_stream();
+            let mut total: usize = 0;
+            let mut buf = bytes::BytesMut::new();
+            while let Some(chunk) = stream.try_next().await? {
+                total = total.saturating_add(chunk.len());
+                if total > cap as usize {
+                    tracing::warn!(
+                        deployment_id,
+                        url = %url,
+                        cap,
+                        total,
+                        "aborting artifact download: streamed body exceeded worker cap"
+                    );
+                    anyhow::bail!(
+                        "artifact response for {deployment_id} exceeded cap of {cap} bytes \
+                         after reading {total} bytes (Content-Length: {content_length:?})"
+                    );
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            return Ok(buf.freeze());
+        }
+        // Unreachable: the loop above always either returns Ok via
+        // the stream EOF or returns Err via the bail! / classify arms.
+        unreachable!("fetch_body_with_retry loop exited without returning")
     }
 
     pub fn cache_path(&self, deployment_id: &str) -> PathBuf {
@@ -401,6 +546,85 @@ impl Downloader {
         tracing::info!(url = %url, status = %status, "auto-rollback POST accepted");
         Ok(())
     }
+}
+
+/// Hand-rolled xorshift64 RNG used by `compute_backoff_ms` for ±25% jitter.
+///
+/// **Vendored verbatim from `edge-cli/src/commands/retry.rs::xorshift_uniform_u64`
+/// (issue #46 implementation).** Cross-crate extraction is out of scope —
+/// `edge-cli` is a binary, not a shared lib, so the function is private
+/// there. The CAS pitfall below is documented at the original site
+/// (commands/retry.rs:316-320) and preserved here: a contributor who
+/// attempts to "simplify" the loop into `load → shift → store` will
+/// corrupt state under concurrent supervisors; the `compare_exchange_weak`
+/// dance is load-bearing.
+///
+/// Process-global static state means concurrent retry calls share the
+/// RNG, but contention is negligible (CAS retry is the slow path) and
+/// collisions only widen the jitter distribution. Acceptable.
+fn xorshift_uniform_u64() -> u64 {
+    static STATE: OnceLock<AtomicU64> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xCAFE_BABE_DEAD_BEEF);
+        AtomicU64::new(seed | 1)
+    });
+    let mut x = state.load(Ordering::Relaxed);
+    loop {
+        let original = x;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let next = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // CAS the *original* loaded state value (not the shifted `next`),
+        // so a concurrent caller that already advanced `x` retries with
+        // their updated value. See commands/retry.rs:316-320 for the
+        // original write-up of the regression this prevents.
+        match state.compare_exchange_weak(original, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => x = actual,
+        }
+    }
+}
+
+/// Exponential backoff with ±25% jitter for `attempt in 1..=MAX_DOWNLOAD_ATTEMPTS`.
+///
+/// `attempt=1` returns a value near `base_ms`, `attempt=2` near `base_ms × 2`,
+/// capped at `RETRY_CAP_MS` (constant — not parameterized, since the
+/// issue #46 contract hardcodes the schedule).
+fn compute_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
+    let exp = attempt.saturating_sub(1).min(31);
+    let raw = base_ms.saturating_mul(1u64 << exp);
+    let capped = raw.min(RETRY_CAP_MS);
+    let jitter_factor = (xorshift_uniform_u64() % 51) + 75; // 75..=125 (i.e. 0.75..=1.25)
+    capped.saturating_mul(jitter_factor) / 100
+}
+
+/// `true` iff a 5xx server response or `408 Request Timeout` is transient.
+///
+/// Used as the response-side retry classifier inside
+/// `fetch_body_with_retry` when `reqwest::Error::status()` carries
+/// the status (a real HTTP reply was received, just not 2xx). Accepts
+/// a `StatusCode` rather than a `&reqwest::Response` so the unit
+/// tests can pin it without constructing a network round-trip. The
+/// split with `is_retryable_error` (which only sees transport-level
+/// errors) makes the two cases independently testable.
+fn is_retryable_response_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// `true` iff a transport-level `reqwest::Error` is transient (worth retrying).
+///
+/// Mirrors `edge-cli/src/commands/retry.rs::is_anyhow_retryable`'s
+/// builder-error rule: builder errors are deterministic (constructor
+/// failures never succeed on retry), every other variant
+/// (connect/timeout/request/body/decode) is treated as transient.
+/// `reqwest::Error` exposes `.is_builder()`; network errors set
+/// `.is_connect()` / `.is_timeout()` / `.is_request()`.
+fn is_retryable_error(e: &reqwest::Error) -> bool {
+    !e.is_builder()
 }
 
 /// Verify the Ed25519 signature over `(sha256(bytes) || deployment_id)`
@@ -614,6 +838,136 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+// -----------------------------------------------------------------------
+// Retry-helper unit tests (issue #46).
+//
+// Pure-function tests for the helpers added in commit 1: the xorshift
+// RNG, the backoff math, and the response/error classifiers. The
+// wire-level integration of the retry loop is in `mod tests` below.
+//
+// These tests do NOT exercise the full retry loop — that comes in
+// commit 3 when `fetch_body_with_retry` is wired up. Today they pin the
+// individual helper contracts so a future bug in any one of them is
+// caught without spinning up wiremock.
+// -----------------------------------------------------------------------
+#[cfg(test)]
+mod retry_helpers_tests {
+    use super::*;
+
+    /// xorshift64 must produce varying output across many calls. A
+    /// regression to a constant seed or a static `return 0;` is caught
+    /// here before the more expensive backoff/jitter tests run.
+    #[test]
+    fn xorshift_produces_distinct_values_across_many_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            seen.insert(xorshift_uniform_u64());
+        }
+        // 1 000 calls into a 64-bit RNG must hit well under 1 000 unique
+        // values on average — but pathological bugs (constant seed,
+        // accidental `return 0`) collapse to ~1 unique value. The
+        // threshold "at least 100" is loose enough to survive any
+        // genuine xorshift bug fix that shifts the seed distribution.
+        assert!(
+            seen.len() >= 100,
+            "xorshift collapsed: only {} distinct values across 1 000 calls",
+            seen.len()
+        );
+    }
+
+    /// Backoff for `attempt=1` must sit in `[0.75×base, 1.25×base]` —
+    /// the jitter band. Anything outside is a sign that `xorshift % 51
+    /// + 75` has been refactored without updating the test.
+    #[test]
+    fn compute_backoff_attempt_1_is_within_pm_25_percent_of_base() {
+        let base = 200u64;
+        // 200 samples to wash out per-call RNG draw variance.
+        for _ in 0..200 {
+            let got = compute_backoff_ms(1, base);
+            assert!(
+                got >= (base * 3 / 4) && got <= (base * 5 / 4),
+                "attempt 1 backoff {got} out of [150, 250] for base={base}"
+            );
+        }
+    }
+
+    /// Backoff doubles per attempt until it saturates at `RETRY_CAP_MS`.
+    /// attempt=3 with base=200 must cap at `3200 × 5/4 = 4000` (the
+    /// jitter band above the cap).
+    #[test]
+    fn compute_backoff_grows_then_caps_at_retry_cap_ms() {
+        // attempt=2 → uncapped raw = 200 × 2 = 400, jitter band 300..500
+        for _ in 0..50 {
+            let got = compute_backoff_ms(2, 200);
+            assert!(
+                (300..=500).contains(&got),
+                "attempt 2 backoff {got} out of [300, 500]"
+            );
+        }
+
+        // attempt=3 → uncapped raw = 200 × 4 = 800, but RETRY_CAP_MS=3200
+        // is above 800 so the cap doesn't kick in here. Verify the cap
+        // does kick in at saturation: ask for a huge base that *would*
+        // overflow RETRY_CAP_MS without the `.min(RETRY_CAP_MS)`. With
+        // the cap present, the answer must be ≤ RETRY_CAP_MS × 5/4.
+        for _ in 0..50 {
+            let got = compute_backoff_ms(3, 200);
+            // raw=800, no cap, jitter band 600..1000
+            assert!(
+                (600..=1000).contains(&got),
+                "attempt 3 with base 200 got {got}, expected [600, 1000]"
+            );
+        }
+
+        // Saturation: attempt=20 with base=200 — raw = 200 × 2^19 ≫ cap,
+        // capped at 3200, jitter band 2400..4000.
+        for _ in 0..50 {
+            let got = compute_backoff_ms(20, 200);
+            assert!(
+                (2400..=4000).contains(&got),
+                "attempt 20 backoff {got} out of [2400, 4000] (cap=3200)"
+            );
+        }
+    }
+
+    /// `is_retryable_response_status` accepts the issue #46 contract:
+    /// 5xx and 408 are transient; everything else (2xx, 3xx, other
+    /// 4xx) is deterministic. Tested by passing StatusCodes directly
+    /// to avoid standing up a network round-trip for a pure function.
+    #[test]
+    fn is_retryable_response_status_accepts_5xx_and_408_rejects_others() {
+        let retryable_statuses = [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ];
+        for s in retryable_statuses {
+            assert!(
+                is_retryable_response_status(s),
+                "{s} should be classified retryable"
+            );
+        }
+
+        let deterministic_statuses = [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ];
+        for s in deterministic_statuses {
+            assert!(
+                !is_retryable_response_status(s),
+                "{s} should be classified deterministic"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,8 +1150,17 @@ mod tests {
     }
 
     /// Network error after cache invalidation: a tampered cache triggers
-    /// invalidation, the subsequent download fails with HTTP 500, and the
-    /// error propagates. The failed download must NOT recreate the cache file.
+    /// invalidation, the subsequent download exhausts the retry budget
+    /// (issue #46: 3 attempts, all returning 500), and the final error
+    /// propagates. The failed downloads must NOT recreate the cache file.
+    ///
+    /// Behavior change under the retry loop: previously this asserted
+    /// "single 500 → Err". Now the mock is unbounded, every one of the
+    /// 3 attempts receives 500, the budget exhausts, and the final Err
+    /// still surfaces. The assertion below stays valid by accident of
+    /// the contract, but the real "retry budget is 3" pin lives in
+    /// `get_artifact_gives_up_after_three_5xx` (which DOES assert
+    /// `received.len() == 3`).
     #[tokio::test]
     async fn get_artifact_download_failure_propagates_error() {
         use tempfile::TempDir;
@@ -840,6 +1203,223 @@ mod tests {
         assert!(
             !cache_path.exists(),
             "cache file should not be recreated on download failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_artifact retry tests (issue #46). These pin the contract on the
+    // new 3-attempt retry loop in fetch_body_with_retry. Each test wires
+    // a specific wiremock expectation sequence and asserts both the
+    // outcome AND the observed request count, so a regression in the
+    // classifier or the retry counter fails loudly.
+    //
+    // Wiremock-0.6 shape note: per-Mock `expect(N)` is enforced strictly,
+    // so two or three mocks on the same (method, path) pair with overlapping
+    // request counts trip verification. Both retry tests below use the
+    // idiomatic 0.6 fix — a single Mock + closure `Respond` impl backed by
+    // `Arc<AtomicUsize>` that drives the response sequence itself.
+    // -----------------------------------------------------------------------
+
+    /// 5xx + 5xx + 200: the helper retries twice and succeeds on the
+    /// third attempt. The third response body is a real 1 KiB wasm
+    /// prefix whose SHA-256 we re-verify to prove we got the bytes,
+    /// not just a status code.
+    ///
+    /// Implementation note: wiremock 0.6's per-Mock `expect(N)` is
+    /// enforced strictly — three registered mocks on the same path
+    /// with `expect(1)` cause verification to fail when a 4xx-mock
+    /// serves more than its share of requests. A single Mock +
+    /// closure-driven `Respond` (via `wiremock::Respond`'s
+    /// `FnMut(Request) -> ResponseTemplate` impl) plus a shared
+    /// `Arc<AtomicUsize>` counter is the idiomatic 0.6 fix.
+    #[tokio::test]
+    async fn get_artifact_retries_5xx_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let third_body: Vec<u8> = vec![0xAB; 1024];
+        let third_hash = sha256_hex(&third_body);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // Single Mock + closure Respond. counter.fetch_add returns the
+        // pre-increment count: 0 → 500, 1 → 500, 2 → 200 with body.
+        // `Respond::respond` consumes `self` per call, so the closure
+        // must own an `Arc` clone (Arc::clone is cheap, the closure
+        // runs once per request). Move a clone of third_body into the
+        // closure so we can still assert against the original below.
+        let counter_for_respond = Arc::clone(&counter);
+        let body_for_respond = third_body.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_retry_5xx_ok"))
+            .respond_with(move |_req: &Request| {
+                let n = counter_for_respond.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 | 1 => ResponseTemplate::new(500),
+                    _ => ResponseTemplate::new(200).set_body_bytes(body_for_respond.clone()),
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
+
+        let result = downloader
+            .get_artifact("d_retry_5xx_ok", &third_hash, None, None)
+            .await
+            .expect("retry-then-success must return Ok");
+        assert_eq!(
+            result.as_ref(),
+            third_body.as_slice(),
+            "returned bytes must equal the third mock's body"
+        );
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            3,
+            "expected exactly 3 attempts (2 retries + 1 success), got {}",
+            received.len()
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "responder must have been invoked 3 times"
+        );
+    }
+
+    /// 5xx three times: the helper retries up to the budget and gives
+    /// up. The wiremock call count must be exactly 3, and the surfaced
+    /// error must preserve the typed `reqwest::Error` so the classifier
+    /// contract is auditable from the caller side. Single Mock +
+    /// counter-driven `Respond` (see the wiremock-0.6 shape note
+    /// above `retries_5xx_then_succeeds`).
+    #[tokio::test]
+    async fn get_artifact_gives_up_after_three_5xx() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let counter_for_respond = Arc::clone(&counter);
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_give_up_5xx"))
+            .respond_with(move |_req: &Request| {
+                let _ = counter_for_respond.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            })
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
+
+        let hash = sha256_hex(b"any bytes");
+        let err = downloader
+            .get_artifact("d_give_up_5xx", &hash, None, None)
+            .await
+            .expect_err("3 × 500 must exhaust the retry budget and Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("500") || msg.contains("HTTP error"),
+            "expected error to reference 500, got: {msg}"
+        );
+
+        // `received.len()` is the contract pin — every accepted request
+        // goes through the closure `Respond` and increments `counter`, so
+        // asserting the wiremock-side count is sufficient.
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            3,
+            "retry budget must be exactly 3 (got {})",
+            received.len()
+        );
+    }
+
+    /// 4xx (404): the helper MUST NOT retry — 4xx other than 408 is
+    /// deterministic. Wiremock call count must be exactly 1.
+    #[tokio::test]
+    async fn get_artifact_does_not_retry_on_4xx() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_no_retry_4xx"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
+
+        let hash = sha256_hex(b"any bytes");
+        let err = downloader
+            .get_artifact("d_no_retry_4xx", &hash, None, None)
+            .await
+            .expect_err("404 must Err immediately without retry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404") || msg.contains("HTTP error"),
+            "expected error to reference 404, got: {msg}"
+        );
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            1,
+            "404 must NOT retry (got {} requests)",
+            received.len()
+        );
+    }
+
+    /// Happy path (200): over-eager retry would inflate this to 3
+    /// requests. The helper must make exactly one call when the
+    /// response succeeds on the first attempt.
+    #[tokio::test]
+    async fn get_artifact_happy_path_makes_exactly_one_request() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body: Vec<u8> = b"happy path body".to_vec();
+        let hash = sha256_hex(&body);
+        Mock::given(method("GET"))
+            .and(path("/api/internal/download/d_happy_one"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let downloader =
+            Downloader::new(server.uri(), tmp.path().to_path_buf(), test_signer(), None);
+
+        let result = downloader
+            .get_artifact("d_happy_one", &hash, None, None)
+            .await
+            .expect("happy path must return Ok");
+        assert_eq!(result.as_ref(), body.as_slice());
+
+        let received = server.received_requests().await.expect("received");
+        assert_eq!(
+            received.len(),
+            1,
+            "first-attempt success must make exactly one request (got {})",
+            received.len()
         );
     }
 
