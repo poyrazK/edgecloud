@@ -480,7 +480,27 @@ Supervisor publishes to NATS subject `edgecloud.heartbeats.<region>`:
 
 Heartbeat interval: **30 seconds**.
 
-### 5.7 Graceful Shutdown
+### 5.7 Worker `/metrics` endpoint (issue #49)
+
+Each `edge-worker` process exposes a Prometheus-format metrics endpoint
+for scraping per-app counters without going through the control plane.
+Binds to `METRICS_ADDR` (default `0.0.0.0:9090`) and serves one
+endpoint: `GET /metrics`. Bearer-token auth via `METRICS_AUTH_TOKEN`;
+empty token = every request returns 401 (fail-closed).
+
+Metric families:
+
+- `edge_requests_total{deployment_id, app_name}` — monotonic FaaS request counter (mirrors `RequestMeter::record_request`).
+- `edge_outbound_bytes_total{deployment_id, app_name}` — monotonic FaaS response byte counter (mirrors `RequestMeter::record_outbound_bytes`).
+- `edge_duration_ms_total{deployment_id, app_name}` — monotonic FaaS wall-clock latency (mirrors `RequestMeter::record_duration`).
+- `edge_resident_seconds_total{deployment_id, app_name}` — LongRunning resident-time ticker (bumped every heartbeat interval for LR apps only).
+- `edge_app_status{deployment_id, app_name, status}` — gauge. Single-row invariant: previous status is cleared before a new one is stamped.
+- `edge_worker_uptime_seconds` — worker process uptime.
+- `edge_worker_active_apps` — current count of running apps.
+
+The counters are intentionally redundant with `HeartbeatMessage.{request_count, outbound_bytes, duration_ms_total, resident_seconds}`: the heartbeat is for billing (snapshot-and-subtract per heartbeat), the Prometheus counter is for operator dashboards (monotonic running total). They are NOT a duplicate channel — both are wired at the dispatch path.
+
+### 5.8 Graceful Shutdown
 
 On SIGTERM:
 1. Stop accepting NATS messages
