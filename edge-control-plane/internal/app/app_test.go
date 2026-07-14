@@ -572,19 +572,25 @@ func TestReady_UnhealthyOnDBPingFailure(t *testing.T) {
 	}
 }
 
-// TestHealth_LivenessAlwaysOK verifies the post-#48 /health handler is
-// pure liveness: it returns 200 + {"status":"ok"} even when the DB
-// mock has NO ExpectPing registered and the NATS publisher is a
-// zero-value (Conn() returns nil, short-circuiting the NATS path).
-// The handler must not touch any external dependency.
-func TestHealth_LivenessAlwaysOK(t *testing.T) {
+// TestHealth_LivenessDoesNotTouchDeps pins the post-#48 /health
+// contract: the handler must not touch any external dependency. The
+// test wires up:
+//   - a sqlmock DB with NO ExpectPing (newMockDBWithMock enables
+//     MonitorPingsOption(true), so any stray PingContext surfaces as
+//     a missing-expectation failure when ExpectationsWereMet runs);
+//   - a zero-value NATSPublisher (Conn() returns nil, short-circuiting
+//     the NATS path);
+//
+// then asserts 200 + status="ok". If a future refactor accidentally
+// re-adds a db.PingContext() or any other dependency call to the
+// /health handler, ExpectationsWereMet fails the test.
+//
+// The wire-shape contract (no loops / degraded_reasons on /health) is
+// pinned separately by TestHealth_LivenessNoLoops below.
+func TestHealth_LivenessDoesNotTouchDeps(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
-	// Deliberately no ExpectPing — the handler must not call
-	// PingContext. If it does, sqlmock (with MonitorPingsOption) and
-	// any queued ExpectPing mismatch would surface as a missing-
-	// expectation failure.
-	db, _, cleanup := newMockDBWithMock(t)
+	db, mock, cleanup := newMockDBWithMock(t)
 	defer cleanup()
 	publisher := &nats.NATSPublisher{}
 	artifactStore := storage.NewFSArtifactStore(artifactPath)
@@ -606,36 +612,6 @@ func TestHealth_LivenessAlwaysOK(t *testing.T) {
 	if got := body["status"]; got != "ok" {
 		t.Errorf("status = %v, want ok", got)
 	}
-}
-
-// TestHealth_LivenessDoesNotTouchDeps is the strict version of
-// LivenessAlwaysOK: it uses sqlmock.MonitorPingsOption(true) so any
-// stray PingContext call from the handler becomes a hard failure
-// surfaced by go test. If a future refactor accidentally re-adds a
-// db.PingContext() to the /health handler, this test fails.
-func TestHealth_LivenessDoesNotTouchDeps(t *testing.T) {
-	artifactPath := t.TempDir()
-	cfg := testConfig(t, artifactPath)
-	mockDB, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
-	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
-	}
-	defer mockDB.Close()
-	// No ExpectPing. If the handler calls PingContext, sqlmock
-	// records the violation and VerifyAll below surfaces it.
-	db := sqlx.NewDb(mockDB, "postgres")
-	publisher := &nats.NATSPublisher{}
-	artifactStore := storage.NewFSArtifactStore(artifactPath)
-
-	app := New(cfg, db, publisher, artifactStore, emptyFS)
-
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	app.Handler.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
-	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sqlmock recorded unexpected calls — the /health handler touched the DB: %v", err)
@@ -649,9 +625,8 @@ func TestHealth_LivenessDoesNotTouchDeps(t *testing.T) {
 func TestHealth_LivenessNoLoops(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
-	db, mock, cleanup := newMockDBWithMock(t)
+	db, _, cleanup := newMockDBWithMock(t)
 	defer cleanup()
-	mock.ExpectPing() // unused but pinned so the handler's lack of Ping doesn't trigger a mismatch
 	publisher := &nats.NATSPublisher{}
 	artifactStore := storage.NewFSArtifactStore(artifactPath)
 
