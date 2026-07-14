@@ -706,10 +706,12 @@ components:
       type: object
       description: |
         Envelope returned by `GET /api/v1/apps/{appName}/logs`. Items
-        are ordered newest-first (by `ts` DESC). `limit` echoes the
-        effective ceiling the server applied (after clamping the
-        request to [1, 1000]); `since` echoes the cutoff timestamp
-        when one was supplied or applied as a default.
+        are ordered newest-first by `(ts DESC, id DESC)`, so rows that
+        share a timestamp have a deterministic order and pagination
+        is stable across equal timestamps. `limit` echoes the effective
+        ceiling the server applied (after clamping the request to
+        [1, 1000]); `since` echoes the cutoff timestamp when one was
+        supplied or applied as a default.
       properties:
         items:
           type: array
@@ -728,6 +730,30 @@ components:
             was applied (clients should not pin follow-on requests
             to a specific ts in that case).
           example: 2026-06-24T11:55:00Z
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque pagination token for the next older page. Pass as
+            `cursor=<value>` to fetch the page that immediately
+            precedes the last row in this response. `null` when the
+            current page is the final page (no older rows remain).
+            This is the preferred pagination contract.
+          example: eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9
+        next_offset:
+          type: integer
+          nullable: true
+          description: |
+            Offset of the next older page when paginating with the
+            legacy `offset` query parameter. `null` when the current
+            page is the final page, or when the request used
+            `cursor` rather than `offset` (cursor mode suppresses
+            offset hints).
+            Deprecated: this field is retained for one release for
+            clients still using `offset`. New clients should use
+            `next_cursor`; a follow-up issue will remove the offset
+            parameter, the offset response field, and the offset
+            server branch.
 
     AppWorkerStatus:
       type: object
@@ -811,6 +837,28 @@ components:
         reason:
           type: string
           example: no running app found for this tenant
+
+    # -------------------------------------------------------------------------
+    # L4/TCP public-port (issue #548)
+    # -------------------------------------------------------------------------
+    L4PortResponse:
+      type: object
+      required: [public_port]
+      properties:
+        public_port:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 65535
+          description: |
+            Ingress-side port the tenant connects to for raw-TCP traffic to
+            the named app. Allocated by the control plane from the
+            configured L4 port range (default 31000-31999); persisted on
+            the apps row so it survives ingress / worker restarts. Two
+            ingress instances polling the same (tenant, app) see the
+            same value because allocation is atomic via
+            `UPDATE … WHERE l4_public_port IS NULL`.
+          example: 31042
 
     # -------------------------------------------------------------------------
     # Environment Variables
@@ -1206,6 +1254,73 @@ components:
           type: boolean
           description: Clear both `quota_lock_grace_until` and `overage_allowed_until`.
           example: false
+
+    # -------------------------------------------------------------------------
+    # Per-tenant data-plane rate limit (issue #305)
+    # -------------------------------------------------------------------------
+    TenantRateLimitRequest:
+      type: object
+      description: |
+        Per-tenant data-plane rate-limit caps written by
+        `PUT /api/v1/admin/tenants/{tenantID}/rate-limit`. All fields are
+        optional; absent fields are not modified. Every field accepts 0
+        ("no cap"). The ingress cache drops the row when all four caps are
+        zero so the per-tenant `rate_limit` route disappears from Caddy
+        within one `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick.
+
+        Sub-features #2 (concurrent_limit) and #3 (bandwidth_bps) are
+        cached for follow-up render work — neither is consumed by the
+        Caddy renderer in the issue #305 PR.
+      properties:
+        rps:
+          type: integer
+          minimum: 0
+          description: Per-tenant requests-per-second cap. 0 = no cap.
+          example: 100
+        burst:
+          type: integer
+          minimum: 0
+          description: Per-tenant burst paired with `rps`. 0 = falls back to rps at the renderer.
+          example: 200
+        concurrent_limit:
+          type: integer
+          minimum: 0
+          description: Concurrent-request cap per tenant (sub-feature #2, render deferred).
+          example: 50
+        bandwidth_bps:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-tenant bytes-per-second cap (sub-feature #3, render deferred).
+          example: 5000000
+
+    TenantRateLimitResponse:
+      type: object
+      description: |
+        Per-tenant rate-limit row consumed by the edge-ingress
+        `tenant_ratelimit` fetcher via
+        `GET /api/v1/internal/rate-limit/{tenantID}`. Polls every
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s). 404 from
+        this endpoint means "no quotas row" — the cache treats that as
+        "delete any stale entry, emit no route". 200 with all zeros is
+        identical: cache clears on the same tick.
+      properties:
+        tenant_id:
+          type: string
+          example: t_acme
+        rps:
+          type: integer
+          example: 100
+        burst:
+          type: integer
+          example: 200
+        concurrent_limit:
+          type: integer
+          example: 0
+        bandwidth_bps:
+          type: integer
+          format: int64
+          example: 0
 
     # -------------------------------------------------------------------------
     # Migration
@@ -2385,12 +2500,34 @@ paths:
       summary: List recent log entries for an app
       description: |
         Returns the most recent log entries for the named app within
-        the caller's tenant, newest first. Supports `since` (RFC3339
-        cutoff), `level` (minimum severity), and `limit` (max items).
+        the caller's tenant, newest first by `(ts DESC, id DESC)`.
+        Supports `since` (RFC3339 lower bound), `until` (RFC3339
+        upper bound), `level` (minimum severity), `limit` (max items),
+        and either `cursor` (preferred) or `offset` (deprecated)
+        for pagination.
 
         The cutoff is computed server-side against the database clock
-        (NOW() - interval), so wall-clock skew between this server
-        and the database does not affect what is returned.
+        (`NOW() - make_interval(secs => $1)`), so wall-clock skew
+        between this server and the database does not affect what is
+        returned.
+
+        Pagination contracts:
+        - First-page and `offset` requests: response contains both
+          `next_cursor` and `next_offset` (deprecated) when another
+          page exists; both are `null` on the final page.
+        - `cursor` requests: response contains `next_cursor` only;
+          `next_offset` is `null` by construction.
+        - A cursor is scoped to an unchanged `(tenant, app, since,
+          until, level)` query — clients reusing a cursor must
+          preserve the original filter set, or paging may silently
+          skip rows that fall outside the new filter.
+        - The cursor is opaque (URL-safe base64 of a private v1
+          JSON payload). The server does not sign it: authorization
+          continues to come from the authenticated tenant ID plus
+          the SQL `WHERE tenant_id = $1 AND app_name = $2` boundary,
+          so a forged cursor cannot cross tenants or apps.
+        - `cursor` and `offset` are mutually exclusive. A request
+          that supplies both, including `offset=0`, returns 400.
       parameters:
         - name: appName
           in: path
@@ -2405,8 +2542,24 @@ paths:
             type: string
             format: date-time
           description: |
-            RFC3339 cutoff; missing → server default (5m). Future-dated
-            values are clamped to the default window.
+            RFC3339 lower bound on `ts`; missing → server default
+            (5 minutes). Future-dated values are rejected with 400
+            (the server does not silently clamp them). Malformed
+            values are rejected with 400.
+        - name: until
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: |
+            Optional RFC3339 upper bound on `ts`. The server returns
+            rows with `ts <= until`. Future-dated values are
+            rejected with 400; a value earlier than `since` is
+            rejected with 400; malformed values are rejected with
+            400. When omitted, the upper bound is unbounded (live
+            read), so cursor pages do not freeze the watermark
+            unless the caller asks for a snapshot.
         - name: level
           in: query
           required: false
@@ -2415,7 +2568,8 @@ paths:
             enum: [trace, debug, info, warn, error]
           description: |
             Minimum severity. Filter is inclusive: `level=warn` returns
-            `warn` and `error`. Unknown values → 400.
+            `warn` and `error`. Unknown values → 400. `trace` is
+            honored as the lowest severity.
         - name: limit
           in: query
           required: false
@@ -2426,6 +2580,33 @@ paths:
           description: |
             Maximum items to return. Values outside [1, 1000] are
             clamped; absent or zero → server default (100).
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Opaque pagination token returned by a previous response
+            as `next_cursor`. Pass it back here to fetch the page
+            that immediately precedes the last row of that response.
+            Preferred over `offset`. Mutually exclusive with
+            `offset`; supplying both, including `offset=0`, returns
+            400. Malformed or unsupported-version cursors return 400.
+        - name: offset
+          in: query
+          required: false
+          deprecated: true
+          schema:
+            type: integer
+            minimum: 0
+          description: |
+            Legacy offset-based pagination. The response returns
+            `next_offset` (also deprecated) for compatibility. New
+            clients should use `cursor` instead. Mutually exclusive
+            with `cursor`; supplying both returns 400. Deprecated:
+            this parameter, the `next_offset` response field, and
+            the server's offset branch will be removed in a
+            follow-up release.
       responses:
         '200':
           description: Log entries.
@@ -2611,6 +2792,77 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/IngressResponseNotReady'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # -------------------------------------------------------------------------
+  # L4/TCP public-port (issue #548)
+  # -------------------------------------------------------------------------
+  /api/v1/apps/{appName}/l4-port:
+    get:
+      operationId: getL4Port
+      summary: Get the L4/TCP public port for an app
+      description: |
+        Returns the ingress-side public port allocated to this app for
+        raw-TCP traffic. The port is in the configured L4 range
+        (default 31000-31999) and is what the tenant's TCP clients
+        should connect to. Returns 404 if the app does not exist OR
+        if it exists but no port has been allocated yet (HTTP-only
+        app, or no TCP heartbeat has been processed yet).
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Port allocated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            App not found, or app exists but no L4 port allocated yet.
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: allocateL4Port
+      summary: Allocate the L4/TCP public port for an app
+      description: |
+        Atomically allocates a public port from the configured L4 range
+        if one is not already allocated. Idempotent — calling twice for
+        the same app returns the same port without consuming a second
+        slot. Returns 409 if the configured range is fully allocated
+        (operator should widen L4_PORT_RANGE_END).
+      parameters:
+        - name: appName
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique name of the app within the tenant.
+      responses:
+        '200':
+          description: Port (just) allocated, or already-allocated port returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: App not found.
+        '409':
+          description: L4 port range exhausted.
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -3410,6 +3662,62 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/admin/tenants/{tenantID}/rate-limit:
+    put:
+      operationId: adminSetTenantRateLimit
+      summary: Set or clear a tenant's data-plane rate-limit caps (admin only)
+      description: |
+        Writes the four per-tenant rate-limit columns on `quotas`
+        (`tenant_rate_limit_rps`, `tenant_rate_limit_burst`,
+        `tenant_concurrent_limit`, `tenant_bandwidth_bps`) via
+        `UPDATE ... SET ... WHERE tenant_id = $1`. Every field in the
+        request body is optional; absent fields are not modified. The
+        `tenant_rate_limit_set_at` audit column is bumped to
+        `now()` on every write.
+
+        The ingress picks up the change on its next
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` tick (default 30s):
+        a non-zero rps causes a new per-tenant `rate_limit` route to
+        appear in Caddy; clearing rps back to 0 (or deleting the whole
+        row via all-zero + 404) removes the route on the next tick.
+
+        Records an `audit_logs` row with action `tenant.rate_limit.set`
+        and the full request body as the diff payload.
+
+        Owner role required. Returns 404 when the tenant (or its quota
+        row) doesn't exist; 400 when any field is negative.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: tenantID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantRateLimitRequest'
+      responses:
+        '200':
+          description: Rate-limit row upserted. Returns the post-write values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantRateLimitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /api/v1/admin/tenants/{tenantID}/enable:
     post:
       operationId: enableTenant
@@ -3654,6 +3962,46 @@ paths:
           description: App not found
 
   # -------------------------------------------------------------------------
+  # Internal: per-tenant data-plane rate limit (issue #305)
+  # -------------------------------------------------------------------------
+  /api/v1/internal/rate-limit/{tenantID}:
+    get:
+      summary: Per-tenant data-plane rate-limit caps for the ingress
+      description: |
+        Returns the four per-tenant caps consumed by the
+        edge-ingress `tenant_ratelimit` fetcher. Polled every
+        `TENANT_RATE_LIMIT_FETCH_INTERVAL` (default 30s) per tenant
+        in the routing table. Drives the per-tenant `rate_limit`
+        routes in Caddy (sub-feature #1).
+
+        Returns 404 when the tenant has no `quotas` row (fail-open:
+        the cache clears the entry so the renderer stops emitting a
+        route for that tenant). Returns 200 with all-zero caps when
+        the row exists but no caps are configured (same fail-open
+        semantics — the cache drops the entry). 5xx is logged at
+        warn but not treated as a cache invalidation, so the
+        ingress keeps the last-known state.
+      security:
+        - InternalTokenAuth: []
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Per-tenant rate-limit caps (all zeros = no caps).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantRateLimitResponse'
+        '400':
+          description: Invalid tenant ID
+        '404':
+          description: Tenant has no quotas row
+
+  # -------------------------------------------------------------------------
   # Internal: per-tenant quota state (issue #420)
   # -------------------------------------------------------------------------
   /api/v1/internal/quota/{tenantID}:
@@ -3686,6 +4034,47 @@ paths:
           description: Invalid tenant ID
         '404':
           description: Tenant not found
+
+  # Issue #548: edge-ingress polls this every QUOTA_FETCH_INTERVAL so
+  # two ingress instances in the same region converge on the same
+  # persisted L4 port for each (tenant, app). Mounted under the same
+  # X-Internal-Token as the other /api/v1/internal/* endpoints.
+  /api/v1/internal/l4-port/{tenantID}/{appName}:
+    get:
+      summary: Per-(tenant, app) L4/TCP public port for the ingress
+      description: |
+        Returns the persisted L4 public port for the named (tenant, app).
+        The ingress `L4PortCache` polls this endpoint every
+        `QUOTA_FETCH_INTERVAL` (default 30s) so two ingress instances in
+        the same region can converge on the same persisted port. 404
+        means either "app not found" or "no port allocated yet" — the
+        ingress treats both as a cache miss and falls back to its local
+        `L4PortPool` + write-back on the next heartbeat.
+      security:
+        - InternalTokenAuth: []
+      parameters:
+        - in: path
+          name: tenantID
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: appName
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Port assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L4PortResponse'
+        '400':
+          description: Invalid app name or tenant ID
+        '404':
+          description: |
+            App not found, or app exists but no port allocated yet.
 
   # -------------------------------------------------------------------------
   # Custom domains (issue #83)

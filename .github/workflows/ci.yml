@@ -447,6 +447,24 @@ jobs:
         with:
           go-version: '1.25.0'
 
+      - name: Check embedded OpenAPI matches canonical
+        # The canonical OpenAPI source lives at
+        # `docs/api/openapi.yaml`. `cmd/api/main.go:23` runs
+        # `cp ../../docs/api/openapi.yaml docs/api/openapi.yaml`
+        # via `go generate`, producing the embedded copy at
+        # `cmd/api/docs/api/openapi.yaml`. The drift guard below
+        # fails CI if a developer edited the canonical without
+        # regenerating the embedded copy (or vice versa), forcing
+        # both to ship in lockstep — otherwise runtime docs would
+        # silently disagree with what `/docs/` serves.
+        run: |
+          if ! diff -q docs/api/openapi.yaml cmd/api/docs/api/openapi.yaml >/dev/null; then
+            echo "::error::docs/api/openapi.yaml and cmd/api/docs/api/openapi.yaml are out of sync."
+            echo "Run 'go generate ./cmd/api' and commit the regenerated embedded copy."
+            diff -u docs/api/openapi.yaml cmd/api/docs/api/openapi.yaml | head -200
+            exit 1
+          fi
+
       - name: Validate spec coverage
         run: go run ./scripts/openapi_check.go
 

@@ -338,12 +338,34 @@ export interface paths {
         /**
          * List recent log entries for an app
          * @description Returns the most recent log entries for the named app within
-         *     the caller's tenant, newest first. Supports `since` (RFC3339
-         *     cutoff), `level` (minimum severity), and `limit` (max items).
+         *     the caller's tenant, newest first by `(ts DESC, id DESC)`.
+         *     Supports `since` (RFC3339 lower bound), `until` (RFC3339
+         *     upper bound), `level` (minimum severity), `limit` (max items),
+         *     and either `cursor` (preferred) or `offset` (deprecated)
+         *     for pagination.
          *
          *     The cutoff is computed server-side against the database clock
-         *     (NOW() - interval), so wall-clock skew between this server
-         *     and the database does not affect what is returned.
+         *     (`NOW() - make_interval(secs => $1)`), so wall-clock skew
+         *     between this server and the database does not affect what is
+         *     returned.
+         *
+         *     Pagination contracts:
+         *     - First-page and `offset` requests: response contains both
+         *       `next_cursor` and `next_offset` (deprecated) when another
+         *       page exists; both are `null` on the final page.
+         *     - `cursor` requests: response contains `next_cursor` only;
+         *       `next_offset` is `null` by construction.
+         *     - A cursor is scoped to an unchanged `(tenant, app, since,
+         *       until, level)` query — clients reusing a cursor must
+         *       preserve the original filter set, or paging may silently
+         *       skip rows that fall outside the new filter.
+         *     - The cursor is opaque (URL-safe base64 of a private v1
+         *       JSON payload). The server does not sign it: authorization
+         *       continues to come from the authenticated tenant ID plus
+         *       the SQL `WHERE tenant_id = $1 AND app_name = $2` boundary,
+         *       so a forged cursor cannot cross tenants or apps.
+         *     - `cursor` and `offset` are mutually exclusive. A request
+         *       that supplies both, including `offset=0`, returns 400.
          */
         get: operations["listLogsForApp"];
         put?: never;
@@ -1989,10 +2011,12 @@ export interface components {
         };
         /**
          * @description Envelope returned by `GET /api/v1/apps/{appName}/logs`. Items
-         *     are ordered newest-first (by `ts` DESC). `limit` echoes the
-         *     effective ceiling the server applied (after clamping the
-         *     request to [1, 1000]); `since` echoes the cutoff timestamp
-         *     when one was supplied or applied as a default.
+         *     are ordered newest-first by `(ts DESC, id DESC)`, so rows that
+         *     share a timestamp have a deterministic order and pagination
+         *     is stable across equal timestamps. `limit` echoes the effective
+         *     ceiling the server applied (after clamping the request to
+         *     [1, 1000]); `since` echoes the cutoff timestamp when one was
+         *     supplied or applied as a default.
          */
         LogListResponse: {
             items?: components["schemas"]["LogEntry"][];
@@ -2010,6 +2034,28 @@ export interface components {
              * @example 2026-06-24T11:55:00Z
              */
             since?: string;
+            /**
+             * @description Opaque pagination token for the next older page. Pass as
+             *     `cursor=<value>` to fetch the page that immediately
+             *     precedes the last row in this response. `null` when the
+             *     current page is the final page (no older rows remain).
+             *     This is the preferred pagination contract.
+             * @example eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9
+             */
+            next_cursor?: string | null;
+            /**
+             * @description Offset of the next older page when paginating with the
+             *     legacy `offset` query parameter. `null` when the current
+             *     page is the final page, or when the request used
+             *     `cursor` rather than `offset` (cursor mode suppresses
+             *     offset hints).
+             *     Deprecated: this field is retained for one release for
+             *     clients still using `offset`. New clients should use
+             *     `next_cursor`; a follow-up issue will remove the offset
+             *     parameter, the offset response field, and the offset
+             *     server branch.
+             */
+            next_offset?: number | null;
         };
         /**
          * @description Tenant-facing projection of the worker-reported status of one
@@ -3510,13 +3556,26 @@ export interface operations {
         parameters: {
             query?: {
                 /**
-                 * @description RFC3339 cutoff; missing → server default (5m). Future-dated
-                 *     values are clamped to the default window.
+                 * @description RFC3339 lower bound on `ts`; missing → server default
+                 *     (5 minutes). Future-dated values are rejected with 400
+                 *     (the server does not silently clamp them). Malformed
+                 *     values are rejected with 400.
                  */
                 since?: string;
                 /**
+                 * @description Optional RFC3339 upper bound on `ts`. The server returns
+                 *     rows with `ts <= until`. Future-dated values are
+                 *     rejected with 400; a value earlier than `since` is
+                 *     rejected with 400; malformed values are rejected with
+                 *     400. When omitted, the upper bound is unbounded (live
+                 *     read), so cursor pages do not freeze the watermark
+                 *     unless the caller asks for a snapshot.
+                 */
+                until?: string;
+                /**
                  * @description Minimum severity. Filter is inclusive: `level=warn` returns
-                 *     `warn` and `error`. Unknown values → 400.
+                 *     `warn` and `error`. Unknown values → 400. `trace` is
+                 *     honored as the lowest severity.
                  */
                 level?: "trace" | "debug" | "info" | "warn" | "error";
                 /**
@@ -3524,6 +3583,26 @@ export interface operations {
                  *     clamped; absent or zero → server default (100).
                  */
                 limit?: number;
+                /**
+                 * @description Opaque pagination token returned by a previous response
+                 *     as `next_cursor`. Pass it back here to fetch the page
+                 *     that immediately precedes the last row of that response.
+                 *     Preferred over `offset`. Mutually exclusive with
+                 *     `offset`; supplying both, including `offset=0`, returns
+                 *     400. Malformed or unsupported-version cursors return 400.
+                 */
+                cursor?: string;
+                /**
+                 * @deprecated
+                 * @description Legacy offset-based pagination. The response returns
+                 *     `next_offset` (also deprecated) for compatibility. New
+                 *     clients should use `cursor` instead. Mutually exclusive
+                 *     with `cursor`; supplying both returns 400. Deprecated:
+                 *     this parameter, the `next_offset` response field, and
+                 *     the server's offset branch will be removed in a
+                 *     follow-up release.
+                 */
+                offset?: number;
             };
             header?: never;
             path: {
