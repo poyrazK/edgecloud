@@ -88,7 +88,7 @@ func TestWebhookHandler_ListDeliveries_Success(t *testing.T) {
 // non-nil NextCursor from the service makes it into the wire response
 // as a non-null JSON string.
 func TestWebhookHandler_ListDeliveries_NextCursorEncoded(t *testing.T) {
-	next := "eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTM6MDA6MDBaIiwiaWQiOjk5fQ"
+	next := "eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTM6MDE6MDFaIiwiaWQiOjk5fQ"
 	svc := &mockWebhookSvc{
 		listDeliveriesResult: &service.WebhookDeliveriesResult{
 			Deliveries: []domain.WebhookDelivery{{ID: 99, WebhookID: "wh_1"}},

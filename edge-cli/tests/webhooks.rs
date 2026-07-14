@@ -587,7 +587,7 @@ async fn deliveries_decodes_envelope_with_next_cursor() {
                 }
             ],
             "limit": 50,
-            "next_cursor": "eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTE6NTk6MDBaIiwiaWQiOjExfQ"
+            "next_cursor": "eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTE6NTk6MDFaIiwiaWQiOjExfQ"
         })))
         .mount(&server)
         .await;
@@ -634,7 +634,7 @@ async fn deliveries_decodes_envelope_with_next_cursor() {
         "expected next-page hint on stdout, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTE6NTk6MDBaIiwiaWQiOjExfQ"),
+        stdout.contains("eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTE6NTk6MDFaIiwiaWQiOjExfQ"),
         "hint must include the next_cursor verbatim:\n{stdout}"
     );
 }

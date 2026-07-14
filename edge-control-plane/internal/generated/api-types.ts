@@ -1824,7 +1824,7 @@ export interface components {
              *     The cursor is base64url-encoded; its internal shape is server-private
              *     and may change between server versions — consumers MUST treat it
              *     as opaque.
-             * @example eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTI6MDA6MDBaIiwiaWQiOjk5fQ
+             * @example eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTM6MDE6MDFaIiwiaWQiOjk5fQ
              */
             next_cursor: string | null;
         };
