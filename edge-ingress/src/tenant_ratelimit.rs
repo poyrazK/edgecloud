@@ -12,10 +12,13 @@
 //!
 //! Sub-feature scope in this module: read-only fetcher + cache. The
 //! renderer's per-tenant + global route emission lives in `caddy.rs`
-//! (commit 4). Sub-features #2 (concurrent cap) and #3 (bandwidth) are
-//! cached here but not rendered — the schema + admin endpoint + cache
-//! are wired so the render layer is a follow-up that only touches
-//! `caddy.rs`.
+//! (commit 4). Sub-feature #2 (concurrent cap, issue #663) renders a
+//! `tenant_concurrent` HTTP handler invocation — enforced inside the
+//! custom Caddy image `edgecloud/caddy-concurrent:latest` by the
+//! first-party module at `caddy-modules/tenant_concurrent/` (see
+//! `edge-ingress/Dockerfile.caddy-concurrent`). Sub-feature #3
+//! (bandwidth) is cached here but not rendered — needs Caddy 2.8+
+//! `rate_limit.bandwidth`.
 //!
 //! Mirrors the structure of `quota.rs` (cache + fetch + spawn). The
 //! cache is per-tenant (NOT per-(tenant, app)) because all five caps
@@ -44,8 +47,14 @@ pub struct TenantRateLimitState {
     /// `rps` (matches the per-app rate_limit handler semantics at
     /// `caddy.rs:380-404`).
     pub burst: u32,
-    /// Concurrent-request cap per tenant (sub-feature #2). Cached but
-    /// not rendered in this PR — needs a custom Caddy module.
+    /// Concurrent-request cap per tenant (sub-feature #2, issue #663).
+    /// Rendered as a `tenant_concurrent` HTTP handler invocation by
+    /// `caddy.rs`; enforced inside the custom Caddy image
+    /// `edgecloud/caddy-concurrent:latest` by the first-party module
+    /// at `caddy-modules/tenant_concurrent/`. Each `key` keeps a
+    /// buffered channel semaphore sized at `concurrent_limit` — a
+    /// request whose key's bucket is full receives 429 with
+    /// `Retry-After: 1`.
     pub concurrent_limit: u32,
     /// Bandwidth cap per tenant (sub-feature #3). Cached but not
     /// rendered in this PR — needs Caddy 2.8+ `rate_limit.bandwidth`.
@@ -103,6 +112,18 @@ impl TenantRateLimitCache {
     /// only carries tenants that need a route.
     pub fn active_caps(&self) -> impl Iterator<Item = (&String, &TenantRateLimitState)> {
         self.inner.iter().filter(|(_, s)| s.rps > 0)
+    }
+
+    /// Iterate `(tenant_id, state)` for every tenant with
+    /// `concurrent_limit > 0` (sub-feature #2, issue #663). The
+    /// renderer's hot path: skip zero-concurrent rows so the route
+    /// table only carries tenants that need a `tenant_concurrent`
+    /// handler invocation. Mirrors `active_caps()`, which gates on
+    /// `rps > 0`. The two iterators are independent — a tenant with
+    /// both caps appears in both.
+    #[allow(dead_code)] // consumed by caddy.rs render pass (issue #663 commit 4).
+    pub fn concurrent_caps(&self) -> impl Iterator<Item = (&String, &TenantRateLimitState)> {
+        self.inner.iter().filter(|(_, s)| s.concurrent_limit > 0)
     }
 }
 
@@ -364,6 +385,61 @@ mod tests {
         let mut ids: Vec<&String> = cache.active_caps().map(|(k, _)| k).collect();
         ids.sort();
         assert_eq!(ids, vec!["t_active"]);
+    }
+
+    #[test]
+    fn cache_concurrent_caps_skips_zero_concurrent() {
+        // t_acme has only a concurrent cap (no RPS) — must still
+        // appear in concurrent_caps(). t_globex has only an RPS cap
+        // — must NOT appear here. Mirrors cache_active_caps_skips_zero_rps
+        // but for the concurrent axis (issue #663).
+        let mut cache = TenantRateLimitCache::default();
+        cache.update(
+            "t_acme".into(),
+            TenantRateLimitState {
+                rps: 0,
+                burst: 0,
+                concurrent_limit: 50,
+                bandwidth_bps: 0,
+                fetched_at: None,
+            },
+        );
+        cache.update(
+            "t_globex".into(),
+            TenantRateLimitState {
+                rps: 100,
+                burst: 0,
+                concurrent_limit: 0,
+                bandwidth_bps: 0,
+                fetched_at: None,
+            },
+        );
+        let mut ids: Vec<&String> = cache.concurrent_caps().map(|(k, _)| k).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t_acme"]);
+    }
+
+    #[test]
+    fn cache_concurrent_caps_and_active_caps_are_independent() {
+        // A tenant with both caps must appear in BOTH iterators.
+        // This pins that the two filters are independent (not
+        // collapsed into one OR-filter on `active_caps()`).
+        let mut cache = TenantRateLimitCache::default();
+        cache.update(
+            "t_both".into(),
+            TenantRateLimitState {
+                rps: 100,
+                burst: 200,
+                concurrent_limit: 50,
+                ..Default::default()
+            },
+        );
+        let mut active: Vec<&String> = cache.active_caps().map(|(k, _)| k).collect();
+        let mut concurrent: Vec<&String> = cache.concurrent_caps().map(|(k, _)| k).collect();
+        active.sort();
+        concurrent.sort();
+        assert_eq!(active, vec!["t_both"]);
+        assert_eq!(concurrent, vec!["t_both"]);
     }
 
     #[test]
