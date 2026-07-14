@@ -16,3 +16,11 @@ ture = "ture"
 inser = "inser"
 alue = "alue"
 nclude = "nclude"
+
+# `ba` substring inside the caddy-modules/tenant_concurrent/go.mod
+# commit-hash digest (`091c0ba34f0a`) — flagging the literal "ba" is a
+# false positive (issue #663). extend-identifiers ignores substrings
+# inside identifiers, which is the right tool here because the
+# token is inside a version pseudo-identifier, not a real word.
+[default.extend-identifiers]
+"091c0ba34f0a" = "091c0ba34f0a"
