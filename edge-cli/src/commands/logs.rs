@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::state_io::load_state_optional;
-use crate::api::{ApiClient, LogEntry};
+use crate::api::{ApiClient, LogEntry, LogListQuery};
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
@@ -102,18 +102,37 @@ pub(crate) fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
 /// stays an absolute timestamp (which is what `--follow` advances
 /// incrementally).
 ///
+/// `until_rfc3339` is an optional absolute RFC3339 upper bound
+/// (issue #644). When supplied it is forwarded verbatim so the
+/// server remains the only validator — clients of older servers
+/// without `--until` ignore the flag with a `clap` parse error at
+/// worst (no crash), but the path is also documented in the
+/// help text.
+///
 /// `follow` enables the polling loop. The initial request is made
 /// with the requested `since`; on every subsequent tick we advance
 /// the cutoff to the timestamp of the newest entry we've printed,
-/// and dedupe by id.
+/// and dedupe by id (issue #644 keeps dedupe bounded to the current
+/// inclusive `since` boundary timestamp).
+///
+/// `cursor` is the user's keyset cursor; when supplied it overrides
+/// `offset`/`since` and is fed back to the server verbatim. The
+/// CLI does NOT inspect the cursor payload — opacity is part of
+/// the contract.
+///
+/// `offset` is the DEPRECATED `?offset=` compatibility parameter.
+/// Use `cursor` in new code.
 #[cfg(feature = "network")]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     path: &Path,
     app: &str,
     since: Duration,
+    until_rfc3339: Option<&str>,
     level: Option<&str>,
     follow: bool,
     limit: u32,
+    cursor: Option<&str>,
     offset: Option<u32>,
 ) -> Result<()> {
     let state = load_state_optional(path)?;
@@ -139,34 +158,49 @@ pub fn run(
     if follow {
         run_follow(&client, &app_name, &since_rfc, level, limit, is_tty)
     } else {
-        let resp = client
-            .logs()
-            .list(&app_name, Some(&since_rfc), level, Some(limit), offset)?;
+        let resp = client.logs().list(
+            &app_name,
+            LogListQuery {
+                since_rfc3339: Some(&since_rfc),
+                until_rfc3339,
+                level,
+                limit: Some(limit),
+                offset,
+                cursor,
+            },
+        )?;
         for entry in &resp.items {
             print_entry(entry, is_tty);
         }
-        maybe_print_next_page_hint(resp.next_offset);
+        // Prefer the cursor in the hint (issue #644 — cursor is the
+        // new contract). Fall back to next_offset for older servers.
+        maybe_print_next_page_hint(&resp.next_cursor, resp.next_offset, &app_name, &since_rfc);
         Ok(())
     }
 }
 
 #[cfg(not(feature = "network"))]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     _path: &Path,
     _app: &str,
     _since: Duration,
+    _until_rfc3339: Option<&str>,
     _level: Option<&str>,
     _follow: bool,
     _limit: u32,
+    _cursor: Option<&str>,
     _offset: Option<u32>,
 ) -> Result<()> {
     anyhow::bail!("logs requires network support; rebuild with --features network")
 }
 
-/// The follow loop. Pulls an initial batch, prints it, then polls
-/// every [`FOLLOW_INTERVAL`] advancing the cutoff to the latest
-/// entry's ts. Stops on SIGINT, after [`FOLLOW_TIMEOUT`], or when
-/// the user hits the upper bound.
+/// The follow loop. Pulls an initial batch, drains any pages using
+/// `next_cursor` (issue #644) until the current polling window is
+/// empty, advances the `since` watermark to the largest ts observed,
+/// and then sleeps for [`FOLLOW_INTERVAL`] before the next tick.
+/// Stops on SIGINT, after [`FOLLOW_TIMEOUT`], or when the user hits
+/// the upper bound.
 #[cfg(feature = "network")]
 fn run_follow(
     client: &ApiClient,
@@ -187,21 +221,28 @@ fn run_follow(
     .context("installing SIGINT handler for --follow")?;
 
     let deadline = Instant::now() + follow_timeout();
-    // ids we've already printed — used to dedupe the boundary row
-    // that the server returns on every poll. The server's filter is
-    // `ts >= cutoff` and our cutoff is set to the last entry's `ts`
-    // verbatim (we do NOT add +1ms), so the same boundary row comes
-    // back on every tick. Without dedup, the boundary row would
-    // print repeatedly. Dedupe by id is correct because (a) id is
-    // DB-assigned and unique per row, (b) we want to print rows
-    // that share a `ts` but differ in id (a worker can emit two
-    // rows in the same microsecond).
-    let mut printed_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    // Initial tick uses the user-supplied since; later ticks use
-    // the newest entry's ts. The server returns newest-first, so
-    // `resp.items.first().ts` is the largest ts in the batch (and
-    // therefore the right new cutoff).
+    // Bounded dedupe (issue #644): the previous implementation kept
+    // a session-wide HashSet<i64>, which grew without bound. We now
+    // keep ONLY the IDs of rows that share the current inclusive
+    // `since` boundary timestamp — the only rows that can be
+    // re-served on the next poll. When the watermark advances, the
+    // set is replaced with just the boundary IDs sharing the new
+    // max ts.
+    //
+    // Correctness invariant: the server's range predicate is
+    // `ts >= cutoff`, so any row with `ts` STRICTLY greater than
+    // the watermark is new and will not be served again until the
+    // watermark advances past it. Boundary IDs are exactly the
+    // rows whose ts equals the current watermark and may be
+    // returned again; they must be deduped.
+    let mut boundary_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // The current inclusive `since` watermark. Advances only AFTER
+    // all cursor pages for the current window are drained, so a
+    // burst larger than one page does NOT skip the next pages
+    // (the previous implementation advanced per page, dropping
+    // rows between the cursor's last entry and the next tick).
     let mut since = since_rfc.to_string();
 
     loop {
@@ -215,25 +256,126 @@ fn run_follow(
             break;
         }
 
-        let resp = client
-            .logs()
-            .list(app_name, Some(&since), level, Some(limit), None)?;
-        if resp.items.is_empty() {
-            // No new rows. Sleep interruptibly so SIGINT exits
-            // promptly (up to FOLLOW_POLL_GRANULARITY instead of
-            // FOLLOW_INTERVAL).
-            interruptible_sleep(FOLLOW_INTERVAL, &stop);
-            continue;
-        }
-        for entry in &resp.items {
-            if !printed_ids.contains(&entry.id) {
-                print_entry(entry, is_tty);
-                printed_ids.insert(entry.id);
+        // --- Drain the current polling window ---
+        //
+        // Track the largest ts observed and the rows that share
+        // it across this window's pages (newest-first). When the
+        // cursor chain ends, advance the watermark to that max ts
+        // and replace boundary_ids with just those IDs.
+        let mut new_max_ts: Option<String> = None;
+        // IDs whose ts equals new_max_ts, captured during the
+        // drain so we can swap them into boundary_ids atomically.
+        let mut new_max_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut next_cursor: Option<String> = None;
+        // Track whether we printed any rows this window, so a
+        // window with zero rows is treated as a quiet period (no
+        // watermark advance — the next tick still says "show me
+        // rows past the watermark").
+        let mut printed_this_window = false;
+
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let resp = client.logs().list(
+                app_name,
+                LogListQuery {
+                    since_rfc3339: Some(&since),
+                    until_rfc3339: None,
+                    level,
+                    limit: Some(limit),
+                    offset: None,
+                    cursor: next_cursor.as_deref(),
+                },
+            )?;
+
+            if resp.items.is_empty() {
+                // Truly empty page (cursor walk exhausted or no rows).
+                break;
+            }
+
+            for entry in &resp.items {
+                // Skip rows that share the current inclusive
+                // `since` boundary — they were already printed on
+                // the previous tick (or earlier in this drain, if
+                // they share the new max ts across pages).
+                let already_printed = boundary_ids.contains(&entry.id);
+                if !already_printed {
+                    print_entry(entry, is_tty);
+                    printed_this_window = true;
+                }
+
+                // Track the watermark candidate for THIS window.
+                match new_max_ts.as_ref() {
+                    None => {
+                        new_max_ts = Some(entry.ts.clone());
+                        if !already_printed {
+                            new_max_ids.insert(entry.id);
+                        }
+                    }
+                    Some(cur) if entry.ts > *cur => {
+                        // Strict-`>` byte comparison is correct here
+                        // because the server emits `ts` as the
+                        // canonical RFC3339 UTC wire form
+                        // (`...-07-14T13:00:00.123456789Z`) for
+                        // every entry it returns — same width, same
+                        // alignment, no timezone suffix surprises.
+                        // ISO-8601 ordering matches byte ordering
+                        // under that fixed shape.
+                        // New max — replace the id set.
+                        new_max_ts = Some(entry.ts.clone());
+                        new_max_ids.clear();
+                        if !already_printed {
+                            new_max_ids.insert(entry.id);
+                        }
+                    }
+                    Some(cur) if entry.ts == *cur => {
+                        if !already_printed {
+                            new_max_ids.insert(entry.id);
+                        }
+                    }
+                    Some(_) => {
+                        // older than current max; nothing to do
+                    }
+                }
+            }
+
+            // Continue the cursor chain (issue #644). When
+            // next_cursor is None, the server returned the final
+            // page.
+            next_cursor = resp.next_cursor;
+            if next_cursor.as_deref().is_none_or(str::is_empty) {
+                // Server contract says terminal page is `null`,
+                // but belt-and-suspenders against a buggy server
+                // emitting `""`: treat empty string as terminal
+                // too, so the drain doesn't loop forever and
+                // doesn't issue a request with `?cursor=` (which
+                // the server would 400 as malformed).
+                break;
             }
         }
-        if let Some(first) = resp.items.first() {
-            since = first.ts.clone();
+
+        // --- Advance the watermark (only after draining) ---
+        //
+        // The "drain-then-advance" discipline is the entire
+        // correctness invariant of `--follow`: the boundary set
+        // captures exactly the rows that may be re-served on the
+        // NEXT tick (rows whose ts equals the new watermark). The
+        // next-tick request is `since=watermark` inclusive, so the
+        // server WILL re-return the boundary rows; without dedupe
+        // we would double-print the same row.
+        //
+        // See docs/logs-api.md#follow-burst-draining for the
+        // end-to-end example and the reason we replace `boundary_ids`
+        // (rather than union it with `new_max_ids`).
+        if printed_this_window {
+            if let Some(new_ts) = new_max_ts {
+                since = new_ts;
+                boundary_ids = new_max_ids;
+            }
         }
+
         interruptible_sleep(FOLLOW_INTERVAL, &stop);
     }
     Ok(())
@@ -445,12 +587,38 @@ fn chrono_parse_rfc3339(s: &str) -> Result<i64, ()> {
     Ok(days * 86_400 + secs_of_day)
 }
 
-/// Print a hint pointing at `--offset` when the response includes a
-/// `next_offset` field, indicating more results exist beyond this page.
-fn maybe_print_next_page_hint(next_offset: Option<u32>) {
+/// Print a hint pointing at `--cursor` (preferred) or `--offset`
+/// (deprecated) when the response includes a next-page marker,
+/// preserving the original `(app, --since)` filters so the user can
+/// copy-paste the suggested command.
+///
+/// Issue #644: the cursor is the new contract. We prefer it for new
+/// workflows and only suggest `--offset` when the server is too old
+/// to emit `next_cursor`.
+fn maybe_print_next_page_hint(
+    next_cursor: &Option<String>,
+    next_offset: Option<u32>,
+    app_name: &str,
+    since_rfc: &str,
+) {
+    if let Some(cur) = next_cursor.as_ref() {
+        output::hint(&format!(
+            "More entries available — \
+             run `edge logs {app} --since {since} --cursor '{cur}'` for the next page",
+            app = app_name,
+            since = since_rfc,
+            cur = cur,
+        ));
+        return;
+    }
     if let Some(no) = next_offset {
         output::hint(&format!(
-            "More entries available — run with `--offset {no}` for the next page"
+            "More entries available — \
+             run `edge logs {app} --since {since} --offset {no}` for the next page \
+             (deprecated; --cursor is the preferred successor)",
+            app = app_name,
+            since = since_rfc,
+            no = no,
         ));
     }
 }
@@ -553,5 +721,33 @@ mod tests {
         ] {
             assert!(s.contains(key), "json missing key {key}: {s}");
         }
+    }
+
+    #[test]
+    fn interruptible_sleep_returns_early_when_stop_is_set() {
+        // The SIGINT flag is an `AtomicBool` shared across threads;
+        // flipping it from a unit test exercises the same code path
+        // that the SIGINT handler in `run_follow` flips in
+        // production (issue #644). We assert the sleep returns in
+        // well under its nominal 2-second FOLLOW_INTERVAL.
+        use std::sync::atomic::AtomicBool;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_for_setter = stop.clone();
+        let setter = std::thread::spawn(move || {
+            // Set the flag shortly after the sleep starts. The
+            // FOLLOW_POLL_GRANULARITY is 100ms, so 150ms guarantees
+            // at least one poll sees the flag.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            stop_for_setter.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        interruptible_sleep(std::time::Duration::from_secs(2), &stop);
+        let elapsed = start.elapsed();
+        setter.join().unwrap();
+        // Allow generous slack (1s) for slow CI machines.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "interruptible_sleep did not honor stop flag; elapsed={elapsed:?}"
+        );
     }
 }

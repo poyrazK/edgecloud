@@ -86,18 +86,23 @@ func LevelsAtOrAbove(minLevel string) []string {
 // can do so without re-implementing LevelsAtOrAbove.
 type LogQuery struct {
 	Since  time.Duration
+	Until  time.Time
 	MinLvl string // canonical level string; "" = no filter
 	Levels []string
 	Limit  int
 	Offset int
+	Cursor string
 }
 
-// LogListResult wraps the entries, effective limit, and an optional
-// next-offset indicator for pagination.
+// LogListResult wraps the visible entries, effective limit, and compatibility
+// pagination hints. Cursor pagination is preferred; offset remains available
+// for one release so existing clients continue to work.
 type LogListResult struct {
 	Entries    []domain.LogEntry
 	Limit      int
-	NextOffset *int // nil when there are no more pages
+	Since      time.Duration
+	NextOffset *int
+	NextCursor *string
 }
 
 // LogEntryLister is the repository subset LogService consumes. Defined locally
@@ -138,21 +143,8 @@ func ResolveLimit(requested int) int {
 }
 
 // ListByTenantApp validates and normalizes q, then forwards to the repository.
-//
-// Defaults / clamps (issue #77 §3):
-//
-//   - Since: zero → DefaultLogSince (5m). Negative values are clamped to 0
-//     before the default kicks in — the CLI is supposed to parse the duration
-//     before this, but a negative from any caller (e.g. a clock-skewed `since=`
-//     in the future) should not blow up the query.
-//   - MinLvl: empty → no filter (Levels slice nil). Unknown → ErrInvalidLevel.
-//   - Limit: ≤0 → DefaultLogLimit (100). >MaxLogLimit (1000) → MaxLogLimit.
-//   - Offset: ≥0. Negative values are clamped to 0 by the handler.
-//
-// Returns a LogListResult with entries, effective limit, and an optional
-// NextOffset pointer. When len(entries) == limit there may be more rows
-// beyond the current page; NextOffset is set to offset + len(entries) so
-// the caller can request the next page.
+// It fetches one extra row so pagination hints are emitted only when another
+// page actually exists.
 func (s *LogService) ListByTenantApp(
 	ctx context.Context, tenantID, appName string, q LogQuery,
 ) (*LogListResult, error) {
@@ -164,7 +156,6 @@ func (s *LogService) ListByTenantApp(
 	if since <= 0 {
 		since = DefaultLogSince
 	}
-
 	limit := ResolveLimit(q.Limit)
 
 	levels := []string(nil)
@@ -172,25 +163,68 @@ func (s *LogService) ListByTenantApp(
 		levels = LevelsAtOrAbove(q.MinLvl)
 	}
 
+	var cursorTS time.Time
+	var cursorID int64
+	if q.Cursor != "" {
+		var err error
+		cursorTS, cursorID, err = decodeLogCursor(q.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		// Reject the silent-empty case: if the caller supplied
+		// `until` AND the cursor points at a row whose ts is
+		// strictly after until, the strict-tuple predicate and
+		// the `ts <= until` clause will both filter the result
+		// down to nothing. The client almost certainly intended
+		// either a different cursor or a different `until`;
+		// returning a typed error lets the handler surface a
+		// friendly 400 instead of an empty page that looks like
+		// "no more rows".
+		if !q.Until.IsZero() && cursorTS.After(q.Until) {
+			return nil, fmt.Errorf("%w: cursor ts %s is after until %s",
+				ErrInvalidLogCursor, cursorTS.UTC().Format(time.RFC3339Nano),
+				q.Until.UTC().Format(time.RFC3339Nano))
+		}
+	}
+
 	entries, err := s.repo.ListByTenantApp(ctx, tenantID, appName, repository.LogListFilter{
-		Since:  since,
-		Levels: levels,
-		Limit:  limit,
-		Offset: q.Offset,
+		Since:    since,
+		Until:    q.Until,
+		Levels:   levels,
+		Limit:    limit + 1,
+		Offset:   q.Offset,
+		CursorTS: cursorTS,
+		CursorID: cursorID,
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	hasMore := len(entries) > limit
+	if hasMore {
+		entries = entries[:limit]
+	}
+
 	var nextOffset *int
-	if len(entries) == limit {
-		no := q.Offset + len(entries)
-		nextOffset = &no
+	var nextCursor *string
+	if hasMore {
+		last := entries[len(entries)-1]
+		cursor, err := encodeLogCursor(last.TS, last.ID)
+		if err != nil {
+			return nil, err
+		}
+		nextCursor = &cursor
+		if q.Cursor == "" {
+			no := q.Offset + len(entries)
+			nextOffset = &no
+		}
 	}
 
 	return &LogListResult{
 		Entries:    entries,
 		Limit:      limit,
+		Since:      since,
 		NextOffset: nextOffset,
+		NextCursor: nextCursor,
 	}, nil
 }

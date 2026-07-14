@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -188,10 +189,13 @@ func (r *LogEntryRepository) GetByID(ctx context.Context, id int64) (*domain.Log
 //     index — adding more index columns would slow down ingest (PR #98) for
 //     marginal read-path gain.
 type LogListFilter struct {
-	Since  time.Duration
-	Levels []string
-	Limit  int
-	Offset int
+	Since    time.Duration
+	Until    time.Time
+	Levels   []string
+	Limit    int
+	Offset   int
+	CursorTS time.Time
+	CursorID int64
 }
 
 // ListByTenantApp returns the most recent log entries for (tenantID, appName),
@@ -207,6 +211,11 @@ func (r *LogEntryRepository) ListByTenantApp(
 ) ([]domain.LogEntry, error) {
 	if filter.Limit <= 0 {
 		return nil, fmt.Errorf("limit must be positive, got %d", filter.Limit)
+	}
+	cursorTSSet := !filter.CursorTS.IsZero()
+	cursorIDSet := filter.CursorID != 0
+	if cursorTSSet != cursorIDSet || filter.CursorID < 0 {
+		return nil, errors.New("cursor timestamp and positive id must be provided together")
 	}
 
 	var sb strings.Builder
@@ -228,17 +237,32 @@ WHERE tenant_id = $1 AND app_name = $2`)
 		sb.WriteString(")")
 		args = append(args, filter.Since.Seconds())
 	}
+	if !filter.Until.IsZero() {
+		sb.WriteString(" AND ts <= ")
+		sb.WriteString(nextPlaceholder())
+		sb.WriteString("::timestamptz")
+		args = append(args, filter.Until.UTC())
+	}
 	if len(filter.Levels) > 0 {
 		sb.WriteString(" AND level = ANY(")
 		sb.WriteString(nextPlaceholder())
 		sb.WriteString("::text[])")
 		args = append(args, pq.Array(filter.Levels))
 	}
-	sb.WriteString(" ORDER BY ts DESC LIMIT ")
+	if !filter.CursorTS.IsZero() {
+		sb.WriteString(" AND (ts, id) < (")
+		sb.WriteString(nextPlaceholder())
+		sb.WriteString("::timestamptz, ")
+		args = append(args, filter.CursorTS.UTC())
+		sb.WriteString(nextPlaceholder())
+		sb.WriteString("::bigint)")
+		args = append(args, filter.CursorID)
+	}
+	sb.WriteString(" ORDER BY ts DESC, id DESC LIMIT ")
 	sb.WriteString(nextPlaceholder())
 	args = append(args, filter.Limit)
 
-	if filter.Offset > 0 {
+	if filter.CursorTS.IsZero() && filter.Offset > 0 {
 		sb.WriteString(" OFFSET ")
 		sb.WriteString(nextPlaceholder())
 		args = append(args, filter.Offset)

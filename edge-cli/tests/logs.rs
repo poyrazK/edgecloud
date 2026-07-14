@@ -503,3 +503,395 @@ async fn logs_silently_continues_when_status_endpoint_fails() {
         .stdout(predicate::str::contains("crashed").not())
         .stdout(predicate::str::contains("rollback").not());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #644 — new query keys (`until`, `cursor`) and pagination hints.
+//
+// These pin the wire shape: the CLI must translate the new clap flags
+// into the corresponding `?until=` and `?cursor=` query parameters
+// without touching the deprecated `offset` parameter on a fresh page.
+// ---------------------------------------------------------------------------
+
+/// `--until <RFC3339>` is forwarded verbatim into the `until` query
+/// parameter so the server (which is the canonical validator) can
+/// reject malformed values with a 400.
+#[tokio::test]
+async fn logs_forwards_until_query_param() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("until", "2026-06-24T13:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--until");
+    cmd.arg("2026-06-24T13:00:00Z");
+
+    cmd.assert().success();
+}
+
+/// `--cursor <OPQ>` is forwarded verbatim. The CLI doesn't try to
+/// decode the opaque payload — that's the server's job. This guards
+/// against any future "let me parse the cursor and reformat it"
+/// refactor that would silently mangle the payload.
+#[tokio::test]
+async fn logs_forwards_cursor_query_param() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("cursor", "opaque-payload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--cursor");
+    cmd.arg("opaque-payload");
+
+    cmd.assert().success();
+}
+
+/// When the server returns `next_cursor`, the CLI must surface a
+/// `--cursor`-based next-page hint that preserves the original
+/// `--since` and app so the user can copy-paste verbatim.
+#[tokio::test]
+async fn logs_emits_cursor_next_page_hint() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("limit", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {
+                    "id": 1,
+                    "tenant_id": "t_test",
+                    "deployment_id": "d_a",
+                    "app_name": "myapp",
+                    "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1",
+                    "level": "info",
+                    "message": "first",
+                    "labels": {},
+                    "ts": "2026-06-24T12:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "tenant_id": "t_test",
+                    "deployment_id": "d_a",
+                    "app_name": "myapp",
+                    "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1",
+                    "level": "info",
+                    "message": "second",
+                    "labels": {},
+                    "ts": "2026-06-24T12:00:01Z",
+                },
+                {
+                    "id": 3,
+                    "tenant_id": "t_test",
+                    "deployment_id": "d_a",
+                    "app_name": "myapp",
+                    "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1",
+                    "level": "info",
+                    "message": "third",
+                    "labels": {},
+                    "ts": "2026-06-24T12:00:02Z",
+                },
+            ],
+            "limit": 3,
+            "since": "2026-06-24T11:55:00Z",
+            "next_cursor": "eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--limit");
+    cmd.arg("3");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("first"))
+        // Cursor-based hint, preserves app + since and shows the
+        // opaque cursor payload verbatim.
+        .stdout(predicate::str::contains(
+            "--cursor 'eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9'",
+        ))
+        .stdout(predicate::str::contains("edge logs myapp"))
+        // No deprecated offset hint when next_cursor is present.
+        .stdout(predicate::str::contains("--offset").not());
+}
+
+/// When the server is old enough to omit `next_cursor` but still
+/// returns `next_offset`, the CLI must surface the offset hint so
+/// existing users keep their workflow. After issue #644 ships the
+/// PR removes this fallback once the cutoff elapses.
+#[tokio::test]
+async fn logs_falls_back_to_offset_hint_when_no_cursor() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("limit", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {"id": 1, "tenant_id": "t_test", "deployment_id": "d_a",
+                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                 "region": "us-east-1", "level": "info", "message": "x",
+                 "labels": {}, "ts": "2026-06-24T12:00:00Z"},
+                {"id": 2, "tenant_id": "t_test", "deployment_id": "d_a",
+                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                 "region": "us-east-1", "level": "info", "message": "y",
+                 "labels": {}, "ts": "2026-06-24T12:00:01Z"},
+                {"id": 3, "tenant_id": "t_test", "deployment_id": "d_a",
+                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                 "region": "us-east-1", "level": "info", "message": "z",
+                 "labels": {}, "ts": "2026-06-24T12:00:02Z"},
+            ],
+            "limit": 3,
+            "since": "",
+            "next_offset": 6,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--limit");
+    cmd.arg("3");
+
+    cmd.assert()
+        .success()
+        // Old-server fallback is preserved, marked deprecated.
+        .stdout(predicate::str::contains("--offset 6"))
+        .stdout(predicate::str::contains("deprecated"));
+}
+
+/// `--cursor` and `--offset` are mutually exclusive (clap enforces
+/// this; a regression that removed the constraint would surface as
+/// both query parameters being sent and the server returning 400).
+#[tokio::test]
+async fn logs_rejects_cursor_and_offset_together() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    // We intentionally don't mount a Mock on /api/v1/apps/myapp/logs.
+    // If the conflict gate is dropped, the test would send an
+    // unauthorized request and 401; the clap conflict surfaces
+    // BEFORE the request, so exit != 0 without contacting the
+    // server at all.
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--cursor");
+    cmd.arg("x");
+    cmd.arg("--offset");
+    cmd.arg("100");
+
+    cmd.assert().failure();
+}
+
+/// `--follow` is mutually exclusive with `--until`. A follow loop
+/// with a fixed `until` would silently drop entries past the page
+/// boundary, so clap rejects the combination at parse time.
+#[tokio::test]
+async fn logs_rejects_follow_with_until() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--follow");
+    cmd.arg("--until");
+    cmd.arg("2026-06-24T13:00:00Z");
+
+    cmd.assert().failure();
+}
+
+#[tokio::test]
+async fn logs_rejects_follow_with_cursor() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--follow");
+    cmd.arg("--cursor");
+    cmd.arg("x");
+
+    cmd.assert().failure();
+}
+
+/// One-shot `--cursor` smoke test: a single-shot call with `--cursor`
+/// must surface the server's response verbatim. Bounded timeout on
+/// the follow timer isn't needed for one-shot — we just verify the
+/// flag round-trips through the wire layer.
+#[tokio::test]
+async fn logs_cursor_passes_through_to_server() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("limit", "2"))
+        .and(query_param("cursor", "oldest-page"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {"id": 1, "tenant_id": "t_test", "deployment_id": "d_a",
+                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                 "region": "us-east-1", "level": "info", "message": "page2-first",
+                 "labels": {}, "ts": "2026-06-24T12:00:00Z"},
+                {"id": 2, "tenant_id": "t_test", "deployment_id": "d_a",
+                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                 "region": "us-east-1", "level": "info", "message": "page2-second",
+                 "labels": {}, "ts": "2026-06-24T12:00:01Z"},
+            ],
+            "limit": 2,
+            "since": "2026-06-24T11:55:00Z",
+            // No next_cursor: terminal page.
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--limit");
+    cmd.arg("2");
+    cmd.arg("--cursor");
+    cmd.arg("oldest-page");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("page2-first"))
+        .stdout(predicate::str::contains("page2-second"));
+}
+
+/// Stale-cursor test (issue #644 follow-up): a `--cursor` whose
+/// `(ts, id)` resolves to a position older than any retained row
+/// (e.g. the cursor was issued against a row that LogGC has since
+/// deleted) should produce an empty page from the server. The CLI
+/// must exit 0 without panicking — this is the contract: stale
+/// cursors degrade silently, not as errors.
+#[tokio::test]
+async fn logs_stale_cursor_returns_empty_page_exits_cleanly() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("cursor", "expired-cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "2026-06-24T11:55:00Z",
+            "next_cursor": null,
+            "next_offset": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--cursor");
+    cmd.arg("expired-cursor");
+
+    cmd.assert().success().stdout(predicate::str::is_empty());
+}
