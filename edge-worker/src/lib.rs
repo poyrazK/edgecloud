@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod downloader;
 pub mod log_forwarder;
 pub mod messages;
+pub mod metrics;
 pub mod metering_dedupe;
 pub mod nats;
 pub mod port_pool;

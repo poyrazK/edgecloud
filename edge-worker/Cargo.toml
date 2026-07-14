@@ -78,6 +78,15 @@ hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 rustls = { version = "=0.23.41", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"
 wasmparser = "0.252.0"
+# Prometheus metrics endpoint (issue #49). `WorkerMetrics` owns a
+# `Registry` + a per-app `MetricsHandle` map keyed by `(tenant_id,
+# deployment_id)`. Counters mirror the per-deployment `RequestMeter`
+# atomics in edge-runtime; the `edge_app_status` gauge is bumped
+# from `Supervisor::start_app` + `stop_app` + the status-transition
+# arms inside `run_app_loop` / `handle_app_crash`. `prometheus` 0.13
+# is dependency-free (default-features=false drops the `protobuf`
+# exporter; we only need the text encoder).
+prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
