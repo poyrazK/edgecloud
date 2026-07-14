@@ -81,7 +81,7 @@ pub(crate) fn xorshift_uniform_u64() -> u64 {
 /// `saturating_sub(1)` clamps zero to a zero shift, so the pre-jitter
 /// value is just `base_ms`. Don't pass zero expecting a smaller backoff;
 /// the contract is `attempt ≥ 1`.
-pub(crate) fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
+pub fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let exp = attempt.saturating_sub(1).min(31);
     let raw = base_ms.saturating_mul(1u64 << exp);
     let capped = raw.min(cap_ms);

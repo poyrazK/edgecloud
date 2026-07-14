@@ -21,6 +21,7 @@ use crate::messages::{
     TaskMessage,
 };
 use crate::metering_dedupe::dedupe_id;
+use crate::metrics::{MetricsHandle, WorkerMetrics};
 use crate::nats::NatsClient;
 use crate::port_pool::PortPool;
 use crate::state::{AppInstance, AppInstanceStatus, WorkerState};
@@ -132,6 +133,9 @@ mod heartbeat_integration_tests {
             worker_id: "w_test".to_string(),
             region: "fra".to_string(),
             worker_addr: "127.0.0.1:9000".to_string(),
+            // Issue #49: tests don't bind a metrics server.
+            metrics_addr: "127.0.0.1:0".parse().unwrap(),
+            metrics_auth_token: String::new(),
             worker_tenant_id: "t_test".to_string(),
             nats_url: String::new(),
             control_plane_url: "http://localhost:0".to_string(),
@@ -244,6 +248,7 @@ mod heartbeat_integration_tests {
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
             port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics: WorkerMetrics::new().expect("metrics::new"),
         })
     }
 
@@ -1446,6 +1451,7 @@ mod heartbeat_integration_tests {
                 "panic-app",
                 "d_panic",
                 &sup.downloader,
+                &sup.metrics,
                 rc,
                 5,
                 base,
@@ -1468,6 +1474,7 @@ mod heartbeat_integration_tests {
             "panic-app",
             "d_panic",
             &sup.downloader,
+            &sup.metrics,
             5,
             5,
             base,
@@ -1553,6 +1560,7 @@ mod heartbeat_integration_tests {
             "every-app",
             "d_every",
             &sup.downloader,
+            &sup.metrics,
             1,
             5,
             base,
@@ -1631,6 +1639,7 @@ mod heartbeat_integration_tests {
             "hung-app",
             "d_hung",
             &sup.downloader,
+            &sup.metrics,
             5,
             5,
             base,
@@ -1804,6 +1813,12 @@ pub struct Supervisor {
     /// Reset on worker process restart (matches `request_count`
     /// semantics — per-process-boot cumulative).
     pub port_pool_exhausted_events: Arc<std::sync::atomic::AtomicU64>,
+    /// Prometheus /metrics surface (issue #49). One process-wide
+    /// worker handle. Per-app `MetricsHandle`s are looked up by key
+    /// via `register_app` (during `start_app`) and removed via
+    /// `unregister_app` (during `stop_app`). The HTTP server
+    /// spawned in `main` reads from this struct's `Registry`.
+    pub metrics: Arc<WorkerMetrics>,
 }
 
 impl Supervisor {
@@ -2357,6 +2372,18 @@ impl Supervisor {
             spec.deployment_id.clone(),
         ));
 
+        // Register the per-app Prometheus handle (issue #49) so
+        // EVERY bump site has access: the resident-ticker below,
+        // the dispatch path, and the LongRunning HTTP-server
+        // request-accept path. The handle is captured before any
+        // bump so the very first request increments the counter
+        // — registering AFTER would leave a window where the
+        // per-app counter is missing from `/metrics`.
+        let metrics_handle: Arc<MetricsHandle> = self
+            .metrics
+            .register_app(tenant_id, &spec.deployment_id, app_name)
+            .await;
+
         // Spawn the per-app resident-seconds ticker (issue #484).
         // LongRunning apps only — Handler (FaaS) apps don't contribute
         // resident time, so their resident_ticker stays None and the
@@ -2367,6 +2394,7 @@ impl Supervisor {
         // gone).
         let resident_ticker = if execution_model == ExecutionModel::LongRunning {
             let resident_meter = meter.clone();
+            let resident_metrics = metrics_handle.clone();
             // TODO(metering): collapse 3 goroutines when drainer ships.
             // The resident-seconds ticker below is the third parallel
             // goroutine on the heartbeat path (alongside the existing
@@ -2380,6 +2408,12 @@ impl Supervisor {
                 loop {
                     tokio::time::sleep(Duration::from_secs(resident_tick_secs)).await;
                     resident_meter.record_resident_seconds(resident_tick_secs);
+                    // Mirror the bump onto the Prometheus counter
+                    // (issue #49). The IntCounter is cheap (atomic
+                    // add); the operator's `rate()` math benefits
+                    // from having resident-seconds both on the
+                    // heartbeat and on the /metrics surface.
+                    resident_metrics.resident_seconds.inc_by(resident_tick_secs);
                 }
             }))
         } else {
@@ -2499,6 +2533,11 @@ impl Supervisor {
                 // /preview-{id}/ and stamps EDGE_PREVIEW_PR_NUMBER.
                 preview_id: spec.preview_id.clone(),
                 preview_pr_number: spec.preview_pr_number,
+                // Per-app MetricsHandle (issue #49). The dispatch path
+                // bumps the same four IntCounters that RequestMeter
+                // already increments, mirroring them into the worker
+                // /metrics endpoint without taking a lock.
+                metrics_handle: Some(metrics_handle.clone()),
             };
 
             let tls_config =
@@ -2564,6 +2603,11 @@ impl Supervisor {
             let log_forwarder = self.log_forwarder.clone();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             let metrics_acc_for_loop = metrics_acc.clone();
+            // WorkerMetrics handle (issue #49) — threaded into the
+            // run_app_loop for the per-task terminal-status stamps
+            // and into Handler dispatch via the per-app MetricsHandle
+            // returned by register_app above.
+            let metrics_clone = self.metrics.clone();
 
             // Per-app socket mode (issue #412). The LongRunning path
             // uses the per-app value directly — it does NOT need the
@@ -2598,6 +2642,7 @@ impl Supervisor {
                     socket_mode_for_loop,
                     preview_id_for_loop.clone(),
                     preview_pr_number_for_loop,
+                    metrics_clone,
                 )
                 .await;
                 tracing::info!(app_name = %app_name_str, "app task exited");
@@ -2641,6 +2686,22 @@ impl Supervisor {
             (tenant_id_for_instance.clone(), app_name.to_string()),
             instance,
         );
+
+        // Stamp the per-app status gauge (issue #49). The
+        // `metrics_handle` was created via `register_app` above
+        // (just after the `meter` is built, so the per-app counter
+        // series is reachable from the very first request). The
+        // initial status is `Running` since by the time we land
+        // here, the per-app task has been spawned and the
+        // LongRunning/FaaS path is up.
+        self.metrics
+            .set_status(
+                &tenant_id_for_instance,
+                &spec.deployment_id,
+                app_name,
+                &AppInstanceStatus::Running,
+            )
+            .await;
 
         tracing::info!(tenant_id = %tenant_id_for_instance, app_name, port = raw_port, "app started");
         Ok(())
@@ -2748,7 +2809,21 @@ impl Supervisor {
             };
 
         // Remove from the map.
-        self.state.write().await.apps.remove(&key);
+        let removed_handle = self.state.write().await.apps.remove(&key);
+
+        // Tear down the Prometheus surface for this app (issue #49).
+        // Without this, every app that ever ran on this worker
+        // leaves label series behind — eventually OOM'ing on
+        // long-lived multi-tenant nodes. We snapshot the
+        // `tenant_id + deployment_id` from the removed
+        // `AppInstance` so the `unregister_app` call doesn't have
+        // to look it up.
+        if let Some(removed_mutex) = &removed_handle {
+            let removed = removed_mutex.lock().await;
+            self.metrics
+                .unregister_app(&removed.tenant_id, &removed.deployment_id)
+                .await;
+        }
 
         // Free both the primary app port AND the dedicated WebSocket
         // listener port (issue #448 — previously only `port` was
@@ -2891,6 +2966,7 @@ impl Supervisor {
         app_name: &str,
         current_deployment_id: &str,
         downloader: &Arc<Downloader>,
+        metrics: &Arc<WorkerMetrics>,
         restart_count: u32,
         max_restarts: u32,
         base_backoff: Duration,
@@ -2910,12 +2986,26 @@ impl Supervisor {
                 let crash_key = (tenant_id.to_string(), app_name.to_string());
                 if let Some(inst) = s.apps.get_mut(&crash_key) {
                     let mut inst = inst.lock().await;
-                    inst.status = terminal_status;
+                    inst.status = terminal_status.clone();
                     if let Some(err) = err_for_audit {
                         inst.last_error = Some(err.to_string());
                     }
                 }
             }
+            // Stamp the terminal status onto the Prometheus
+            // surface (issue #49). The status gauge is the only
+            // signal an operator scraping `/metrics` gets to learn
+            // an app died — without this, a Crashed app would still
+            // show `status=running` until the next reconcile or
+            // until `unregister_app` runs in `stop_app`. The two
+            // operations are sequenced so the gauge reaches a sane
+            // value: this happens before unregister (in
+            // `stop_app`'s `apps.remove()`); after unregister the
+            // per-app row is gone, which is also fine — the same
+            // `(tenant, app, deployment)` will rebuild on redeploy.
+            metrics
+                .set_status(tenant_id, current_deployment_id, app_name, &terminal_status)
+                .await;
             // Best-effort auto-rollback: signal the control plane so
             // it can swap the active deployment back to last_good. We
             // do NOT block the per-app task on this — `spawn`
@@ -2997,6 +3087,7 @@ impl Supervisor {
         socket_mode: edge_runtime::socket_egress::SocketEgressPolicy,
         preview_id: Option<String>,
         preview_pr_number: Option<u32>,
+        metrics: Arc<WorkerMetrics>,
     ) {
         let mut restart_count = 0u32;
         let max_restarts = 5;
@@ -3100,6 +3191,7 @@ impl Supervisor {
                                 &app_name,
                                 &current_deployment_id,
                                 &downloader,
+                                &metrics,
                                 restart_count,
                                 max_restarts,
                                 base_backoff,
@@ -3146,6 +3238,7 @@ impl Supervisor {
                                 &app_name,
                                 &current_deployment_id,
                                 &downloader,
+                                &metrics,
                                 restart_count,
                                 max_restarts,
                                 base_backoff,
@@ -3179,6 +3272,7 @@ impl Supervisor {
                                 &app_name,
                                 &current_deployment_id,
                                 &downloader,
+                                &metrics,
                                 restart_count,
                                 max_restarts,
                                 base_backoff,
@@ -4110,6 +4204,7 @@ mod tests {
             // issue #308: defaults for unit tests; specific tests override.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let config_b = HandlerConfig {
@@ -4137,6 +4232,7 @@ mod tests {
             // issue #308: defaults for unit tests; specific tests override.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let downloader = Arc::new(crate::downloader::Downloader::new(
@@ -4423,6 +4519,8 @@ mod tests {
                 worker_id: "w_test".to_string(),
                 region: "fra".to_string(),
                 worker_addr: "127.0.0.1:9000".to_string(),
+                metrics_addr: "127.0.0.1:0".parse().unwrap(),
+                metrics_auth_token: String::new(),
                 worker_tenant_id: "t_test".to_string(),
                 nats_url: String::new(),
                 control_plane_url: "http://localhost:0".to_string(),
@@ -4471,6 +4569,7 @@ mod tests {
             http: reqwest::Client::new(),
             engine_pool: Arc::new(StandbyPool::new(1).expect("pool")),
             port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metrics: crate::metrics::WorkerMetrics::new().expect("metrics::new"),
         })
     }
 
@@ -4573,6 +4672,7 @@ mod tests {
             // issue #308: defaults for unit tests; specific tests override.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
         let dispatch = Arc::new(
             HandlerDispatch::new(

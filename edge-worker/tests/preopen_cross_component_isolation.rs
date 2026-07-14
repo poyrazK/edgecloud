@@ -119,6 +119,7 @@ impl IsoHarness {
             cpu_budget_ms: 1000,
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let dispatch = Arc::new({

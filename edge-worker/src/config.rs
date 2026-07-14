@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 use edge_runtime::socket_egress::SocketEgressPolicy;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,17 @@ pub struct Config {
     /// Required: the worker fails to start without it. Operators in private VPCs
     /// must set this to a routable IP or domain (Cloud NAT EIP, internal LB, etc.).
     pub worker_addr: String,
+    /// Bind address for the Prometheus `/metrics` HTTP server
+    /// (issue #49). Defaults to `0.0.0.0:9090` when unset. The server
+    /// is fail-closed: if `metrics_auth_token` is empty, every
+    /// request returns 401 until the operator provisions a token via
+    /// `METRICS_AUTH_TOKEN`.
+    pub metrics_addr: SocketAddr,
+    /// Bearer token required by the `/metrics` endpoint
+    /// (`Authorization: Bearer <token>`). Empty = server refuses
+    /// every request. Operators MUST set this to a random 32+ byte
+    /// string in any multi-tenant environment.
+    pub metrics_auth_token: String,
     pub nats_url: String,
     pub control_plane_url: String,
     pub cache_dir: PathBuf,
@@ -294,6 +306,21 @@ impl Config {
             );
         }
         let cfg = Config {
+            // METRICS_ADDR defaults to 0.0.0.0:9090 — the conventional
+            // Prometheus scrape port. Operators override via
+            // `METRICS_ADDR=127.0.0.1:9090` to bind localhost-only
+            // when the scrape target is on the same host.
+            metrics_addr: std::env::var("METRICS_ADDR")
+                .ok()
+                .map(|s| s.parse::<SocketAddr>())
+                .transpose()
+                .context("METRICS_ADDR")?
+                .unwrap_or_else(|| "0.0.0.0:9090".parse().expect("static addr")),
+            // METRICS_AUTH_TOKEN — fail-closed. Empty token → every
+            // request gets 401. Operators MUST set this in
+            // multi-tenant clusters; the absence of the env var is a
+            // loud signal that the deploy hasn't been configured.
+            metrics_auth_token: std::env::var("METRICS_AUTH_TOKEN").unwrap_or_default(),
             task_stream_replicas: parse_env_usize("TASK_STREAM_REPLICAS", 3)?,
             consumer_name,
             queue_group: std::env::var("EDGE_QUEUE_GROUP").unwrap_or_default(),

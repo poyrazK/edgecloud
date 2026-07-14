@@ -315,12 +315,7 @@ impl WorkerMetrics {
         // unknown series, which is fine — we sweep every status
         // we ever stamp.
         for status in [
-            "running",
-            "starting",
-            "draining",
-            "stopping",
-            "crashed",
-            "hung",
+            "running", "starting", "draining", "stopping", "crashed", "hung",
         ] {
             self.app_status
                 .remove_label_values(&[deployment_id, &app_name, status])
@@ -395,6 +390,15 @@ impl WorkerMetrics {
         Ok(String::from_utf8(buf)?)
     }
 
+    /// Render convenience for the HTTP server. Falls back to an empty
+    /// body on encode failure (which would only happen if the registry
+    /// holds a collector that returns malformed metric families — the
+    /// text encoder is well-tested and we own all registered
+    /// collectors, so a non-empty fallback would be misleading).
+    pub fn render(&self) -> Option<String> {
+        self.gather().ok()
+    }
+
     /// Bump the worker-level gauges. The uptime gauge is set, not
     /// incremented, because uptime is a monotonic duration, not a
     /// delta. The active-apps gauge is set to the current map size
@@ -443,13 +447,15 @@ mod tests {
     #[tokio::test]
     async fn register_app_idempotent_on_duplicate_key() {
         let m = WorkerMetrics::new().unwrap();
-        let h1 = m
-            .register_app("t_test", "dep_1", "my-app")
-            .await;
+        let h1 = m.register_app("t_test", "dep_1", "my-app").await;
         let h2 = m.register_app("t_test", "dep_1", "my-app").await;
         assert_eq!(h1.requests.get(), 0);
         h1.requests.inc();
-        assert_eq!(h2.requests.get(), 1, "duplicate register shares the same counter");
+        assert_eq!(
+            h2.requests.get(),
+            1,
+            "duplicate register shares the same counter"
+        );
         // Map has exactly one entry.
         let apps = m.apps.read().await;
         assert_eq!(apps.len(), 1);
@@ -461,9 +467,7 @@ mod tests {
     #[tokio::test]
     async fn register_app_emits_per_app_counter_series() {
         let m = WorkerMetrics::new().unwrap();
-        let h = m
-            .register_app("t_test", "dep_a", "api")
-            .await;
+        let h = m.register_app("t_test", "dep_a", "api").await;
         h.requests.inc_by(3);
         h.outbound_bytes.inc_by(1024);
         h.resident_seconds.inc_by(60);
@@ -476,9 +480,13 @@ mod tests {
             body.contains("edge_requests_total{app_name=\"api\",deployment_id=\"dep_a\"} 3"),
             "expected edge_requests_total per-app series in:\n{body}"
         );
-        assert!(body.contains("edge_outbound_bytes_total{app_name=\"api\",deployment_id=\"dep_a\"} 1024"));
-        assert!(body.contains("edge_resident_seconds_total{app_name=\"api\",deployment_id=\"dep_a\"} 60"));
-        assert!(body.contains("edge_duration_ms_total{app_name=\"api\",deployment_id=\"dep_a\"} 120"));
+        assert!(body
+            .contains("edge_outbound_bytes_total{app_name=\"api\",deployment_id=\"dep_a\"} 1024"));
+        assert!(body
+            .contains("edge_resident_seconds_total{app_name=\"api\",deployment_id=\"dep_a\"} 60"));
+        assert!(
+            body.contains("edge_duration_ms_total{app_name=\"api\",deployment_id=\"dep_a\"} 120")
+        );
     }
 
     /// After `unregister_app`, the per-app label set is gone — the
@@ -514,17 +522,14 @@ mod tests {
     async fn set_status_writes_one_status_per_app() {
         let m = WorkerMetrics::new().unwrap();
         let _h = m.register_app("t_test", "dep_c", "svc").await;
-        m.set_status(
-            "t_test",
-            "dep_c",
-            "svc",
-            &AppInstanceStatus::Starting,
-        )
-        .await;
+        m.set_status("t_test", "dep_c", "svc", &AppInstanceStatus::Starting)
+            .await;
         let body = m.gather().unwrap();
         // Labels are sorted alphabetically by the encoder.
         assert!(
-            body.contains("edge_app_status{app_name=\"svc\",deployment_id=\"dep_c\",status=\"starting\"} 1"),
+            body.contains(
+                "edge_app_status{app_name=\"svc\",deployment_id=\"dep_c\",status=\"starting\"} 1"
+            ),
             "expected starting=1 in:\n{body}"
         );
 
@@ -534,7 +539,9 @@ mod tests {
             .await;
         let body = m.gather().unwrap();
         assert!(
-            body.contains("edge_app_status{app_name=\"svc\",deployment_id=\"dep_c\",status=\"running\"} 1"),
+            body.contains(
+                "edge_app_status{app_name=\"svc\",deployment_id=\"dep_c\",status=\"running\"} 1"
+            ),
             "expected running=1 in:\n{body}"
         );
         assert!(
@@ -559,7 +566,8 @@ mod tests {
         // floats; >= 1.0 is the right band for `elapsed().as_secs()`.
         assert!(
             body.contains("edge_worker_uptime_seconds ")
-                && body.lines()
+                && body
+                    .lines()
                     .find(|l| l.starts_with("edge_worker_uptime_seconds"))
                     .and_then(|l| l.split_whitespace().last())
                     .and_then(|v| v.parse::<f64>().ok())

@@ -66,6 +66,11 @@ http-body-util = "0.1"
 # `client` because wasmtime-wasi-http's default_send_request depends on the
 # hyper client internals.
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+# hyper-util's TokioIo adapter is required by the metrics server
+# (issue #49) to bridge TcpStream → hyper's AsyncRead+AsyncWrite
+# traits. Promoted from a dev-only dep (issue #451) to a regular dep
+# so the production metrics_server.rs can use it.
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # TLS support for HandlerDispatch FaaS endpoint (issue #209).
 # PEM parsing uses the in-tree `rustls::pki_types::pem::PemObject` API
@@ -93,11 +98,6 @@ testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["nats"] }
 wiremock = "0.6"
 tempfile = "3"
-# Used by the body-cap test (issue #451) to spin up a tiny in-process
-# hyper server that returns a chunked-encoded response (no
-# Content-Length), so the streaming-accumulator branch in the
-# downloader is the only thing that can catch an oversize body.
-hyper-util = { version = "0.1", features = ["tokio"] }
 # Used by the signature integration tests (issue #307 PR2) to
 # sign fixtures with the deterministic test keypair.
 ed25519-dalek = { version = "2.2", features = ["std"] }
