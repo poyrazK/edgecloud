@@ -1,10 +1,11 @@
 //! Backoff math shared by `edge-worker` retry loops.
 //!
 //! Extracted from `downloader.rs` (PR #676). Second caller is the
-//! consume-loop reconnect in `main.rs` (issue #47); further callers
-//! stay in-crate until a third crate needs them, at which point a
-//! shared `edge-retry` / `edge-config` extension is justified per the
-//! follow-up note on PR #676's PR body.
+//! consume-loop reconnect in `main.rs` (issue #47, same PR family),
+//! wired in `main.rs:440-490`. Further callers stay in-crate until a
+//! third crate needs them, at which point a shared `edge-retry` /
+//! `edge-config` extension is justified per the follow-up note on
+//! PR #676's PR body.
 //!
 //! Conventions (matching `edge-cli/src/commands/retry.rs`):
 //! - ±25% jitter band (jitter_factor in `[75, 125]`).
@@ -68,6 +69,13 @@ pub(crate) fn xorshift_uniform_u64() -> u64 {
 /// Mirrors `edge-cli/src/commands/retry.rs:258` (modulo the explicit
 /// `cap_ms` parameter, which the PR #676 version hardcoded via the
 /// `RETRY_CAP_MS` const).
+///
+/// Used by:
+/// - `downloader::Downloader::fetch_body_with_retry` — `base_ms = 500`,
+///   `cap_ms = 3_200`, across-attempt exponential. (PR #676.)
+/// - `main::run_consume_loop` reconnect — `base_ms = backoff`,
+///   `cap_ms = 60_000`, per-iteration `attempt = 1` (jitter only);
+///   exponential doubling lives at the call site. (Issue #47.)
 pub(crate) fn compute_backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let exp = attempt.saturating_sub(1).min(31);
     let raw = base_ms.saturating_mul(1u64 << exp);
