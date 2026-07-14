@@ -344,7 +344,7 @@ impl WorkerMetrics {
             // App isn't registered yet — the supervisor stamps
             // `status = Running` in `start_app` BEFORE calling
             // `register_app` to keep the timer anchor on the
-            // counter-intialization moment, so this branch is the
+            // counter-initialization moment, so this branch is the
             // expected normal path for the very first status.
             // Trace at debug to avoid log spam during the boot
             // window.
