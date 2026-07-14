@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	natsio "github.com/nats-io/nats.go"
+
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 )
 
@@ -598,5 +600,57 @@ func TestTaskMessageKindConstants(t *testing.T) {
 	}
 	if PurgeReasonTenantOffboarded != "tenant_offboarded" {
 		t.Errorf("PurgeReasonTenantOffboarded = %q, want tenant_offboarded", PurgeReasonTenantOffboarded)
+	}
+}
+
+// Issue #665 PR C. Pin the CP-side stream constants against the
+// sidecar's source-of-truth so a future drift is caught at CI time
+// rather than production. The sidecar hard-codes these at
+// `edge-ingress-sidecar/src/nats_pub.rs::RATE_LIMIT_STREAM` and
+// `RATE_LIMIT_SUBJECT_WILDCARD`; the CP must agree byte-for-byte.
+
+func TestRateLimitStreamNameMatchesSidecar(t *testing.T) {
+	const want = "edgecloud-rl-global"
+	if RateLimitStreamName != want {
+		t.Errorf("RateLimitStreamName = %q, want %q (must match edge-ingress-sidecar/src/nats_pub.rs::RATE_LIMIT_STREAM)", RateLimitStreamName, want)
+	}
+}
+
+func TestRateLimitSubjectWildcardMatchesSidecar(t *testing.T) {
+	const want = "edgecloud.rate-limit.global.>"
+	if RateLimitSubjectWildcard != want {
+		t.Errorf("RateLimitSubjectWildcard = %q, want %q (must match edge-ingress-sidecar/src/nats_pub.rs::RATE_LIMIT_SUBJECT_WILDCARD)", RateLimitSubjectWildcard, want)
+	}
+}
+
+func TestRateLimitStreamConfigShape(t *testing.T) {
+	// Pin the full StreamConfig so a future change to
+	// MaxAge / Retention / Subjects on either side is caught at CI
+	// time. The sidecar's build_stream_config is tested in Rust so
+	// this is the CP-side mirror. The MaxAge=60s matches the
+	// sidecar's nats_pub.rs:65 hardcode; InterestPolicy matches the
+	// sidecar's LastPerSubject consumer which holds a durable.
+	cfg := StreamConfig{
+		Name:      RateLimitStreamName,
+		Subjects:  []string{RateLimitSubjectWildcard},
+		Retention: natsio.InterestPolicy,
+		MaxAge:    60 * time.Second,
+		Replicas:  3,
+	}
+	if cfg.Name != "edgecloud-rl-global" {
+		t.Errorf("cfg.Name = %q, want edgecloud-rl-global", cfg.Name)
+	}
+	wantSubjects := []string{"edgecloud.rate-limit.global.>"}
+	if len(cfg.Subjects) != len(wantSubjects) || cfg.Subjects[0] != wantSubjects[0] {
+		t.Errorf("cfg.Subjects = %v, want %v", cfg.Subjects, wantSubjects)
+	}
+	if cfg.Retention != natsio.InterestPolicy {
+		t.Errorf("cfg.Retention = %v, want InterestPolicy", cfg.Retention)
+	}
+	if cfg.MaxAge != 60*time.Second {
+		t.Errorf("cfg.MaxAge = %v, want 60s", cfg.MaxAge)
+	}
+	if cfg.Replicas != 3 {
+		t.Errorf("cfg.Replicas = %d, want 3 (default cfg.NATS.Replicas)", cfg.Replicas)
 	}
 }

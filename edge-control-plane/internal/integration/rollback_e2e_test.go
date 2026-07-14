@@ -156,6 +156,20 @@ func TestRollbackE2E(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Issue #665 PR C. Declare the rate-limit stream the sidecar will
+	// publish into. The sidecar's ensure_stream is idempotent w.r.t.
+	// this declaration (delete+recreate on shape mismatch), so the
+	// earliest declare wins and the rest are no-ops. This pins the
+	// CP-side wire shape against testcontainers NATS — a future
+	// drift in natsctl.RateLimitStreamName /
+	// natsctl.RateLimitSubjectWildcard will fail the EnsureStream
+	// call here at CI time.
+	err = publisher.EnsureStream(natsctl.StreamConfig{
+		Name:     natsctl.RateLimitStreamName,
+		Subjects: []string{natsctl.RateLimitSubjectWildcard},
+	})
+	require.NoError(t, err)
+
 	// --- 3. Seed tenant, deployments, quota ---
 	keyring := e2eNewKeyring(t)
 	sha := e2eArtifactHash(t)

@@ -15,6 +15,29 @@ import (
 // Exposed here so the worker can verify it's subscribing to the same stream.
 const TaskStreamName = "edgecloud-tasks"
 
+// RateLimitStreamName is the JetStream stream that carries per-replica
+// RPS deltas for cross-replica rate-limit aggregation (issue #665).
+// The sidecar publishes per-replica leaves under
+// `edgecloud.rate-limit.global.delta.<replica_id>`; the CP declares
+// the stream here at startup, mirroring the TaskStreamName pattern.
+// Both declarations are idempotent so the boot order is symmetric —
+// whichever process connects first wins; the other is a no-op.
+//
+// The string value MUST match
+// `edge-ingress-sidecar/src/nats_pub.rs::RATE_LIMIT_STREAM` exactly;
+// `TestRateLimitStreamNameMatchesSidecar` pins this invariant.
+const RateLimitStreamName = "edgecloud-rl-global"
+
+// RateLimitSubjectWildcard is the single subject filter the rate-limit
+// stream carries. The sidecar's `delta_subject(replica_id)` builder
+// formats to `edgecloud.rate-limit.global.delta.<replica_id>`, which
+// lives under this wildcard.
+//
+// The string value MUST match
+// `edge-ingress-sidecar/src/nats_pub.rs::RATE_LIMIT_SUBJECT_WILDCARD`
+// exactly; `TestRateLimitSubjectWildcardMatchesSidecar` pins this.
+const RateLimitSubjectWildcard = "edgecloud.rate-limit.global.>"
+
 // Publisher defines the interface for NATS publishing.
 type Publisher interface {
 	PublishTaskUpdate(region string, msg *TaskMessage) error
