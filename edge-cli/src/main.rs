@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::time::SystemTime;
 
+use crate::commands::retry::{DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS};
 use crate::config::EdgeToml;
 
 /// Source language for the `edge build` and `edge init` commands
@@ -203,6 +204,27 @@ enum WebhooksCommand {
         /// webhook_delivery_cursor.go`).
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
+        /// Maximum number of retries on transient failures
+        /// (issue #571 propagation): 5xx, network errors, and 429.
+        /// The total number of attempts is `1 + max_retries`.
+        /// `--max-retries=0` disables retry (single attempt, fail
+        /// fast). Hard-capped at 20 by `value_parser`. Parity with
+        /// `edge traffic set` / `edge env delete` per CLAUDE.md
+        /// "operator-tunable retry tier".
+        #[arg(long, default_value_t = DEFAULT_MAX_RETRIES, value_parser = clap::value_parser!(u32).range(0..=20))]
+        max_retries: u32,
+        /// Base backoff in milliseconds. First retry sleeps
+        /// `retry_base_ms × ±25%` jitter; each subsequent retry
+        /// doubles the wait, capped at `--retry-cap-ms`. Ignored
+        /// when `--max-retries=0`.
+        #[arg(long, default_value_t = DEFAULT_RETRY_BASE_MS)]
+        retry_base_ms: u64,
+        /// Maximum backoff in milliseconds. Caps the exponential
+        /// backoff so a sustained outage doesn't pin the CLI for
+        /// minutes. Hard-capped at 60_000 by `value_parser`.
+        /// Ignored when `--max-retries=0`.
+        #[arg(long, default_value_t = DEFAULT_RETRY_CAP_MS, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+        retry_cap_ms: u64,
     },
 }
 
@@ -268,9 +290,21 @@ impl From<WebhooksCommand> for commands::webhooks::WebhooksAction {
                 }
             }
             WebhooksCommand::Remove { id } => Self::Remove { id },
-            WebhooksCommand::Deliveries { id, limit, cursor } => {
-                Self::Deliveries { id, limit, cursor }
-            }
+            WebhooksCommand::Deliveries {
+                id,
+                limit,
+                cursor,
+                max_retries,
+                retry_base_ms,
+                retry_cap_ms,
+            } => Self::Deliveries {
+                id,
+                limit,
+                cursor,
+                max_retries,
+                retry_base_ms,
+                retry_cap_ms,
+            },
         }
     }
 }

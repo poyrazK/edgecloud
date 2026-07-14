@@ -28,7 +28,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 mod common;
 
@@ -743,9 +743,16 @@ async fn deliveries_omits_query_when_only_id() {
     let server = MockServer::start().await;
 
     common::seed_api_key(&home, "k_seed");
-    // No query_param matcher — wiremock would 404 on a query string.
+    // Strengthened from a `// no query_param matcher` comment to an
+    // explicit `query_param_absent` matcher on each expected-absent
+    // param. The original test passed even if the CLI accidentally
+    // added `?limit=50` or `?cursor=…` because wiremock only checks
+    // matchers that are present — the absence matcher flips the
+    // semantics so a stray query param now fails the test.
     Mock::given(method("GET"))
         .and(path("/api/v1/webhooks/wh_alpha/deliveries"))
+        .and(query_param_absent("limit"))
+        .and(query_param_absent("cursor"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "deliveries": [],
             "limit": 50,
@@ -853,4 +860,22 @@ async fn deliveries_400_on_invalid_cursor_propagates() {
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("400").or(predicate::str::contains("invalid cursor")));
+}
+
+// query_param_absent — local Wiremock matcher that asserts a given
+// query parameter is NOT present on the request URL. Mirrors the
+// same helper at `tests/preview.rs:206-224` (QueryParamAbsentMatcher);
+// if a third caller appears, lift this into `tests/common/matcher.rs`
+// so both binaries can share it. Today only 2 callers exist, so the
+// duplication is cheaper than a new shared module.
+fn query_param_absent(name: &'static str) -> QueryParamAbsentMatcher {
+    QueryParamAbsentMatcher(name)
+}
+
+struct QueryParamAbsentMatcher(&'static str);
+
+impl Match for QueryParamAbsentMatcher {
+    fn matches(&self, req: &Request) -> bool {
+        !req.url.query_pairs().any(|(k, _)| k == self.0)
+    }
 }
