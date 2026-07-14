@@ -312,12 +312,7 @@ impl Downloader {
             let token = self.jwt_signer.sign();
             tracing::info!(url, attempt, "downloading artifact");
 
-            let send_result = self
-                .client
-                .get(url)
-                .bearer_auth(token)
-                .send()
-                .await;
+            let send_result = self.client.get(url).bearer_auth(token).send().await;
             let response = match send_result {
                 Ok(r) => match r.error_for_status() {
                     Ok(r2) => r2,
@@ -592,7 +587,7 @@ fn compute_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
     let exp = attempt.saturating_sub(1).min(31);
     let raw = base_ms.saturating_mul(1u64 << exp);
     let capped = raw.min(RETRY_CAP_MS);
-    let jitter_factor = (xorshift_uniform_u64() % 51) as u64 + 75; // 75..=125 (i.e. 0.75..=1.25)
+    let jitter_factor = (xorshift_uniform_u64() % 51) + 75; // 75..=125 (i.e. 0.75..=1.25)
     capped.saturating_mul(jitter_factor) / 100
 }
 
@@ -894,7 +889,7 @@ mod retry_helpers_tests {
         for _ in 0..50 {
             let got = compute_backoff_ms(2, 200);
             assert!(
-                got >= 300 && got <= 500,
+                (300..=500).contains(&got),
                 "attempt 2 backoff {got} out of [300, 500]"
             );
         }
@@ -918,7 +913,7 @@ mod retry_helpers_tests {
         for _ in 0..50 {
             let got = compute_backoff_ms(20, 200);
             assert!(
-                got >= 2400 && got <= 4000,
+                (2400..=4000).contains(&got),
                 "attempt 20 backoff {got} out of [2400, 4000] (cap=3200)"
             );
         }
