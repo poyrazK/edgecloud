@@ -202,6 +202,8 @@ edge deploy
 | [edge-control-plane/docs/api/openapi.yaml](./edge-control-plane/docs/api/openapi.yaml) | OpenAPI 3 spec for the `api` binary's HTTP surface. |
 | [edge-ingress/README.md](./edge-ingress/README.md) | Operator runbook for `edge-ingress`. |
 | [edge-worker/tests/fixtures/README.md](./edge-worker/tests/fixtures/README.md) | Test fixture builder reference (`wasm32-unknown-unknown` + `wasm-tools`, L1–L10 layers). |
+| [docs/welcome.md](./docs/welcome.md) | Tenant-facing quickstart map — first-account + first-deploy flow, language picker, "what to read next" (issue #550 welcome doc). |
+| [docs/recipes/databases.md](./docs/recipes/databases.md) | Tenant recipes for Neon / Turso / Upstash from a Rust or JS guest (issue #550). |
 
 ## Layout
 

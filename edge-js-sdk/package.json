@@ -13,7 +13,8 @@
     "./time": "./src/time.js",
     "./scheduling": "./src/scheduling.js",
     "./process": "./src/process.js",
-    "./websocket": "./src/websocket.js"
+    "./websocket": "./src/websocket.js",
+    "./http": "./src/http.js"
   },
   "files": [
     "src/"
