@@ -5,6 +5,7 @@ members = [
     "edge-runtime/bin/wasm2cwasm",
     "edge-worker",
     "edge-ingress",
+    "edge-ingress-sidecar",
     "edge-cli",
     "edge-config",
     "edge-migrate/edge-migrate-lib",
