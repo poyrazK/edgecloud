@@ -591,7 +591,7 @@ enum Command {
         app: String,
     },
 
-    /// Read recent log entries for the app (issue #77).
+    /// Read recent log entries for the app (issue #77 / #644).
     ///
     /// Calls `GET /api/v1/apps/{appName}/logs` and prints the most
     /// recent entries, newest first. With `--follow`, polls every
@@ -599,6 +599,19 @@ enum Command {
     /// prints the last 5 minutes; use `--since 1h` for a longer
     /// window. Pipe mode (`edge logs myapp | jq`) emits one JSON
     /// object per line.
+    ///
+    /// Pagination (issue #644): the server prefers opaque keyset
+    /// cursors. `edge logs` re-emits the server's `next_cursor`
+    /// in its follow-up hint when present. `--cursor <CURSOR>`
+    /// lets the user feed a cursor back manually. `--offset` is
+    /// DEPRECATED and only kept for one release; new workflows
+    /// should use `--cursor`. `--until <RFC3339>` adds an optional
+    /// upper bound.
+    ///
+    /// `--follow` is mutually exclusive with `--until`, `--cursor`,
+    /// and `--offset`: follow keeps a moving watermark, so a fixed
+    /// cursor/offset would silently drop every entry past the page
+    /// boundary.
     Logs {
         /// App name. Defaults to the app in `.edge/state.json`.
         #[arg(default_value = "")]
@@ -610,6 +623,12 @@ enum Command {
         #[arg(long, default_value = "5m")]
         since: String,
 
+        /// Optional absolute upper bound (RFC3339). The server
+        /// returns entries whose `ts <= until`. Incompatible with
+        /// `--follow`.
+        #[arg(long, value_name = "RFC3339", conflicts_with = "follow")]
+        until: Option<String>,
+
         /// Minimum severity filter. `warn` returns `warn` + `error`.
         /// Unknown values are rejected by the server with a 400.
         #[arg(long)]
@@ -617,8 +636,9 @@ enum Command {
 
         /// Poll for new entries instead of printing once and
         /// exiting. Stops on Ctrl-C, after 30 minutes, or when
-        /// the process is killed.
-        #[arg(short, long)]
+        /// the process is killed. Incompatible with `--until`,
+        /// `--cursor`, and `--offset`.
+        #[arg(short, long, conflicts_with_all = ["until", "cursor", "offset"])]
         follow: bool,
 
         /// Maximum entries to return per request. Server clamps
@@ -626,9 +646,15 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: u32,
 
-        /// Offset for pagination. Use to page through older entries.
-        /// Pagination is offset-based; the server returns a
-        /// `next_offset` hint when more results exist.
+        /// Opaque keyset cursor from a previous response's
+        /// `next_cursor`. Stable across concurrent inserts;
+        /// preferred over `--offset`.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+
+        /// DEPRECATED. Offset for pagination. The server returns
+        /// `next_offset` for one release only; switch to
+        /// `--cursor`.
         #[arg(long, value_name = "N")]
         offset: Option<u32>,
     },
@@ -888,9 +914,11 @@ fn main() -> Result<()> {
         Command::Logs {
             app,
             since,
+            until,
             level,
             follow,
             limit,
+            cursor,
             offset,
         } => {
             let since_dur = parse_since(&since)?;
@@ -898,9 +926,11 @@ fn main() -> Result<()> {
                 &cli.path,
                 &app,
                 since_dur,
+                until.as_deref(),
                 level.as_deref(),
                 follow,
                 limit,
+                cursor.as_deref(),
                 offset,
             )
         }

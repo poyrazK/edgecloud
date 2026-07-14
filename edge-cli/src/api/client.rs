@@ -392,12 +392,35 @@ pub struct LogEntry {
 /// prime the loop and then advances the cutoff from the newest
 /// returned entry's `ts` (with client-side dedup by id to hide the
 /// boundary row the server returns on every poll).
+///
+/// Pagination (issue #644):
+///
+/// * `next_cursor` is the preferred pager; it is `Some` on the
+///   offset/first-page path AND on cursor pages whenever another
+///   page exists, and `None` on the final page.
+/// * `next_offset` is the deprecated compatibility mirror of
+///   `next_cursor` — it is `Some` only on the offset/first-page
+///   path; cursor pages leave it `None`. A future release (PR
+///   #644 follow-up) will drop the server-side field. Until then,
+///   older servers do not emit it at all, so the field is
+///   `#[serde(default)]`.
+///
+/// `Option<u32>` for `next_offset` rather than `Option<i64>`: the
+/// server uses `INT` because Postgres `OFFSET` is a 32-bit
+/// non-negative integer.
 #[derive(Debug, Deserialize)]
 pub struct LogListResponse {
     pub items: Vec<LogEntry>,
     pub limit: u32,
     #[serde(default)]
     pub since: String,
+    /// Preferred page marker — pass back via `?cursor=`. Stable
+    /// across concurrent inserts.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// Deprecated offset compatibility (issue #644). New code
+    /// should read `next_cursor`; this remains so older clients
+    /// don't break until removal lands.
     #[serde(default)]
     pub next_offset: Option<u32>,
 }
@@ -1410,6 +1433,31 @@ pub struct Logs<'a> {
     client: &'a ApiClient,
 }
 
+/// Query parameters for [`Logs::list`] (issue #644). All fields are
+/// optional so the caller threads only what the user's flags asked
+/// for; `None` and empty-string both suppress the query key, leaving
+/// the server's defaults untouched.
+#[derive(Debug, Default, Clone)]
+pub struct LogListQuery<'a> {
+    /// Absolute RFC3339 lower bound. Callers convert relative
+    /// `--since 5m` into this form so the wire shape stays RFC3339.
+    pub since_rfc3339: Option<&'a str>,
+    /// Absolute RFC3339 upper bound (issue #644).
+    pub until_rfc3339: Option<&'a str>,
+    /// Minimum severity (`trace|debug|info|warn|error`). Server
+    /// expands to the inclusive set.
+    pub level: Option<&'a str>,
+    /// Page size. `0` (the CLI's "use server default" sentinel) is
+    /// dropped — emitting `limit=0` would be misleading.
+    pub limit: Option<u32>,
+    /// Deprecated offset for paginating older entries. New code
+    /// should prefer `cursor`.
+    pub offset: Option<u32>,
+    /// Opaque keyset cursor (issue #644). Stable across concurrent
+    /// inserts, scoped to the tenant/app/since/until/level filters.
+    pub cursor: Option<&'a str>,
+}
+
 impl<'a> Logs<'a> {
     /// GET `/api/v1/apps/{appName}/logs` — list the most recent
     /// log entries for the app, newest first.
@@ -1420,20 +1468,15 @@ impl<'a> Logs<'a> {
     /// The server defaults to the last 5 minutes when omitted.
     /// `level` is the minimum severity (`trace|debug|info|warn|error`).
     /// `limit` is clamped to [1, 1000] server-side; the CLI sends
-    /// the user-supplied value through unmodified.
+    /// the user-supplied value through unmodified. `until_rfc3339`
+    /// and `cursor` are the new keyset pager additions from issue
+    /// #644; `offset` remains available for one compatibility release.
     ///
     /// Errors: any non-2xx becomes a flat `anyhow::Error` carrying
     /// the status and body. 4xx rejections (e.g. invalid level)
     /// surface as the message so `edge logs` can show the
     /// server-typed reason to the user.
-    pub fn list(
-        &self,
-        app_name: &str,
-        since_rfc3339: Option<&str>,
-        level: Option<&str>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    ) -> Result<LogListResponse> {
+    pub fn list(&self, app_name: &str, q: LogListQuery<'_>) -> Result<LogListResponse> {
         // Build the URL with optional query params locally, then
         // hand the formatted string to `get_json_anyhow` for the
         // auth + check + decode pipeline. The URL build is the only
@@ -1443,17 +1486,22 @@ impl<'a> Logs<'a> {
             self.client.base_url, app_name
         ))
         .map_err(|e| anyhow::anyhow!("invalid base url: {e}"))?;
-        if let Some(since) = since_rfc3339 {
+        if let Some(since) = q.since_rfc3339 {
             if !since.is_empty() {
                 parsed.query_pairs_mut().append_pair("since", since);
             }
         }
-        if let Some(lvl) = level {
+        if let Some(until) = q.until_rfc3339 {
+            if !until.is_empty() {
+                parsed.query_pairs_mut().append_pair("until", until);
+            }
+        }
+        if let Some(lvl) = q.level {
             if !lvl.is_empty() {
                 parsed.query_pairs_mut().append_pair("level", lvl);
             }
         }
-        if let Some(n) = limit {
+        if let Some(n) = q.limit {
             // `0` is the CLI's "use server default" signal (the
             // handler treats it the same as omitted). We only emit
             // the param when > 0 so the URL is clean.
@@ -1463,11 +1511,26 @@ impl<'a> Logs<'a> {
                     .append_pair("limit", &n.to_string());
             }
         }
-        if let Some(n) = offset {
+        if let Some(n) = q.offset {
             if n > 0 {
                 parsed
                     .query_pairs_mut()
                     .append_pair("offset", &n.to_string());
+            }
+        }
+        if let Some(c) = q.cursor {
+            if !c.is_empty() {
+                // The v1 cursor codec
+                // (edge-control-plane/internal/service/logs_cursor.go)
+                // emits base64.RawURLEncoding — URL-safe, no padding,
+                // so the value never contains `+`, `/`, or `=`.
+                // `query_pairs_mut()` percent-encodes any reserved
+                // characters that happen to appear, but for v1
+                // cursors that's a no-op. Older servers that emit
+                // standard base64 (with `+/=`) are not part of the
+                // v1 contract and will 400 at the decoder — clients
+                // pinned to those need to migrate.
+                parsed.query_pairs_mut().append_pair("cursor", c);
             }
         }
         let url = parsed.to_string();
