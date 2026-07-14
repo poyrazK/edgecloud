@@ -602,7 +602,9 @@ impl WasiHttpHooks for EgressHttpHooks {
 /// gated by the `socket_addr_check` closure installed in
 /// `build_wasi_ctx_for_tenant`. See `socket_egress` for the dispatch
 /// table. Binds (`TcpBind`/`UdpBind`) are local-only and unconditionally
-/// permitted; only the connect-side is policy-gated.
+/// permitted under `AllowList` / `AllowAll` / `HostnamePinned`; under
+/// `BlockAll` (the default) they are denied too — every `SocketAddrUse`
+/// variant returns `access-denied`.
 impl WasiHttpView for RuntimeState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         // `&mut self.http_hooks` (a `&mut EgressHttpHooks`) coerces to
@@ -1105,7 +1107,8 @@ fn resolve_edge_fs_path() -> Option<&'static std::path::Path> {
 /// The closure consults the tenant `EgressPolicy` (closed over from
 /// `egress`) and the per-tenant `SocketEgressPolicy` mode (`mode`).
 /// Mode = `BlockAll` keeps the wasmtime 45 default close behavior
-/// (guests cannot use `wasi:sockets` for connect/send); mode =
+/// (guests cannot use `wasi:sockets` at all — every bind and connect
+/// returns `access-denied`); mode =
 /// `AllowList` consults `EgressPolicy::check_address` (hard-deny +
 /// allowlist); mode = `AllowAll` is equivalent to
 /// `WasiCtxBuilder::inherit_network(true)` and is **off by default**.
