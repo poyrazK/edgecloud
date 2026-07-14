@@ -120,10 +120,11 @@ impl From<DomainsCommand> for commands::domains::DomainsAction {
     }
 }
 
-/// `edge webhooks <add|list|update|remove>` — manage tenant webhook
-/// subscriptions (issue #565). The full subcommand surface is
-/// defined here (clap derives the help text from it) and dispatched
-/// through `commands::webhooks::WebhooksAction::run`. Adding a new
+/// `edge webhooks <add|list|update|remove|deliveries>` — manage
+/// tenant webhook subscriptions (issues #565, #659). The full
+/// subcommand surface is defined here (clap derives the help text
+/// from it) and dispatched through
+/// `commands::webhooks::WebhooksAction::run`. Adding a new
 /// subcommand means one variant here + one match arm.
 ///
 /// Webhooks are tenant-scoped (not app-scoped), so the `<app>`
@@ -184,6 +185,24 @@ enum WebhooksCommand {
     Remove {
         /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
         id: String,
+    },
+    /// List delivery attempts for a webhook (issue #659). Cursor
+    /// pagination only — pass `--cursor` from the previous response's
+    /// `next_cursor` field to fetch the next page. Default `limit`
+    /// is 50 (server-side default; clamped to 200).
+    Deliveries {
+        /// Webhook id (the `wh_…` prefix from `edge webhooks list`).
+        id: String,
+        /// Maximum deliveries per page. Server-side clamped to 200.
+        /// Omit to use the server default (50).
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        /// Opaque next-page cursor from a prior `next_cursor`
+        /// response. Treat as a black box — its shape is owned by
+        /// the server (`edge-control-plane/internal/service/
+        /// webhook_delivery_cursor.go`).
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
     },
 }
 
@@ -249,6 +268,9 @@ impl From<WebhooksCommand> for commands::webhooks::WebhooksAction {
                 }
             }
             WebhooksCommand::Remove { id } => Self::Remove { id },
+            WebhooksCommand::Deliveries { id, limit, cursor } => {
+                Self::Deliveries { id, limit, cursor }
+            }
         }
     }
 }

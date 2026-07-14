@@ -5,6 +5,7 @@
 //! - `list`
 //! - `update <id> [--url <u>] [--events e1,e2] [--description <s>] [--enabled|--disable] [--secret <s>]`
 //! - `remove <id>`
+//! - `deliveries <id> [--limit <n>] [--cursor <opaque>]` (issue #659)
 //!
 //! The CLI does NOT persist webhook state to `.edge/state.json` —
 //! every invocation is a fresh query against the control plane.
@@ -29,12 +30,13 @@
 //! `update` are Phase-2 deferred — see the docstring on `run`.
 
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 
 use super::retry::{
     call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
 };
+use crate::api::webhooks::WebhookDeliveriesResponse;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
@@ -73,6 +75,14 @@ pub enum WebhooksAction {
     },
     Remove {
         id: String,
+    },
+    /// List delivery attempts for a webhook (issue #659).
+    /// `--limit` defaults to the server-side default (50); `--cursor`
+    /// is the opaque next-page token from a prior response.
+    Deliveries {
+        id: String,
+        limit: Option<u32>,
+        cursor: Option<String>,
     },
 }
 
@@ -297,6 +307,37 @@ impl WebhooksAction {
                 println!("Removed webhook {id}.");
                 Ok(())
             }
+            WebhooksAction::Deliveries { id, limit, cursor } => {
+                let resp = call_with_retry_no_interrupt(
+                    "webhooks deliveries",
+                    || webhooks.deliveries(&id, limit, cursor.as_deref()),
+                    DEFAULT_MAX_RETRIES,
+                    DEFAULT_RETRY_BASE_MS,
+                    DEFAULT_RETRY_CAP_MS,
+                )
+                .with_context(|| format!("listing deliveries for webhook {id}"))?;
+                if std::io::stdout().is_terminal() {
+                    print_deliveries_table(&resp);
+                } else {
+                    for d in &resp.deliveries {
+                        println!("{}", serde_json::to_string(d).unwrap_or_default());
+                    }
+                }
+                if let Some(cur) = resp.next_cursor.as_deref() {
+                    if !cur.is_empty() {
+                        let limit_hint = limit.unwrap_or(resp.limit);
+                        output::hint(&format!(
+                            "More deliveries available — \
+                             run `edge webhooks deliveries {id} --limit {limit_hint} \
+                             --cursor '{cur}'` for the next page",
+                            id = id,
+                            limit_hint = limit_hint,
+                            cur = cur,
+                        ));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -323,6 +364,71 @@ fn clip(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Render a `WebhookDeliveriesResponse` as a human-readable table on
+/// a TTY. Layout (column widths chosen to fit a 130-col terminal):
+///
+///   TIMESTAMP         STATUS     EVENT    ATTEMPT   STATUS  ERROR
+///   2026-07-14T12:00  success    deploy   1/3       200
+///
+/// `error_msg` is rendered last and truncated via `clip` to keep the
+/// row under one line. We deliberately omit the `id` / `webhook_id`
+/// columns — the user already knows which webhook they queried (it's
+/// the `<id>` positional), and the server-generated delivery `id`
+/// is an opaque handle. This matches the `edge logs` print shape
+/// (`commands/logs.rs:165-185`), giving tenants a consistent read
+/// pattern across both surfaces.
+///
+/// Empty response: print `No deliveries.` to match the `webhooks
+/// list` empty-state wording so mixed-output terminals stay
+/// visually consistent.
+fn print_deliveries_table(resp: &WebhookDeliveriesResponse) {
+    if resp.deliveries.is_empty() {
+        println!("No deliveries.");
+        return;
+    }
+    println!(
+        "{:<20} {:<10} {:<10} {:<9} {:<7} ERROR",
+        "TIMESTAMP", "STATUS", "EVENT", "ATTEMPT", "STATUS"
+    );
+    println!("{}", "-".repeat(96));
+    for d in &resp.deliveries {
+        let status = render_status(&d.status);
+        let event = clip(&d.event_type, 10);
+        let attempt = format!("{}/{}", d.attempt, d.max_attempts);
+        let status_code = d.status_code.map(|c| c.to_string()).unwrap_or_default();
+        let error = clip(&d.error_msg, 40);
+        println!(
+            "{:<20} {:<10} {:<10} {:<9} {:<7} {}",
+            clip(&d.created_at, 20),
+            status,
+            event,
+            attempt,
+            status_code,
+            error,
+        );
+    }
+}
+
+/// Render the delivery status with ANSI color when stderr is a TTY.
+/// Falls back to the bare status string when colors are disabled
+/// (CI / piped output), so downstream tooling can grep without
+/// stripping ANSI codes.
+fn render_status(status: &str) -> String {
+    // We don't have direct access to `atty::Stream::Stderr` without
+    // adding a dep; checking `stdout()` is sufficient — if stdout is
+    // a TTY the user is interactive. Colors are a UX nice-to-have,
+    // not a contract, so no test pins the exact escape codes.
+    if !std::io::stdout().is_terminal() {
+        return status.to_string();
+    }
+    match status {
+        "success" => format!("\x1b[32m{status}\x1b[0m"), // green
+        "failed" => format!("\x1b[31m{status}\x1b[0m"),  // red
+        "retrying" | "pending" => format!("\x1b[33m{status}\x1b[0m"), // yellow
+        _ => status.to_string(),
     }
 }
 
