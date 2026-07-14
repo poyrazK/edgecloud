@@ -89,10 +89,16 @@ const CHANNEL_BUFFER: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Operator's configured platform cap (passed through unchanged
-    /// from `Config::global_rate_limit_rps`).
+    /// from `Config::global_rate_limit_rps`). `0` is the operator's
+    /// "no enforcement" signal — the per-replica cap computation
+    /// returns `None` (fail-closed) rather than fabricating a 1-RPS
+    /// floor from a zero budget.
     pub configured_cap: u32,
     /// Sum of every replica's latest delta inside the window.
-    pub platform_total: u32,
+    /// `u64` so the `sum()` path can hold 64 replicas at
+    /// `u32::MAX / 2` apiece without overflowing — the verification
+    /// target below pins this bound.
+    pub platform_total: u64,
     /// This replica's latest delta inside the window (0 if this
     /// replica hasn't published yet).
     pub this_replica_rps: u32,
@@ -113,18 +119,39 @@ impl Snapshot {
     /// for.
     ///
     /// `None` ⇒ the caller should emit NO global route (fail-closed).
-    /// Currently only triggered when `replicas_seen == 0` (no traffic
-    /// has been seen in the window).
+    /// Triggers when:
+    /// - `configured_cap == 0` (operator deliberately disabled
+    ///   enforcement — do not fabricate a 1-RPS floor from a zero
+    ///   budget), or
+    /// - `replicas_seen == 0` (no traffic seen in the window).
     pub fn per_replica_cap(&self) -> Option<u32> {
+        // Fail-closed on a zero configured cap. The operator's "no
+        // enforcement" signal must not be silently overridden by the
+        // `max(1, ...)` floor — that would re-enable throttling on
+        // a deliberately-disabled cap. Same invariant PR B's
+        // review surfaced as a subagent bug.
+        if self.configured_cap == 0 {
+            return None;
+        }
         if self.replicas_seen == 0 {
             return None;
         }
         let others_share = if self.replicas_seen > 1 {
-            (self.platform_total.saturating_sub(self.this_replica_rps)) / (self.replicas_seen - 1)
+            // `platform_total` is u64; widen `this_replica_rps` so
+            // the subtraction doesn't truncate before the divide.
+            let pt = self.platform_total;
+            let tr = self.this_replica_rps as u64;
+            pt.saturating_sub(tr) / (self.replicas_seen - 1) as u64
         } else {
             0
         };
-        Some(self.configured_cap.saturating_sub(others_share).max(1))
+        // `others_share` is u64 (from the division above); the
+        // configured_cap is u32. The `.saturating_sub(... as u32)`
+        // saturates at 0 when others_share exceeds the cap, then
+        // `.max(1)` lifts the floor to 1 (Caddy's token bucket
+        // would choke on rps=0).
+        let other_u32 = others_share.min(u32::MAX as u64) as u32;
+        Some(self.configured_cap.saturating_sub(other_u32).max(1))
     }
 }
 
@@ -290,7 +317,10 @@ impl Aggregator {
     #[allow(unused_variables)]
     pub async fn snapshot_at(&self, _now: Instant) -> Snapshot {
         let state = self.state.read().await;
-        let platform_total: u32 = state.latest_by_replica.values().map(|e| e.rps).sum();
+        // u64 so 64 replicas × u32::MAX/2 doesn't overflow. Each
+        // per-replica `rps` is u32, but the sum can legitimately
+        // exceed u32 when N is large.
+        let platform_total: u64 = state.latest_by_replica.values().map(|e| e.rps as u64).sum();
         let replicas_seen = state.latest_by_replica.len() as u32;
         let this_replica_rps = state
             .latest_by_replica
@@ -349,6 +379,7 @@ mod tests {
         DeltaMsg {
             replica_id: replica_id.to_string(),
             rps,
+            scraped_at_unix_ms: 1_700_000_000_000,
         }
     }
 
@@ -414,6 +445,48 @@ mod tests {
             this_replica_rps: 50_000,
             replicas_seen: 2,
         };
+        assert_eq!(snap.per_replica_cap(), Some(1));
+    }
+
+    /// NEW (PR B review follow-up): `configured_cap == 0` is the
+    /// operator's deliberate "no enforcement" signal. Must return
+    /// `None`, not `Some(1)` — otherwise the `.max(1, ...)` floor
+    /// would silently re-enable throttling on a deliberately-
+    /// disabled cap, contradicting the issue #665 plan's fail-
+    /// closed contract.
+    #[test]
+    fn snapshot_cap_zero_configured_yields_none() {
+        let snap = Snapshot {
+            configured_cap: 0,
+            platform_total: 30_000,
+            this_replica_rps: 10_000,
+            replicas_seen: 3,
+        };
+        assert_eq!(
+            snap.per_replica_cap(),
+            None,
+            "configured=0 must be fail-closed (emit NO global route)"
+        );
+    }
+
+    /// NEW (PR B review follow-up): `platform_total` is `u64` so
+    /// the sum path can hold 64 replicas × `u32::MAX / 2` each
+    /// without overflowing. Pin the arithmetic doesn't underflow or
+    /// saturate incorrectly under this load.
+    #[test]
+    fn snapshot_cap_handles_64_replicas_without_overflow() {
+        let per_replica: u32 = u32::MAX / 2;
+        let n: u32 = 64;
+        let snap = Snapshot {
+            configured_cap: 10_000,
+            platform_total: u64::from(per_replica) * u64::from(n),
+            this_replica_rps: per_replica,
+            replicas_seen: n,
+        };
+        // others_share = (64 * u32::MAX/2 − u32::MAX/2) / 63
+        //               = (63 * u32::MAX/2) / 63
+        //               = u32::MAX / 2
+        // >> configured_cap(10000), so the floor is 1.
         assert_eq!(snap.per_replica_cap(), Some(1));
     }
 

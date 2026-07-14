@@ -120,13 +120,11 @@ fn nats_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// this in a trait without changing the call sites in `main.rs`.
 pub struct NatsPublisher {
     client: async_nats::Client,
-    /// Stream replication factor passed to `ensure_stream`. Mirrors
+    /// Stream replication factor. Mirrors
     /// `edge_worker::nats::NatsClientImpl::task_stream_replicas` at
-    /// `edge-worker/src/nats.rs:148`. Carried on the struct (rather
-    /// than threaded through every call) so a future "auto-rebuild
-    /// the stream when the operator changes the replication factor"
-    /// follow-up has the value in scope.
-    #[allow(dead_code)]
+    /// `edge-worker/src/nats.rs:148`. Carried on the struct so a
+    /// future "auto-rebuild the stream when the operator changes
+    /// the replication factor" follow-up has the value in scope.
     replicas: usize,
 }
 
@@ -139,27 +137,22 @@ impl NatsPublisher {
         Ok(Self { client, replicas })
     }
 
-    /// Test-only constructor that injects an already-connected
-    /// client. Used by the integration tests to share a NATS
-    /// container between the test harness and the sidecar.
-    #[cfg(test)]
-    #[allow(dead_code)] // reserved for the integration test in tests/integration_test.rs (PR E)
-    pub fn from_client(client: async_nats::Client, replicas: usize) -> Self {
-        Self { client, replicas }
-    }
-
-    /// Public for tests + the consumer module: the underlying
-    /// async-nats client (used to build the consumer stream).
+    /// Public for the consumer module: the underlying async-nats
+    /// client (used to build the consumer stream).
     pub fn client(&self) -> async_nats::Client {
         self.client.clone()
     }
 
     /// Idempotently create the rate-limit stream if it doesn't
     /// exist. Mirrors `edge_worker::nats::ensure_task_stream` at
-    /// `edge-worker/src/nats.rs:170-184`.
-    pub async fn ensure_stream(&self, replicas: usize) -> anyhow::Result<()> {
+    /// `edge-worker/src/nats.rs:170-184`. Uses the struct's
+    /// `replicas` field — the replication factor is a property of
+    /// the connection (set at `connect` time), not a per-call
+    /// argument, so callers don't have to remember to thread it
+    /// through.
+    pub async fn ensure_stream(&self) -> anyhow::Result<()> {
         let js = jetstream::new(self.client.clone());
-        js.get_or_create_stream(build_stream_config(replicas))
+        js.get_or_create_stream(build_stream_config(self.replicas))
             .await
             .map_err(nats_err)
             .context("failed to ensure rate-limit stream")?;

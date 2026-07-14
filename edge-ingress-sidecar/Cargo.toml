@@ -12,16 +12,15 @@ publish = false
 # Update this list as PRs B/C/D/E land — the goal is to delete entries
 # once each dep has a real call site.
 [package.metadata.cargo-udeps.ignore]
-# PR B wired every prod-side dep below — `humantime`, `serde_json`,
-# `thiserror`, `async-nats`, `futures` all have real call sites now.
-# `edge-test-helpers` is still on the ignore list because the
-# `build_supervisor_*` helpers are wired into edge-worker / edge-ingress
-# integration tests, not the sidecar's; PR B's sidecar tests use
-# `testcontainers-modules::nats` directly + a hand-rolled
-# `start_nats` helper instead (the supervisor builders don't fit
-# this crate's single-purpose nature).
+# PR B is the data plane: it ships publisher + consumer + UDS writer +
+# aggregator + caddy scraper. Every prod dep below has a real call
+# site in the sidecar's main pipeline. `edge-test-helpers` was wired
+# by PR B for the planned testcontainers integration test, but the
+# review pushed that test to PR E — drop both the testcontainers dev-
+# deps AND the `edge-test-helpers` dev-dep now; the sidecar's
+# unit tests (in `mod tests` blocks) don't need either.
 normal = []
-development = ["edge-test-helpers"]
+development = []
 
 [[bin]]
 name = "edge-ingress-sidecar"
@@ -38,8 +37,6 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
-thiserror = "2.0"
-humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -48,20 +45,11 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
 
 [dev-dependencies]
-# Reuses the same NATS-testcontainer helper already wired into edge-ingress
-# (see `edge-test-helpers`). PR B's integration tests plug the
-# testcontainer-backed NATS into the publisher + consumer end-to-end
-# path.
-testcontainers = { version = "0.27", features = ["blocking"] }
-testcontainers-modules = { version = "0.15", features = ["nats"] }
-edge-test-helpers = { path = "../edge-test-helpers" }
-# Per-test UDS socket paths for the `expose::Exposer::bind` tests.
+# Per-test UDS socket paths for the `expose::write_to_path` tests.
 tempfile = "3"
 # Serializes the `config::tests` that mutate global env vars
 # (`SIDECAR_NATS_URL`, `HOSTNAME`, etc.). Without this, `cargo nextest`
 # runs the `from_env_*` tests in parallel and one test's
 # `unset_all_config_vars()` can stomp another's `set_var()` mid-flight,
 # producing a flaky `from_env_overrides` failure that resolves on re-run.
-# `parse_duration_env` tests use uniquely-named env vars (`__TEST_*`) so
-# they don't need serialization.
 serial_test = "3"

@@ -1,16 +1,35 @@
 //! UDS datagram writer (issue #665, PR B).
 //!
-//! Owns a single SOCK_DGRAM socket at
-//! `/var/run/edge-ingress/global-rps.sock` (mode 0660, group
-//! `edge-ingress` shared between Caddy + the sidecar) and writes a
-//! single datagram per aggregator tick carrying
+//! Sends one SOCK_DGRAM datagram per aggregator tick carrying
 //! ```json
 //! {"ts":..., "configured":M, "platform_total":N,
 //!  "this_replica":K, "replicas_seen":L, "local_cap":R}
 //! ```
+//! to a well-known socket path (default
+//! `/var/run/edge-ingress/global-rps.sock`). The ingress binary
+//! (PR D) is the receiver; it `bind()`s the socket, `chmod()`s it
+//! 0660, and `recv()`s the datagrams.
 //!
-//! The ingress binary (PR D) reads this socket at 1 Hz and consults
-//! it in `caddy.rs:719-746` to render the per-replica `rates.rps`.
+//! ## UDS SOCK_DGRAM ownership (PR B review fix)
+//!
+//! In the original PR B (commit `7384be63`) the sidecar owned the
+//! socket via `UnixDatagram::bind(path)`, and `write()` called
+//! `socket.send(bytes)` — an addressless send. That works in tests
+//! where a paired peer manually `connect()`s the sidecar socket,
+//! but in production a bound Unix datagram socket is NOT auto-
+//! connected, so `send()` returns `ENOTCONN`/`EDESTADDRREQ`.
+//!
+//! The correct architecture is **receiver owns the bind**:
+//!
+//! - Receiver (ingress process, PR D) calls `bind(path)`,
+//!   `chmod(path, 0o660)`, and `unlink(stale_path)` on startup.
+//! - Sender (this sidecar) uses `UnixDatagram::unbound()` +
+//!   `send_to(bytes, path)` and treats `ENOENT` as "receiver not
+//!   ready; drop and retry next tick."
+//!
+//! `send_to(path)` works across receiver restarts because the path
+//! string is stable even though the inode is fresh; `connect()`
+//! would follow the inode and break on restart.
 //!
 //! ## Why UDS datagram (not stream, not TCP, not a file)
 //!
@@ -29,31 +48,17 @@
 //! UDS SOCK_DGRAM is atomic per packet, no torn reads, no Caddy
 //! config touch.
 //!
-//! ## Mode 0660 / group ownership
-//!
-//! The socket directory is created with mode 0750 and the socket
-//! file with mode 0660. Both Caddy and the sidecar run with primary
-//! group `edge-ingress`, so the OS-enforced permission gates
-//! cross-process access. Operators chown the socket directory
-//! out-of-band (the sidecar does NOT change group ownership at
-//! startup — touching ownership from a non-root process would
-//! silently fail, and pulling `libc` into the dep tree just for a
-//! chown() we don't strictly need would balloon the binary). On a
-//! well-configured deployment the runtime directory already has the
-//! right owner (see `scripts/dev-install.sh`).
-//!
 //! ## Failure modes
 //!
-//!   - Socket directory missing → `bind()` fails → the sidecar logs a
-//!     WARN and retries on the next tick. The ingress keeps
-//!     rendering the previous cache value (fail-closed).
-//!   - Stale socket file from a prior process → `unlink()` before
-//!     `bind()`.
-//!   - Write fails (EAGAIN, EPIPE) → log + drop. The next tick
+//!   - Socket missing (receiver hasn't started or just restarted) ⇒
+//!     `ENOENT` on `send_to` ⇒ log + drop; next tick republishes.
+//!   - Write fails (EAGAIN, EPIPE) ⇒ log + drop; next tick
 //!     republishes.
+//!   - Receiver restarts mid-publish ⇒ next `send_to` finds the
+//!     fresh inode at the same path (no client-side reconnect
+//!     needed).
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -79,13 +84,17 @@ pub struct DatagramPayload {
     /// Operator's configured platform cap.
     pub configured: u32,
     /// Sum of every replica's latest delta inside the window.
-    pub platform_total: u32,
+    /// `u64` mirrors `Snapshot::platform_total` so the wire can
+    /// carry 64-replica aggregates without truncation.
+    pub platform_total: u64,
     /// This replica's latest delta inside the window.
     pub this_replica: u32,
     /// Number of distinct replicas that published in the window.
     pub replicas_seen: u32,
     /// Precomputed per-replica cap. `None` ⇒ ingress should emit
-    /// NO global route (fail-closed; zero replicas in window).
+    /// NO global route (fail-closed; either operator disabled
+    /// enforcement via `configured_cap == 0`, or no traffic has
+    /// been seen in the window).
     pub local_cap: Option<u32>,
 }
 
@@ -109,93 +118,66 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Writer state. Owns the bound socket; `write` is called once per
-/// aggregator tick.
-pub struct Exposer {
-    /// `pub(crate)` so the test module can call `connect()` to set a
-    /// peer for the end-to-end roundtrip test. Production callers go
-    /// through `Exposer::write`, which doesn't need a connected peer
-    /// (it sends one datagram per tick into the kernel buffer; the
-    /// ingress binary opens its own `recv` socket and reads).
-    pub(crate) socket: UnixDatagram,
-    path: PathBuf,
-}
-
-impl Exposer {
-    /// Bind the UDS datagram socket. The parent directory must
-    /// exist with mode 0750 and group ownership matching the
-    /// ingress process; the sidecar creates the directory if
-    /// missing and chmod's it 0750. Group ownership is left to
-    /// the operator (see module-level docs).
-    ///
-    /// `path` is the full socket path (default
-    /// `/var/run/edge-ingress/global-rps.sock`).
-    pub fn bind(path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create socket dir {}", parent.display()))?;
-            // Mode 0750 on the runtime directory. The sidecar does
-            // NOT chown — operators own the directory lifecycle
-            // (see module docs).
-            let perms = std::fs::Permissions::from_mode(0o750);
-            std::fs::set_permissions(parent, perms)
-                .with_context(|| format!("chmod 0750 on {}", parent.display()))?;
+/// Write one datagram to `path`. Best-effort: on `ENOENT` (receiver
+/// not bound yet, or just restarted) and on `EAGAIN`/`EPIPE` we
+/// log and return `Ok(())` — the next tick republishes. Only
+/// surface hard errors (serialization failure, etc.) as `Err`.
+///
+/// Uses an **unbound** `UnixDatagram` per call. This is cheap
+/// (one `socket(AF_UNIX, SOCK_DGRAM, 0)` + close per call) and
+/// keeps the function stateless so the caller doesn't need to
+/// hold a socket across ticks. Tokio's runtime reuses the file
+/// descriptor cache for short-lived sockets.
+///
+/// Returns `Ok(())` even when the receiver is not bound — the
+/// production semantic is "fire and forget; the next tick
+/// republishes." A persistent `ENOENT` shows up in the operator's
+/// logs as repeated `warn!`s and in the sidecar's missing-
+/// receiver metric (future work).
+pub async fn write_to_path(payload: &DatagramPayload, path: &Path) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(payload).context("serialize datagram")?;
+    let sock = UnixDatagram::unbound().context("create unbound UDS datagram socket")?;
+    match sock.send_to(&bytes, path).await {
+        Ok(n) => {
+            debug!(
+                bytes = n,
+                configured = payload.configured,
+                platform_total = payload.platform_total,
+                local_cap = ?payload.local_cap,
+                "exposer: wrote datagram"
+            );
+            Ok(())
         }
-        // Stale socket from a previous process — unlink before bind.
-        let _ = std::fs::remove_file(path);
-        let socket = UnixDatagram::bind(path)
-            .with_context(|| format!("bind UDS datagram at {}", path.display()))?;
-        // Mode 0660 on the socket itself.
-        let perms = std::fs::Permissions::from_mode(0o660);
-        std::fs::set_permissions(path, perms)
-            .with_context(|| format!("chmod 0660 on {}", path.display()))?;
-        Ok(Self {
-            socket,
-            path: path.to_path_buf(),
-        })
-    }
-
-    /// Write one datagram. Best-effort: on EAGAIN / EPIPE we log
-    /// and drop; the next tick republishes. The send is async —
-    /// tokio's `UnixDatagram::send` returns a future that completes
-    /// when the kernel accepts the datagram into the socket buffer.
-    pub async fn write(&self, payload: &DatagramPayload) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(payload).context("serialize datagram")?;
-        match self.socket.send(&bytes).await {
-            Ok(_) => {
-                debug!(
-                    configured = payload.configured,
-                    platform_total = payload.platform_total,
-                    local_cap = ?payload.local_cap,
-                    "exposer: wrote datagram"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                warn!(err = %e, path = %self.path.display(), "exposer: send failed");
-                Err(e.into())
-            }
+        Err(e) => {
+            // ENOENT (receiver not bound), ENOTDIR (parent missing),
+            // ECONNREFUSED (linux returns this on a path with no
+            // listener) all mean "receiver not ready." Log + drop
+            // rather than fail the tick — the ingress keeps serving
+            // the last value it had.
+            warn!(
+                err = %e,
+                path = %path.display(),
+                "exposer: send_to failed; receiver probably not bound (drop)"
+            );
+            Ok(())
         }
     }
 }
 
-/// Bridge from the aggregator's tick callback to the exposer's write
-/// method. Builds a [`DatagramPayload`] from the [`Snapshot`] and
-/// forwards it. The write is async, so the synchronous callback
-/// spawns a fire-and-forget tokio task — the aggregator's tick
-/// cadence is 1 Hz and the kernel socket buffer absorbs any back-
-/// pressure; a write failure is logged and dropped (the next tick
-/// republishes a fresh snapshot).
-#[allow(dead_code)] // reserved for the integration test that wires aggregator → exposer directly
-pub fn snapshot_to_writer(
-    exposer: Arc<Exposer>,
-) -> impl Fn(crate::aggregate::Snapshot) + Send + Sync {
+/// Bridge from the aggregator's tick callback to the UDS writer.
+/// Returns an `Arc<dyn Fn(Snapshot) + Send + Sync>` so the
+/// aggregator's `spawn_aggregator` signature stays unchanged.
+pub fn snapshot_to_writer(path: Arc<Path>) -> impl Fn(crate::aggregate::Snapshot) + Send + Sync {
     move |snap| {
         let payload = DatagramPayload::from(&snap);
-        let exposer = Arc::clone(&exposer);
+        let path = Arc::clone(&path);
         tokio::spawn(async move {
-            if let Err(e) = exposer.write(&payload).await {
-                warn!(err = %e, "snapshot_to_writer: write failed");
+            if let Err(e) = write_to_path(&payload, &path).await {
+                // write_to_path already swallows transient errors;
+                // only a serialization failure reaches here. Log
+                // at error level because the wire shape will be
+                // stuck until the next code deploy.
+                tracing::error!(err = %e, "snapshot_to_writer: write_to_path returned Err");
             }
         });
     }
@@ -206,7 +188,7 @@ mod tests {
     use super::*;
     use crate::aggregate::Snapshot;
 
-    fn snap(configured: u32, total: u32, this_replica: u32, replicas: u32) -> Snapshot {
+    fn snap(configured: u32, total: u64, this_replica: u32, replicas: u32) -> Snapshot {
         Snapshot {
             configured_cap: configured,
             platform_total: total,
@@ -236,6 +218,16 @@ mod tests {
     }
 
     #[test]
+    fn payload_local_cap_none_when_zero_configured() {
+        // NEW (PR B review): configured=0 must also be fail-closed.
+        // The .max(1, ...) floor in Snapshot::per_replica_cap is
+        // suppressed by an earlier guard; pin the wire shape so
+        // the ingress sees `local_cap: null` rather than `1`.
+        let p = DatagramPayload::from(&snap(0, 30_000, 10_000, 3));
+        assert_eq!(p.local_cap, None, "configured=0 must be fail-closed");
+    }
+
+    #[test]
     fn payload_serializes_to_json_with_expected_fields() {
         // Pin the wire shape — the ingress binary (PR D) reads
         // exactly these field names.
@@ -249,55 +241,88 @@ mod tests {
         assert!(v["ts"].is_u64());
     }
 
-    // ── Exposer::bind + write roundtrip test ────────────────────────
+    // ── write_to_path tests (UDS ownership flip) ────────────────────
 
     #[tokio::test]
-    async fn exposer_bind_sets_mode_0660_and_writes_datagram() {
-        // Bind the exposer in a per-test tempdir so we don't
-        // pollute /var/run/edge-ingress during `cargo test`. Set
-        // up a paired SOCK_DGRAM peer to receive the datagram
-        // and assert the JSON wire shape end-to-end.
+    async fn write_to_path_delivers_datagram_to_bound_receiver() {
+        // Real-receiver pattern: a second `UnixDatagram::bind(path)`
+        // is the receiver. The sidecar's `write_to_path` uses an
+        // UNBOUND socket + `send_to(path)` — no `connect` on the
+        // sender side, no `connect` of paired peers. This mirrors
+        // production: ingress process binds, sidecar sends.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("global-rps.sock");
-        let peer_path = dir.path().join("peer.sock");
-        let exposer = Exposer::bind(&path).expect("bind");
-        assert!(path.exists(), "socket file should exist after bind");
-        let meta = std::fs::metadata(&path).expect("stat");
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o660, "socket must be mode 0660, got {mode:o}");
-
-        // Bind the peer socket and `connect()` the exposer to it
-        // so a `send()` (no address) routes to the peer.
-        let peer = tokio::net::UnixDatagram::bind(&peer_path).expect("bind peer");
-        exposer
-            .socket
-            .connect(&peer_path)
-            .expect("connect exposer to peer");
+        let receiver = tokio::net::UnixDatagram::bind(&path).expect("bind receiver");
 
         let payload = DatagramPayload::from(&snap(10_000, 5_000, 5_000, 1));
-        exposer.write(&payload).await.expect("write");
+        write_to_path(&payload, &path).await.expect("write_to_path");
+
         let mut buf = vec![0u8; 1024];
-        let n = peer.recv(&mut buf).await.expect("recv");
+        let n = receiver.recv(&mut buf).await.expect("recv");
         let json: serde_json::Value = serde_json::from_slice(&buf[..n]).expect("parse json");
         assert_eq!(json["configured"], 10_000);
         assert_eq!(json["platform_total"], 5_000);
         assert_eq!(json["this_replica"], 5_000);
         assert_eq!(json["replicas_seen"], 1);
-        // N=1 replica ⇒ others_share=0 ⇒ per_replica_cap=10000.
+        // N=1 ⇒ others_share=0 ⇒ per_replica_cap=configured=10000.
         assert_eq!(json["local_cap"], 10_000);
         assert!(json["ts"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
-    async fn exposer_bind_unlinks_stale_socket() {
-        // A prior process left a stale socket file — bind() must
-        // succeed anyway. (Without the unlink, the bind would
-        // error with EADDRINUSE.)
+    async fn write_to_path_treats_enoent_as_drop() {
+        // Receiver has never bound the socket. Production semantic
+        // is "fire and forget; the next tick republishes" — must
+        // return Ok(()), not Err, so a missing receiver doesn't
+        // fail the sidecar's tick loop.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("never-bound.sock");
+        let payload = DatagramPayload::from(&snap(10_000, 0, 0, 0));
+        write_to_path(&payload, &path)
+            .await
+            .expect("ENOENT is dropped, not surfaced");
+    }
+
+    #[tokio::test]
+    async fn write_to_path_delivers_after_receiver_rebind() {
+        // The load-bearing production scenario: the ingress
+        // process restarts. The path string is stable; a new
+        // inode is created at the same path. The sidecar's next
+        // `send_to(path)` finds the new inode without any client-
+        // side reconnect — unlike `connect()`, which follows the
+        // inode and would break.
+        //
+        // The receiver must `unlink(stale)` before rebinding
+        // (production receiver behavior; see expose.rs module
+        // docs). Without unlink, EADDRINUSE fires immediately on
+        // rebind because the kernel hasn't garbage-collected the
+        // old inode yet. We mirror that here so the test catches
+        // the unlink-required regression.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("global-rps.sock");
-        std::fs::write(&path, b"stale").expect("create stale file");
-        let exposer = Exposer::bind(&path).expect("bind despite stale");
-        assert!(path.exists());
-        drop(exposer);
+
+        // First receiver.
+        let receiver1 = tokio::net::UnixDatagram::bind(&path).expect("bind receiver1");
+        let payload1 = DatagramPayload::from(&snap(10_000, 1_000, 1_000, 1));
+        write_to_path(&payload1, &path).await.expect("write 1");
+        let mut buf = vec![0u8; 1024];
+        let n = receiver1.recv(&mut buf).await.expect("recv 1");
+        let json1: serde_json::Value = serde_json::from_slice(&buf[..n]).expect("parse 1");
+        assert_eq!(json1["this_replica"], 1_000);
+
+        // Receiver restarts: drop the old socket (releases the
+        // handle), unlink the stale path (mirrors the production
+        // receiver's `remove_file` before `bind`), bind a new one
+        // at the same path.
+        drop(receiver1);
+        // Best-effort unlink — if it raced the kernel cleanup
+        // that's still fine (NotFound is harmless).
+        let _ = std::fs::remove_file(&path);
+        let receiver2 = tokio::net::UnixDatagram::bind(&path).expect("bind receiver2");
+        let payload2 = DatagramPayload::from(&snap(10_000, 2_000, 2_000, 1));
+        write_to_path(&payload2, &path).await.expect("write 2");
+        let n = receiver2.recv(&mut buf).await.expect("recv 2");
+        let json2: serde_json::Value = serde_json::from_slice(&buf[..n]).expect("parse 2");
+        assert_eq!(json2["this_replica"], 2_000);
     }
 }

@@ -50,9 +50,16 @@ use tracing_subscriber::EnvFilter;
 use crate::aggregate::{Aggregator, Snapshot};
 use crate::caddy_metrics::{spawn_scraper, DeltaMsg};
 use crate::config::Config;
-use crate::expose::Exposer;
+use crate::expose::snapshot_to_writer;
 use crate::nats_pub::{spawn_publisher, NatsPublisher};
 use crate::nats_sub::spawn_consumer;
+
+/// Channel buffer between the scraper and the NATS publisher. The
+/// scraper ticks at 1 Hz; a buffer of 4 covers 4 missed publishes
+/// (≈3s of measurement queue) before backpressure forces the
+/// scraper to drop a tick — the same self-healing semantic the
+/// publisher uses on the wire.
+const SCRAPER_CHANNEL_BUFFER: usize = 4;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -91,6 +98,7 @@ async fn main() -> ExitCode {
         caddy_admin = %cfg.caddy_admin_url,
         metrics_listen = %cfg.metrics_listen,
         global_rate_limit_rps = cfg.global_rate_limit_rps,
+        nats_replicas = cfg.nats_replicas,
         uds_path = %cfg.uds_path,
         "edge-ingress-sidecar starting (PR B — full pipeline wired)"
     );
@@ -123,20 +131,31 @@ async fn main() -> ExitCode {
     // safe to call in any order).
     let publisher: Arc<NatsPublisher> = match NatsPublisher::connect(
         &cfg.nats_url,
-        // TODO(PR B review): thread `cfg.nats_replicas` from a new
-        // env var. For PR B we use 1 (single-replica NATS — the
-        // testcontainer-backed NATS server in PR B's integration
-        // tests is single-replica by default).
-        1,
+        cfg.nats_replicas,
     )
     .await
     {
-        Ok(p) => {
-            if let Err(e) = p.ensure_stream(1).await {
-                tracing::error!(err = %e, "ensure_stream failed; sidecar will retry on each tick");
+        Ok(p) => match p.ensure_stream().await {
+            Ok(()) => Arc::new(p),
+            Err(e) => {
+                // Exit instead of "retry on each tick" — the stream
+                // declaration is the load-bearing primitive the
+                // consumer subscribes against; without it the
+                // consumer's `get_stream` fails forever and the
+                // "retry on each tick" message misleads operators
+                // into thinking the sidecar is making progress.
+                // A failure here means the NATS cluster is missing
+                // or permissions are wrong; both deserve operator
+                // intervention, not silent retry.
+                tracing::error!(
+                    err = %e,
+                    "ensure_stream failed; the rate-limit stream must be declared before \
+                     the sidecar can subscribe. The control plane (PR C) declares this stream \
+                     on startup — boot the CP first, or check NATS cluster permissions. Exiting."
+                );
+                return ExitCode::from(2);
             }
-            Arc::new(p)
-        }
+        },
         Err(e) => {
             tracing::error!(err = %e, "nats connect failed; exiting");
             return ExitCode::from(2);
@@ -147,7 +166,7 @@ async fn main() -> ExitCode {
     let consumer_client = publisher.client();
 
     // ── Scraper → publisher channel (scrape Caddy at 1 Hz, ship) ──
-    let (scraper_tx, scraper_rx) = mpsc::channel::<DeltaMsg>(64);
+    let (scraper_tx, scraper_rx) = mpsc::channel::<DeltaMsg>(SCRAPER_CHANNEL_BUFFER);
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -174,38 +193,17 @@ async fn main() -> ExitCode {
     let consumer_name = format!("{}-rl-consumer", cfg.replica_id);
     let consumer_handle = spawn_consumer(consumer_client, consumer_name, agg_tx, shutdown.clone());
 
-    // ── Aggregator → UDS exposer. ──
+    // ── Aggregator → UDS datagram writer. ──
+    //
+    // PR B review fix: the sidecar is the SENDER, not the receiver.
+    // The ingress process (PR D) owns the bind + chmod + unlink of
+    // the well-known socket path; the sidecar uses an unbound
+    // socket + send_to(path) per tick and treats ENOENT as
+    // "receiver not bound yet; drop and retry next tick." See
+    // expose.rs module docs for the full ownership rationale.
     let aggregator = Aggregator::new(cfg.replica_id.clone(), cfg.global_rate_limit_rps);
-
-    let exposer = match Exposer::bind(std::path::Path::new(&cfg.uds_path)) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
-            tracing::error!(err = %e, uds_path = %cfg.uds_path, "exposer bind failed");
-            return ExitCode::from(2);
-        }
-    };
-
-    // The aggregator ticks once per second; on each tick we hand
-    // the snapshot to the exposer, which writes one UDS datagram.
-    // PR D's ingress-side cache is the eventual reader of those
-    // datagrams.
-    let on_snapshot: Arc<dyn Fn(Snapshot) + Send + Sync> = {
-        let exposer = Arc::clone(&exposer);
-        Arc::new(move |snap: Snapshot| {
-            let payload = crate::expose::DatagramPayload::from(&snap);
-            let exposer = Arc::clone(&exposer);
-            // Fire-and-forget: the kernel socket buffer absorbs
-            // backpressure at 1 Hz, and a write failure is logged
-            // and dropped (the next tick republishes a fresh
-            // snapshot).
-            tokio::spawn(async move {
-                if let Err(e) = exposer.write(&payload).await {
-                    tracing::warn!(err = %e, "snapshot write failed");
-                }
-            });
-        })
-    };
-
+    let uds_path = Arc::<std::path::Path>::from(std::path::PathBuf::from(&cfg.uds_path));
+    let on_snapshot: Arc<dyn Fn(Snapshot) + Send + Sync> = Arc::new(snapshot_to_writer(uds_path));
     let aggregator_handle =
         crate::aggregate::spawn_aggregator(aggregator, agg_rx, on_snapshot, shutdown.clone());
 

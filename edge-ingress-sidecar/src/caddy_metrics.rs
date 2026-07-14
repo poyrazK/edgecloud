@@ -49,20 +49,30 @@ use tracing::{debug, warn};
 /// protects against the brief window where Caddy restarts and the
 /// counter resets to 0; the saturation would otherwise underflow to
 /// u32::MAX and poison the platform total.
+///
+/// `scraped_at_unix_ms` is stamped at scrape time so the consumer can
+/// reason about freshness independent of arrival time. Without this
+/// stamp, a `LastPerSubject` replay that arrives 60s late would be
+/// treated as a fresh 1-second measurement and poison the sliding
+/// window (the platform total would suddenly include a stale value).
+/// See `nats_sub::spawn_consumer` for the staleness-rejection
+/// invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaMsg {
     pub replica_id: String,
     pub rps: u32,
+    pub scraped_at_unix_ms: u64,
 }
 
 impl DeltaMsg {
-    /// Stamp `ts_unix_ms` into the payload. The wire shape carries
-    /// it explicitly (see module docs) so a future consumer can
-    /// reason about clock skew without re-deriving it.
+    /// Render the wire payload. Kept as a `serde_json::Value` rather
+    /// than a typed struct so the consumer's `DeltaMsgWire` (which
+    /// must tolerate missing fields for forward-compat) can match
+    /// without coupling to the publisher's full schema.
     pub fn to_wire(&self) -> serde_json::Value {
         serde_json::json!({
             "replica_id": self.replica_id,
-            "ts_unix_ms": unix_ms_now(),
+            "scraped_at_unix_ms": self.scraped_at_unix_ms,
             "rps": self.rps,
         })
     }
@@ -105,10 +115,18 @@ pub struct ScrapeDiff {
 /// caddy_http_requests_total{code="200",...} 1234
 /// ```
 ///
+/// **Prefix-match gotcha:** the metric name MUST be followed by `{`
+/// (labeled form), whitespace (unlabeled form), or end-of-line. A
+/// bare `strip_prefix("caddy_http_requests_total")` would also match
+/// `caddy_http_requests_total_created` (the timestamp helper metric
+/// Prom auto-emits for every counter), which would inflate the total
+/// by one entry per scrape. We require a delimiter after the name.
+///
 /// Returns `None` if the counter is absent (very early scrape, before
 /// Caddy has served any requests — shouldn't happen in steady state
 /// but the caller's `Option` handles it gracefully).
 pub fn parse_caddy_counter(body: &str) -> Option<u64> {
+    const NAME: &str = "caddy_http_requests_total";
     let mut total: u64 = 0;
     let mut found = false;
     for line in body.lines() {
@@ -116,15 +134,40 @@ pub fn parse_caddy_counter(body: &str) -> Option<u64> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Match the metric name; labels may follow in `{...}`.
-        if let Some(rest) = line.strip_prefix("caddy_http_requests_total") {
-            // Skip the label block (anything up to the first space).
-            let value_str = rest.split_once(' ').map(|(_, v)| v).unwrap_or(rest);
-            // Strip trailing whitespace / comments.
-            let value_str = value_str.trim();
-            if let Ok(v) = value_str.parse::<f64>() {
+        // Match the metric name + a delimiter that distinguishes
+        // the real counter from derivatives like `*_created` /
+        // `*_sum` / `*_count`.
+        let Some(rest) = line.strip_prefix(NAME) else {
+            continue;
+        };
+        let next = rest.chars().next();
+        if !matches!(next, Some('{') | Some(' ') | Some('\t') | None) {
+            // E.g. `caddy_http_requests_total_created` — skip.
+            continue;
+        }
+        // Skip the label block (anything up to the first whitespace).
+        let value_str = rest
+            .split_whitespace()
+            .nth(if rest.starts_with('{') { 1 } else { 0 })
+            .unwrap_or("");
+        match value_str.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => {
                 total = total.saturating_add(v as u64);
                 found = true;
+            }
+            Ok(_) => {
+                // NaN, +Inf, -Inf, or negative — skip. Prom counters
+                // shouldn't ever produce these in steady state; we
+                // filter defensively so a buggy exporter doesn't
+                // poison the platform total.
+                warn!(
+                    value = value_str,
+                    "parse_caddy_counter: non-finite or negative value, skipping"
+                );
+            }
+            Err(_) => {
+                // Malformed numeric — skip without poisoning other
+                // lines (the rest of the series may still be valid).
             }
         }
     }
@@ -205,6 +248,7 @@ pub fn spawn_scraper(
                     let msg = DeltaMsg {
                         replica_id: replica_id.clone(),
                         rps: diff.rps,
+                        scraped_at_unix_ms: unix_ms_now(),
                     };
                     if tx.send(msg).await.is_err() {
                         warn!("scraper: aggregator dropped the channel; bailing");
@@ -287,6 +331,40 @@ caddy_http_requests_total 50
         assert_eq!(parse_caddy_counter(body), Some(150));
     }
 
+    #[test]
+    fn parse_rejects_caddy_http_requests_total_created() {
+        // The `_created` metric is the timestamp Prom auto-emits for
+        // every counter; without the delimiter guard it would match
+        // `strip_prefix("caddy_http_requests_total")` and inflate the
+        // total by one entry per scrape. Pin the rejection here.
+        let body = "# HELP caddy_http_requests_total_created ...\n# TYPE caddy_http_requests_total_created counter\ncaddy_http_requests_total_created 1.7e9\ncaddy_http_requests_total{code=\"200\"} 100\n";
+        assert_eq!(parse_caddy_counter(body), Some(100));
+    }
+
+    #[test]
+    fn parse_rejects_nan_and_infinity() {
+        // Defensive: a buggy exporter emitting NaN / ±Inf / negatives
+        // would otherwise poison the total (NaN→0u64, +Inf→u64::MAX,
+        // -Inf→saturating_neg panics).
+        let body = "\
+caddy_http_requests_total NaN
+caddy_http_requests_total +Inf
+caddy_http_requests_total -Inf
+caddy_http_requests_total -5
+caddy_http_requests_total 7
+";
+        assert_eq!(parse_caddy_counter(body), Some(7));
+    }
+
+    #[test]
+    fn parse_handles_unlabeled_form_with_whitespace() {
+        // Unlabeled Prometheus counters have just `name value`.
+        // Pin that the delimiter guard accepts whitespace (not just
+        // `{`).
+        let body = "caddy_http_requests_total 42\n";
+        assert_eq!(parse_caddy_counter(body), Some(42));
+    }
+
     // ── diff_scrapes tests ─────────────────────────────────────────
 
     #[test]
@@ -324,12 +402,15 @@ caddy_http_requests_total 50
         let m = DeltaMsg {
             replica_id: "pod-1".into(),
             rps: 5000,
+            scraped_at_unix_ms: 1_700_000_000_000,
         };
         let v = m.to_wire();
         assert_eq!(v["replica_id"], "pod-1");
         assert_eq!(v["rps"], 5000);
-        // ts_unix_ms is stamped from the clock; pin only that it
-        // exists and is non-zero (CI runners have a real epoch).
-        assert!(v["ts_unix_ms"].as_u64().unwrap() > 0);
+        // scraped_at_unix_ms is the wire field that drives the
+        // consumer's staleness rejection (issue #665 PR B review
+        // follow-up). Pin its presence + value here so the consumer
+        // doesn't silently lose the field.
+        assert_eq!(v["scraped_at_unix_ms"], 1_700_000_000_000_u64);
     }
 }

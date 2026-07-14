@@ -18,19 +18,17 @@
 //!     (issue #305 #4, mirrored from `edge-ingress`). 0 = disabled
 //!     (sidecar logs at info and exits with code 0; operator must
 //!     opt in to cross-replica aggregation).
+//!   - `SIDECAR_NATS_REPLICAS` — JetStream stream replication factor
+//!     for `edgecloud-rl-global` (PR C declares the same value on the
+//!     CP side; the sidecar's `EnsureStream` and the CP's `EnsureStream`
+//!     must agree). Defaults to `1`. The `cargo-udeps`/nightly gate
+//!     flagged a hard-coded `1` in the publisher constructor — this
+//!     env var threads the value through.
 //!   - `SIDECAR_UDS_PATH` — UDS datagram socket the ingress binary
 //!     reads at 1 Hz (PR D). Defaults to `/var/run/edge-ingress/global-rps.sock`.
 //!
-//! `parse_duration_env` is duplicated from `edge-ingress/src/config.rs`
-//! rather than factored into `edge-config` because the two crates already
-//! share the same `humantime` dep and a 4-line helper doesn't justify the
-//! cross-crate surface. If a third caller ever appears, fold them.
-//!
 //! `validate()` mirrors the same MIN_REASONABLE_RPS guard pattern — a
 //! sub-10 cap on the platform total is almost certainly a typo.
-
-#[cfg(test)]
-use std::time::Duration;
 
 use anyhow::Context;
 use tracing::warn;
@@ -65,6 +63,11 @@ pub struct Config {
     /// not have been deployed; we still run because operators may want
     /// the sidecar's `/metrics` surface without enabling aggregation.
     pub global_rate_limit_rps: u32,
+    /// JetStream stream replication factor for `edgecloud-rl-global`.
+    /// Must match the CP's `cfg.NATS.Replicas` (PR C); both call
+    /// `EnsureStream` with the same value so the stream config is
+    /// idempotent across the cluster.
+    pub nats_replicas: usize,
     /// UDS datagram socket path the ingress binary reads at 1 Hz
     /// (issue #665 PR D).
     pub uds_path: String,
@@ -93,6 +96,13 @@ impl Config {
             .unwrap_or_else(|_| "0".into())
             .parse()
             .context("SIDECAR_GLOBAL_RATE_LIMIT_RPS must be a non-negative integer")?;
+        let nats_replicas: usize = std::env::var("SIDECAR_NATS_REPLICAS")
+            .unwrap_or_else(|_| "1".into())
+            .parse()
+            .context("SIDECAR_NATS_REPLICAS must be a positive integer")?;
+        if nats_replicas == 0 {
+            anyhow::bail!("SIDECAR_NATS_REPLICAS must be ≥ 1 (got 0)");
+        }
 
         Ok(Config {
             nats_url: std::env::var("SIDECAR_NATS_URL")
@@ -103,6 +113,7 @@ impl Config {
             metrics_listen: std::env::var("SIDECAR_METRICS_LISTEN")
                 .unwrap_or_else(|_| DEFAULT_METRICS_LISTEN.into()),
             global_rate_limit_rps,
+            nats_replicas,
             uds_path: std::env::var("SIDECAR_UDS_PATH").unwrap_or_else(|_| DEFAULT_UDS_PATH.into()),
         })
     }
@@ -131,23 +142,6 @@ impl Config {
     }
 }
 
-/// Parse a duration env var. Accepts Go-style strings (`30s`, `1m`,
-/// `500ms`, `2h`) via the `humantime` crate. Returns `None` if the
-/// env var is unset, malformed, or parses to zero.
-///
-/// Kept here (rather than inlined) so unit tests can pin: (a) standard
-/// Go-style strings round-trip, (b) `0s` / `0ms` / `0` are rejected,
-/// (c) malformed values return `None` rather than panic.
-#[cfg(test)] // unit-tested but currently unreferenced from `from_env`; reserved for PR D
-fn parse_duration_env(name: &str) -> Option<Duration> {
-    let raw = std::env::var(name).ok()?;
-    let d = humantime::parse_duration(&raw).ok()?;
-    if d.is_zero() {
-        return None;
-    }
-    Some(d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,55 +154,6 @@ mod tests {
 
     fn unset_var(name: &str) {
         unsafe { std::env::remove_var(name) };
-    }
-
-    // ── parse_duration_env tests (mirror edge-ingress/src/config.rs) ─
-
-    #[test]
-    fn parse_duration_env_handles_go_style_seconds() {
-        let name = "__TEST_SIDECAR_DUR_SECS";
-        set_var(name, "5s");
-        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(5)));
-        unset_var(name);
-    }
-
-    #[test]
-    fn parse_duration_env_handles_go_style_minutes() {
-        let name = "__TEST_SIDECAR_DUR_MINS";
-        set_var(name, "5m");
-        assert_eq!(parse_duration_env(name), Some(Duration::from_secs(300)));
-        unset_var(name);
-    }
-
-    #[test]
-    fn parse_duration_env_handles_go_style_millis() {
-        let name = "__TEST_SIDECAR_DUR_MS";
-        set_var(name, "500ms");
-        assert_eq!(parse_duration_env(name), Some(Duration::from_millis(500)));
-        unset_var(name);
-    }
-
-    #[test]
-    fn parse_duration_env_rejects_zero_seconds() {
-        let name = "__TEST_SIDECAR_DUR_ZERO_S";
-        set_var(name, "0s");
-        assert_eq!(parse_duration_env(name), None, "0s would busy-loop");
-        unset_var(name);
-    }
-
-    #[test]
-    fn parse_duration_env_rejects_malformed() {
-        let name = "__TEST_SIDECAR_DUR_GARBAGE";
-        set_var(name, "garbage");
-        assert_eq!(parse_duration_env(name), None);
-        unset_var(name);
-    }
-
-    #[test]
-    fn parse_duration_env_returns_none_when_unset() {
-        let name = "__TEST_SIDECAR_DUR_DEFINITELY_UNSET_XYZ";
-        unset_var(name);
-        assert_eq!(parse_duration_env(name), None);
     }
 
     // ── Config::from_env tests ──────────────────────────────────────
@@ -224,6 +169,7 @@ mod tests {
             "SIDECAR_CADDY_ADMIN_URL",
             "SIDECAR_METRICS_LISTEN",
             "SIDECAR_GLOBAL_RATE_LIMIT_RPS",
+            "SIDECAR_NATS_REPLICAS",
             "SIDECAR_UDS_PATH",
             "HOSTNAME",
         ] {
@@ -258,6 +204,7 @@ mod tests {
         assert_eq!(cfg.caddy_admin_url, "http://127.0.0.1:2019");
         assert_eq!(cfg.metrics_listen, "0.0.0.0:9091");
         assert_eq!(cfg.global_rate_limit_rps, 0);
+        assert_eq!(cfg.nats_replicas, 1, "default replicas=1");
         assert_eq!(cfg.uds_path, "/var/run/edge-ingress/global-rps.sock");
     }
 
@@ -280,13 +227,51 @@ mod tests {
         set_var("SIDECAR_CADDY_ADMIN_URL", "http://caddy-admin:2019");
         set_var("SIDECAR_METRICS_LISTEN", "0.0.0.0:9191");
         set_var("SIDECAR_GLOBAL_RATE_LIMIT_RPS", "10000");
+        set_var("SIDECAR_NATS_REPLICAS", "3");
         set_var("SIDECAR_UDS_PATH", "/tmp/sidecar.sock");
         let cfg = Config::from_env().expect("overrides");
         assert_eq!(cfg.nats_url, "nats://nats.internal:4222");
         assert_eq!(cfg.caddy_admin_url, "http://caddy-admin:2019");
         assert_eq!(cfg.metrics_listen, "0.0.0.0:9191");
         assert_eq!(cfg.global_rate_limit_rps, 10000);
+        assert_eq!(cfg.nats_replicas, 3);
         assert_eq!(cfg.uds_path, "/tmp/sidecar.sock");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn from_env_parses_nats_replicas() {
+        unset_all_config_vars();
+        set_var("HOSTNAME", "pod-1");
+        set_var("SIDECAR_NATS_REPLICAS", "5");
+        let cfg = Config::from_env().expect("replicas override");
+        assert_eq!(cfg.nats_replicas, 5);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn from_env_rejects_nats_replicas_zero() {
+        unset_all_config_vars();
+        set_var("HOSTNAME", "pod-1");
+        set_var("SIDECAR_NATS_REPLICAS", "0");
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("SIDECAR_NATS_REPLICAS"),
+            "err must mention SIDECAR_NATS_REPLICAS: {err}"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn from_env_rejects_nats_replicas_garbage() {
+        unset_all_config_vars();
+        set_var("HOSTNAME", "pod-1");
+        set_var("SIDECAR_NATS_REPLICAS", "three");
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("SIDECAR_NATS_REPLICAS"),
+            "err must mention SIDECAR_NATS_REPLICAS: {err}"
+        );
     }
 
     #[serial_test::serial]
@@ -313,6 +298,7 @@ mod tests {
             caddy_admin_url: "http://localhost:2019".into(),
             metrics_listen: "0.0.0.0:9091".into(),
             global_rate_limit_rps: 5,
+            nats_replicas: 1,
             uds_path: "/tmp/s.sock".into(),
         };
         cfg.validate();
@@ -326,6 +312,7 @@ mod tests {
             caddy_admin_url: "http://localhost:2019".into(),
             metrics_listen: "0.0.0.0:9091".into(),
             global_rate_limit_rps: 0,
+            nats_replicas: 1,
             uds_path: "/tmp/s.sock".into(),
         };
         cfg.validate();
@@ -339,6 +326,7 @@ mod tests {
             caddy_admin_url: "http://localhost:2019".into(),
             metrics_listen: "0.0.0.0:9091".into(),
             global_rate_limit_rps: 10_000,
+            nats_replicas: 1,
             uds_path: "/tmp/s.sock".into(),
         };
         cfg.validate();

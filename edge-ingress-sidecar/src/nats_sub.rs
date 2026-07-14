@@ -27,7 +27,7 @@
 //! panicking — matching the failure-mode table in the issue #665
 //! plan.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_nats::jetstream::{self};
@@ -36,6 +36,26 @@ use tracing::{debug, warn};
 
 use crate::caddy_metrics::DeltaMsg;
 use crate::nats_pub::{build_consumer_config, RATE_LIMIT_STREAM};
+
+/// Maximum acceptable age of a message's `scraped_at_unix_ms`
+/// relative to the consumer's wall clock. 2s is twice the planned
+/// 1s scrape cadence so a one-tick jitter (network blip, GC pause)
+/// doesn't reject a fresh measurement, but a `LastPerSubject` replay
+/// that arrives 60s late (stream outage) is dropped instead of
+/// poisoning the sliding window.
+///
+/// Mirrors the `MAX_SKEW` sanity check pattern used by
+/// `edge-runtime/src/interfaces/scheduling.rs` (Instant ↔ Unix
+/// boot-time offset), so the sidecar stays consistent with how the
+/// rest of the platform bounds clock skew.
+const MAX_MESSAGE_AGE: Duration = Duration::from_secs(2);
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Spawn the consumer task. See module docs for the wire contract.
 ///
@@ -115,20 +135,61 @@ pub fn spawn_consumer(
                         match next {
                             Some(Ok(msg)) => {
                                 let subject = msg.subject.to_string();
-                                let replica_id = subject
+                                // Subject leaf wins over the JSON
+                                // payload's `replica_id` for the
+                                // dedup key. NATS guarantees the
+                                // subject routing; the payload field
+                                // is operator-controlled and could
+                                // be tampered with (PR B review
+                                // follow-up). If the two disagree
+                                // we still accept the message (the
+                                // publisher may be a buggy older
+                                // build) but log a WARN so the
+                                // operator notices the drift.
+                                let subject_replica = subject
                                     .strip_prefix("edgecloud.rate-limit.global.delta.")
                                     .unwrap_or(&subject)
                                     .to_string();
                                 match serde_json::from_slice::<DeltaMsgWire>(&msg.payload) {
                                     Ok(wire) => {
-                                        let delta = DeltaMsg {
-                                            replica_id: wire.replica_id.unwrap_or(replica_id),
-                                            rps: wire.rps,
-                                        };
-                                        debug!(replica = %delta.replica_id, rps = delta.rps, "consumer: received delta");
-                                        if tx.send(delta).await.is_err() {
-                                            warn!("consumer: aggregator dropped the channel; bailing");
-                                            return;
+                                        if let Some(payload_rid) = wire.replica_id.as_deref() {
+                                            if payload_rid != subject_replica {
+                                                warn!(
+                                                    subject_replica = %subject_replica,
+                                                    payload_replica = %payload_rid,
+                                                    "consumer: payload replica_id disagrees with subject leaf; using subject"
+                                                );
+                                            }
+                                        }
+                                        // Freshness check: drop
+                                        // messages whose scrape
+                                        // timestamp is older than
+                                        // `now − MAX_MESSAGE_AGE`.
+                                        // Bounds the worst case for
+                                        // `LastPerSubject` replays
+                                        // after a stream outage.
+                                        let now_ms = unix_ms_now();
+                                        let age_ms = now_ms.saturating_sub(wire.scraped_at_unix_ms);
+                                        if age_ms > MAX_MESSAGE_AGE.as_millis() as u64 {
+                                            warn!(
+                                                subject = %subject,
+                                                age_ms,
+                                                "consumer: stale scraped_at_unix_ms; dropping"
+                                            );
+                                            // Skip but still ack so
+                                            // the server doesn't
+                                            // redeliver.
+                                        } else {
+                                            let delta = DeltaMsg {
+                                                replica_id: subject_replica,
+                                                rps: wire.rps,
+                                                scraped_at_unix_ms: wire.scraped_at_unix_ms,
+                                            };
+                                            debug!(replica = %delta.replica_id, rps = delta.rps, age_ms, "consumer: received delta");
+                                            if tx.send(delta).await.is_err() {
+                                                warn!("consumer: aggregator dropped the channel; bailing");
+                                                return;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -158,14 +219,16 @@ pub fn spawn_consumer(
 }
 
 /// Wire shape produced by [`crate::caddy_metrics::DeltaMsg::to_wire`]
-/// and consumed here. `replica_id` may be absent on a malformed
-/// message — fall back to the subject leaf so a buggy publisher
-/// can't poison the aggregator.
+/// and consumed here. `replica_id` is technically optional — the
+/// consumer falls back to the subject leaf — but `scraped_at_unix_ms`
+/// is **required** so the freshness check has a value to bound the
+/// worst case for `LastPerSubject` replays.
 #[derive(Debug, serde::Deserialize)]
 struct DeltaMsgWire {
     #[serde(default)]
     replica_id: Option<String>,
     rps: u32,
+    scraped_at_unix_ms: u64,
 }
 
 #[cfg(test)]
@@ -178,12 +241,13 @@ mod tests {
     fn wire_parses_replica_id_and_rps() {
         let body = serde_json::json!({
             "replica_id": "pod-A",
-            "ts_unix_ms": 1700000000000_u64,
+            "scraped_at_unix_ms": 1_700_000_000_000_u64,
             "rps": 5_000,
         });
         let wire: DeltaMsgWire = serde_json::from_value(body).unwrap();
         assert_eq!(wire.replica_id.as_deref(), Some("pod-A"));
         assert_eq!(wire.rps, 5_000);
+        assert_eq!(wire.scraped_at_unix_ms, 1_700_000_000_000);
     }
 
     #[test]
@@ -191,7 +255,7 @@ mod tests {
         // Subject-leaf fallback is the consumer's job — the wire
         // parser should accept the field as absent.
         let body = serde_json::json!({
-            "ts_unix_ms": 1700000000000_u64,
+            "scraped_at_unix_ms": 1_700_000_000_000_u64,
             "rps": 5_000,
         });
         let wire: DeltaMsgWire = serde_json::from_value(body).unwrap();
@@ -201,8 +265,30 @@ mod tests {
 
     #[test]
     fn wire_rejects_missing_rps() {
-        let body = serde_json::json!({"replica_id": "pod-A"});
+        let body = serde_json::json!({"replica_id": "pod-A", "scraped_at_unix_ms": 1});
         let err = serde_json::from_value::<DeltaMsgWire>(body).unwrap_err();
         assert!(err.to_string().contains("rps"));
+    }
+
+    #[test]
+    fn wire_rejects_missing_scraped_at() {
+        // The freshness check (subject to MAX_MESSAGE_AGE) needs
+        // this field; missing → reject the message rather than
+        // guessing.
+        let body = serde_json::json!({
+            "replica_id": "pod-A",
+            "rps": 1_000,
+        });
+        let err = serde_json::from_value::<DeltaMsgWire>(body).unwrap_err();
+        assert!(err.to_string().contains("scraped_at_unix_ms"));
+    }
+
+    #[test]
+    fn max_message_age_is_two_seconds() {
+        // Sanity-check the constant — if someone tightens it to 1s
+        // a single GC pause would drop legitimate measurements, and
+        // if they loosen it to 60s the LastPerSubject replay-poison
+        // risk returns.
+        assert_eq!(MAX_MESSAGE_AGE, Duration::from_secs(2));
     }
 }
