@@ -149,8 +149,17 @@ fn read_until<F: Fn(&[u8]) -> bool>(
         // `Result<Vec<u8>, StreamError>`. Ask for up to 4096 bytes; the
         // host may short-read (returns a `Vec<u8>` shorter than the
         // requested `len`).
-        let chunk = [0u8; 4096];
-        let chunk = match input.read(chunk.len() as u64) {
+        // Use `blocking_read` (not `read`) so the call suspends until
+        // data arrives or the peer closes. `read` is non-blocking and
+        // returns an empty Vec when no bytes are buffered yet — which
+        // races with the TCP accept queue and causes a false-EOF that
+        // closes the connection before any RESP bytes flow. The
+        // single-connection design of this sample means blocking the
+        // guest is fine; we don't need to interleave other work while
+        // one client holds the InputStream. The supervisor's epoch
+        // ticker (10ms cadence) bounds the call via the wasmtime
+        // epoch interruption.
+        let chunk = match input.blocking_read(4096) {
             Ok(c) => c,
             Err(StreamError::Closed) => return Err(()),
             Err(e) => {
