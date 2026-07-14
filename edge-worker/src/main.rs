@@ -31,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 use edge_worker::tracing_layer::WorkerLogLayer;
 
 use crate::auth::WorkerJwtSigner;
+use crate::backoff::compute_backoff_ms;
 use crate::config::Config;
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
@@ -437,26 +438,52 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Run the consume loop on the main task. Wrapped in a reconnect loop
-    // with bounded exponential backoff so transient stream-end (consumer
-    // deleted, server restart, push-consumer dropped) doesn't kill the
-    // worker. Shutdown signal is observed via the broadcast receiver, so
+    // with bounded exponential backoff + ±25% jitter so transient stream-end
+    // (consumer deleted, server restart, push-consumer dropped) doesn't kill
+    // the worker. Shutdown signal is observed via the broadcast receiver, so
     // Ok(()) here means "shutdown was signalled" — break and drain.
+    //
+    // Issue #47 contract:
+    // - Jitter prevents a thundering-herd reconnect when a partition heals
+    //   and many workers would otherwise re-subscribe at the same wall-clock
+    //   instant. The math is `compute_backoff_ms(1, backoff, MAX_BACKOFF)`
+    //   — the jitter is per-sleep, not per-attempt; backoff doubles across
+    //   sleeps via the `backoff *= 2` arm below.
+    // - Reset: if the consume loop ran healthily for ≥ RESET_AFTER_HEALTHY
+    //   before stream-end, `backoff` resets to 1s. Without this, a worker
+    //   that ran stable for a day and then hit one transient reconnect
+    //   would inherit the 60s cap from the previous day's failure run.
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    const RESET_AFTER_HEALTHY: Duration = Duration::from_secs(60);
     loop {
         let consume_shutdown_rx = shutdown_tx.subscribe();
+        let started_at = std::time::Instant::now();
         match supervisor.run_consume_loop(consume_shutdown_rx).await {
             Ok(()) => {
                 tracing::info!("consume loop returned after shutdown signal");
                 break;
             }
             Err(e) => {
+                if let Some(reset_to) = reset_backoff_if_healthy(started_at, RESET_AFTER_HEALTHY) {
+                    tracing::info!(
+                        healthy_for = ?started_at.elapsed(),
+                        "consume loop ran healthily before stream-end; resetting backoff"
+                    );
+                    backoff = reset_to;
+                }
+                let backoff_ms = compute_backoff_ms(
+                    1,
+                    backoff.as_millis() as u64,
+                    MAX_BACKOFF.as_millis() as u64,
+                );
                 tracing::error!(
                     err = %e,
-                    backoff_secs = backoff.as_secs(),
+                    backoff_ms,
+                    backoff_after_sleep_secs = std::cmp::min(backoff * 2, MAX_BACKOFF).as_secs(),
                     "consume loop ended unexpectedly; reconnecting"
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
             }
         }
@@ -466,6 +493,29 @@ async fn main() -> anyhow::Result<()> {
     // broadcast, stopped apps, published the final heartbeat, and awaited
     // the log forwarder drain. main() returns cleanly.
     Ok(())
+}
+
+/// Reset the consume-loop backoff when the previous run was healthy.
+///
+/// Returns `Some(Duration::from_secs(1))` iff the wall-clock elapsed
+/// between `started_at` and "now" is at least `threshold`, signaling
+/// that the previous consume-loop run was healthy long enough to forget
+/// any prior failure-state. Returns `None` otherwise.
+///
+/// Issue #47 contract: a worker that ran stable for ≥ `threshold` and
+/// then hit one transient stream-end should reconnect immediately (1s)
+/// instead of inheriting yesterday's 60s cap. The threshold is the
+/// operator-facing knob — bumping it tightens the definition of
+/// "healthy run."
+fn reset_backoff_if_healthy(
+    started_at: std::time::Instant,
+    threshold: Duration,
+) -> Option<Duration> {
+    if started_at.elapsed() >= threshold {
+        Some(Duration::from_secs(1))
+    } else {
+        None
+    }
 }
 
 /// Resolve the JWT signing secret + kid (issue #430).
@@ -688,5 +738,86 @@ mod shutdown_tests {
         });
         let outcome = drain_logs_task(Duration::from_millis(50), handle).await;
         assert_eq!(outcome, DrainOutcome::Timeout);
+    }
+}
+
+/// Unit tests for the consume-loop reconnect path (issue #47).
+///
+/// The two contracts under test are jitter (no thundering-herd) and
+/// reset-after-healthy-run (backoff doesn't carry across long stable
+/// periods). The reset test feeds `reset_backoff_if_healthy` synthetic
+/// Instants to keep the suite independent of wall-clock — the loop
+/// body itself is `async fn`-shaped and tied to `Supervisor`, so the
+/// helper is the smallest testable unit. The jitter tests are pure
+/// math against `compute_backoff_ms`.
+#[cfg(test)]
+mod reconnect_tests {
+    use super::compute_backoff_ms;
+    use super::reset_backoff_if_healthy;
+
+    /// 200-iteration sample must stay in `[750, 1250]` ms when
+    /// `base = 1_000` and `cap = 60_000`. Pins the thundering-herd
+    /// prevention invariant — every reconnecting worker in a fleet
+    /// picks a different wall-clock instant within this band.
+    #[test]
+    fn reconnect_jitter_band_is_pm_25_percent() {
+        for _ in 0..200 {
+            let slept = compute_backoff_ms(1, 1_000, 60_000);
+            assert!(
+                (750..=1_250).contains(&slept),
+                "jitter out of band: {slept}ms (want 750..=1250)"
+            );
+        }
+    }
+
+    /// `cap_ms` is honored even when `base_ms > cap_ms`. Pins the
+    /// third-argument semantic — without it the downloader's 3 200 ms
+    /// cap and the consume-loop's 60 000 ms cap would both leak.
+    ///
+    /// Note: the cap is applied to the *pre-jitter* value, so the
+    /// post-jitter result can sit in `[cap × 0.75, cap × 1.25]` —
+    /// the cap is the ceiling of the jitter band, not the ceiling of
+    /// the post-jitter output. This matches the saturation doc on the
+    /// `RETRY_CAP_MS` const in downloader.rs.
+    #[test]
+    fn reconnect_jitter_caps_at_max_backoff() {
+        for _ in 0..200 {
+            let slept = compute_backoff_ms(1, 100_000, 60_000);
+            assert!(
+                slept <= 75_000,
+                "post-jitter output {slept}ms above cap × 1.25 = 75_000ms"
+            );
+            assert!(
+                slept >= 45_000,
+                "post-jitter output {slept}ms below cap × 0.75 = 45_000ms"
+            );
+        }
+    }
+
+    /// After a healthy run ≥ threshold, the loop resets backoff to 1s.
+    /// Synthesized by constructing `started_at` 120s in the past.
+    #[test]
+    fn reconnect_resets_backoff_after_60s_healthy() {
+        let now = std::time::Instant::now();
+        let started_at = now - std::time::Duration::from_secs(120);
+        let reset = reset_backoff_if_healthy(started_at, std::time::Duration::from_secs(60));
+        assert_eq!(
+            reset,
+            Some(std::time::Duration::from_secs(1)),
+            "backoff must reset to 1s after a ≥60s healthy run"
+        );
+    }
+
+    /// A short-lived run (< threshold) must NOT reset — the backoff
+    /// state carries forward into the next reconnect.
+    #[test]
+    fn reconnect_does_not_reset_backoff_before_60s() {
+        let now = std::time::Instant::now();
+        let started_at = now - std::time::Duration::from_secs(30);
+        let reset = reset_backoff_if_healthy(started_at, std::time::Duration::from_secs(60));
+        assert_eq!(
+            reset, None,
+            "backoff must NOT reset if the healthy run was <60s"
+        );
     }
 }
