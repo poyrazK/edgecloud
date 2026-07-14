@@ -512,6 +512,60 @@ pub fn render_routes(
     let quota_402_route_count = quota_402_routes.len();
     routes = quota_402_routes.into_iter().chain(routes).collect();
 
+    // Issue #305 sub-feature #2 — per-tenant concurrent-request cap.
+    // For every tenant the TenantRateLimitCache reports as having a
+    // configured concurrent cap (state.concurrent_limit > 0), insert
+    // a `tenant_concurrent` HTTP handler invocation keyed by host
+    // matching the `<tenant>-<app>.edgecloud.dev` synthetic-host
+    // pattern. `terminal: false` so the per-tenant RPS rate_limit
+    // route layered below still applies when the request passes
+    // through.
+    //
+    // Enforcement: handled inside the custom Caddy image
+    // `edgecloud/caddy-concurrent:latest` (see
+    // `edge-ingress/Dockerfile.caddy-concurrent` and
+    // `caddy-modules/tenant_concurrent/`). Stock `caddy:2` has no
+    // in-flight counter primitive — `rate_limit` is token-bucket /
+    // RPS-only — so the cap is enforced by the first-party module.
+    // A request whose `key` already has `limit` requests in flight
+    // receives `429` with `Retry-After: 1`.
+    //
+    // Insertion order: AFTER quota_402_routes (so 402 short-circuits
+    // first when the tenant is over cap) and BEFORE the per-tenant
+    // RPS rate_limit route (so the concurrent cap is the FIRST
+    // rate-limit signal Caddy walks for a tenant — in-flight
+    // exhaustion is a stronger signal than RPS throttling and should
+    // not consume RPS tokens).
+    //
+    // Multi-replica caveat: each Caddy process enforces its own
+    // copy of the cap. With N replicas a tenant can sustain
+    // N × `concurrent_limit` in-flight requests across the fleet.
+    // Same shape as the per-replica RPS caveat (see #665 for
+    // cross-replica RPS aggregation, the parallel follow-up).
+    //
+    // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
+    // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
+    // The cache carries bandwidth_bps for that follow-up.
+    let mut tenant_concurrent_routes: Vec<Value> = Vec::new();
+    for (tenant_id, state) in tenant_rate_limit_cache.concurrent_caps() {
+        tenant_concurrent_routes.push(json!({
+            "@id": format!("tenant-concurrent:{}", tenant_id),
+            "match": [{
+                "host_regexp": format!(
+                    "^{}-[^.]+\\.{}$",
+                    tenant_id,
+                    crate::config::INGRESS_HOST_SUFFIX,
+                )
+            }],
+            "handle": [{
+                "handler": "tenant_concurrent",
+                "key": format!("tenant-{}", tenant_id),
+                "limit": state.concurrent_limit,
+            }],
+            "terminal": false,
+        }));
+    }
+
     // Issue #305 sub-feature #1 — per-tenant data-plane rate limit.
     // For every tenant the TenantRateLimitCache reports as having a
     // configured cap (state.rps > 0), insert a `rate_limit` route keyed
@@ -521,15 +575,11 @@ pub fn render_routes(
     // The cache treats `None` (unknown tenant) and `rps == 0` as
     // "no cap" — fail-open, same shape as the quota 402 cache.
     //
-    // Insertion order: AFTER quota_402_routes (so 402 short-circuits
-    // first when the tenant is over cap) and BEFORE per-app routes (so
-    // per-tenant caps apply before the per-app cap chain inside the
-    // handle).
-    //
-    // TODO(issue #NNN sub-feature #2): render the concurrent_limit
-    // via a custom Caddy module once the platform-side primitive
-    // exists. The cache already carries concurrent_limit for that
-    // follow-up.
+    // Insertion order: AFTER quota_402_routes + tenant_concurrent_routes
+    // (so 402 short-circuits first when the tenant is over cap, then
+    // the concurrent cap is the first rate-limit signal) and BEFORE
+    // per-app routes (so per-tenant caps apply before the per-app cap
+    // chain inside the handle).
     //
     // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
     // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
@@ -561,11 +611,13 @@ pub fn render_routes(
             "terminal": false,
         }));
     }
-    if !tenant_rl_routes.is_empty() {
-        // Splice: keep the first `quota_402_route_count` entries, then
-        // the tenant_rl_routes, then the rest (per-app routes).
+    if !tenant_concurrent_routes.is_empty() || !tenant_rl_routes.is_empty() {
+        // Splice: keep the first `quota_402_route_count` entries,
+        // then the tenant_concurrent_routes, then the tenant_rl_routes,
+        // then the rest (per-app routes).
         let per_app_start = quota_402_route_count;
         let per_app = routes.split_off(per_app_start);
+        routes.extend(tenant_concurrent_routes);
         routes.extend(tenant_rl_routes);
         routes.extend(per_app);
     }
@@ -2029,6 +2081,148 @@ mod tests {
                 .iter()
                 .all(|r| r["@id"].as_str().unwrap_or("") != "tenant-rl:t_acme"),
             "all-zero caps must NOT emit a per-tenant route"
+        );
+    }
+
+    // ── Issue #305 sub-feature #2 (per-tenant concurrent cap) ──
+
+    /// Issue #305 sub-feature #2 — concurrent-cap route is emitted
+    /// when the cache has `concurrent_limit > 0` for a tenant. The
+    /// `handle[0]` is a `tenant_concurrent` invocation that the
+    /// custom Caddy image (`edgecloud/caddy-concurrent:latest`, see
+    /// `edge-ingress/Dockerfile.caddy-concurrent`) enforces via the
+    /// first-party module at `caddy-modules/tenant_concurrent/`.
+    /// Pin the JSON shape so a renderer change can't silently
+    /// misconfigure the handler.
+    #[test]
+    fn tenant_concurrent_cache_injects_handler_invocation() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                rps: 0,
+                burst: 0,
+                concurrent_limit: 50,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let concurrent = routes
+            .iter()
+            .find(|r| r["@id"] == "tenant-concurrent:t_acme")
+            .expect("concurrent-cap handler route must exist");
+        assert_eq!(
+            concurrent["handle"][0]["handler"], "tenant_concurrent",
+            "handler module id must match the Go module's CaddyModule ID"
+        );
+        assert_eq!(
+            concurrent["handle"][0]["key"], "tenant-t_acme",
+            "key must be tenant-<tenant_id> so the Go module scopes the bucket per tenant"
+        );
+        assert_eq!(
+            concurrent["handle"][0]["limit"], 50,
+            "limit must mirror state.concurrent_limit"
+        );
+        let re = concurrent["match"][0]["host_regexp"].as_str().unwrap();
+        assert_eq!(re, "^t_acme-[^.]+\\.edgecloud.dev$");
+        assert_eq!(
+            concurrent["terminal"], false,
+            "concurrent-cap route must NOT be terminal — Caddy must fall through to per-tenant RPS and per-app routes"
+        );
+    }
+
+    /// Concurrent-cap route is omitted when the cache has
+    /// `concurrent_limit == 0` (fail-open: no cap → no route).
+    /// Mirrors `tenant_rl_route_skipped_when_rps_zero`.
+    #[test]
+    fn tenant_concurrent_zero_no_route_emitted() {
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState::default(),
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &test_cfg(),
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            routes
+                .iter()
+                .all(|r| r["@id"].as_str().unwrap_or("") != "tenant-concurrent:t_acme"),
+            "concurrent_limit=0 must NOT emit a concurrent-cap route"
+        );
+    }
+
+    /// When a tenant has BOTH caps, the concurrent-cap route must
+    /// appear BEFORE the tenant-rl rate_limit route in the rendered
+    /// routes list. In-flight exhaustion is a stronger signal than
+    /// RPS throttling — a 429 from the concurrent cap should not
+    /// consume RPS tokens, so Caddy must walk the concurrent route
+    /// first. Mirrors `tenant_global_per_app_coexist_with_correct_order`'s
+    /// ordering-assert pattern.
+    #[test]
+    fn tenant_concurrent_route_precedes_tenant_rl_route() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                rps: 50,
+                burst: 100,
+                concurrent_limit: 5,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let concurrent_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-concurrent:t_acme")
+            .expect("concurrent route must exist");
+        let rl_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-rl:t_acme")
+            .expect("tenant-rl route must exist");
+        assert!(
+            concurrent_idx < rl_idx,
+            "concurrent-cap route (idx {}) must precede tenant-rl route (idx {})",
+            concurrent_idx,
+            rl_idx,
         );
     }
 
