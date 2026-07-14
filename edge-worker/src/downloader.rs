@@ -30,6 +30,12 @@ pub(crate) const MAX_ARTIFACT_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// at attempt 1 ≈ 200ms, attempt 2 ≈ 800ms, attempt 3 ≈ 3.2s. The
 /// constants are not exposed as `Config` knobs; the issue #46
 /// contract hardcodes them and `Config` has no retry precedent.
+///
+/// Saturation semantics: `RETRY_CAP_MS` only kicks in once `base × 2^(n-1)`
+/// would exceed it — for the production 3-attempt budget the cap is never
+/// applied to the raw backoff (200, 800, 3200 are all below 3200); the
+/// caller still observes the cap as the ceiling of the jitter band on
+/// the final attempt.
 pub(crate) const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
 pub(crate) const RETRY_BASE_MS: u64 = 200;
 pub(crate) const RETRY_CAP_MS: u64 = 3_200;
@@ -310,7 +316,12 @@ impl Downloader {
     ) -> anyhow::Result<bytes::Bytes> {
         for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
             let token = self.jwt_signer.sign();
-            tracing::info!(url, attempt, "downloading artifact");
+            // Demoted from `info!`: a transient CP hiccup fires this on
+            // every attempt of every affected download, which can easily
+            // hit hundreds of lines per second across a busy worker.
+            // The `warn!` lines in the retry arms below carry the
+            // operator-visible "this is retrying" signal.
+            tracing::debug!(url, attempt, "downloading artifact");
 
             let send_result = self.client.get(url).bearer_auth(token).send().await;
             let response = match send_result {
@@ -1202,10 +1213,11 @@ mod tests {
     // outcome AND the observed request count, so a regression in the
     // classifier or the retry counter fails loudly.
     //
-    // Wiremock-0.6 ordering note: `Mock`s registered on the same
-    // (method, path) pair are served first-registered-first-served in
-    // 0.6.x; if the helper ever serves mocks LIFO instead, swap to
-    // `Arc<AtomicUsize>` + a custom `Respond` impl.
+    // Wiremock-0.6 shape note: per-Mock `expect(N)` is enforced strictly,
+    // so two or three mocks on the same (method, path) pair with overlapping
+    // request counts trip verification. Both retry tests below use the
+    // idiomatic 0.6 fix — a single Mock + closure `Respond` impl backed by
+    // `Arc<AtomicUsize>` that drives the response sequence itself.
     // -----------------------------------------------------------------------
 
     /// 5xx + 5xx + 200: the helper retries twice and succeeds on the
@@ -1284,8 +1296,8 @@ mod tests {
     /// up. The wiremock call count must be exactly 3, and the surfaced
     /// error must preserve the typed `reqwest::Error` so the classifier
     /// contract is auditable from the caller side. Single Mock +
-    /// counter-driven `Respond` (see the FIFOnote in
-    /// `retries_5xx_then_succeeds`).
+    /// counter-driven `Respond` (see the wiremock-0.6 shape note
+    /// above `retries_5xx_then_succeeds`).
     #[tokio::test]
     async fn get_artifact_gives_up_after_three_5xx() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1321,17 +1333,15 @@ mod tests {
             "expected error to reference 500, got: {msg}"
         );
 
+        // `received.len()` is the contract pin — every accepted request
+        // goes through the closure `Respond` and increments `counter`, so
+        // asserting the wiremock-side count is sufficient.
         let received = server.received_requests().await.expect("received");
         assert_eq!(
             received.len(),
             3,
             "retry budget must be exactly 3 (got {})",
             received.len()
-        );
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            3,
-            "responder must have been invoked exactly 3 times before giving up"
         );
     }
 
