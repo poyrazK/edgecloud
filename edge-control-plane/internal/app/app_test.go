@@ -394,9 +394,11 @@ func TestRunBackground_PanicInLogGCIsRecovered(t *testing.T) {
 	}
 }
 
-// TestHealth_HealthyReturns200 verifies the default /health response
-// shape: 200 + status=ok + loops map populated.
-func TestHealth_HealthyReturns200(t *testing.T) {
+// TestReady_HealthyReturns200 verifies the default /ready response
+// shape (issue #48 — was TestHealth_HealthyReturns200 pre-split):
+// 200 + status=ok + loops map populated. The deep readiness check
+// pings the DB; this test gives it a successful mock ping.
+func TestReady_HealthyReturns200(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
 	db, mock, cleanup := newMockDBWithMock(t)
@@ -426,7 +428,7 @@ func TestHealth_HealthyReturns200(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
 	app.Handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -452,10 +454,11 @@ func TestHealth_HealthyReturns200(t *testing.T) {
 	}
 }
 
-// TestHealth_DegradedAfterLoopPanic verifies the new behavior: any loop
-// with panics>0 (or stale) flips status to "degraded" but stays 200 so
-// load balancers don't pull the CP from rotation.
-func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
+// TestReady_DegradedStays200 verifies the post-#48 behavior: any loop
+// with panics>0 (or stale) flips status to "degraded" on /ready but
+// stays 200 so load balancers don't pull the CP from rotation. DB
+// and NATS are healthy throughout.
+func TestReady_DegradedStays200(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
 	db, mock, cleanup := newMockDBWithMock(t)
@@ -472,7 +475,7 @@ func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
 	// field on WorkerService). Run is now non-blocking — poll for
 	// the counter to bump.
 	app.loopHealth.Run(context.Background(), "heartbeat", "heartbeat: ", func(string, ...any) {}, func(c context.Context) {
-		panic("forced for /health degraded test")
+		panic("forced for /ready degraded test")
 	})
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -486,7 +489,7 @@ func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
 	app.Handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -509,10 +512,11 @@ func TestHealth_DegradedAfterLoopPanic(t *testing.T) {
 	}
 }
 
-// TestHealth_UnhealthyOnDBPingFailure preserves the existing 503
-// behavior: a failed DB ping must still produce status=unhealthy so
-// load balancers pull this instance from rotation.
-func TestHealth_UnhealthyOnDBPingFailure(t *testing.T) {
+// TestReady_UnhealthyOnDBPingFailure preserves the pre-#48 503
+// behavior on the deep path: a failed DB ping must produce
+// status=unhealthy + failure_component="db" so load balancers pull
+// this instance from rotation.
+func TestReady_UnhealthyOnDBPingFailure(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
 	db, mock, cleanup := newMockDBWithMock(t)
@@ -524,7 +528,7 @@ func TestHealth_UnhealthyOnDBPingFailure(t *testing.T) {
 	app := New(cfg, db, publisher, artifactStore, emptyFS)
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
 	app.Handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusServiceUnavailable {
@@ -537,20 +541,28 @@ func TestHealth_UnhealthyOnDBPingFailure(t *testing.T) {
 	if got := body["status"]; got != "unhealthy" {
 		t.Errorf("status = %v, want unhealthy", got)
 	}
+	if got := body["failure_component"]; got != "db" {
+		t.Errorf("failure_component = %v, want db", got)
+	}
 	if body["loops"] != nil {
 		t.Errorf("unhealthy response should not include loops map, got: %v", body["loops"])
 	}
 }
 
-// TestHealth_BackwardCompatibleStatusCode verifies that the response
-// shape on the healthy path still includes status="ok" as a string
-// field (so any operator script that grep'd for "ok" still works).
-func TestHealth_BackwardCompatibleStatusCode(t *testing.T) {
+// TestHealth_LivenessAlwaysOK verifies the post-#48 /health handler is
+// pure liveness: it returns 200 + {"status":"ok"} even when the DB
+// mock has NO ExpectPing registered and the NATS publisher is a
+// zero-value (Conn() returns nil, short-circuiting the NATS path).
+// The handler must not touch any external dependency.
+func TestHealth_LivenessAlwaysOK(t *testing.T) {
 	artifactPath := t.TempDir()
 	cfg := testConfig(t, artifactPath)
-	db, mock, cleanup := newMockDBWithMock(t)
+	// Deliberately no ExpectPing — the handler must not call
+	// PingContext. If it does, sqlmock (with MonitorPingsOption) and
+	// any queued ExpectPing mismatch would surface as a missing-
+	// expectation failure.
+	db, _, cleanup := newMockDBWithMock(t)
 	defer cleanup()
-	mock.ExpectPing()
 	publisher := &nats.NATSPublisher{}
 	artifactStore := storage.NewFSArtifactStore(artifactPath)
 
@@ -561,10 +573,87 @@ func TestHealth_BackwardCompatibleStatusCode(t *testing.T) {
 	app.Handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), `"status":"ok"`) {
-		t.Errorf("body missing status=ok: %s", rr.Body.String())
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := body["status"]; got != "ok" {
+		t.Errorf("status = %v, want ok", got)
+	}
+}
+
+// TestHealth_LivenessDoesNotTouchDeps is the strict version of
+// LivenessAlwaysOK: it uses sqlmock.MonitorPingsOption(true) so any
+// stray PingContext call from the handler becomes a hard failure
+// surfaced by go test. If a future refactor accidentally re-adds a
+// db.PingContext() to the /health handler, this test fails.
+func TestHealth_LivenessDoesNotTouchDeps(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	mockDB, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+	// No ExpectPing. If the handler calls PingContext, sqlmock
+	// records the violation and VerifyAll below surfaces it.
+	db := sqlx.NewDb(mockDB, "postgres")
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sqlmock recorded unexpected calls — the /health handler touched the DB: %v", err)
+	}
+}
+
+// TestHealth_LivenessNoLoops pins the wire-shape contract of /health:
+// the body must be exactly {"status":"ok"} — no loops map, no
+// degraded_reasons list, no per-loop state of any kind. Those belong
+// on /ready (issue #48 split).
+func TestHealth_LivenessNoLoops(t *testing.T) {
+	artifactPath := t.TempDir()
+	cfg := testConfig(t, artifactPath)
+	db, mock, cleanup := newMockDBWithMock(t)
+	defer cleanup()
+	mock.ExpectPing() // unused but pinned so the handler's lack of Ping doesn't trigger a mismatch
+	publisher := &nats.NATSPublisher{}
+	artifactStore := storage.NewFSArtifactStore(artifactPath)
+
+	app := New(cfg, db, publisher, artifactStore, emptyFS)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	app.Handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, present := body["loops"]; present {
+		t.Errorf("/health must not include loops map (issue #48 — lives on /ready); got: %v", body["loops"])
+	}
+	if _, present := body["degraded_reasons"]; present {
+		t.Errorf("/health must not include degraded_reasons (issue #48 — lives on /ready); got: %v", body["degraded_reasons"])
+	}
+	if got := body["status"]; got != "ok" {
+		t.Errorf("status = %v, want ok", got)
 	}
 }
 
