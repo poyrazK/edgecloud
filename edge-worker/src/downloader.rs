@@ -205,19 +205,73 @@ impl Downloader {
             );
         }
 
-        // Download from control plane. Sign the request with the worker's
-        // bearer JWT — the control plane's WorkerAuth middleware will reject
-        // any unsigned /api/internal/* request with 401.
+        // Download from control plane via the (single-attempt, issue
+        // #46) body helper. Verify + cache write happen below, after
+        // this returns.
         let url = format!(
             "{}/api/internal/download/{}",
             self.control_plane_url, deployment_id
         );
+        let data = self.fetch_body_with_retry(deployment_id, &url).await?;
+
+        // Verify before caching — never persist unverified bytes to disk.
+        verify_hash(&data, expected_hash, deployment_id)?;
+        // Signature verification is only meaningful when a verifier
+        // is configured. A None verifier + None signature is the
+        // legitimate "unsigned mode" path; the helper below returns
+        // Ok(()) in that case and bails on every other combination
+        // (None + Some sig, Some + None sig, malformed sig, etc.).
+        verify_signature(
+            &data,
+            expected_hash,
+            expected_signature,
+            expected_signature_kid,
+            deployment_id,
+            self.signature_verifier.as_deref(),
+        )?;
+        // Defensive warning: a control plane that signs but a worker
+        // that doesn't verify would silently accept the AppSpec's
+        // claimed signature without checking it. The helper returned
+        // Ok(()) above, so we log once so operators see the
+        // mismatch and can flip EDGE_REQUIRE_SIGNATURE on.
+        if self.signature_verifier.is_none() && expected_signature.is_some() {
+            tracing::warn!(
+                deployment_id,
+                "AppSpec carries a signature but worker has no verifier configured; \
+                 the signature is ignored. Set EDGE_SIGNING_PUBKEY[_PATH] and \
+                 EDGE_REQUIRE_SIGNATURE=true to enable verification."
+            );
+        }
+
+        // Ensure cache directory exists and write to cache
+        tokio::fs::create_dir_all(&self.cache_dir).await?;
+        tokio::fs::write(&cache_path, &data).await?;
+
+        tracing::info!(deployment_id, bytes = data.len(), "artifact cached");
+        Ok(data)
+    }
+
+    /// Fetch the artifact body from the control plane, applying the
+    /// response-body cap (issue #451). Returns the post-cap body, pre-
+    /// verify, pre-cache — the caller verifies the SHA-256 / Ed25519
+    /// exactly once after this returns.
+    ///
+    /// **Single attempt today** (extracted in commit 2 of #46 to keep
+    /// the move reviewable; the retry loop is wired in commit 3). The
+    /// body-cap `bail!` paths are permanent — oversize bytes from the
+    /// control plane are not a transient fault and MUST NOT be wrapped
+    /// in the retry classifier.
+    async fn fetch_body_with_retry(
+        &self,
+        deployment_id: &str,
+        url: &str,
+    ) -> anyhow::Result<bytes::Bytes> {
         let token = self.jwt_signer.sign();
         tracing::info!(url, "downloading artifact");
 
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .bearer_auth(token)
             .send()
             .await
@@ -273,43 +327,7 @@ impl Downloader {
             }
             buf.extend_from_slice(&chunk);
         }
-        let data: bytes::Bytes = buf.freeze();
-
-        // Verify before caching — never persist unverified bytes to disk.
-        verify_hash(&data, expected_hash, deployment_id)?;
-        // Signature verification is only meaningful when a verifier
-        // is configured. A None verifier + None signature is the
-        // legitimate "unsigned mode" path; the helper below returns
-        // Ok(()) in that case and bails on every other combination
-        // (None + Some sig, Some + None sig, malformed sig, etc.).
-        verify_signature(
-            &data,
-            expected_hash,
-            expected_signature,
-            expected_signature_kid,
-            deployment_id,
-            self.signature_verifier.as_deref(),
-        )?;
-        // Defensive warning: a control plane that signs but a worker
-        // that doesn't verify would silently accept the AppSpec's
-        // claimed signature without checking it. The helper returned
-        // Ok(()) above, so we log once so operators see the
-        // mismatch and can flip EDGE_REQUIRE_SIGNATURE on.
-        if self.signature_verifier.is_none() && expected_signature.is_some() {
-            tracing::warn!(
-                deployment_id,
-                "AppSpec carries a signature but worker has no verifier configured; \
-                 the signature is ignored. Set EDGE_SIGNING_PUBKEY[_PATH] and \
-                 EDGE_REQUIRE_SIGNATURE=true to enable verification."
-            );
-        }
-
-        // Ensure cache directory exists and write to cache
-        tokio::fs::create_dir_all(&self.cache_dir).await?;
-        tokio::fs::write(&cache_path, &data).await?;
-
-        tracing::info!(deployment_id, bytes = data.len(), "artifact cached");
-        Ok(data)
+        Ok(buf.freeze())
     }
 
     pub fn cache_path(&self, deployment_id: &str) -> PathBuf {
