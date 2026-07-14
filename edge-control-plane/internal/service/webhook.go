@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,6 +26,30 @@ type WebhookService struct {
 	interval time.Duration
 }
 
+// Limits for the deliveries read endpoint (issue #659). Same shape as
+// logs.ResolveLimit — single source of truth for the policy, exported so
+// the handler can echo the post-clamp value in the response envelope
+// without re-implementing the policy.
+const (
+	DefaultWebhookDeliveryLimit = 50
+	MaxWebhookDeliveryLimit     = 200
+)
+
+// WebhookDeliveriesResult is the service-bound result for
+// ListDeliveriesByWebhook. Mirrors the logs envelope shape (see
+// LogListResult) so the wire can be reasoned about with one rule.
+type WebhookDeliveriesResult struct {
+	Deliveries []domain.WebhookDelivery
+	Limit      int
+	NextCursor *string
+}
+
+// ErrWebhookNotFound is returned by ListDeliveriesByWebhook when the
+// webhook does not exist OR belongs to a different tenant. Collapsing
+// both cases into one typed error prevents enumeration of webhook IDs
+// across tenants.
+var ErrWebhookNotFound = errors.New("webhook not found")
+
 // WebhookServiceInterface abstracts webhook operations for the handler.
 type WebhookServiceInterface interface {
 	Create(ctx context.Context, wh *domain.Webhook) error
@@ -33,6 +58,7 @@ type WebhookServiceInterface interface {
 	Update(ctx context.Context, wh *domain.Webhook) error
 	Delete(ctx context.Context, id, tenantID string) (bool, error)
 	PublishEvent(ctx context.Context, tenantID, appName, eventType string, payload interface{})
+	ListDeliveriesByWebhook(ctx context.Context, tenantID, webhookID string, limit int, cursor string) (*WebhookDeliveriesResult, error)
 }
 
 func NewWebhookService(repo *repository.WebhookRepository) *WebhookService {
@@ -161,4 +187,83 @@ func (s *WebhookService) logDelivery(ctx context.Context, d *domain.WebhookDeliv
 	if _, err := s.repo.InsertDelivery(ctx, d); err != nil {
 		log.Printf("webhook: log delivery %s/%s: %v", d.WebhookID, d.EventType, err)
 	}
+}
+
+// ListDeliveriesByWebhook serves GET /api/v1/webhooks/{id}/deliveries.
+// Mirrors the LogService.ListByTenantApp pattern (issue #644, PR #681):
+//
+//  1. Ownership check via GetByID + tenant_id compare. Missing webhook
+//     AND wrong-tenant webhook both surface as ErrWebhookNotFound so the
+//     wire response cannot be used to enumerate webhook IDs across tenants.
+//  2. Decode the opaque cursor (typed errors → 400 in the handler).
+//  3. Clamp limit via the same `<=0 → default / >max → max` rule used by
+//     ResolveLimit (logs).
+//  4. Request limit+1 rows from the repository, trim, derive hasMore.
+//  5. Encode next_cursor from the last visible row's (created_at, id)
+//     when hasMore is true.
+//
+// Returns ErrWebhookNotFound, ErrInvalidWebhookDeliveryCursor, or
+// ErrUnsupportedWebhookDeliveryCursorVersion as typed errors — the
+// handler maps these to 404 and 400 respectively (with structured
+// log.Printf on the cursor path).
+func (s *WebhookService) ListDeliveriesByWebhook(
+	ctx context.Context, tenantID, webhookID string, limit int, cursor string,
+) (*WebhookDeliveriesResult, error) {
+	wh, err := s.repo.GetByID(ctx, webhookID)
+	if err != nil {
+		return nil, fmt.Errorf("get webhook %s: %w", webhookID, err)
+	}
+	if wh == nil || wh.TenantID != tenantID {
+		return nil, ErrWebhookNotFound
+	}
+
+	effectiveLimit := limit
+	switch {
+	case effectiveLimit <= 0:
+		effectiveLimit = DefaultWebhookDeliveryLimit
+	case effectiveLimit > MaxWebhookDeliveryLimit:
+		effectiveLimit = MaxWebhookDeliveryLimit
+	}
+
+	var cursorTS time.Time
+	var cursorID int64
+	hasCursor := cursor != ""
+	if hasCursor {
+		cursorTS, cursorID, err = decodeWebhookDeliveryCursor(cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	deliveries, err := s.repo.ListDeliveriesByWebhook(ctx, repository.WebhookDeliveryListFilter{
+		WebhookID: webhookID,
+		Limit:     effectiveLimit + 1,
+		CursorTS:  cursorTS,
+		CursorID:  cursorID,
+		HasCursor: hasCursor,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := len(deliveries) > effectiveLimit
+	if hasMore {
+		deliveries = deliveries[:effectiveLimit]
+	}
+
+	var nextCursor *string
+	if hasMore && len(deliveries) > 0 {
+		last := deliveries[len(deliveries)-1]
+		encoded, err := encodeWebhookDeliveryCursor(last.CreatedAt, last.ID)
+		if err != nil {
+			return nil, fmt.Errorf("encode next cursor: %w", err)
+		}
+		nextCursor = &encoded
+	}
+
+	return &WebhookDeliveriesResult{
+		Deliveries: deliveries,
+		Limit:      effectiveLimit,
+		NextCursor: nextCursor,
+	}, nil
 }

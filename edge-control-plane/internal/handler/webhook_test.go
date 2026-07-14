@@ -10,6 +10,7 @@ import (
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/middleware"
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/service"
 )
 
 type mockWebhookSvc struct {
@@ -22,6 +23,14 @@ type mockWebhookSvc struct {
 	deleteOK     bool
 	deleteErr    error
 	publishCalls int
+
+	// ListDeliveriesByWebhook (issue #659) fields.
+	listDeliveries       []domain.WebhookDelivery
+	listDeliveriesResult *service.WebhookDeliveriesResult
+	listDeliveriesErr    error
+	listDeliveriesCalls  int
+	lastDeliveriesLimit  int
+	lastDeliveriesCursor string
 }
 
 func (m *mockWebhookSvc) Create(_ context.Context, wh *domain.Webhook) error {
@@ -42,6 +51,21 @@ func (m *mockWebhookSvc) Delete(_ context.Context, _, _ string) (bool, error) {
 }
 func (m *mockWebhookSvc) PublishEvent(_ context.Context, _, _, _ string, _ interface{}) {
 	m.publishCalls++
+}
+func (m *mockWebhookSvc) ListDeliveriesByWebhook(_ context.Context, _, _ string, limit int, cursor string) (*service.WebhookDeliveriesResult, error) {
+	m.listDeliveriesCalls++
+	m.lastDeliveriesLimit = limit
+	m.lastDeliveriesCursor = cursor
+	if m.listDeliveriesErr != nil {
+		return nil, m.listDeliveriesErr
+	}
+	if m.listDeliveriesResult != nil {
+		return m.listDeliveriesResult, nil
+	}
+	return &service.WebhookDeliveriesResult{
+		Deliveries: m.listDeliveries,
+		Limit:      limit,
+	}, nil
 }
 
 func newWebhookMux(svc *mockWebhookSvc) *http.ServeMux {

@@ -709,6 +709,10 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 	api.HandleFunc("GET /api/v1/webhooks", webhookHandler.List)
 	api.HandleFunc("PUT /api/v1/webhooks/{webhookID}", webhookHandler.Update)
 	api.HandleFunc("DELETE /api/v1/webhooks/{webhookID}", webhookHandler.Delete)
+	// Per-webhook delivery history (issue #659). Sibling route on the
+	// same `api` mux — inherits Bearer API-key auth + tenant rate
+	// limiting. Cursor pagination only; no offset to deprecate.
+	api.HandleFunc("GET /api/v1/webhooks/{webhookID}/deliveries", webhookHandler.ListDeliveries)
 
 	// Billing routes (issue #419). Three are auth-required; the
 	// webhook below is mounted on the public mux because the

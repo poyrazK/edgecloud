@@ -15,6 +15,22 @@ type WebhookRepository struct {
 	db DBTX
 }
 
+// WebhookDeliveryListFilter is the typed parameter bag for
+// ListDeliveriesByWebhook (issue #659). The HasCursor flag lets the
+// repository switch between the two SQL shapes (no cursor: just the
+// webhook_id predicate; cursor present: webhook_id + the strict-tuple
+// predicate) without the caller having to pass zero-valued time/ids.
+//
+// Limit is `effectiveLimit + 1` from the service so the service can
+// derive an exact `hasMore` from the extra row.
+type WebhookDeliveryListFilter struct {
+	WebhookID string
+	Limit     int
+	HasCursor bool
+	CursorTS  time.Time
+	CursorID  int64
+}
+
 func NewWebhookRepository(db *sqlx.DB) *WebhookRepository {
 	return &WebhookRepository{db: db}
 }
@@ -83,6 +99,48 @@ func (r *WebhookRepository) InsertDelivery(ctx context.Context, d *domain.Webhoo
 		d.ResponseBody, d.ErrorMsg, d.Attempt, d.MaxAttempts,
 		d.CreatedAt, d.CompletedAt).Scan(&id)
 	return id, err
+}
+
+// ListDeliveriesByWebhook serves the per-webhook delivery history
+// endpoint (issue #659). The query is:
+//
+//	SELECT ... FROM webhook_deliveries
+//	WHERE webhook_id = $1
+//	  [AND (created_at, id) < ($2, $3)]    -- only when HasCursor
+//	ORDER BY created_at DESC, id DESC
+//	LIMIT $4
+//
+// The composite index idx_webhook_deliveries_webhook (webhook_id,
+// created_at DESC) from migration 015 covers this query — no new
+// migration is needed. The strict-tuple predicate makes pagination
+// stable across rows that share a microsecond CreatedAt (mirrors the
+// logs pattern at internal/repository/log_entry.go).
+func (r *WebhookRepository) ListDeliveriesByWebhook(
+	ctx context.Context, f WebhookDeliveryListFilter,
+) ([]domain.WebhookDelivery, error) {
+	var (
+		rows []domain.WebhookDelivery
+		err  error
+	)
+	if f.HasCursor {
+		const q = `SELECT id, webhook_id, event_type, status, status_code,
+				error_msg, attempt, max_attempts, created_at, completed_at
+			FROM webhook_deliveries
+			WHERE webhook_id = $1 AND (created_at, id) < ($2, $3)
+			ORDER BY created_at DESC, id DESC
+			LIMIT $4`
+		err = r.db.SelectContext(ctx, &rows, q,
+			f.WebhookID, f.CursorTS, f.CursorID, f.Limit)
+	} else {
+		const q = `SELECT id, webhook_id, event_type, status, status_code,
+				error_msg, attempt, max_attempts, created_at, completed_at
+			FROM webhook_deliveries
+			WHERE webhook_id = $1
+			ORDER BY created_at DESC, id DESC
+			LIMIT $2`
+		err = r.db.SelectContext(ctx, &rows, q, f.WebhookID, f.Limit)
+	}
+	return rows, err
 }
 
 // DeleteOlderThanBatched deletes up to `batchSize` rows whose created_at
