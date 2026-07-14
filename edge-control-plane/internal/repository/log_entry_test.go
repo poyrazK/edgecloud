@@ -332,18 +332,16 @@ func TestLogEntryRepository_ListByTenantApp_RejectsNonPositiveLimit(t *testing.T
 	}
 }
 
-// TestLogEntryRepository_ListByTenantApp_OrdersByTsDesc pins the ORDER BY:
-// the SQL must end with `ORDER BY ts DESC LIMIT $N`. A regression that
-// forgot DESC would return oldest-first, defeating the "latest logs"
-// use case the index exists to support.
-func TestLogEntryRepository_ListByTenantApp_OrdersByTsDesc(t *testing.T) {
+// TestLogEntryRepository_ListByTenantApp_OrdersByTsDescThenID pins the
+// stable keyset ordering: SQL must end with `ORDER BY ts DESC, id DESC
+// LIMIT $N`. A regression that forgot `id DESC` would return rows out
+// of (ts,id) order — defeating the cursor codec that relies on strict
+// lexicographic ordering for pagination.
+func TestLogEntryRepository_ListByTenantApp_OrdersByTsDescThenID(t *testing.T) {
 	repo, mock, cleanup := newLogEntryMockRepo(t)
 	defer cleanup()
 
-	// No rows needed; we only assert the SQL shape via ExpectQuery's
-	// regex matcher. mock.ExpectationsWereMet then fails if the
-	// query was never issued.
-	mock.ExpectQuery(`SELECT .* ORDER BY ts DESC LIMIT \$3`).
+	mock.ExpectQuery(`SELECT .* ORDER BY ts DESC, id DESC LIMIT \$3`).
 		WithArgs("t_test", "myapp", int64(10)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "deployment_id", "app_name",
@@ -358,5 +356,169 @@ func TestLogEntryRepository_ListByTenantApp_OrdersByTsDesc(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations (ORDER BY/LIMIT shape wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_AppliesUntilBound pins the
+// upper-bound SQL: when filter.Until is positive, the SQL must add
+// `AND ts <= $N::timestamptz` and bind the UTC instant. The cast to
+// `::timestamptz` is what keeps PostgreSQL from miscomparing against
+// the timestamptz column.
+func TestLogEntryRepository_ListByTenantApp_AppliesUntilBound(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	until := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT .* WHERE tenant_id = \$1 AND app_name = \$2`).
+		WithArgs("t_test", "myapp", until, int64(50)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "deployment_id", "app_name",
+			"worker_id", "region", "level", "message", "labels", "ts",
+		}))
+
+	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Until: until,
+		Limit: 50,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (until SQL wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_AppliesCursorTuplePredicate
+// pins the row-value keyset predicate: when the filter has both a
+// cursor timestamp and a positive ID, the SQL must add
+// `AND (ts, id) < ($N::timestamptz, $N::bigint)`. The tuple form is
+// what lets ties on `ts` page correctly via `id` as the tiebreak.
+func TestLogEntryRepository_ListByTenantApp_AppliesCursorTuplePredicate(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	ts := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(`SELECT .* AND \(ts, id\) < \(\$3::timestamptz, \$4::bigint\)`).
+		WithArgs("t_test", "myapp", ts, int64(42), int64(10)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "deployment_id", "app_name",
+			"worker_id", "region", "level", "message", "labels", "ts",
+		}))
+
+	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit:    10,
+		CursorTS: ts,
+		CursorID: 42,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (cursor SQL wrong): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_CursorModeOmitsOffset pins
+// the cursor-mode contract: when a cursor is set, OFFSET must NOT
+// appear in the SQL even if Offset > 0, because the keyset predicate
+// is the page boundary. (A regression that emitted both would still
+// return correct rows, but it's wasted budget and hides intent.)
+func TestLogEntryRepository_ListByTenantApp_CursorModeOmitsOffset(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	ts := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	// The regex prohibits the literal `OFFSET` keyword only on the
+	// cursor-mode query, so any regression that re-emits OFFSET fails.
+	mock.ExpectQuery(`SELECT .* ORDER BY ts DESC, id DESC LIMIT \$5`).
+		WithArgs("t_test", "myapp", ts, int64(7), int64(10)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "deployment_id", "app_name",
+			"worker_id", "region", "level", "message", "labels", "ts",
+		}))
+
+	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit:    10,
+		Offset:   100, // Intentionally set; must be ignored in cursor mode.
+		CursorTS: ts,
+		CursorID: 7,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (OFFSET leaked into cursor mode): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_OffsetModeEmitsOffset pins
+// the offset-mode contract: when no cursor is set, OFFSET must reach
+// the SQL unchanged.
+func TestLogEntryRepository_ListByTenantApp_OffsetModeEmitsOffset(t *testing.T) {
+	repo, mock, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`SELECT .* LIMIT \$3 OFFSET \$4`).
+		WithArgs("t_test", "myapp", int64(10), int64(150)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "tenant_id", "deployment_id", "app_name",
+			"worker_id", "region", "level", "message", "labels", "ts",
+		}))
+
+	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
+		Limit:  10,
+		Offset: 150,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations (OFFSET missing on offset mode): %v", err)
+	}
+}
+
+// TestLogEntryRepository_ListByTenantApp_RejectsHalfCursor pins the
+// defense-in-depth guard: a cursor must supply BOTH timestamp AND id.
+// Half-cursors (one without the other) are rejected up front so the
+// repo never issues a malformed query.
+func TestLogEntryRepository_ListByTenantApp_RejectsHalfCursor(t *testing.T) {
+	repo, _, cleanup := newLogEntryMockRepo(t)
+	defer cleanup()
+
+	cases := []struct {
+		name   string
+		filter LogListFilter
+	}{
+		{
+			name: "ts but no id",
+			filter: LogListFilter{
+				Limit:    10,
+				CursorTS: time.Now(),
+			},
+		},
+		{
+			name: "id but no ts",
+			filter: LogListFilter{
+				Limit:    10,
+				CursorID: 7,
+			},
+		},
+		{
+			name: "negative id",
+			filter: LogListFilter{
+				Limit:    10,
+				CursorTS: time.Now(),
+				CursorID: -1,
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := repo.ListByTenantApp(
+				context.Background(), "t_test", "myapp", c.filter,
+			); err == nil {
+				t.Errorf("expected error for half-cursor, got nil")
+			}
+		})
 	}
 }
