@@ -27,6 +27,17 @@
 # reverification.
 
 FROM caddy:2-builder AS builder
+# Copy the module source into the builder image. xcaddy's
+# `--with <module>=<local-path>` form expects the source at the
+# path resolved against xcaddy's CWD (which is `/usr/bin/` inside
+# this image); without this COPY the local-path form resolves to
+# `/usr/bin/caddy-modules/tenant_concurrent` and the build fails
+# with `replacement directory does not exist`. The published
+# GitHub ref form (`--with <module>@<version>`) would not need
+# this COPY; we keep the local-path form during the bootstrap
+# period until the repo publishes tagged releases of
+# edgecloud-caddy-modules/tenant_concurrent.
+COPY caddy-modules/ /usr/bin/caddy-modules/
 RUN xcaddy build \
         --with github.com/mholt/caddy-l4 \
         --with github.com/poyrazK/edgecloud-caddy-modules/tenant_concurrent=./caddy-modules/tenant_concurrent
