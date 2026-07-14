@@ -67,7 +67,7 @@ edge init my-app --lang=rust --api=https://api.edgecloud.dev
 cd my-app
 ```
 
-…or copy the canonical sample as a starting point:
+Or copy the canonical sample as a starting point:
 
 ```sh
 cp -r ../../samples/hello my-app
@@ -77,6 +77,14 @@ cd my-app
 The scaffold and the sample have the same `Cargo.toml`,
 `edge.toml`, and `wit/` shape (`samples/hello/src/lib.rs:22-90`). The
 recipe below edits `src/lib.rs` in either case.
+
+> `edge build` runs the cargo + `wasm-tools component new` wrap for
+> you (issue #410); you don't need to invoke either directly. The
+> scaffold's `Cargo.toml` ships with `wit-bindgen = "0.45"` as its only
+> dependency, which is what `wasmtime 45.0.3` expects for
+> `wasi:http@0.2.1`. Add `serde_json = { version = "1", features = ["std"] }`
+> under `[dependencies]` if you're following the Neon recipe's
+> response-parse step.
 
 ### Two scope distinctions to internalize up front
 
@@ -156,7 +164,7 @@ wit_bindgen::generate!({
 
 use crate::exports::wasi::http::incoming_handler::Guest;
 use crate::wasi::http::types::{
-    Fields, Headers, IncomingRequest, Method, OutgoingBody, OutgoingRequest,
+    Fields, IncomingRequest, Method, OutgoingBody, OutgoingRequest,
     OutgoingResponse, RequestOptions, ResponseOutparam, Scheme,
 };
 use crate::edge::cloud::env;
@@ -231,7 +239,8 @@ impl Guest for NeonHandler {
             _               => return_error(out, 502, "no response"),
         };
         let upstream_status = resp.status();
-        let _resp_headers: Headers = resp.headers();
+        // Response headers are not surfaced to the recipe's caller; the
+        // body below already carries everything we want to forward.
 
         // 7. Drain the body.
         let resp_body = resp.consume().expect("consume body");
@@ -244,14 +253,23 @@ impl Guest for NeonHandler {
             if ended { break; }
         }
 
-        // 8. Echo upstream status + body back to our caller.
+        // Parse the Neon SQL response: `{"rows":[{"x":1}],"fields":[...]}`.
+        // For a real app, add `serde_json` to Cargo.toml under
+        // `[dependencies]` and import as needed; the recipe's parsed
+        // value is folded into the echoed body so the structure is
+        // visible to a caller hitting `curl` against the FaaS endpoint.
+        let parsed: String = serde_json::from_slice::<serde_json::Value>(&buf)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&buf).into_owned());
+
+        // 8. Echo upstream status + parsed body back to our caller.
         let out_headers = Fields::new();
         let _ = out_headers.set("content-type", &[b"application/json".to_vec()]);
         let out_resp = OutgoingResponse::new(out_headers);
         let _ = out_resp.set_status_code(upstream_status);
         let oh = out_resp.body().expect("response body");
         let os = oh.write().expect("output stream");
-        let _ = os.blocking_write_and_flush(&buf);
+        let _ = os.blocking_write_and_flush(parsed.as_bytes());
         drop(os);
         let _ = OutgoingBody::finish(oh, None);
         ResponseOutparam::set(out, Ok(out_resp));
@@ -273,15 +291,23 @@ fn return_error(out: ResponseOutparam, code: u16, msg: &str) {
     ResponseOutparam::set(out, Ok(r));
 }
 
-// Minimal URL parser: returns the host:port pair from a
-// `postgresql://user:pass@host[:port]/db?query` URL. A production impl
-// would pull in a `url` crate; this is enough for the recipe.
+// Minimal URL parser: returns the host:port pair (the "authority" in
+// `wasi:http` parlance) from a `postgresql://user:pass@host[:port]/db?query`
+// or `https://host[:port]/path?query` URL. A production impl would pull
+// in a `url` crate; this is enough for the recipe.
 fn authority_from_url(s: &str) -> Result<String, String> {
     let rest = s.strip_prefix("postgresql://")
         .or_else(|| s.strip_prefix("postgres://"))
+        .or_else(|| s.strip_prefix("https://"))
+        .or_else(|| s.strip_prefix("http://"))
         .ok_or("missing scheme")?;
-    let host_and_after = rest.splitn(2, '/').next().unwrap_or(rest);
-    let host_port = host_and_after.rsplitn(2, '@').next().unwrap_or(host_and_after);
+    // Drop the query string first; the userinfo and path both contain
+    // characters that would confuse the subsequent splits.
+    let without_query = rest.split('?').next().unwrap_or(rest);
+    // Drop the userinfo (everything up to and including the last `@`).
+    let without_userinfo = without_query.rsplitn(2, '@').next().unwrap_or(without_query);
+    // Drop the path (everything from the first `/` onward).
+    let host_port = without_userinfo.splitn(2, '/').next().unwrap_or(without_userinfo);
     if host_port.is_empty() { return Err("missing host".into()); }
     Ok(host_port.to_string())
 }
@@ -348,20 +374,32 @@ Same as the Neon recipe — `edge init my-app --lang=rust` or copy
 
 ### 4. Replace `src/lib.rs`
 
-Same skeleton as Neon; the only differences are the request shape and
-the auth header.
+Same `wit_bindgen!` block, `wasi:cli/run` stub, `Guest for TursoHandler`,
+and `return_error` / `authority_from_url` helpers as the Neon recipe.
+The `handle` body differs in three places — request body, auth header,
+and request path.
 
 ```rust
-// (wit_bindgen! block + Guest impl shell omitted — identical to Neon.)
-
 impl Guest for TursoHandler {
     fn handle(_req: IncomingRequest, out: ResponseOutparam) {
-        let db_url  = must_env(out, "TURSO_DATABASE_URL");
-        let token   = must_env(out, "TURSO_AUTH_TOKEN");
-        let authority = authority_from_url(&db_url);
+        // 1. Read env.
+        let db_url = match env::get("TURSO_DATABASE_URL") {
+            Some(v) => v,
+            None    => return_error(out, 500, "TURSO_DATABASE_URL missing"),
+        };
+        let token = match env::get("TURSO_AUTH_TOKEN") {
+            Some(v) => v,
+            None    => return_error(out, 500, "TURSO_AUTH_TOKEN missing"),
+        };
+        let authority = match authority_from_url(&db_url) {
+            Ok(a)  => a,
+            Err(e) => return_error(out, 500, &format!("bad TURSO_DATABASE_URL: {e}")),
+        };
 
+        // 2. Build the JSON body Turso's pipeline endpoint expects.
         let body_json = br#"{"statements":[{"q":"SELECT 1"}]}"#;
 
+        // 3. Build the request.
         let headers = Fields::new();
         let _ = headers.set("content-type",  &[b"application/json".to_vec()]);
         let _ = headers.set("authorization", &[format!("Bearer {token}").into_bytes()]);
@@ -371,8 +409,57 @@ impl Guest for TursoHandler {
         let _ = req.set_authority(Some(&authority));
         let _ = req.set_path_with_query(Some("/v2/pipeline"));
         let _ = req.set_scheme(Some(&Scheme::Https));
-        // ...write body, submit, poll, drain, echo back — same shape as Neon.
-        todo!()
+
+        // 4-8. Write body, submit, poll, drain, echo — same shape as
+        //      the Neon recipe, with the response treated as opaque
+        //      JSON. Add `serde_json` to Cargo.toml under
+        //      `[dependencies]` to parse the libSQL pipeline response
+        //      (`{"results":[{"response":{"type":"ok","result":{...}}}]}`).
+        let body = req.body().expect("request body");
+        let stream = body.write().expect("output stream");
+        let _ = stream.blocking_write_and_flush(body_json);
+        drop(stream);
+        let _ = OutgoingBody::finish(body, None);
+
+        let opts = RequestOptions::new();
+        let resp_fut = match crate::wasi::http::outgoing_handler::handle(req, Some(opts)) {
+            Ok(f)  => f,
+            Err(e) => return_error(out, 502, &format!("submit failed: {e:?}")),
+        };
+
+        let poll = resp_fut.subscribe();
+        loop {
+            if poll.ready() { break; }
+            crate::wasi::io::poll::poll_oneoff(&[poll.clone()]);
+        }
+        let resp = match resp_fut.get() {
+            Some(Ok(Ok(r))) => r,
+            _               => return_error(out, 502, "no response"),
+        };
+        let upstream_status = resp.status();
+
+        let resp_body = resp.consume().expect("consume body");
+        let mut stream = resp_body.stream().expect("response stream");
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        loop {
+            let (chunk, ended) = stream.blocking_read(4096);
+            if chunk.is_empty() && ended { break; }
+            buf.extend_from_slice(&chunk);
+            if ended { break; }
+        }
+
+        let out_headers = Fields::new();
+        let _ = out_headers.set("content-type", &[b"application/json".to_vec()]);
+        let out_resp = OutgoingResponse::new(out_headers);
+        let _ = out_resp.set_status_code(upstream_status);
+        let oh = out_resp.body().expect("response body");
+        let os = oh.write().expect("output stream");
+        let _ = os.blocking_write_and_flush(&buf);
+        drop(os);
+        let _ = OutgoingBody::finish(oh, None);
+        ResponseOutparam::set(out, Ok(out_resp));
+
+        let _ = resp_body;
     }
 }
 ```
@@ -408,6 +495,11 @@ edge egress show
 edge egress set *.upstash.io
 ```
 
+> Upstash has shipped newer database instances under `*.upstash.com`
+> in addition to the legacy `*.upstash.io`. Verify against the REST
+> endpoint URL in your dashboard and allow whichever shape your
+> instance uses — for example `edge egress set *.upstash.io *.upstash.com`.
+
 ### 2. Set the env vars
 
 ```sh
@@ -423,16 +515,33 @@ Same as the other recipes.
 
 ### 4. Replace `src/lib.rs`
 
+Same `wit_bindgen!` block, `wasi:cli/run` stub, `Guest for UpstashHandler`,
+and `return_error` / `authority_from_url` helpers as the Neon recipe.
+Body and path differ.
+
 ```rust
 impl Guest for UpstashHandler {
     fn handle(_req: IncomingRequest, out: ResponseOutparam) {
-        let rest_url = must_env(out, "UPSTASH_REDIS_REST_URL");
-        let token    = must_env(out, "UPSTASH_REDIS_REST_TOKEN");
-        let authority = authority_from_url(&rest_url);
+        // 1. Read env.
+        let rest_url = match env::get("UPSTASH_REDIS_REST_URL") {
+            Some(v) => v,
+            None    => return_error(out, 500, "UPSTASH_REDIS_REST_URL missing"),
+        };
+        let token = match env::get("UPSTASH_REDIS_REST_TOKEN") {
+            Some(v) => v,
+            None    => return_error(out, 500, "UPSTASH_REDIS_REST_TOKEN missing"),
+        };
+        let authority = match authority_from_url(&rest_url) {
+            Ok(a)  => a,
+            Err(e) => return_error(out, 500, &format!("bad UPSTASH_REDIS_REST_URL: {e}")),
+        };
 
-        // ["PING"] — the simplest valid Upstash REST body.
+        // 2. Build the body. Upstash accepts a JSON array of
+        //    command-and-args tuples. ["PING"] is the simplest valid
+        //    command and returns ["PONG"] on success.
         let body_json = br#"["PING"]"#;
 
+        // 3. Build the request.
         let headers = Fields::new();
         let _ = headers.set("content-type",  &[b"application/json".to_vec()]);
         let _ = headers.set("authorization", &[format!("Bearer {token}").into_bytes()]);
@@ -442,8 +551,56 @@ impl Guest for UpstashHandler {
         let _ = req.set_authority(Some(&authority));
         let _ = req.set_path_with_query(Some("/"));
         let _ = req.set_scheme(Some(&Scheme::Https));
-        // ...write body, submit, poll, drain, echo back — same shape as Neon.
-        todo!()
+
+        // 4-8. Write body, submit, poll, drain, echo — same shape as
+        //      the Neon recipe. The Upstash REST response is a JSON
+        //      array; parse it with serde_json if you need the typed
+        //      value rather than the opaque echo.
+        let body = req.body().expect("request body");
+        let stream = body.write().expect("output stream");
+        let _ = stream.blocking_write_and_flush(body_json);
+        drop(stream);
+        let _ = OutgoingBody::finish(body, None);
+
+        let opts = RequestOptions::new();
+        let resp_fut = match crate::wasi::http::outgoing_handler::handle(req, Some(opts)) {
+            Ok(f)  => f,
+            Err(e) => return_error(out, 502, &format!("submit failed: {e:?}")),
+        };
+
+        let poll = resp_fut.subscribe();
+        loop {
+            if poll.ready() { break; }
+            crate::wasi::io::poll::poll_oneoff(&[poll.clone()]);
+        }
+        let resp = match resp_fut.get() {
+            Some(Ok(Ok(r))) => r,
+            _               => return_error(out, 502, "no response"),
+        };
+        let upstream_status = resp.status();
+
+        let resp_body = resp.consume().expect("consume body");
+        let mut stream = resp_body.stream().expect("response stream");
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        loop {
+            let (chunk, ended) = stream.blocking_read(4096);
+            if chunk.is_empty() && ended { break; }
+            buf.extend_from_slice(&chunk);
+            if ended { break; }
+        }
+
+        let out_headers = Fields::new();
+        let _ = out_headers.set("content-type", &[b"application/json".to_vec()]);
+        let out_resp = OutgoingResponse::new(out_headers);
+        let _ = out_resp.set_status_code(upstream_status);
+        let oh = out_resp.body().expect("response body");
+        let os = oh.write().expect("output stream");
+        let _ = os.blocking_write_and_flush(&buf);
+        drop(os);
+        let _ = OutgoingBody::finish(oh, None);
+        ResponseOutparam::set(out, Ok(out_resp));
+
+        let _ = resp_body;
     }
 }
 ```
@@ -584,7 +741,7 @@ shape of problem one layer down.
 | I forget whether egress is per-tenant or per-app | Egress is per-tenant (`edge egress set`). Env is per-app (`edge env set --app <name>`). One allowlist governs all of that tenant's apps. |
 | My SQLite file is empty after a redeploy | Preopens are per-worker, not shared (`EDGE_FS_PATH`, `edge-runtime/src/runtime.rs:1121`). If the deployment is rebalanced, the new worker starts empty. Pin the worker (issue #641) or move to a hosted DB. |
 | `401 Unauthorized` on every CLI call | Run `edge auth signup` (or `edge auth login`) first. `~/.config/edgecloud/config.toml` must have a valid API key. `edge auth whoami` confirms the session. |
-| The `Cargo.toml` workspace-isolation block keeps getting "re-resolved" by cargo | The `samples/hello/Cargo.toml` has an isolated `[workspace]` block by design (it prevents cargo from resolving against the parent monorepo). Don't remove it. |
+| The `Cargo.toml` workspace-isolation block keeps getting "re-resolved" by cargo | If you forked `samples/hello/` into your own dir, leave its `[workspace]` isolation block alone — without it, cargo walks up to the parent edgeCloud workspace and tries to resolve your crate against the host-only members (`edge-runtime`, `edge-cli`, `edge-worker`, ...), which can't be cross-compiled to `wasm32-unknown-unknown`. The block is also present in the `edge init --lang=rust` scaffold's `Cargo.toml`. |
 
 ## Related
 
