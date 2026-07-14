@@ -372,7 +372,7 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
         // Mismatch on any byte — false.
-        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abe"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"abcd", b"abc"));
         // Length delta counts as a mismatch (folded into the diff).
