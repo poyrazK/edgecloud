@@ -42,15 +42,38 @@ type RespBody = Full<Bytes>;
 
 /// Run the metrics server on `addr` until `shutdown_rx` fires. Returns
 /// `Ok(())` on clean shutdown, `Err` only on a fatal bind error.
+///
+/// `auth_token` is captured by the inner accept loop and cloned into
+/// each connection-spawned task. We accept it as `Arc<str>` rather
+/// than `String` so the per-connection spawn does a cheap refcount
+/// bump instead of a heap allocation per scrape — at sustained
+/// scrape rates (Prometheus default = 15s interval), the per-second
+/// allocation pressure on a `String` clone compounds. The outer
+/// `String` from `main()` is wrapped in `Arc::from` once at startup
+/// (see `main.rs:metrics_server::serve`).
 pub async fn serve(
     addr: SocketAddr,
     metrics: Arc<WorkerMetrics>,
-    auth_token: String,
-    mut shutdown_rx: broadcast::Receiver<()>,
+    auth_token: Arc<str>,
+    shutdown_rx: broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "metrics server listening on /metrics");
+    serve_inner(listener, metrics, auth_token, shutdown_rx).await
+}
 
+/// Inner accept loop. Public so tests can supply an already-bound
+/// `TcpListener` (e.g. `TcpListener::bind("127.0.0.1:0")`) without
+/// duplicating the accept/tokio::spawn/service_fn dance. Tests use
+/// `127.0.0.1:0` so multiple tests can run in parallel without
+/// colliding on a fixed port. The `shutdown_rx` is consumed; the
+/// caller transfers ownership.
+async fn serve_inner(
+    listener: TcpListener,
+    metrics: Arc<WorkerMetrics>,
+    auth_token: Arc<str>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             biased;
@@ -92,7 +115,7 @@ pub async fn serve(
 async fn handle(
     req: Request<Incoming>,
     metrics: Arc<WorkerMetrics>,
-    auth_token: String,
+    auth_token: Arc<str>,
 ) -> Result<Response<RespBody>, Infallible> {
     // Only GET /metrics is served. Anything else is 404 — the endpoint
     // is intentionally narrow; we don't want to expose an arbitrary
@@ -102,17 +125,24 @@ async fn handle(
     }
 
     // Auth header check. `Authorization: Bearer <token>` is the only
-    // accepted shape; anything else is 401. The token comparison uses
-    // a constant-length equality so a partial-prefix probing attack
-    // would not gain timing information — `==` on `&str` is fine here
-    // because the variance is dominated by network jitter on a 32+
-    // byte token.
+    // accepted shape; anything else is 401.
+    //
+    // Constant-time comparison: `&str ==` short-circuits on the first
+    // mismatching byte, leaking prefix-match timing to an attacker on
+    // the same network. We use a hand-rolled byte-wise compare that
+    // iterates the maximum of the two lengths and accumulates the XOR
+    // of all bytes (including length delta) — the running diff is
+    // independent of which byte mismatches. Without `subtle` in the
+    // direct dep graph this is the simplest primitive available; it
+    // is correct against byte-level timing, not microarchitectural
+    // side channels, which is the threat model for an unauthenticated
+    // network-side scraper probing the bearer token.
     let auth_ok = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|t| t == auth_token)
+        .map(|t| constant_time_eq(t.as_bytes(), auth_token.as_bytes()))
         .unwrap_or(false);
 
     if !auth_ok {
@@ -145,6 +175,29 @@ fn empty(status: StatusCode) -> Response<RespBody> {
         .unwrap()
 }
 
+/// Constant-time equality on byte slices. Returns false on length
+/// mismatch (the length delta is folded into the running diff so the
+/// comparison cost is independent of where the bytes diverge). NOT a
+/// defense against microarchitectural side channels (cache-timing,
+/// Spectre, etc.); only against network-side timing oracles on the
+/// bearer token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // `diff` is widened to `usize` so the typed accumulator pattern
+    // `diff |= av ^ bv` works without a `usize |= u8` cast at every
+    // iteration (the byte-XOR result is widened before the OR). The
+    // length XOR seeds the diff with a non-zero value when the inputs
+    // differ in length, so a length mismatch returns false without
+    // reading any bytes.
+    let max_len = a.len().max(b.len());
+    let mut diff: usize = a.len() ^ b.len();
+    for i in 0..max_len {
+        let av = a.get(i).copied().unwrap_or(0) as usize;
+        let bv = b.get(i).copied().unwrap_or(0) as usize;
+        diff |= av ^ bv;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for the metrics HTTP server. Each test stands up a tiny
@@ -168,7 +221,10 @@ mod tests {
     ) -> (SocketAddr, Arc<WorkerMetrics>, tokio::task::JoinHandle<()>) {
         let metrics = WorkerMetrics::new().expect("metrics");
         // Register one app so the rendered body has a labeled series.
-        metrics.register_app("t_test", "d_test", "app_test").await;
+        metrics
+            .register_app("t_test", "d_test", "app_test")
+            .await
+            .expect("test register_app");
         metrics
             .set_status(
                 "t_test",
@@ -181,42 +237,25 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let metrics_for_server = metrics.clone();
-        let token = token.to_string();
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        // Move shutdown_tx INTO the spawned task. The outer scope
-        // does NOT touch it again — it lives as long as the task.
-        // If we dropped it from the outer scope, `shutdown_rx.recv()`
-        // in the task would return Err immediately and the accept
-        // loop would exit, leaving the listener unregistered — the
+        let token: Arc<str> = Arc::from(token);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        // Move one sender INTO the spawned task so the broadcast
+        // channel stays open for the lifetime of the inner accept
+        // loop. The outer scope keeps a clone for clean shutdown
+        // signalling at the end of the test. If every sender is
+        // dropped, `broadcast::Receiver::recv` returns `Err` and
+        // `serve_inner` exits as if shutdown was signalled — the
         // kernel would then RST incoming SYNs (ConnectionReset on
-        // connect). The clone below is for the outer test scope, so
-        // we can signal shutdown from outside without taking
-        // ownership away from the task.
-        let shutdown_tx_for_outer = shutdown_tx.clone();
+        // connect). The original pre-finding-#7 implementation had
+        // the same intent but held the keepalive only in the
+        // outer scope, which let a fast-path test drop it before
+        // the spawned task was polled. Moving it inside is robust.
+        let shutdown_tx_for_task = shutdown_tx.clone();
         let handle = tokio::spawn(async move {
-            // Hold shutdown_tx alive for the lifetime of the task.
-            let _shutdown_tx_keepalive = shutdown_tx;
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => return,
-                    accept = listener.accept() => {
-                        let (stream, _) = match accept {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        let io = TokioIo::new(stream);
-                        let m = metrics_for_server.clone();
-                        let t = token.clone();
-                        tokio::spawn(async move {
-                            let svc = service_fn(move |req| {
-                                handle(req, m.clone(), t.clone())
-                            });
-                            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                                tracing::debug!(err = %e, "metrics connection ended");
-                            }
-                        });
-                    }
-                }
+            // Hold shutdown_tx alive across the entire accept loop.
+            let _shutdown_tx_keepalive = shutdown_tx_for_task;
+            if let Err(e) = serve_inner(listener, metrics_for_server, token, shutdown_rx).await {
+                tracing::warn!(err = %e, "test serve_inner failed");
             }
         });
         // Yield repeatedly so the spawned task gets polled and the
@@ -224,7 +263,6 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        drop(shutdown_tx_for_outer);
         (addr, metrics, handle)
     }
 
@@ -325,5 +363,56 @@ mod tests {
         metrics.tick_worker_gauges();
         let second = metrics.worker_uptime_seconds.get();
         assert!(second >= first, "uptime gauge must not regress");
+    }
+
+    #[test]
+    fn constant_time_eq_smoke() {
+        // Equal slices — true.
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+        // Mismatch on any byte — false.
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        // Length delta counts as a mismatch (folded into the diff).
+        assert!(!constant_time_eq(b"", b"x"));
+        // Different positions of mismatch — both false, no observable
+        // ordering. We can't directly assert constant-time without
+        // statistical tooling; the smoke test just pins correctness.
+        assert!(!constant_time_eq(
+            b"prefix-match-suffix-A",
+            b"prefix-match-suffix-B"
+        ));
+        assert!(!constant_time_eq(b"prefix-A", b"prefix-B"));
+    }
+
+    /// Cover the refactor: `serve_inner` accepts a pre-bound
+    /// `TcpListener` and a `Arc<str>` token, returns `Ok(())` when
+    /// the shutdown channel fires. This avoids duplicating the
+    /// accept-loop body in every test (pre-finding-#7 bug; the
+    /// production `serve()` and the test diverged by a few lines on
+    /// a previous edit).
+    #[tokio::test]
+    async fn serve_inner_returns_ok_when_shutdown_signalled() {
+        use tokio::sync::broadcast;
+
+        let metrics = WorkerMetrics::new().expect("metrics");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let (tx, rx) = broadcast::channel::<()>(1);
+        // Hold a sender alive so the receiver inside `serve_inner`
+        // doesn't see `RecvError::Closed` before we explicitly shut
+        // down — same lifetime pattern as `spawn_test_server`.
+        let _keepalive = tx.clone();
+        let join =
+            tokio::spawn(
+                async move { serve_inner(listener, metrics, Arc::from("token"), rx).await },
+            );
+        // Yield so the listener is registered before we shut down.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tx.send(()).expect("shutdown send");
+        join.await.expect("join").expect("serve_inner");
     }
 }

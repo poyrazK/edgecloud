@@ -312,8 +312,13 @@ async fn main() -> anyhow::Result<()> {
     // auth via `METRICS_AUTH_TOKEN`; empty token → every request gets
     // 401 (fail-closed). Shutdown piggy-backs on the same broadcast
     // the heartbeat + log forwarder observe.
+    //
+    // The token is wrapped in `Arc<str>` once at startup so the per-
+    // connection spawn inside `serve_inner` does a refcount bump
+    // instead of allocating a fresh `String` per scrape — see the
+    // doc on `metrics_server::serve`.
     let metrics_for_server = worker_metrics.clone();
-    let metrics_token = config.metrics_auth_token.clone();
+    let metrics_token: Arc<str> = Arc::from(config.metrics_auth_token.as_str());
     let metrics_addr = config.metrics_addr;
     let shutdown_rx_for_metrics = shutdown_tx.subscribe();
     let metrics_task = tokio::spawn(async move {

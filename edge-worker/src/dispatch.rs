@@ -894,6 +894,16 @@ impl HandlerDispatch {
         let started_at = std::time::Instant::now();
         let tenant_for_log = self.config.tenant_id.clone();
         let app_name_for_log = self.config.app_ctx.app_name.clone();
+        // Hoist the Option<&Arc<MetricsHandle>> once. Per finding #8
+        // (PR #697 review), the closure below previously captured
+        // `self.config.metrics_handle.as_ref()` four times across
+        // the terminal arms — a refcount bump per arm, per FaaS
+        // request. Pulling it out once at the top of handle_request
+        // cuts the four bumps to one (negligible compared to the
+        // guest trap path, but the cleanest pattern). Tests still
+        // get `None` here when `metrics_handle: None` was set on the
+        // dispatched HandlerConfig.
+        let metrics_handle = self.config.metrics_handle.as_ref();
 
         // Spawn the guest concurrently so the host can start serving
         // the response body as soon as the guest calls
@@ -926,7 +936,7 @@ impl HandlerDispatch {
         // tests that build a synthetic dispatch.
         let stamp_duration = |elapsed: std::time::Duration| {
             meter.record_duration(elapsed);
-            if let Some(handle) = self.config.metrics_handle.as_ref() {
+            if let Some(handle) = metrics_handle {
                 handle.duration_ms.inc_by(elapsed.as_millis() as u64);
             }
         };
@@ -945,7 +955,7 @@ impl HandlerDispatch {
                 let counting = CountingBody {
                     inner: body,
                     meter: meter.clone(),
-                    metrics_handle: self.config.metrics_handle.clone(),
+                    metrics_handle: metrics_handle.cloned(),
                 };
                 Ok(HyperResponse::from_parts(parts, counting.boxed_unsync()))
             }
@@ -967,7 +977,7 @@ impl HandlerDispatch {
                 Ok(synthetic_500(
                     &format!("guest returned error-code: {error_code:?}"),
                     meter,
-                    self.config.metrics_handle.as_ref(),
+                    metrics_handle,
                 ))
             }
             Err(_dropped) => {
@@ -997,11 +1007,7 @@ impl HandlerDispatch {
                     // process.exit is billable, consistent with
                     // `request_count` being billed for this arm.
                     stamp_duration(started_at.elapsed());
-                    return Ok(synthetic_500(
-                        "guest cleanly exited",
-                        meter,
-                        self.config.metrics_handle.as_ref(),
-                    ));
+                    return Ok(synthetic_500("guest cleanly exited", meter, metrics_handle));
                 }
 
                 // Real trap. guest_result has already resolved with
@@ -1026,11 +1032,7 @@ impl HandlerDispatch {
                 // no grace period today; see `record_duration`'s
                 // doc-comment in edge-runtime/src/metering.rs.
                 stamp_duration(started_at.elapsed());
-                Ok(synthetic_500(
-                    &format!("{e:#}"),
-                    meter,
-                    self.config.metrics_handle.as_ref(),
-                ))
+                Ok(synthetic_500(&format!("{e:#}"), meter, metrics_handle))
             }
         }
     }

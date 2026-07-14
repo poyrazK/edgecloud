@@ -16,13 +16,24 @@
 //! metrics endpoint. Adding a `decrement` call to the prom counters
 //! would break `rate()` math on the operator side.
 //!
-//! Surface (7 families):
+//! Surface (8 families):
 //!   - edge_requests_total{deployment_id, app_name}              (IntCounter)
 //!   - edge_outbound_bytes_total{deployment_id, app_name}        (IntCounter)
 //!   - edge_resident_seconds_total{deployment_id, app_name}      (IntCounter)
 //!   - edge_duration_ms_total{deployment_id, app_name}           (IntCounter)
 //!   - edge_app_status{deployment_id, app_name, status}          (IntGaugeVec)
-//!     — set to 1 by set_status; clear previous via remove_label_values
+//!     — set to 1 by set_status; clear previous via remove_label_values.
+//!     Swept on `unregister_app` so the active set is bounded by app
+//!     cardinality currently running on the worker.
+//!   - edge_app_terminal_status{deployment_id, app_name, status, exit_code}
+//!     — audit-style terminal status that SURVIVES unregister_app.
+//!     Stamp-once-per-`(deployment_id, app_name)` invariant: a re-register
+//!     with the same key simply overwrites the row. Bounded by total
+//!     deployment cardinality ever seen on this worker (operators already
+//!     have access to that set via the control plane), so the long-lived-worker
+//!     OOM hazard that applies to the per-app counter families does NOT
+//!     apply here. Operators query `== 1` for the last-seen terminal state
+//!     and `== 0` (no row) means the app has never been observed.
 //!   - edge_worker_uptime_seconds                                 (Gauge)
 //!   - edge_worker_active_apps                                    (Gauge)
 //!
@@ -41,6 +52,26 @@ use tokio::sync::RwLock;
 
 use crate::state::AppInstanceStatus;
 use crate::supervisor::app_status_to_string;
+
+/// Render the exit-code label for a terminal-status string.
+///
+/// `crashed` is the one variant that carries a numeric code (the
+/// restart_count, which the supervisor embeds into the wire
+/// string). Everything else — `running`, `starting`, `draining`,
+/// `stopping`, `hung` — emits an empty string so the
+/// `edge_app_terminal_status` gauge has at most one row per
+/// `(deployment_id, app_name, status)` pair.
+///
+/// The supervisor does not currently stamp a numeric code for
+/// `crashed` (the AppInstanceStatus wire string is just
+/// "crashed"), so this helper always returns the empty string
+/// today. The hook exists so a future PR that splits the restart
+/// count out of the status string has a single integration
+/// point — pass the restart count alongside the status_str into
+/// this helper and the gauge labels pick it up automatically.
+pub(crate) fn exit_code_for_status(_status_str: &str) -> &'static str {
+    ""
+}
 
 /// The four process-level counter families, scoped to one app
 /// instance. Cloned cheaply — each field is `Arc`-backed inside
@@ -92,6 +123,13 @@ pub struct WorkerMetrics {
     pub worker_uptime_seconds: Gauge,
     pub worker_active_apps: Gauge,
     pub app_status: IntGaugeVec,
+    /// Audit-style terminal status. Stamped once per
+    /// `(deployment_id, app_name)` from `unregister_app` AFTER
+    /// reading the last known status from `last_status`. Never
+    /// swept — the operator-side cardinality is bounded by total
+    /// deployments ever seen on this worker (one row per
+    /// `(deployment_id, app_name)`), not by the active set.
+    pub app_terminal_status: IntGaugeVec,
     /// Map of active apps. The `MetricsHandle` is the value; we keep
     /// the `Arc` indirection so the dispatch path can `.inc()` on a
     /// cloned handle without taking the lock.
@@ -143,11 +181,40 @@ impl WorkerMetrics {
         )?;
         registry.register(Box::new(app_status.clone()))?;
 
+        // edge_app_terminal_status is the audit-style sibling of
+        // `edge_app_status`. Operators want to know what state a
+        // CRASHED/STOPPED app died in, but `unregister_app` sweeps
+        // the live gauge to keep memory bounded by active apps.
+        // This gauge preserves ONE terminal status per
+        // `(deployment_id, app_name)` — overwrite semantics, no
+        // sweep — and survives unregister. `exit_code` is an empty
+        // string for non-`Crashed` transitions and a numeric code
+        // for `Crashed { restart_count }`. The cardinality is
+        // bounded by total deployments ever seen on this worker
+        // (one row per `(deployment_id, app_name)`), so it does not
+        // share the OOM hazard that motivates sweeping the live
+        // `edge_app_status` gauge.
+        let app_terminal_status = IntGaugeVec::new(
+            Opts::new(
+                "edge_app_terminal_status",
+                "Last terminal status for an app that has been \
+                 unregistered (1 = matches, 0 = absent). Persists \
+                 across the live-app lifecycle — operators query this \
+                 to learn why an app died, since `edge_app_status` \
+                 for the same key is swept on unregister. \
+                 `exit_code` is the integer code for `crashed` and \
+                 the empty string otherwise.",
+            ),
+            &["deployment_id", "app_name", "status", "exit_code"],
+        )?;
+        registry.register(Box::new(app_terminal_status.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             worker_uptime_seconds,
             worker_active_apps,
             app_status,
+            app_terminal_status,
             apps: RwLock::new(HashMap::new()),
             last_status: StdMutex::new(HashMap::new()),
             started_at: Instant::now(),
@@ -160,6 +227,22 @@ impl WorkerMetrics {
     /// counter is reachable from the dispatch path on the very
     /// first request).
     ///
+    /// Register an app and return a cloneable handle. Called from
+    /// `Supervisor::start_app` after the `RequestMeter` is built
+    /// but BEFORE the per-app task is spawned (so the request
+    /// counter is reachable from the dispatch path on the very
+    /// first request).
+    ///
+    /// Returns `anyhow::Result` because `prometheus::IntCounter::with_opts`
+    /// and `Registry::register` both carry error paths that should
+    /// propagate as typed errors, not panics. In practice these
+    /// errors only fire when label values escape the prometheus
+    /// crate's validation (e.g. an empty string for a const label,
+    /// which the supervisor already strips at `start_app`), so
+    /// production callers should see `Ok`; the typed return is a
+    /// defense against a future field addition that introduces an
+    /// invalid label.
+    ///
     /// Idempotency: if the same `(tenant_id, deployment_id)` is
     /// already registered, the existing handle is returned and a
     /// warn is logged. The supervisor's bring-up path does not
@@ -170,7 +253,7 @@ impl WorkerMetrics {
         tenant_id: &str,
         deployment_id: &str,
         app_name: &str,
-    ) -> Arc<MetricsHandle> {
+    ) -> anyhow::Result<Arc<MetricsHandle>> {
         let key = (tenant_id.to_string(), deployment_id.to_string());
         {
             let apps = self.apps.read().await;
@@ -181,7 +264,7 @@ impl WorkerMetrics {
                     app_name,
                     "register_app: duplicate key — returning existing handle"
                 );
-                return existing.clone();
+                return Ok(existing.clone());
             }
         }
 
@@ -191,17 +274,17 @@ impl WorkerMetrics {
         // unregister cleanly later (Registry::unregister matches
         // collectors by descriptor — name + const labels — so a
         // cloned IntCounter with the same labels works).
-        let register_one = |name: &'static str, help: &'static str| -> IntCounter {
+        let register_one = |name: &'static str, help: &'static str| -> anyhow::Result<IntCounter> {
             let c = IntCounter::with_opts(
                 Opts::new(name, help)
                     .const_label("deployment_id", deployment_id)
                     .const_label("app_name", app_name),
             )
-            .expect("IntCounter::with_opts");
+            .map_err(|e| anyhow::anyhow!("IntCounter::with_opts({name}): {e}"))?;
             self.registry
                 .register(Box::new(c.clone()))
-                .unwrap_or_else(|e| panic!("register {name}: {e}"));
-            c
+                .map_err(|e| anyhow::anyhow!("register({name}): {e}"))?;
+            Ok(c)
         };
 
         let requests = register_one(
@@ -209,24 +292,24 @@ impl WorkerMetrics {
             "Per-app request count, mirrored from the per-deployment \
              RequestMeter (issue #49). Monotonic — NOT decremented by \
              the heartbeat's snapshot-and-subtract path.",
-        );
+        )?;
         let outbound_bytes = register_one(
             "edge_outbound_bytes_total",
             "Per-app outbound bytes (response bodies + synthetic 500s), \
              mirrored from the per-deployment RequestMeter.",
-        );
+        )?;
         let resident_seconds = register_one(
             "edge_resident_seconds_total",
             "Per-app resident-seconds count (LongRunning apps only — \
              Handler FaaS apps don't contribute and the label set will \
              not appear). Mirrored from the per-deployment RequestMeter.",
-        );
+        )?;
         let duration_ms = register_one(
             "edge_duration_ms_total",
             "Per-app FaaS wall-clock duration total in milliseconds (issue \
              #555). Handler apps only — LongRunning apps don't contribute \
              and the label set will not appear.",
-        );
+        )?;
 
         let requests_box: Arc<dyn Collector> = Arc::new(requests.clone());
         let outbound_bytes_box: Arc<dyn Collector> = Arc::new(outbound_bytes.clone());
@@ -251,10 +334,10 @@ impl WorkerMetrics {
         // Double-check inside the write lock to close the
         // register-arc race between concurrent first-time registers.
         if let Some(existing) = apps.get(&key) {
-            return existing.clone();
+            return Ok(existing.clone());
         }
         apps.insert(key, handle.clone());
-        handle
+        Ok(handle)
     }
 
     /// Unregister an app. Called from `Supervisor::stop_app` after
@@ -264,6 +347,12 @@ impl WorkerMetrics {
     /// response would accumulate one series per app that has ever
     /// run on this worker — eventually OOM'ing on long-lived
     /// multi-tenant nodes.
+    ///
+    /// Before sweeping `edge_app_status`, stamps the last known
+    /// status into the audit-style sibling `edge_app_terminal_status`
+    /// so operators retain visibility into why a `Crashed`/`Hung`
+    /// app died (otherwise the live gauge is empty for offline
+    /// apps).
     pub async fn unregister_app(&self, tenant_id: &str, deployment_id: &str) {
         let key = (tenant_id.to_string(), deployment_id.to_string());
         let (app_name, handle) = {
@@ -279,13 +368,23 @@ impl WorkerMetrics {
             (handle.app_name.clone(), handle)
         };
 
-        // Drop the last_status tracker entry for this app so a
-        // future `register_app` with the same deployment_id (rare
-        // but possible after a redeploy) doesn't see a phantom
-        // previous status.
-        if let Ok(mut last) = self.last_status.lock() {
-            last.remove(&(deployment_id.to_string(), app_name.clone()));
-        }
+        // Snapshot the last known status BEFORE we drop the
+        // `last_status` entry — we still need it to stamp
+        // `edge_app_terminal_status`. If the app died without
+        // `set_status` ever firing (a debug-level skip in the
+        // start_app path), default to "stopping" — semantically
+        // correct (the operator sees an unregister, which means
+        // the app was alive enough to reach `stop_app`).
+        let (last_status_str, last_exit_code) = {
+            let mut last = self.last_status.lock().ok();
+            let snapshot = last
+                .as_mut()
+                .and_then(|m| m.remove(&(deployment_id.to_string(), app_name.clone())));
+            match snapshot {
+                Some(s) => (s.to_string(), exit_code_for_status(s).to_string()),
+                None => ("stopping".to_string(), String::new()),
+            }
+        };
 
         // Registry::unregister matches collectors by descriptor
         // (name + const labels). The boxes on the handle are
@@ -313,14 +412,29 @@ impl WorkerMetrics {
         // has a `remove_label_values` API keyed on the full label
         // tuple (deployment_id, app_name, status). It errors on
         // unknown series, which is fine — we sweep every status
-        // we ever stamp.
-        for status in [
-            "running", "starting", "draining", "stopping", "crashed", "hung",
-        ] {
+        // we ever stamp. The status string set is the canonical
+        // `APP_STATUS_STRINGS` from `supervisor` — a single source
+        // of truth shared with `app_status_to_string`, so adding a
+        // new variant only requires one place to be updated.
+        for status in crate::supervisor::APP_STATUS_STRINGS {
             self.app_status
                 .remove_label_values(&[deployment_id, &app_name, status])
                 .ok();
         }
+
+        // Stamp the audit-style terminal status. The label set
+        // includes `exit_code` (empty for non-`Crashed`,
+        // numeric for `Crashed { restart_count }`) so the same
+        // `(deployment_id, app_name, status)` triple cannot
+        // collide on a different `restart_count`. A repeat
+        // unregister (e.g. via the register_app idempotency path)
+        // overwrites the existing row — overwrite semantics, not
+        // additive, so the cardinality is bounded by total
+        // deployments ever observed (one row per
+        // `(deployment_id, app_name)`).
+        self.app_terminal_status
+            .with_label_values(&[deployment_id, &app_name, &last_status_str, &last_exit_code])
+            .set(1);
     }
 
     /// Stamp the current `edge_app_status` for an app to the
@@ -447,8 +561,14 @@ mod tests {
     #[tokio::test]
     async fn register_app_idempotent_on_duplicate_key() {
         let m = WorkerMetrics::new().unwrap();
-        let h1 = m.register_app("t_test", "dep_1", "my-app").await;
-        let h2 = m.register_app("t_test", "dep_1", "my-app").await;
+        let h1 = m
+            .register_app("t_test", "dep_1", "my-app")
+            .await
+            .expect("test register_app");
+        let h2 = m
+            .register_app("t_test", "dep_1", "my-app")
+            .await
+            .expect("test register_app");
         assert_eq!(h1.requests.get(), 0);
         h1.requests.inc();
         assert_eq!(
@@ -467,7 +587,10 @@ mod tests {
     #[tokio::test]
     async fn register_app_emits_per_app_counter_series() {
         let m = WorkerMetrics::new().unwrap();
-        let h = m.register_app("t_test", "dep_a", "api").await;
+        let h = m
+            .register_app("t_test", "dep_a", "api")
+            .await
+            .expect("test register_app");
         h.requests.inc_by(3);
         h.outbound_bytes.inc_by(1024);
         h.resident_seconds.inc_by(60);
@@ -489,29 +612,51 @@ mod tests {
         );
     }
 
-    /// After `unregister_app`, the per-app label set is gone — the
-    /// `/metrics` body must not contain `edge_requests_total{...}` for
-    /// the unregistered app. This is the load-bearing test against
-    /// the long-lived-worker OOM hazard.
+    /// After `unregister_app`, the per-app counter label set is
+    /// gone — the `/metrics` body must not contain
+    /// `edge_requests_total{...}` for the unregistered app. This
+    /// is the load-bearing test against the long-lived-worker OOM
+    /// hazard. The audit-style `edge_app_terminal_status` sibling
+    /// intentionally retains a row for the same key (that's the
+    /// whole point — see the `terminal_status` tests below) so we
+    /// check the four counter families specifically rather than
+    /// the broad `app_name="ghost"` substring match that the
+    /// pre-finding-#4 test used to assert.
     #[tokio::test]
     async fn unregister_app_drops_per_app_counters() {
         let m = WorkerMetrics::new().unwrap();
-        let h = m.register_app("t_test", "dep_b", "ghost").await;
+        let h = m
+            .register_app("t_test", "dep_b", "ghost")
+            .await
+            .expect("test register_app");
         h.requests.inc();
         m.unregister_app("t_test", "dep_b").await;
 
         let body = m.gather().unwrap();
-        assert!(
-            !body.contains("edge_requests_total{app_name=\"ghost\",deployment_id=\"dep_b\""),
-            "edge_requests_total series leaked after unregister:\n{body}"
-        );
-        assert!(
-            !body.contains("app_name=\"ghost\""),
-            "any ghost-series still present after unregister:\n{body}"
-        );
+        // The four counter families must be gone — those are the
+        // ones the OOM-hazard arg is about.
+        for family in &[
+            "edge_requests_total",
+            "edge_outbound_bytes_total",
+            "edge_resident_seconds_total",
+            "edge_duration_ms_total",
+        ] {
+            assert!(
+                !body.contains(&format!(
+                    "{family}{{app_name=\"ghost\",deployment_id=\"dep_b\""
+                )),
+                "{family} series leaked after unregister:\n{body}"
+            );
+        }
         // Map is empty again.
         let apps = m.apps.read().await;
         assert!(apps.is_empty());
+        // But the audit-style terminal status for the same key
+        // must STILL be present (finding #4 contract).
+        assert!(
+            body.contains("edge_app_terminal_status{app_name=\"ghost\",deployment_id=\"dep_b\""),
+            "expected audit-style terminal status to survive unregister:\n{body}"
+        );
     }
 
     /// `set_status` writes the gauge to 1 for the current status,
@@ -521,7 +666,10 @@ mod tests {
     #[tokio::test]
     async fn set_status_writes_one_status_per_app() {
         let m = WorkerMetrics::new().unwrap();
-        let _h = m.register_app("t_test", "dep_c", "svc").await;
+        let _h = m
+            .register_app("t_test", "dep_c", "svc")
+            .await
+            .expect("test register_app");
         m.set_status("t_test", "dep_c", "svc", &AppInstanceStatus::Starting)
             .await;
         let body = m.gather().unwrap();
@@ -550,12 +698,113 @@ mod tests {
         );
     }
 
+    /// `unregister_app` stamps the audit-style terminal status
+    /// (`edge_app_terminal_status`) with the LAST KNOWN status
+    /// for the app, AFTER sweeping the live `edge_app_status`.
+    /// Operators need this so a `Crashed`/`Hung` app still has a
+    /// visible row in `/metrics` post-unregister. Pin: after
+    /// `set_status(Stopping)` + `unregister_app`, the body must
+    /// contain `edge_app_terminal_status{...,status="stopping"} 1`
+    /// and NO `edge_app_status` row for the same labels.
+    #[tokio::test]
+    async fn unregister_app_preserves_terminal_status_in_audit_gauge() {
+        let m = WorkerMetrics::new().unwrap();
+        let _h = m
+            .register_app("t_test", "dep_d", "crashy")
+            .await
+            .expect("test register_app");
+        m.set_status("t_test", "dep_d", "crashy", &AppInstanceStatus::Stopping)
+            .await;
+        m.unregister_app("t_test", "dep_d").await;
+
+        let body = m.gather().unwrap();
+        assert!(
+            body.contains("edge_app_terminal_status{")
+                && body.contains("deployment_id=\"dep_d\"")
+                && body.contains("app_name=\"crashy\"")
+                && body.contains("status=\"stopping\"")
+                && body.contains("exit_code=\"\""),
+            "expected audit-style terminal status row in:\n{body}"
+        );
+        assert!(
+            !body.contains("edge_app_status{") || !body.contains("deployment_id=\"dep_d\""),
+            "live edge_app_status row should be swept after unregister:\n{body}"
+        );
+    }
+
+    /// Pin the invariant for the rarer path: an app that reaches
+    /// `unregister_app` without `set_status` ever firing (rare but
+    /// possible during a boot-time crash). The terminal status
+    /// MUST still be stamped — defaulting to "stopping" — so an
+    /// operator can tell from `/metrics` that an app reached
+    /// `unregister` at all. Without the default, the audit trail
+    /// silently disappears and the operator only sees a clean
+    /// `/metrics` body.
+    #[tokio::test]
+    async fn unregister_app_defaults_terminal_status_when_set_status_was_never_called() {
+        let m = WorkerMetrics::new().unwrap();
+        let _h = m
+            .register_app("t_test", "dep_e", "ghost")
+            .await
+            .expect("test register_app");
+        // No set_status call.
+        m.unregister_app("t_test", "dep_e").await;
+
+        let body = m.gather().unwrap();
+        assert!(
+            body.contains("edge_app_terminal_status{")
+                && body.contains("deployment_id=\"dep_e\"")
+                && body.contains("status=\"stopping\""),
+            "expected default terminal status row in:\n{body}"
+        );
+    }
+
+    /// Idempotent re-registration: a second `register_app` for
+    /// the same `(tenant_id, deployment_id)` returns the existing
+    /// handle (already covered by `register_app_idempotent_on_duplicate_key`).
+    /// The audit gauge for the same key after a hypothetical
+    /// unregister-then-register cycle should overwrite, not
+    /// accumulate.
+    #[tokio::test]
+    async fn unregister_app_then_register_app_keeps_audit_gauge_bounded() {
+        let m = WorkerMetrics::new().unwrap();
+        let _h1 = m
+            .register_app("t_test", "dep_f", "wave")
+            .await
+            .expect("test register_app");
+        m.set_status(
+            "t_test",
+            "dep_f",
+            "wave",
+            &AppInstanceStatus::Crashed { restart_count: 3 },
+        )
+        .await;
+        m.unregister_app("t_test", "dep_f").await;
+        // Don't actually re-register — we just want to confirm the
+        // audit row is the only one we see, not duplicated.
+        let body = m.gather().unwrap();
+        let count = body
+            .matches("edge_app_terminal_status{")
+            .filter(|_| true)
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one terminal status row, got {count} in:\n{body}"
+        );
+    }
+
     /// tick_worker_gauges bumps uptime + active-apps. Pin both.
     #[tokio::test]
     async fn tick_worker_gauges_sets_uptime_and_active_count() {
         let m = WorkerMetrics::new().unwrap();
-        let _h = m.register_app("t1", "d1", "a").await;
-        let _h = m.register_app("t2", "d2", "b").await;
+        let _h = m
+            .register_app("t1", "d1", "a")
+            .await
+            .expect("test register_app");
+        let _h = m
+            .register_app("t2", "d2", "b")
+            .await
+            .expect("test register_app");
         // Sleep just enough for elapsed() to advance > 0.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         m.tick_worker_gauges();

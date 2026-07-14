@@ -2382,7 +2382,13 @@ impl Supervisor {
         let metrics_handle: Arc<MetricsHandle> = self
             .metrics
             .register_app(tenant_id, &spec.deployment_id, app_name)
-            .await;
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "register_app failed for {tenant_id}/{app_name}/deployment={}: {e}",
+                    spec.deployment_id
+                )
+            })?;
 
         // Spawn the per-app resident-seconds ticker (issue #484).
         // LongRunning apps only — Handler (FaaS) apps don't contribute
@@ -2756,57 +2762,117 @@ impl Supervisor {
             state.apps.get(&key).cloned()
         };
 
-        let (port, ws_port, handle, ticker, resident_ticker, _dispatch) =
-            if let Some(inst) = instance {
-                // Phase 1: set Draining, signal serve() to stop accepting,
-                // then drain in-flight requests.
-                let mut inst = inst.lock().await;
-                inst.status = AppInstanceStatus::Draining;
-                let port = inst.port;
-                let ws_port = inst.ws_port;
-                let handle = inst.handle.clone();
-                let ticker = inst.ticker.take();
-                // Take the resident-seconds ticker (issue #484) out of
-                // the locked struct so we can abort it after the app
-                // exits. Without abort, the ticker would keep firing
-                // every 30s on a stopped app, drifting the
-                // `meter.resident_seconds` counter past the heartbeat
-                // already-published value.
-                let resident_ticker = inst.resident_ticker.take();
-                let broadcast_tx = inst.shutdown_tx_broadcast.take();
-                let dispatch = inst.dispatch.clone();
-                drop(inst);
+        let (
+            port,
+            ws_port,
+            handle,
+            ticker,
+            resident_ticker,
+            _dispatch,
+            snap_tenant,
+            snap_app,
+            snap_dep,
+        ) = if let Some(inst) = instance {
+            // Phase 1: set Draining, signal serve() to stop accepting,
+            // then drain in-flight requests.
+            let mut inst = inst.lock().await;
+            inst.status = AppInstanceStatus::Draining;
+            let port = inst.port;
+            let ws_port = inst.ws_port;
+            let handle = inst.handle.clone();
+            let ticker = inst.ticker.take();
+            // Take the resident-seconds ticker (issue #484) out of
+            // the locked struct so we can abort it after the app
+            // exits. Without abort, the ticker would keep firing
+            // every 30s on a stopped app, drifting the
+            // `meter.resident_seconds` counter past the heartbeat
+            // already-published value.
+            let resident_ticker = inst.resident_ticker.take();
+            let broadcast_tx = inst.shutdown_tx_broadcast.take();
+            let dispatch = inst.dispatch.clone();
+            // Snapshot identity fields so we can call
+            // `WorkerMetrics::set_status` for the
+            // Draining/Stopping transitions below — the prior
+            // PR mutation left `inst.status = Draining` and
+            // `inst.status = Stopping` to the in-memory state
+            // only, leaving the Prometheus gauge stuck on
+            // `running` until unregister swept it. Operators
+            // saw no lifecycle signal during the drain window
+            // (review finding #2 — flagged after this PR was
+            // already merged as a draft; fixing here so the
+            // gauge reflects reality).
+            let snap_tenant = tenant_id.to_string();
+            let snap_app = app_name.to_string();
+            let snap_dep = inst.deployment_id.clone();
+            drop(inst);
 
-                // Signal serve() to stop accepting new connections.
-                if let Some(tx) = broadcast_tx {
-                    let _ = tx.send(());
+            // Stamp Draining on the Prometheus gauge BEFORE
+            // dropping the lock so `edge_app_status{...,
+            // status="draining"} 1` is observable across the
+            // full drain window (default up to 30s).
+            self.metrics
+                .set_status(
+                    &snap_tenant,
+                    &snap_dep,
+                    &snap_app,
+                    &AppInstanceStatus::Draining,
+                )
+                .await;
+
+            // Signal serve() to stop accepting new connections.
+            if let Some(tx) = broadcast_tx {
+                let _ = tx.send(());
+            }
+
+            // Phase 2: wait for in-flight requests to drain (up to 30s).
+            if let Some(ref d) = dispatch {
+                let drained = d.drain_in_flight(Duration::from_secs(30)).await;
+                if !drained {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        app_name = %app_name,
+                        "drain timeout reached — forcing stop"
+                    );
                 }
+            }
 
-                // Phase 2: wait for in-flight requests to drain (up to 30s).
-                if let Some(ref d) = dispatch {
-                    let drained = d.drain_in_flight(Duration::from_secs(30)).await;
-                    if !drained {
-                        tracing::warn!(
-                            tenant_id = %tenant_id,
-                            app_name = %app_name,
-                            "drain timeout reached — forcing stop"
-                        );
-                    }
+            // Set stopping status after drain.
+            {
+                let state = self.state.read().await;
+                if let Some(stopping_inst) = state.apps.get(&key) {
+                    let mut stopping_inst = stopping_inst.lock().await;
+                    stopping_inst.status = AppInstanceStatus::Stopping;
                 }
+            }
 
-                // Set stopping status after drain.
-                {
-                    let state = self.state.read().await;
-                    if let Some(stopping_inst) = state.apps.get(&key) {
-                        let mut stopping_inst = stopping_inst.lock().await;
-                        stopping_inst.status = AppInstanceStatus::Stopping;
-                    }
-                }
+            // Stamp Stopping on the Prometheus gauge. The
+            // `unregister_app` call below will sweep the live
+            // status row, but `edge_app_terminal_status`
+            // (finding #4) preserves `stopping` for operators
+            // who want a post-mortem audit trail.
+            self.metrics
+                .set_status(
+                    &snap_tenant,
+                    &snap_dep,
+                    &snap_app,
+                    &AppInstanceStatus::Stopping,
+                )
+                .await;
 
-                (port, ws_port, handle, ticker, resident_ticker, dispatch)
-            } else {
-                return Ok(()); // already gone
-            };
+            (
+                port,
+                ws_port,
+                handle,
+                ticker,
+                resident_ticker,
+                dispatch,
+                snap_tenant,
+                snap_app,
+                snap_dep,
+            )
+        } else {
+            return Ok(()); // already gone
+        };
 
         // Remove from the map.
         let removed_handle = self.state.write().await.apps.remove(&key);
@@ -2818,6 +2884,21 @@ impl Supervisor {
         // `tenant_id + deployment_id` from the removed
         // `AppInstance` so the `unregister_app` call doesn't have
         // to look it up.
+        //
+        // The snap_* identity fields captured during the drain
+        // window are surfaced in the trace so operators can map
+        // the drained-but-unregistered deployment to its source
+        // row, even if `state.apps` has already been garbage-
+        // collected by the time the log lands. Routed via
+        // `tracing::info!` rather than `debug!` because the
+        // bind-time `RUST_LOG` defaults in this crate already
+        // surface `info` but not `debug`.
+        tracing::info!(
+            tenant_id = %snap_tenant,
+            app_name = %snap_app,
+            deployment_id = %snap_dep,
+            "stop_app unregister begin"
+        );
         if let Some(removed_mutex) = &removed_handle {
             let removed = removed_mutex.lock().await;
             self.metrics
@@ -3779,6 +3860,17 @@ pub fn compute_app_diff(
         apps_to_start,
     }
 }
+
+/// Canonical ordered list of every `AppInstanceStatus` wire string.
+/// Single source of truth — `app_status_to_string` maps into the
+/// same set, and `metrics::WorkerMetrics::unregister_app` sweeps
+/// these on app teardown to clear every `edge_app_status` series.
+/// Adding a new `AppInstanceStatus` variant requires extending this
+/// `match` + this array in lock-step; the metrics module does not
+/// have its own copy.
+pub const APP_STATUS_STRINGS: &[&str] = &[
+    "running", "starting", "draining", "stopping", "crashed", "hung",
+];
 
 /// Map an AppInstanceStatus to its heartbeat wire string.
 pub fn app_status_to_string(status: &AppInstanceStatus) -> &'static str {
