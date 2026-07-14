@@ -34,10 +34,40 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Health check
-         * @description Returns 200 if the control plane is running. No auth required.
+         * Liveness probe
+         * @description Returns 200 if the control plane process is running and able to
+         *     respond to HTTP. Does NOT check downstream dependencies — for a
+         *     deep readiness check see `GET /ready`. K8s `livenessProbe` should
+         *     point here. No auth required.
          */
         get: operations["health"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ready": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Readiness probe
+         * @description Deep readiness check. Pings the database, flushes the NATS
+         *     connection (2s timeout), and snapshots every background loop
+         *     tracked by `internal/loophealth`. Returns `200` with `status=ok`
+         *     when everything is healthy, `200` with `status=degraded` when one
+         *     or more loops are unhealthy (DB+NATS still healthy — the CP can
+         *     still serve reads), or `503` with `status=unhealthy` when DB or
+         *     NATS connectivity failed. K8s `readinessProbe` should point here.
+         *     No auth required.
+         */
+        get: operations["ready"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1511,6 +1541,28 @@ export interface components {
              *     ]
              */
             degraded_reasons?: string[];
+        };
+        UnhealthyResponse: {
+            /**
+             * @description Always `unhealthy` on this response. The 200/503 split is via HTTP status, not this field.
+             * @example unhealthy
+             * @enum {string}
+             */
+            status: "unhealthy";
+            /**
+             * @description Which dependency check failed first. The DB ping runs
+             *     before NATS, so a simultaneous failure surfaces `db`.
+             * @example db
+             * @enum {string}
+             */
+            failure_component: "db" | "nats";
+            /**
+             * @description Raw error message from the failing dependency
+             *     (`db.PingContext` or `nc.FlushTimeout`). Operator-internal;
+             *     no PII or secret material leaks through here.
+             * @example dial tcp 127.0.0.1:5432: connect: connection refused
+             */
+            error: string;
         };
         LoopState: {
             /** @example heartbeat */
@@ -3007,7 +3059,42 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
+                    "application/json": {
+                        /**
+                         * @example ok
+                         * @enum {string}
+                         */
+                        status: "ok";
+                    };
+                };
+            };
+        };
+    };
+    ready: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK or degraded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+            /** @description Unhealthy */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnhealthyResponse"];
                 };
             };
         };

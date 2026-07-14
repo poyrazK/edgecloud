@@ -110,7 +110,7 @@ type App struct {
 	// loopHealth tracks liveness of every background goroutine spawned
 	// by RunBackground (heartbeat, log_gc, reconcile, worker_gc,
 	// deployment_gc, autoscale). It also drives the per-loop map on
-	// /health so operators can see degraded state without scraping
+	// /ready so operators can see degraded state without scraping
 	// logs. See internal/loophealth for the package contract. Related
 	// to issue #443.
 	loopHealth *loophealth.Tracker
@@ -498,63 +498,43 @@ func New(
 	// internal operator access only. Do not expose this path on the public LB.
 	mux.HandleFunc("GET /metrics", metricsHandler.GetAllMetrics)
 
-	// Health check — pings the database (and optionally NATS) so load
-	// balancers and orchestrators stop routing traffic to a control plane
-	// instance with a dead database connection (issue #142).
-	//
-	// On success the body includes a per-loop "loops" map sourced from
-	// the loophealth tracker (issue #443): if any background loop has
-	// panicked or gone stale, status becomes "degraded" (still 200 so
-	// load balancers don't pull the CP from rotation for a non-fatal
-	// heartbeat panic) and degraded_reasons lists the affected loop
-	// names. 503 is reserved for DB/NATS failures, same as before.
-	//
-	// The tracker is built once near the top of New() and threaded
-	// into the services that feed it; the closure below captures the
-	// same instance to read liveness for the response body.
+	// Liveness probe — pure process liveness (issue #48). Returns 200
+	// + `{"status":"ok"}` as long as the HTTP handler is reached. K8s
+	// livenessProbe must point here; restart decisions are based only
+	// on "is the goroutine model wedged?" — never on downstream
+	// dependency state. See /ready for the deep readiness check.
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		if err := db.PingContext(r.Context()); err != nil {
-			log.Printf("Health check: DB ping failed: %v", err)
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// Readiness probe — DB ping (issue #142) + NATS flush (with the
+	// historical 2s budget) + per-loop snapshot (issue #443). Behavior
+	// is unchanged from the pre-#48 /health handler: 503 on DB/NATS
+	// failure; 200 + status=degraded on a degraded loop snapshot. K8s
+	// readinessProbe should point here so a transient Postgres blip
+	// pulls the pod from service endpoints without restarting it.
+	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+		res := checkReady(r.Context(), db, publisher, loopHealth)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(res.HTTPStatus)
+		if res.Status == "unhealthy" {
+			log.Printf("Readiness check: %s failed: %v", res.FailureComponent, res.FailureError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":            res.Status,
+				"failure_component": res.FailureComponent,
+				"error":             res.FailureError.Error(),
+			})
 			return
 		}
-		// Optional NATS connectivity check. A NATS outage doesn't kill
-		// the API server (it still serves reads), but surfacing it in
-		// the health check gives operators an early signal.
-		if nc := publisher.Conn(); nc != nil {
-			if err := nc.FlushTimeout(2 * time.Second); err != nil {
-				log.Printf("Health check: NATS ping failed: %v", err)
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_ = json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
-				return
-			}
-		}
-		// Build the extended healthy body. Even on the "ok" path we
-		// include the per-loop map so operators always see the same
-		// shape — the existing `{"status":"ok"}` field stays first for
-		// backward compatibility with clients that parse the JSON.
-		snapshot := loopHealth.Snapshot()
-		loops := make(map[string]loophealth.State, len(snapshot))
-		var degradedReasons []string
-		for _, s := range snapshot {
-			loops[s.Name] = s
-			if s.Panics > 0 || s.Stale {
-				degradedReasons = append(degradedReasons, s.Name)
-			}
-		}
-		status := "ok"
-		if len(degradedReasons) > 0 {
-			status = "degraded"
-		}
 		body := map[string]any{
-			"status": status,
-			"loops":  loops,
+			"status": res.Status,
+			"loops":  res.Loops,
 		}
-		if len(degradedReasons) > 0 {
-			body["degraded_reasons"] = degradedReasons
+		if len(res.DegradedReasons) > 0 {
+			body["degraded_reasons"] = res.DegradedReasons
 		}
-		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(body)
 	})
 
@@ -972,6 +952,66 @@ func newLoopHealth() *loophealth.Tracker {
 		tr.SetStaleAfter(d)
 	}
 	return tr
+}
+
+// readyStatus is the result of a deep readiness probe (issue #48).
+// HTTPStatus is the response code the /ready handler should write
+// (200 for ok/degraded, 503 for unhealthy). FailureComponent +
+// FailureError are populated only when Status == "unhealthy".
+type readyStatus struct {
+	Status           string
+	HTTPStatus       int
+	Loops            map[string]loophealth.State
+	DegradedReasons  []string
+	FailureComponent string
+	FailureError     error
+}
+
+// checkReady runs the deep readiness probe used by GET /ready (issue
+// #48 — moved verbatim from the pre-#48 /health closure). Sequential
+// DB → NATS → loops today; parallelizing the two network checks via
+// errgroup is a tracked follow-up. NATS flush budget stays at the
+// historical 2s. Free function (not a *App method) so the /ready
+// closure inside New() can call it directly without lifting the
+// dependencies onto the App struct.
+func checkReady(ctx context.Context, db *sqlx.DB, publisher *nats.NATSPublisher, lh *loophealth.Tracker) readyStatus {
+	if err := db.PingContext(ctx); err != nil {
+		return readyStatus{
+			Status:           "unhealthy",
+			HTTPStatus:       http.StatusServiceUnavailable,
+			FailureComponent: "db",
+			FailureError:     err,
+		}
+	}
+	if nc := publisher.Conn(); nc != nil {
+		if err := nc.FlushTimeout(2 * time.Second); err != nil {
+			return readyStatus{
+				Status:           "unhealthy",
+				HTTPStatus:       http.StatusServiceUnavailable,
+				FailureComponent: "nats",
+				FailureError:     err,
+			}
+		}
+	}
+	snapshot := lh.Snapshot()
+	loops := make(map[string]loophealth.State, len(snapshot))
+	var degradedReasons []string
+	for _, s := range snapshot {
+		loops[s.Name] = s
+		if s.Panics > 0 || s.Stale {
+			degradedReasons = append(degradedReasons, s.Name)
+		}
+	}
+	status := "ok"
+	if len(degradedReasons) > 0 {
+		status = "degraded"
+	}
+	return readyStatus{
+		Status:          status,
+		HTTPStatus:      http.StatusOK,
+		Loops:           loops,
+		DegradedReasons: degradedReasons,
+	}
 }
 
 // RunBackground starts all background goroutines. Call once the HTTP server

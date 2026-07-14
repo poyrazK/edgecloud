@@ -194,7 +194,8 @@ All endpoints require API Key authentication via `Authorization: Bearer <key>` h
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Liveness probe |
+| GET | `/health` | Liveness probe — returns 200 if the process can respond. |
+| GET | `/ready` | Readiness probe — DB ping + NATS flush + per-loop snapshot. 503 only on DB/NATS failure. |
 
 ### 4.2 Internal Worker API (NATS)
 
