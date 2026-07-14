@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
@@ -142,6 +143,98 @@ func (h *WebhookHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// webhookDeliveriesResponse is the JSON envelope returned by
+// GET /api/v1/webhooks/{webhookID}/deliveries. Mirrors the
+// {"deliveries": [...]} shape used by List ("webhooks": [...]) so
+// future envelope fields (filters, totals) can be added without
+// breaking the wire.
+type webhookDeliveriesResponse struct {
+	Deliveries []domain.WebhookDelivery `json:"deliveries"`
+	Limit      int                      `json:"limit"`
+	NextCursor *string                  `json:"next_cursor"`
+}
+
+// ListDeliveries handles GET /api/v1/webhooks/{webhookID}/deliveries.
+// Cursor pagination only (no offset — there is no legacy offset for
+// this endpoint to deprecate). Mirrors handler/logs.go::List:
+//   - parse + validate → service → encode
+//   - typed cursor errors mapped to 400 with structured log.Printf
+//   - ownership mismatch (webhook belongs to another tenant or doesn't
+//     exist) maps to a 404 — collapsing both cases prevents enumeration
+//     of webhook IDs across tenants.
+//
+// Status codes:
+//
+//	200  envelope {deliveries, limit, next_cursor}
+//	400  invalid cursor / invalid limit
+//	404  webhook not found OR not owned by the calling tenant
+//	500  unexpected
+func (h *WebhookHandler) ListDeliveries(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.GetTenantID(r.Context())
+	webhookID := r.PathValue("webhookID")
+
+	q := r.URL.Query()
+	if q.Has("cursor") && q.Has("offset") {
+		// Defensive: the endpoint does not advertise `offset`, but
+		// reject any request that supplies one alongside a cursor so
+		// a confused client cannot trigger ambiguous SQL branches.
+		httperror.BadRequestCtx(w, r, "cursor and offset are mutually exclusive")
+		return
+	}
+
+	limit, err := parseWebhookDeliveriesLimitParam(q.Get("limit"))
+	if err != nil {
+		httperror.BadRequestCtx(w, r, "invalid limit: "+err.Error())
+		return
+	}
+
+	result, err := h.webhookSvc.ListDeliveriesByWebhook(r.Context(), tenantID, webhookID, limit, q.Get("cursor"))
+	if err != nil {
+		if errors.Is(err, service.ErrWebhookNotFound) {
+			httperror.NotFoundCtx(w, r, "webhook not found")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidWebhookDeliveryCursor) || errors.Is(err, service.ErrUnsupportedWebhookDeliveryCursorVersion) {
+			// Structured operator log so "malformed cursor" can be
+			// distinguished from "unsupported cursor version" in
+			// production without enabling debug logging. Mirrors
+			// handler/logs.go:112-122 (issue #644).
+			log.Printf("invalid webhook delivery cursor (tenant=%s webhook=%s): %v", tenantID, webhookID, err)
+			httperror.BadRequestCtx(w, r, "invalid cursor")
+			return
+		}
+		log.Printf("internal error listing deliveries (tenant=%s webhook=%s): %v", tenantID, webhookID, err)
+		httperror.InternalErrorCtx(w, r)
+		return
+	}
+
+	resp := webhookDeliveriesResponse{
+		Deliveries: result.Deliveries,
+		Limit:      result.Limit,
+		NextCursor: result.NextCursor,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// parseWebhookDeliveriesLimitParam returns the user-supplied limit, or 0
+// when absent. The service substitutes a default (50) when <=0 and
+// clamps to MaxWebhookDeliveryLimit (200) — the handler only validates
+// that the string parses as a non-negative integer.
+func parseWebhookDeliveriesLimitParam(raw string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New("expected integer")
+	}
+	if n < 0 {
+		return 0, errors.New("must be non-negative")
+	}
+	return n, nil
 }
 
 func validateWebhookRequest(rawURL, secret string, events []string) error {

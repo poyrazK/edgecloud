@@ -756,6 +756,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/webhooks/{webhookID}/deliveries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List delivery attempts for a webhook (cursor pagination)
+         * @description Returns the most recent delivery attempts for the given webhook,
+         *     newest first. The endpoint is tenant-scoped — a webhook owned by
+         *     another tenant (or unknown) returns 404, never leaking the existence
+         *     of webhook IDs across tenants.
+         *
+         *     Pages are bounded by `limit` (default 50, max 200). To page
+         *     forward, pass the previous response's `next_cursor` value as the
+         *     `cursor` query parameter verbatim. When `next_cursor` is `null`,
+         *     the current page is the final page.
+         */
+        get: operations["listWebhookDeliveries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/billing/checkout": {
         parameters: {
             query?: never;
@@ -1795,6 +1823,62 @@ export interface components {
         };
         WebhookListResponse: {
             webhooks?: components["schemas"]["Webhook"][];
+        };
+        WebhookDelivery: {
+            /**
+             * Format: int64
+             * @description Server-assigned monotonic delivery id.
+             */
+            id?: number;
+            /** @example wh_abc123 */
+            webhook_id?: string;
+            /** @enum {string} */
+            event_type?: "deploy" | "activate" | "rollback" | "auto_rollback";
+            /**
+             * @description Final outcome of this attempt:
+             *       * `success` — upstream returned a 2xx
+             *       * `failed`  — all retries exhausted (see `attempt`/`max_attempts`)
+             *       * `retrying` — transient failure; next attempt scheduled
+             *       * `pending`  — enqueued but not yet sent
+             * @enum {string}
+             */
+            status?: "pending" | "success" | "failed" | "retrying";
+            /** @description HTTP status code returned by the upstream endpoint (null while pending). */
+            status_code?: number | null;
+            /** @description Truncated upstream error / connection failure reason. */
+            error_msg?: string;
+            /** @description 1-based attempt counter. */
+            attempt?: number;
+            /** @description Total retries budget for this event. */
+            max_attempts?: number;
+            /**
+             * Format: date-time
+             * @description Wall-clock time the delivery was enqueued.
+             */
+            created_at?: string;
+            /**
+             * Format: date-time
+             * @description Wall-clock time the delivery reached a terminal status (null while pending).
+             */
+            completed_at?: string | null;
+        };
+        WebhookDeliveriesResponse: {
+            deliveries: components["schemas"]["WebhookDelivery"][];
+            /**
+             * @description Effective page size after server-side clamping (max 200).
+             * @example 50
+             */
+            limit: number;
+            /**
+             * @description Opaque cursor for the next page. Pass this string verbatim as
+             *     the `?cursor=` query parameter to fetch the next page.
+             *     `null` indicates the current page is the final page.
+             *     The cursor is base64url-encoded; its internal shape is server-private
+             *     and may change between server versions — consumers MUST treat it
+             *     as opaque.
+             * @example eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTM6MDE6MDFaIiwiaWQiOjk5fQ
+             */
+            next_cursor: string | null;
         };
         BillingCheckoutRequest: {
             /**
@@ -4429,6 +4513,42 @@ export interface operations {
                 };
                 content?: never;
             };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listWebhookDeliveries: {
+        parameters: {
+            query?: {
+                /** @description Maximum deliveries per page. Server-side clamped to 200. */
+                limit?: number;
+                /**
+                 * @description Opaque next-page cursor from a prior response's `next_cursor`.
+                 *     Treat as a black box; the server may change the internal shape
+                 *     between versions.
+                 */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Webhook id (the `wh_…` prefix from `listWebhooks`). */
+                webhookID: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deliveries page. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDeliveriesResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalError"];

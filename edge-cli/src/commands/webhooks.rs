@@ -5,6 +5,7 @@
 //! - `list`
 //! - `update <id> [--url <u>] [--events e1,e2] [--description <s>] [--enabled|--disable] [--secret <s>]`
 //! - `remove <id>`
+//! - `deliveries <id> [--limit <n>] [--cursor <opaque>]` (issue #659)
 //!
 //! The CLI does NOT persist webhook state to `.edge/state.json` —
 //! every invocation is a fresh query against the control plane.
@@ -29,12 +30,13 @@
 //! `update` are Phase-2 deferred — see the docstring on `run`.
 
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 
 use super::retry::{
     call_with_retry_no_interrupt, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_CAP_MS,
 };
+use crate::api::webhooks::WebhookDeliveriesResponse;
 use crate::api::ApiClient;
 use crate::config::EdgeToml;
 use crate::output;
@@ -73,6 +75,20 @@ pub enum WebhooksAction {
     },
     Remove {
         id: String,
+    },
+    /// List delivery attempts for a webhook (issue #659).
+    /// `--limit` defaults to the server-side default (50); `--cursor`
+    /// is the opaque next-page token from a prior response.
+    /// `--max-retries`, `--retry-base-ms`, `--retry-cap-ms` are the
+    /// operator-tunable retry tier (matches `edge traffic set` /
+    /// `edge env delete` per CLAUDE.md).
+    Deliveries {
+        id: String,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        max_retries: u32,
+        retry_base_ms: u64,
+        retry_cap_ms: u64,
     },
 }
 
@@ -297,6 +313,44 @@ impl WebhooksAction {
                 println!("Removed webhook {id}.");
                 Ok(())
             }
+            WebhooksAction::Deliveries {
+                id,
+                limit,
+                cursor,
+                max_retries,
+                retry_base_ms,
+                retry_cap_ms,
+            } => {
+                let resp = call_with_retry_no_interrupt(
+                    "webhooks deliveries",
+                    || webhooks.deliveries(&id, limit, cursor.as_deref()),
+                    max_retries,
+                    retry_base_ms,
+                    retry_cap_ms,
+                )
+                .with_context(|| format!("listing deliveries for webhook {id}"))?;
+                if std::io::stdout().is_terminal() {
+                    print_deliveries_table(&resp);
+                } else {
+                    for d in &resp.deliveries {
+                        println!("{}", serde_json::to_string(d).unwrap_or_default());
+                    }
+                }
+                if let Some(cur) = resp.next_cursor.as_deref() {
+                    if !cur.is_empty() {
+                        let limit_hint = limit.unwrap_or(resp.limit);
+                        output::hint(&format!(
+                            "More deliveries available — \
+                             run `edge webhooks deliveries {id} --limit {limit_hint} \
+                             --cursor '{cur}'` for the next page",
+                            id = id,
+                            limit_hint = limit_hint,
+                            cur = cur,
+                        ));
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -323,6 +377,107 @@ fn clip(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
+    }
+}
+
+/// Render a `WebhookDeliveriesResponse` as a human-readable table on
+/// a TTY. Layout (column widths chosen to fit a 130-col terminal):
+///
+///   TIMESTAMP         STATUS     EVENT    ATTEMPT   STATUS  ERROR
+///   2026-07-14T12:00  success    deploy   1/3       200
+///
+/// `error_msg` is rendered last and truncated via `clip` to keep the
+/// row under one line. We deliberately omit the `id` / `webhook_id`
+/// columns — the user already knows which webhook they queried (it's
+/// the `<id>` positional), and the server-generated delivery `id`
+/// is an opaque handle. This matches the `edge logs` print shape
+/// (`commands/logs.rs:165-185`), giving tenants a consistent read
+/// pattern across both surfaces.
+///
+/// Empty response: print `No deliveries.` to match the `webhooks
+/// list` empty-state wording so mixed-output terminals stay
+/// visually consistent.
+fn print_deliveries_table(resp: &WebhookDeliveriesResponse) {
+    if resp.deliveries.is_empty() {
+        println!("No deliveries.");
+        return;
+    }
+    // Note: the HTTP-column header reads `HTTP` (not the second
+    // `STATUS` it had in #659's first cut) so the two status-like
+    // columns don't visually collide. `STATUS` is the delivery
+    // outcome (success/failed/retrying/pending); `HTTP` is the
+    // upstream's status code (or blank while pending).
+    println!(
+        "{:<20} {:<10} {:<10} {:<9} {:<7} ERROR",
+        "TIMESTAMP", "STATUS", "EVENT", "ATTEMPT", "HTTP"
+    );
+    println!("{}", "-".repeat(96));
+    for d in &resp.deliveries {
+        let status = render_status(&d.status);
+        let event = clip(&d.event_type, 10);
+        let attempt = format!("{}/{}", d.attempt, d.max_attempts);
+        let status_code = d.status_code.map(|c| c.to_string()).unwrap_or_default();
+        let error = clip(&d.error_msg, 40);
+        println!(
+            "{:<20} {:<10} {:<10} {:<9} {:<7} {}",
+            format_created_at(&d.created_at),
+            status,
+            event,
+            attempt,
+            status_code,
+            error,
+        );
+    }
+}
+
+/// Render a wire timestamp for the deliveries table.
+///
+/// The server emits Go `time.Time` via `json.Marshal`, which produces
+/// RFC3339Nano (29 chars, e.g. `2026-07-14T12:00:00.123456789Z`) when
+/// the timestamp has fractional seconds, or RFC3339 (20 chars,
+/// `2026-07-14T12:00:00Z`) when it doesn't. A naive `clip(.., 20)`
+/// would silently truncate a Nano wire value to
+/// `2026-07-14T12:00:00.1` — visually wrong.
+///
+/// This helper drops any fractional-second suffix and returns the
+/// seconds-precision form (`YYYY-MM-DDTHH:MM:SS`), always 19 chars
+/// before padding. Matches the `edge logs` rendering convention
+/// (`commands/logs.rs:165-185`) so tenants see a consistent
+/// timestamp shape across read surfaces.
+///
+/// The wire format from the server is always RFC3339(±Nano) with
+/// the trailing `Z` (the SQL column is `TIMESTAMPTZ` and the Go
+/// side normalizes to UTC before encoding — see
+/// `internal/service/webhook_delivery_cursor.go:60`). We split on
+/// the FIRST `.`; if no `.` is present the input is already
+/// seconds-precision and we strip the trailing `Z` so the column
+/// is date+time only (avoids trailing garbage in the table).
+fn format_created_at(raw: &str) -> String {
+    // Drop everything from the first '.' onward (fractional seconds).
+    // If there's no '.', the wire form is RFC3339 — strip the trailing
+    // 'Z' so the column reads `YYYY-MM-DDTHH:MM:SS` only.
+    let no_fraction = raw.split('.').next().unwrap_or(raw);
+    let no_zone = no_fraction.strip_suffix('Z').unwrap_or(no_fraction);
+    no_zone.to_string()
+}
+
+/// Render the delivery status with ANSI color when stderr is a TTY.
+/// Falls back to the bare status string when colors are disabled
+/// (CI / piped output), so downstream tooling can grep without
+/// stripping ANSI codes.
+fn render_status(status: &str) -> String {
+    // We don't have direct access to `atty::Stream::Stderr` without
+    // adding a dep; checking `stdout()` is sufficient — if stdout is
+    // a TTY the user is interactive. Colors are a UX nice-to-have,
+    // not a contract, so no test pins the exact escape codes.
+    if !std::io::stdout().is_terminal() {
+        return status.to_string();
+    }
+    match status {
+        "success" => format!("\x1b[32m{status}\x1b[0m"), // green
+        "failed" => format!("\x1b[31m{status}\x1b[0m"),  // red
+        "retrying" | "pending" => format!("\x1b[33m{status}\x1b[0m"), // yellow
+        _ => status.to_string(),
     }
 }
 
@@ -426,6 +581,52 @@ mod tests {
         let clipped = clip(&s, 10);
         assert_eq!(clipped.chars().count(), 10);
         assert!(clipped.ends_with('…'));
+    }
+
+    // format_created_at boundary tests. The wire format from the
+    // Go side is RFC3339Nano (29 chars) when the timestamp has
+    // fractional seconds, or RFC3339 (20 chars) when it doesn't.
+    // A naive clip-to-20 would silently truncate Nano to a
+    // mid-second cut — pin both forms here so a future refactor
+    // that breaks the seconds-precision rendering fails CI.
+
+    #[test]
+    fn format_created_at_drops_nanoseconds_from_rfc3339_nano() {
+        assert_eq!(
+            format_created_at("2026-07-14T12:00:00.123456789Z"),
+            "2026-07-14T12:00:00"
+        );
+    }
+
+    #[test]
+    fn format_created_at_drops_z_from_rfc3339() {
+        assert_eq!(
+            format_created_at("2026-07-14T12:00:00Z"),
+            "2026-07-14T12:00:00"
+        );
+    }
+
+    #[test]
+    fn format_created_at_handles_microsecond_precision() {
+        // 6-digit fraction is the common Go time.Time JSON shape for
+        // timestamps with microsecond (not nanosecond) precision.
+        assert_eq!(
+            format_created_at("2026-07-14T12:00:00.123456Z"),
+            "2026-07-14T12:00:00"
+        );
+    }
+
+    #[test]
+    fn format_created_at_passes_through_when_already_seconds_precision() {
+        // The wire form from the Go side always has a trailing 'Z'.
+        // The helper is defensive against a server-side schema
+        // change that omits the zone marker — pin that path so a
+        // future migration that returns bare RFC3339 (no Z) is
+        // surfaced here rather than rendered with a trailing 'Z'.
+        assert_eq!(
+            format_created_at("2026-07-14T12:00:00"),
+            "2026-07-14T12:00:00"
+        );
     }
 
     // acquire_secret boundary tests. The function has two bail!

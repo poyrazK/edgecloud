@@ -13,12 +13,13 @@
 //! never echoes it back, so there is no field to deserialize.
 //!
 //! **Note on `WebhookDelivery`:** the `webhook_deliveries` table is
-//! not yet readable via a tenant-scoped HTTP route (only
-//! `WebhookDeliveryGCService` reads it today; see issue #659 for the
-//! planned `GET /api/v1/webhooks/{id}/deliveries` endpoint). The
-//! DTO and its consumer are deferred to the follow-up PR — adding
-//! it here as dead code would let a future refactor drift the wire
-//! shape without any test catching it.
+//! readable via `GET /api/v1/webhooks/{id}/deliveries` (issue #659,
+//! closed by the same PR that introduces the DTOs in this file).
+//! `request_body` / `response_body` are deliberately omitted from the
+//! DTO — the Go side tags them `json:"-"` (issue #565 follow-up) so
+//! the wire never carries them, and including them here as dead
+//! fields would let a future refactor drift the wire shape without
+//! any test catching it.
 //!
 //! `WebhookClient` borrows the parent `ApiClient` so the API key
 //! and base URL are shared across all subcommands without cloning
@@ -68,6 +69,53 @@ pub struct Webhook {
 #[derive(Debug, Deserialize)]
 struct WebhookListResponse {
     webhooks: Vec<Webhook>,
+}
+
+/// One row of the `webhook_deliveries` table as seen by the tenant.
+///
+/// Mirrors `domain.WebhookDelivery` in
+/// `edge-control-plane/internal/domain/webhook.go` field-for-field
+/// minus `RequestBody` / `ResponseBody` (which the server omits via
+/// `json:"-"` — the CLI never sees them, and a future server refactor
+/// that leaks them would be visible only at this serde boundary).
+///
+/// `status_code` is `Option<i32>` because the Go column is nullable
+/// (an in-flight delivery hasn't received a status code yet). Pinning
+/// the option-ness here is the single source of truth for the wire
+/// shape; a future change to non-nullable status_code must change
+/// both sides.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WebhookDelivery {
+    pub id: i64,
+    pub webhook_id: String,
+    pub event_type: String,
+    pub status: String,
+    pub status_code: Option<i32>,
+    pub error_msg: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Wire shape for `GET /api/v1/webhooks/{webhookID}/deliveries`
+/// (issue #659). The handler returns a JSON object so the OpenAPI
+/// spec can document named properties — the `deliveries` array, the
+/// effective `limit`, and an opaque `next_cursor`.
+///
+/// **Cursor codec:** the server encodes `next_cursor` as URL-safe
+/// base64 (no padding) of `{ "v": 1, "ts": "<RFC3339Nano UTC>",
+/// "id": <int64> }`. The CLI treats the value as opaque — a future
+/// server version bump that changes the payload shape is
+/// surfaced as a typed error and the CLI prints the
+/// `ErrUnsupportedCursorVersion` message verbatim, no decoding on
+/// the client side. The shape is owned by the server's
+/// `webhook_delivery_cursor.go`; we only echo it back via `--cursor`.
+#[derive(Debug, Deserialize)]
+pub struct WebhookDeliveriesResponse {
+    pub deliveries: Vec<WebhookDelivery>,
+    pub limit: u32,
+    pub next_cursor: Option<String>,
 }
 
 /// Borrowed accessor for the webhook endpoints. Constructed via
@@ -186,5 +234,51 @@ impl<'a> WebhookClient<'a> {
             .context("DELETE /api/v1/webhooks/{id}")?;
         check_response(resp).context("remove webhook request failed")?;
         Ok(())
+    }
+
+    /// List delivery attempts for a webhook. Cursor pagination only
+    /// (issue #659); `--offset` is not exposed because the server
+    /// never advertises it. `limit = None` lets the server pick the
+    /// default (50); `cursor = None` requests the first page. The
+    /// server clamps `limit` to `[1, 200]`.
+    pub fn deliveries(
+        &self,
+        id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<WebhookDeliveriesResponse> {
+        let mut endpoint = format!(
+            "{}/api/v1/webhooks/{}/deliveries",
+            self.client.base_url(),
+            id
+        );
+        let mut query_parts: Vec<String> = Vec::new();
+        if let Some(l) = limit {
+            query_parts.push(format!("limit={l}"));
+        }
+        if let Some(c) = cursor {
+            // The cursor is an opaque token; it MAY contain URL-unsafe
+            // base64 chars (`-`, `_`) but never `&` / `=` — and the
+            // server's codec uses RawURLEncoding (no padding) so we
+            // don't need to percent-encode anything. We still append
+            // it verbatim to keep the wire shape trivially roundtrip-able
+            // when the user copy-pastes the next-page hint.
+            query_parts.push(format!("cursor={c}"));
+        }
+        if !query_parts.is_empty() {
+            endpoint.push('?');
+            endpoint.push_str(&query_parts.join("&"));
+        }
+        let resp = self
+            .client
+            .http()
+            .get(&endpoint)
+            .header("Authorization", self.client.auth_header())
+            .send()
+            .context("GET /api/v1/webhooks/{id}/deliveries")?;
+        let resp = check_response(resp).context("list webhook deliveries request failed")?;
+        resp.json().context(
+            "decoding list-deliveries response (missing 'deliveries'/'limit'/'next_cursor'?)",
+        )
     }
 }

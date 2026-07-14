@@ -413,6 +413,84 @@ components:
             $ref: '#/components/schemas/Webhook'
 
     # -------------------------------------------------------------------------
+    # Webhook deliveries (issue #659)
+    #
+    # `request_body` and `response_body` are deliberately NOT modeled
+    # here — the server tags them `json:"-"` on the Go side (see
+    # `edge-control-plane/internal/domain/webhook.go`), so the wire
+    # never carries them. Documenting them as schema fields would lie
+    # to SDK consumers.
+    # -------------------------------------------------------------------------
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Server-assigned monotonic delivery id.
+        webhook_id:
+          type: string
+          example: wh_abc123
+        event_type:
+          type: string
+          enum: [deploy, activate, rollback, auto_rollback]
+        status:
+          type: string
+          enum: [pending, success, failed, retrying]
+          description: |
+            Final outcome of this attempt:
+              * `success` — upstream returned a 2xx
+              * `failed`  — all retries exhausted (see `attempt`/`max_attempts`)
+              * `retrying` — transient failure; next attempt scheduled
+              * `pending`  — enqueued but not yet sent
+        status_code:
+          type: integer
+          nullable: true
+          description: HTTP status code returned by the upstream endpoint (null while pending).
+        error_msg:
+          type: string
+          description: Truncated upstream error / connection failure reason.
+        attempt:
+          type: integer
+          description: 1-based attempt counter.
+        max_attempts:
+          type: integer
+          description: Total retries budget for this event.
+        created_at:
+          type: string
+          format: date-time
+          description: Wall-clock time the delivery was enqueued.
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Wall-clock time the delivery reached a terminal status (null while pending).
+
+    WebhookDeliveriesResponse:
+      type: object
+      required: [deliveries, limit, next_cursor]
+      properties:
+        deliveries:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookDelivery'
+        limit:
+          type: integer
+          description: Effective page size after server-side clamping (max 200).
+          example: 50
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque cursor for the next page. Pass this string verbatim as
+            the `?cursor=` query parameter to fetch the next page.
+            `null` indicates the current page is the final page.
+            The cursor is base64url-encoded; its internal shape is server-private
+            and may change between server versions — consumers MUST treat it
+            as opaque.
+          example: eyJ2IjoxLCJ0cyI6IjIwMjYtMDctMTRUMTM6MDE6MDFaIiwiaWQiOjk5fQ
+
+    # -------------------------------------------------------------------------
     # Billing (issue #419)
     # -------------------------------------------------------------------------
     BillingCheckoutRequest:
@@ -3430,6 +3508,66 @@ paths:
       responses:
         '204':
           description: Webhook deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # Webhook delivery history (issue #659). Cursor pagination only —
+  # `?offset` is intentionally not exposed because the server never
+  # advertises it; clients should follow `next_cursor` instead. The
+  # response envelope is `{deliveries, limit, next_cursor}` so the
+  # OpenAPI schema can document named properties.
+  /api/v1/webhooks/{webhookID}/deliveries:
+    get:
+      operationId: listWebhookDeliveries
+      summary: List delivery attempts for a webhook (cursor pagination)
+      description: |
+        Returns the most recent delivery attempts for the given webhook,
+        newest first. The endpoint is tenant-scoped — a webhook owned by
+        another tenant (or unknown) returns 404, never leaking the existence
+        of webhook IDs across tenants.
+
+        Pages are bounded by `limit` (default 50, max 200). To page
+        forward, pass the previous response's `next_cursor` value as the
+        `cursor` query parameter verbatim. When `next_cursor` is `null`,
+        the current page is the final page.
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Webhook id (the `wh_…` prefix from `listWebhooks`).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Maximum deliveries per page. Server-side clamped to 200.
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Opaque next-page cursor from a prior response's `next_cursor`.
+            Treat as a black box; the server may change the internal shape
+            between versions.
+      responses:
+        '200':
+          description: Deliveries page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDeliveriesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
