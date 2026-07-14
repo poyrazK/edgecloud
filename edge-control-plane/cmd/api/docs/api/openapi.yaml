@@ -104,6 +104,35 @@ components:
           example:
             - heartbeat
 
+    # Returned only on the 503 path of GET /ready (issue #48 follow-up
+    # to PR #685). Distinct from HealthResponse because the unhealthy
+    # body carries the failing component + raw error, not the per-loop
+    # snapshot — operators want to know *why* the CP pulled itself
+    # from rotation, not just that it did.
+    UnhealthyResponse:
+      type: object
+      required: [status, failure_component, error]
+      properties:
+        status:
+          type: string
+          enum: [unhealthy]
+          example: unhealthy
+          description: Always `unhealthy` on this response. The 200/503 split is via HTTP status, not this field.
+        failure_component:
+          type: string
+          enum: [db, nats]
+          description: |
+            Which dependency check failed first. The DB ping runs
+            before NATS, so a simultaneous failure surfaces `db`.
+          example: db
+        error:
+          type: string
+          description: |
+            Raw error message from the failing dependency
+            (`db.PingContext` or `nc.FlushTimeout`). Operator-internal;
+            no PII or secret material leaks through here.
+          example: "dial tcp 127.0.0.1:5432: connect: connection refused"
+
     LoopState:
       type: object
       properties:
@@ -1809,7 +1838,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthResponse'
+                $ref: '#/components/schemas/UnhealthyResponse'
 
   /api/v1/tenants:
     post:

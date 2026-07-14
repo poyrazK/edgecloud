@@ -547,6 +547,29 @@ func TestReady_UnhealthyOnDBPingFailure(t *testing.T) {
 	if body["loops"] != nil {
 		t.Errorf("unhealthy response should not include loops map, got: %v", body["loops"])
 	}
+	// Pin the body to the documented UnhealthyResponse schema
+	// (docs/api/openapi.yaml:112 — added in this PR's follow-up so
+	// the 503 body shape is documented, not just the 200). The
+	// schema requires exactly status + failure_component + error;
+	// any extra field would diverge from the spec.
+	wantKeys := map[string]struct{}{
+		"status":            {},
+		"failure_component": {},
+		"error":             {},
+	}
+	for k := range body {
+		if _, ok := wantKeys[k]; !ok {
+			t.Errorf("unexpected key %q in 503 body (UnhealthyResponse schema does not declare it); full body: %v", k, body)
+		}
+	}
+	for k := range wantKeys {
+		if _, ok := body[k]; !ok {
+			t.Errorf("missing required key %q from 503 body (UnhealthyResponse schema requires it); full body: %v", k, body)
+		}
+	}
+	if errStr, ok := body["error"].(string); !ok || errStr == "" {
+		t.Errorf("error must be a non-empty string per UnhealthyResponse schema; got %v", body["error"])
+	}
 }
 
 // TestHealth_LivenessAlwaysOK verifies the post-#48 /health handler is

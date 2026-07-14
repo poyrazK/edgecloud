@@ -1520,6 +1520,28 @@ export interface components {
              */
             degraded_reasons?: string[];
         };
+        UnhealthyResponse: {
+            /**
+             * @description Always `unhealthy` on this response. The 200/503 split is via HTTP status, not this field.
+             * @example unhealthy
+             * @enum {string}
+             */
+            status: "unhealthy";
+            /**
+             * @description Which dependency check failed first. The DB ping runs
+             *     before NATS, so a simultaneous failure surfaces `db`.
+             * @example db
+             * @enum {string}
+             */
+            failure_component: "db" | "nats";
+            /**
+             * @description Raw error message from the failing dependency
+             *     (`db.PingContext` or `nc.FlushTimeout`). Operator-internal;
+             *     no PII or secret material leaks through here.
+             * @example dial tcp 127.0.0.1:5432: connect: connection refused
+             */
+            error: string;
+        };
         LoopState: {
             /** @example heartbeat */
             name?: string;
@@ -3026,7 +3048,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json": components["schemas"]["UnhealthyResponse"];
                 };
             };
         };
