@@ -47,6 +47,13 @@ returned. The handler captures `now := time.Now()` once per request and uses
 the same value when re-rendering the RFC3339 echo so parsing and echoing
 never drift.
 
+The `since` echo in the response reflects the **application server's clock**,
+not the DB clock — they are different `time.Now()` instantiations across two
+processes (the API and Postgres). A client that pins a follow-up request to
+that string should expect drift bounded by network RTT and NTP sync, which
+is fine for human-driven follow but not for tight machine loops. For those,
+prefer `--cursor`/`next_cursor`, which is server-relative and stable.
+
 ## Level ordering
 
 Severity ordering is defined in `service.LogLevelOrdinal`
@@ -102,6 +109,16 @@ predicate only narrows, it never broadens.
 (`edge-control-plane/internal/handler/logs.go`) — any request that supplies
 both, including `offset=0`, returns 400. The handler also returns 400 on
 malformed or unsupported-version cursors.
+
+A cursor whose `ts` is **strictly after** the supplied `until` returns 400
+(`internal/service/logs.go` — `if !q.Until.IsZero() && cursorTS.After(q.Until)`,
+typed as `ErrInvalidLogCursor`). Without this check the strict-tuple
+predicate and the `ts <= until` clause would silently produce an empty page,
+which is indistinguishable from "no more rows" — the empty page is the
+correct response to a stale cursor, but a cursor-supplied-after-`until`
+request is a client bug that should be flagged loudly. Cursors whose `ts`
+equals `until` are accepted (the `ts <= until` clause still has rows to return
+when `(ts,id)` is strictly less).
 
 ## Pagination semantics
 
@@ -173,6 +190,28 @@ edge logs myapp --follow
 edge logs myapp --offset 100
 ```
 
+### <a id="follow-burst-draining"></a>Follow burst-draining
+
+`edge logs --follow` polls every 2s. Each tick it issues one request, then
+**drains the cursor chain** by following `next_cursor` until the server
+returns a final page. Only after the chain is fully drained does the
+`since` watermark advance to the largest `ts` observed in this tick. The
+`boundary_ids` set captures exactly the rows sharing the new watermark —
+every other row in the window has a strictly greater `ts` and will not be
+re-served, so dedupe is reduced to a tiny set per tick instead of every
+row ever printed (which would be unbounded for a long follow).
+
+The drain-then-advance discipline matters when one tick contains a burst
+larger than `--limit`. A burst of 500 rows with `--limit=100` produces 5
+pages in the same tick; printing only the first page would advance the
+watermark past 400 unread rows. Draining first keeps the watermark grounded
+in the last row actually printed.
+
+Cross-reference: the implementation is at
+[`edge-cli/src/commands/logs.rs`](../edge-cli/src/commands/logs.rs) — see
+the `run_follow` watermark-advance block and the `entry.ts > *cur` strict
+comparison comment above it.
+
 ## Test coverage
 
 - **Go unit**:
@@ -184,8 +223,11 @@ edge logs myapp --offset 100
 - **Go unit**:
   [`internal/service/logs_test.go`](../edge-control-plane/internal/service/logs_test.go)
   pins `limit+1` semantics, cursor-mode suppression of `next_offset`,
-  cursor generation from the last visible row, `until` propagation, and
-  the existing defaults / severity translation.
+  cursor generation from the last visible row, `until` propagation,
+  **cursor + level combined propagation**, **cursor-after-`until`
+  rejection** (`TestLogService_RejectsCursorAfterUntil` — the typed
+  `ErrInvalidLogCursor` short-circuits before any repo call), and the
+  existing defaults / severity translation.
 - **Go unit**:
   [`internal/service/logs_cursor_test.go`](../edge-control-plane/internal/service/logs_cursor_test.go)
   pins the v1 roundtrip, URL-safe/no-padding encoding, malformed
@@ -205,7 +247,10 @@ edge logs myapp --offset 100
   JSON output, clap mutual exclusion (`--cursor`/`--offset`, `--follow`
   with `--until`/`--cursor`/`--offset`), `--until` forwarding, stable
   filter preservation, burst draining over multiple pages,
-  equal-timestamp boundary dedupe, and Ctrl-C between pages.
+  equal-timestamp boundary dedupe, Ctrl-C between pages, **stale-cursor
+  empty-page exit** (`logs_stale_cursor_returns_empty_page_exits_cleanly`),
+  and pure `interruptible_sleep` SIGINT-flag semantics
+  (`interruptible_sleep_returns_early_when_stop_is_set`).
 
 ## What is explicitly out of scope
 

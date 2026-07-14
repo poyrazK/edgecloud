@@ -315,6 +315,14 @@ fn run_follow(
                         }
                     }
                     Some(cur) if entry.ts > *cur => {
+                        // Strict-`>` byte comparison is correct here
+                        // because the server emits `ts` as the
+                        // canonical RFC3339 UTC wire form
+                        // (`...-07-14T13:00:00.123456789Z`) for
+                        // every entry it returns — same width, same
+                        // alignment, no timezone suffix surprises.
+                        // ISO-8601 ordering matches byte ordering
+                        // under that fixed shape.
                         // New max — replace the id set.
                         new_max_ts = Some(entry.ts.clone());
                         new_max_ids.clear();
@@ -337,12 +345,30 @@ fn run_follow(
             // next_cursor is None, the server returned the final
             // page.
             next_cursor = resp.next_cursor;
-            if next_cursor.is_none() {
+            if next_cursor.as_deref().is_none_or(str::is_empty) {
+                // Server contract says terminal page is `null`,
+                // but belt-and-suspenders against a buggy server
+                // emitting `""`: treat empty string as terminal
+                // too, so the drain doesn't loop forever and
+                // doesn't issue a request with `?cursor=` (which
+                // the server would 400 as malformed).
                 break;
             }
         }
 
         // --- Advance the watermark (only after draining) ---
+        //
+        // The "drain-then-advance" discipline is the entire
+        // correctness invariant of `--follow`: the boundary set
+        // captures exactly the rows that may be re-served on the
+        // NEXT tick (rows whose ts equals the new watermark). The
+        // next-tick request is `since=watermark` inclusive, so the
+        // server WILL re-return the boundary rows; without dedupe
+        // we would double-print the same row.
+        //
+        // See docs/logs-api.md#follow-burst-draining for the
+        // end-to-end example and the reason we replace `boundary_ids`
+        // (rather than union it with `new_max_ids`).
         if printed_this_window {
             if let Some(new_ts) = new_max_ts {
                 since = new_ts;

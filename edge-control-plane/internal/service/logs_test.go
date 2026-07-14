@@ -18,12 +18,14 @@ import (
 type stubLister struct {
 	entries    []domain.LogEntry
 	err        error
+	called     bool
 	lastFilter repository.LogListFilter
 }
 
 func (s *stubLister) ListByTenantApp(
 	_ context.Context, _, _ string, filter repository.LogListFilter,
 ) ([]domain.LogEntry, error) {
+	s.called = true
 	s.lastFilter = filter
 	return s.entries, s.err
 }
@@ -416,6 +418,75 @@ func TestLogService_UntilPropagatesToRepo(t *testing.T) {
 	}
 	if !repo.lastFilter.Until.Equal(until) {
 		t.Errorf("repo until = %s, want %s", repo.lastFilter.Until, until)
+	}
+}
+
+// TestLogService_CursorAndLevelPropagateTogether pins that the
+// service correctly composes a cursor with a minimum-severity
+// level filter. The repository integration test
+// (TestLogEntryRepoIntegration_CombinedFiltersCompose) covers the
+// SQL contract; this test pins the in-Go combination — that the
+// service decodes the cursor into (ts, id), translates the level
+// into the set of accepted levels, and hands BOTH to the repo
+// (rather than silently dropping one when the other is present).
+func TestLogService_CursorAndLevelPropagateTogether(t *testing.T) {
+	repo := &stubLister{}
+	svc := NewLogService(repo)
+	cursor, err := encodeLogCursor(time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC), 99)
+	if err != nil {
+		t.Fatalf("encodeLogCursor: %v", err)
+	}
+	_, err = svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+		Limit:  50,
+		MinLvl: "warn",
+		Cursor: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListByTenantApp: %v", err)
+	}
+	wantLevels := LevelsAtOrAbove("warn")
+	if !reflect.DeepEqual(repo.lastFilter.Levels, wantLevels) {
+		t.Errorf("repo levels = %v, want %v", repo.lastFilter.Levels, wantLevels)
+	}
+	if repo.lastFilter.CursorID != 99 {
+		t.Errorf("repo cursor id = %d, want 99", repo.lastFilter.CursorID)
+	}
+	wantTS := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	if !repo.lastFilter.CursorTS.Equal(wantTS) {
+		t.Errorf("repo cursor ts = %s, want %s", repo.lastFilter.CursorTS, wantTS)
+	}
+}
+
+// TestLogService_RejectsCursorAfterUntil pins that the service
+// rejects a request whose cursor ts is strictly after the supplied
+// `until`. Without this check, the strict-tuple predicate and the
+// `ts <= until` clause would silently produce an empty page — the
+// client would think "no more rows" when they really meant "rows
+// up to a different time bound". The handler maps the returned
+// ErrInvalidLogCursor sentinel to a 400 (see
+// TestLogsList_RejectsCursorAndOffsetTogether for the existing
+// handler-level cursor rejection path).
+func TestLogService_RejectsCursorAfterUntil(t *testing.T) {
+	repo := &stubLister{}
+	svc := NewLogService(repo)
+	// Cursor encodes (ts=13:00:00Z, id=42). `until` is 12:00:00Z,
+	// so cursor.ts is strictly after until.
+	cursor, err := encodeLogCursor(time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC), 42)
+	if err != nil {
+		t.Fatalf("encodeLogCursor: %v", err)
+	}
+	until := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	_, err = svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
+		Limit:  50,
+		Until:  until,
+		Cursor: cursor,
+	})
+	if !errors.Is(err, ErrInvalidLogCursor) {
+		t.Fatalf("err = %v, want ErrInvalidLogCursor", err)
+	}
+	// Repo must NOT be called when the request is invalid.
+	if repo.called {
+		t.Errorf("repo called despite cursor-after-until rejection")
 	}
 }
 

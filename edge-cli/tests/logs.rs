@@ -854,3 +854,44 @@ async fn logs_cursor_passes_through_to_server() {
         .stdout(predicate::str::contains("page2-first"))
         .stdout(predicate::str::contains("page2-second"));
 }
+
+/// Stale-cursor test (issue #644 follow-up): a `--cursor` whose
+/// `(ts, id)` resolves to a position older than any retained row
+/// (e.g. the cursor was issued against a row that LogGC has since
+/// deleted) should produce an empty page from the server. The CLI
+/// must exit 0 without panicking — this is the contract: stale
+/// cursors degrade silently, not as errors.
+#[tokio::test]
+async fn logs_stale_cursor_returns_empty_page_exits_cleanly() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+    seed_project(&project, "myapp");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps/myapp/logs"))
+        .and(query_param("cursor", "expired-cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [],
+            "limit": 100,
+            "since": "2026-06-24T11:55:00Z",
+            "next_cursor": null,
+            "next_offset": null,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.env("EDGE_API_URL", server.uri());
+    cmd.current_dir(project.path());
+    cmd.arg("logs");
+    cmd.arg("myapp");
+    cmd.arg("--cursor");
+    cmd.arg("expired-cursor");
+
+    cmd.assert().success().stdout(predicate::str::is_empty());
+}

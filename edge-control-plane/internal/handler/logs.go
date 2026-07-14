@@ -110,6 +110,13 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrInvalidLogCursor) || errors.Is(err, service.ErrUnsupportedLogCursorVersion) {
+			// Log the typed reason at info level so an operator
+			// can distinguish "malformed base64 / JSON" from
+			// "unsupported cursor version" without enabling
+			// debug logging. The wire response collapses both
+			// to a generic "invalid cursor" so we don't leak
+			// decoder internals to clients.
+			log.Printf("invalid cursor (tenant=%s app=%s): %v", tenantID, appName, err)
 			httperror.BadRequestCtx(w, r, "invalid cursor")
 			return
 		}

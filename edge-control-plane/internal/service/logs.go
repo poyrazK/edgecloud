@@ -171,6 +171,20 @@ func (s *LogService) ListByTenantApp(
 		if err != nil {
 			return nil, err
 		}
+		// Reject the silent-empty case: if the caller supplied
+		// `until` AND the cursor points at a row whose ts is
+		// strictly after until, the strict-tuple predicate and
+		// the `ts <= until` clause will both filter the result
+		// down to nothing. The client almost certainly intended
+		// either a different cursor or a different `until`;
+		// returning a typed error lets the handler surface a
+		// friendly 400 instead of an empty page that looks like
+		// "no more rows".
+		if !q.Until.IsZero() && cursorTS.After(q.Until) {
+			return nil, fmt.Errorf("%w: cursor ts %s is after until %s",
+				ErrInvalidLogCursor, cursorTS.UTC().Format(time.RFC3339Nano),
+				q.Until.UTC().Format(time.RFC3339Nano))
+		}
 	}
 
 	entries, err := s.repo.ListByTenantApp(ctx, tenantID, appName, repository.LogListFilter{
