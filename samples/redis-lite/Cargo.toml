@@ -1,0 +1,49 @@
+[package]
+name = "redis-lite"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "edgeCloud L4/TCP demo — minimal RESP server (PING / ECHO / SET / GET / DEL) persisted via edge:cloud/kv-store. Long-running guest on world = \"edge-runtime\"."
+
+# Isolated workspace: without this, cargo would walk up to the parent
+# edgeCloud workspace and try to resolve `redis-lite` against the
+# host repo's members (edge-runtime, edge-cli, edge-worker, …).
+# Those are host-only crates that can't be cross-compiled to
+# wasm32-unknown-unknown. Same pattern as samples/hello-tcp.
+#
+# `resp-parser` is a workspace member (instead of a sibling `[workspace]`
+# root) so the parser unit tests can run on the host while the cdylib
+# still builds for wasm32-unknown-unknown. Listing the parser here keeps
+# cargo's "single workspace root" invariant.
+[workspace]
+members = ["resp-parser"]
+
+[lib]
+# `cdylib` is what `edge build` / `wasm-tools component new` consumes
+# (the WASM cross-compile target). `rlib` lets the host-side `cargo
+# test` linker resolve `_main` from the test harness without us
+# having to ship a `bin/main.rs` that the WASM pipeline would
+# accidentally pick up (the empty `[workspace]` block above prevents
+# cargo from walking up to the parent edgeCloud workspace).
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Same wit-bindgen major as edge-worker/tests/fixtures/handler/Cargo.toml
+# and samples/hello-tcp/Cargo.toml. wasmtime 45.0.3 (the runtime this
+# repo ships) expects a wasi:http@0.2.1 component, which wit-bindgen
+# 0.45 emits. The `wasi:sockets/*` + `edge:cloud/kv-store` types we
+# use here were stable at 0.45 too.
+wit-bindgen = "0.45"
+
+# RESP2 protocol parser, extracted from this crate into a sibling
+# so the unit tests can run on the host (the parent crate is
+# `#![no_main]` for the WASM cdylib, which prevents `cargo test`
+# from linking a test binary). Implementation is duplicated
+# byte-for-byte across the two files; keep them in sync.
+redis-lite-resp = { path = "resp-parser" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

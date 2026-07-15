@@ -11,6 +11,7 @@ Cargo.lock
 !edge-worker/tests/fixtures/js_websocket_handler.wasm
 !edge-worker/tests/fixtures/handler.wasm
 !edge-worker/tests/fixtures/test-handle.wasm
+!edge-worker/tests/fixtures/redis_lite.wasm
 *.wat
 *.log
 .env

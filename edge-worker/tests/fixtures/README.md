@@ -10,10 +10,11 @@ existing supervisor tests.
 |------------------------------|--------|-------|
 | `handler/` (Rust source)     | ✅ builds | `cargo build --target wasm32-unknown-unknown --release` produces `target/wasm32-unknown-unknown/release/edge_fixture_handler.wasm` |
 | `handler.wasm` (pre-built)   | ✅ committed | SHA-256 in `test_fixtures_match_source.rs` |
-| `long_running/`              | ⏳ stub | deferred — see "Open items" |
+| `redis_lite/` (Rust source)  | ✅ builds | `samples/redis-lite/` LR TCP/RESP guest (issue #496). Build via `cd samples/redis-lite && ../../target/release/edge build` |
+| `redis_lite.wasm` (pre-built)| ✅ committed | SHA-256 in `test_fixtures_match_source.rs`; e2e in `edge-worker/tests/redis_lite_e2e.rs` |
 | `kv/`                        | ⏳ stub | deferred — see "Open items" |
 | `test-handle.wasm`           | ✅ legacy | retained for the 9 supervisor integration tests from v0.1 |
-| `wit/`                       | ✅ vendored | shared by all 3 fixture crates |
+| `wit/`                       | ✅ vendored | shared by all fixture crates |
 
 ## Build workflow (Phase D-final)
 
@@ -150,9 +151,9 @@ deadline, the guest must burn its own CPU. `/busy` does that.
 
 ## Open items
 
-- `long_running/` (L8) — needs a `wasi:sockets/*` TCP echo server.
-  Deferred; the supervisor's long-running path runs `wasi:http`
-  already-built FaaS components via the `wasmtime_wasi_http` plumbing.
+- `long_running/` (L8) — implemented by `redis_lite/` above (issue
+  #496) — a `wasi:sockets/*` TCP RESP server exercising the LR
+  supervisor path. Replaces the stub row in the table.
 - `kv/` (L6/L9/L10) — needs `edge:cloud/kv-store` and
   `wasi:filesystem/*` plus `wasi:http/outgoing-handler`. Deferred;
   these need additional wit-bindgen API gymnastics (resource lifetimes,
