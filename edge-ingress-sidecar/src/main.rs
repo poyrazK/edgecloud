@@ -30,37 +30,28 @@
 //!
 //! See issue #665 for the design doc + PR breakdown.
 
-// All modules are `pub` so the integration test binary
-// (`tests/integration_test.rs`) can drive the full pipeline:
-// publisher (`nats_pub::NatsPublisher::publish_delta`) → consumer
-// (`nats_sub::spawn_consumer` + freshness gate) → aggregator
-// (`Aggregator::tick`) → snapshot (`Snapshot::per_replica_cap`).
-// The binary keeps the same surface; only the visibility flips. The
-// only consumer of these `pub` paths outside the binary is the
-// integration test, which is gated behind `RUN_INTEGRATION_TESTS`.
-pub mod aggregate;
-pub mod caddy_metrics;
-pub mod config;
-pub mod expose;
-pub mod nats_pub;
-pub mod nats_sub;
+// Modules are declared in `src/lib.rs` (PR E) so the integration
+// test (`tests/integration_test.rs`) can reach them via
+// `edge_ingress_sidecar::*`. The binary imports from the library
+// crate (they share the same name; see Cargo.toml [lib]). Identical
+// runtime behaviour — the bin just adds `fn main`.
+extern crate edge_ingress_sidecar;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use edge_ingress_sidecar::aggregate::{Aggregator, Snapshot};
+use edge_ingress_sidecar::caddy_metrics::{spawn_scraper, DeltaMsg};
+use edge_ingress_sidecar::config::Config;
+use edge_ingress_sidecar::expose::snapshot_to_writer;
+use edge_ingress_sidecar::nats_pub::{spawn_publisher, NatsPublisher};
+use edge_ingress_sidecar::nats_sub::spawn_consumer;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-
-use crate::aggregate::{Aggregator, Snapshot};
-use crate::caddy_metrics::{spawn_scraper, DeltaMsg};
-use crate::config::Config;
-use crate::expose::snapshot_to_writer;
-use crate::nats_pub::{spawn_publisher, NatsPublisher};
-use crate::nats_sub::spawn_consumer;
 
 /// Channel buffer between the scraper and the NATS publisher. The
 /// scraper ticks at 1 Hz; a buffer of 4 covers 4 missed publishes
@@ -213,7 +204,7 @@ async fn main() -> ExitCode {
     let uds_path = Arc::<std::path::Path>::from(std::path::PathBuf::from(&cfg.uds_path));
     let on_snapshot: Arc<dyn Fn(Snapshot) + Send + Sync> = Arc::new(snapshot_to_writer(uds_path));
     let aggregator_handle =
-        crate::aggregate::spawn_aggregator(aggregator, agg_rx, on_snapshot, shutdown.clone());
+        edge_ingress_sidecar::aggregate::spawn_aggregator(aggregator, agg_rx, on_snapshot, shutdown.clone());
 
     // ── Signal handlers (mirror edge-ingress/src/main.rs:180-211) ──
     let mut sigterm =
