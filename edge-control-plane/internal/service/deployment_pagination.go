@@ -1,16 +1,24 @@
-// deployment_pagination.go (issue #58) — deployments-list cursor codec.
+// deployment_pagination.go (issue #58 + #709) — deployments-list
+// cursor codec.
 //
 // The deployments list orders on (created_at DESC, id DESC) and the
-// keyset predicate is (created_at, id) < ($afterTS, $afterID). The
-// cursor payload is therefore a strict-tuple — a single string is
-// not enough because two deployments can share a second-precision
-// timestamp and the (id DESC) tiebreaker is load-bearing.
+// keyset predicate is `created_at < $3 OR (created_at = $3 AND id <
+// $4)`. The cursor payload is therefore a strict-tuple — a single
+// string is not enough because two deployments can share a
+// second-precision timestamp and the (id DESC) tiebreaker is
+// load-bearing.
 //
 // Mirrors the per-resource codec shape at internal/service/
 // webhook_delivery_cursor.go — same v1 envelope, same RawURLEncoding
 // base64url, same typed-error contract — but delegates the encode
 // and decode primitives to internal/httpx so every list endpoint
 // shares the wire format.
+//
+// Issue #709 — the deployments.id column is TEXT (the `d_<uuid>`
+// convention codified in domain.Deployment.ID), so the cursor
+// payload carries the id as a string, not int64. The SQL comparator
+// handles the lexicographic tiebreaker on the text column directly;
+// the codec is unchanged in shape from #58.
 //
 // Resource-specific zero-guards:
 //
@@ -19,20 +27,14 @@
 //     zero values up front; decodeDeploymentCursor rejects what
 //     slips through hand-crafted cursors.
 //
-//   - ID must be > 0. ID is the deployments PK (SERIAL), so a zero
-//     value can never appear in a real row — but accepting it would
-//     silently no-op the keyset predicate.
+//   - ID must NOT be empty. The text PK guarantees uniqueness, so an
+//     empty id can never appear in a real row — but accepting one
+//     would silently no-op the keyset predicate.
 //
 // Both encode and decode force UTC: timestamps in the cursor are
 // stored without a tz suffix by json.Marshal, so a naive parse round-
 // trip can drift if the caller is in a non-UTC tz. We .UTC() both
 // directions to keep the wire canonical.
-//
-// Issue #58 dual-envelope: deployments keeps ?offset= + next_offset
-// for one compat release so the existing CLI's --page flag still
-// works against the new server. The follow-up to drop those lives
-// in #58-followup (modeled on issue #682, the logs offset-retire
-// follow-up).
 
 package service
 
@@ -46,14 +48,15 @@ import (
 
 // deploymentCursor is the opaque payload embedded in the v1 cursor
 // envelope for GET /api/v1/list/{appName}. TS is the deployments
-// row's created_at (UTC); ID is the row's BIGSERIAL pk. The
-// keyset predicate at the SQL layer is `(created_at, id) < ($3, $4)`,
-// so these two fields MUST travel together — a single-field cursor
+// row's created_at (UTC); ID is the row's text PK (`d_<uuid>`).
+// These two fields MUST travel together — a single-field cursor
 // would lose the tiebreaker and silently skip rows that share a
-// timestamp.
+// timestamp. Adding fields here requires bumping the cursor version
+// on the httpx side and a migration in this file — keep this
+// struct minimal.
 type deploymentCursor struct {
 	TS time.Time `json:"ts"`
-	ID int64     `json:"id"`
+	ID string    `json:"id"`
 }
 
 // Errors this codec can return. Chained via %w to the underlying
@@ -79,16 +82,16 @@ var (
 // via httpx and returns a base64url string. Both TS and ID are
 // required: zero values are rejected up front because they would
 // either no-op the keyset predicate (zero TS) or violate the
-// schema (zero ID, since deployments.id is BIGSERIAL).
+// schema (empty ID, since deployments.id is the NOT NULL TEXT PK).
 //
 // TS is normalized to UTC so the wire is canonical regardless of
 // the caller's local timezone — a Postgres TIMESTAMPTZ round-trip
 // always lands in UTC and the cursor must match.
-func encodeDeploymentCursor(ts time.Time, id int64) (string, error) {
+func encodeDeploymentCursor(ts time.Time, id string) (string, error) {
 	if ts.IsZero() {
 		return "", ErrInvalidDeploymentCursor
 	}
-	if id <= 0 {
+	if id == "" {
 		return "", ErrInvalidDeploymentCursor
 	}
 	return httpx.EncodeCursor(deploymentCursor{TS: ts.UTC(), ID: id})
@@ -103,26 +106,26 @@ func encodeDeploymentCursor(ts time.Time, id int64) (string, error) {
 //
 // TS is normalized to UTC so the wire is canonical regardless of
 // the caller's local timezone.
-func decodeDeploymentCursor(s string) (time.Time, int64, error) {
+func decodeDeploymentCursor(s string) (time.Time, string, error) {
 	var c deploymentCursor
 	if err := httpx.DecodeCursor(s, &c); err != nil {
 		if errors.Is(err, httpx.ErrUnsupportedCursorVersion) {
-			return time.Time{}, 0, ErrUnsupportedDeploymentCursorVersion
+			return time.Time{}, "", ErrUnsupportedDeploymentCursorVersion
 		}
-		return time.Time{}, 0, ErrInvalidDeploymentCursor
+		return time.Time{}, "", ErrInvalidDeploymentCursor
 	}
 	if c.TS.IsZero() {
 		// A v1 envelope that decoded cleanly but carries a zero TS
 		// is treated as malformed. encodeDeploymentCursor never
 		// produces one; a hand-crafted or partial cursor shouldn't
 		// slip through.
-		return time.Time{}, 0, ErrInvalidDeploymentCursor
+		return time.Time{}, "", ErrInvalidDeploymentCursor
 	}
-	if c.ID <= 0 {
-		// Same reasoning for ID — a zero or negative ID can never
-		// appear in a real deployments row, so accepting one would
-		// silently no-op the keyset predicate.
-		return time.Time{}, 0, ErrInvalidDeploymentCursor
+	if c.ID == "" {
+		// Same reasoning for ID — an empty ID can never appear in
+		// a real deployments row, so accepting one would silently
+		// no-op the keyset predicate.
+		return time.Time{}, "", ErrInvalidDeploymentCursor
 	}
 	return c.TS.UTC(), c.ID, nil
 }

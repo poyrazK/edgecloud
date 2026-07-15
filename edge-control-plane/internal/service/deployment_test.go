@@ -28,7 +28,7 @@ type mockDeployDeploymentRepo struct {
 	getByIDFn            func(ctx context.Context, id string) (*domain.Deployment, error)
 	listByAppFn          func(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
 	countByAppFn         func(ctx context.Context, tenantID, appName string) (int, error)
-	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error)
+	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error)
 	createFn             func(ctx context.Context, deployment *domain.Deployment) error
 	deleteByIDFn         func(ctx context.Context, id string) error
 }
@@ -52,7 +52,7 @@ func (m *mockDeployDeploymentRepo) CountByApp(ctx context.Context, tenantID, app
 	}
 	return 0, nil
 }
-func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error) {
+func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error) {
 	if m.listByAppPaginatedFn != nil {
 		return m.listByAppPaginatedFn(ctx, tenantID, appName, afterTS, afterID, limit)
 	}
@@ -937,7 +937,7 @@ func TestListDeploymentsPaginated_NonPositiveLimitRejected(t *testing.T) {
 func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
 	var capturedLimit int
 	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, limit int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, limit int) ([]domain.Deployment, error) {
 			capturedLimit = limit
 			return nil, nil
 		},
@@ -957,10 +957,10 @@ func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
 // the repo's first-page SQL.
 func TestListDeploymentsPaginated_FirstPage_NoCursor(t *testing.T) {
 	var capturedTS time.Time
-	var capturedID int64
+	var capturedID string
 	var capturedLimit int
 	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error) {
 			capturedTS, capturedID, capturedLimit = afterTS, afterID, limit
 			return nil, nil
 		},
@@ -975,8 +975,8 @@ func TestListDeploymentsPaginated_FirstPage_NoCursor(t *testing.T) {
 	if !capturedTS.IsZero() {
 		t.Errorf("afterTS = %v, want zero", capturedTS)
 	}
-	if capturedID != 0 {
-		t.Errorf("afterID = %d, want 0", capturedID)
+	if capturedID != "" {
+		t.Errorf("afterID = %q, want empty", capturedID)
 	}
 	if capturedLimit != 21 {
 		t.Errorf("capturedLimit = %d, want 21 (limit+1)", capturedLimit)
@@ -986,18 +986,20 @@ func TestListDeploymentsPaginated_FirstPage_NoCursor(t *testing.T) {
 // TestListDeploymentsPaginated_CursorDecodedAndForwardsKeyset pins
 // the contract that a non-empty afterCursor is decoded and the
 // strict-tuple components are forwarded to the repo unchanged.
+// Issue #709 — the id travels as a text PK (`d_<uuid>`), so the
+// repo receives a string, not an int64.
 func TestListDeploymentsPaginated_CursorDecodedAndForwardsKeyset(t *testing.T) {
 	wantTS := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	const wantID int64 = 42
+	const wantID = "d_42"
 	cursor, err := encodeDeploymentCursor(wantTS, wantID)
 	if err != nil {
 		t.Fatalf("encodeDeploymentCursor: %v", err)
 	}
 
 	var capturedTS time.Time
-	var capturedID int64
+	var capturedID string
 	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID string, _ int) ([]domain.Deployment, error) {
 			capturedTS, capturedID = afterTS, afterID
 			return nil, nil
 		},
@@ -1012,7 +1014,7 @@ func TestListDeploymentsPaginated_CursorDecodedAndForwardsKeyset(t *testing.T) {
 		t.Errorf("afterTS = %v, want %v", capturedTS, wantTS)
 	}
 	if capturedID != wantID {
-		t.Errorf("afterID = %d, want %d", capturedID, wantID)
+		t.Errorf("afterID = %q, want %q", capturedID, wantID)
 	}
 }
 
@@ -1030,16 +1032,23 @@ func TestListDeploymentsPaginated_BadCursor_Chains(t *testing.T) {
 	}
 }
 
-// TestListDeploymentsPaginated_D_EncodedCursor_Rejects pins the
-// text-PK limitation documented in mustParseDeploymentID: the
-// deployments.id is a `d_…` prefixed text column, so a cursor
-// built from a real row's (TS, ID) trips the codec's id>0 guard.
-// This is intentional — see the TODO at mustParseDeploymentID.
-// Follow-up #58-followup swaps the cursor to (created_at, id_text).
-func TestListDeploymentsPaginated_D_EncodedCursor_Rejects(t *testing.T) {
+// TestListDeploymentsPaginated_TextPKCursorRoundTrips pins the new
+// contract (issue #709): the deployments.id column is TEXT
+// (`d_<uuid>`), so a cursor built from a real row's (TS, ID)
+// round-trips through encodeDeploymentCursor / decodeDeploymentCursor
+// without rejection. Pre-#709 this test was named
+// `TestListDeploymentsPaginated_D_EncodedCursor_Rejects` and pinned
+// the documented limitation that `mustParseDeploymentID` returned 0
+// for text ids; the codec swap in #709 retires that limitation.
+//
+// With limit=2 the service fetches limit+1=3 rows from the mock, the
+// repo returns d_a/d_b/d_c (newest first), hasMore=true trims to
+// [d_a, d_b], and the cursor encodes the LAST VISIBLE row (d_b) so
+// the next page starts strictly past it.
+func TestListDeploymentsPaginated_TextPKCursorRoundTrips(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{
 				{ID: "d_a", TenantID: "t_test", AppName: "myapp", CreatedAt: ts},
 				{ID: "d_b", TenantID: "t_test", AppName: "myapp", CreatedAt: ts.Add(-time.Second)},
@@ -1050,13 +1059,27 @@ func TestListDeploymentsPaginated_D_EncodedCursor_Rejects(t *testing.T) {
 	svc := &DeploymentService{deploymentRepo: repo,
 		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
-	_, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 2, "")
-	// mustParseDeploymentID returns 0 for text ids, encode rejects 0,
-	// service surfaces an error. This is the documented limitation;
-	// until #58-followup lands the cursor codec must NOT produce
-	// working cursors against d_-prefixed ids.
-	if err == nil {
-		t.Fatal("err = nil, want non-nil (text PK cannot be encoded as int64 — see mustParseDeploymentID TODO)")
+	page, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 2, "")
+	if err != nil {
+		t.Fatalf("ListDeploymentsPaginated (first page, text PK cursor): %v", err)
+	}
+	if page.NextCursor == nil {
+		t.Fatal("NextCursor = nil, want encoded cursor (limit+1 returned 3 rows with limit=2 → hasMore)")
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("Items len = %d, want 2 (limit=2 trim)", len(page.Items))
+	}
+	// Round-trip the cursor back through the codec to prove the
+	// (ts, id_text) pair decodes cleanly.
+	gotTS, gotID, err := decodeDeploymentCursor(*page.NextCursor)
+	if err != nil {
+		t.Fatalf("decodeDeploymentCursor: %v", err)
+	}
+	if !gotTS.Equal(ts.Add(-time.Second)) {
+		t.Errorf("decoded TS = %v, want %v (last visible row d_b's created_at)", gotTS, ts.Add(-time.Second))
+	}
+	if gotID != "d_b" {
+		t.Errorf("decoded ID = %q, want d_b (last visible row)", gotID)
 	}
 }
 
@@ -1069,7 +1092,7 @@ func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
 		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
 			return 42, nil
 		},
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			// Return exactly `limit` rows so NextCursor stays nil
 			// and the only assertions are on Total + NextOffset.
 			return []domain.Deployment{
@@ -1104,7 +1127,7 @@ func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
 func TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	wantTS := ts
-	const wantID int64 = 42
+	const wantID = "d_42"
 	cursor, err := encodeDeploymentCursor(wantTS, wantID)
 	if err != nil {
 		t.Fatalf("encodeDeploymentCursor: %v", err)
@@ -1113,7 +1136,7 @@ func TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset(t *testing.T
 		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
 			return 7, nil
 		},
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{ID: "d_2", TenantID: "t_test", AppName: "myapp", CreatedAt: ts}}, nil
 		},
 	}

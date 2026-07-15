@@ -8,12 +8,13 @@ import (
 
 // TestEncodeDeploymentCursor_HappyPath round-trips a (ts, id) tuple
 // through encode/decode. UTC normalization is verified — the input
-// is in a non-UTC zone and the decoded value must be in UTC.
+// is in a non-UTC zone and the decoded value must be in UTC. Issue
+// #709 — id is a text PK (`d_<uuid>`), not int64.
 func TestEncodeDeploymentCursor_HappyPath(t *testing.T) {
 	// Pick a fixed point so the encoded cursor is reproducible
 	// across test runs (avoids flakiness from time.Now).
 	wantTS := time.Date(2026, 7, 15, 12, 34, 56, 0, time.FixedZone("PDT", -7*3600))
-	const wantID int64 = 42
+	const wantID = "d_42"
 
 	encoded, err := encodeDeploymentCursor(wantTS, wantID)
 	if err != nil {
@@ -28,7 +29,7 @@ func TestEncodeDeploymentCursor_HappyPath(t *testing.T) {
 		t.Fatalf("decodeDeploymentCursor(%q): %v", encoded, err)
 	}
 	if gotID != wantID {
-		t.Errorf("ID round-trip: got %d, want %d", gotID, wantID)
+		t.Errorf("ID round-trip: got %q, want %q", gotID, wantID)
 	}
 	// TS round-trip: the wire is UTC, the input was PDT. The instant
 	// must match; only the Location differs.
@@ -44,23 +45,20 @@ func TestEncodeDeploymentCursor_HappyPath(t *testing.T) {
 // guard against a zero time.Time. A zero TS would silently no-op
 // the keyset predicate (every row's created_at > 0001-01-01).
 func TestEncodeDeploymentCursor_ZeroTSRejected(t *testing.T) {
-	_, err := encodeDeploymentCursor(time.Time{}, 42)
+	_, err := encodeDeploymentCursor(time.Time{}, "d_42")
 	if !errors.Is(err, ErrInvalidDeploymentCursor) {
 		t.Errorf("err = %v, want ErrInvalidDeploymentCursor", err)
 	}
 }
 
-// TestEncodeDeploymentCursor_NonPositiveIDRejected pins the ID
-// guard. deployments.id is BIGSERIAL so a non-positive value can
-// never appear in a real row.
-func TestEncodeDeploymentCursor_NonPositiveIDRejected(t *testing.T) {
+// TestEncodeDeploymentCursor_EmptyIDRejected pins the ID guard. The
+// deployments.id column is TEXT (NOT NULL), so an empty id can never
+// appear in a real row — accepting it would silently no-op the
+// keyset predicate. Issue #709 swapped the codec from int64 to text.
+func TestEncodeDeploymentCursor_EmptyIDRejected(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
-	cases := []int64{0, -1, -42}
-	for _, id := range cases {
-		_, err := encodeDeploymentCursor(ts, id)
-		if !errors.Is(err, ErrInvalidDeploymentCursor) {
-			t.Errorf("id=%d: err=%v, want ErrInvalidDeploymentCursor", id, err)
-		}
+	if _, err := encodeDeploymentCursor(ts, ""); !errors.Is(err, ErrInvalidDeploymentCursor) {
+		t.Errorf("err = %v, want ErrInvalidDeploymentCursor", err)
 	}
 }
 
@@ -92,23 +90,24 @@ func TestDecodeDeploymentCursor_BadJSON(t *testing.T) {
 // envelope is well-formed), but this file's decodeDeploymentCursor
 // must still reject it with ErrInvalidDeploymentCursor.
 func TestDecodeDeploymentCursor_ZeroTSInPayload(t *testing.T) {
-	// {"v":1,"p":{"ts":"0001-01-01T00:00:00Z","id":42}}
-	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpZCI6NDJ9fQ"
+	// {"v":1,"p":{"ts":"0001-01-01T00:00:00Z","id":"d_42"}}
+	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpZCI6ImRfNDIifX0"
 	_, _, err := decodeDeploymentCursor(bad)
 	if !errors.Is(err, ErrInvalidDeploymentCursor) {
 		t.Errorf("err = %v, want ErrInvalidDeploymentCursor (zero TS payload)", err)
 	}
 }
 
-// TestDecodeDeploymentCursor_NonPositiveIDInPayload — mirror of the
-// zero-TS test, for the ID field. A v1 envelope with id<=0 must
-// chain to ErrInvalidDeploymentCursor.
-func TestDecodeDeploymentCursor_NonPositiveIDInPayload(t *testing.T) {
-	// {"v":1,"p":{"ts":"2026-07-15T12:34:56Z","id":0}}
-	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6MH19"
+// TestDecodeDeploymentCursor_EmptyIDInPayload — mirror of the
+// zero-TS test, for the ID field. A v1 envelope with an empty id
+// must chain to ErrInvalidDeploymentCursor. Issue #709 — id is
+// text now, so the payload's id field is quoted in the JSON.
+func TestDecodeDeploymentCursor_EmptyIDInPayload(t *testing.T) {
+	// {"v":1,"p":{"ts":"2026-07-15T12:34:56Z","id":""}}
+	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6IiJ9fQ"
 	_, _, err := decodeDeploymentCursor(bad)
 	if !errors.Is(err, ErrInvalidDeploymentCursor) {
-		t.Errorf("err = %v, want ErrInvalidDeploymentCursor (id=0 payload)", err)
+		t.Errorf("err = %v, want ErrInvalidDeploymentCursor (empty id payload)", err)
 	}
 }
 
@@ -117,8 +116,8 @@ func TestDecodeDeploymentCursor_NonPositiveIDInPayload(t *testing.T) {
 // satisfy both this alias and the underlying
 // httpx.ErrUnsupportedCursorVersion.
 func TestDecodeDeploymentCursor_UnsupportedVersion(t *testing.T) {
-	// {"v":2,"p":{"ts":"2026-07-15T12:34:56Z","id":42}}
-	const future = "eyJ2IjoyLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6NDJ9fQ"
+	// {"v":2,"p":{"ts":"2026-07-15T12:34:56Z","id":"d_42"}}
+	const future = "eyJ2IjoyLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
 	_, _, err := decodeDeploymentCursor(future)
 	if !errors.Is(err, ErrUnsupportedDeploymentCursorVersion) {
 		t.Errorf("err = %v, want ErrUnsupportedDeploymentCursorVersion", err)

@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -380,7 +379,7 @@ type deploymentRepoInterface interface {
 	GetByID(ctx context.Context, id string) (*domain.Deployment, error)
 	ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
 	CountByApp(ctx context.Context, tenantID, appName string) (int, error)
-	ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error)
+	ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error)
 	Create(ctx context.Context, deployment *domain.Deployment) error
 	DeleteByID(ctx context.Context, id string) error
 }
@@ -1382,7 +1381,7 @@ func (s *DeploymentService) ListDeploymentsPaginated(
 	}
 
 	afterTS := time.Time{}
-	var afterID int64
+	var afterID string
 	if afterCursor != "" {
 		var err error
 		afterTS, afterID, err = decodeDeploymentCursor(afterCursor)
@@ -1401,7 +1400,7 @@ func (s *DeploymentService) ListDeploymentsPaginated(
 	if len(rows) > limit {
 		rows = rows[:limit]
 		last := rows[len(rows)-1]
-		cursor, err := encodeDeploymentCursor(last.CreatedAt, mustParseDeploymentID(last.ID))
+		cursor, err := encodeDeploymentCursor(last.CreatedAt, last.ID)
 		if err != nil {
 			// encodeDeploymentCursor only fails on a zero TS or
 			// non-positive ID — would mean the schema is broken.
@@ -1412,34 +1411,6 @@ func (s *DeploymentService) ListDeploymentsPaginated(
 	}
 	page.Items = rows
 	return page, nil
-}
-
-// mustParseDeploymentID parses a deployment id string to int64. The
-// deployments.id column is BIGSERIAL-backed (TEXT in the Go domain
-// type per the d_ prefix convention, but the underlying PG type is
-// still bigint in older schemas — see migration 017 + the d_ prefix
-// codification). If the id cannot be parsed as int64 the deployments
-// cursor contract is impossible to satisfy, so we surface the error
-// rather than silently emitting a cursor with id=0 (which the codec
-// rejects, but better to fail fast at the source).
-func mustParseDeploymentID(id string) int64 {
-	v, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		// d_ prefixed ids are NOT numeric — see domain.Deployment.ID.
-		// The cursor codec requires int64, but the repo's PK is text.
-		// Return 0 so the encoder rejects it and we surface a 500;
-		// the alternative (parsing the d_ prefix as a hash) would
-		// not be monotonically ordered across deploys.
-		//
-		// TODO(issue-58-followup): either change the repo's PK to
-		// BIGINT (which would invalidate every existing d_* id) or
-		// switch the cursor to a (created_at, id_text) tuple where
-		// id_text is the row's text id and the SQL comparator falls
-		// back to created_at alone when ids tie. The latter is the
-		// right answer; tracked separately so this PR stays small.
-		return 0
-	}
-	return v
 }
 
 // ListDeploymentsPaginatedWithTotal adds the dual-envelope's total
