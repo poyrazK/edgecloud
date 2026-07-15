@@ -68,7 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # builder stage exports those env vars so cargo's precedence rules
 # (env > config-file) keep the Docker build hermetic.
 
-FROM rust:1.85-bookworm AS rust-builder
+FROM rust:1-bookworm AS rust-builder
 
 ARG BUILD_WITH_WASM2CWASM=true
 

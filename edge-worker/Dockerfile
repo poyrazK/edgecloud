@@ -26,7 +26,7 @@
 # CARGO_BUILD_RUSTC_WRAPPER prefix the Docker bind-mount target).
 
 # ── Stage 1a: dep fetch (workspace + all member manifests) ──────────
-FROM rust:1.85-bookworm AS deps
+FROM rust:1-bookworm AS deps
 
 ENV CARGO_BUILD_RUSTC_WRAPPER="" \
     CARGO_TARGET_DIR=/build/target \
@@ -101,7 +101,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo fetch --locked
 
 # ── Stage 1b: actual build ─────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 ENV CARGO_BUILD_RUSTC_WRAPPER="" \
     CARGO_TARGET_DIR=/build/target \
