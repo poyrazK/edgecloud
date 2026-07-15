@@ -59,6 +59,13 @@ use tracing::{debug, warn};
 ///
 /// `local_cap: None` is the **fail-closed signal** — see module docs.
 /// The renderer reads this and emits no global route when it's `None`.
+///
+/// `configured` / `platform_total` / `replicas_seen` are populated for
+/// introspection (tests + a future Prometheus metric that surfaces
+/// "global-route-emitted vs fail-closed" so operators can alert on
+/// sidecar outages). The bin-side does not read them today; that's
+/// intentional, not a bug. The `#[allow(dead_code)]` mirrors the same
+/// allowance on the read-side `latest()` accessor below.
 #[derive(Debug, Clone)]
 pub struct GlobalRpsEntry {
     /// Precomputed per-replica cap from the sidecar's aggregator.
@@ -67,10 +74,13 @@ pub struct GlobalRpsEntry {
     /// traffic has been seen in the window).
     pub local_cap: Option<u32>,
     /// Operator's configured platform cap (echo of `GLOBAL_RATE_LIMIT_RPS`).
+    #[allow(dead_code)]
     pub configured: u32,
     /// Sum of every replica's latest delta inside the window.
+    #[allow(dead_code)]
     pub platform_total: u64,
     /// Number of distinct replicas that published in the window.
+    #[allow(dead_code)]
     pub replicas_seen: u32,
     /// Wall-clock instant this entry was received (NOT the wire `ts` —
     /// `ts` is the sidecar's clock, which is what `received_at` lets us

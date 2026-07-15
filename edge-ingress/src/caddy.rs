@@ -304,6 +304,16 @@ async fn delete_with_retry(client: &Client, url: &str, token: Option<&str>) -> R
 /// both match. A FQDN whose `(tenant, app)` is missing from `entries`
 /// is silently skipped — that means the underlying app is not
 /// currently running, so the route would 502 anyway.
+// `render_routes` carries one cache reference per backing signal the
+// renderer might splice: traffic splits, per-IP rate limits, quota_402,
+// tenant rate limits, and the cross-replica global RPS cap. PR D for
+// issue #665 added the eighth argument (`global_rps_cache`); the
+// seven-arg threshold tripped clippy::too_many_arguments. Bundling the
+// caches into a struct is the structural fix, but that touches every
+// call site in tests + heartbeats.rs. The narrow allow is the
+// minimum-delta fix for the PR — tracked for the next time the
+// renderer gains an argument.
+#[allow(clippy::too_many_arguments)]
 pub fn render_routes(
     entries: &[RouteEntry],
     fqdns: &[FqdnBinding],
