@@ -380,11 +380,9 @@ export interface paths {
          *     returned.
          *
          *     Pagination contracts:
-         *     - First-page and `offset` requests: response contains both
-         *       `next_cursor` and `next_offset` (deprecated) when another
-         *       page exists; both are `null` on the final page.
-         *     - `cursor` requests: response contains `next_cursor` only;
-         *       `next_offset` is `null` by construction.
+         *     - The response contains `next_cursor` when another page
+         *       exists; it is `null` (or absent) on the final page.
+         *       `next_offset` is gone from the wire.
          *     - A cursor is scoped to an unchanged `(tenant, app, since,
          *       until, level)` query — clients reusing a cursor must
          *       preserve the original filter set, or paging may silently
@@ -394,8 +392,8 @@ export interface paths {
          *       continues to come from the authenticated tenant ID plus
          *       the SQL `WHERE tenant_id = $1 AND app_name = $2` boundary,
          *       so a forged cursor cannot cross tenants or apps.
-         *     - `cursor` and `offset` are mutually exclusive. A request
-         *       that supplies both, including `offset=0`, returns 400.
+         *     - The compat-release `?offset=` parameter is retired: any
+         *       non-empty value returns 400.
          */
         get: operations["listLogsForApp"];
         put?: never;
@@ -2091,24 +2089,13 @@ export interface components {
             /**
              * @description Opaque keyset cursor for the next page on
              *     (created_at, id). Pass back as `?cursor=` to fetch the
-             *     next page. Absent (or null) on the final page. Issue #58.
-             * @example eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6NDJ9fQ
+             *     next page. Absent (or null) on the final page.
+             *     Issue #58 (cursor); #709 (text-PK cursor; the `d_<uuid>`
+             *     id is encoded as a JSON string and survives a server
+             *     upgrade unchanged).
+             * @example eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0
              */
             next_cursor?: string | null;
-            /**
-             * @deprecated
-             * @description **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic kept
-             *     for one compat release so the existing CLI's `--page`
-             *     math works against the new server. Use `next_cursor`
-             *     instead. Emitted ONLY on first-page responses (when
-             *     no `?cursor=` is supplied); cursor-driven pages omit
-             *     this because there's no well-defined offset once the
-             *     client has jumped forward in the cursor chain. Will be
-             *     removed in the next compat cycle — see #58-followup.
-             *     Issue #58.
-             * @example 20
-             */
-            next_offset?: number | null;
         };
         ActivateResponse: {
             /** @example activated */
@@ -2199,23 +2186,10 @@ export interface components {
              *     `cursor=<value>` to fetch the page that immediately
              *     precedes the last row in this response. `null` when the
              *     current page is the final page (no older rows remain).
-             *     This is the preferred pagination contract.
-             * @example eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9
+             *     This is the only pagination contract post-#709 / #682
+             *     hard-cut.
              */
             next_cursor?: string | null;
-            /**
-             * @description Offset of the next older page when paginating with the
-             *     legacy `offset` query parameter. `null` when the current
-             *     page is the final page, or when the request used
-             *     `cursor` rather than `offset` (cursor mode suppresses
-             *     offset hints).
-             *     Deprecated: this field is retained for one release for
-             *     clients still using `offset`. New clients should use
-             *     `next_cursor`; a follow-up issue will remove the offset
-             *     parameter, the offset response field, and the offset
-             *     server branch.
-             */
-            next_offset?: number | null;
         };
         /**
          * @description Tenant-facing projection of the worker-reported status of one
@@ -3543,19 +3517,15 @@ export interface operations {
                  * @description Opaque keyset cursor returned as `next_cursor` from a
                  *     prior `listDeployments` call. Pass it back to fetch the
                  *     next page of deployments ordered by (created_at DESC,
-                 *     id DESC). Mutually exclusive with `?offset=` (400).
-                 *     Issue #58.
+                 *     id DESC). Issue #58 (cursor); #709 (text-PK cursor —
+                 *     the embedded id is the row's text PK `d_<uuid>`).
+                 *
+                 *     The compat-release `?offset=` parameter is retired: any
+                 *     non-empty value returns 400. Clients should re-fetch
+                 *     with `?cursor=` to resume a walk started before this
+                 *     change.
                  */
                 cursor?: string;
-                /**
-                 * @deprecated
-                 * @description **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic.
-                 *     Use `?cursor=` instead. Retained for one compat release
-                 *     so the existing CLI's `--page` flag keeps working. Will
-                 *     be removed in the next compat cycle — see #58-followup.
-                 *     Issue #58.
-                 */
-                offset?: number;
             };
             header?: never;
             path: {
@@ -3805,22 +3775,12 @@ export interface operations {
                  * @description Opaque pagination token returned by a previous response
                  *     as `next_cursor`. Pass it back here to fetch the page
                  *     that immediately precedes the last row of that response.
-                 *     Preferred over `offset`. Mutually exclusive with
-                 *     `offset`; supplying both, including `offset=0`, returns
-                 *     400. Malformed or unsupported-version cursors return 400.
+                 *     Malformed or unsupported-version cursors return 400.
+                 *
+                 *     The compat-release `?offset=` parameter is retired: any
+                 *     non-empty value returns 400.
                  */
                 cursor?: string;
-                /**
-                 * @deprecated
-                 * @description Legacy offset-based pagination. The response returns
-                 *     `next_offset` (also deprecated) for compatibility. New
-                 *     clients should use `cursor` instead. Mutually exclusive
-                 *     with `cursor`; supplying both returns 400. Deprecated:
-                 *     this parameter, the `next_offset` response field, and
-                 *     the server's offset branch will be removed in a
-                 *     follow-up release.
-                 */
-                offset?: number;
             };
             header?: never;
             path: {
