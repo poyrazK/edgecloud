@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/httpx"
 )
 
 // TestEncodeDeploymentCursor_HappyPath round-trips a (ts, id) tuple
@@ -121,5 +123,48 @@ func TestDecodeDeploymentCursor_UnsupportedVersion(t *testing.T) {
 	_, _, err := decodeDeploymentCursor(future)
 	if !errors.Is(err, ErrUnsupportedDeploymentCursorVersion) {
 		t.Errorf("err = %v, want ErrUnsupportedDeploymentCursorVersion", err)
+	}
+}
+
+// TestDeploymentPaginationCursorTypedErrorsAliasHttpx pins that the
+// typed-error aliases wrap (not replace) the httpx sentinels. A
+// future refactor that switched `ErrInvalidDeploymentCursor` from a
+// wrapped fmt.Errorf to a fresh `errors.New` would break
+// `errors.Is(err, httpx.ErrInvalidCursor)` — a contract the handler
+// relies on when distinguishing 400 vs 500 logging. The wrap-shape
+// must stay.
+//
+// Mirrors `TestWebhookDeliveryCursorTypedErrorsAliasHttpx` (issue
+// #58 follow-up). Issue #709 added the typed-error aliasing path
+// for deployments alongside the codec swap to text PK.
+func TestDeploymentPaginationCursorTypedErrorsAliasHttpx(t *testing.T) {
+	// Invalid cursor: the broken-b64 case maps to
+	// ErrInvalidDeploymentCursor, which must chain through to
+	// httpx.ErrInvalidCursor.
+	_, _, err := decodeDeploymentCursor("not base64url!")
+	if err == nil {
+		t.Fatal("expected error decoding malformed cursor")
+	}
+	if !errors.Is(err, httpx.ErrInvalidCursor) {
+		t.Errorf("err = %v, want chainable to httpx.ErrInvalidCursor", err)
+	}
+	if !errors.Is(err, ErrInvalidDeploymentCursor) {
+		t.Errorf("err = %v, want chainable to ErrInvalidDeploymentCursor", err)
+	}
+
+	// Unknown version: maps to
+	// ErrUnsupportedDeploymentCursorVersion, which must chain
+	// through to httpx.ErrUnsupportedCursorVersion. Reuse the v2
+	// fixture from TestDecodeDeploymentCursor_UnsupportedVersion.
+	const future = "eyJ2IjoyLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6ImRfNTAifX0"
+	_, _, err = decodeDeploymentCursor(future)
+	if err == nil {
+		t.Fatal("expected error decoding future-version cursor")
+	}
+	if !errors.Is(err, httpx.ErrUnsupportedCursorVersion) {
+		t.Errorf("err = %v, want chainable to httpx.ErrUnsupportedCursorVersion", err)
+	}
+	if !errors.Is(err, ErrUnsupportedDeploymentCursorVersion) {
+		t.Errorf("err = %v, want chainable to ErrUnsupportedDeploymentCursorVersion", err)
 	}
 }

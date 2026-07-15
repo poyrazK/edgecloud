@@ -50,8 +50,9 @@ type LogListResponse struct {
 //
 // Status codes:
 //
-//	200  envelope {items, limit, since}
-//	400  invalid appName, malformed since/level/limit
+//	200  envelope {items, limit, since, next_cursor}
+//	400  invalid appName, malformed since/level/limit, non-empty
+//	     `?offset=` (hard-cut; cursor is the only pagination input)
 //	500  anything else
 func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())

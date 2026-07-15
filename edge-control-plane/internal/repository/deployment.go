@@ -75,7 +75,9 @@ func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName 
 //
 // The afterTS / afterID pair is the cursor: pass the time.Time and
 // id of the previous page's last visible row. The zero time.Time +
-// id 0 means "first page" (no lower-bound predicate).
+// empty id (`""`) means "first page" (no lower-bound predicate).
+// Issue #709 swapped the PK from int64 to TEXT, so the sentinel
+// for the id column is now the empty string.
 //
 // Backed by idx_deployments_tenant_app_created_at_id_desc (migration
 // 036). The composite matches both the WHERE filter and the ORDER BY
