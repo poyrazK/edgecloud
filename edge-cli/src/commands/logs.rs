@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::state_io::load_state_optional;
-use crate::api::{ApiClient, LogEntry, LogListQuery};
+use crate::api::{list_all_logs, ApiClient, LogEntry, LogListQuery};
 use crate::config::EdgeToml;
 use crate::output;
 use crate::state::State;
@@ -116,12 +116,12 @@ pub(crate) fn interruptible_sleep(total: Duration, stop: &AtomicBool) {
 /// inclusive `since` boundary timestamp).
 ///
 /// `cursor` is the user's keyset cursor; when supplied it overrides
-/// `offset`/`since` and is fed back to the server verbatim. The
-/// CLI does NOT inspect the cursor payload — opacity is part of
-/// the contract.
+/// `since` and is fed back to the server verbatim. The CLI does NOT
+/// inspect the cursor payload — opacity is part of the contract.
 ///
-/// `offset` is the DEPRECATED `?offset=` compatibility parameter.
-/// Use `cursor` in new code.
+/// `--offset` is gone in #709 / #682. The single-shot non-follow
+/// path now uses [`list_all_logs`] to walk the cursor chain to
+/// exhaustion (the same shape as `edge apps` / `edge deployments`).
 #[cfg(feature = "network")]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -133,7 +133,6 @@ pub fn run(
     follow: bool,
     limit: u32,
     cursor: Option<&str>,
-    offset: Option<u32>,
 ) -> Result<()> {
     let state = load_state_optional(path)?;
     let app_name = resolve_app_name(app, state.as_ref())?;
@@ -157,7 +156,10 @@ pub fn run(
 
     if follow {
         run_follow(&client, &app_name, &since_rfc, level, limit, is_tty)
-    } else {
+    } else if let Some(c) = cursor {
+        // Manual cursor walk (issue #644 — `edge logs --cursor X`
+        // returns ONE page). The user opted into manual paginate;
+        // we don't auto-walk on top of them.
         let resp = client.logs().list(
             &app_name,
             LogListQuery {
@@ -165,16 +167,29 @@ pub fn run(
                 until_rfc3339,
                 level,
                 limit: Some(limit),
-                offset,
-                cursor,
+                cursor: Some(c),
             },
         )?;
         for entry in &resp.items {
             print_entry(entry, is_tty);
         }
-        // Prefer the cursor in the hint (issue #644 — cursor is the
-        // new contract). Fall back to next_offset for older servers.
-        maybe_print_next_page_hint(&resp.next_cursor, resp.next_offset, &app_name, &since_rfc);
+        Ok(())
+    } else {
+        // Issue #709 / #682: cursor-only. Walk the chain to
+        // exhaustion so a one-shot `edge logs myapp` returns every
+        // matching entry (was a single page + "next page" hint
+        // pre-#709).
+        let entries = list_all_logs(
+            &client,
+            &app_name,
+            Some(&since_rfc),
+            until_rfc3339,
+            level,
+            limit,
+        )?;
+        for entry in &entries {
+            print_entry(entry, is_tty);
+        }
         Ok(())
     }
 }
@@ -190,7 +205,6 @@ pub fn run(
     _follow: bool,
     _limit: u32,
     _cursor: Option<&str>,
-    _offset: Option<u32>,
 ) -> Result<()> {
     anyhow::bail!("logs requires network support; rebuild with --features network")
 }
@@ -285,7 +299,6 @@ fn run_follow(
                     until_rfc3339: None,
                     level,
                     limit: Some(limit),
-                    offset: None,
                     cursor: next_cursor.as_deref(),
                 },
             )?;
@@ -585,42 +598,6 @@ fn chrono_parse_rfc3339(s: &str) -> Result<i64, ()> {
 
     let secs_of_day = (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
     Ok(days * 86_400 + secs_of_day)
-}
-
-/// Print a hint pointing at `--cursor` (preferred) or `--offset`
-/// (deprecated) when the response includes a next-page marker,
-/// preserving the original `(app, --since)` filters so the user can
-/// copy-paste the suggested command.
-///
-/// Issue #644: the cursor is the new contract. We prefer it for new
-/// workflows and only suggest `--offset` when the server is too old
-/// to emit `next_cursor`.
-fn maybe_print_next_page_hint(
-    next_cursor: &Option<String>,
-    next_offset: Option<u32>,
-    app_name: &str,
-    since_rfc: &str,
-) {
-    if let Some(cur) = next_cursor.as_ref() {
-        output::hint(&format!(
-            "More entries available — \
-             run `edge logs {app} --since {since} --cursor '{cur}'` for the next page",
-            app = app_name,
-            since = since_rfc,
-            cur = cur,
-        ));
-        return;
-    }
-    if let Some(no) = next_offset {
-        output::hint(&format!(
-            "More entries available — \
-             run `edge logs {app} --since {since} --offset {no}` for the next page \
-             (deprecated; --cursor is the preferred successor)",
-            app = app_name,
-            since = since_rfc,
-            no = no,
-        ));
-    }
 }
 
 // ---------------------------------------------------------------------------

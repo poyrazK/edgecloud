@@ -585,11 +585,19 @@ async fn logs_forwards_cursor_query_param() {
     cmd.assert().success();
 }
 
-/// When the server returns `next_cursor`, the CLI must surface a
-/// `--cursor`-based next-page hint that preserves the original
-/// `--since` and app so the user can copy-paste verbatim.
+/// Post-#709 / #682 hard-cut: a one-shot `edge logs myapp --limit N`
+/// auto-walks the cursor chain to exhaustion. The user does NOT
+/// need to chase a "next page" hint — the walker terminates on
+/// `next_cursor: null`. This test pins:
+///   1. the second page is fetched when `next_cursor` is set, AND
+///   2. the cursor value never leaks into stdout (it's opaque).
+///
+/// Pre-#709 / #682 this test asserted on a `--cursor '...'` hint
+/// in stdout; the walker supersedes that hint.
 #[tokio::test]
-async fn logs_emits_cursor_next_page_hint() {
+async fn logs_walks_cursor_chain_to_exhaustion() {
+    use wiremock::matchers::query_param_is_missing;
+
     let home = common::isolated_home();
     let project = common::isolated_home();
     let server = MockServer::start().await;
@@ -597,112 +605,60 @@ async fn logs_emits_cursor_next_page_hint() {
     common::seed_api_key(&home, "k_seed");
     seed_project(&project, "myapp");
 
+    let cursor = "eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9";
+
+    // First page: 3 entries + cursor. The `query_param_is_missing`
+    // matcher pins that the initial request has no `?cursor=`
+    // (the walker only adds it on the SECOND-and-later pages).
     Mock::given(method("GET"))
         .and(path("/api/v1/apps/myapp/logs"))
         .and(query_param("limit", "3"))
+        .and(query_param_is_missing("cursor"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [
                 {
-                    "id": 1,
-                    "tenant_id": "t_test",
-                    "deployment_id": "d_a",
-                    "app_name": "myapp",
-                    "worker_id": "w_us-east-1_h01",
-                    "region": "us-east-1",
-                    "level": "info",
-                    "message": "first",
-                    "labels": {},
-                    "ts": "2026-06-24T12:00:00Z",
+                    "id": 1, "tenant_id": "t_test", "deployment_id": "d_a",
+                    "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1", "level": "info", "message": "first",
+                    "labels": {}, "ts": "2026-06-24T12:00:00Z",
                 },
                 {
-                    "id": 2,
-                    "tenant_id": "t_test",
-                    "deployment_id": "d_a",
-                    "app_name": "myapp",
-                    "worker_id": "w_us-east-1_h01",
-                    "region": "us-east-1",
-                    "level": "info",
-                    "message": "second",
-                    "labels": {},
-                    "ts": "2026-06-24T12:00:01Z",
+                    "id": 2, "tenant_id": "t_test", "deployment_id": "d_a",
+                    "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1", "level": "info", "message": "second",
+                    "labels": {}, "ts": "2026-06-24T12:00:01Z",
                 },
                 {
-                    "id": 3,
-                    "tenant_id": "t_test",
-                    "deployment_id": "d_a",
-                    "app_name": "myapp",
-                    "worker_id": "w_us-east-1_h01",
-                    "region": "us-east-1",
-                    "level": "info",
-                    "message": "third",
-                    "labels": {},
-                    "ts": "2026-06-24T12:00:02Z",
+                    "id": 3, "tenant_id": "t_test", "deployment_id": "d_a",
+                    "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1", "level": "info", "message": "third",
+                    "labels": {}, "ts": "2026-06-24T12:00:02Z",
                 },
             ],
             "limit": 3,
             "since": "2026-06-24T11:55:00Z",
-            "next_cursor": "eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9",
+            "next_cursor": cursor,
         })))
         .expect(1)
         .mount(&server)
         .await;
 
-    let mut cmd = Command::cargo_bin("edge").unwrap();
-    common::set_platform_env(&mut cmd, &home);
-    cmd.env("EDGE_API_URL", server.uri());
-    cmd.current_dir(project.path());
-    cmd.arg("logs");
-    cmd.arg("myapp");
-    cmd.arg("--limit");
-    cmd.arg("3");
-
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("first"))
-        // Cursor-based hint, preserves app + since and shows the
-        // opaque cursor payload verbatim.
-        .stdout(predicate::str::contains(
-            "--cursor 'eyJ2IjoxLCJ0cyI6IjIwMjYtMDYtMjRUMTI6MDA6MDJaIiwiaWQiOjN9'",
-        ))
-        .stdout(predicate::str::contains("edge logs myapp"))
-        // No deprecated offset hint when next_cursor is present.
-        .stdout(predicate::str::contains("--offset").not());
-}
-
-/// When the server is old enough to omit `next_cursor` but still
-/// returns `next_offset`, the CLI must surface the offset hint so
-/// existing users keep their workflow. After issue #644 ships the
-/// PR removes this fallback once the cutoff elapses.
-#[tokio::test]
-async fn logs_falls_back_to_offset_hint_when_no_cursor() {
-    let home = common::isolated_home();
-    let project = common::isolated_home();
-    let server = MockServer::start().await;
-
-    common::seed_api_key(&home, "k_seed");
-    seed_project(&project, "myapp");
-
+    // Second page: 1 entry, no further cursor (terminates the walk).
     Mock::given(method("GET"))
         .and(path("/api/v1/apps/myapp/logs"))
-        .and(query_param("limit", "3"))
+        .and(query_param("cursor", cursor))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [
-                {"id": 1, "tenant_id": "t_test", "deployment_id": "d_a",
-                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
-                 "region": "us-east-1", "level": "info", "message": "x",
-                 "labels": {}, "ts": "2026-06-24T12:00:00Z"},
-                {"id": 2, "tenant_id": "t_test", "deployment_id": "d_a",
-                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
-                 "region": "us-east-1", "level": "info", "message": "y",
-                 "labels": {}, "ts": "2026-06-24T12:00:01Z"},
-                {"id": 3, "tenant_id": "t_test", "deployment_id": "d_a",
-                 "app_name": "myapp", "worker_id": "w_us-east-1_h01",
-                 "region": "us-east-1", "level": "info", "message": "z",
-                 "labels": {}, "ts": "2026-06-24T12:00:02Z"},
+                {
+                    "id": 4, "tenant_id": "t_test", "deployment_id": "d_a",
+                    "app_name": "myapp", "worker_id": "w_us-east-1_h01",
+                    "region": "us-east-1", "level": "info", "message": "fourth",
+                    "labels": {}, "ts": "2026-06-24T12:00:03Z",
+                },
             ],
             "limit": 3,
-            "since": "",
-            "next_offset": 6,
+            "since": "2026-06-24T11:55:00Z",
+            "next_cursor": null,
         })))
         .expect(1)
         .mount(&server)
@@ -719,40 +675,17 @@ async fn logs_falls_back_to_offset_hint_when_no_cursor() {
 
     cmd.assert()
         .success()
-        // Old-server fallback is preserved, marked deprecated.
-        .stdout(predicate::str::contains("--offset 6"))
-        .stdout(predicate::str::contains("deprecated"));
-}
-
-/// `--cursor` and `--offset` are mutually exclusive (clap enforces
-/// this; a regression that removed the constraint would surface as
-/// both query parameters being sent and the server returning 400).
-#[tokio::test]
-async fn logs_rejects_cursor_and_offset_together() {
-    let home = common::isolated_home();
-    let project = common::isolated_home();
-    let server = MockServer::start().await;
-
-    common::seed_api_key(&home, "k_seed");
-    seed_project(&project, "myapp");
-
-    // We intentionally don't mount a Mock on /api/v1/apps/myapp/logs.
-    // If the conflict gate is dropped, the test would send an
-    // unauthorized request and 401; the clap conflict surfaces
-    // BEFORE the request, so exit != 0 without contacting the
-    // server at all.
-    let mut cmd = Command::cargo_bin("edge").unwrap();
-    common::set_platform_env(&mut cmd, &home);
-    cmd.env("EDGE_API_URL", server.uri());
-    cmd.current_dir(project.path());
-    cmd.arg("logs");
-    cmd.arg("myapp");
-    cmd.arg("--cursor");
-    cmd.arg("x");
-    cmd.arg("--offset");
-    cmd.arg("100");
-
-    cmd.assert().failure();
+        // All four entries printed across both pages.
+        .stdout(predicate::str::contains("first"))
+        .stdout(predicate::str::contains("second"))
+        .stdout(predicate::str::contains("third"))
+        .stdout(predicate::str::contains("fourth"))
+        // Cursor value never leaks into stdout — opacity is part
+        // of the contract.
+        .stdout(predicate::str::contains(cursor).not())
+        // Pre-#709 / #682 also rendered a `--cursor '...'` hint;
+        // the walker supersedes that hint.
+        .stdout(predicate::str::contains("--cursor").not());
 }
 
 /// `--follow` is mutually exclusive with `--until`. A follow loop

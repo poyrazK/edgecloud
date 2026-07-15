@@ -393,34 +393,30 @@ pub struct LogEntry {
 /// returned entry's `ts` (with client-side dedup by id to hide the
 /// boundary row the server returns on every poll).
 ///
-/// Pagination (issue #644):
+/// Pagination (issue #709 / #682-style hard-cut):
 ///
-/// * `next_cursor` is the preferred pager; it is `Some` on the
-///   offset/first-page path AND on cursor pages whenever another
-///   page exists, and `None` on the final page.
-/// * `next_offset` is the deprecated compatibility mirror of
-///   `next_cursor` — it is `Some` only on the offset/first-page
-///   path; cursor pages leave it `None`. A future release (PR
-///   #644 follow-up) will drop the server-side field. Until then,
-///   older servers do not emit it at all, so the field is
-///   `#[serde(default)]`.
+/// * `next_cursor` is the only pager; it is `Some` whenever another
+///   page exists and `None` on the final page.
 ///
-/// `Option<u32>` for `next_offset` rather than `Option<i64>`: the
-/// server uses `INT` because Postgres `OFFSET` is a 32-bit
-/// non-negative integer.
+/// `next_offset` was the deprecated offset-paging mirror. The
+/// `?offset=` parameter is retired in #709; the field is preserved
+/// with `#[serde(default)]` so a stale server response
+/// (pre-#709 with `next_offset` still emitted) decodes cleanly, but
+/// the CLI never reads it. New code treats cursor as the only
+/// pager.
 #[derive(Debug, Deserialize)]
 pub struct LogListResponse {
     pub items: Vec<LogEntry>,
     pub limit: u32,
     #[serde(default)]
     pub since: String,
-    /// Preferred page marker — pass back via `?cursor=`. Stable
-    /// across concurrent inserts.
+    /// Page marker — pass back via `?cursor=`. Stable across
+    /// concurrent inserts.
     #[serde(default)]
     pub next_cursor: Option<String>,
-    /// Deprecated offset compatibility (issue #644). New code
-    /// should read `next_cursor`; this remains so older clients
-    /// don't break until removal lands.
+    /// `#[serde(default)]` so a stale pre-#709 server response
+    /// (with `next_offset` still emitted on the wire) decodes
+    /// cleanly. The CLI never reads this field after #709.
     #[serde(default)]
     pub next_offset: Option<u32>,
 }
@@ -507,21 +503,23 @@ pub struct AppListResponse {
 /// offsets are always non-negative. `next_cursor` is opaque so the
 /// CLI never decodes it — only round-trips it back as `?cursor=`.
 ///
-/// Dual envelope (issue #58 compat release):
+/// Field types mirror the server (Go) side: `total` is signed so a
+/// future "unknown" sentinel can travel as `-1`, while `limit` is
+/// unsigned. `next_cursor` is opaque so the CLI never decodes it —
+/// only round-trips it back as `?cursor=`.
 ///
-///   - `next_cursor` is the new keyset cursor. The CLI's
-///     page-walk loop uses it; `commands::deployments` page-walks
-///     via cursor when `--cursor` is supplied, falls back to
-///     `--offset` semantics against `next_offset` for the existing
-///     `--page` UX.
-///   - `next_offset` is the legacy offset arithmetic, kept for one
-///     compat release. The server emits it ONLY on first-page
-///     responses (when no `?cursor=` was supplied); cursor-driven
-///     pages omit it. `#[serde(default)]` lets the CLI decode both
-///     shapes without branching.
+/// Hard-cut (issue #709):
 ///
-/// `total`/`limit`/`offset` are consumed by `commands::deployments::run`
-/// to render the page-of-N footer; `items` is the only field read by
+///   - `next_cursor` is the only pager. `commands::deployments`
+///     walks the cursor chain to exhaustion (no `--page` flag; the
+///     cursor walker is the only path).
+///   - `next_offset` was the legacy offset arithmetic, retired in
+///     #709. The field is preserved with `#[serde(default)]` so a
+///     stale server response (pre-#709 with `next_offset` still
+///     emitted) decodes cleanly, but the CLI never reads it.
+///
+/// `total` is consumed by `commands::deployments::run` to render the
+/// "N deployments" header; `items` is the only field read by
 /// callers that don't paginate (currently none — see
 /// [`ApiClient::list_deployments`]).
 #[derive(Debug, Deserialize)]
@@ -531,10 +529,9 @@ pub struct DeploymentListEnvelope {
     pub limit: u32,
     #[serde(default)]
     pub next_cursor: Option<String>,
-    /// Deprecated offset arithmetic (issue #58 compat release).
-    /// Pre-#58 servers emit this; post-#58 servers emit it only on
-    /// first-page responses. The follow-up in #58-followup retires
-    /// it after the CLI has migrated.
+    /// `#[serde(default)]` so a stale pre-#709 server response
+    /// (with `next_offset` still emitted on the wire) decodes
+    /// cleanly. The CLI never reads this field after #709.
     #[serde(default)]
     pub next_offset: Option<u32>,
 }
@@ -1123,62 +1120,29 @@ impl ApiClient {
         serde_json::from_reader(resp.take(MAX_SUCCESS_BODY)).map_err(Into::into)
     }
 
-    /// List all deployments for an app. Returns the first page
-    /// only — for paginated traversal use
-    /// [`ApiClient::list_deployments_paginated`].
+    /// List all deployments for an app. Page-walks the cursor chain
+    /// to exhaustion (post-#709 contract).
     ///
     /// Today no caller uses this method; it is retained as a
     /// backward-compatible wrapper so a future "give me the bare
     /// list" call site doesn't have to fan out to the envelope
-    /// shape. `commands::deployments::run` itself goes through the
-    /// paginated path so it can render the footer.
+    /// shape. `commands::deployments::run` itself goes through
+    /// [`ApiClient::list_all_deployments`] so it can render the
+    /// page-of-N header.
     pub fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentSummary>> {
-        let envelope = self.list_deployments_paginated(app_name, 0, 0)?;
-        Ok(envelope.items)
+        self.list_all_deployments(app_name, 0)
     }
 
-    /// List deployments for an app with explicit `?limit=` and
-    /// `?offset=` query parameters forwarded to the server.
-    /// `limit=0` and `offset=0` mean "use the server default" /
-    /// "from the start", respectively; in both cases the
-    /// corresponding query param is omitted from the request URL
-    /// to keep the wire shape clean (the server treats absence the
-    /// same as the default — confirmed at
-    /// `internal/handler/deployment.go::List`).
+    /// Cursor-aware per-page accessor for `/api/v1/list/{appName}`.
+    /// Pass `cursor=None` for the first page, the previous response's
+    /// `next_cursor` for every page after.
     ///
-    /// Returns the full [`DeploymentListEnvelope`] so callers can
-    /// decide whether to render a pagination footer without a
-    /// second round-trip.
-    ///
-    /// Issue #58 dual envelope: the response carries an opaque
-    /// `next_cursor` (always emitted when more pages exist) and the
-    /// legacy `next_offset` (emitted only on first-page responses).
-    /// Existing CLI callers continue to work; new page-walk logic
-    /// should use [`ApiClient::list_deployments_with_cursor`].
-    pub fn list_deployments_paginated(
-        &self,
-        app_name: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<DeploymentListEnvelope> {
-        self.get_json_anyhow("list deployments", |base| {
-            let mut parsed = reqwest::Url::parse(&format!("{base}/api/v1/list/{app_name}"))
-                .expect("hardcoded URL template parses");
-            if limit > 0 {
-                parsed
-                    .query_pairs_mut()
-                    .append_pair("limit", &limit.to_string());
-            }
-            if offset > 0 {
-                parsed
-                    .query_pairs_mut()
-                    .append_pair("offset", &offset.to_string());
-            }
-            parsed.to_string()
-        })
-    }
-
-    /// Cursor-aware sibling of [`ApiClient::list_deployments_paginated`].
+    /// Issue #58 — the cursor and offset paths were mutually
+    /// exclusive on the server (400 if both were supplied).
+    /// Issue #709 — `?offset=` is gone from the wire entirely.
+    /// New code should call [`ApiClient::list_all_deployments`] to
+    /// walk the cursor chain to exhaustion. This method is kept
+    /// as the per-page accessor for scripted walks.
     /// Pass `cursor=None` for the first page, the previous response's
     /// `next_cursor` for every page after.
     ///
@@ -1186,6 +1150,12 @@ impl ApiClient {
     /// on the server (400 if both are supplied). This method omits
     /// `?offset=` entirely because cursor-driven pages can never be
     /// translated back to a meaningful offset.
+    ///
+    /// Issue #709 — `?offset=` is gone from the wire entirely. The
+    /// pre-#709 [`ApiClient::list_deployments_paginated`] is kept
+    /// only as the per-page accessor for scripted walks; new code
+    /// should call [`ApiClient::list_all_deployments`] to walk the
+    /// cursor chain to exhaustion.
     pub fn list_deployments_with_cursor(
         &self,
         app_name: &str,
@@ -1207,6 +1177,39 @@ impl ApiClient {
             }
             parsed.to_string()
         })
+    }
+
+    /// GET `/api/v1/list/{appName}` — page-walk the cursor chain to
+    /// exhaustion. The post-#709 contract is cursor-only, so this is
+    /// the canonical "give me every deployment for the app" entry
+    /// point (mirrors [`ApiClient::list_all_apps`] for the apps
+    /// endpoint).
+    ///
+    /// `page_size` is the per-request limit. `0` falls back to the
+    /// server's default (20). The walker terminates when the server
+    /// returns a `null` / absent `next_cursor`. The `MAX_PAGES`
+    /// ceiling is a defensive guard against a server that emits an
+    /// empty page + cursor loop; at 20/page the cap is 20k
+    /// deployments per app, which is well beyond any realistic
+    /// tenant footprint.
+    pub fn list_all_deployments(
+        &self,
+        app_name: &str,
+        page_size: u32,
+    ) -> Result<Vec<DeploymentSummary>> {
+        const MAX_PAGES: u32 = 1_000;
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let envelope =
+                self.list_deployments_with_cursor(app_name, page_size, cursor.as_deref())?;
+            all.extend(envelope.items);
+            match envelope.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(all)
     }
 
     /// GET `/api/v1/apps` — return ONE page of apps for the
@@ -1545,10 +1548,16 @@ pub struct Logs<'a> {
     client: &'a ApiClient,
 }
 
-/// Query parameters for [`Logs::list`] (issue #644). All fields are
-/// optional so the caller threads only what the user's flags asked
-/// for; `None` and empty-string both suppress the query key, leaving
-/// the server's defaults untouched.
+/// Query parameters for [`Logs::list`] (issue #644, hard-cut in
+/// #709 / #682). All fields are optional so the caller threads only
+/// what the user's flags asked for; `None` and empty-string both
+/// suppress the query key, leaving the server's defaults untouched.
+///
+/// `?offset=` is gone from the wire (issue #709 / #682 hard-cut).
+/// Only `?cursor=` carries forward — pre-#709 servers that still
+/// emit `next_offset` decode cleanly into the
+/// `#[serde(default)] next_offset` field on [`LogListResponse`], but
+/// the CLI never reads it.
 #[derive(Debug, Default, Clone)]
 pub struct LogListQuery<'a> {
     /// Absolute RFC3339 lower bound. Callers convert relative
@@ -1562,9 +1571,6 @@ pub struct LogListQuery<'a> {
     /// Page size. `0` (the CLI's "use server default" sentinel) is
     /// dropped — emitting `limit=0` would be misleading.
     pub limit: Option<u32>,
-    /// Deprecated offset for paginating older entries. New code
-    /// should prefer `cursor`.
-    pub offset: Option<u32>,
     /// Opaque keyset cursor (issue #644). Stable across concurrent
     /// inserts, scoped to the tenant/app/since/until/level filters.
     pub cursor: Option<&'a str>,
@@ -1582,7 +1588,8 @@ impl<'a> Logs<'a> {
     /// `limit` is clamped to [1, 1000] server-side; the CLI sends
     /// the user-supplied value through unmodified. `until_rfc3339`
     /// and `cursor` are the new keyset pager additions from issue
-    /// #644; `offset` remains available for one compatibility release.
+    /// #644. `?offset=` is retired in #709 / #682 — the wire shape
+    /// is now cursor-only.
     ///
     /// Errors: any non-2xx becomes a flat `anyhow::Error` carrying
     /// the status and body. 4xx rejections (e.g. invalid level)
@@ -1623,13 +1630,6 @@ impl<'a> Logs<'a> {
                     .append_pair("limit", &n.to_string());
             }
         }
-        if let Some(n) = q.offset {
-            if n > 0 {
-                parsed
-                    .query_pairs_mut()
-                    .append_pair("offset", &n.to_string());
-            }
-        }
         if let Some(c) = q.cursor {
             if !c.is_empty() {
                 // The v1 cursor codec
@@ -1649,6 +1649,56 @@ impl<'a> Logs<'a> {
 
         self.client.get_json_anyhow("logs", |_| url.clone())
     }
+}
+
+/// Cursor-only walker for `/api/v1/apps/{appName}/logs`. Mirrors
+/// [`ApiClient::list_all_deployments`] and [`ApiClient::list_all_apps`]:
+/// page-walks the cursor chain to exhaustion.
+///
+/// Post-#709 / #682, the only pager is `?cursor=`; the walker
+/// terminates when the server returns `null` / absent `next_cursor`.
+/// The `MAX_PAGES` ceiling (1_000) is a defensive guard against a
+/// server that emits an empty page + cursor loop; at the CLI's
+/// default `page_size=100` the cap is 100k entries, well beyond any
+/// realistic `--since` window.
+pub fn list_all_logs(
+    client: &ApiClient,
+    app_name: &str,
+    since_rfc: Option<&str>,
+    until_rfc: Option<&str>,
+    level: Option<&str>,
+    page_size: u32,
+) -> Result<Vec<LogEntry>> {
+    const MAX_PAGES: u32 = 1_000;
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let q = LogListQuery {
+            since_rfc3339: since_rfc,
+            until_rfc3339: until_rfc,
+            level,
+            limit: Some(page_size),
+            cursor: cursor.as_deref(),
+        };
+        let resp = client.logs().list(app_name, q)?;
+        let empty = resp.items.is_empty();
+        all.extend(resp.items);
+        match resp.next_cursor {
+            Some(c) if !c.is_empty() => cursor = Some(c),
+            _ => break,
+        }
+        // Belt-and-suspenders: if the server returns an empty page
+        // AND no cursor, the next iteration would loop forever if
+        // we treated the empty cursor as "more to fetch". Already
+        // guarded above by the `match` arm — empty + no-cursor
+        // breaks. Leaving the comment here so a future refactor
+        // that swaps the order doesn't silently introduce an
+        // infinite loop.
+        if empty {
+            break;
+        }
+    }
+    Ok(all)
 }
 
 #[cfg(test)]
