@@ -124,6 +124,7 @@ COPY edge-test-helpers/                     edge-test-helpers/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin edge-ingress && \
+    mkdir -p /out && \
     cp /build/target/release/edge-ingress /out/edge-ingress
 
 # ── Stage 2: runtime ───────────────────────────────────────────────

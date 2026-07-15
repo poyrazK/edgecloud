@@ -142,6 +142,7 @@ COPY edge-test-helpers/                     edge-test-helpers/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin edge-worker && \
+    mkdir -p /out && \
     cp /build/target/release/edge-worker /out/edge-worker
 
 # ── Stage 2: runtime ───────────────────────────────────────────────
