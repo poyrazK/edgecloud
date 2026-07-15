@@ -337,8 +337,8 @@ jobs:
           file: edge-control-plane/Dockerfile
           tags: edgecloud/control-plane:test
           load: true
-          cache-from: type=gha,mode=min
-          cache-to: type=gha,mode=max,duration=336h
+          cache-from: type=gha,scope=build-images-cp,mode=min
+          cache-to: type=gha,scope=build-images-cp,mode=max,duration=336h
           provenance: false
 
       - name: Build worker image
@@ -348,8 +348,8 @@ jobs:
           file: edge-worker/Dockerfile
           tags: edgecloud/worker:test
           load: true
-          cache-from: type=gha,mode=min
-          cache-to: type=gha,mode=max,duration=336h
+          cache-from: type=gha,scope=build-images-worker,mode=min
+          cache-to: type=gha,scope=build-images-worker,mode=max,duration=336h
           provenance: false
 
       - name: Build ingress image
@@ -359,8 +359,8 @@ jobs:
           file: edge-ingress/Dockerfile
           tags: edgecloud/ingress:test
           load: true
-          cache-from: type=gha,mode=min
-          cache-to: type=gha,mode=max,duration=336h
+          cache-from: type=gha,scope=build-images-ingress,mode=min
+          cache-to: type=gha,scope=build-images-ingress,mode=max,duration=336h
           provenance: false
 
       # Smoke: each image runs and answers a basic liveness check.
