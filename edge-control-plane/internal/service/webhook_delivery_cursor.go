@@ -1,36 +1,52 @@
 package service
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/httpx"
 )
+
+// Issue #58 / #709: webhook delivery cursor codec is now a thin
+// resource-level wrapper around the shared `httpx.EncodeCursor` /
+// `httpx.DecodeCursor` helpers. The wire format is unchanged —
+// v1 envelope, base64url (RawURLEncoding, no padding) — but the
+// base64 / JSON plumbing lives in `internal/httpx/pagination.go`
+// alongside every other list-endpoint codec.
+//
+// Resource-specific concerns kept here:
+//   - Zero-guard on encode: a zero ts or non-positive id is
+//     rejected before any JSON marshal happens (defends against
+//     a service bug constructing a cursor from a partial row).
+//   - Typed-error aliases: callers (service + handler tests)
+//     compare against `ErrInvalidWebhookDeliveryCursor` /
+//     `ErrUnsupportedWebhookDeliveryCursorVersion`. Both alias
+//     the httpx sentinels via `fmt.Errorf("...: %w", ...)` so
+//     `errors.Is` keeps working through the chain.
 
 var (
 	// ErrInvalidWebhookDeliveryCursor is returned when a webhook delivery
 	// cursor cannot be decoded or does not contain a valid timestamp and
-	// delivery ID.
-	ErrInvalidWebhookDeliveryCursor = errors.New("invalid webhook delivery cursor")
+	// delivery ID. Aliases httpx.ErrInvalidCursor via wrap so
+	// `errors.Is(err, httpx.ErrInvalidCursor)` AND
+	// `errors.Is(err, ErrInvalidWebhookDeliveryCursor)` both match.
+	ErrInvalidWebhookDeliveryCursor = fmt.Errorf("invalid webhook delivery cursor: %w", httpx.ErrInvalidCursor)
 	// ErrUnsupportedWebhookDeliveryCursorVersion is returned when the
 	// cursor was produced by a newer, unsupported cursor contract.
-	ErrUnsupportedWebhookDeliveryCursorVersion = errors.New("unsupported webhook delivery cursor version")
+	// Aliases httpx.ErrUnsupportedCursorVersion.
+	ErrUnsupportedWebhookDeliveryCursorVersion = fmt.Errorf("unsupported webhook delivery cursor version: %w", httpx.ErrUnsupportedCursorVersion)
 )
 
-const webhookDeliveryCursorVersion = 1
-
-// webhookDeliveryCursor is the private v1 JSON payload encoded into the
-// opaque base64 string returned as `next_cursor` from
-// GET /api/v1/webhooks/{id}/deliveries. The (ts, id) pair keyset matches
+// webhookDeliveryCursor is the private v1 JSON payload carried in the
+// `p` field of the httpx envelope. The (ts, id) pair keyset matches
 // the repository's strict-tuple predicate
 // `AND (created_at, id) < ($N::timestamptz, $N::bigint)` and the existing
 // composite index idx_webhook_deliveries_webhook (webhook_id, created_at
 // DESC) from migration 015 — no new migration is required.
 type webhookDeliveryCursor struct {
-	Version int       `json:"v"`
-	TS      time.Time `json:"ts"`
-	ID      int64     `json:"id"`
+	TS time.Time `json:"ts"`
+	ID int64     `json:"id"`
 }
 
 // encodeWebhookDeliveryCursor serializes the (created_at, id) of the last
@@ -42,35 +58,27 @@ func encodeWebhookDeliveryCursor(ts time.Time, id int64) (string, error) {
 	if ts.IsZero() || id <= 0 {
 		return "", ErrInvalidWebhookDeliveryCursor
 	}
-	payload, err := json.Marshal(webhookDeliveryCursor{
-		Version: webhookDeliveryCursorVersion,
-		TS:      ts.UTC(),
-		ID:      id,
+	return httpx.EncodeCursor(webhookDeliveryCursor{
+		TS: ts.UTC(),
+		ID: id,
 	})
-	if err != nil {
-		return "", fmt.Errorf("encoding webhook delivery cursor: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(payload), nil
 }
 
 // decodeWebhookDeliveryCursor parses the opaque base64 cursor string
 // supplied by a client back into (created_at, id). Returns
-// ErrUnsupportedWebhookDeliveryCursorVersion when the v field is not 1
-// and ErrInvalidWebhookDeliveryCursor for any other parse failure
-// (malformed base64, malformed JSON, zero ts, non-positive id). The
-// returned timestamp is normalized to UTC.
+// ErrUnsupportedWebhookDeliveryCursorVersion when the envelope's v
+// field is not 1 and ErrInvalidWebhookDeliveryCursor for any other
+// parse failure (malformed base64, malformed JSON, zero ts,
+// non-positive id). The returned timestamp is normalized to UTC.
 func decodeWebhookDeliveryCursor(raw string) (time.Time, int64, error) {
-	payload, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return time.Time{}, 0, ErrInvalidWebhookDeliveryCursor
-	}
-
 	var cursor webhookDeliveryCursor
-	if err := json.Unmarshal(payload, &cursor); err != nil {
-		return time.Time{}, 0, ErrInvalidWebhookDeliveryCursor
-	}
-	if cursor.Version != webhookDeliveryCursorVersion {
-		return time.Time{}, 0, ErrUnsupportedWebhookDeliveryCursorVersion
+	if err := httpx.DecodeCursor(raw, &cursor); err != nil {
+		switch {
+		case errors.Is(err, httpx.ErrUnsupportedCursorVersion):
+			return time.Time{}, 0, ErrUnsupportedWebhookDeliveryCursorVersion
+		default:
+			return time.Time{}, 0, ErrInvalidWebhookDeliveryCursor
+		}
 	}
 	if cursor.TS.IsZero() || cursor.ID <= 0 {
 		return time.Time{}, 0, ErrInvalidWebhookDeliveryCursor

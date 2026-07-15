@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/httpx"
 )
 
 // TestWebhookDeliveryCursorRoundTrip pins the codec contract: encoding
@@ -95,4 +97,42 @@ func encodeWebhookDeliveryCursorPayload(t *testing.T, payload any) string {
 		t.Fatalf("json.Marshal: %v", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+// TestWebhookDeliveryCursorTypedErrorsAliasHttpx pins that the
+// typed-error aliases wrap (not replace) the httpx sentinels. A
+// future refactor that switched `ErrInvalidWebhookDeliveryCursor`
+// from a wrapped fmt.Errorf to a fresh `errors.New` would break
+// `errors.Is(err, httpx.ErrInvalidCursor)` — a contract the
+// handler relies on when distinguishing 400 vs 500 logging. The
+// wrap-shape must stay.
+func TestWebhookDeliveryCursorTypedErrorsAliasHttpx(t *testing.T) {
+	// Invalid cursor: the broken-b64 case maps to
+	// ErrInvalidWebhookDeliveryCursor, which must chain through
+	// to httpx.ErrInvalidCursor.
+	_, _, err := decodeWebhookDeliveryCursor("not base64url!")
+	if err == nil {
+		t.Fatal("expected error decoding malformed cursor")
+	}
+	if !errors.Is(err, httpx.ErrInvalidCursor) {
+		t.Errorf("err = %v, want chainable to httpx.ErrInvalidCursor", err)
+	}
+	if !errors.Is(err, ErrInvalidWebhookDeliveryCursor) {
+		t.Errorf("err = %v, want chainable to ErrInvalidWebhookDeliveryCursor", err)
+	}
+
+	// Unknown version: maps to
+	// ErrUnsupportedWebhookDeliveryCursorVersion, which must chain
+	// through to httpx.ErrUnsupportedCursorVersion.
+	raw := encodeWebhookDeliveryCursorPayload(t, map[string]any{"v": 99, "ts": time.Now(), "id": 1})
+	_, _, err = decodeWebhookDeliveryCursor(raw)
+	if err == nil {
+		t.Fatal("expected error decoding future-version cursor")
+	}
+	if !errors.Is(err, httpx.ErrUnsupportedCursorVersion) {
+		t.Errorf("err = %v, want chainable to httpx.ErrUnsupportedCursorVersion", err)
+	}
+	if !errors.Is(err, ErrUnsupportedWebhookDeliveryCursorVersion) {
+		t.Errorf("err = %v, want chainable to ErrUnsupportedWebhookDeliveryCursorVersion", err)
+	}
 }
