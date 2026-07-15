@@ -7,6 +7,20 @@
 //! exists so the preview CI in `.github/workflows/preview.yml` has a
 //! real artifact to upload on every PR.
 //!
+//! ## Query parameters
+//!
+//! - `size=N` (issue #664 smoke fixture) — return a body of exactly
+//!   `N` bytes instead of the small JSON document. Capped at 1 MiB
+//!   to bound the worker's memory + the ingress's pacing-window
+//!   arithmetic. The body is a JSON envelope wrapping a `data`
+//!   string of the requested size; default content-type is
+//!   `application/json` so the smoke script's response-shape checks
+//!   stay simple. Used by `scripts/dev-bandwidth-smoke.sh` to
+//!   exercise the per-tenant bandwidth cap: with a `bandwidth_bps`
+//!   cap set on the tenant, a `?size=10000` request takes a
+//!   predictable, sized response and the smoke script asserts
+//!   `time_total ≥ expected` (no pacing → instant; paced → slow).
+//!
 //! ## Build
 //!
 //! The CLI does the two-step build (cargo + wasm-tools wrap) for you:
@@ -44,6 +58,14 @@ use crate::wasi::http::types::{
 };
 use crate::edge::cloud::time;
 
+/// Maximum body size for the `?size=N` query parameter (issue #664
+/// smoke fixture). 1 MiB is large enough for any plausible pacing
+/// window (a 1 KB/s cap stretches 1 MiB over ~17 minutes) without
+/// exhausting the worker's per-request memory budget. Requests over
+/// this limit get a 400 response so the smoke script can't OOM the
+/// worker by accident.
+const MAX_SIZE: usize = 1024 * 1024;
+
 struct Hello;
 export!(Hello);
 
@@ -63,15 +85,62 @@ impl crate::exports::wasi::cli::run::Guest for Hello {
 
 impl Guest for Hello {
     fn handle(req: IncomingRequest, out: ResponseOutparam) {
-        let path = req.path_with_query().unwrap_or_else(|| "/".to_string());
+        let path_with_query =
+            req.path_with_query().unwrap_or_else(|| "/".to_string());
+
+        // ?size=N smoke fixture (issue #664). When present, emit a
+        // sized JSON envelope instead of the small default body so
+        // the bandwidth-cap smoke can assert pacing behavior on a
+        // body whose size the script controls. Reject N > 1 MiB with
+        // 400 so a typo or hostile probe can't OOM the worker.
+        if let Some(size) = parse_size_query(&path_with_query) {
+            if size > MAX_SIZE {
+                return_json(
+                    out,
+                    400,
+                    format!("{{\"error\":\"size exceeds {} byte cap\"}}", MAX_SIZE)
+                        .as_bytes(),
+                );
+                return;
+            }
+            let payload = "x".repeat(size);
+            let body = format!(
+                "{{\"size\":{},\"data\":\"{}\"}}",
+                size,
+                payload
+            );
+            return_json(out, 200, body.as_bytes());
+            return;
+        }
+
         let now = time::now();
         let body = format!(
             "{{\"hello\":\"world\",\"path\":\"{}\",\"now\":{}}}",
-            escape_json(&path),
+            escape_json(&path_with_query),
             now
         );
         return_json(out, 200, body.as_bytes());
     }
+}
+
+/// Parse `?size=N` from a path-with-query string. Returns `None`
+/// when the parameter is absent or unparseable. Caps the parsed
+/// value at 1 MiB so an OOM probe can't crash the worker — the
+/// caller still needs to enforce MAX_SIZE for the canonical 400
+/// response, but the cap here is the belt-and-braces second line.
+fn parse_size_query(path_with_query: &str) -> Option<usize> {
+    let qpos = path_with_query.find('?')?;
+    let query = &path_with_query[qpos + 1..];
+    for pair in query.split('&') {
+        if let Some(eq) = pair.find('=') {
+            let key = &pair[..eq];
+            let value = &pair[eq + 1..];
+            if key == "size" {
+                return value.parse::<usize>().ok().map(|n| n.min(MAX_SIZE));
+            }
+        }
+    }
+    None
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
