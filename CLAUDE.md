@@ -206,18 +206,17 @@ IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<reg
 5. Wasm stored at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`; a `deployments` row is written with status `migrated` (no `active_deployments` row yet). Ed25519 signature over `(sha256_raw_32_bytes || deployment_id)` is persisted on the row.
 6. Response is returned: single-file mode returns `MigrationReport`; tree mode returns `TreeMigrationReport` with a per-file `FileReport` array (`{path, status, patterns_detected, transformations, manual_review, errors, preprocessor}`). The developer activates via `edge activate <id>`.
 
-### User-facing list pagination (issue #58)
+### User-facing list pagination (issue #58, issue #709, issue #682)
 
-Both `GET /api/v1/apps` (issue #58 hard-cut) and `GET /api/v1/list/{appName}` (issue #58 dual-envelope compat release) paginate via opaque keyset cursors that round-trip as `?cursor=`. Wire format: base64url `{RawURLEncoding}` of `{"v":1,"p":<payload>}` envelopes. Per-resource payloads differ:
+All three user-facing list endpoints paginate via opaque keyset cursors that round-trip as `?cursor=`. Wire format: base64url `{RawURLEncoding}` of `{"v":1,"p":<payload>}` envelopes, with per-resource payloads differing only in the `p` field's shape:
 
 - **`apps`** keyset on `name` — backed by `UNIQUE(tenant_id, name)` for strict total order (migration 004).
-- **`deployments`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_deployments_tenant_app_created_at_id_desc` (migration 036). Strict because deployments can share a second-precision `created_at` under load.
+- **`deployments`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_deployments_tenant_app_created_at_id_desc` (migration 036). Strict because deployments can share a second-precision `created_at` under load. The `id` cursor is TEXT (`d_<uuid>` convention); the SQL comparator is the disjunctive form `(created_at < $3 OR (created_at = $3 AND id < $4))` because heterogeneous-type tuples `(timestamptz, text)` are not row-comparable. The composite index covers both branches — see `internal/repository/deployment.go::ListByAppPaginated`.
+- **`logs`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_logs_*` migration 025.
 
-Per-resource codec lives at `internal/service/{app,deployment}_pagination.go`; both delegate wire-format primitives (encode/decode/version/URL encoding) to `internal/httpx/pagination.go` so every list endpoint shares the same envelope. Ad-hoc codecs at `internal/service/{webhook_delivery,logs}_cursor.go` will migrate to that helper in a follow-up — out of scope here.
+Per-resource codec lives at `internal/service/{app,deployment}_pagination.go` plus the `logs_cursor.go` / `webhook_delivery_cursor.go` resource wrappers; every codec delegates wire-format primitives (encode/decode/version/URL encoding) to `internal/httpx/pagination.go` so all four list endpoints share one envelope. Adding a new list endpoint: write the resource wrapper, the SQL comparator, the composite index migration; the wire envelope is already done.
 
-**Compat release scope:** `?offset=` and `next_offset` on `/api/v1/list/{appName}` are kept behind `deprecated: true` (openapi precedent at lines 2740-2754) for one release so the existing `edge deployments --page N` math keeps working. Retire in #58-followup. `GET /api/v1/apps` is a hard-cut — there is no offset/compat layer.
-
-`?cursor=` and `?offset=` are mutually exclusive on the deployments endpoint (400), mirroring `handler/webhook.go:179-185` and the apps handler added in this issue.
+**Hard-cut window (issue #709, issue #682):** `?offset=` returns 400 on `/api/v1/list/{appName}` and `/api/v1/apps/{appName}/logs`; the response envelope contains only `{items, total, limit, next_cursor}` (deployments) or `{items, limit, next_cursor}` (logs). There is no `next_offset` field and no compat layer. `?cursor=` is the only accepted pagination knob. `GET /api/v1/apps` was already a hard-cut at issue #58. The CLI dropped `--page` and `--offset`; `edge apps`, `edge deployments`, and `edge logs` all walk the cursor chain to exhaustion (mirroring `list_all_apps`).
 
 **Batch GC paths retain `LIMIT … OFFSET` as non-user-facing optimization** — these are tightly-bounded batch operations keyed on retention cutoffs (`DeleteOlderThanBatched`, `LogGC`, `AuditGC`, `PreviewGC`, `CacheRetrySweep`), not user-facing lists. Offset is fine here because the loop is server-internal and the row set doesn't shift under concurrent inserts the way a user-facing `LIMIT … OFFSET` page does.
 

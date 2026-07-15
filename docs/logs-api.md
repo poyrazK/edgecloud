@@ -37,8 +37,7 @@ clients cannot request rows beyond the retention window.
 | `until`   | RFC3339     | no       | Optional upper bound on `ts` (`ts <= until`). Future-dated → 400. `until < since` → 400. Absent → unbounded (live). |
 | `level`   | enum        | no       | Minimum severity, inclusive (`trace`, `debug`, `info`, `warn`, `error`). Unknown → 400. |
 | `limit`   | int         | no       | [1, 1000], clamped. Default 100. |
-| `cursor`  | opaque str  | no       | Preferred pagination token. Mutually exclusive with `offset` (including `offset=0`). Malformed / unsupported-version → 400. |
-| `offset`  | int         | no       | **Deprecated.** Mutually exclusive with `cursor`. See "Deprecation schedule" below. |
+| `cursor`  | opaque str  | no       | Pagination token. Supplying any non-empty `?offset=` together with `?cursor=` → 400; supplying a non-empty `?offset=` alone → 400. Malformed / unsupported-version cursor → 400. |
 
 The cutoff for `since` is computed server-side as `NOW() - make_interval(secs => $1)`
 (`edge-control-plane/internal/repository/log_entry.go:235`) so a wall-clock
@@ -73,9 +72,7 @@ read-path gain.
   "since": "2026-06-24T11:55:00Z", // echo of the lower bound (empty when
                                    //   no `since` was supplied AND no
                                    //   default was applied)
-  "next_cursor": "eyJ2I...",       // null on final page
-  "next_offset": 100               // null on final page; null in cursor mode
-                                   //   (DEPRECATED — see below)
+  "next_cursor": "eyJ2I..."        // null on final page
 }
 ```
 
@@ -105,9 +102,8 @@ query**. Clients that reuse a cursor with a different filter set may
 silently skip rows that fall outside the new filter — the strict-tuple
 predicate only narrows, it never broadens.
 
-`cursor` and `offset` are mutually exclusive at the handler
-(`edge-control-plane/internal/handler/logs.go`) — any request that supplies
-both, including `offset=0`, returns 400. The handler also returns 400 on
+`?offset=` is rejected at the handler (`edge-control-plane/internal/handler/logs.go`)
+— any non-empty value returns 400. The handler also returns 400 on
 malformed or unsupported-version cursors.
 
 A cursor whose `ts` is **strictly after** the supplied `until` returns 400
@@ -128,24 +124,12 @@ extra row (`edge-control-plane/internal/service/logs.go:189`). This fixes
 the legacy bug where `len(entries) == limit` would promise another page
 when the final page was exactly full.
 
-| Request type      | `next_cursor`              | `next_offset` (deprecated) |
-|-------------------|----------------------------|----------------------------|
-| First page, more  | last row's cursor          | `limit`                    |
-| First page, final | `null`                     | `null`                     |
-| `offset=N`, more  | last row's cursor          | `N + limit`                |
-| `offset=N`, final | `null`                     | `null`                     |
-| `cursor=…`, more  | last row's cursor          | `null` (suppressed)        |
-| `cursor=…`, final | `null`                     | `null`                     |
-
-## Deprecation schedule
-
-`offset` / `next_offset` are retained for one release to give clients time to
-migrate. The follow-up issue (open at the time of writing) will remove the
-`offset` query parameter, the `next_offset` response field, the server's
-offset branch in `LogService.ListByTenantApp` and
-`LogEntryRepository.ListByTenantApp`, the `LogListFilter.Offset` field, and
-the CLI's `--offset` flag plus its offset-fallback next-page hint. Until
-then, clients using `offset` keep working unchanged.
+| Request type      | `next_cursor`              |
+|-------------------|----------------------------|
+| First page, more  | last row's cursor          |
+| First page, final | `null`                     |
+| `cursor=…`, more  | last row's cursor          |
+| `cursor=…`, final | `null`                     |
 
 ## Index decision (and why no new migration)
 
@@ -185,9 +169,6 @@ edge logs myapp --level warn
 # Live follow (SIGINT-aware, drains cursor chain before advancing the
 # watermark so bursts larger than one page are not truncated)
 edge logs myapp --follow
-
-# Legacy offset — still works for one release
-edge logs myapp --offset 100
 ```
 
 ### <a id="follow-burst-draining"></a>Follow burst-draining
@@ -217,39 +198,40 @@ comparison comment above it.
 - **Go unit**:
   [`internal/handler/logs_test.go`](../edge-control-plane/internal/handler/logs_test.go)
   pins handler-level invariants (explicit `since` produces a positive
-  lookback; `until` validation; cursor+offset including `offset=0`; rich
-  envelope retained; JWT/context tenant, not a client-provided field, is
-  forwarded to the service).
+  lookback; `until` validation; cursor-only envelope; rejection of any
+  non-empty `?offset=`; rich envelope retained; JWT/context tenant, not a
+  client-provided field, is forwarded to the service).
 - **Go unit**:
   [`internal/service/logs_test.go`](../edge-control-plane/internal/service/logs_test.go)
-  pins `limit+1` semantics, cursor-mode suppression of `next_offset`,
-  cursor generation from the last visible row, `until` propagation,
-  **cursor + level combined propagation**, **cursor-after-`until`
-  rejection** (`TestLogService_RejectsCursorAfterUntil` — the typed
+  pins `limit+1` semantics, cursor generation from the last visible row,
+  `until` propagation, **cursor + level combined propagation**,
+  **cursor-after-`until` rejection**
+  (`TestLogService_RejectsCursorAfterUntil` — the typed
   `ErrInvalidLogCursor` short-circuits before any repo call), and the
   existing defaults / severity translation.
 - **Go unit**:
   [`internal/service/logs_cursor_test.go`](../edge-control-plane/internal/service/logs_cursor_test.go)
   pins the v1 roundtrip, URL-safe/no-padding encoding, malformed
-  base64/JSON, unsupported version, zero timestamp, and non-positive ID.
+  base64/JSON, unsupported version, zero timestamp, non-positive ID, and
+  that the typed-error aliases wrap (not replace) the `httpx` sentinels.
 - **Go unit**:
   [`internal/repository/log_entry_test.go`](../edge-control-plane/internal/repository/log_entry_test.go)
   pins the SQL shape (`tenant_id`/`app_name` first, upper/lower time
   bounds, level, cursor tuple predicate, `ORDER BY ts DESC, id DESC`,
-  `LIMIT limit+1`, offset absent in cursor mode, retained otherwise).
+  `LIMIT limit+1`).
 - **PostgreSQL integration** (build tag `integration`,
   [`internal/repository/log_entry_integration_test.go`](../edge-control-plane/internal/repository/log_entry_integration_test.go)):
   pins tenant isolation, equal-timestamp cursor stability, concurrent-insert
   stability, combined filter propagation, and `EXPLAIN` evidence that the
   planner uses `idx_logs_tenant_app_ts` without seq scan or full sort.
 - **Rust CLI** ([`edge-cli/tests/logs.rs`](../edge-cli/tests/logs.rs)):
-  pins URL query encoding, cursor-preferred / offset-fallback hints, rich
-  JSON output, clap mutual exclusion (`--cursor`/`--offset`, `--follow`
-  with `--until`/`--cursor`/`--offset`), `--until` forwarding, stable
-  filter preservation, burst draining over multiple pages,
-  equal-timestamp boundary dedupe, Ctrl-C between pages, **stale-cursor
-  empty-page exit** (`logs_stale_cursor_returns_empty_page_exits_cleanly`),
-  and pure `interruptible_sleep` SIGINT-flag semantics
+  pins URL query encoding, rich JSON output, cursor walker behavior
+  (`logs_walks_cursor_chain_to_exhaustion`), `--cursor` forwarding on
+  second-page request, `--until` forwarding, stable filter preservation,
+  burst draining over multiple pages, equal-timestamp boundary dedupe,
+  Ctrl-C between pages, **stale-cursor empty-page exit**
+  (`logs_stale_cursor_returns_empty_page_exits_cleanly`), and pure
+  `interruptible_sleep` SIGINT-flag semantics
   (`interruptible_sleep_returns_early_when_stop_is_set`).
 
 ## What is explicitly out of scope
@@ -260,4 +242,3 @@ comparison comment above it.
 - SSE / WebSocket streaming. Pagination already supports `edge logs
   --follow` without long-lived connections.
 - Label / regex filters. Add a follow-up issue if needed.
-- Removing `offset`. Tracked in a separate follow-up issue.
