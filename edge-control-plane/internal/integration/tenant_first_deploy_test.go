@@ -50,7 +50,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"embed"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -254,9 +253,11 @@ func TestTenantFirstDeploy(t *testing.T) {
 	// pending row will flip to `published` within ~1s. The drainer
 	// has no Stop method — cancellation breaks its loop. We don't
 	// need a reference to the returned drainer here; the goroutine
-	// runs for the test's lifetime.
+	// runs for the test's lifetime. Use the production-constructed
+	// drainer (already wired by app.New with the same DB + publisher)
+	// instead of building a parallel one with the same arguments.
 	t.Log("starting outbox drainer")
-	_ = firstDeployStartDrainer(t, ctx, db, publisher)
+	_ = firstDeployStartDrainer(t, ctx, appObj.OutboxDrainer)
 
 	// Step 15 — wait for the fake worker to receive task_update.
 	t.Log("waiting for fake worker to receive task_update")
@@ -334,6 +335,42 @@ func TestTenantFirstDeploy(t *testing.T) {
 	require.Equal(t, firstDeployWorkerID, claims.WorkerID)
 	require.Equal(t, tenantID, claims.TenantID)
 	require.Equal(t, firstDeployRegion, claims.Region)
+
+	// Step 20 — EnrollWorker→Invalidate contract. Rotate the worker's
+	// Ed25519 public key on disk + bust the WorkerKeyCache entry (the
+	// same Invalidate call EnrollWorker makes after a fresh
+	// SetPublicKey, see internal/handler/internal.go:1170-1171). The
+	// next /tokens/tenant mint MUST verify under the new key without
+	// waiting out the 5-minute cache TTL.
+	//
+	// This pins the seam #713's cache-share fix is supposed to keep
+	// closed: if the route-middleware and the InternalHandler ever
+	// diverge and stop sharing the same *WorkerKeyCache instance,
+	// Invalidating here doesn't reach the InternalHandler's cache
+	// and the next mint verifies against the stale key.
+	t.Log("rotating worker public key (EnrollWorker contract)")
+	newPub, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	newPubHex := hex.EncodeToString(newPub)
+	_, err = workerRepo.SetPublicKey(ctx, firstDeployWorkerID, newPubHex)
+	require.NoError(t, err)
+	cache := appObj.WorkerJWTConfig.WorkerKeyCache
+	require.NotNil(t, cache, "production WorkerKeyCache must be wired on appObj.WorkerJWTConfig")
+	cache.Invalidate(firstDeployWorkerID)
+
+	status, body = firstDeployPostTenantToken(t, srv.URL, workerJWT, tenantID)
+	require.Equal(t, http.StatusOK, status,
+		"post-rotate /tokens/tenant must 200; body=%s", string(body))
+	require.NoError(t, json.Unmarshal(body, &resp))
+
+	// The new mint MUST verify under the rotated key — if the cache
+	// served the stale entry, the token would verify under the old
+	// pubkey instead and the test would go red on the secret
+	// mismatch.
+	_, err = jwt.ParseWithClaims(resp.Token, &middleware.WorkerClaims{}, func(tok *jwt.Token) (interface{}, error) {
+		return signing.DeriveWorkerSecret([]byte(firstDeployJWTSecret), firstDeployWorkerID, tenantID, firstDeployRegion, newPubHex)
+	})
+	require.NoError(t, err, "rotated key must take effect on the next mint (cache-invalidation contract)")
 
 	t.Logf("PASS — kid=%v claims.WorkerID=%v claims.TenantID=%v", claims.WorkerID, claims.WorkerID, claims.TenantID)
 }
@@ -619,9 +656,11 @@ func firstDeployAssertFreshTenantRows(
 	req.Header.Set("Authorization", "Bearer "+rawAPIKey)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	rawBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err, "read /apps response body")
 	require.Equal(t, http.StatusOK, resp.StatusCode,
-		"owner bearer must 200 on /api/v1/apps; body=%s", readBody(resp.Body))
+		"owner bearer must 200 on /api/v1/apps; body=%q", string(rawBody))
 }
 
 // firstDeployNewFakeWorker generates an Ed25519 keypair, inserts a
@@ -758,14 +797,19 @@ func firstDeployPostTenantToken(
 // firstDeploySubscribeWorkerTasks subscribes to the task subject for
 // the supplied region. Returns the message channel; callers receive
 // from it directly and decode the *natsctl.TaskMessage themselves.
+//
+// The subscription is registered for explicit Unsubscribe via
+// t.Cleanup so the close path doesn't depend on nc.Close() running
+// first — defensive against a future cleanup refactor.
 func firstDeploySubscribeWorkerTasks(
 	t *testing.T, nc *natsio.Conn, region string,
 ) chan *natsio.Msg {
 	t.Helper()
 	ch := make(chan *natsio.Msg, 16)
-	_, err := nc.ChanSubscribe("edgecloud.tasks."+region, ch)
+	sub, err := nc.ChanSubscribe("edgecloud.tasks."+region, ch)
 	require.NoError(t, err)
 	require.NoError(t, nc.Flush())
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
 	return ch
 }
 
@@ -961,19 +1005,21 @@ func firstDeployAssertActivationCommitted(
 	require.NotEmpty(t, appCfg.DeploymentSignature, "outbox payload must carry the Ed25519 signature")
 }
 
-// firstDeployStartDrainer wires the production OutboxDrainer at 100ms
-// tick (matches rollback_e2e_test.go's posture) and runs it in a
+// firstDeployStartDrainer runs the production OutboxDrainer in a
 // goroutine bound to the test context. The drainer has no Stop method
 // — cancellation breaks the loop. Returns the drainer so callers can
 // drive Tick deterministically if needed; the production-style tick
 // loop here matches what app.RunBackground would do.
+//
+// We pass the App's already-constructed drainer instead of building
+// a parallel one — both share the same DB + publisher, but reusing
+// the production instance keeps the helper honest about which
+// drainer the test is driving.
 func firstDeployStartDrainer(
-	t *testing.T, ctx context.Context, db *sqlx.DB, pub *natsctl.NATSPublisher,
+	t *testing.T, ctx context.Context, d *service.OutboxDrainer,
 ) *service.OutboxDrainer {
 	t.Helper()
 
-	d := service.NewOutboxDrainer(repository.NewOutboxRepository(db), pub,
-		100*time.Millisecond, 50, 10)
 	go func() {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
@@ -1011,20 +1057,12 @@ func firstDeployEventuallyOutboxPublished(
 		"outbox row for tenant=%s app=%s never flipped to published", tenantID, appName)
 }
 
-// newIdempotencyKey returns a fresh UUID-v4-shaped hex string. The
-// Activate handler only checks the [a-fA-F0-9-]{8,128} format, so any
-// sufficiently long hex+dasg string works.
+// newIdempotencyKey returns a fresh 32-char hex string. The Activate
+// handler's idempotency-key regex is `[a-fA-F0-9-]{8,128}`, so any
+// sufficiently long hex string works — we don't set UUID v4 version
+// bits because the server doesn't need them.
 func newIdempotencyKey() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-// readBody reads and returns the response body bytes for diagnostic
-// messages. Truncated to 4 KiB.
-func readBody(r io.Reader) string {
-	const maxDump = 4 << 10
-	b, _ := io.ReadAll(io.LimitReader(r, maxDump))
-	// base64-encode to keep binary garbage out of test logs.
-	return base64.StdEncoding.EncodeToString(b)
 }
