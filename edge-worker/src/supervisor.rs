@@ -335,7 +335,7 @@ mod heartbeat_integration_tests {
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         assert_eq!(hb.apps.len(), 1);
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(s.status, "running");
         assert_eq!(s.tenant_id, "t_test");
         assert_eq!(s.port, 18000);
@@ -360,7 +360,7 @@ mod heartbeat_integration_tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(s.status, "crashed");
         assert_eq!(s.exit_code, Some(1));
     }
@@ -378,7 +378,7 @@ mod heartbeat_integration_tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(s.ws_port, Some(19091));
     }
 
@@ -403,7 +403,7 @@ mod heartbeat_integration_tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(
             s.resident_seconds,
             Some(60),
@@ -430,7 +430,7 @@ mod heartbeat_integration_tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert!(
             s.resident_seconds.is_none(),
             "Handler (FaaS) app must omit resident_seconds (None); got {:?}",
@@ -455,12 +455,83 @@ mod heartbeat_integration_tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
-        let s = hb.apps.get("my-app").expect("app present");
+        let s = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(
             s.resident_seconds,
             Some(0),
             "LongRunning just-started app must stamp Some(0); got {:?}",
             s.resident_seconds
+        );
+    }
+
+    /// Two deployments of the same `(tenant, app_name)` (canary fan-out,
+    /// issue #290) must produce TWO distinct heartbeat keys — not
+    /// collapse to one. The legacy single-key `app_name` form would
+    /// overwrite; the new `"app_name:deployment_id"` form keeps both.
+    #[tokio::test]
+    async fn build_heartbeat_canary_two_deployments_no_key_collision() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app_d1 = make_app(None, AppInstanceStatus::Running, None);
+        let app_d2 = make_app(None, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(
+                ("t_test".into(), "my-app".into(), "d1".into()),
+                app_d1,
+            );
+        state
+            .write()
+            .await
+            .apps
+            .insert(
+                ("t_test".into(), "my-app".into(), "d2".into()),
+                app_d2,
+            );
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert_eq!(
+            hb.apps.len(),
+            2,
+            "canary fan-out must produce 2 heartbeat entries, got {:?}",
+            hb.apps.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            hb.apps.contains_key("my-app:d1"),
+            "deployment_id d1 must appear under composite key"
+        );
+        assert!(
+            hb.apps.contains_key("my-app:d2"),
+            "deployment_id d2 must appear under composite key"
+        );
+    }
+
+    /// Legacy single-deployment shape still uses the composite key —
+    /// the wire format is `"{app_name}:{deployment_id}"`, NOT just
+    /// `"{app_name}"`. Ingress does `split_once(':')` to recover both
+    /// halves, so a missing `:` for new workers would leave
+    /// `deployment_id: None` on the ingress side.
+    #[tokio::test]
+    async fn build_heartbeat_legacy_single_deployment_key_has_deployment_id_suffix() {
+        let engine = edge_runtime::create_engine().expect("engine");
+        let state = Arc::new(RwLock::new(WorkerState::new(engine)));
+        let app = make_app(None, AppInstanceStatus::Running, None);
+        state
+            .write()
+            .await
+            .apps
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
+        let sup = build_supervisor(state);
+        let hb = sup.build_heartbeat().await;
+        assert!(
+            !hb.apps.contains_key("my-app"),
+            "legacy app_name-only key must NOT be emitted — ingress split_once(':') would lose deployment_id"
+        );
+        assert!(
+            hb.apps.contains_key("my-app:d1"),
+            "composite key must carry deployment_id suffix"
         );
     }
 
@@ -1246,7 +1317,7 @@ mod heartbeat_integration_tests {
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
 
-        let status = hb.apps.get("my-app").expect("app present");
+        let status = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(status.request_count, 2);
         assert_eq!(status.outbound_bytes, 512);
 
@@ -3565,13 +3636,18 @@ impl Supervisor {
             .unwrap_or(0);
 
         let state = self.state.read().await;
-        // Iterate the (tenant_id, app_name)-keyed map. The heartbeat wire
-        // format keys `apps` by app_name only, so if two tenants happen
-        // to share an app name one will overwrite the other — preserved
-        // from v0.1 behavior; multi-tenant app-name collisions are a
-        // v0.3 routing concern (ingress already disambiguates by
-        // (tenant_id, app_name), see edge-ingress::config::ingress_host).
-        for ((_tenant_id, app_name, _deployment_id), inst) in &state.apps {
+        // Iterate the (tenant_id, app_name, deployment_id)-keyed map.
+        // The heartbeat wire format keys `apps` by `"{app_name}:{deployment_id}"`
+        // (issue #290) so a canary fan-out of the same `(tenant, app_name)`
+        // produces N distinct keys instead of one overwrite. The ingress
+        // already does `key.split_once(':')` to recover the pair
+        // (`edge-ingress/src/heartbeats.rs`), so this is pure
+        // forward-compat — legacy workers emitting `app_name` keys still
+        // parse as `deployment_id: None` on the ingress. Multi-tenant
+        // app-name collisions are still a separate concern; ingress
+        // disambiguates by `(tenant_id, app_name)` and worker state still
+        // keys by triple.
+        for ((_tenant_id, app_name, deployment_id), inst) in &state.apps {
             let inst = inst.lock().await;
             let status = app_status_to_string(&inst.status);
             let exit_code = app_status_exit_code(&inst.status);
@@ -3619,7 +3695,7 @@ impl Supervisor {
             };
 
             msg.apps.insert(
-                app_name.clone(),
+                format!("{}:{}", app_name, deployment_id),
                 AppStatus {
                     deployment_id: inst.deployment_id.clone(),
                     status: status.to_string(),
@@ -3718,15 +3794,37 @@ impl Supervisor {
     /// will appear in the next heartbeat interval rather than being silently lost.
     pub async fn reset_meters_after(&self, heartbeat: &HeartbeatMessage) {
         let state = self.state.read().await;
-        for (app_name, status) in &heartbeat.apps {
-            // Look up by (tenant_id, app_name) — the heartbeat carries
-            // tenant_id inside AppStatus, so we can resolve the right
-            // instance even if app_name alone is ambiguous on this
-            // worker.
+        for (wire_key, status) in &heartbeat.apps {
+            // Wire key is `"{app_name}:{deployment_id}"` (issue #290).
+            // The composite lets canary fan-out carry multiple
+            // deployments under one app_name without overwriting, but
+            // for state-map lookup we still need the trio. Split off
+            // the deployment_id (everything after the first `:`);
+            // app_name is everything before. Legacy single-deployment
+            // keys still carry the `:d1` suffix, so the split is
+            // safe — `split_once(':')` matches the ingress parser
+            // (`edge-ingress/src/heartbeats.rs`).
+            let (app_name, deployment_id) = match wire_key.split_once(':') {
+                Some((n, d)) => (n.to_string(), d.to_string()),
+                None => {
+                    // Defensive: should not happen post-#290, but log
+                    // and skip so a malformed key never crashes the
+                    // heartbeat drain path.
+                    tracing::warn!(
+                        wire_key = %wire_key,
+                        "heartbeat key missing ':' separator; skipping reset"
+                    );
+                    continue;
+                }
+            };
+            // Look up by (tenant_id, app_name, deployment_id) — the
+            // heartbeat carries tenant_id inside AppStatus, so we can
+            // resolve the right instance even if app_name alone is
+            // ambiguous on this worker.
             let key = (
                 status.tenant_id.clone(),
                 app_name.clone(),
-                status.deployment_id.clone(),
+                deployment_id.clone(),
             );
             if let Some(inst) = state.apps.get(&key) {
                 let inst = inst.lock().await;
@@ -5231,7 +5329,7 @@ mod tests {
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         // Sanity check: build_heartbeat stamped Some(60).
-        let stamped = hb.apps.get("my-app").expect("app present");
+        let stamped = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(
             stamped.resident_seconds,
             Some(60),
@@ -5365,7 +5463,7 @@ mod tests {
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         // Sanity check: build_heartbeat stamped 200ms onto the wire.
-        let stamped = hb.apps.get("my-app").expect("app present");
+        let stamped = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(
             stamped.duration_ms_total, 200,
             "build_heartbeat must stamp duration_ms_total for Handler app"
@@ -5491,7 +5589,7 @@ mod tests {
             .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
-        let stamped = hb.apps.get("my-app").expect("app present");
+        let stamped = hb.apps.get("my-app:d1").expect("app present");
         assert_eq!(
             stamped.duration_ms_total, 0,
             "LongRunning app must stamp duration_ms_total = 0"
