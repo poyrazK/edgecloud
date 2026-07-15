@@ -2724,6 +2724,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2771,6 +2772,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2816,6 +2818,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
