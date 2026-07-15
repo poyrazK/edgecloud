@@ -103,52 +103,55 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
         shutdown.clone(),
     );
 
-    // Wait for the consumer to attach its JetStream push subscription
-    // before publishing. With `RetentionPolicy::Interest` on the stream
-    // (`nats_pub::build_stream_config`), messages published before any
-    // consumer has them in its filter are GC'd immediately — so
-    // publishing too early in the test would deliver zero messages to
-    // the aggregator. `spawn_consumer` only spawns the task; the
-    // `consumer.messages()` round-trip (a JetStream RPC) is one tick
-    // away. Empirically that chain takes ~500ms on CI; a 3s settle
-    // gives ample headroom. Production doesn't need this dance because
-    // the scrape tick is 1s and the consumer attaches during the
-    // sidecar's first boot, long before the first scrape — production
-    // has minutes of grace.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Note: we deliberately do NOT pre-sleep before publishing. The
+    // 3s "wait for the consumer to attach" idiom didn't bound the
+    // race on slow CI (see issue #665 PR E review thread). The
+    // re-publish loop below is what gives the spawned consumer task
+    // ample attach-time headroom — by the time we observe 3
+    // distinct replicas in the aggregator's window, the consumer's
+    // push subscription has been live for at least one round.
 
     let aggregator = Aggregator::new(observer.to_string(), 10_000);
 
-    // Publish one DeltaMsg per replica, in order. Production emits
-    // these on every 1s scrape tick; the test publishes one per
-    // replica because the aggregator's window is 1s and the assertion
-    // is on the steady-state snapshot (3 distinct replicas seen).
+    // Drive the publisher → consumer → aggregator pipeline until the
+    // aggregator observes all 3 replicas at the steady-state RPS.
+    // Each round re-publishes a fresh `DeltaMsg` per replica (same
+    // shape, fresh `scraped_at_unix_ms`) for two reasons:
+    //
+    //   - the spawned consumer task has to complete get_stream +
+    //     get_or_create_consumer + consumer.messages() RPCs before
+    //     its push subscription is attached, and on slow CI runners
+    //     that chain can take several seconds (LastPerSubject means
+    //     messages published before attach are lost);
+    //   - re-publishing keeps the stream `Interest` and the consumer's
+    //     freshness gate (`MAX_MESSAGE_AGE = 2s`) satisfied on every
+    //     round.
+    //
+    // Re-publishing every ~250ms is more resilient than a fixed
+    // `tokio::time::sleep`; the timeout budget is RECONCILE_GRACE.
     let rps_per_replica = 10_000u32;
-    for (i, rid) in replicas.iter().enumerate() {
-        let msg = fresh_delta(rid, rps_per_replica);
-        publishers[i]
-            .publish_delta(rid, &msg)
-            .await
-            .expect("publish");
-    }
-
-    // Tick the aggregator until it sees all 3 replicas with the
-    // expected platform total. The consumer may take a moment to
-    // deliver via the push subscription — poll with a generous grace
-    // window.
     let t0 = Instant::now();
     let snap = loop {
+        for (i, rid) in replicas.iter().enumerate() {
+            let msg = fresh_delta(rid, rps_per_replica);
+            publishers[i]
+                .publish_delta(rid, &msg)
+                .await
+                .expect("publish");
+            publishers[i].flush().await.expect("flush");
+        }
+
         let snap = aggregator.tick(&mut agg_rx, Instant::now()).await;
         if snap.replicas_seen == 3 && snap.platform_total == 30_000 {
             break snap;
         }
         if t0.elapsed() > RECONCILE_GRACE {
             panic!(
-                "aggregator never observed 3 replicas; last snap = {:?}",
-                snap
+                "aggregator never observed 3 replicas within {RECONCILE_GRACE:?}; \
+                 last snap = {snap:?}"
             );
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     };
 
     // Field-by-field assertion on the steady-state snapshot.
