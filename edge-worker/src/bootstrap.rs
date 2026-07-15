@@ -1,37 +1,38 @@
 //! Bootstrap handshake client for the per-worker HS256 secret
 //! provisioning flow (issue #430).
 //!
-//! Replaces the pre-#430 two-phase handshake that returned the
+//! Replaces the pre-#430 single-`GET` flow that returned the
 //! cluster-wide `JWT_SECRET` to any caller with a valid bootstrap
 //! JWT — a CRITICAL exfiltration vector for a compromised worker
 //! (one compromised worker could forge JWTs for every other
 //! worker cluster-wide).
 //!
-//! The new flow is three phases:
+//! The flow is two phases:
 //!
-//! 1. POST `/api/internal/bootstrap` — same shape as before, but
-//!    the payload now also carries the worker's Ed25519
+//! 1. POST `/api/internal/bootstrap` — the worker sends its Ed25519
 //!    `public_key`. The HMAC-SHA256 signature covers the
 //!    `public_key` so a stolen bootstrap secret alone is
 //!    insufficient to enroll a worker the attacker doesn't control.
 //!    Response: `{token, enrollment_challenge, challenge_expires_at}`.
+//!    `enrollment_challenge` is a 32-byte random secret, base64-encoded
+//!    for transport; `bootstrap_phase1` returns both the wire string
+//!    and the decoded bytes so phase 2 can forward the wire string
+//!    verbatim (the CP challenge-store keys on it) while signing the
+//!    decoded bytes.
 //!
-//! 2. (handled by `WorkerIdentity` in `worker_key.rs`) the worker
-//!    keeps the same Ed25519 keypair across restarts so phase 1 can
-//!    prove possession of the matching private key in phase 3.
-//!
-//! 3. POST `/api/internal/worker-bootstrap/enroll` — presents the
-//!    bootstrap JWT and an Ed25519 signature over
-//!    `sha256(public_key || enrollment_challenge)`. The CP verifies
-//!    the signature, persists `public_key` on the `workers` row,
-//!    and returns the per-worker derived secret + kid:
+//! 2. POST `/api/internal/worker-bootstrap/enroll` — body carries
+//!    `worker_id`, `public_key`, `enrollment_challenge` (wire
+//!    string), and an Ed25519 signature over
+//!    `sha256(decoded_pubkey || decoded_challenge)`. The CP
+//!    verifies, persists `public_key` on the `workers` row, and
+//!    returns the per-worker derived secret + kid:
 //!    `{kid: "wkr_" + hex(sha256(pubkey))[:8], secret, expires_at}`.
 //!
 //! On success the caller persists the derived secret to disk via
 //! `auth::persist_identity` so subsequent restarts can skip the
 //! handshake entirely (see `auth::load_persisted_identity`).
 //!
-//! The previous phase-2 endpoint `GET /api/internal/worker-secret`
+//! The previous endpoint `GET /api/internal/worker-secret`
 //! is removed from the control plane in the same release; this
 //! module has no fallback to it.
 
@@ -50,6 +51,29 @@ pub const BOOTSTRAP_PATH: &str = "/api/internal/bootstrap";
 /// The path the control plane exposes for the enrollment phase 2.
 pub const ENROLL_PATH: &str = "/api/internal/worker-bootstrap/enroll";
 
+/// Phase-1 enrollment challenge in both wire and decoded forms.
+///
+/// The CP issues a 32-byte random challenge, base64url-encoded for
+/// transport. Phase 2 needs both:
+///
+/// - the **wire string** verbatim — the CP's challenge-store keys on
+///   the original string (`internal.go:1115-1135`) and re-base64-encoding
+///   the decoded bytes could collide if the encoder normalizes padding
+///   differently.
+/// - the **decoded 32 bytes** for the SHA-256 binding
+///   `sha256(pubkey || challenge)` that phase 2 signs.
+///
+/// Returning both from `bootstrap_phase1` lets phase 2 forward the wire
+/// string in the request body while signing the decoded bytes — the
+/// two encodings are intentionally separated.
+#[derive(Debug, Clone)]
+pub struct Challenge {
+    /// Verbatim wire encoding the CP returned in phase 1.
+    pub wire: String,
+    /// Decoded 32-byte challenge bytes the worker signs in phase 2.
+    pub bytes: [u8; 32],
+}
+
 /// Result of a successful bootstrap enrollment handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedSecret {
@@ -63,11 +87,6 @@ pub struct DerivedSecret {
     /// surface it for observability and for the future
     /// `EDGE_WORKER_REENROLL_ON_BOOT` path.
     pub expires_at: i64,
-    /// Lowercase hex of the enrolled Ed25519 public key. Echoed
-    /// back by the CP so the worker can assert the CP stored the
-    /// key we expected (defends against a man-in-the-middle that
-    /// enrolls a different pubkey under our bootstrap JWT).
-    pub public_key_hex: String,
 }
 
 /// Phase-1 response body. The bootstrap JWT (`token`) is a regular
@@ -82,14 +101,20 @@ struct BootstrapResponse {
 }
 
 /// Phase-2 (enrollment) response body. Mirrors the Go side's
-/// `EnrollmentResponse` struct.
+/// `EnrollmentResponse` struct (`internal/handler/internal.go:998-1010`,
+/// `:1213-1219`).
+///
+/// Note: the CP does NOT echo back `public_key_hex`. The pre-#504
+/// worker expected the echo as a MITM defense; with phase-2 now
+/// signed over `enrollment_challenge`, that defense moves to the
+/// challenge signature — the worker signs
+/// `sha256(pubkey || challenge)` and the CP verifies against
+/// the stored `pubkey_hex` from the workers row.
 #[derive(Debug, Deserialize, Serialize)]
 struct EnrollResponse {
     kid: String,
     secret: String,
     expires_at: i64,
-    #[allow(dead_code)]
-    public_key_hex: String,
 }
 
 /// BootstrapClient handles the two-step handshake with the control
@@ -174,8 +199,8 @@ impl BootstrapClient {
     /// Run the full bootstrap handshake.
     ///
     /// `identity` is the worker's long-lived Ed25519 keypair. Its
-    /// `public_key_hex` is sent in phase 1 (covered by the HMAC) and
-    /// used to sign the challenge in phase 2.
+    /// raw public-key bytes are decoded from hex, sent in phase 2,
+    /// and used to sign the challenge.
     ///
     /// Returns the per-worker derived secret on success. The caller
     /// is expected to feed the result into
@@ -192,20 +217,8 @@ impl BootstrapClient {
 
         // Phase 2: POST /api/internal/worker-bootstrap/enroll
         let derived = self
-            .enroll_phase2(&bootstrap_jwt, identity, &challenge)
+            .enroll_phase2(&bootstrap_jwt, identity, &challenge, &public_key_hex)
             .await?;
-
-        // Defense-in-depth: assert the CP stored the pubkey we sent.
-        // The CP also returns its stored pubkey in the response so
-        // the worker can detect a MITM that swapped our pubkey for
-        // the attacker's.
-        if derived.public_key_hex.to_lowercase() != public_key_hex.to_lowercase() {
-            anyhow::bail!(
-                "enrollment public_key mismatch: sent {} but CP stored {}",
-                public_key_hex,
-                derived.public_key_hex
-            );
-        }
 
         tracing::info!(
             worker_id = %self.worker_id,
@@ -223,7 +236,13 @@ impl BootstrapClient {
     /// challenge. The `public_key` is part of the HMAC coverage so
     /// a stolen bootstrap secret alone cannot enroll a different
     /// worker's pubkey.
-    async fn bootstrap_phase1(&self, public_key_hex: &str) -> anyhow::Result<(String, Vec<u8>)> {
+    ///
+    /// Returns both the wire-formatted challenge string and the
+    /// decoded 32-byte challenge. Phase 2 forwards the wire string
+    /// to the CP and signs the decoded bytes — the two encodings
+    /// are intentionally separated so the CP challenge-store can
+    /// key on the original encoding.
+    async fn bootstrap_phase1(&self, public_key_hex: &str) -> anyhow::Result<(String, Challenge)> {
         let timestamp = Self::rfc3339_now();
         let nonce = Uuid::new_v4().to_string();
 
@@ -283,19 +302,24 @@ impl BootstrapClient {
         // generates these with crypto/rand; the wire format is
         // unpadded base64 (matches the request-side encoding used
         // everywhere else in this crate).
-        let challenge = base64::engine::general_purpose::STANDARD
-            .decode(data.enrollment_challenge.as_bytes())
-            .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(data.enrollment_challenge.as_bytes())
-            })
+        let raw = data.enrollment_challenge.as_bytes();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw))
             .context("bootstrap phase 1: enrollment_challenge is not valid base64")?;
-        if challenge.len() != 32 {
+        if decoded.len() != 32 {
             anyhow::bail!(
                 "bootstrap phase 1: enrollment_challenge has wrong length ({} bytes, want 32)",
-                challenge.len()
+                decoded.len()
             );
         }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&decoded);
+
+        let challenge = Challenge {
+            wire: data.enrollment_challenge.clone(),
+            bytes,
+        };
 
         tracing::info!(
             worker_id = %self.worker_id,
@@ -308,33 +332,54 @@ impl BootstrapClient {
     /// Phase 2: Exchange the bootstrap JWT for the per-worker
     /// derived secret.
     ///
-    /// Signs `sha256(public_key || challenge)` with the worker's
-    /// Ed25519 keypair so the CP can verify the caller actually
-    /// holds the private key matching the public_key it HMAC'd in
-    /// phase 1. Without this proof, a stolen bootstrap JWT alone
-    /// would let an attacker exfiltrate the derived secret for
-    /// their own worker_id.
+    /// Decodes the worker's public key from hex, signs
+    /// `sha256(decoded_pubkey || decoded_challenge)` with the
+    /// Ed25519 keypair, and sends `{worker_id, public_key,
+    /// enrollment_challenge (wire), signature}` in the request body.
+    /// The CP re-derives the same hash and verifies against the
+    /// stored pubkey.
+    ///
+    /// Without this proof of private-key possession, a stolen
+    /// bootstrap JWT alone would let an attacker exfiltrate the
+    /// derived secret for their own worker_id.
     async fn enroll_phase2(
         &self,
         bootstrap_jwt: &str,
         identity: &crate::worker_key::WorkerIdentity,
-        challenge: &[u8],
+        challenge: &Challenge,
+        public_key_hex: &str,
     ) -> anyhow::Result<DerivedSecret> {
-        let public_key_hex = identity.public_key_hex();
+        // Decode pubkey from hex so we hash the **raw 32 bytes** of
+        // the public key, not the ASCII hex string. Pre-#504 the
+        // worker hashed `public_key_hex.as_bytes()` and the CP
+        // hashed `decoded_pubkey_bytes` — they disagreed, so every
+        // phase-2 request was silently rejected.
+        let pubkey_raw = hex::decode(public_key_hex)
+            .context("bootstrap phase 2: public_key is not valid hex")?;
+        if pubkey_raw.len() != 32 {
+            anyhow::bail!(
+                "bootstrap phase 2: public_key has wrong length ({} bytes, want 32)",
+                pubkey_raw.len()
+            );
+        }
 
-        // sha256(public_key || challenge) — bound message the
-        // worker signs. The CP re-derives the same hash and
-        // verifies the Ed25519 signature against `public_key_hex`.
+        // sha256(decoded_pubkey || decoded_challenge) — bound
+        // message the worker signs. The CP re-derives the same
+        // hash from the stored `workers.public_key_hex` (after its
+        // own hex-decode) and the challenge-store entry popped by
+        // `enrollment_challenge`.
         let mut hasher = Sha256::new();
-        hasher.update(public_key_hex.as_bytes());
-        hasher.update(challenge);
+        hasher.update(&pubkey_raw);
+        hasher.update(challenge.bytes);
         let bound: [u8; 32] = hasher.finalize().into();
 
         let signature = identity.sign(&bound);
         let signature_hex = hex::encode(signature);
 
         let body = serde_json::json!({
+            "worker_id": self.worker_id,
             "public_key": public_key_hex,
+            "enrollment_challenge": challenge.wire,
             "signature": signature_hex,
         });
 
@@ -393,8 +438,38 @@ impl BootstrapClient {
             kid: data.kid,
             secret,
             expires_at: data.expires_at,
-            public_key_hex: data.public_key_hex,
         })
+    }
+}
+
+/// Adapter that lets [`crate::jwt_refresh::spawn_jwt_refresh_loop`]
+/// drive the bootstrap handshake without taking a dependency on
+/// `BootstrapClient` directly (the refresh loop is generic over any
+/// `EnrollmentRefresher`). `BootstrapClient::run` itself takes a
+/// `&WorkerIdentity` per call, so the adapter keeps a long-lived
+/// reference and just delegates.
+///
+/// This is the production half of the `EnrollmentRefresher` trait;
+/// tests use a `wiremock`-backed stub for end-to-end coverage of the
+/// refresh path.
+pub struct BootstrapRefreshClient {
+    inner: BootstrapClient,
+    identity: std::sync::Arc<crate::worker_key::WorkerIdentity>,
+}
+
+impl BootstrapRefreshClient {
+    pub fn new(
+        inner: BootstrapClient,
+        identity: std::sync::Arc<crate::worker_key::WorkerIdentity>,
+    ) -> Self {
+        Self { inner, identity }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::jwt_refresh::EnrollmentRefresher for BootstrapRefreshClient {
+    async fn refresh_once(&self) -> anyhow::Result<DerivedSecret> {
+        self.inner.run(&self.identity).await
     }
 }
 
@@ -443,6 +518,30 @@ mod tests {
         }
     }
 
+    /// Phase-2 body capture responder. Captures the request body
+    /// into a shared `Mutex` for inspection in test assertions,
+    /// then returns a synthetic `{kid, secret, expires_at}`
+    /// response (no `public_key_hex`, mirroring the real CP).
+    struct Phase2Capture {
+        capture: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        kid: String,
+        secret_b64: String,
+        expires_at: i64,
+    }
+
+    impl Respond for Phase2Capture {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("phase2 body should be JSON");
+            *self.capture.lock().unwrap() = Some(parsed);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kid": self.kid,
+                "secret": self.secret_b64,
+                "expires_at": self.expires_at,
+            }))
+        }
+    }
+
     /// Build a WorkerIdentity backed by a tempdir so the test
     /// doesn't leak an identity.key into the repo.
     fn fresh_identity() -> (WorkerIdentity, tempfile::TempDir) {
@@ -473,7 +572,9 @@ mod tests {
 
         // Phase 2: derive the kid + secret the way the CP would and
         // return it so the worker can verify its own handshake.
-        let pubkey = identity.public_key_hex().to_string();
+        // The response deliberately OMITS `public_key_hex` — the CP
+        // does not echo the pubkey; the wire contract is now
+        // `{kid, secret, expires_at}` only.
         let secret_b64 = BASE64.encode([0xAAu8; 32]);
         Mock::given(method("POST"))
             .and(path(ENROLL_PATH))
@@ -482,7 +583,6 @@ mod tests {
                 "kid": "wkr_test0001",
                 "secret": secret_b64,
                 "expires_at": chrono::Utc::now().timestamp() + 86400,
-                "public_key_hex": pubkey,
             })))
             .expect(1)
             .mount(&server)
@@ -499,7 +599,6 @@ mod tests {
         let derived = client.run(&identity).await.expect("handshake");
         assert_eq!(derived.kid, "wkr_test0001");
         assert_eq!(derived.secret, vec![0xAAu8; 32]);
-        assert_eq!(derived.public_key_hex, pubkey);
     }
 
     /// Phase 1 must include the worker's `public_key` in BOTH the
@@ -534,7 +633,6 @@ mod tests {
                 "kid": "wkr_deadbeef",
                 "secret": BASE64.encode([0u8; 32]),
                 "expires_at": 0i64,
-                "public_key_hex": pubkey,
             })))
             .expect(1)
             .mount(&server)
@@ -773,7 +871,6 @@ mod tests {
                 "kid": "wkr_persist",
                 "secret": BASE64.encode(secret_bytes),
                 "expires_at": 0i64,
-                "public_key_hex": pubkey,
             })))
             .expect(1)
             .mount(&server)
@@ -788,12 +885,15 @@ mod tests {
         );
         let derived = client.run(&identity).await.expect("handshake");
 
-        // Mirror the production main.rs persist call.
+        // Mirror the production main.rs persist call. `PersistedIdentity`
+        // still needs `public_key_hex` so subsequent restarts can prove
+        // possession against the CP — but the source is now the worker's
+        // own `WorkerIdentity`, not the CP-derived response.
         let identity_path = dir.path().join("identity.key");
         let persisted = crate::auth::PersistedIdentity {
             kid: derived.kid.clone(),
             secret: derived.secret.clone(),
-            public_key_hex: derived.public_key_hex.clone(),
+            public_key_hex: pubkey,
         };
         crate::auth::persist_identity(&identity_path, &persisted).expect("persist");
 
@@ -802,6 +902,94 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded, persisted);
+    }
+
+    /// Phase-2 wire contract test. Pins the exact JSON body shape
+    /// the CP enforces (`internal/handler/internal.go:967-996`):
+    /// `{worker_id, public_key, enrollment_challenge, signature}`.
+    /// Also asserts the signature is over
+    /// `sha256(decoded_pubkey || decoded_challenge)` — the post-#504
+    /// contract. Pre-#504 the worker hashed the **hex string** of
+    /// the pubkey and produced a signature the CP could never
+    /// verify, so every phase-2 request was silently rejected.
+    #[tokio::test]
+    async fn bootstrap_phase2_carries_worker_id_and_challenge_and_signs_decoded_bytes() {
+        use sha2::{Digest, Sha256};
+
+        let server = MockServer::start().await;
+        let (identity, _dir) = fresh_identity();
+        let challenge = [0x99u8; 32];
+        let challenge_b64 = BASE64.encode(challenge);
+
+        Mock::given(method("POST"))
+            .and(path(BOOTSTRAP_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "test-bootstrap-jwt",
+                "enrollment_challenge": challenge_b64,
+                "challenge_expires_at": 0i64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pubkey = identity.public_key_hex().to_string();
+        let secret_bytes = [0x77u8; 32];
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None::<serde_json::Value>));
+        let capture_clone = capture.clone();
+        let capture_responder = Phase2Capture {
+            capture: capture_clone,
+            kid: "wkr_decode".to_string(),
+            secret_b64: BASE64.encode(secret_bytes),
+            expires_at: 1234567890,
+        };
+        Mock::given(method("POST"))
+            .and(path(ENROLL_PATH))
+            .and(header("Authorization", "Bearer test-bootstrap-jwt"))
+            .respond_with(capture_responder)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(
+            server.uri(),
+            b"test-secret".to_vec(),
+            "w_worker_jwt".to_string(),
+            "fra".to_string(),
+            "t_test".to_string(),
+        );
+        let _ = client.run(&identity).await.expect("handshake");
+
+        let captured = capture
+            .lock()
+            .unwrap()
+            .take()
+            .expect("phase 2 body should have been captured");
+        assert_eq!(captured["worker_id"], "w_worker_jwt");
+        assert_eq!(captured["public_key"], pubkey);
+        assert_eq!(captured["enrollment_challenge"], challenge_b64);
+
+        let signature_hex = captured["signature"]
+            .as_str()
+            .expect("signature should be a string");
+        let signature = hex::decode(signature_hex).expect("signature should be hex");
+        assert_eq!(signature.len(), 64, "Ed25519 signature is 64 bytes");
+
+        // Recompute the bound message the **CP** would verify:
+        // sha256(decoded_pubkey || decoded_challenge). Verify the
+        // signature against that.
+        let pubkey_raw = hex::decode(&pubkey).expect("pubkey is hex");
+        let mut hasher = Sha256::new();
+        hasher.update(&pubkey_raw);
+        hasher.update(challenge);
+        let bound: [u8; 32] = hasher.finalize().into();
+
+        let verifying_key =
+            ed25519_dalek::VerifyingKey::from_bytes(pubkey_raw.as_slice().try_into().unwrap())
+                .expect("pubkey is a valid ed25519 point");
+        let sig = ed25519_dalek::Signature::from_bytes(&signature.try_into().unwrap());
+        verifying_key
+            .verify_strict(&bound, &sig)
+            .expect("signature must verify against sha256(decoded_pubkey || decoded_challenge)");
     }
 
     /// Pre-existing `.worker-cache/identity.key` on disk lets

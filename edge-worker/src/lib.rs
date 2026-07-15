@@ -9,6 +9,7 @@ pub mod config;
 pub mod detect;
 pub mod dispatch;
 pub mod downloader;
+pub mod jwt_refresh;
 pub mod log_forwarder;
 pub mod messages;
 pub mod metering_dedupe;

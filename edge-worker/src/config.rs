@@ -161,12 +161,21 @@ pub struct Config {
     /// containers / immutable images where mounting a per-pod secret
     /// file is impractical. Default: `.worker-cache/identity.key`.
     pub worker_key_path: PathBuf,
-    /// Path to the persisted per-worker signing secret (issue #430).
-    /// Written by the bootstrap enrollment handshake on first boot
-    /// and read on subsequent boots to skip the handshake. Default:
-    /// `.worker-cache/identity.key`. (Same default as
-    /// `worker_key_path`; keeping the two fields separate lets the
-    /// operator mount each from a different volume.)
+    /// Path to the persisted per-worker signing secret (issue #430,
+    /// reworked in issue #504). Written by the bootstrap enrollment
+    /// handshake on first boot and read on subsequent boots to skip
+    /// the handshake.
+    ///
+    /// Defaults to `.worker-cache/identity.bin` — deliberately
+    /// distinct from `worker_key_path`'s `.worker-cache/identity.key`.
+    /// Pre-#504 the two paths collided: `WorkerIdentity::load_or_create`
+    /// writes a 32-byte raw Ed25519 seed to one location, while
+    /// `auth::persist_identity` writes the longer EWIS binary record
+    /// to another; whichever writer ran second corrupted the other.
+    /// Splitting the defaults is what stops the corruption; the two
+    /// paths are separate so each writer can stay strict about its
+    /// own file shape. Operators can still override either with
+    /// `EDGE_WORKER_KEY_PATH` / `EDGE_WORKER_IDENTITY_PATH`.
     pub worker_identity_path: PathBuf,
     /// Force re-enrollment on every boot (issue #430). When `true`,
     /// the worker ignores any persisted signing secret and runs the
@@ -383,13 +392,19 @@ impl Config {
             // together by `auth::persist_identity` — but keeping
             // the config fields distinct lets future code (e.g. a
             // planned HMAC-secret-only rotation) reference either
-            // independently.
+            // The two paths share a default directory but are
+            // different files. Pre-#504 they were the same path, so
+            // the raw Ed25519 seed and the EWIS enrollment record
+            // collided. The fix is to give each writer its own
+            // default filename (operators can still override via
+            // env); see the field-level docs on `worker_key_path`
+            // and `worker_identity_path` for the full rationale.
             worker_key_path: std::env::var("EDGE_WORKER_KEY_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(".worker-cache/identity.key")),
             worker_identity_path: std::env::var("EDGE_WORKER_IDENTITY_PATH")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(".worker-cache/identity.key")),
+                .unwrap_or_else(|_| PathBuf::from(".worker-cache/identity.bin")),
             worker_reenroll_on_boot: parse_env_bool("EDGE_WORKER_REENROLL_ON_BOOT", false)?,
             socket_mode: SocketEgressPolicy::from_env(),
             hostname_pinning_enabled: parse_env_bool("EDGE_EGRESS_HOSTNAME_PINNING", false)?,
@@ -740,6 +755,41 @@ mod tests {
             cfg.epoch_deadline_ticks, 100,
             "default epoch_deadline_ticks is 100"
         );
+    }
+
+    /// Issue #504 regression: `worker_key_path` (the raw Ed25519
+    /// seed) and `worker_identity_path` (the EWIS enrollment record)
+    /// must NOT default to the same file path. Pre-#504 both
+    /// defaulted to `.worker-cache/identity.key`, so whichever
+    /// writer ran second corrupted the other — losing either the
+    /// signing keypair or the derived HS256 secret across restarts.
+    /// Explicitly distinct defaults are the load-bearing fix; this
+    /// test catches a future refactor that quietly re-collides the
+    /// two paths.
+    #[test]
+    fn config_from_env_identity_paths_are_distinct() {
+        let _g = lock_and_set(&[
+            ("WORKER_ID", Some("w_test_abc")),
+            ("REGION", Some("fra")),
+            ("CONTROL_PLANE_URL", Some("http://localhost:8080")),
+            ("EDGE_WORKER_ADDR", Some("127.0.0.1:0")),
+            ("WORKER_TENANT_ID", Some("t_test")),
+            ("EDGE_WORKER_KEY_PATH", None),
+            ("EDGE_WORKER_IDENTITY_PATH", None),
+            ("EDGE_REQUIRE_SIGNATURE", Some("false")),
+        ]);
+        let cfg = Config::from_env().expect("from_env");
+        assert_ne!(
+            cfg.worker_key_path, cfg.worker_identity_path,
+            "worker_key_path ({:?}) and worker_identity_path ({:?}) \
+             must default to distinct files to avoid corrupting one \
+             with the other's contents (issue #504).",
+            cfg.worker_key_path, cfg.worker_identity_path
+        );
+        // The contract: raw seed stays at .worker-cache/identity.key;
+        // EWIS enrollment record lives at .worker-cache/identity.bin.
+        assert!(cfg.worker_key_path.ends_with("identity.key"));
+        assert!(cfg.worker_identity_path.ends_with("identity.bin"));
     }
 
     /// `WORKER_JWT_SECRET` is intentionally optional (see main.rs warning):

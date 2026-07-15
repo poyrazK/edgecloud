@@ -46,7 +46,8 @@ use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
 use prometheus::{
-    core::Collector, Encoder, Gauge, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder,
+    core::Collector, Encoder, Gauge, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use tokio::sync::RwLock;
 
@@ -122,6 +123,17 @@ pub struct WorkerMetrics {
     pub registry: Registry,
     pub worker_uptime_seconds: Gauge,
     pub worker_active_apps: Gauge,
+    /// Wall-clock Unix-epoch seconds at which the current JWT
+    /// snapshot will expire. Updated by the proactive refresh
+    /// loop (`jwt_refresh::spawn_jwt_refresh_loop`) on every
+    /// successful refresh; alert if the timestamp is older than
+    /// `2 * REFRESH_LEAD` to catch a stuck loop. Issue #504.
+    pub worker_jwt_expires_at_seconds: Gauge,
+    /// Per-outcome counter for proactive + reactive JWT refresh
+    /// attempts. `outcome = "ok" | "err"`. Bumped by both
+    /// `jwt_refresh` and the reactive `with_token_refresh` helper
+    /// so a single counter is the source of truth. Issue #504.
+    pub worker_jwt_refresh_total: IntCounterVec,
     pub app_status: IntGaugeVec,
     /// Audit-style terminal status. Stamped once per
     /// `(deployment_id, app_name)` from `unregister_app` AFTER
@@ -143,6 +155,15 @@ pub struct WorkerMetrics {
     /// Worker-process boot instant — anchored at construction so
     /// `tick_worker_gauges` can compute uptime by `start.elapsed()`.
     pub started_at: Instant,
+}
+
+/// Lightweight handle to the JWT refresh gauge + outcome counter,
+/// carried by the refresh loop and the reactive 401 helper.
+/// Cloned cheaply (all fields are `Arc`-backed by prometheus).
+#[derive(Clone)]
+pub struct RefreshMetrics {
+    pub expires_at: Gauge,
+    pub refresh_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -209,10 +230,39 @@ impl WorkerMetrics {
         )?;
         registry.register(Box::new(app_terminal_status.clone()))?;
 
+        // JWT refresh: wall-clock expiry + per-outcome counter.
+        // Both are process-global (one worker → one signer → one
+        // refresh loop), so they live as a single-series Gauge /
+        // labeled IntCounterVec on the private registry.
+        let worker_jwt_expires_at_seconds = Gauge::with_opts(Opts::new(
+            "edge_worker_jwt_expires_at_seconds",
+            "Unix-epoch seconds at which the current JWT snapshot \
+             will expire. Updated by the proactive refresh loop \
+             (`jwt_refresh::spawn_jwt_refresh_loop`, issue #504) on \
+             every successful refresh. Alert if older than \
+             `2 * REFRESH_LEAD` to catch a stuck loop.",
+        ))?;
+        registry.register(Box::new(worker_jwt_expires_at_seconds.clone()))?;
+        let worker_jwt_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "edge_worker_jwt_refresh_total",
+                "Outcome counter for proactive + reactive JWT refresh \
+                 attempts (issue #504). `outcome=\"ok\"` for a successful \
+                 install; `outcome=\"err\"` for any failure (previous \
+                 snapshot remains in service). Reactive 401-triggered \
+                 refreshes share the same counter so the operator sees \
+                 a single source of truth.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(worker_jwt_refresh_total.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             worker_uptime_seconds,
             worker_active_apps,
+            worker_jwt_expires_at_seconds,
+            worker_jwt_refresh_total,
             app_status,
             app_terminal_status,
             apps: RwLock::new(HashMap::new()),
@@ -518,6 +568,15 @@ impl WorkerMetrics {
     /// delta. The active-apps gauge is set to the current map size
     /// so a `remove_app` that races with the tick lands at a
     /// consistent value.
+    ///
+    /// `edge_worker_jwt_expires_at_seconds` is NOT touched here —
+    /// it's set explicitly by the proactive refresh loop
+    /// (`jwt_refresh::spawn_jwt_refresh_loop`) on every successful
+    /// install. Tick-worker-gauges knows nothing about the signer;
+    /// threading the signer in would force the metrics module to
+    /// take a circular dependency on `auth`. The 1s ticker is short
+    /// enough that the gauge stays live between installs — a stalled
+    /// gauge is the intended "loop is stuck" alert signal.
     pub fn tick_worker_gauges(&self) {
         self.worker_uptime_seconds
             .set(self.started_at.elapsed().as_secs() as f64);
@@ -529,6 +588,38 @@ impl WorkerMetrics {
         if let Ok(apps) = self.apps.try_read() {
             self.worker_active_apps.set(apps.len() as f64);
         }
+    }
+
+    /// Convenience for `jwt_refresh::spawn_jwt_refresh_loop` and the
+    /// reactive `with_token_refresh` helper. Bumps
+    /// `edge_worker_jwt_refresh_total{outcome="ok"|"err"}` once per
+    /// refresh attempt — both the proactive loop and the reactive
+    /// helper share this counter so an operator sees a single source
+    /// of truth.
+    pub fn refresh_outcome_inc(&self, outcome: &str) {
+        self.worker_jwt_refresh_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    /// Stamp `edge_worker_jwt_expires_at_seconds` from the monotonic
+    /// `Instant` the signer holds in its `TokenSnapshot`. We translate
+    /// `Instant` → wall-clock Unix-epoch seconds using
+    /// `SystemTime::now() + (deadline - Instant::now())` so the metric
+    /// shares the same axis as the JWT's `exp` claim. The math is
+    /// deliberately done in `i64`s — clock skew between the worker
+    /// boot offset and the CP is bounded by `1s` of NTP drift in
+    /// practice, so a saturated clamp at 0 is the only realistic
+    /// failure mode.
+    pub fn set_jwt_expires_at(&self, expires_at: std::time::Instant) {
+        let now = std::time::Instant::now();
+        let secs_from_now = expires_at.saturating_duration_since(now).as_secs() as i64;
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.worker_jwt_expires_at_seconds
+            .set((unix_now + secs_from_now).max(0) as f64);
     }
 }
 
