@@ -30,12 +30,20 @@
 //!
 //! See issue #665 for the design doc + PR breakdown.
 
-mod aggregate;
-mod caddy_metrics;
-mod config;
-mod expose;
-mod nats_pub;
-mod nats_sub;
+// All modules are `pub` so the integration test binary
+// (`tests/integration_test.rs`) can drive the full pipeline:
+// publisher (`nats_pub::NatsPublisher::publish_delta`) → consumer
+// (`nats_sub::spawn_consumer` + freshness gate) → aggregator
+// (`Aggregator::tick`) → snapshot (`Snapshot::per_replica_cap`).
+// The binary keeps the same surface; only the visibility flips. The
+// only consumer of these `pub` paths outside the binary is the
+// integration test, which is gated behind `RUN_INTEGRATION_TESTS`.
+pub mod aggregate;
+pub mod caddy_metrics;
+pub mod config;
+pub mod expose;
+pub mod nats_pub;
+pub mod nats_sub;
 
 use std::process::ExitCode;
 use std::sync::Arc;
