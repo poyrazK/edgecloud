@@ -346,7 +346,7 @@ func (r *WorkerRepository) UpsertStatus(ctx context.Context, ws *domain.WorkerSt
 	// predicate tight on workers that have never exhausted.
 	query := `
 		INSERT INTO worker_status (worker_id, apps, last_report, free_slots, cluster_headroom, port_pool_exhausted_count, last_exhaustion_at)
-		VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::BIGINT > 0 THEN $3 ELSE NULL END)
+		VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6::BIGINT > 0 THEN $3::TIMESTAMPTZ ELSE NULL END)
 		ON CONFLICT (worker_id) DO UPDATE SET
 			apps                    = EXCLUDED.apps,
 			last_report             = EXCLUDED.last_report,
