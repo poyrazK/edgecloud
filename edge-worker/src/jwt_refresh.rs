@@ -53,29 +53,88 @@ pub enum RefreshSource {
     /// Bootstrap enrollment mode (issue #430, primary path post-#504).
     /// `refresh` runs the full handshake and returns the new
     /// `(kid, secret)` to install via `signer.set_secret`.
-    Enrolled(Arc<dyn EnrollmentRefresher>),
+    Enrolled(Arc<EnrolledSource>),
+}
+
+/// Enrolled source wired with its single-flight gate.
+///
+/// The gate is a `tokio::sync::Mutex<()>` held only across the
+/// `refresh_once` call. A second caller that finds the lock held
+/// receives `RefreshOutcome::Skipped` rather than queuing for the
+/// in-flight handshake — the next tick will pick up the staleness
+/// check post-install.
+pub struct EnrolledSource {
+    inner: Arc<dyn EnrollmentRefresher>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Outcome of a refresh attempt.
+///
+/// `Skipped` is returned when another task already holds the
+/// single-flight gate. The loop treats it identically to a
+/// successful refresh for the purpose of resetting `attempt` to 0
+/// but DOES NOT call `signer.set_secret` — the in-flight handshake
+/// owns the new snapshot.
+#[derive(Debug)]
+pub enum RefreshOutcome {
+    /// A fresh `(kid, secret)` pair from the CP.
+    Rotated {
+        kid: Option<String>,
+        secret: Option<Vec<u8>>,
+    },
+    /// A `Static` refresh — nothing to install.
+    Noop,
+    /// Another refresh is in flight; this caller bailed out.
+    Skipped,
 }
 
 impl RefreshSource {
-    /// Run a refresh. Returns `RefreshOutcome` on success or an
-    /// `anyhow::Error` describing the failure. Implementations are
-    /// expected to internally serialize concurrent callers (single-
-    /// flight gate) so two ticks in rapid succession collapse to
-    /// one handshake.
+    /// Run a refresh. Returns `RefreshOutcome::Noop` for `Static`,
+    /// `Rotated` on a successful enrollment, `Skipped` when the
+    /// single-flight gate is already held, and `Err` on a hard
+    /// enrollment failure (network, CP 4xx/5xx, signature mismatch).
     async fn refresh(&self) -> anyhow::Result<RefreshOutcome> {
         match self {
-            RefreshSource::Static => Ok(RefreshOutcome {
-                kid: None, // kid stays at whatever the signer already has
-                secret: None,
-            }),
-            RefreshSource::Enrolled(r) => {
-                let derived = r.refresh_once().await?;
-                Ok(RefreshOutcome {
-                    kid: Some(derived.kid),
-                    secret: Some(derived.secret),
-                })
-            }
+            RefreshSource::Static => Ok(RefreshOutcome::Noop),
+            RefreshSource::Enrolled(src) => src.refresh_once_serialized().await,
         }
+    }
+}
+
+impl EnrolledSource {
+    pub fn new(inner: Arc<dyn EnrollmentRefresher>) -> Self {
+        Self {
+            inner,
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Try to acquire the single-flight gate without awaiting it.
+    /// Returns `Ok(SkipGuard)` on success, `Err(Skip)` if held.
+    fn try_gate(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, ()> {
+        match Arc::clone(&self.gate).try_lock_owned() {
+            Ok(g) => Ok(g),
+            Err(_) => Err(()),
+        }
+    }
+
+    async fn refresh_once_serialized(&self) -> anyhow::Result<RefreshOutcome> {
+        // Non-blocking acquire: a second caller that finds the gate held
+        // returns `Skipped` rather than queuing behind the in-flight
+        // handshake. The next tick will pick up the staleness check
+        // after the install. This avoids a thundering herd when the
+        // proactive loop ticks within microseconds of the reactive 401
+        // helper (issue #504 followup).
+        let _guard = match self.try_gate() {
+            Ok(g) => g,
+            Err(()) => return Ok(RefreshOutcome::Skipped),
+        };
+
+        let derived = self.inner.refresh_once().await?;
+        Ok(RefreshOutcome::Rotated {
+            kid: Some(derived.kid),
+            secret: Some(derived.secret),
+        })
     }
 }
 
@@ -84,13 +143,6 @@ impl RefreshSource {
 #[async_trait::async_trait]
 pub trait EnrollmentRefresher: Send + Sync {
     async fn refresh_once(&self) -> anyhow::Result<crate::bootstrap::DerivedSecret>;
-}
-
-/// Result of a successful refresh. `kid` and `secret` are `None`
-/// for the static secret mode (the signer's existing fields stay).
-pub struct RefreshOutcome {
-    pub kid: Option<String>,
-    pub secret: Option<Vec<u8>>,
 }
 
 /// Spawn the refresh loop. Returns a `JoinHandle` so `main` can
@@ -142,22 +194,35 @@ pub fn spawn_jwt_refresh_loop(
                         "jwt token approaching expiry; running proactive refresh"
                     );
                     match source.refresh().await {
-                        Ok(outcome) => {
+                        Ok(RefreshOutcome::Rotated { kid, secret }) => {
                             attempt = 0;
-                            // Install the new secret + kid under one
-                            // write lock; generation bumps
-                            // automatically (WorkerJwtSigner invariant).
-                            if outcome.kid.is_some() || outcome.secret.is_some() {
-                                signer.set_secret(
-                                    outcome.secret.unwrap_or_default(),
-                                    outcome.kid,
-                                );
+                            // Install the new secret + kid atomically
+                            // (one Arc<TokenSnapshot> swap). Empty-secret
+                            // guard inside install_snapshot closes
+                            // Defect 4 from the #504 review.
+                            if let Some(secret) = secret {
+                                signer.install_snapshot(secret, kid);
                             }
                             metrics.refresh_outcome_inc("ok");
-                            metrics.set_jwt_expires_at(signer.snapshot().expires_at);
+                            metrics.set_jwt_expires_at(signer.snapshot_arc().expires_at);
                             tracing::info!(
-                                kid = ?signer.snapshot().kid,
+                                kid = ?signer.snapshot_arc().kid,
                                 "jwt refresh succeeded"
+                            );
+                        }
+                        Ok(RefreshOutcome::Noop) => {
+                            attempt = 0;
+                            metrics.refresh_outcome_inc("ok");
+                            tracing::debug!(
+                                "jwt refresh tick: static-secret mode; no handshake required"
+                            );
+                        }
+                        Ok(RefreshOutcome::Skipped) => {
+                            // Another task is mid-handshake. Don't
+                            // bump `attempt` so the next tick picks
+                            // up immediately after the install.
+                            tracing::debug!(
+                                "jwt refresh tick: single-flight gate held; skipping"
                             );
                         }
                         Err(err) => {

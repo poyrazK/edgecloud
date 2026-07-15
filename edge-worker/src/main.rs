@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             config.region.clone(),
             config.worker_tenant_id.clone(),
         );
-        signer.set_secret(jwt_secret.clone(), Some(kid));
+        signer.install_snapshot(jwt_secret.clone(), Some(kid));
         signer
     } else {
         WorkerJwtSigner::new(
@@ -374,29 +374,31 @@ async fn main() -> anyhow::Result<()> {
             // HTTP client, with its 10s timeout, is reserved for
             // supervisor-level fetches.)
             let refresher = BootstrapRefreshClient::new(client, std::sync::Arc::new(identity));
-            edge_worker::jwt_refresh::RefreshSource::Enrolled(std::sync::Arc::new(refresher))
+            let enrolled =
+                edge_worker::jwt_refresh::EnrolledSource::new(std::sync::Arc::new(refresher));
+            edge_worker::jwt_refresh::RefreshSource::Enrolled(std::sync::Arc::new(enrolled))
         } else {
             edge_worker::jwt_refresh::RefreshSource::Static
         };
     let refresh_tick = std::time::Duration::from_secs(60);
     let refresh_lead = std::time::Duration::from_secs(300); // 5min
-    let _refresh_task = tokio::spawn(async move {
-        // Stamp the initial expiry on the gauge so `/metrics`
-        // reflects the current snapshot even if the loop's first
-        // tick lands at the deadline boundary (where the gauge
-        // would otherwise stay at the default 0.0 until the first
-        // refresh). Issue #504.
-        refresh_metrics.set_jwt_expires_at(refresh_signer.snapshot().expires_at);
-        edge_worker::jwt_refresh::spawn_jwt_refresh_loop(
-            refresh_signer,
-            refresh_source,
-            refresh_tick,
-            refresh_lead,
-            refresh_shutdown_token,
-            refresh_metrics,
-        )
-        .await
-    });
+                                                            // Stamp the initial expiry on the gauge BEFORE spawning the
+                                                            // loop so `/metrics` reflects the current snapshot even if the
+                                                            // loop's first tick lands at the deadline boundary (where the
+                                                            // gauge would otherwise stay at the default 0.0 until the
+                                                            // first refresh). Issue #504. Done on the local handles so we
+                                                            // don't need a wrapping `tokio::spawn` (which would expose a
+                                                            // `JoinHandle<Result<(), JoinError>>` mismatch at the call site
+                                                            // for `graceful_shutdown`, which expects `JoinHandle<()>`).
+    refresh_metrics.set_jwt_expires_at(refresh_signer.snapshot().expires_at);
+    let refresh_task = edge_worker::jwt_refresh::spawn_jwt_refresh_loop(
+        refresh_signer,
+        refresh_source,
+        refresh_tick,
+        refresh_lead,
+        refresh_shutdown_token,
+        refresh_metrics,
+    );
     tracing::info!("jwt refresh task started");
 
     let heartbeat_supervisor = supervisor.clone();
@@ -486,9 +488,13 @@ async fn main() -> anyhow::Result<()> {
     // broadcast::Sender is Clone + Send + Sync, so no Arc is needed.
     let shutdown_tx_s = shutdown_tx.clone();
     let metrics_task_for_shutdown = metrics_task;
-    // The JWT refresh task's JoinHandle (`refresh_task`) is awaited at the
-    // very end of fn main() — we only own the cancellation token here
-    // so graceful_shutdown can fire it; the loop exits on its own.
+    // Issue #504 (review-fix): the JWT refresh task's JoinHandle is now
+    // moved into the signal-handler closure and drained inside
+    // `graceful_shutdown` with a 2-second grace — mirroring the metrics
+    // task pattern. Dropping the handle silently at end of `fn main`
+    // would fire-and-forget the loop body (panic + in-flight refreshes
+    // invisible to operators).
+    let refresh_task_for_shutdown = refresh_task;
     let refresh_shutdown_for_shutdown = refresh_shutdown.clone();
     tokio::spawn(async move {
         let mut sigterm = match signal(SignalKind::terminate()) {
@@ -519,17 +525,12 @@ async fn main() -> anyhow::Result<()> {
             signal = signal_name,
             "received signal, initiating graceful shutdown"
         );
-        // We don't have access to refresh_task here (it was bound
-        // inside the previous `tokio::spawn` closure). The signal-
-        // handler task above already cancels `refresh_shutdown`, so
-        // the loop will exit on its own; we don't need to await it
-        // here. main() awaits it after the consume loop returns
-        // (see end of fn main).
         graceful_shutdown(
             shutdown_tx_s,
             shutdown_supervisor,
             logs_task,
             metrics_task_for_shutdown,
+            refresh_task_for_shutdown,
             refresh_shutdown_for_shutdown,
         )
         .await;
@@ -798,15 +799,15 @@ async fn graceful_shutdown(
     supervisor: Arc<Supervisor>,
     logs_task: tokio::task::JoinHandle<()>,
     metrics_task: tokio::task::JoinHandle<()>,
+    refresh_task: tokio::task::JoinHandle<()>,
     refresh_shutdown: CancellationToken,
 ) {
     // Signal the heartbeat + log-forwarder + metrics tasks to stop.
     let _ = shutdown_tx.send(());
 
     // Issue #504: signal the proactive JWT refresh task to exit at its
-    // next loop iteration. The `refresh_task` JoinHandle lives in
-    // `fn main()` and is awaited after `graceful_shutdown` returns,
-    // so all the signal-handler closeout sees here is the cancellation.
+    // next loop iteration. The handle is awaited below with a 2-second
+    // grace (mirror of the metrics task pattern).
     refresh_shutdown.cancel();
 
     tracing::info!("graceful shutdown: stopping all apps");
@@ -841,6 +842,24 @@ async fn graceful_shutdown(
         Err(_) => tracing::warn!(
             timeout_secs = metrics_grace.as_secs(),
             "metrics server drain timed out; connections may be cut",
+        ),
+    }
+
+    // Wait for the JWT refresh loop to exit at the next select! boundary.
+    // The cancellation token is already cancelled; the loop observes it,
+    // drops the join-error if any, and the wrapper task completes.
+    // 2-second grace matches `metrics_task` and the public runbook.
+    let refresh_grace = Duration::from_secs(2);
+    match tokio::time::timeout(refresh_grace, refresh_task).await {
+        Ok(Ok(())) => tracing::info!("jwt refresh task drained cleanly"),
+        Ok(Err(join_err)) => tracing::warn!(
+            err = %join_err,
+            panicked = join_err.is_panic(),
+            "jwt refresh task ended (panic or abort)"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = refresh_grace.as_secs(),
+            "jwt refresh task drain timed out; loop may be killed mid-handshake"
         ),
     }
 

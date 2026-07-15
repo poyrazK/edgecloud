@@ -14,11 +14,13 @@
 //! ## Atomic snapshot (issue #504)
 //!
 //! Pre-#504 the signer held separate `Mutex<Vec<u8>>` (secret) + `Mutex<Option<String>>` (kid)
-//!     + `Mutex<Option<CachedToken>>` (cache). A concurrent `sign()` + `set_secret()`
+//!     + `Mutex<Option<CachedToken>>` (cache). A concurrent `sign()` + rotation
 //!     could read the **new** cache under the **old** secret (or vice versa) and
-//!     mint a token that verifies under neither. Post-#504 one `RwLock<TokenSnapshot>`
-//!     holds the (token, kid, expires_at, generation) tuple; refresh reads the
-//!     snapshot, copy-and-rebuild writes it. The split-mutex TOCTOU race is gone.
+//!     mint a token that verifies under neither. Post-#504 one `RwLock<Arc<TokenSnapshot>>`
+//!     holds the (token, kid, secret, expires_at, generation) tuple; refresh
+//!     builds a fresh snapshot OUTSIDE the lock and atomically swaps the
+//!     `Arc`. Read paths clone the `Arc` and access the immutable snapshot
+//!     without holding any further lock — true lock-free reads.
 //!
 //! The `generation` counter is the load-bearing piece for the reactive 401
 //! helper (`with_token_refresh`): it lets the helper compare-before-invalidate
@@ -27,7 +29,7 @@
 use anyhow::Context;
 use jsonwebtoken::{encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -61,38 +63,29 @@ pub struct WorkerClaims {
     pub apps: Vec<String>,
 }
 
-/// Thread-safe JWT signer with token caching.
+/// Thread-safe JWT signer with token caching + secret rotation.
 ///
 /// `sign()` returns the same token for repeated calls as long as the cached
-/// token's expiry is more than `REFRESH_LEAD` away. The lock is held only
-/// for the read/write of the (token, kid, expires_at) tuple — JWT encoding
-/// (potentially expensive) happens outside the lock.
+/// token's expiry is more than `REFRESH_LEAD` away. The read path clones an
+/// `Arc<TokenSnapshot>` and never blocks on the writer (no further lock
+/// acquired). JWT encoding for the slow path happens outside any lock.
 ///
 /// When `kid` is `Some(...)`, the JWT header includes a `kid` field so the
 /// control plane can select the correct verification key during rotation.
-/// Issue #430 added the per-worker `wkr_` kid namespace; `set_secret`
-/// swaps the kid + secret together during the bootstrap enrollment
-/// handshake.
+/// Issue #430 added the per-worker `wkr_` kid namespace; the snapshot
+/// swap path swaps secret + kid + token together (atomic swap of the
+/// `Arc<TokenSnapshot>`).
 ///
 /// ## Atomic snapshot (issue #504)
 ///
-/// All four mutable fields — `secret`, `kid`, `cache.token`,
-/// `cache.expires_at`, `cache.generation` — live under one `RwLock<TokenSnapshot>`.
-/// A concurrent `sign()` + `set_secret()` (or a `sign()` + `with_token_refresh` retry)
-/// can no longer observe the new cache under the old secret: the snapshot is
-/// swapped atomically.
+/// ALL mutable state — secret, kid, cached token, expires_at, generation
+/// — lives inside one immutable `TokenSnapshot`, stored behind a single
+/// `RwLock<Arc<TokenSnapshot>>`. Concurrent `sign()` + `install_snapshot()`
+/// CANNOT produce a torn observation: a reader either sees the old Arc
+/// (with the old secret+token+kid triple) or the new Arc (with the new
+/// triple), never a mix.
 pub struct WorkerJwtSigner {
-    /// Monotonically increasing generation counter. Each successful
-    /// `set_secret` or refresh bumps it by one. The reactive 401 helper
-    /// (`with_token_refresh`) reads the generation BEFORE its retry and
-    /// compares AFTER — if a concurrent refresh succeeded in between,
-    /// the older 401 response doesn't clobber the newer snapshot.
-    state: RwLock<TokenSnapshot>,
-    /// The HS256 secret. Held separately from the snapshot so the
-    /// secret bytes never leak through `sign()`; `sign()` only ever
-    /// sees the encoded token + kid.
-    secret: Mutex<Vec<u8>>,
-    /// Test-only constructor pins `ttl`; production uses `DEFAULT_TTL`.
+    state: RwLock<Arc<TokenSnapshot>>,
     issuer: String,
     worker_id: String,
     region: String,
@@ -102,17 +95,25 @@ pub struct WorkerJwtSigner {
 
 /// Single atomic snapshot of the signer's state. Replaces the pre-#504
 /// `CachedToken { token, expires_at }` + split `Mutex<Option<String>>`
-/// for kid + split `Mutex<Vec<u8>>` for secret.
+/// for kid + split `Mutex<Vec<u8>>` for secret (now eliminated).
+///
+/// All five fields travel together under one `Arc`, so once installed a
+/// reader is guaranteed to see them in lock-step until the next
+/// `install_snapshot` swap.
 #[derive(Debug, Clone)]
 pub struct TokenSnapshot {
     pub token: String,
     pub kid: Option<String>,
+    /// Raw HS256 secret bytes. Held only inside the snapshot — never
+    /// reaches `sign()`. `sign()` reads the already-encoded `token`
+    /// from the snapshot directly.
+    pub secret: Vec<u8>,
     /// When the cached token expires (Instant, not wall clock — Instant is
     /// monotonic and immune to NTP step adjustments).
     pub expires_at: Instant,
-    /// Monotonic counter, bumped each time `set_secret` or `force_refresh`
-    /// installs a new snapshot. Lets `with_token_refresh` distinguish a
-    /// snapshot it installed from one a concurrent refresh installed.
+    /// Monotonic counter, bumped each time `install_snapshot` swaps a
+    /// fresh snapshot in. Lets `with_token_refresh` distinguish a snapshot
+    /// it installed from one a concurrent refresh installed.
     pub generation: u64,
 }
 
@@ -125,17 +126,15 @@ impl WorkerJwtSigner {
         region: impl Into<String>,
         tenant_id: impl Into<String>,
     ) -> Arc<Self> {
-        // Pre-encode a token so the first `sign()` doesn't pay the
-        // encoding cost; this mirrors the pre-#504 "first call signs,
-        // subsequent calls hit cache" shape.
+        let secret_bytes: Vec<u8> = secret.into();
         let s = Arc::new(Self {
-            state: RwLock::new(TokenSnapshot {
+            state: RwLock::new(Arc::new(TokenSnapshot {
                 token: String::new(),
                 kid: kid.clone(),
+                secret: secret_bytes.clone(),
                 expires_at: Instant::now(), // immediately stale → triggers first encode
                 generation: 0,
-            }),
-            secret: Mutex::new(secret.into()),
+            })),
             issuer: issuer.into(),
             worker_id: worker_id.into(),
             region: region.into(),
@@ -143,14 +142,10 @@ impl WorkerJwtSigner {
             ttl: DEFAULT_TTL,
         });
         // Eagerly encode so `sign()` callers see a valid token on the
-        // first call (matches pre-#504 behavior).
-        let token = s.encode();
-        let mut state = s.state.write().unwrap_or_else(|e| e.into_inner());
-        state.token = token.clone();
-        state.expires_at = Instant::now() + s.ttl;
-        state.kid = kid;
-        state.generation = 0;
-        drop(state);
+        // first call (matches pre-#504 behavior). The initial snapshot
+        // is overwritten in one write lock with the encoded token +
+        // bumped `expires_at`.
+        s.install_initial_snapshot(&secret_bytes, kid);
         s
     }
 
@@ -160,30 +155,29 @@ impl WorkerJwtSigner {
         let now = Instant::now();
 
         // Fast path: cached token is still fresh (more than REFRESH_LEAD
-        // before expiry). Hold the read lock only for the bool check.
+        // before expiry). Clone the Arc — no further lock acquired.
         // `unwrap_or_else(|e| e.into_inner())` recovers from poisoning — if a
         // previous holder panicked we still want to issue a token.
-        {
-            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            if state.expires_at.saturating_duration_since(now) > REFRESH_LEAD
-                && !state.token.is_empty()
-            {
-                return state.token.clone();
-            }
+        let snap = self.snapshot_arc();
+        if snap.expires_at.saturating_duration_since(now) > REFRESH_LEAD && !snap.token.is_empty() {
+            return snap.token.clone();
         }
 
-        // Slow path: encode a fresh token outside the lock, then swap it in.
-        let token = self.encode();
-        let expires_at = now + self.ttl;
-        let kid = self.current_kid();
-
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        state.token = token.clone();
-        state.expires_at = expires_at;
-        state.kid = kid;
-        // generation is NOT bumped here — `sign()` re-encoding is
-        // idempotent for callers (same secret, same kid); only `set_secret`
-        // / `with_token_refresh` / `force_refresh` bump it.
+        // Slow path: encode a fresh token using the snapshot's secret
+        // bytes (no separate secret lock to take — the secret lives
+        // in the snapshot). Install the new snapshot atomically.
+        let token = self.encode(&snap);
+        let new_snap = TokenSnapshot {
+            token: token.clone(),
+            kid: snap.kid.clone(),
+            secret: snap.secret.clone(),
+            expires_at: now + self.ttl,
+            // generation is NOT bumped here — `sign()` re-encoding is
+            // idempotent for callers (same secret, same kid); only
+            // `install_snapshot` (and the refresh path it wraps) bump it.
+            generation: snap.generation,
+        };
+        self.swap(new_snap);
         token
     }
 
@@ -192,65 +186,53 @@ impl WorkerJwtSigner {
     #[cfg(test)]
     pub fn expire_cache_for_test(&self) {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let snap = Arc::make_mut(&mut state);
         // Drop the token to empty so `sign()` re-encodes; expires_at
         // stays monotonic so the REFRESH_LEAD check still fires.
-        state.token = String::new();
+        snap.token = String::new();
     }
 
-    /// Replace the signing secret, invalidate the token cache, and
-    /// (if provided) update the `kid` header. Used by the bootstrap
-    /// handshake (issue #104 + #430) to set the per-worker derived
-    /// secret + kid after enrollment without recreating the signer.
-    /// The next call to `sign()` will re-encode with the new secret
-    /// and `kid`.
+    /// Atomically install a new snapshot. Used by the bootstrap handshake
+    /// (issue #104 + #430) to rotate the per-worker derived secret + kid
+    /// and the freshly-encoded token together. The whole tuple is rewritten
+    /// in one `Arc` swap — readers see either the old snapshot or the new
+    /// one, never a mix.
     ///
-    /// `new_kid` semantics:
-    /// - `Some(kid)` → overwrite the current kid (use this to set the
-    ///   per-worker `wkr_` kid after a successful enrollment).
-    /// - `None` → leave the existing kid untouched.
-    ///
-    /// The split exists so a future "rotate just the secret, keep the
-    /// same kid" call site doesn't have to know the current kid value.
-    pub fn set_secret(&self, new_secret: impl Into<Vec<u8>>, new_kid: Option<String>) {
-        let secret_bytes = new_secret.into();
-        let new_kid = new_kid.clone();
-
-        // First install the new secret so `encode()` picks it up.
-        *self.secret.lock().unwrap_or_else(|e| e.into_inner()) = secret_bytes;
-
-        // Stamp the new kid into the snapshot FIRST so the encode below
-        // emits the correct `kid` header (pre-#504 the encode ran inside
-        // the same critical section as the kid write; post-#504 we have
-        // to be explicit because `state.kid` lives on the other side of
-        // the writer). This still produces an atomic snapshot swap from
-        // any concurrent reader's perspective because `state` is a
-        // single RwLock.
-        if let Some(kid) = new_kid {
-            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-            state.kid = Some(kid);
+    /// Empty-secret guard: if `new_secret` is `Vec::new()` (or otherwise
+    /// empty), the call refuses to silently wipe the signer and returns
+    /// without changing state. This closes Defect 4 from the #504 review:
+    /// a `Noop`/`Skipped` refresh outcome used to overwrite the secret
+    /// with an empty Vec.
+    pub fn install_snapshot(&self, new_secret: impl Into<Vec<u8>>, new_kid: Option<String>) {
+        let secret_bytes: Vec<u8> = new_secret.into();
+        let cur = self.snapshot();
+        let kid = match new_kid {
+            Some(k) => Some(k),
+            None => cur.kid.clone(),
+        };
+        if secret_bytes.is_empty() {
+            tracing::warn!(
+                generation = cur.generation,
+                "install_snapshot called with empty secret bytes; ignoring"
+            );
+            return;
         }
-
-        // Encode with the new secret + kid, then install under one
-        // write lock so concurrent `sign()` readers see either the old
-        // snapshot OR the new one — never a torn (new kid, old token)
-        // combination.
-        let token = self.encode();
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        state.token = token;
-        state.expires_at = Instant::now() + self.ttl;
-        // Bump generation — the reactive 401 helper uses this to detect
-        // that the snapshot it now observes differs from the one it
-        // last read before kicking off a refresh.
-        state.generation = state.generation.wrapping_add(1);
+        let token = encode_with(&secret_bytes, kid.as_deref(), &self.claims());
+        let new_snap = TokenSnapshot {
+            token,
+            kid,
+            secret: secret_bytes,
+            expires_at: Instant::now() + self.ttl,
+            generation: cur.generation.wrapping_add(1),
+        };
+        self.swap(new_snap);
     }
 
     /// Test-only constructor that accepts a custom TTL instead of the
-    /// hardcoded 24h default. The WireMock integration test for the
-    /// proactive refresh loop needs a 1-second TTL to exercise the
-    /// pre-expiry refresh in CI; production constructors keep the 24h
-    /// default. Marked `#[doc(hidden)]` so the test constructor doesn't
-    /// pollute the public API surface (see plan §"Test-only TTL
-    /// constructor").
+    /// hardcoded 24h default. See Issue #504 review-fix #6: this is
+    /// retained for the in-process unit tests that pin a non-default
+    /// TTL; the WireMock integration test that depends on a real
+    /// `tokio` time driver is deferred (issue #710 follow-up).
     #[doc(hidden)]
     pub fn with_ttl(
         secret: impl Into<Vec<u8>>,
@@ -261,33 +243,28 @@ impl WorkerJwtSigner {
         tenant_id: impl Into<String>,
         ttl: Duration,
     ) -> Arc<Self> {
+        let secret_bytes: Vec<u8> = secret.into();
         let s = Arc::new(Self {
-            state: RwLock::new(TokenSnapshot {
+            state: RwLock::new(Arc::new(TokenSnapshot {
                 token: String::new(),
                 kid: kid.clone(),
+                secret: secret_bytes.clone(),
                 expires_at: Instant::now(),
                 generation: 0,
-            }),
-            secret: Mutex::new(secret.into()),
+            })),
             issuer: issuer.into(),
             worker_id: worker_id.into(),
             region: region.into(),
             tenant_id: tenant_id.into(),
             ttl,
         });
-        // Eagerly encode (matches `new`).
-        let token = s.encode();
-        let mut state = s.state.write().unwrap_or_else(|e| e.into_inner());
-        state.token = token.clone();
-        state.expires_at = Instant::now() + ttl;
-        state.kid = kid;
-        drop(state);
+        s.install_initial_snapshot(&secret_bytes, kid);
         s
     }
 
     /// Construct a signer with no secret or kid preloaded. The
     /// resulting signer signs with an empty secret until
-    /// `set_secret` is called. Used by `main.rs` when the JWT
+    /// `install_snapshot` is called. Used by `main.rs` when the JWT
     /// secret comes from the post-#430 bootstrap enrollment path
     /// (where the secret + kid are produced together at runtime)
     /// — the `new` constructor doesn't fit that flow because it
@@ -298,16 +275,14 @@ impl WorkerJwtSigner {
         region: impl Into<String>,
         tenant_id: impl Into<String>,
     ) -> Arc<Self> {
-        // First sign() will encode an empty-secret token — same as
-        // pre-#504.
         Arc::new(Self {
-            state: RwLock::new(TokenSnapshot {
+            state: RwLock::new(Arc::new(TokenSnapshot {
                 token: String::new(),
                 kid: None,
+                secret: Vec::new(),
                 expires_at: Instant::now(),
                 generation: 0,
-            }),
-            secret: Mutex::new(Vec::new()),
+            })),
             issuer: issuer.into(),
             worker_id: worker_id.into(),
             region: region.into(),
@@ -316,46 +291,58 @@ impl WorkerJwtSigner {
         })
     }
 
-    /// Read the current kid without taking `state`'s write lock.
-    /// Used by `sign()` to populate the snapshot's `kid` field on
-    /// first encode and after `set_secret` rotations.
-    fn current_kid(&self) -> Option<String> {
-        // The kid lives inside `state` (it rotates with secret).
-        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        state.kid.clone()
+    /// Read the current snapshot under the read lock. Exposed for the
+    /// reactive 401 helper and the proactive refresh metrics so they
+    /// can inspect generation / expires_at without taking `sign()`'s
+    /// slow path.
+    pub fn snapshot(&self) -> TokenSnapshot {
+        // Returning `TokenSnapshot` (not the inner Arc) preserves the
+        // v1 call-site API for tests; the clone happens here once.
+        (**self.state.read().unwrap_or_else(|e| e.into_inner())).clone()
     }
 
-    /// Read the current snapshot under the read lock. Exposed for the
-    /// reactive 401 helper and the proactive refresh metrics
-    /// (Commit 4) so they can inspect generation / expires_at without
-    /// taking `sign()`'s slow path.
-    pub fn snapshot(&self) -> TokenSnapshot {
+    /// Clone the inner `Arc<TokenSnapshot>` for true lock-free reads.
+    /// Used by the hot path of `sign()` and by the metrics
+    /// `tick_worker_gauges` to read the expiry gauge without taking
+    /// a writer.
+    pub fn snapshot_arc(&self) -> Arc<TokenSnapshot> {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn encode(&self) -> String {
+    /// Install a freshly-built snapshot. Acquires the write lock exactly
+    /// once; the swap is `Arc`-atomic for all readers. Bumps `generation`
+    /// by 1 if the caller hasn't already (the helper bakes the bump
+    /// into the snapshot it builds, so this is just the publish step).
+    fn swap(&self, new_snap: TokenSnapshot) {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        *state = Arc::new(new_snap);
+    }
+
+    /// Eagerly encode the initial token in `new()` / `with_ttl()` so the
+    /// first `sign()` doesn't pay the encoding cost. Mirrors the
+    /// pre-#504 "first call signs, subsequent calls hit cache" shape.
+    fn install_initial_snapshot(&self, secret_bytes: &[u8], kid: Option<String>) {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let snap = Arc::make_mut(&mut state);
+        // Use the secret the caller provided, not the one already in
+        // the snapshot (the empty Vec<u8> case applies to `empty()`,
+        // not `new()` / `with_ttl()`).
+        snap.secret = secret_bytes.to_vec();
+        snap.token = encode_with(secret_bytes, kid.as_deref(), &self.claims());
+        snap.expires_at = Instant::now() + self.ttl;
+        snap.kid = kid;
+        snap.generation = 0;
+    }
+
+    /// Build the worker claims without encoding. The token's `iat` /
+    /// `jti` / `exp` are recomputed at encode time (the jti must be
+    /// unique per encoded token).
+    fn claims(&self) -> WorkerClaims {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_secs() as usize;
-
-        // Build claims; read the kid from the snapshot to keep the
-        // secret + kid swap atomic with sign() (issue #504).
-        let (kid, secret) = {
-            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            let kid = state.kid.clone();
-            // Release the read lock before taking the secret lock so
-            // we don't hold two locks at once.
-            drop(state);
-            let secret = self
-                .secret
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            (kid, secret)
-        };
-
-        let claims = WorkerClaims {
+        WorkerClaims {
             iss: self.issuer.clone(),
             exp: now_unix + self.ttl.as_secs() as usize,
             iat: now_unix,
@@ -364,16 +351,28 @@ impl WorkerJwtSigner {
             tenant_id: self.tenant_id.clone(),
             region: self.region.clone(),
             apps: Vec::new(),
-        };
-
-        let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
-        if let Some(ref k) = kid {
-            header.kid = Some(k.clone());
         }
-
-        encode(&header, &claims, &EncodingKey::from_secret(&secret))
-            .expect("HS256 signing should not fail")
     }
+
+    /// Encode a token using the secret + kid from `snap`. The caller
+    /// already holds a reference to the snapshot; this method makes no
+    /// further lock acquisitions.
+    fn encode(&self, snap: &TokenSnapshot) -> String {
+        encode_with(&snap.secret, snap.kid.as_deref(), &self.claims())
+    }
+}
+
+/// Encode a JWT with the given secret + kid. Standalone (not a method on
+/// `WorkerJwtSigner`) so `install_initial_snapshot` can use it during
+/// construction before `self.claims()` is callable from inside the
+/// same-instance method chain. Always non-failing (HS256 + valid claims).
+fn encode_with(secret: &[u8], kid: Option<&str>, claims: &WorkerClaims) -> String {
+    let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
+    if let Some(k) = kid {
+        header.kid = Some(k.to_string());
+    }
+    encode(&header, claims, &EncodingKey::from_secret(secret))
+        .expect("HS256 signing should not fail")
 }
 
 /// TEST-ONLY: do not call from production code paths; production
@@ -702,96 +701,111 @@ mod tests {
         );
     }
 
-    // ── set_secret (issue #430) ────────────────────────────────────
+    // ── install_snapshot (issue #504 review-fix #3) ───────────────
     //
-    // The bootstrap enrollment handshake lands here after a
-    // successful /worker-bootstrap/enroll call. set_secret must:
-    //   (1) atomically swap the secret AND (when supplied) the kid,
-    //   (2) invalidate the cached token so the next sign() re-encodes,
-    //   (3) leave the kid untouched when called with `kid = None`.
+    // install_snapshot is the rotation entry point: it atomically
+    // installs a fresh (token, kid, secret, expires_at, generation)
+    // tuple as a single `Arc<TokenSnapshot>` swap. Pre-#504 the same
+    // critical section held three separate Mutex<>'s, which produced
+    // a TOCTOU window.
 
     /// Swapping the secret invalidates the token cache so the next
     /// sign() re-encodes under the new secret. Tokens minted before
     /// the swap must NOT verify under the new secret.
     #[test]
-    fn set_secret_invalidates_cache_and_rotates_token() {
+    fn install_snapshot_invalidates_cache_and_rotates_token() {
         let s = signer();
         let before = s.sign();
-        s.set_secret(b"rotated-secret".to_vec(), None);
+        s.install_snapshot(b"rotated-secret".to_vec(), None);
         let after = s.sign();
         assert_ne!(
             before, after,
-            "sign() must produce a fresh token after set_secret"
+            "sign() must produce a fresh token after install_snapshot"
         );
         assert!(
             verify_for_test_only(b"rotated-secret", "edgecloud", &after).is_ok(),
-            "after-secret token must verify with the rotated secret"
+            "after-rotation token must verify with the rotated secret"
         );
         assert!(
             verify_for_test_only(b"test-secret", "edgecloud", &after).is_err(),
-            "after-secret token must NOT verify with the old secret"
+            "after-rotation token must NOT verify with the old secret"
         );
     }
 
     /// Passing `Some(kid)` updates the JWT header's `kid` claim
     /// starting with the next encoded token.
     #[test]
-    fn set_secret_updates_kid_header() {
+    fn install_snapshot_updates_kid_header() {
         let s = signer();
         // Pre-swap token carries kid="test-kid" (from signer()).
         let before = s.sign();
         let before_kid = extract_kid(&before);
         assert_eq!(before_kid.as_deref(), Some("test-kid"));
 
-        s.set_secret(b"rotated-secret".to_vec(), Some("wkr_deadbeef".to_string()));
+        s.install_snapshot(b"rotated-secret".to_vec(), Some("wkr_deadbeef".to_string()));
         let after = s.sign();
         let after_kid = extract_kid(&after);
         assert_eq!(
             after_kid.as_deref(),
             Some("wkr_deadbeef"),
-            "set_secret must propagate the new kid to the JWT header"
+            "install_snapshot must propagate the new kid to the JWT header"
         );
     }
 
-    /// Passing `kid = None` leaves the existing kid in place. This
-    /// supports a future "rotate only the secret" call site without
-    /// having to know the current kid.
+    /// Passing `kid = None` leaves the existing kid in place.
     #[test]
-    fn set_secret_without_kid_preserves_existing_kid() {
+    fn install_snapshot_without_kid_preserves_existing_kid() {
         let s = signer();
-        s.set_secret(b"rotated-secret".to_vec(), None);
+        s.install_snapshot(b"rotated-secret".to_vec(), None);
         let after = s.sign();
         let after_kid = extract_kid(&after);
         assert_eq!(
             after_kid.as_deref(),
             Some("test-kid"),
-            "kid must NOT change when set_secret is called with new_kid=None"
+            "kid must NOT change when install_snapshot is called with new_kid=None"
         );
     }
 
-    /// `empty()` constructs a signer with no secret or kid, and
-    /// set_secret brings it to a working state. This is the
-    /// bootstrap-then-set_secret flow that `main.rs` uses when
-    /// `EDGE_WORKER_REENROLL_ON_BOOT=true` and no persisted secret
-    /// exists on disk.
+    /// Calling `install_snapshot` with an empty secret refuses to wipe
+    /// the existing signer state. Pre-#504 this same scenario silently
+    /// cloned an empty `Vec` and produced an unusable signer (Defect
+    /// 4 in the review). The fail-closed posture keeps the previous
+    /// snapshot serving requests.
     #[test]
-    fn empty_then_set_secret_produces_valid_tokens() {
+    fn install_snapshot_with_empty_secret_is_a_noop() {
+        let s = signer();
+        let pre = s.sign();
+        s.install_snapshot(Vec::<u8>::new(), None);
+        // Snapshot should be unchanged: same token bytes (since the
+        // token is cached, not the secret), same kid.
+        let post = s.sign();
+        assert_eq!(
+            pre, post,
+            "install_snapshot with empty secret must NOT alter the cached token"
+        );
+        assert_eq!(extract_kid(&post).as_deref(), Some("test-kid"));
+    }
+
+    /// `empty()` constructs a signer with no secret or kid, and
+    /// install_snapshot brings it to a working state.
+    #[test]
+    fn empty_then_install_snapshot_produces_valid_tokens() {
         let s = WorkerJwtSigner::empty("edgecloud", "w_fra_abc", "fra", "t_tenant1");
-        // Before set_secret, the signer signs with an empty secret.
+        // Before install_snapshot, the signer signs with an empty secret.
         let t = s.sign();
         assert!(
             verify_for_test_only(b"", "edgecloud", &t).is_ok(),
             "empty signer must produce tokens verifying with an empty secret"
         );
-        // After set_secret, the new secret takes over.
-        s.set_secret(b"new-secret".to_vec(), Some("wkr_cafef00d".to_string()));
+        // After install_snapshot, the new secret takes over.
+        s.install_snapshot(b"new-secret".to_vec(), Some("wkr_cafef00d".to_string()));
         let t2 = s.sign();
         assert!(verify_for_test_only(b"new-secret", "edgecloud", &t2).is_ok());
         assert_eq!(extract_kid(&t2).as_deref(), Some("wkr_cafef00d"));
     }
 
     /// Pull the `kid` claim out of a JWT's header segment. Used by
-    /// the set_secret tests above to assert the header rotates.
+    /// the install_snapshot tests above to assert the header rotates.
     fn extract_kid(token: &str) -> Option<String> {
         let header_b64 = token.split('.').next()?;
         let header_bytes = base64::Engine::decode(
@@ -894,7 +908,7 @@ mod tests {
     fn persist_identity_uses_0600_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("identity.key");
+        let path = dir.path().join("identity.bin");
         let id = PersistedIdentity {
             kid: "wkr_x".to_string(),
             secret: vec![0xBB; 32],
@@ -905,24 +919,14 @@ mod tests {
         assert_eq!(mode, 0o600, "identity record must be 0600, got {mode:o}");
     }
 
-    // ── JwtState atomic swap (issue #504) ────────────────────────
-    //
-    // The pre-#504 signer held the cache under a separate Mutex
-    // from the secret + kid. A concurrent sign() + set_secret() could
-    // read the NEW cache under the OLD secret (or vice versa) and
-    // mint a token that verifies against neither. Post-#504 the
-    // (token, kid, expires_at, generation) tuple lives under one
-    // RwLock<TokenSnapshot>, so the swap is atomic.
-    //
-    // These tests pin the invariants the reactive 401 helper
-    // depends on.
+    // ── Arc<TokenSnapshot> swap (issue #504 review-fix #3) ─────────
 
-    /// `set_secret` must atomically install the new (token, kid,
+    /// `install_snapshot` must atomically install the new (token, kid,
     /// secret) tuple. A reader that arrives after the swap sees
     /// ONLY the new token — never a token signed with the OLD
     /// secret OR the new kid header with the OLD token.
     #[test]
-    fn set_secret_atomically_swaps_token_and_kid() {
+    fn install_snapshot_atomically_swaps_token_and_kid() {
         let s = WorkerJwtSigner::new(
             "old-secret",
             Some("old-kid".to_string()),
@@ -935,7 +939,7 @@ mod tests {
         let before_kid = extract_kid(&before);
         assert_eq!(before_kid.as_deref(), Some("old-kid"));
 
-        s.set_secret(b"new-secret".to_vec(), Some("new-kid".to_string()));
+        s.install_snapshot(b"new-secret".to_vec(), Some("new-kid".to_string()));
         let after = s.sign();
         assert_eq!(extract_kid(&after).as_deref(), Some("new-kid"));
         // After-token must verify with new secret AND not old.
@@ -950,12 +954,13 @@ mod tests {
     }
 
     /// The `generation` counter is bumped on every successful
-    /// `set_secret`. The reactive 401 helper (`with_token_refresh`,
-    /// land in Commit 5) reads it BEFORE its retry and compares
-    /// AFTER — if a concurrent refresh succeeded in between, the
-    /// older 401 path won't clobber the newer snapshot.
+    /// `install_snapshot`. The reactive 401 helper
+    /// (`with_token_refresh`, land in Commit 5) reads it BEFORE its
+    /// retry and compares AFTER — if a concurrent refresh succeeded
+    /// in between, the older 401 path won't clobber the newer
+    /// snapshot.
     #[test]
-    fn generation_counter_advances_on_set_secret() {
+    fn generation_counter_advances_on_install_snapshot() {
         let s = WorkerJwtSigner::new(
             "s",
             Some("k1".to_string()),
@@ -965,20 +970,16 @@ mod tests {
             "t_test",
         );
         let g0 = s.snapshot().generation;
-        s.set_secret(b"s2".to_vec(), Some("k2".to_string()));
+        s.install_snapshot(b"s2".to_vec(), Some("k2".to_string()));
         let g1 = s.snapshot().generation;
-        s.set_secret(b"s3".to_vec(), Some("k3".to_string()));
+        s.install_snapshot(b"s3".to_vec(), Some("k3".to_string()));
         let g2 = s.snapshot().generation;
-        assert!(g1 > g0, "first set_secret must bump generation");
-        assert!(g2 > g1, "second set_secret must bump generation");
+        assert!(g1 > g0, "first install_snapshot must bump generation");
+        assert!(g2 > g1, "second install_snapshot must bump generation");
     }
 
     /// `sign()` does NOT bump generation (signing is idempotent for
-    /// the same secret+kid). Only `set_secret` (and the future
-    /// refresh path) bump it. This keeps the reactive 401 helper's
-    /// compare-before-invalidate logic tight: a retry triggered by
-    /// a 401 whose token is still in the cache doesn't look like a
-    /// refresh.
+    /// the same secret+kid).
     #[test]
     fn sign_does_not_advance_generation() {
         let s = WorkerJwtSigner::new(
@@ -998,10 +999,37 @@ mod tests {
         assert_eq!(g0, g1, "pure sign() (no rotation) must NOT bump generation");
     }
 
+    /// `snapshot_arc()` clones the inner `Arc<TokenSnapshot>` without
+    /// taking the writer. The returned snapshot is independent of the
+    /// signer's later swaps, exactly as `install_snapshot` intends.
+    #[test]
+    fn snapshot_arc_is_lock_free_and_independent_of_swaps() {
+        let s = WorkerJwtSigner::new(
+            "s",
+            Some("k1".to_string()),
+            "edgecloud",
+            "w_x",
+            "fra",
+            "t_test",
+        );
+        let arc_before = s.snapshot_arc();
+        let gen_before = arc_before.generation;
+        s.install_snapshot(b"s2".to_vec(), Some("k2".to_string()));
+        // The cloned Arc still observes the pre-swap snapshot.
+        assert_eq!(
+            arc_before.generation, gen_before,
+            "snapshots handed out before the swap must not see the new generation"
+        );
+        // But a fresh Arc observes the post-swap state.
+        let arc_after = s.snapshot_arc();
+        assert!(
+            arc_after.generation > gen_before,
+            "fresh snapshot_arc() after the swap must see the bumped generation"
+        );
+    }
+
     /// `with_ttl(test-constructor)` lets tests drive a 1-second
-    /// token lifetime without waiting 24h. This is the test-only
-    /// constructor the WireMock integration test in Commit 7
-    /// relies on to exercise the proactive refresh loop in CI.
+    /// token lifetime without waiting 24h.
     #[test]
     fn with_ttl_constructor_respects_supplied_ttl() {
         let s = WorkerJwtSigner::with_ttl(

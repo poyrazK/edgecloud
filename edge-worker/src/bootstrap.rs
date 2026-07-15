@@ -1027,7 +1027,7 @@ mod tests {
 
         let signer =
             crate::auth::WorkerJwtSigner::empty("edgecloud", "w_test_abc", "fra", "t_test");
-        signer.set_secret(loaded.secret.clone(), Some(loaded.kid.clone()));
+        signer.install_snapshot(loaded.secret.clone(), Some(loaded.kid.clone()));
         let token = signer.sign();
         let claims =
             crate::auth::verify_for_test_only(&loaded.secret, "edgecloud", &token).expect("verify");
