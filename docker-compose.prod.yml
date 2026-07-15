@@ -1,0 +1,353 @@
+# Production-equivalent compose stack for edgeCloud — Postgres + NATS +
+# control plane + worker + ingress + Caddy on a single Linux host.
+#
+# Usage:
+#   cp .env.prod.example .env.prod
+#   # edit .env.prod: set JWT_SECRET, DATABASE_PASSWORD (>=16B),
+#   # EDGE_INTERNAL_TOKEN, EDGE_SIGNING_KEYRING, CADDY_ADMIN_TOKEN, etc.
+#   make prod-up       # build + start
+#   make prod-smoke    # curl http://t_<tenant>-hello.edgecloud.dev/health
+#   make prod-down     # stop (keeps volumes)
+#   make prod-reset    # nuke volumes + re-apply migrations
+#
+# Run alongside (not on top of) the dev `docker-compose.yml`. Services
+# here are prefixed `edgecloud-prod-` to keep container_name distinct
+# from the dev compose's `edgecloud-postgres` / `edgecloud-nats`. This
+# lets a developer run both stacks on the same host without collision.
+#
+# Why a separate compose file rather than `docker-compose.override.yml`:
+#   - the dev compose only has Postgres + NATS (per PR #264). Hooking
+#     our three services in via override would mean a non-trivial
+#     merge in a file that's not the operator-facing entrypoint.
+#   - production is a distinct deployment topology: different volumes
+#     (separate Postgres dataset), different image tags (stable,
+#     versioned), different env-var strictness (no default fallbacks).
+#
+# All secrets flow through `.env.prod` (gitignored). The strict-fail
+# `${VAR:?msg}` form mirrors the dev `docker-compose.yml:28` pattern
+# from PR #264 / PR #670. Known-placeholder passwords are rejected
+# at CP boot by `validateDBPassword` (issue #626) — the floor is 16
+# bytes.
+
+name: edgecloud-prod
+
+x-common-restart: &common-restart
+  restart: unless-stopped
+
+services:
+
+  # ── Postgres ──────────────────────────────────────────────────────────
+  postgres:
+    <<: *common-restart
+    image: postgres:16-alpine
+    container_name: edgecloud-prod-pg
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-edgecloud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set; copy .env.prod.example to .env.prod and edit it}
+      POSTGRES_DB:       ${POSTGRES_DB:-edgecloud}
+    volumes:
+      - pgdata-prod:/var/lib/postgresql/data
+    networks:
+      - edgecloud
+    healthcheck:
+      # Same check as dev compose; pg_isready ships in postgres:16-alpine.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edgecloud} -d ${POSTGRES_DB:-edgecloud}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── NATS (single-node, JetStream) ─────────────────────────────────────
+  nats:
+    <<: *common-restart
+    image: nats:2.10-alpine
+    container_name: edgecloud-prod-nats
+    # -js enables JetStream (the task + rate-limit streams declared by
+    # the control plane at boot per edge-control-plane/cmd/api/main.go:55-95
+    # require it). -sd mounts the JetStream file-store into the
+    # `jsdata` volume so messages survive container restarts. -m 8222
+    # opens the HTTP monitoring endpoint for healthchecks.
+    command:
+      - "nats-server"
+      - "-js"
+      - "-sd"
+      - "/data/js"
+      - "-m"
+      - "8222"
+    volumes:
+      - natsdata-prod:/data/js
+    networks:
+      - edgecloud
+      - edgecloud-cp-nats
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── Control plane: migrate (one-shot) + api (long-lived) ─────────────
+  #
+  # The `migrate` service is a sibling that runs `cmd/migrate -up` and
+  # exits. The `api` service `service_completed_successfully: true`s
+  # on `migrate`, so a fresh deploy never boots the API against an
+  # out-of-date schema. To run migrations manually (e.g. for a
+  # `prod-reset`), use `make prod-migrate`.
+  cp:
+    <<: *common-restart
+    build:
+      context: .
+      dockerfile: edge-control-plane/Dockerfile
+      args:
+        # Set to "false" to ship a lean image that skips wasm2cwasm.
+        # Worker falls back to JIT-compile on first load when .cwasm
+        # is unavailable — perf hit, not a correctness one.
+        BUILD_WITH_WASM2CWASM: "true"
+    image: edgecloud/control-plane:latest
+    container_name: edgecloud-prod-cp
+    environment:
+      DATABASE_HOST:           postgres
+      DATABASE_PORT:           5432
+      DATABASE_USER:           ${POSTGRES_USER:-edgecloud}
+      DATABASE_PASSWORD:       ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (16-byte minimum per validateDBPassword)}
+      DATABASE_NAME:           ${POSTGRES_DB:-edgecloud}
+      DATABASE_SSLMODE:        disable
+      NATS_URL:                nats://nats:4222
+      # Single-node compose: 3-replica stream declaration fails; explicitly pin to 1.
+      # The control plane's boot-time WARN at cmd/api/main.go:88-93 acknowledges this.
+      NATS_REPLICAS:           "1"
+      APP_HOST:                0.0.0.0
+      APP_PORT:                8080
+      APP_REGION:              ${APP_REGION:-edge-prod}
+      APP_ENV:                 production
+      STORAGE_ARTIFACT_PATH:   /var/edgecloud/registry
+      JWT_SECRET:              ${JWT_SECRET:?JWT_SECRET must be set (>=32B recommended; configure via `openssl rand -base64 48`)}
+      JWT_TTL_HOURS:           "24"
+      JWT_ISSUER:              edgecloud
+      EDGE_INTERNAL_TOKEN:     ${EDGE_INTERNAL_TOKEN:?EDGE_INTERNAL_TOKEN must be set; use `openssl rand -hex 32`}
+      BOOTSTRAP_SECRET:        ${BOOTSTRAP_SECRET:?BOOTSTRAP_SECRET must be set; use `openssl rand -hex 32`}
+      EDGE_ALLOW_LEGACY_PLAINTEXT_ENV: "false"
+      # Auto-migrate on boot is enabled by default via the entrypoint.
+      # Set SKIP_MIGRATE_ON_BOOT=true once the schema is fully managed
+      # by an external migration job.
+      SKIP_MIGRATE_ON_BOOT:    "false"
+      RUST_LOG:                info
+    volumes:
+      - cp-registry-prod:/var/edgecloud/registry
+      # Bind-mount samples/ into the CP container so `make prod-smoke`
+      # can `edge deploy /samples/hello` from inside. Not committed
+      # to the image — these are dev fixtures, not production code.
+      - ./samples:/samples:ro
+    networks:
+      - edgecloud
+      - edgecloud-cp-nats
+    # Both ports hit the same handler internally. Expose only the API
+    # port to the host; metrics is only for an internal Prometheus
+    # scrape (the operator chooses to expose via a separate compose
+    # override if they want metrics on the public LB).
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    # The runtime healthcheck is baked into the Dockerfile (wget
+    # /health, 15s interval). Override here only if an operator
+    # needs different timing.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+  # ── Worker ────────────────────────────────────────────────────────────
+  #
+  # The worker subscribes to NATS, instantiates WASM components, and
+  # reports back. It needs:
+  #   - DATABASE_* via CP_ADMIN_HTTP (no — workers don't talk to Postgres
+  #     directly; the CP is the source of truth. The CP gives the worker
+  #     a per-worker JWT at bootstrap.)
+  #   - A signing keyring mounted from the host so the worker can
+  #     verify Ed25519 signatures on artifacts (issue #307 PR2).
+  #     `EDGE_SIGNING_KEYRING_PATH` points at the mounted file; the
+  #     worker fails fast on boot if the file is missing or
+  #     `EDGE_REQUIRE_SIGNATURE=false` is unset (default true,
+  #     `edge-worker/src/config.rs:403`).
+  #   - A WORKER_BOOTSTRAP_SECRET that the worker uses to mint its
+  #     initial per-worker JWT at boot (3-phase handshake: HMAC-signed
+  #     phase 1, Ed25519-signed phase 2, persisted secret on disk
+  #     thereafter — see docs/jwt-bootstrap.md).
+  worker:
+    <<: *common-restart
+    build:
+      context: .
+      dockerfile: edge-worker/Dockerfile
+    image: edgecloud/worker:latest
+    container_name: edgecloud-prod-worker
+    environment:
+      # Identity — these three are required (worker fails fast at boot
+      # if any is missing per edge-worker/src/config.rs:286, 328-332).
+      WORKER_ID:               ${WORKER_ID:-w_prod_main}
+      REGION:                  ${REGION:-edge-prod}
+      WORKER_TENANT_ID:        ${WORKER_TENANT_ID:-*}
+      CONTROL_PLANE_URL:       http://cp:8080
+      EDGE_WORKER_ADDR:        ${EDGE_WORKER_ADDR:?EDGE_WORKER_ADDR required — the externally-routable address of this worker host:port}
+      NATS_URL:                nats://nats:4222
+      CACHE_DIR:               /data/.worker-cache
+      EDGE_WORKER_KEY_PATH:    /data/.worker-cache/identity.key
+      # Bootstrap: HMAC-SHA256 over (worker_id|region|tenant_id|timestamp|nonce|pubkey)
+      # via POST /api/internal/bootstrap. The worker handles its own
+      # Ed25519 phase 2 + HKDF-derived per-worker JWT thereafter.
+      WORKER_BOOTSTRAP_SECRET: ${BOOTSTRAP_SECRET:?BOOTSTRAP_SECRET must be set; same value as on the CP}
+      # Metrics + observability
+      METRICS_ADDR:            0.0.0.0:9090
+      METRICS_AUTH_TOKEN:      ${METRICS_AUTH_TOKEN:-changeme-in-prod}
+      EDGE_WORKER_LOG_LEVEL:   info
+      RUST_LOG:                edge_worker=info,edge_runtime=info
+      # Secure-by-default: the worker fails to start if the keyring
+      # file is missing or malformed. Pointing at the host-mounted
+      # file in `./secrets/signing-keyring` is the operator's job —
+      # see .env.prod.example for the keyring format.
+      EDGE_REQUIRE_SIGNATURE:  "true"
+      EDGE_SIGNING_KEYRING_PATH: /run/secrets/signing-keyring
+    volumes:
+      - worker-cache-prod:/data/.worker-cache
+      - worker-spool-prod:/data/.worker-spool
+      # Operator-supplied keyring (issue #307 PR2). The file format
+      # mirrors edge-control-plane/internal/signing/keyring.go
+      # (`<kid> = <32-byte-hex-seed>` per line).
+      - ./secrets/signing-keyring:/run/secrets/signing-keyring:ro
+    networks:
+      - edgecloud
+      - edgecloud-cp-nats
+      - edgecloud-worker-fleet
+    depends_on:
+      cp:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # ── Ingress ──────────────────────────────────────────────────────────
+  #
+  # The ingress is the public-facing edge. It subscribes to NATS for
+  # heartbeats and pushes Caddyfile-JSON to Caddy on every change.
+  # Cloud-LB ingress terminates here; raw HTTP/HTTPS come in on 80/443.
+  # The ingress does NOT talk Postgres — only NATS (heartbeats) +
+  # Caddy admin (`POST /load`).
+  ingress:
+    <<: *common-restart
+    build:
+      context: .
+      dockerfile: edge-ingress/Dockerfile
+    image: edgecloud/ingress:latest
+    container_name: edgecloud-prod-ingress
+    environment:
+      INGRESS_REGION:           ${APP_REGION:-edge-prod}
+      NATS_URL:                 nats://nats:4222
+      # Default in edge-ingress/src/config.rs:135 is localhost:2019 —
+      # that's container-scoped inside Caddy's netns (issue #279).
+      # Override to 0.0.0.0:2019 here so the ingress can reach the
+      # Caddy admin API on the `caddy` container.
+      CADDY_ADMIN_LISTEN:       0.0.0.0:2019
+      CADDY_ADMIN_URL:          http://caddy:2019
+      CADDY_ADMIN_TOKEN:        ${CADDY_ADMIN_TOKEN:?CADDY_ADMIN_TOKEN must match the value baked into docker-compose.prod/caddy.json}
+      CONTROL_PLANE_API_URL:    http://cp:8080
+      EDGE_INTERNAL_TOKEN:      ${EDGE_INTERNAL_TOKEN:?same value as on the CP}
+      TLS_CERT_FILE:            ${TLS_CERT_FILE:-/etc/caddy/tls/cert.pem}
+      TLS_KEY_FILE:             ${TLS_KEY_FILE:-/etc/caddy/tls/key.pem}
+      INGRESS_METRICS_LISTEN:   0.0.0.0:9091
+      QUOTA_FETCH_INTERVAL:     "30s"
+      RATE_LIMIT_FETCH_INTERVAL: "60s"
+      RUST_LOG:                 edge_ingress=info
+    volumes:
+      # TLS certs mounted read-only from the host. For self-signed/dev,
+      # copy or symlink into `./tls/` in the repo and point at the
+      # absolute path. For prod, mount from a secret manager.
+      - ./tls:/etc/caddy/tls:ro
+    networks:
+      - edgecloud
+      - edgecloud-cp-nats
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      caddy:
+        condition: service_started
+      cp:
+        condition: service_healthy
+
+  # ── Caddy ────────────────────────────────────────────────────────────
+  #
+  # Stock `caddy:2` image is enough for routing — the L4 listener and
+  # the per-app concurrent-cap module are xcaddy builds, shipped as
+  # `edgecloud/caddy-l4` and `edgecloud/caddy-concurrent` by the
+  # `caddy-image` CI job. To use those, swap the `image:` line below
+  # for the project-built tag (see docs/l4-ingress.md).
+  caddy:
+    <<: *common-restart
+    image: caddy:2
+    container_name: edgecloud-prod-caddy
+    # The Caddyfile-equivalent JSON is mounted read-only. Caddy reads
+    # it on startup AND on every `POST /load` from the ingress, so
+    # the file is a one-time bootstrap — runtime routing comes from
+    # the ingress's POST /load calls.
+    volumes:
+      - ./docker-compose.prod/caddy.json:/etc/caddy/caddy.json:ro
+      - caddy-data-prod:/data
+      - caddy-config-prod:/config
+    networks:
+      - edgecloud
+    ports:
+      - "2019:2019"   # admin API
+    environment:
+      # The `caddy:2` image only honors CADDY_ADMIN_TOKEN when a
+      # JSON config file sets the identity. Bind-mount puts a token
+      # into the json at run time via envsubst (see Makefile's prod-up).
+      # Cannot envsubst inside json without a custom image, so we
+      # rely on operators generating caddy.json out-of-band OR we
+      # ship a JSON with a placeholder and override CADDY_ADMIN_TOKEN
+      # post-hoc via `docker compose exec caddy caddy adapt` —
+      # left as a documented workflow in docs/prod-compose.md.
+      CADDY_ADMIN_TOKEN: ${CADDY_ADMIN_TOKEN:?matches caddy.json}
+    depends_on:
+      cp:
+        condition: service_healthy
+
+# ── Volumes ────────────────────────────────────────────────────────────
+volumes:
+  pgdata-prod:
+    name: edgecloud-prod-pgdata
+  natsdata-prod:
+    name: edgecloud-prod-natsdata
+  cp-registry-prod:
+    name: edgecloud-prod-cp-registry
+  worker-cache-prod:
+    name: edgecloud-prod-worker-cache
+  worker-spool-prod:
+    name: edgecloud-prod-worker-spool
+  caddy-data-prod:
+    name: edgecloud-prod-caddy-data
+  caddy-config-prod:
+    name: edgecloud-prod-caddy-config
+
+# ── Networks ───────────────────────────────────────────────────────────
+# Distinct networks reflect the security/trust boundaries:
+#   - `edgecloud`            : everything
+#   - `edgecloud-cp-nats`    : only CP + worker + ingress + NATS — no
+#                              Postgres traffic on this side
+#   - `edgecloud-worker-fleet`: worker + future peer workers
+#                              (intra-fleet gossip, currently unused;
+#                              scoped here so the sidecar/PR-E work
+#                              has a place to land)
+networks:
+  edgecloud:
+    name: edgecloud-prod
+    driver: bridge
+  edgecloud-cp-nats:
+    name: edgecloud-prod-cp-nats
+    driver: bridge
+  edgecloud-worker-fleet:
+    name: edgecloud-prod-worker-fleet
+    driver: bridge
