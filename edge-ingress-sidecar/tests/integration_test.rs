@@ -29,9 +29,12 @@ use edge_test_helpers::{should_skip_integration_tests, start_nats};
 
 /// Reconciliation grace window — how long the test waits for the
 /// aggregator to observe all replicas. Production has the same 1s
-/// window; tests give it 5× headroom because CI Docker cold-start
-/// inflates the wire latency past the production norm.
-const RECONCILE_GRACE: Duration = Duration::from_secs(5);
+/// window; tests give it 10× headroom because CI Docker cold-start
+/// inflates the wire latency past the production norm (the spawn
+/// task must finish get_stream + get_or_create_consumer +
+/// consumer.messages() RPCs before subscribed; that chain can take
+/// >1s under load).
+const RECONCILE_GRACE: Duration = Duration::from_secs(10);
 
 /// Build a `DeltaMsg` stamped at the current wall-clock time. The
 /// consumer's freshness gate (`MAX_MESSAGE_AGE = 2s`) drops messages
@@ -107,12 +110,12 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
     // publishing too early in the test would deliver zero messages to
     // the aggregator. `spawn_consumer` only spawns the task; the
     // `consumer.messages()` round-trip (a JetStream RPC) is one tick
-    // away. A 1s settle gives the spawn task time to land the
-    // subscription before our first `publish_delta`. Production
-    // doesn't need this dance because the scrape tick is 1s and the
-    // consumer attaches during the sidecar's first boot, long before
-    // the first scrape — production has plenty of grace.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // away. Empirically that chain takes ~500ms on CI; a 3s settle
+    // gives ample headroom. Production doesn't need this dance because
+    // the scrape tick is 1s and the consumer attaches during the
+    // sidecar's first boot, long before the first scrape — production
+    // has minutes of grace.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     let aggregator = Aggregator::new(observer.to_string(), 10_000);
 
