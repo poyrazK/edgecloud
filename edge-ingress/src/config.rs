@@ -1,5 +1,6 @@
 //! edge-ingress configuration loaded from environment variables.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -192,6 +193,29 @@ pub struct Config {
     /// cooldown opens a silent-takeover footgun). Default 60s.
     /// Override with `L4_PORT_COOLDOWN_SECS`.
     pub l4_port_cooldown_secs: u64,
+    // ── Cross-replica RPS aggregation (issue #665 PR D) ───────────
+    /// Whether the ingress spawns the cross-replica UDS reader task
+    /// (issue #665 PR D). When true, the renderer emits a global
+    /// `rate_limit` route that enforces the per-replica cap computed
+    /// by the sidecar's aggregator (see
+    /// `edge-ingress-sidecar/src/aggregate.rs::Snapshot::per_replica_cap`).
+    /// When false, the renderer behaves exactly as before — no UDS
+    /// socket is bound, the cross-replica route is never emitted.
+    /// Set via `INGRESS_RATE_LIMIT_AGGREGATION` (default `false`).
+    pub ingress_rate_limit_aggregation: bool,
+    /// Path to the UDS SOCK_DGRAM socket the sidecar writes to once
+    /// per tick. Must match `edge-ingress-sidecar::config::DEFAULT_UDS_PATH`
+    /// (`/var/run/edge-ingress/global-rps.sock`); drift between the
+    /// two turns the sidecar's writes into a black hole and the
+    /// renderer silently never sees a fresh `local_cap`. Set via
+    /// `GLOBAL_RPS_UDS_PATH` (default
+    /// `/var/run/edge-ingress/global-rps.sock`).
+    pub global_rps_uds_path: PathBuf,
+    /// Expected sidecar tick interval. The cache treats a datagram
+    /// older than `2 × this value` as stale and stops emitting the
+    /// cross-replica route (fail-closed). Set via
+    /// `GLOBAL_RPS_TICK_INTERVAL` (default `1s`).
+    pub global_rps_tick_interval: Duration,
 }
 
 impl Config {
@@ -394,6 +418,17 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            ingress_rate_limit_aggregation: std::env::var("INGRESS_RATE_LIMIT_AGGREGATION")
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | ""))
+                .unwrap_or(false),
+            global_rps_uds_path: PathBuf::from(
+                std::env::var("GLOBAL_RPS_UDS_PATH")
+                    .unwrap_or_else(|_| "/var/run/edge-ingress/global-rps.sock".into()),
+            ),
+            global_rps_tick_interval: std::env::var("GLOBAL_RPS_TICK_INTERVAL")
+                .ok()
+                .and_then(|v| humantime::parse_duration(&v).ok())
+                .unwrap_or(Duration::from_secs(1)),
         })
     }
 
@@ -428,6 +463,23 @@ impl Config {
                  this caps every tenant without an explicit override to <{}/s. \
                  Confirm this is intentional.",
                 MIN_REASONABLE_RPS
+            );
+        }
+        // Issue #665 PR D: surface the operator foot-gun where the
+        // ingress is opted into cross-replica aggregation but the
+        // operator hasn't configured a global cap. The renderer will
+        // never emit the cross-replica route (per-replica cap math
+        // returns None when configured_cap == 0 — see
+        // edge-ingress-sidecar/src/aggregate.rs::Snapshot::per_replica_cap),
+        // so the operator sees nothing happen at Caddy level. The
+        // WARN is informational — operators sometimes deliberately
+        // deploy the aggregation plumbing ahead of setting a cap.
+        if self.ingress_rate_limit_aggregation && self.global_rate_limit_rps == 0 {
+            warn!(
+                "INGRESS_RATE_LIMIT_AGGREGATION=true but GLOBAL_RATE_LIMIT_RPS=0; \
+                 the cross-replica route will never render a cap. Either set \
+                 GLOBAL_RATE_LIMIT_RPS to the operator's intended platform cap \
+                 or disable aggregation with INGRESS_RATE_LIMIT_AGGREGATION=false."
             );
         }
     }
@@ -611,6 +663,9 @@ mod tests {
             "INGRESS_L4_MAX_CONNS_PER_APP",
             "INGRESS_L4_MAX_CONNS_PER_IP",
             "L4_PORT_COOLDOWN_SECS",
+            "INGRESS_RATE_LIMIT_AGGREGATION",
+            "GLOBAL_RPS_UDS_PATH",
+            "GLOBAL_RPS_TICK_INTERVAL",
         ] {
             unset_var(v);
         }
@@ -835,6 +890,9 @@ mod tests {
             l4_max_conns_per_app: 1000,
             l4_max_conns_per_ip: 100,
             l4_port_cooldown_secs: 60,
+            ingress_rate_limit_aggregation: false,
+            global_rps_uds_path: PathBuf::from("/var/run/edge-ingress/global-rps.sock"),
+            global_rps_tick_interval: Duration::from_secs(1),
         }
     }
 

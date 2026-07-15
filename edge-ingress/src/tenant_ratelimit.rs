@@ -17,8 +17,13 @@
 //! custom Caddy image `edgecloud/caddy-concurrent:latest` by the
 //! first-party module at `caddy-modules/tenant_concurrent/` (see
 //! `edge-ingress/Dockerfile.caddy-concurrent`). Sub-feature #3
-//! (bandwidth) is cached here but not rendered — needs Caddy 2.8+
-//! `rate_limit.bandwidth`.
+//! (bandwidth, issue #664) renders a `tenant_bandwidth` HTTP handler
+//! invocation — enforced by the first-party module at
+//! `caddy-modules/tenant_bandwidth/`, also built into
+//! `edgecloud/caddy-concurrent:latest`. Stock caddy:2 has no
+//! response-payload throttle primitive
+//! (caddyserver/caddy#4476 closed as not-planned), so we ship our own
+//! token-bucket-on-ResponseWriter middleware.
 //!
 //! Mirrors the structure of `quota.rs` (cache + fetch + spawn). The
 //! cache is per-tenant (NOT per-(tenant, app)) because all five caps
@@ -34,11 +39,14 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// Per-tenant rate-limit state. The Caddy renderer looks at `rps` (and
-/// the matching `burst`) to decide whether to inject a `rate_limit`
-/// route. `concurrent_limit` and `bandwidth_bps` are cached for
-/// follow-up render work (sub-features #2 + #3) — neither is consumed
-/// by the renderer in this PR.
+/// Per-tenant rate-limit state. The Caddy renderer drives each of the
+/// three tenant-level caps from an independent iterator:
+/// `rps`/`burst` (sub-feature #1) via `active_caps()`,
+/// `concurrent_limit` (sub-feature #2, issue #663) via
+/// `concurrent_caps()`, and `bandwidth_bps` (sub-feature #3, issue
+/// #664) via `bandwidth_caps()`. A tenant with one cap enabled and
+/// the others at zero must still appear in the matching iterator and
+/// not in the others — the per-axis iterators are independent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TenantRateLimitState {
     /// Per-tenant RPS cap. 0 = no cap (renderer skips emitting a route).
@@ -56,8 +64,15 @@ pub struct TenantRateLimitState {
     /// request whose key's bucket is full receives 429 with
     /// `Retry-After: 1`.
     pub concurrent_limit: u32,
-    /// Bandwidth cap per tenant (sub-feature #3). Cached but not
-    /// rendered in this PR — needs Caddy 2.8+ `rate_limit.bandwidth`.
+    /// Bandwidth cap per tenant in bytes/sec (sub-feature #3, issue
+    /// #664). Rendered via the first-party `tenant_bandwidth` Caddy
+    /// middleware at `caddy-modules/tenant_bandwidth/`, built into
+    /// `edgecloud/caddy-concurrent:latest` (see
+    /// `edge-ingress/Dockerfile.caddy-concurrent`). The handler wraps
+    /// the downstream `http.ResponseWriter` in a token-bucket pacing
+    /// writer; a response whose `key` already has `bytes_per_sec`
+    /// tokens consumed is paced at that rate — the body bytes are
+    /// still delivered, just stretched across time.
     pub bandwidth_bps: u64,
     /// When this state was last refreshed. Currently unused on the
     /// render path; carried for shape parity with
@@ -124,6 +139,22 @@ impl TenantRateLimitCache {
     #[allow(dead_code)] // consumed by caddy.rs render pass (issue #663 commit 4).
     pub fn concurrent_caps(&self) -> impl Iterator<Item = (&String, &TenantRateLimitState)> {
         self.inner.iter().filter(|(_, s)| s.concurrent_limit > 0)
+    }
+
+    /// Iterate `(tenant_id, state)` for every tenant with
+    /// `bandwidth_bps > 0` (sub-feature #3, issue #664). The
+    /// renderer's hot path: skip zero-bandwidth rows so the route
+    /// table only carries tenants that need a `tenant_bandwidth`
+    /// handler invocation. Mirrors `active_caps()` and
+    /// `concurrent_caps()`. All three iterators are independent —
+    /// a tenant with only `bandwidth_bps > 0` (rps=0,
+    /// concurrent_limit=0) must still appear here so the renderer
+    /// emits its bandwidth route. `active_caps()` filters on `rps>0`
+    /// only, so a bandwidth-only tenant would be silently dropped
+    /// without this dedicated iterator.
+    #[allow(dead_code)] // consumed by caddy.rs render pass (issue #664 commit 4).
+    pub fn bandwidth_caps(&self) -> impl Iterator<Item = (&String, &TenantRateLimitState)> {
+        self.inner.iter().filter(|(_, s)| s.bandwidth_bps > 0)
     }
 }
 
@@ -440,6 +471,66 @@ mod tests {
         concurrent.sort();
         assert_eq!(active, vec!["t_both"]);
         assert_eq!(concurrent, vec!["t_both"]);
+    }
+
+    #[test]
+    fn cache_bandwidth_caps_skips_zero_bandwidth() {
+        // t_acme has only a bandwidth cap (no RPS, no concurrent) —
+        // must still appear in bandwidth_caps(). t_globex has only an
+        // RPS cap — must NOT appear here. Mirrors
+        // cache_active_caps_skips_zero_rps but for the bandwidth axis
+        // (issue #664).
+        let mut cache = TenantRateLimitCache::default();
+        cache.update(
+            "t_acme".into(),
+            TenantRateLimitState {
+                rps: 0,
+                burst: 0,
+                concurrent_limit: 0,
+                bandwidth_bps: 1_000_000,
+                fetched_at: None,
+            },
+        );
+        cache.update(
+            "t_globex".into(),
+            TenantRateLimitState {
+                rps: 100,
+                burst: 0,
+                concurrent_limit: 0,
+                bandwidth_bps: 0,
+                fetched_at: None,
+            },
+        );
+        let mut ids: Vec<&String> = cache.bandwidth_caps().map(|(k, _)| k).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t_acme"]);
+    }
+
+    #[test]
+    fn cache_bandwidth_caps_and_active_caps_are_independent() {
+        // A tenant with both RPS and bandwidth caps must appear in
+        // BOTH iterators. Pins that the third per-axis filter is
+        // independent (not collapsed into an OR-filter on either
+        // sibling iterator). Mirrors
+        // cache_concurrent_caps_and_active_caps_are_independent for
+        // the bandwidth axis.
+        let mut cache = TenantRateLimitCache::default();
+        cache.update(
+            "t_both".into(),
+            TenantRateLimitState {
+                rps: 100,
+                burst: 200,
+                concurrent_limit: 0,
+                bandwidth_bps: 5_000_000,
+                ..Default::default()
+            },
+        );
+        let mut active: Vec<&String> = cache.active_caps().map(|(k, _)| k).collect();
+        let mut bandwidth: Vec<&String> = cache.bandwidth_caps().map(|(k, _)| k).collect();
+        active.sort();
+        bandwidth.sort();
+        assert_eq!(active, vec!["t_both"]);
+        assert_eq!(bandwidth, vec!["t_both"]);
     }
 
     #[test]

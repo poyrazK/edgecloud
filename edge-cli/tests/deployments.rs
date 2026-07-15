@@ -419,3 +419,47 @@ async fn list_walks_cursor_chain() {
         // it as opaque and the user gets only the items.
         .stdout(predicate::str::contains("page2cursor").not());
 }
+
+/// Pre-flight path-component validation on `edge deployments`.
+/// The `app_name` interpolates into
+/// `GET /api/v1/apps/{app}/deployments` and is sourced from
+/// `.edge/state.json` (the only path). We seed state.json with a
+/// hostile app_name so the validator surfaces the bad id rather
+/// than the state-loading code path. Issue #671.
+#[tokio::test]
+async fn deployments_rejects_invalid_app_name() {
+    for (bad_name, expected_substr) in [
+        ("my../api", "'..'"),
+        ("my%2Fapi", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // state.json + edge.toml are required by `edge deployments`.
+        // We seed them so the path-component validator (which runs
+        // AFTER the toml/state load) actually gets to fire.
+        write_minimal_edge_toml(&project);
+        write_state_with_app(&project, bad_name);
+
+        // Fence: NO GET on /api/v1/apps/<id>/deployments may ever land.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"deployments": [], "next_cursor": null})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.arg("deployments");
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

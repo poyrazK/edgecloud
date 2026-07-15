@@ -119,16 +119,27 @@ type Quota struct {
 	// column on apps introduced in migration 017).
 	TenantRateLimitBurst int32 `db:"tenant_rate_limit_burst" json:"tenant_rate_limit_burst"`
 	// TenantConcurrentLimit caps in-flight requests per tenant
-	// (issue #305, sub-feature #2 — resource-starvation prevention).
-	// Rendered layer is intentionally deferred: stock `caddy:2` does
-	// not ship a concurrency limiter. Column + cache + admin endpoint
-	// wired today so the follow-up render-layer change is a pure
-	// caddy.rs delta with no schema or handler churn.
+	// (issue #305 sub-feature #2, issue #663 — resource-starvation
+	// prevention). Rendered by edge-ingress as a `tenant_concurrent`
+	// HTTP handler invocation (see edge-ingress/src/caddy.rs);
+	// enforced inside the custom Caddy image
+	// `edgecloud/caddy-concurrent:latest` by the first-party module
+	// at `caddy-modules/tenant_concurrent/`. Each `key` keeps a
+	// buffered-channel semaphore sized at this value; a request whose
+	// key's bucket is full receives 429 with `Retry-After: 1`.
 	TenantConcurrentLimit int32 `db:"tenant_concurrent_limit" json:"tenant_concurrent_limit"`
-	// TenantBandwidthBPS caps per-tenant bytes/sec (issue #305,
-	// sub-feature #3). Rendered layer deferred — needs Caddy 2.8+
-	// `rate_limit.bandwidth` field; the floating `caddy:2` Docker tag
-	// makes "does this work today" a probe, not a guarantee.
+	// TenantBandwidthBPS caps per-tenant bytes/sec (issue #305
+	// sub-feature #3, issue #664). Rendered by edge-ingress as a
+	// `tenant_bandwidth` HTTP handler invocation (see
+	// edge-ingress/src/caddy.rs); enforced inside the custom Caddy
+	// image `edgecloud/caddy-concurrent:latest` by the first-party
+	// module at `caddy-modules/tenant_bandwidth/`. Stock `caddy:2`
+	// has no response-payload throttle primitive — stock `rate_limit`
+	// is RPS-only, and caddyserver/caddy#4476 ("Feature Request:
+	// Bandwidth Limiting") was closed as not-planned — so this cap is
+	// implemented as a token-bucket pacing writer that wraps the
+	// downstream `http.ResponseWriter` and stretches the body bytes
+	// across time at the configured byte rate.
 	TenantBandwidthBPS int64 `db:"tenant_bandwidth_bps" json:"tenant_bandwidth_bps"`
 	// TenantRateLimitSetAt is the audit timestamp: when an admin last
 	// wrote this row's tenant-rate-limit columns via

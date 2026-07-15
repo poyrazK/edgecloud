@@ -347,3 +347,69 @@ async fn delete_resolves_app_from_positional_when_state_missing() {
 
     cmd.assert().success();
 }
+
+/// Pre-flight path-component validation on `edge env-set --app <app>
+/// <key> <value>` and `edge env-delete --app <app> <key>`. Both
+/// interpolate `app_name` into the URL path; env-delete also
+/// interpolates `key` into the path (`/apps/{app}/env/{key}`).
+/// Issue #671.
+#[tokio::test]
+async fn env_set_and_delete_reject_invalid_app_or_key() {
+    for (verb_args, expected_substr, verb) in [
+        // env-set with bad app
+        (
+            vec!["env-set", "--app", "my../api", "FOO", "bar"],
+            "'..'",
+            "POST",
+        ),
+        (
+            vec!["env-set", "--app", "my%2Fapi", "FOO", "bar"],
+            "invalid character",
+            "POST",
+        ),
+        // env-delete with bad app
+        (
+            vec!["env-delete", "--app", "my../api", "FOO"],
+            "'..'",
+            "DELETE",
+        ),
+        // env-delete with bad key
+        (
+            vec!["env-delete", "--app", "api", "FOO/../BAR"],
+            "'..'",
+            "DELETE",
+        ),
+        (
+            vec!["env-delete", "--app", "api", "FOO%2FBAR"],
+            "invalid character",
+            "DELETE",
+        ),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // edge.toml + state.json are required by `edge env-set` /
+        // `edge env-delete` to resolve the [deployment] api URL.
+        // We seed them so the path-component validator (which runs
+        // AFTER the toml parse) actually gets to fire.
+        write_minimal_edge_toml(&project);
+        write_state_with_app(&project, "myapp");
+
+        // Fence: NO POST/DELETE on env paths may ever land.
+        Mock::given(method(verb))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.args(&verb_args);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

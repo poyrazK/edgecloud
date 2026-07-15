@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::caddy::{render_full, render_routes, CaddyClient};
 use crate::config::Config;
+use crate::global_rps::{spawn_global_rps_reader, SharedGlobalRpsCache};
 use crate::l4::{L4AppKey, L4PortPool, L4RouteEntry, L4RoutingTable};
 use crate::l4_cache::{spawn_l4_port_cache_fetcher, SharedL4PortCache};
 use crate::messages::HeartbeatMessage;
@@ -77,6 +78,12 @@ pub async fn run(
     // falling back to the ingress-local `L4PortPool` on the cold
     // path.
     let l4_port_cache: SharedL4PortCache = Default::default();
+    // Cross-replica global RPS cache (issue #665 PR D). The
+    // UDS reader task below parses datagrams from the sidecar
+    // and writes the latest `local_cap` here; the renderer reads
+    // it to emit the cross-replica `rate_limit` route. Fail-closed
+    // by default (cold cache → no route emitted).
+    let global_rps_cache: SharedGlobalRpsCache = Default::default();
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -89,6 +96,8 @@ pub async fn run(
     let quota_cache_for_push = quota_cache.clone();
     let tenant_rate_limit_cache_for_renderer = tenant_rate_limit_cache.clone();
     let tenant_rate_limit_cache_for_push = tenant_rate_limit_cache.clone();
+    let global_rps_cache_for_renderer = global_rps_cache.clone();
+    let global_rps_cache_for_push = global_rps_cache.clone();
 
     // Spawn background tasks with the shutdown token.
     let fetcher_shutdown = shutdown.clone();
@@ -161,6 +170,40 @@ pub async fn run(
         l4_table.clone(),
         l4_cache_shutdown,
     );
+    // Issue #665 PR D — spawn the cross-replica global RPS UDS
+    // reader. Opt-in via `INGRESS_RATE_LIMIT_AGGREGATION=true`;
+    // when false, the cache stays empty and the renderer never
+    // emits the cross-replica route (fail-closed). The reader
+    // owns the bind + chmod + unlink on `cfg.global_rps_uds_path`
+    // — see `edge-ingress-sidecar/src/expose.rs` module docs for
+    // the UDS ownership rationale.
+    let global_rps_reader_shutdown = shutdown.clone();
+    let global_rps_cache_for_reader = global_rps_cache.clone();
+    let global_rps_uds_path = cfg.global_rps_uds_path.clone();
+    if cfg.ingress_rate_limit_aggregation {
+        match spawn_global_rps_reader(
+            global_rps_uds_path,
+            global_rps_cache_for_reader,
+            global_rps_reader_shutdown,
+        ) {
+            Ok(_handle) => {
+                info!(
+                    path = %cfg.global_rps_uds_path.display(),
+                    "global_rps: UDS reader spawned (cross-replica aggregation enabled)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    err = %e,
+                    path = %cfg.global_rps_uds_path.display(),
+                    "global_rps: UDS reader spawn failed; cross-replica route will be omitted \
+                     (fail-closed). Check that the path's parent directory exists and is writable."
+                );
+            }
+        }
+    } else {
+        debug!("global_rps: INGRESS_RATE_LIMIT_AGGREGATION=false; cross-replica route disabled");
+    }
     let renderer_shutdown = shutdown.clone();
     spawn_renderer(
         cfg.clone(),
@@ -171,6 +214,7 @@ pub async fn run(
         rate_limit_cache_for_renderer,
         quota_cache_for_renderer,
         tenant_rate_limit_cache_for_renderer,
+        global_rps_cache_for_renderer,
         render_notify.clone(),
         renderer_shutdown,
     );
@@ -197,6 +241,7 @@ pub async fn run(
         &rate_limit_cache_for_push,
         &quota_cache_for_push,
         &tenant_rate_limit_cache_for_push,
+        &global_rps_cache_for_push,
         &mut boot_previous,
     )
     .await
@@ -458,6 +503,19 @@ struct PreviousState {
     /// sets differ, `render_full` re-emits the entire `apps.layer4`
     /// block.
     l4_entries: Vec<L4RouteEntry>,
+    /// Last-pushed cross-replica global RPS cap (issue #665 PR D).
+    /// `None` ⇒ no global route was emitted on the last render
+    /// (cold cache, sidecar disabled, or stale). When this flips
+    /// between `None` and `Some(cap)` the renderer must take the
+    /// full `render_full` path — the incremental route-id patch
+    /// can't add or remove a brand-new `@id` from Caddy's config.
+    /// Without this field the `None → Some(7_500)` transition (cold
+    /// start of the sidecar) would never propagate to Caddy until
+    /// the next heartbeat-driven render — operator-visible
+    /// regression. Compared by value; cap drift also forces a full
+    /// reload so the new `rps` reaches Caddy without waiting for
+    /// a >20% HTTP delta.
+    global_rps_cap: Option<u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,6 +528,7 @@ fn spawn_renderer(
     rate_limit_cache: SharedRateLimitCache,
     quota_cache: SharedQuotaCache,
     tenant_rate_limit_cache: SharedTenantRateLimitCache,
+    global_rps_cache: SharedGlobalRpsCache,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
 ) {
@@ -479,7 +538,7 @@ fn spawn_renderer(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("renderer: shutdown signal received; performing final push");
-                    let _ = push_now(&cfg, &table, &l4_table, &caddy, &traffic_cache, &rate_limit_cache, &quota_cache, &tenant_rate_limit_cache, &mut previous).await;
+                    let _ = push_now(&cfg, &table, &l4_table, &caddy, &traffic_cache, &rate_limit_cache, &quota_cache, &tenant_rate_limit_cache, &global_rps_cache, &mut previous).await;
                     break;
                 }
                 _ = notify.notified() => {
@@ -494,6 +553,7 @@ fn spawn_renderer(
                         &rate_limit_cache,
                         &quota_cache,
                         &tenant_rate_limit_cache,
+                        &global_rps_cache,
                         &mut previous,
                     )
                     .await
@@ -582,6 +642,7 @@ async fn push_now(
     rate_limit_cache: &SharedRateLimitCache,
     quota_cache: &SharedQuotaCache,
     tenant_rate_limit_cache: &SharedTenantRateLimitCache,
+    global_rps_cache: &SharedGlobalRpsCache,
     previous: &mut Option<PreviousState>,
 ) -> Result<()> {
     let snap: Vec<RouteEntry> = table.snapshot().await;
@@ -591,6 +652,14 @@ async fn push_now(
     let rate_limit_cache_guard = rate_limit_cache.read().await;
     let quota_cache_guard = quota_cache.read().await;
     let tenant_rate_limit_cache_guard = tenant_rate_limit_cache.read().await;
+    let global_rps_cache_guard = global_rps_cache.read().await;
+    // Snapshot the current cross-replica cap BEFORE taking the
+    // `previous` match — we need this both to feed the renderer and
+    // to record into `PreviousState` so the next render's diff logic
+    // can detect a `None ↔ Some(cap)` transition (see PreviousState
+    // doc on `global_rps_cap`).
+    let current_global_rps_cap =
+        global_rps_cache_guard.current_local_cap(2 * cfg.global_rps_tick_interval);
 
     // Set gauges from current state.
     metrics::gauge!("ingress.routes.active").set(snap.len() as f64);
@@ -612,6 +681,7 @@ async fn push_now(
                 &rate_limit_cache_guard,
                 &quota_cache_guard,
                 &tenant_rate_limit_cache_guard,
+                &global_rps_cache_guard,
             );
             let json = render_full(http_payload, &l4_snap, cfg, &quota_cache_guard);
             let render_dur = render_start.elapsed();
@@ -632,6 +702,7 @@ async fn push_now(
                         route_entries: snap,
                         fqdn_bindings: fqdns,
                         l4_entries: l4_snap,
+                        global_rps_cap: current_global_rps_cap,
                     });
                 }
                 Err(_) => {
@@ -659,8 +730,18 @@ async fn push_now(
             // per-id patch path used by the HTTP tree. The HTTP
             // >20% heuristic above is the *additional* gate that
             // can trigger a full reload on the HTTP side too.
+            //
+            // Issue #665 PR D: ANY change in `global_rps_cap` also
+            // forces a full reload — the incremental route-id patch
+            // can't add or remove a brand-new `@id` from Caddy's
+            // config, so the `None → Some(cap)` cold-start transition
+            // (and the `Some(cap1) → Some(cap2)` cap-drift transition
+            // that lets the new rps reach Caddy without waiting for
+            // an HTTP delta) both require the full `render_full`
+            // path.
             let l4_changed = prev.l4_entries != l4_snap;
-            if l4_changed || total_changes * 5 > total {
+            let global_rps_changed = prev.global_rps_cap != current_global_rps_cap;
+            if l4_changed || global_rps_changed || total_changes * 5 > total {
                 let render_start = std::time::Instant::now();
                 let http_payload = render_routes(
                     &snap,
@@ -670,6 +751,7 @@ async fn push_now(
                     &rate_limit_cache_guard,
                     &quota_cache_guard,
                     &tenant_rate_limit_cache_guard,
+                    &global_rps_cache_guard,
                 );
                 let json = render_full(http_payload, &l4_snap, cfg, &quota_cache_guard);
                 let render_dur = render_start.elapsed();
@@ -690,6 +772,7 @@ async fn push_now(
                             route_entries: snap,
                             fqdn_bindings: fqdns,
                             l4_entries: l4_snap,
+                            global_rps_cap: current_global_rps_cap,
                         });
                     }
                     Err(_) => {
@@ -771,6 +854,7 @@ async fn push_now(
                     route_entries: snap,
                     fqdn_bindings: fqdns,
                     l4_entries: l4_snap,
+                    global_rps_cap: current_global_rps_cap,
                 });
                 Ok(())
             } else {
@@ -1562,6 +1646,9 @@ mod tests {
             l4_max_conns_per_app: 1000,
             l4_max_conns_per_ip: 100,
             l4_port_cooldown_secs: 60,
+            ingress_rate_limit_aggregation: false,
+            global_rps_uds_path: std::path::PathBuf::from("/var/run/edge-ingress/global-rps.sock"),
+            global_rps_tick_interval: std::time::Duration::from_secs(1),
         }
     }
 
@@ -1588,6 +1675,7 @@ mod tests {
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
         let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
+        let global_rps_cache: SharedGlobalRpsCache = Default::default();
 
         push_now(
             &cfg,
@@ -1598,6 +1686,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &tenant_rl_cache,
+            &global_rps_cache,
             &mut None,
         )
         .await
@@ -1624,6 +1713,7 @@ mod tests {
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
         let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
+        let global_rps_cache: SharedGlobalRpsCache = Default::default();
 
         let err = push_now(
             &cfg,
@@ -1634,6 +1724,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &tenant_rl_cache,
+            &global_rps_cache,
             &mut None,
         )
         .await
@@ -1671,6 +1762,7 @@ mod tests {
         let rl_cache: SharedRateLimitCache = Default::default();
         let q_cache: SharedQuotaCache = Default::default();
         let tenant_rl_cache: SharedTenantRateLimitCache = Default::default();
+        let global_rps_cache: SharedGlobalRpsCache = Default::default();
         let notify = Arc::new(Notify::new());
 
         // Notify BEFORE spawn: tokio::sync::Notify stores a pending
@@ -1687,6 +1779,7 @@ mod tests {
             rl_cache,
             q_cache,
             tenant_rl_cache,
+            global_rps_cache,
             notify.clone(),
             CancellationToken::new(),
         );

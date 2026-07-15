@@ -853,7 +853,7 @@ fn main() -> Result<()> {
             let preview_suffix = if preview { Some(short_hash()) } else { None };
             let preview_app = preview_suffix
                 .as_ref()
-                .map(|s| format!("{}--preview-{}", &resolved_app, s));
+                .map(|s| format!("{resolved_app}--preview-{s}"));
             // issue #308: build the PreviewOpts payload for the
             // server when --preview is set. The preview-id is the
             // same hash we used to suffix the app name — that's

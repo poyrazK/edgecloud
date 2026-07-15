@@ -41,6 +41,17 @@ const EXPECTED_HANDLER_HASH: &str =
 const EXPECTED_JS_WEBSOCKET_HASH: &str =
     "5f785981710bc687f16b640e62a508f61b9aa00327b66caa2a35db09f9345c6e";
 
+// Issue #496 — `samples/redis-lite` is the long-running Rust guest
+// (`world = "edge-runtime"`, `export start: func()`) that speaks RESP
+// over raw TCP. The fixture is committed at
+// `tests/fixtures/redis_lite.wasm`. Rebuild with:
+//   cd samples/redis-lite
+//   ../../target/release/edge build   # produces target/component.wasm
+//   cp target/component.wasm ../../edge-worker/tests/fixtures/redis_lite.wasm
+//   sha256sum ../../edge-worker/tests/fixtures/redis_lite.wasm
+const EXPECTED_REDIS_LITE_HASH: &str =
+    "a714d28b1afbe4594889d0408499f57e4c82f51029c012e79d61da4782e3d9ab";
+
 fn sha256_hex(bytes: &[u8]) -> String {
     // Production SHA-256 via the `sha2` crate (already a regular
     // `[dependencies]` entry on `edge-worker` — used by
@@ -97,6 +108,11 @@ fn handler_fixture_intact() {
 #[test]
 fn js_websocket_fixture_intact() {
     assert_hash("js_websocket_handler.wasm", EXPECTED_JS_WEBSOCKET_HASH);
+}
+
+#[test]
+fn redis_lite_fixture_intact() {
+    assert_hash("redis_lite.wasm", EXPECTED_REDIS_LITE_HASH);
 }
 
 #[test]

@@ -54,17 +54,19 @@ cert. Generate one with `caddy trust` or
 # 1. Caddy — the reverse-proxy this binary controls. Exposes the JSON
 #    admin API on :2019 and binds the public ports :80/:443.
 #
-#    Issue #548 + #663: stock `caddy:2` has no `apps.layer4` AND
-#    no in-flight concurrency counter primitive for HTTP routes.
-#    Use the xcaddy-built image `edgecloud/caddy-concurrent:latest`
-#    (built from `edge-ingress/Dockerfile.caddy-concurrent`) which
-#    is a strict superset: includes both the `mholt/caddy-l4`
-#    plugin (for #548) AND the first-party `tenant_concurrent`
-#    HTTP middleware (for #663, sub-feature #2 of #305). The HTTP
-#    path is byte-identical to stock for unconfigured routes. The
-#    L4-only `edgecloud/caddy-l4:latest` image is still built (see
-#    `Dockerfile.caddy-l4`) for environments that do not need
-#    concurrent caps.
+#    Issues #548 + #663 + #664: stock `caddy:2` has no `apps.layer4`,
+#    no in-flight concurrency counter primitive for HTTP routes,
+#    and no response-payload byte-rate throttle. Use the
+#    xcaddy-built image `edgecloud/caddy-concurrent:latest` (built
+#    from `edge-ingress/Dockerfile.caddy-concurrent`) which is a
+#    strict superset: includes the `mholt/caddy-l4` plugin (for
+#    #548), the first-party `tenant_concurrent` HTTP middleware
+#    (for #663, sub-feature #2 of #305), AND the first-party
+#    `tenant_bandwidth` HTTP middleware (for #664, sub-feature #3
+#    of #305). The HTTP path is byte-identical to stock for
+#    unconfigured routes. The L4-only `edgecloud/caddy-l4:latest`
+#    image is still built (see `Dockerfile.caddy-l4`) for
+#    environments that do not need concurrent / bandwidth caps.
 docker run --rm -p 2019:2019 -p 80:80 -p 443:443 \
   -v ~/.edgecloud/tls:/etc/caddy/tls:ro \
   -e CADDY_ADMIN_TOKEN=dev-token \
@@ -125,8 +127,11 @@ curl http://127.0.0.1:2019/config/ | jq .apps.http.servers.edge_https.routes
 | `RATE_LIMIT_RPS_TENANT_DEFAULT` | `0`                  | Per-tenant default RPS applied to every tenant with no explicit per-tenant override (issue #305 sub-feature #1). `0` = no default cap. |
 | `RATE_LIMIT_BURST_TENANT_DEFAULT` | `0`                | Per-tenant default burst paired with `RATE_LIMIT_RPS_TENANT_DEFAULT`. `0` = falls back to the RPS value at the renderer. |
 | `TENANT_RATE_LIMIT_FETCH_INTERVAL` | `30s`             | How often the ingress polls `GET /api/v1/internal/rate-limit/{tenantID}` to refresh the per-tenant rate-limit cache. Matches `QUOTA_FETCH_INTERVAL` so both caches refresh on the same beat. `0` disables the fetcher entirely. |
-| `GLOBAL_RATE_LIMIT_RPS` | `0`                          | Platform-wide RPS cap applied before any per-tenant route (issue #305 sub-feature #4). Enforced **per Caddy replica** — with N ingress replicas, the effective cap is N × this value. Multi-replica NATS aggregation is a separate follow-up. `0` disables the global cap. |
+| `GLOBAL_RATE_LIMIT_RPS` | `0`                          | Platform-wide RPS cap applied before any per-tenant route (issue #305 sub-feature #4). When `INGRESS_RATE_LIMIT_AGGREGATION=true`, the sidecar's aggregator computes a per-replica cap from this value divided across the replica set; when the flag is false the cap is enforced **per Caddy replica** — with N ingress replicas, the effective cap is N × this value. `0` disables the global cap. |
 | `GLOBAL_RATE_LIMIT_BURST` | `0`                        | Global RPS burst paired with `GLOBAL_RATE_LIMIT_RPS`. `0` = falls back to the RPS value at the renderer. |
+| `INGRESS_RATE_LIMIT_AGGREGATION` | `false`                | Whether the ingress spawns the cross-replica UDS reader task (issue #665 PR D). When `true` + `GLOBAL_RATE_LIMIT_RPS > 0`, the renderer emits a global `rate_limit` route that enforces the per-replica cap computed by `edge-ingress-sidecar`. When `false`, the route is never emitted — same behaviour as before the feature shipped. |
+| `GLOBAL_RPS_UDS_PATH`   | `/var/run/edge-ingress/global-rps.sock` | Path to the UDS SOCK_DGRAM socket the sidecar writes to once per tick. Must match `SIDECAR_UDS_PATH` (default `/var/run/edge-ingress/global-rps.sock`); drift turns the sidecar's writes into a black hole and the renderer silently never sees a fresh cap. |
+| `GLOBAL_RPS_TICK_INTERVAL` | `1s`                     | Expected sidecar tick interval. The cache treats a datagram older than `2 × this value` as stale and stops emitting the cross-replica route (fail-closed). |
 | `L4_PORT_RANGE_START`  | `31000`                       | Inclusive lower bound of the public-port range reserved for raw-TCP apps. Issue #548. |
 | `L4_PORT_RANGE_END`    | `31999`                       | Inclusive upper bound. Provides 1000 ports by default. The CP allocates per-`(tenant_id, app_name)` atomically via `UPDATE … WHERE l4_public_port IS NULL RETURNING` so two ingress instances in the same region cannot collide; this range is the upper bound the CP allocates from. |
 | `INGRESS_L4_MAX_CONNS_PER_APP` | `1000`                | Per-app DDoS cap on simultaneous TCP connections. Mirrors the HTTP `Config::max_conns` shape. |
@@ -256,17 +261,29 @@ global `rate_limit` route when `GLOBAL_RATE_LIMIT_RPS > 0`.
   copy of the cap. With N ingress replicas, the effective cap is
   `N × concurrent_limit`. Cross-replica NATS aggregation is the
   same shape of follow-up as the per-replica RPS cap (issue #665).
+- #3 Per-tenant bandwidth throttling (issue #664) — emits a
+  `tenant_bandwidth` HTTP handler invocation keyed by
+  `tenant-<tenant_id>`. Enforced inside the custom Caddy image
+  (`edgecloud/caddy-concurrent:latest`, see
+  `edge-ingress/Dockerfile.caddy-concurrent`) by the first-party
+  module at `caddy-modules/tenant_bandwidth/`. The handler wraps
+  the downstream `http.ResponseWriter` in a token-bucket pacing
+  writer; a response body whose `key` already has `bytes_per_sec`
+  tokens consumed is paced at that rate — the bytes are still
+  delivered, just stretched across time. Stock `caddy:2` has no
+  response-payload throttle primitive — stock `rate_limit` is
+  RPS-only, and caddyserver/caddy#4476 ("Feature Request:
+  Bandwidth Limiting") was closed as not-planned — so this cap
+  is implemented as a first-party module built into the image
+  alongside #2.
+  **Multi-replica caveat:** each Caddy process enforces its own
+  copy of the cap. With N ingress replicas, the effective cap is
+  `N × bandwidth_bps`. Cross-replica NATS aggregation is the
+  same shape of follow-up as the per-replica RPS cap (issue #665).
 - #4 Global platform RPS — single route keyed on
   `0.0.0.0/0`, capped at `GLOBAL_RATE_LIMIT_RPS`.
 - #5 `RateLimit-*` headers — emitted natively by Caddy's
   `rate_limit` handler.
-
-**Sub-features cached but not rendered in this PR** (follow-ups
-filed):
-- #3 Per-tenant bandwidth throttling — needs Caddy 2.8+ for
-  the `rate_limit.bandwidth` field; the `caddy:2` Docker tag is
-  a floating tag so this is verification-deferred until the
-  production deployment pins a minimum version.
 
 **Per-replica semantics.** `GLOBAL_RATE_LIMIT_RPS` is enforced
 per Caddy process. With N ingress replicas, the effective cap is

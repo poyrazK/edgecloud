@@ -1,0 +1,16 @@
+[package]
+name = "redis-lite-resp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "RESP2 protocol parser extracted from samples/redis-lite so the unit tests can run on the host (the parent crate is #![no_main] for the WASM cdylib, which prevents cargo test from linking a test binary)."
+
+# No `[workspace]` block here — the parent (samples/redis-lite) is the
+# workspace root and lists `resp-parser` in `[workspace.members]`. A
+# nested `[workspace]` would create two roots and cargo would refuse to
+# build.
+
+[dependencies]
+
+[dev-dependencies]
+# None — the parser is pure std + alloc.

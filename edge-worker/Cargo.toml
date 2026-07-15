@@ -125,6 +125,19 @@ edge-test-helpers = { path = "../edge-test-helpers" }
 # function the NATS subscriber loop drives) without standing up the full
 # ingress binary.
 edge-ingress = { path = "../edge-ingress" }
+# `temp-env` is the established pattern in this repo for env-var
+# mutation inside tests (see edge-runtime/src/runtime.rs:1648). Used
+# by `redis_lite_e2e.rs::redis_lite_persists_kv_across_supervisor_restart`
+# to point `EDGE_KV_STORE_PATH` at a per-test tempdir so the kv-store
+# persistence path (issue #495) is exercised against the on-disk store
+# rather than the in-memory fallback.
+temp-env = "0.3"
+# `serial_test` enforces that two tests mutating the same process env
+# var don't race. Belt-and-suspenders against any future concurrent
+# test that touches `EDGE_KV_STORE_PATH`. Mirrors the `ENV_LOCK`
+# pattern in edge-worker/src/config.rs:486-529, but for integration
+# tests rather than unit tests.
+serial_test = "3"
 # Disable cargo-semver-checks lints that flag internal-process structs
 # (Supervisor, WorkerState, Config) and internal enum variants
 # (TaskMessage::FullSync). These types ARE part of the published crate's

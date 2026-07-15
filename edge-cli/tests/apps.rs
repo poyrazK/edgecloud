@@ -254,6 +254,74 @@ async fn apps_delete_requires_yes_flag() {
         .stderr(predicate::str::contains("non-interactive shells"));
 }
 
+/// Pre-flight path-component validation: malformed `app_name`
+/// values must bail with an actionable error before any DELETE
+/// round-trip lands. Mounted:
+///   - one whoami returning owner (so `check_owner_role` passes and
+///     the test reaches the validator — a 401 here would mask the
+///     validator and assert on the wrong substring);
+///   - one DELETE fence with `.expect(0)` (any DELETE that reaches
+///     wiremock would land on the open DELETE mock at line 287-293
+///     in `apps_delete_sends_admin_path_on_yes`, but that test uses
+///     a different mock with a path-matching gate, so the safest
+///     setup here is the SAME `expect(0)` fence used by the
+///     `--yes`-gate test, then a deliberately-overbroad DELETE mock
+///     with `.expect(0)` that fails the test if any DELETE slips by).
+/// Three sub-cases: empty string, `..` substring, `%` (URL-reserved
+/// char). Issue #671.
+#[tokio::test]
+async fn apps_delete_rejects_invalid_app_name() {
+    for (bad_name, expected_substr) in [
+        ("my../etc", "'..'"),
+        ("my%2Fapp", "invalid character"),
+        ("my bad", "invalid character"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/auth/whoami"))
+            .and(header("Authorization", "Bearer k_seed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tenant_id": "t_seed",
+                "tenant_name": "Seed",
+                "plan": "free",
+                "api_key_id": "k_seed",
+                "api_key_name": "default",
+                "role": "owner",
+                "created_at": "2026-06-20T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Fence: NO DELETE may ever land. A regression that skips
+        // pre-flight validation and fires anyway gets caught here.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("apps")
+            .arg("delete")
+            .arg(bad_name)
+            .arg("--yes");
+
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_substr));
+    }
+}
+
 /// Happy path: whoami returns owner, DELETE returns 204, the CLI
 /// prints the success line. The mock counts (expect(1) on both)
 /// pin exactly one whoami + one DELETE round-trip — if the CLI
@@ -629,4 +697,48 @@ async fn list_walks_cursor_chain() {
         .stdout(predicate::str::contains("charlie"))
         .stdout(predicate::str::contains("delta"))
         .stdout(predicate::str::contains("echo"));
+}
+/// Pre-flight path-component validation on `apps create` and
+/// `apps get` (Commit 3 of #671). Reuses the same fence pattern as
+/// the destructive-endpoint suite: the validator fires before the
+/// round-trip, so any of the listed verbs (`POST/GET /api/v1/apps/{app}`,
+/// `GET /api/v1/apps/{app}/status`) must NOT land on the fence mock.
+#[tokio::test]
+async fn apps_create_and_get_reject_invalid_app_name() {
+    for (verb_args, expected_substr) in [
+        // apps create <bad-name>
+        (vec!["apps", "create", "my../api"], "'..'"),
+        (vec!["apps", "create", "my%2Fapi"], "invalid character"),
+        (vec!["apps", "create", ""], "cannot be empty"),
+        // apps get <bad-name>
+        (vec!["apps", "get", "my../api"], "'..'"),
+        (vec!["apps", "get", "my%2Fapi"], "invalid character"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO POST or GET on /api/v1/apps/<id> may ever land.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.args(&verb_args);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
 }

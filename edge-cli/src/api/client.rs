@@ -6,6 +6,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
+use super::path::validate_path_component;
 use crate::config::ApiKey;
 
 /// Distinguishes a credential rejection (4xx — the server explicitly
@@ -720,6 +721,10 @@ impl ApiClient {
     /// failed status fetch must NOT prevent the log fetch from
     /// proceeding, because logs are the user's actual goal.
     pub fn get_app_status(&self, app_name: &str) -> Result<AppWorkerStatus, ApiError> {
+        validate_path_component("app_name", app_name).map_err(|e| ApiError::Rejected {
+            status: StatusCode::BAD_REQUEST,
+            body: format!("invalid app_name: {e}"),
+        })?;
         self.get_json(|base| format!("{base}/api/v1/apps/{app_name}/status"))
     }
 
@@ -734,6 +739,7 @@ impl ApiClient {
     /// `edge logs` continues to use `get_app_status` because its hint
     /// path silently swallows failures (logs are the primary goal).
     pub fn app_status(&self, app_name: &str) -> Result<AppWorkerStatus> {
+        validate_path_component("app_name", app_name)?;
         self.get_json_anyhow("runtime status", |base| {
             format!("{base}/api/v1/apps/{app_name}/status")
         })
@@ -770,6 +776,7 @@ impl ApiClient {
         preview_opts: Option<&PreviewOpts>,
         idempotency_key: &str,
     ) -> Result<DeployResponse> {
+        validate_path_component("app_name", app_name)?;
         let mut url = format!("{}/api/v1/deploy/{}", self.base_url, app_name);
         // Always parse the URL so we can append optional query params
         // (regions, auto-rollback) uniformly. Even when both are
@@ -901,6 +908,7 @@ impl ApiClient {
 
     /// Get deployment status.
     pub fn status(&self, deployment_id: &str) -> Result<StatusResponse> {
+        validate_path_component("deployment_id", deployment_id)?;
         self.get_json_anyhow("status", |base| {
             format!("{base}/api/v1/status/{deployment_id}")
         })
@@ -908,6 +916,7 @@ impl ApiClient {
 
     /// List environment variables for an app.
     pub fn list_env(&self, app_name: &str) -> Result<Vec<EnvVar>> {
+        validate_path_component("app_name", app_name)?;
         self.get_json_anyhow("list env", |base| {
             format!("{base}/api/v1/apps/{app_name}/env")
         })
@@ -915,6 +924,7 @@ impl ApiClient {
 
     /// Set an environment variable.
     pub fn set_env(&self, app_name: &str, key: &str, value: &str) -> Result<()> {
+        validate_path_component("app_name", app_name)?;
         let url = format!("{}/api/v1/apps/{}/env", self.base_url, app_name);
         #[derive(Serialize)]
         struct Payload<'a> {
@@ -936,6 +946,8 @@ impl ApiClient {
 
     /// DELETE `/api/v1/apps/{appName}/env/{key}` — delete an environment variable.
     pub fn delete_env(&self, app_name: &str, key: &str) -> Result<()> {
+        validate_path_component("app_name", app_name)?;
+        validate_path_component("env_key", key)?;
         let url = format!("{}/api/v1/apps/{}/env/{}", self.base_url, app_name, key);
         let resp = self
             .http
@@ -956,6 +968,8 @@ impl ApiClient {
         weight: Option<u8>,
         idempotency_key: &str,
     ) -> Result<()> {
+        validate_path_component("app_name", app_name)?;
+        validate_path_component("deployment_id", deployment_id)?;
         let url = if let Some(w) = weight {
             format!(
                 "{}/api/v1/apps/{}/activate/{}?weight={}",
@@ -993,6 +1007,8 @@ impl ApiClient {
         deployment_id: &str,
         idempotency_key: &str,
     ) -> Result<()> {
+        validate_path_component("app_name", app_name)?;
+        validate_path_component("deployment_id", deployment_id)?;
         let url = format!(
             "{}/api/v1/apps/{}/promote/{}",
             self.base_url, app_name, deployment_id
@@ -1022,6 +1038,7 @@ impl ApiClient {
         struct TrafficRequest<'a> {
             splits: &'a [SplitEntry],
         }
+        validate_path_component("app_name", app_name)?;
         let url = format!("{}/api/v1/apps/{}/traffic", self.base_url, app_name);
         let body = serde_json::to_string(&TrafficRequest {
             splits: &splits
@@ -1046,6 +1063,7 @@ impl ApiClient {
 
     /// Get current traffic splits for an app.
     pub fn get_traffic(&self, app_name: &str) -> Result<Vec<(String, u8)>> {
+        validate_path_component("app_name", app_name)?;
         #[derive(Deserialize)]
         struct SplitEntry {
             deployment_id: String,
@@ -1077,6 +1095,7 @@ impl ApiClient {
     /// roll back to"), this surfaces as a `Rejected` `ApiError` — the
     /// caller can detect that via `body.contains("no previous")`.
     pub fn rollback(&self, app_name: &str, idempotency_key: &str) -> Result<RollbackResponse> {
+        validate_path_component("app_name", app_name)?;
         let url = format!("{}/api/v1/apps/{}/rollback", self.base_url, app_name);
         let mut req = self
             .http
@@ -1135,6 +1154,7 @@ impl ApiClient {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<DeploymentListEnvelope> {
+        validate_path_component("app_name", app_name)?;
         self.get_json_anyhow("list deployments (cursor)", |base| {
             let mut parsed = reqwest::Url::parse(&format!("{base}/api/v1/list/{app_name}"))
                 .expect("hardcoded URL template parses");
@@ -1236,11 +1256,13 @@ impl ApiClient {
 
     /// GET `/api/v1/apps/{appName}` — get a single app by name.
     pub fn get_app(&self, app_name: &str) -> Result<App> {
+        validate_path_component("app_name", app_name)?;
         self.get_json_anyhow("get app", |base| format!("{base}/api/v1/apps/{app_name}"))
     }
 
     /// POST `/api/v1/apps/{appName}` — create a new app.
     pub fn create_app(&self, app_name: &str, description: Option<&str>) -> Result<App> {
+        validate_path_component("app_name", app_name)?;
         let url = format!("{}/api/v1/apps/{}", self.base_url, app_name);
         let payload = serde_json::json!({ "description": description });
         let resp = self
@@ -1265,6 +1287,10 @@ impl ApiClient {
     /// an actionable role-mismatch message before the round-trip.
     /// Issue #573.
     pub fn delete_app(&self, app_name: &str) -> Result<(), ApiError> {
+        validate_path_component("app_name", app_name).map_err(|e| ApiError::Rejected {
+            status: StatusCode::BAD_REQUEST,
+            body: format!("invalid app_name: {e}"),
+        })?;
         let url = format!("{}/api/v1/admin/apps/{}", self.base_url, app_name);
         let resp = self
             .http
@@ -1357,6 +1383,7 @@ impl ApiClient {
     /// GET `/api/v1/apps/{appName}/ingress` — get the ingress target
     /// (worker address and port) for a running app.
     pub fn get_ingress(&self, app_name: &str) -> Result<IngressResponse> {
+        validate_path_component("app_name", app_name)?;
         self.get_json_anyhow("get ingress", |base| {
             format!("{base}/api/v1/apps/{app_name}/ingress")
         })
@@ -1472,6 +1499,10 @@ impl<'a> Keys<'a> {
     /// on 4xx (caller can pattern-match for clean user-facing errors),
     /// and `Err(ApiError::Transient)` on 5xx or network failure.
     pub fn revoke(&self, id: &str) -> Result<(), ApiError> {
+        validate_path_component("key_id", id).map_err(|e| ApiError::Rejected {
+            status: StatusCode::BAD_REQUEST,
+            body: format!("invalid key_id: {e}"),
+        })?;
         let url = format!("{}/api/v1/keys/{}", self.client.base_url, id);
         let resp = self
             .client
@@ -1570,6 +1601,7 @@ impl<'a> Logs<'a> {
         // hand the formatted string to `get_json_anyhow` for the
         // auth + check + decode pipeline. The URL build is the only
         // call-site-specific piece; the rest is generic.
+        validate_path_component("app_name", app_name)?;
         let mut parsed = reqwest::Url::parse(&format!(
             "{}/api/v1/apps/{}/logs",
             self.client.base_url, app_name

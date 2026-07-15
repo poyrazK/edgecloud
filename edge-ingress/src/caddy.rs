@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::config::{ingress_host, Config};
+use crate::global_rps::GlobalRpsCache;
 use crate::l4::L4RouteEntry;
 use crate::quota::QuotaCache;
 use crate::ratelimit::RateLimitCache;
@@ -303,6 +304,16 @@ async fn delete_with_retry(client: &Client, url: &str, token: Option<&str>) -> R
 /// both match. A FQDN whose `(tenant, app)` is missing from `entries`
 /// is silently skipped — that means the underlying app is not
 /// currently running, so the route would 502 anyway.
+// `render_routes` carries one cache reference per backing signal the
+// renderer might splice: traffic splits, per-IP rate limits, quota_402,
+// tenant rate limits, and the cross-replica global RPS cap. PR D for
+// issue #665 added the eighth argument (`global_rps_cache`); the
+// seven-arg threshold tripped clippy::too_many_arguments. Bundling the
+// caches into a struct is the structural fix, but that touches every
+// call site in tests + heartbeats.rs. The narrow allow is the
+// minimum-delta fix for the PR — tracked for the next time the
+// renderer gains an argument.
+#[allow(clippy::too_many_arguments)]
 pub fn render_routes(
     entries: &[RouteEntry],
     fqdns: &[FqdnBinding],
@@ -311,6 +322,7 @@ pub fn render_routes(
     rate_limit_cache: &RateLimitCache,
     quota_cache: &QuotaCache,
     tenant_rate_limit_cache: &TenantRateLimitCache,
+    global_rps_cache: &GlobalRpsCache,
 ) -> Value {
     // Group entries by (tenant_id, app_name). Each entry in a group represents
     // a different deployment_id for the same app (canary/blue-green).
@@ -542,10 +554,6 @@ pub fn render_routes(
     // N × `concurrent_limit` in-flight requests across the fleet.
     // Same shape as the per-replica RPS caveat (see #665 for
     // cross-replica RPS aggregation, the parallel follow-up).
-    //
-    // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
-    // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
-    // The cache carries bandwidth_bps for that follow-up.
     let mut tenant_concurrent_routes: Vec<Value> = Vec::new();
     for (tenant_id, state) in tenant_rate_limit_cache.concurrent_caps() {
         tenant_concurrent_routes.push(json!({
@@ -566,6 +574,58 @@ pub fn render_routes(
         }));
     }
 
+    // Issue #305 sub-feature #3 — per-tenant data-plane bandwidth cap.
+    // For every tenant the TenantRateLimitCache reports as having a
+    // configured cap (state.bandwidth_bps > 0), insert a `tenant_bandwidth`
+    // route keyed by host_regexp matching the `<tenant>-<app>.edgecloud.dev`
+    // synthetic-host pattern. `terminal: false` so per-app handlers layered
+    // below still apply when a request passes through. The cache treats
+    // `None` (unknown tenant) and `bandwidth_bps == 0` as "no cap" —
+    // fail-open, same shape as the quota 402 cache.
+    //
+    // The bandwidth cap is enforced by the first-party
+    // `tenant_bandwidth` Caddy middleware (issue #664, see
+    // `caddy-modules/tenant_bandwidth/` and the
+    // `edgecloud/caddy-concurrent:latest` image). Stock `caddy:2` has no
+    // response-payload byte-rate throttle primitive — stock `rate_limit`
+    // is RPS-only, and caddyserver/caddy#4476 ("Feature Request:
+    // Bandwidth Limiting") was closed as not-planned. The handler wraps
+    // the downstream `http.ResponseWriter` in a token-bucket pacing
+    // writer; a response body whose `key` already has `bytes_per_sec`
+    // tokens consumed is paced at that rate — the bytes are still
+    // delivered, just stretched across time.
+    //
+    // Insertion order: AFTER quota_402_routes + tenant_concurrent_routes
+    // (so 402 short-circuits first when the tenant is over cap, then the
+    // concurrent cap is the first in-flight signal) and BEFORE
+    // tenant_rl_routes (so RPS throttling doesn't short-circuit before
+    // the bandwidth wrapper is installed — bandwidth is response-side and
+    // must wrap the response writer before the per-app handler chain).
+    //
+    // Multi-replica caveat: each Caddy process enforces its own copy of
+    // the cap. With N replicas a tenant can sustain N × `bandwidth_bps`
+    // throughput across the fleet. Same shape of follow-up as the
+    // per-replica RPS cap (#665).
+    let mut tenant_bandwidth_routes: Vec<Value> = Vec::new();
+    for (tenant_id, state) in tenant_rate_limit_cache.bandwidth_caps() {
+        tenant_bandwidth_routes.push(json!({
+            "@id": format!("tenant-bandwidth:{}", tenant_id),
+            "match": [{
+                "host_regexp": format!(
+                    "^{}-[^.]+\\.{}$",
+                    tenant_id,
+                    crate::config::INGRESS_HOST_SUFFIX,
+                )
+            }],
+            "handle": [{
+                "handler": "tenant_bandwidth",
+                "key": format!("tenant-{}", tenant_id),
+                "bytes_per_sec": state.bandwidth_bps as i64,
+            }],
+            "terminal": false,
+        }));
+    }
+
     // Issue #305 sub-feature #1 — per-tenant data-plane rate limit.
     // For every tenant the TenantRateLimitCache reports as having a
     // configured cap (state.rps > 0), insert a `rate_limit` route keyed
@@ -576,14 +636,12 @@ pub fn render_routes(
     // "no cap" — fail-open, same shape as the quota 402 cache.
     //
     // Insertion order: AFTER quota_402_routes + tenant_concurrent_routes
-    // (so 402 short-circuits first when the tenant is over cap, then
-    // the concurrent cap is the first rate-limit signal) and BEFORE
-    // per-app routes (so per-tenant caps apply before the per-app cap
-    // chain inside the handle).
-    //
-    // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
-    // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
-    // The cache carries bandwidth_bps for that follow-up.
+    // + tenant_bandwidth_routes (so 402 short-circuits first, then
+    // the concurrent cap, then the bandwidth wrapper installs BEFORE
+    // the RPS handler — otherwise RPS rejection short-circuits before
+    // we install the bandwidth wrapper) and BEFORE per-app routes (so
+    // per-tenant caps apply before the per-app cap chain inside the
+    // handle).
     let mut tenant_rl_routes: Vec<Value> = Vec::new();
     for (tenant_id, state) in tenant_rate_limit_cache.active_caps() {
         let burst = if state.burst > 0 {
@@ -611,15 +669,98 @@ pub fn render_routes(
             "terminal": false,
         }));
     }
-    if !tenant_concurrent_routes.is_empty() || !tenant_rl_routes.is_empty() {
+    // REBASED (PR #663 + PR #705): main added tenant_concurrent_routes
+    // (PR #663) AND tenant_bandwidth_routes (PR #705) between
+    // quota_402 and tenant_rl_routes. The PR D cross-replica global
+    // route splices AFTER tenant_rl_routes (above per-app routes),
+    // so the offset below adds both counts in addition to
+    // `tenant_rl_route_count`. Updated splice order:
+    //   [per_ip, global_replica, quota_402,
+    //    tenant_concurrent, tenant_bandwidth, tenant_rl,
+    //    global_route, per_app, fqdn].
+    let tenant_concurrent_route_count = tenant_concurrent_routes.len();
+    let tenant_bandwidth_route_count = tenant_bandwidth_routes.len();
+    let tenant_rl_route_count = tenant_rl_routes.len();
+    if !tenant_concurrent_routes.is_empty()
+        || !tenant_bandwidth_routes.is_empty()
+        || !tenant_rl_routes.is_empty()
+    {
         // Splice: keep the first `quota_402_route_count` entries,
-        // then the tenant_concurrent_routes, then the tenant_rl_routes,
-        // then the rest (per-app routes).
+        // then tenant_concurrent_routes, then tenant_bandwidth_routes,
+        // then tenant_rl_routes, then the rest (per-app routes).
         let per_app_start = quota_402_route_count;
         let per_app = routes.split_off(per_app_start);
         routes.extend(tenant_concurrent_routes);
+        routes.extend(tenant_bandwidth_routes);
         routes.extend(tenant_rl_routes);
         routes.extend(per_app);
+    }
+
+    // Issue #665 PR D — cross-replica global rate-limit route. The
+    // sidecar publishes a per-replica cap (computed from the platform
+    // total across all replicas) once per tick; this is the route
+    // that enforces it at the Caddy layer.
+    //
+    // Fail-closed semantics: `global_rps_cache.current_local_cap(...)`
+    // returns None when the cache is cold, when the operator has
+    // disabled enforcement (`local_cap == None` on the wire), or
+    // when the sidecar is stale (no datagram in the last
+    // 2 × tick_interval). On None we emit NO route — same fail-closed
+    // shape as the rest of the ingress caches.
+    //
+    // Opt-in via `INGRESS_RATE_LIMIT_AGGREGATION=true` (default off)
+    // and only when the operator has actually configured a platform
+    // cap via `GLOBAL_RATE_LIMIT_RPS > 0`. Without a configured cap
+    // the sidecar's aggregator returns `local_cap = None` on every
+    // tick, so this branch is dead code anyway, but the explicit
+    // `cfg.global_rate_limit_rps > 0` guard keeps the rendered Caddy
+    // config honest — operators reading `caddy adapt --config` see
+    // no cross-replica route when they haven't configured a cap.
+    //
+    // `match: [{}]` is an empty catch-all matcher — Caddy treats it
+    // as "match every request." No precedent for this in the
+    // codebase; the `[]` matcher-list shape is the same used by the
+    // existing rate-limit routes above. `terminal: false` so per-app
+    // rate-limit handlers layered below still apply when a request
+    // passes through this rate_limit (this is the platform-wide
+    // outer bound, not a leaf cap).
+    //
+    // Splice ordering: AFTER tenant_rl_routes (so per-tenant caps
+    // apply first when the operator has configured both) and BEFORE
+    // per-app routes (so the cross-replica cap applies before any
+    // per-app cap chain inside the handle). Resulting route order:
+    //   [per_ip, global_replica, quota_402,
+    //    tenant_concurrent, tenant_bandwidth, tenant_rl,
+    //    global_route, per_app, fqdn]
+    //
+    // Rust 2021 (the crate's edition) doesn't support `if let` chains
+    // in `&&` arms, so the cap lookup is nested inside an explicit
+    // `if let Some(rps) = ...` rather than glued onto the `&&` above.
+    if cfg.ingress_rate_limit_aggregation && cfg.global_rate_limit_rps > 0 {
+        let rps = global_rps_cache.current_local_cap(2 * cfg.global_rps_tick_interval);
+        if let Some(rps) = rps {
+            // PR D splice offset: count quota_402 + tenant_concurrent
+            // + tenant_bandwidth + tenant_rl routes before the
+            // per-app tail. All three counts were captured before the
+            // `extend` above moved the corresponding vectors into
+            // `routes`.
+            let per_app_start = quota_402_route_count
+                + tenant_concurrent_route_count
+                + tenant_bandwidth_route_count
+                + tenant_rl_route_count;
+            let per_app = routes.split_off(per_app_start);
+            routes.push(json!({
+                "@id": "global-rate-limit-cross-replica",
+                "match": [{}],
+                "handle": [{
+                    "handler": "rate_limit",
+                    "key": "global-platform-cross-replica",
+                    "rates": { "rps": rps, "burst": rps },
+                }],
+                "terminal": false,
+            }));
+            routes.extend(per_app);
+        }
     }
 
     // Build a (tenant, app) → rate limit lookup for FQDN routes.
@@ -1222,6 +1363,9 @@ mod tests {
             l4_max_conns_per_app: 1000,
             l4_max_conns_per_ip: 100,
             l4_port_cooldown_secs: 60,
+            ingress_rate_limit_aggregation: false,
+            global_rps_uds_path: std::path::PathBuf::from("/var/run/edge-ingress/global-rps.sock"),
+            global_rps_tick_interval: std::time::Duration::from_secs(1),
         }
     }
 
@@ -1237,6 +1381,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(servers.contains_key(SERVER_NAME_HTTPS));
@@ -1264,6 +1409,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         // Caddy 2.11 removed the `app.http.automatic_https` field.
         // The wildcard cert in `tls.certificates.load_files` takes
@@ -1296,6 +1442,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
 
         let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
@@ -1329,6 +1476,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
 
         let load_files = &cfg_json["apps"]["tls"]["certificates"]["load_files"];
@@ -1355,6 +1503,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         assert_eq!(
             cfg_json["admin"]["listen"], "0.0.0.0:2019",
@@ -1380,6 +1529,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1431,6 +1581,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1474,6 +1625,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1500,6 +1652,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let servers = cfg_json["apps"]["http"]["servers"].as_object().unwrap();
         assert!(!servers.contains_key(SERVER_NAME_HTTP));
@@ -1524,6 +1677,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1568,6 +1722,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let upstreams = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"][0]
             ["handle"][0]["routes"][0]["handle"][0]["upstreams"];
@@ -1604,6 +1759,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1646,6 +1802,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1697,6 +1854,7 @@ mod tests {
             &test_rate_limit_cache(),
             &q_cache,
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1768,6 +1926,7 @@ mod tests {
             &rl_cache,
             &q_cache,
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         assert!(
             cfg_json["apps"]["tls"].get("automation").is_none(),
@@ -1790,6 +1949,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         assert_eq!(
             cfg_json["apps"]["tls"]["automation"]["on_demand"]["ask"],
@@ -1817,6 +1977,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1854,6 +2015,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1885,6 +2047,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1926,6 +2089,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -1938,6 +2102,302 @@ mod tests {
             "first route must not be rate_limit when per_ip_rps=0"
         );
         assert_eq!(routes.len(), 1, "only the app route should exist");
+    }
+
+    // ── Issue #665 PR D (cross-replica global RPS) ────────────────
+
+    /// Cross-replica global RPS route is emitted when the cache has
+    /// a fresh `Some(rps)` and the aggregation feature is on. Pins
+    /// the verification-target wire shape: rps + burst both = the
+    /// sidecar's `local_cap`, key=`global-platform-cross-replica`,
+    /// `@id` distinguishes it from the per-replica placeholder.
+    #[test]
+    fn global_rps_route_emitted_when_cache_has_cap() {
+        let mut cfg = test_cfg();
+        cfg.ingress_rate_limit_aggregation = true;
+        cfg.global_rate_limit_rps = 10_000;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut cache = GlobalRpsCache::default();
+        cache.update(crate::global_rps::GlobalRpsEntry {
+            local_cap: Some(7_500),
+            configured: 10_000,
+            platform_total: 30_000,
+            replicas_seen: 3,
+            received_at: std::time::Instant::now(),
+        });
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let global = routes
+            .iter()
+            .find(|r| r["@id"] == "global-rate-limit-cross-replica")
+            .expect("cross-replica global route must exist when cache has fresh cap");
+        assert_eq!(global["handle"][0]["handler"], "rate_limit");
+        assert_eq!(global["handle"][0]["rates"]["rps"], 7_500);
+        assert_eq!(global["handle"][0]["rates"]["burst"], 7_500);
+        assert_eq!(global["handle"][0]["key"], "global-platform-cross-replica");
+        // `match: [{}]` is the empty catch-all — Caddy treats it as
+        // "match every request." The single empty object inside the
+        // matcher list is what makes it a catch-all (vs e.g. an
+        // explicit host_regexp); pin both the list and the empty
+        // object so a future refactor that adds an explicit matcher
+        // (and accidentally narrows the route) is caught.
+        assert_eq!(global["match"].as_array().unwrap().len(), 1);
+        assert_eq!(global["match"][0], serde_json::json!({}));
+        assert_eq!(global["terminal"], false);
+    }
+
+    /// No cross-replica route when the cache is cold (no entry yet).
+    /// Pins the fail-closed cold-start semantic.
+    #[test]
+    fn global_rps_route_omitted_when_cache_empty() {
+        let mut cfg = test_cfg();
+        cfg.ingress_rate_limit_aggregation = true;
+        cfg.global_rate_limit_rps = 10_000;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let cache = GlobalRpsCache::default();
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r["@id"] == "global-rate-limit-cross-replica"),
+            "cross-replica route must NOT be emitted when cache is cold"
+        );
+    }
+
+    /// No cross-replica route when `local_cap == None` on the wire
+    /// (operator disabled or no traffic seen). The renderer's hot
+    /// path is `current_local_cap(...)` returning `None`, which
+    /// gates the splice.
+    #[test]
+    fn global_rps_route_omitted_when_cap_is_none() {
+        let mut cfg = test_cfg();
+        cfg.ingress_rate_limit_aggregation = true;
+        cfg.global_rate_limit_rps = 10_000;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut cache = GlobalRpsCache::default();
+        cache.update(crate::global_rps::GlobalRpsEntry {
+            local_cap: None, // operator disabled or no traffic seen
+            configured: 10_000,
+            platform_total: 0,
+            replicas_seen: 0,
+            received_at: std::time::Instant::now(),
+        });
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r["@id"] == "global-rate-limit-cross-replica"),
+            "cross-replica route must NOT be emitted when local_cap is None"
+        );
+    }
+
+    /// No cross-replica route when the cached entry is older than
+    /// `2 × tick_interval` (sidecar stale). Mirrors the cache's
+    /// staleness contract.
+    #[test]
+    fn global_rps_route_omitted_when_stale() {
+        let mut cfg = test_cfg();
+        cfg.ingress_rate_limit_aggregation = true;
+        cfg.global_rate_limit_rps = 10_000;
+        cfg.global_rps_tick_interval = Duration::from_secs(1);
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut cache = GlobalRpsCache::default();
+        // 10s old — well past 2 × 1s = 2s staleness threshold.
+        cache.update(crate::global_rps::GlobalRpsEntry {
+            local_cap: Some(7_500),
+            configured: 10_000,
+            platform_total: 30_000,
+            replicas_seen: 3,
+            received_at: std::time::Instant::now() - Duration::from_secs(10),
+        });
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r["@id"] == "global-rate-limit-cross-replica"),
+            "cross-replica route must NOT be emitted when cache entry is stale"
+        );
+    }
+
+    /// No cross-replica route when `INGRESS_RATE_LIMIT_AGGREGATION=false`
+    /// (the default). Even with a fresh, populated cache, the splice
+    /// is gated by the feature flag — operators who haven't opted
+    /// in see no behavior change.
+    #[test]
+    fn global_rps_route_omitted_when_aggregation_disabled() {
+        let mut cfg = test_cfg();
+        // ingress_rate_limit_aggregation left at default (false)
+        cfg.global_rate_limit_rps = 10_000;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut cache = GlobalRpsCache::default();
+        cache.update(crate::global_rps::GlobalRpsEntry {
+            local_cap: Some(7_500),
+            configured: 10_000,
+            platform_total: 30_000,
+            replicas_seen: 3,
+            received_at: std::time::Instant::now(),
+        });
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &test_tenant_rate_limit_cache(),
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r["@id"] == "global-rate-limit-cross-replica"),
+            "cross-replica route must NOT be emitted when INGRESS_RATE_LIMIT_AGGREGATION=false"
+        );
+    }
+
+    /// Splice ordering invariant. The route order must be exactly:
+    ///   [per_ip, global_replica, quota_402, tenant_rl, global_route,
+    ///    per_app, fqdn]
+    /// Pin the `@id` of each route at its expected position so a
+    /// future refactor that miscounts `quota_402_route_count +
+    /// tenant_rl_route_count` is caught before reaching production.
+    #[test]
+    fn global_rps_route_splice_order() {
+        let mut cfg = test_cfg();
+        cfg.ingress_rate_limit_aggregation = true;
+        cfg.global_rate_limit_rps = 10_000;
+        // Force a quota-402 entry to exercise the quota_402 splice.
+        let mut q_cache = crate::quota::QuotaCache::default();
+        q_cache.update(
+            "t_acme".into(),
+            crate::quota::QuotaState {
+                over_cap: true,
+                ..Default::default()
+            },
+        );
+        // Force a tenant-concurrent + tenant-bandwidth + tenant-rl
+        // entry to exercise the three splices main added between
+        // quota_402 and the PR D global_route (PR #663 + PR #705).
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                rps: 50,
+                burst: 100,
+                concurrent_limit: 100,
+                bandwidth_bps: 1_000_000_000,
+                ..Default::default()
+            },
+        );
+        // (same cache object covers concurrent_caps() + the rps field)
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut cache = GlobalRpsCache::default();
+        cache.update(crate::global_rps::GlobalRpsEntry {
+            local_cap: Some(7_500),
+            configured: 10_000,
+            platform_total: 30_000,
+            replicas_seen: 3,
+            received_at: std::time::Instant::now(),
+        });
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &q_cache,
+            &tenant_rl_cache,
+            &cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        // Find each @id's position and assert the relative order.
+        let position = |id: &str| -> usize {
+            routes
+                .iter()
+                .position(|r| r["@id"] == id)
+                .unwrap_or_else(|| panic!("route with @id={id} not found"))
+        };
+        let p_quota_402 = position("t_acme:quota-402-synthetic");
+        let p_tenant_concurrent = position("tenant-concurrent:t_acme");
+        let p_tenant_bandwidth = position("tenant-bandwidth:t_acme");
+        let p_tenant_rl = position("tenant-rl:t_acme");
+        let p_global = position("global-rate-limit-cross-replica");
+        let p_app = position("t_acme-api.edgecloud.dev");
+        assert!(
+            p_quota_402 < p_tenant_concurrent,
+            "quota_402 ({p_quota_402}) must come before \
+             tenant_concurrent ({p_tenant_concurrent})"
+        );
+        assert!(
+            p_tenant_concurrent < p_tenant_bandwidth,
+            "tenant_concurrent ({p_tenant_concurrent}) must come before \
+             tenant_bandwidth ({p_tenant_bandwidth})"
+        );
+        assert!(
+            p_tenant_bandwidth < p_tenant_rl,
+            "tenant_bandwidth ({p_tenant_bandwidth}) must come before \
+             tenant_rl ({p_tenant_rl})"
+        );
+        assert!(
+            p_tenant_rl < p_global,
+            "tenant_rl ({p_tenant_rl}) must come before global_route ({p_global})"
+        );
+        assert!(
+            p_global < p_app,
+            "global_route ({p_global}) must come before per_app ({p_app})"
+        );
     }
 
     // ── Issue #305 sub-feature #1 (per-tenant RL) + #4 (global RL) ──
@@ -1966,6 +2426,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2004,6 +2465,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2039,6 +2501,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2072,6 +2535,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2117,6 +2581,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2164,6 +2629,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2206,6 +2672,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2226,6 +2693,152 @@ mod tests {
         );
     }
 
+    /// Issue #305 sub-feature #3 — the renderer emits a
+    /// `tenant_bandwidth` HTTP handler invocation per bandwidth-cap
+    /// tenant when the cache has `bandwidth_bps > 0`. The
+    /// `handle[0]` is a `tenant_bandwidth` invocation that the
+    /// custom Caddy image (`edgecloud/caddy-concurrent:latest`, see
+    /// `edge-ingress/Dockerfile.caddy-concurrent`) enforces via the
+    /// first-party module at `caddy-modules/tenant_bandwidth/`.
+    /// Pin the JSON shape so a renderer change can't silently
+    /// misconfigure the handler (e.g. emit `bytes_per_sec` as a
+    /// string or drop `terminal: false`).
+    #[test]
+    fn tenant_bandwidth_cache_injects_handler_invocation() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                bandwidth_bps: 1_000_000,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+            &Default::default(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let bandwidth = routes
+            .iter()
+            .find(|r| r["@id"] == "tenant-bandwidth:t_acme")
+            .expect("bandwidth-cap handler route must exist");
+        assert_eq!(
+            bandwidth["handle"][0]["handler"], "tenant_bandwidth",
+            "handler module id must match the Go module's CaddyModule ID"
+        );
+        assert_eq!(
+            bandwidth["handle"][0]["key"], "tenant-t_acme",
+            "key must be tenant-<tenant_id> so the Go module scopes the bucket per tenant"
+        );
+        assert_eq!(
+            bandwidth["handle"][0]["bytes_per_sec"], 1_000_000i64,
+            "bytes_per_sec must mirror state.bandwidth_bps (cast to i64 for JSON)"
+        );
+        let re = bandwidth["match"][0]["host_regexp"].as_str().unwrap();
+        assert_eq!(re, "^t_acme-[^.]+\\.edgecloud.dev$");
+        assert_eq!(
+            bandwidth["terminal"], false,
+            "bandwidth-cap route must NOT be terminal — Caddy must fall through to per-app routes"
+        );
+    }
+
+    /// Bandwidth-cap route is omitted when the cache has
+    /// `bandwidth_bps == 0` (fail-open: no cap → no route).
+    /// Mirrors `tenant_concurrent_zero_no_route_emitted`.
+    #[test]
+    fn tenant_bandwidth_zero_no_route_emitted() {
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState::default(),
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &test_cfg(),
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+            &Default::default(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            routes
+                .iter()
+                .all(|r| r["@id"].as_str().unwrap_or("") != "tenant-bandwidth:t_acme"),
+            "bandwidth_bps=0 must NOT emit a bandwidth-cap route"
+        );
+    }
+
+    /// When a tenant has both `bandwidth_bps > 0` AND `rps > 0`, the
+    /// bandwidth-cap route must appear BEFORE the tenant-rl
+    /// rate_limit route in the rendered routes list. Bandwidth is
+    /// response-side — it wraps the downstream `http.ResponseWriter`
+    /// in a pacing writer — so the wrapper must install BEFORE the
+    /// RPS handler chain runs. Otherwise RPS rejection (429)
+    /// short-circuits before the bandwidth wrapper is installed,
+    /// and pacing never applies. Mirrors
+    /// `tenant_concurrent_route_precedes_tenant_rl_route`'s
+    /// ordering-assert pattern.
+    #[test]
+    fn tenant_bandwidth_route_precedes_tenant_rl_route() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                rps: 50,
+                burst: 100,
+                bandwidth_bps: 100_000,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+            &Default::default(),
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let bandwidth_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-bandwidth:t_acme")
+            .expect("bandwidth route must exist");
+        let rl_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-rl:t_acme")
+            .expect("tenant-rl route must exist");
+        assert!(
+            bandwidth_idx < rl_idx,
+            "bandwidth-cap route (idx {}) must precede tenant-rl route (idx {})",
+            bandwidth_idx,
+            rl_idx,
+        );
+    }
+
     /// Issue #305 sub-feature #4 — global platform-wide RPS cap is
     /// prepended when configured. Per-replica semantics.
     #[test]
@@ -2242,6 +2855,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2288,6 +2902,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2320,6 +2935,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2347,6 +2963,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2384,6 +3001,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &tenant_rl_cache,
+            &Default::default(),
         );
         let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
             .as_array()
@@ -2409,6 +3027,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert_eq!(server["max_conns"], 1000);
@@ -2430,6 +3049,7 @@ mod tests {
             &test_rate_limit_cache(),
             &test_quota_cache(),
             &test_tenant_rate_limit_cache(),
+            &Default::default(),
         );
         let server = &cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS];
         assert!(
@@ -2723,6 +3343,9 @@ mod tests {
             l4_max_conns_per_app: 1000,
             l4_max_conns_per_ip: 100,
             l4_port_cooldown_secs: 60,
+            ingress_rate_limit_aggregation: false,
+            global_rps_uds_path: std::path::PathBuf::from("/var/run/edge-ingress/global-rps.sock"),
+            global_rps_tick_interval: std::time::Duration::from_secs(1),
         }
     }
 

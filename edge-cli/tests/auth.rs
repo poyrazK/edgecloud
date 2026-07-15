@@ -858,6 +858,55 @@ async fn keys_revoke_without_yes_in_non_tty_refuses_with_clear_error() {
         .stderr(predicate::str::contains("pass --yes"));
 }
 
+/// Pre-flight path-component validation: malformed `key_id` values
+/// must bail with an actionable error before any DELETE round-trip
+/// lands. Three sub-cases mirror the `app_name` validator: literal
+/// `..`, `%` (URL-reserved char), and empty string. The validator
+/// uses the same `validate_path_component` helper as the rest of the
+/// CLI and must surface the offending character. Issue #671.
+#[tokio::test]
+async fn keys_revoke_rejects_invalid_key_id() {
+    for (bad_id, expected_substr) in [
+        ("k_..bad", "'..'"),
+        ("k_%2Fbad", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let keys = serde_json::json!([
+            {
+                "id": "k_other",
+                "name": "ci-deploy",
+                "role": "viewer",
+                "created_at": "2026-06-22T00:00:00Z",
+            },
+        ]);
+        let server = setup_revoke_mocks(&home, "k_existing", keys).await;
+
+        // Fence: NO DELETE may ever land. The validator must fire
+        // before any round-trip.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("auth")
+            .arg("keys")
+            .arg("revoke")
+            .arg("--id")
+            .arg(bad_id)
+            .arg("--yes")
+            .arg("--force");
+
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_substr));
+    }
+}
+
 #[tokio::test]
 async fn keys_revoke_warning_omitted_when_env_key_unaffected() {
     // PR #163 review finding F1: when EDGE_API_KEY env var differs

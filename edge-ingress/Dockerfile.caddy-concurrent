@@ -1,23 +1,33 @@
 # Dockerfile.caddy-concurrent — xcaddy-built Caddy with the
-# edgecloud/tenant_concurrent HTTP middleware (issue #663) layered
-# on top of stock `caddy:2` + mholt/caddy-l4 (issue #548).
+# edgeCloud first-party HTTP middlewares layered on top of stock
+# `caddy:2` + mholt/caddy-l4 (issue #548). Three first-party
+# plugins currently side-loaded:
 #
-# Stock `caddy:2` does not ship a concurrency limiter primitive for
-# HTTP routes; we add the first-party module at
-# ./caddy-modules/tenant_concurrent via xcaddy's local-path form.
-# Once the repo publishes tagged releases, switch the `--with`
-# argument to the GitHub ref (issue #663 follow-up).
+#   - tenant_concurrent (issue #663) — per-key in-flight HTTP
+#     concurrency cap (buffered-channel semaphore).
+#   - tenant_bandwidth (issue #664) — per-key response-payload
+#     byte-rate cap (token-bucket pacing writer). Companion data
+#     path (schema, repo, handler, admin endpoint, ingress cache)
+#     shipped in PR #661; this module is the enforcement half.
+#   - (L4 plugin layered in alongside, same Caddy process serves
+#     L4 (issue #548) and HTTP — the upstream image is a strict
+#     superset of `edgecloud/caddy-l4:latest`.)
 #
-# The L4 plugin is layered in alongside tenant_concurrent so the
-# same Caddy process can serve both L4 (issue #548) and HTTP — the
-# upstream image is a strict superset of `edgecloud/caddy-l4:latest`.
+# Stock `caddy:2` does not ship either primitive. Stock
+# `rate_limit` is RPS-only (no response-payload byte-rate throttle
+# — caddyserver/caddy#4476 closed as not-planned), and there is no
+# in-flight concurrency limiter at all. Both are vendored as
+# first-party Go modules under ./caddy-modules/ and added via
+# xcaddy's local-path form. Once the repo publishes tagged
+# releases, switch the `--with` arguments to the GitHub ref
+# (issue #663 follow-up).
 #
 # Build:
 #   docker build -t edgecloud/caddy-concurrent:latest \
 #     -f edge-ingress/Dockerfile.caddy-concurrent .
 #
 # Note: the build context is the repo root (`.`), not `edge-ingress/`,
-# because the local-path form `--with ...=./caddy-modules/tenant_concurrent`
+# because the local-path form `--with ...=./caddy-modules/<name>`
 # resolves relative to the build context.
 #
 # Operator note: when bumping Caddy upstream (caddy:2 / caddy:2-builder
@@ -31,16 +41,17 @@ FROM caddy:2-builder AS builder
 # `--with <module>=<local-path>` form expects the source at the
 # path resolved against xcaddy's CWD (which is `/usr/bin/` inside
 # this image); without this COPY the local-path form resolves to
-# `/usr/bin/caddy-modules/tenant_concurrent` and the build fails
-# with `replacement directory does not exist`. The published
-# GitHub ref form (`--with <module>@<version>`) would not need
-# this COPY; we keep the local-path form during the bootstrap
-# period until the repo publishes tagged releases of
-# edgecloud-caddy-modules/tenant_concurrent.
+# `/usr/bin/caddy-modules/<name>` and the build fails with
+# `replacement directory does not exist`. The published GitHub
+# ref form (`--with <module>@<version>`) would not need this
+# COPY; we keep the local-path form during the bootstrap period
+# until the repo publishes tagged releases of
+# edgecloud-caddy-modules/tenant_concurrent and tenant_bandwidth.
 COPY caddy-modules/ /usr/bin/caddy-modules/
 RUN xcaddy build \
         --with github.com/mholt/caddy-l4 \
-        --with github.com/poyrazK/edgecloud-caddy-modules/tenant_concurrent=./caddy-modules/tenant_concurrent
+        --with github.com/poyrazK/edgecloud-caddy-modules/tenant_concurrent=./caddy-modules/tenant_concurrent \
+        --with github.com/poyrazK/edgecloud-caddy-modules/tenant_bandwidth=./caddy-modules/tenant_bandwidth
 
 FROM caddy:2
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
