@@ -139,6 +139,24 @@ impl Config {
                  operator's configured platform cap."
             );
         }
+        // Issue #665 PR C: surface the operator foot-gun where the
+        // sidecar's nats_replicas (default 1) disagrees with the CP's
+        // cfg.NATS.Replicas (default 3). On multi-replica NATS
+        // clusters the sidecar's `ensure_stream` will fail with
+        // "insufficient resources" and the sidecar retries on every
+        // tick — the WARN fires once at boot so the operator learns
+        // the knob exists. Single-replica NATS (default for
+        // testcontainers + local dev) keeps nats_replicas=1 as a
+        // valid config; the WARN is informational only.
+        if self.nats_replicas == 1 {
+            warn!(
+                "SIDECAR_NATS_REPLICAS=1 — the rate-limit stream is declared with \
+                 cfg.NATS.Replicas by the control plane (default 3). On multi-replica \
+                 NATS clusters the sidecar's ensure_stream will fail with 'insufficient \
+                 resources'. Set SIDECAR_NATS_REPLICAS to match TASK_STREAM_REPLICAS \
+                 in your deployment."
+            );
+        }
     }
 }
 
@@ -327,6 +345,41 @@ mod tests {
             metrics_listen: "0.0.0.0:9091".into(),
             global_rate_limit_rps: 10_000,
             nats_replicas: 1,
+            uds_path: "/tmp/s.sock".into(),
+        };
+        cfg.validate();
+    }
+
+    #[test]
+    fn validate_replicas_one_does_not_panic() {
+        // Issue #665 PR C. Pin absence-of-side-effect (the WARN text
+        // is logged via tracing; we don't capture subscriber here —
+        // CI just needs to confirm validate() doesn't blow up on the
+        // default nats_replicas=1 path). Production boot sees the
+        // WARN emitted at info level.
+        let cfg = Config {
+            nats_url: "nats://localhost".into(),
+            replica_id: "pod".into(),
+            caddy_admin_url: "http://localhost:2019".into(),
+            metrics_listen: "0.0.0.0:9091".into(),
+            global_rate_limit_rps: 10_000,
+            nats_replicas: 1,
+            uds_path: "/tmp/s.sock".into(),
+        };
+        cfg.validate();
+    }
+
+    #[test]
+    fn validate_replicas_three_does_not_panic() {
+        // Mirror of the above for the non-default path: a multi-replica
+        // NATS deployment should NOT emit the replica=1 WARN.
+        let cfg = Config {
+            nats_url: "nats://localhost".into(),
+            replica_id: "pod".into(),
+            caddy_admin_url: "http://localhost:2019".into(),
+            metrics_listen: "0.0.0.0:9091".into(),
+            global_rate_limit_rps: 10_000,
+            nats_replicas: 3,
             uds_path: "/tmp/s.sock".into(),
         };
         cfg.validate();

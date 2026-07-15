@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,6 +60,38 @@ func main() {
 		Replicas:  cfg.NATS.Replicas,
 	}); err != nil {
 		log.Fatalf("Failed to ensure NATS stream: %v", err)
+	}
+
+	// Issue #665 PR C. Declare the rate-limit stream so the sidecar's
+	// ensure_stream is a no-op when it connects. Idempotent w.r.t. the
+	// sidecar's own declaration (delete+recreate when shape diverges).
+	// Wire shape MUST match edge-ingress-sidecar/src/nats_pub.rs:
+	// RATE_LIMIT_STREAM / RATE_LIMIT_SUBJECT_WILDCARD / build_stream_config.
+	// Replicas default to cfg.NATS.Replicas (3); the sidecar defaults to 1
+	// (SIDECAR_NATS_REPLICAS). Operators running multi-replica NATS must
+	// set both env vars to the same value or the sidecar's ensure_stream
+	// fails with "insufficient resources" — the WARN below surfaces that
+	// failure mode in CP pod logs. Tracked for runtime validation.
+	if err := publisher.EnsureStream(nats.StreamConfig{
+		Name:      nats.RateLimitStreamName,
+		Subjects:  []string{nats.RateLimitSubjectWildcard},
+		Retention: natsio.InterestPolicy,
+		MaxAge:    60 * time.Second,
+		Replicas:  cfg.NATS.Replicas,
+	}); err != nil {
+		// Boot-time WARN per PR C plan: when JetStream reports the
+		// operator-visible "insufficient resources" failure on a
+		// single-node NATS, log a structured WARN that points at the
+		// runbook before the Fatalf fires so the operator sees both
+		// signals in the pod log. Do not block — the sidecar's job is
+		// to keep working even when the CP is misconfigured.
+		if cfg.NATS.Replicas > 1 && strings.Contains(err.Error(), "insufficient") {
+			log.Printf("WARN: rate-limit stream needs %d replicas but NATS cluster is smaller; "+
+				"sidecar pods with SIDECAR_NATS_REPLICAS=1 (default) will fail ensure_stream. "+
+				"Set SIDECAR_NATS_REPLICAS=%d to match TASK_STREAM_REPLICAS (issue #665 PR C).",
+				cfg.NATS.Replicas, cfg.NATS.Replicas)
+		}
+		log.Fatalf("Failed to ensure rate-limit stream: %v", err)
 	}
 
 	artifactStore, err := storage.New(context.Background(), cfg.Storage)
