@@ -126,12 +126,18 @@ WORKDIR /workspace
 # cargo's manifest walk reads every path-dep target, including
 # dev-only ones, so we COPY their sources too.
 COPY Cargo.toml ./
-COPY edge-runtime/         edge-runtime/
-COPY edge-config/          edge-config/
-COPY edge-spool/           edge-spool/
-COPY edge-worker/          edge-worker/
-COPY edge-ingress/         edge-ingress/
-COPY edge-test-helpers/    edge-test-helpers/
+COPY edge-runtime/                          edge-runtime/
+COPY edge-runtime/bin/wasm2cwasm/           edge-runtime/bin/wasm2cwasm/
+COPY edge-config/                           edge-config/
+COPY edge-spool/                            edge-spool/
+COPY edge-worker/                           edge-worker/
+COPY edge-ingress/                          edge-ingress/
+COPY edge-ingress-sidecar/                  edge-ingress-sidecar/
+COPY edge-cli/                              edge-cli/
+COPY edge-migrate/                          edge-migrate/
+COPY edge-js-runtime/                       edge-js-runtime/
+COPY edge-js-runtime-long/                  edge-js-runtime-long/
+COPY edge-test-helpers/                     edge-test-helpers/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
