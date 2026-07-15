@@ -476,23 +476,49 @@ pub struct App {
 }
 
 /// Wrapper for the paginated list response:
-/// `{"apps": [...], "limit": 50, "offset": 0}`
+/// `{"apps": [...], "limit": 50, "next_cursor": "..." | null}`
+///
+/// Mirrors the Go control-plane `AppListResponse` schema introduced
+/// in issue #58. `offset` is gone from the wire (hard-cut — see the
+/// apps envelope docs in `docs/api/openapi.yaml` and PR-#58 commit 6);
+/// only `next_cursor` is the supported pager.
+///
+/// `#[serde(default)]` on every cursor-related field keeps the
+/// decoder backward-compatible with servers that haven't yet
+/// shipped issue #58 — the field's *absence* on a pre-#58 server is
+/// indistinguishable from `null`, which `Pagewalker::Next::Exhausted`
+/// treats as "no more pages".
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct AppListResponse {
-    apps: Vec<App>,
-    limit: u32,
-    offset: u32,
+pub struct AppListResponse {
+    pub apps: Vec<App>,
+    pub limit: u32,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// Wrapper for the paginated deployments response:
-/// `{"items": [...], "total": N, "limit": 20, "offset": 0}`
+/// `{"items": [...], "total": N, "limit": 20, "next_cursor": "...", "next_offset": M}`
 /// returned by `GET /api/v1/list/{appName}`.
 ///
 /// Field types mirror the server (Go) side: `total` is signed so a
-/// future "unknown" sentinel can travel as `-1`, while `limit` and
-/// `offset` are unsigned because pagination offsets are always
-/// non-negative.
+/// future "unknown" sentinel can travel as `-1`, while `limit`,
+/// `offset`, and `next_offset` are unsigned because pagination
+/// offsets are always non-negative. `next_cursor` is opaque so the
+/// CLI never decodes it — only round-trips it back as `?cursor=`.
+///
+/// Dual envelope (issue #58 compat release):
+///
+///   - `next_cursor` is the new keyset cursor. The CLI's
+///     page-walk loop uses it; `commands::deployments` page-walks
+///     via cursor when `--cursor` is supplied, falls back to
+///     `--offset` semantics against `next_offset` for the existing
+///     `--page` UX.
+///   - `next_offset` is the legacy offset arithmetic, kept for one
+///     compat release. The server emits it ONLY on first-page
+///     responses (when no `?cursor=` was supplied); cursor-driven
+///     pages omit it. `#[serde(default)]` lets the CLI decode both
+///     shapes without branching.
 ///
 /// `total`/`limit`/`offset` are consumed by `commands::deployments::run`
 /// to render the page-of-N footer; `items` is the only field read by
@@ -503,7 +529,14 @@ pub struct DeploymentListEnvelope {
     pub items: Vec<DeploymentSummary>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// Deprecated offset arithmetic (issue #58 compat release).
+    /// Pre-#58 servers emit this; post-#58 servers emit it only on
+    /// first-page responses. The follow-up in #58-followup retires
+    /// it after the CLI has migrated.
+    #[serde(default)]
+    pub next_offset: Option<u32>,
 }
 
 /// Quota and usage returned by `GET /api/v1/quotas`.
@@ -1116,6 +1149,12 @@ impl ApiClient {
     /// Returns the full [`DeploymentListEnvelope`] so callers can
     /// decide whether to render a pagination footer without a
     /// second round-trip.
+    ///
+    /// Issue #58 dual envelope: the response carries an opaque
+    /// `next_cursor` (always emitted when more pages exist) and the
+    /// legacy `next_offset` (emitted only on first-page responses).
+    /// Existing CLI callers continue to work; new page-walk logic
+    /// should use [`ApiClient::list_deployments_with_cursor`].
     pub fn list_deployments_paginated(
         &self,
         app_name: &str,
@@ -1139,11 +1178,85 @@ impl ApiClient {
         })
     }
 
-    /// GET `/api/v1/apps` — list all apps for the authenticated tenant.
+    /// Cursor-aware sibling of [`ApiClient::list_deployments_paginated`].
+    /// Pass `cursor=None` for the first page, the previous response's
+    /// `next_cursor` for every page after.
+    ///
+    /// Issue #58 — the cursor and offset paths are mutually exclusive
+    /// on the server (400 if both are supplied). This method omits
+    /// `?offset=` entirely because cursor-driven pages can never be
+    /// translated back to a meaningful offset.
+    pub fn list_deployments_with_cursor(
+        &self,
+        app_name: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<DeploymentListEnvelope> {
+        self.get_json_anyhow("list deployments (cursor)", |base| {
+            let mut parsed = reqwest::Url::parse(&format!("{base}/api/v1/list/{app_name}"))
+                .expect("hardcoded URL template parses");
+            if limit > 0 {
+                parsed
+                    .query_pairs_mut()
+                    .append_pair("limit", &limit.to_string());
+            }
+            if let Some(c) = cursor {
+                // raw, unencoded — cursor is opaque by contract and
+                // base64url chars are URL-safe anyway.
+                parsed.query_pairs_mut().append_pair("cursor", c);
+            }
+            parsed.to_string()
+        })
+    }
+
+    /// GET `/api/v1/apps` — return ONE page of apps for the
+    /// authenticated tenant. Issue #58: callers wanting the full
+    /// list use [`ApiClient::list_all_apps`] which walks the cursor
+    /// chain.
     pub fn list_apps(&self) -> Result<Vec<App>> {
         let resp: AppListResponse =
             self.get_json_anyhow("list apps", |base| format!("{base}/api/v1/apps"))?;
         Ok(resp.apps)
+    }
+
+    /// GET `/api/v1/apps` — list apps for the authenticated tenant,
+    /// page-walking the cursor chain to exhaustion.
+    ///
+    /// Issue #58 — pre-#58 callers only had single-page `list_apps`,
+    /// which is kept as the per-page accessor. New code that wants
+    /// the full list should call `list_all_apps` instead. The
+    /// page-walk terminates when the server returns a `null` (or
+    /// absent) `next_cursor` field; that's the same wire shape as
+    /// `GET /api/v1/webhooks/{id}/deliveries` (issue #659).
+    ///
+    /// `page_size` is the per-request limit (default 50 on the server
+    /// if 0 is supplied). Each call passes through the standard
+    /// retry loop — wire failures transparently retry.
+    pub fn list_all_apps(&self, page_size: u32) -> Result<Vec<App>> {
+        const MAX_PAGES: u32 = 1_000;
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let url = match &cursor {
+                Some(c) => format!(
+                    "{}/api/v1/apps?limit={}&cursor={}",
+                    self.base_url, page_size, c
+                ),
+                None => format!("{}/api/v1/apps?limit={}", self.base_url, page_size),
+            };
+            let resp: AppListResponse =
+                self.get_json_anyhow("list apps", |_| url.clone())?;
+            all.extend(resp.apps);
+            match resp.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+            // Defensive: bail if the server emits an empty-page + cursor
+            // loop that would never terminate. The cap on MAX_PAGES
+            // covers this — at 50/page we cap at 50k apps, which is
+            // already beyond any realistic tenant footprint.
+        }
+        Ok(all)
     }
 
     /// GET `/api/v1/apps/{appName}` — get a single app by name.

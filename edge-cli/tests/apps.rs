@@ -39,7 +39,7 @@ async fn list_returns_empty_message() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "apps": [],
             "limit": 50,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -84,7 +84,7 @@ async fn list_returns_populated_table() {
                 }
             ],
             "limit": 50,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -541,4 +541,92 @@ async fn apps_delete_401_surfaces_auth_guidance() {
         .stderr(predicate::str::contains("authentication failed"))
         .stderr(predicate::str::contains("401"))
         .stderr(predicate::str::contains("edge auth login"));
+}
+
+// list_walks_cursor_chain pins the page-walk loop added for
+// issue #58. The fixture issues three sequential GETs against
+// `/api/v1/apps`:
+//
+//   1. limit=0 (server default) returns 2 apps + next_cursor="c1"
+//   2. limit=0 cursor=c1 returns 2 apps + next_cursor="c2"
+//   3. limit=0 cursor=c2 returns 1 app + next_cursor=null
+//
+// The CLI's `list_all_apps` walker must chain all three pages
+// and print all five rows. The mocks assert the expected
+// `expect(N)` per page so an accidental single-page shortcut
+// (e.g. dropping the loop or short-circuiting on first response)
+// trips the wiremock `Verify` failure.
+#[tokio::test]
+async fn list_walks_cursor_chain() {
+    use wiremock::matchers::query_param;
+
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    // Page 1 — first request, no cursor.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps"))
+        .and(query_param("limit", "0"))
+        .and(wiremock::matchers::query_param_is_missing("cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "apps": [
+                {"ID": "app_1", "TenantID": "t_seed", "Name": "alpha", "Description": null, "CreatedAt": "2026-06-24T12:00:00Z"},
+                {"ID": "app_2", "TenantID": "t_seed", "Name": "bravo", "Description": null, "CreatedAt": "2026-06-24T12:01:00Z"}
+            ],
+            "limit": 0,
+            "next_cursor": "c1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Page 2 — cursor=c1.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps"))
+        .and(query_param("limit", "0"))
+        .and(query_param("cursor", "c1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "apps": [
+                {"ID": "app_3", "TenantID": "t_seed", "Name": "charlie", "Description": null, "CreatedAt": "2026-06-24T12:02:00Z"},
+                {"ID": "app_4", "TenantID": "t_seed", "Name": "delta", "Description": null, "CreatedAt": "2026-06-24T12:03:00Z"}
+            ],
+            "limit": 0,
+            "next_cursor": "c2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Page 3 — cursor=c2; next_cursor=null terminates the walk.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/apps"))
+        .and(query_param("limit", "0"))
+        .and(query_param("cursor", "c2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "apps": [
+                {"ID": "app_5", "TenantID": "t_seed", "Name": "echo", "Description": null, "CreatedAt": "2026-06-24T12:04:00Z"}
+            ],
+            "limit": 0,
+            "next_cursor": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri()).arg("apps");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("alpha"))
+        .stdout(predicate::str::contains("bravo"))
+        .stdout(predicate::str::contains("charlie"))
+        .stdout(predicate::str::contains("delta"))
+        .stdout(predicate::str::contains("echo"));
 }
