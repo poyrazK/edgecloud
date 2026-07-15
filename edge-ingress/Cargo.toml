@@ -40,3 +40,4 @@ wiremock = "0.6"
 # (the supervisor-wiring helpers target edge-worker; we don't use
 # those here). See the matching dev-dep on edge-worker.
 edge-test-helpers = { path = "../edge-test-helpers" }
+tempfile = "3"
