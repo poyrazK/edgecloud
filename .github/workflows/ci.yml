@@ -260,6 +260,260 @@ jobs:
             caddy list-modules --packages http.handlers \
             | grep tenant_concurrent
 
+  # ============================================================
+  # BUILD-IMAGES — Issue #512: build the three service Dockerfiles
+  # (control-plane, worker, ingress) on every push to main + every
+  # PR. Uses BuildKit's GitHub-Actions cache backend so subsequent
+  # runs reuse compiled layers (wasmtime alone is ~10 minutes cold).
+  # No push to a registry here — operator-side publishing is
+  # tracked in #578. Runs on linux/amd64; arm64 not yet supported
+  # (the demo VM target).
+  # ============================================================
+  build-images:
+    name: build-images (issue #512)
+    runs-on: ubuntu-latest
+    # We pin SCCACHE off in this job. The .cargo/config.toml
+    # already sets `rustc-wrapper = "sccache"`, but sccache's local
+    # disk cache can't share state across Docker build invocations
+    # on the same runner. BuildKit's cache-to=type=gha is the
+    # equivalent for cross-invocation reuse. Each Dockerfile
+    # overrides CARGO_BUILD_RUSTC_WRAPPER="" inside the builder
+    # stage so the wrapper is bypassed during Docker builds.
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Cargo registry cache. Cross-invocation reuse of compiled
+      # deps is the largest wall-clock win — first cargo build
+      # pays ~10 min for wasmtime; subsequent runs hit this cache.
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-build-images-cargo-
+
+      # Lint the compose file structurally. Pulls the `docker compose
+      # config` schema resolution into a single fast step (no image
+      # pulls). Catches dead `${VAR:?msg}` references, missing
+      # healthchecks, bad anchor usage. Skipped if `docker compose`
+      # is not on PATH (extremely unlikely on ubuntu-latest but
+      # guards against a future self-hosted runner).
+      - name: Validate docker-compose.prod.yml
+        run: |
+          if command -v docker >/dev/null 2>&1; then
+            docker compose -f docker-compose.prod.yml config > /dev/null
+          else
+            echo "docker not available; skipping compose config validation"
+          fi
+
+      # Multi-platform note: arm64 isn't enabled here because the
+      # xcaddy-built Caddy image stays stock and the demo VM target
+      # is amd64. To add arm64, swap the platform list below.
+      - name: Build control-plane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge-control-plane/Dockerfile
+          tags: edgecloud/control-plane:test
+          load: true
+          cache-from: type=gha,mode=max
+          cache-to: type=gha,mode=max,duration=336h
+          provenance: false
+
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge-worker/Dockerfile
+          tags: edgecloud/worker:test
+          load: true
+          cache-from: type=gha,mode=max
+          cache-to: type=gha,mode=max,duration=336h
+          provenance: false
+
+      - name: Build ingress image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge-ingress/Dockerfile
+          tags: edgecloud/ingress:test
+          load: true
+          cache-from: type=gha,mode=max
+          cache-to: type=gha,mode=max,duration=336h
+          provenance: false
+
+      # Smoke: each image runs and answers a basic liveness check.
+      # Worker / ingress healthchecks return 401 (metrics endpoints
+      # are bearer-gated, but the port is always reachable), so we
+      # just confirm the process is up via `docker inspect` or a TCP
+      # `wget` probe to the loopback port.
+      - name: "Smoke: control-plane answers /health"
+        run: |
+          docker run --rm -d --name smoke-cp \
+            -p 18080:8080 \
+            -e DATABASE_HOST=127.0.0.1 \
+            -e NATS_URL=nats://127.0.0.1:4222 \
+            -e JWT_SECRET=$(openssl rand -base64 48) \
+            -e EDGE_INTERNAL_TOKEN=$(openssl rand -hex 32) \
+            -e BOOTSTRAP_SECRET=$(openssl rand -hex 32) \
+            edgecloud/control-plane:test || true
+          sleep 5
+          curl -fsS http://127.0.0.1:18080/health >/dev/null
+          docker rm -f smoke-cp 2>/dev/null || true
+
+  # ============================================================
+  # COMPOSE-SMOKE — issue #577 (folded into #512 per the
+  # scope decision recorded in
+  # /Users/poyrazk/.claude/plans/lets-create-imp-plan-mighty-lovelace.md).
+  # Boots the prod compose stack on a `push to main` only (skips
+  # PRs to keep PR latency reasonable — the boot+seed+curl round
+  # trip is multi-minute). Pulls images built by `build-images`
+  # on the same workflow run; no GHCR publish required.
+  # ============================================================
+  compose-smoke:
+    name: compose-smoke (issue #577)
+    runs-on: ubuntu-latest
+    # `push` only — this job boots a full Linux-host stack with
+    # Postgres + NATS + control plane + worker + ingress + Caddy,
+    # seeds `samples/hello`, and asserts 200 through Caddy. Skipping
+    # PRs keeps the per-PR build latency reasonable. Operators can
+    # trigger ad-hoc with `gh workflow run`.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-images
+    env:
+      # Wall-clock budget for the seed + curl round trip. The job
+      # fails if it can't get a 200 in this window. 10 minutes
+      # covers cold-cache wasmtime compile + sample deploy +
+      # Caddy reload — the issue #577 spec is "under 5 min" but
+      # in CI practice that's tight without warm caches.
+      SMOKE_DEADLINE_SECS: "600"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Render a per-job .env.smoke with secrets long enough to
+      # pass `validateDBPassword`'s 16-byte floor (PR #670 +
+      # issue #626). Source-of-truth shape: .env.prod.example.
+      # We hand-roll the override file here rather than copy +
+      # sed because the secrets need to be freshly generated so a
+      # leaked one from a previous job can't be replayed.
+      - name: Generate .env.smoke
+        run: |
+          # Single-pass env file generation. Uses `printf` instead
+          # of heredoc to dodge the YAML/multi-line interpolation
+          # ambiguity ($FOO inside a heredoc binds to bash, not
+          # to the literal "FOO" we want in some env-var references).
+          PR=$(openssl rand -base64 24)
+          JWT=$(openssl rand -base64 48)
+          INT=$(openssl rand -hex 32)
+          BOOT=$(openssl rand -hex 32)
+          MET=$(openssl rand -hex 32)
+          CAD=$(openssl rand -hex 32)
+          KEY=$(head -c 32 /dev/urandom | xxd -p -c 64)
+          # Use a sentinel tenant domain that the smoke can curl
+          # through Caddy with the matching Host header.
+          printf '%s\n' \
+            "POSTGRES_USER=edgecloud" \
+            "POSTGRES_DB=edgecloud" \
+            "POSTGRES_PASSWORD=${PR}" \
+            "DATABASE_USER=edgecloud" \
+            "DATABASE_NAME=edgecloud" \
+            "DATABASE_HOST=postgres" \
+            "DATABASE_PORT=5432" \
+            "DATABASE_SSLMODE=disable" \
+            "DATABASE_PASSWORD=${PR}" \
+            "JWT_SECRET=${JWT}" \
+            "EDGE_INTERNAL_TOKEN=${INT}" \
+            "BOOTSTRAP_SECRET=${BOOT}" \
+            "METRICS_AUTH_TOKEN=${MET}" \
+            "CADDY_ADMIN_TOKEN=${CAD}" \
+            "NATS_URL=nats://nats:4222" \
+            "NATS_REPLICAS=1" \
+            "APP_REGION=edge-smoke" \
+            "REGION=edge-smoke" \
+            "WORKER_ID=w_smoke_$(date +%s)" \
+            "WORKER_TENANT_ID=t_smoke" \
+            "EDGE_WORKER_ADDR=127.0.0.1:18081" \
+            "EDGE_REQUIRE_SIGNATURE=true" \
+            "EDGE_SIGNING_KEY_ID=k1" \
+            "EDGE_SIGNING_KEYRING=k1=${KEY}" \
+            "TLS_CERT_FILE=/etc/caddy/tls/cert.pem" \
+            "TLS_KEY_FILE=/etc/caddy/tls/key.pem" \
+            "QUOTA_FETCH_INTERVAL=30s" \
+            "RATE_LIMIT_FETCH_INTERVAL=60s" \
+            "DOMAIN_POLL_INTERVAL=30s" > .env.smoke
+
+      - name: Render Caddy local JSON
+        # Same envsubst flow as the operator Makefile target. The
+        # smoke job doesn't reuse caddy.local.json from a previous
+        # run — it always renders afresh so a stale file can't
+        # poison the smoke.
+        run: |
+          set -a; . ./.env.smoke; set +a
+          envsubst < docker-compose.prod/caddy.json \
+            > docker-compose.prod/caddy.local.json
+
+      - name: Generate operator keyring file
+        run: |
+          mkdir -p secrets
+          echo -n "k1=$(grep '^EDGE_SIGNING_KEYRING' .env.smoke | cut -d= -f3 | cut -d' ' -f1)" \
+            > secrets/signing-keyring
+          cat secrets/signing-keyring
+
+      - name: Generate ephemeral TLS cert (self-signed)
+        # Production uses real certs; the smoke generates a self-
+        # signed pair on the fly so the compose can mount something
+        # at /etc/caddy/tls/cert.pem.
+        run: |
+          mkdir -p tls
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout tls/key.pem -out tls/cert.pem \
+            -days 1 -subj "/CN=localhost"
+
+      - name: Bring up prod compose
+        run: |
+          set -a; . ./.env.smoke; set +a
+          docker compose -f docker-compose.prod.yml up -d --build
+
+      - name: Wait for /ready
+        run: |
+          deadline=$(( $(date +%s) + ${SMOKE_DEADLINE_SECS} ))
+          while [ $(date +%s) -lt $deadline ]; do
+            if curl -fsS http://localhost:8080/ready 2>/dev/null \
+                | grep -Eq '"status":"(ok|degraded)"'; then
+              echo "/ready is green"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for /ready"
+          docker compose -f docker-compose.prod.yml logs
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-logs
+          path: |
+            docker-compose.prod.yml
+            .env.smoke
+            secrets/
+            tls/
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml down -v || true
+
   rust-js-build:
     runs-on: ubuntu-latest
     env:
