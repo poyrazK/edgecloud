@@ -3753,6 +3753,21 @@ impl Supervisor {
                     // heartbeat time), same posture as
                     // `outbound_bytes`/`resident_seconds`.
                     duration_ms_total: snap.duration_ms,
+                    // Fifth metered dimension (issue #84 asks 6/7):
+                    // per-deployment 5xx error count since the last
+                    // heartbeat interval. The FaaS dispatch path stamps
+                    // `meter.record_error()` from the `synthetic_500`
+                    // chokepoint shared by the three error terminal
+                    // arms of `handle_request` (`Ok(Err)`,
+                    // `Err(_dropped)` with `exit_code != 0`,
+                    // `Err(_dropped)` with `exit_code == 0`). LongRunning
+                    // apps stamp 0 (the dispatch path never fires for
+                    // LR). The canary auto-ramp service
+                    // (`CanaryRampService`) reads this off the wire to
+                    // compute rolling-window error rates; auto-shift
+                    // fires when the rate crosses the operator-tunable
+                    // `CANARY_RAMP_ERROR_THRESHOLD_PCT`.
+                    status_5xx_count: snap.errors,
                 },
             );
         }
@@ -3847,6 +3862,16 @@ impl Supervisor {
                 // short-circuits all four subtractions together when
                 // a heartbeat arrives for a stale deployment.
                 inst.meter.subtract_duration_ms(status.duration_ms_total);
+                // Fifth metered dimension (issue #84 asks 6/7):
+                // subtract the 5xx error delta we just shipped.
+                // LongRunning apps stamp `status_5xx_count = 0` (the
+                // dispatch path never fires for LR), so the subtract
+                // folds them to a no-op — same shape as the
+                // duration_ms / resident_seconds arms above. The
+                // deployment-mismatch guard at line ~2920 already
+                // short-circuits all five subtractions together when
+                // a heartbeat arrives for a stale deployment.
+                inst.meter.subtract_error_delta(status.status_5xx_count);
             }
         }
     }
