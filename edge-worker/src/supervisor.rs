@@ -17,8 +17,8 @@ use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{
-    AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample, PurgeReason,
-    TaskMessage,
+    expand_routes, AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind,
+    MetricSample, PurgeReason, TaskMessage,
 };
 use crate::metering_dedupe::dedupe_id;
 use crate::metrics::{MetricsHandle, WorkerMetrics};
@@ -1914,10 +1914,15 @@ impl Supervisor {
             TaskMessage::TaskPurge { .. } => unreachable!("task_purge handled above"),
         };
 
+        // Expand canary/blue-green `routes: Some([...])` into per-deployment
+        // tuples. Legacy single-deployment messages (`routes == None`)
+        // pass through as one tuple per app — pre-#290 behavior.
+        let desired_specs = expand_routes(desired_apps);
+
         // Snapshot this tenant's running apps.
         let current_apps = self.snapshot_current_apps(&tenant_id).await;
 
-        let diff = compute_app_diff(&current_apps, &desired_apps);
+        let diff = compute_app_diff(&current_apps, &desired_specs);
 
         let has_changes = !diff.apps_to_stop.is_empty() || !diff.apps_to_start.is_empty();
 
@@ -1926,7 +1931,10 @@ impl Supervisor {
                 .await?;
         }
 
-        for (app_name, spec) in &diff.apps_to_start {
+        for (app_name, _deployment_id, spec) in &diff.apps_to_start {
+            // `spec.deployment_id` was set per-route by `expand_routes`,
+            // so `start_app` already picks up the right deployment_id
+            // when reading it from the spec — no separate parameter.
             self.start_app(app_name, spec, &tenant_id).await?;
         }
 
@@ -3875,10 +3883,18 @@ impl Supervisor {
 }
 
 /// Result of diffing desired apps against current apps.
+///
+/// `apps_to_stop` and `apps_to_start` are both keyed by `(app_name,
+/// deployment_id)` so a canary fan-out (issue #290) can produce N
+/// independent entries for the same `(tenant, app_name)` — one per
+/// deployment the CP wants hosted.
 #[derive(Debug)]
 pub struct AppDiff {
     pub apps_to_stop: Vec<(String, String)>,
-    pub apps_to_start: Vec<(String, AppSpec)>,
+    /// `(app_name, deployment_id, AppSpec)` — the `AppSpec` carries
+    /// the per-route `deployment_hash` / `deployment_signature` so the
+    /// downloader pulls the right artifact.
+    pub apps_to_start: Vec<(String, String, AppSpec)>,
 }
 
 /// Compute the set of apps to stop vs start based on current and desired sets.
@@ -3886,48 +3902,67 @@ pub struct AppDiff {
 ///
 /// `current_apps` is a `Vec<(app_name, deployment_id, status)>` for a single
 /// tenant. Multiple `(app_name, deployment_id)` triples for the same app
-/// surface as canary fan-out (issue #290). `desired_apps` maps
-/// `app_name → AppSpec` — the wire shape, before canary expansion in
-/// commit 4 introduces `expand_routes` which converts the wire's
-/// `HashMap<String, AppSpec>` into a `Vec<(app, deployment_id, AppSpec)>`
-/// and feeds commit 5's full per-deployment diff. This commit keeps
-/// today's stop/start semantics for the legacy single-deployment path.
+/// surface as canary fan-out (issue #290). `desired_specs` is the
+/// already-expanded form produced by `messages::expand_routes` — one
+/// `(app_name, deployment_id, AppSpec)` tuple per deployment the CP
+/// wants hosted.
+///
+/// Diff semantics (issue #290):
+/// - Stop: every `(app_name, deployment_id)` in `current_apps` whose
+///   pair is **not** present in `desired_specs`. Canary retirement
+///   (e.g. `current = [(api,d1), (api,d2)]`, `desired = [(api,d1)]`)
+///   therefore stops ONLY `(api,d2)`, leaving `(api,d1)` running.
+/// - Start: every tuple in `desired_specs` whose `(app_name,
+///   deployment_id)` pair is **not** already present in `current_apps`.
+///   Adding a canary to a running app (`current = [(api,d1)]`, `desired
+///   = [(api,d1), (api,d2)]`) therefore starts ONLY `(api,d2)` without
+///   touching `(api,d1)`. Blue/green replacement (`current = [(api,d1)]`,
+///   `desired = [(api,d2)]`) stops `(api,d1)` AND starts `(api,d2)` —
+///   preserves the pre-#290 stop-then-start semantics for the legacy
+///   atomic-activate path. Canary fan-out is opt-in via `routes`.
 ///
 /// Tenant filtering is expected to be done by the caller — this function
-/// operates on already-scoped maps.
+/// operates on already-scoped slices.
 pub fn compute_app_diff(
     current_apps: &[(String, String, AppInstanceStatus)],
-    desired_apps: &HashMap<String, AppSpec>,
+    desired_specs: &[(String, String, AppSpec)],
 ) -> AppDiff {
     let mut apps_to_stop = Vec::new();
     let mut apps_to_start = Vec::new();
 
-    // Index current by app_name for O(1) lookups in the second pass.
-    let mut by_app: HashMap<&str, (&str, &AppInstanceStatus)> = HashMap::new();
-    for (n, d, s) in current_apps {
-        by_app.insert(n.as_str(), (d.as_str(), s));
+    // Index desired by (app_name, deployment_id) for O(1) lookups.
+    let mut desired_pairs: HashMap<(&str, &str), &AppSpec> = HashMap::new();
+    for (n, d, spec) in desired_specs {
+        desired_pairs.insert((n.as_str(), d.as_str()), spec);
     }
 
-    // Stop deployments no longer in the desired set. Each
-    // `(app_name, deployment_id)` triple produces one stop entry —
-    // today's behavior for single-deployment apps; commit 5 will tighten
-    // the canary-retirement path to stop only the removed deployment_id.
+    // Index current by (app_name, deployment_id) for the start pass.
+    let mut current_pairs: HashMap<(&str, &str), &AppInstanceStatus> = HashMap::new();
+    for (n, d, s) in current_apps {
+        current_pairs.insert((n.as_str(), d.as_str()), s);
+    }
+
+    // Stop pass: every current (app, dep) NOT in the desired set.
     for (app_name, deployment_id, _) in current_apps {
-        if !desired_apps.contains_key(app_name) {
+        if !desired_pairs.contains_key(&(
+            app_name.as_str(),
+            deployment_id.as_str(),
+        )) {
             apps_to_stop.push((app_name.clone(), deployment_id.clone()));
         }
     }
 
-    // Start or update apps in the desired set.
-    for (app_name, spec) in desired_apps {
-        let is_new = !by_app.contains_key(app_name.as_str());
-        let is_changed = by_app
-            .get(app_name.as_str())
-            .map(|(dep_id, _)| *dep_id != spec.deployment_id.as_str())
-            .unwrap_or(false);
-
-        if is_new || is_changed {
-            apps_to_start.push((app_name.clone(), spec.clone()));
+    // Start pass: every desired (app, dep) NOT in the current set.
+    for (app_name, deployment_id, spec) in desired_specs {
+        if !current_pairs.contains_key(&(
+            app_name.as_str(),
+            deployment_id.as_str(),
+        )) {
+            apps_to_start.push((
+                app_name.clone(),
+                deployment_id.clone(),
+                spec.clone(),
+            ));
         }
     }
 
@@ -4121,21 +4156,22 @@ mod tests {
     #[test]
     fn diff_new_app_is_started() {
         let current: Vec<(String, String, AppInstanceStatus)> = vec![];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d1"));
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_stop.len(), 0);
         assert_eq!(diff.apps_to_start.len(), 1);
         assert_eq!(diff.apps_to_start[0].0, "api");
-        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d1");
+        assert_eq!(diff.apps_to_start[0].1, "d1");
+        assert_eq!(diff.apps_to_start[0].2.deployment_id, "d1");
     }
 
     #[test]
     fn diff_same_app_same_deployment_is_noop() {
         let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d1"));
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_stop.len(), 0);
@@ -4145,20 +4181,24 @@ mod tests {
     #[test]
     fn diff_changed_deployment_triggers_restart() {
         let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d2"));
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d2".to_string(), make_spec("d2"))];
 
         let diff = compute_app_diff(&current, &desired);
-        assert_eq!(diff.apps_to_stop.len(), 0);
+        // Blue/green replacement (atomic activate path): current = (api,d1),
+        // desired = (api,d2) only — stop d1, start d2. Pre-#290 semantics.
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d1".to_string()));
         assert_eq!(diff.apps_to_start.len(), 1);
         assert_eq!(diff.apps_to_start[0].0, "api");
-        assert_eq!(diff.apps_to_start[0].1.deployment_id, "d2");
+        assert_eq!(diff.apps_to_start[0].1, "d2");
+        assert_eq!(diff.apps_to_start[0].2.deployment_id, "d2");
     }
 
     #[test]
     fn diff_missing_app_is_stopped() {
         let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
-        let desired = HashMap::new();
+        let desired: Vec<(String, String, AppSpec)> = vec![];
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_stop.len(), 1);
@@ -4169,9 +4209,10 @@ mod tests {
     #[test]
     fn diff_empty_current_starts_all() {
         let current: Vec<(String, String, AppInstanceStatus)> = vec![];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d1"));
-        desired.insert("worker".to_string(), make_spec("d2"));
+        let desired: Vec<(String, String, AppSpec)> = vec![
+            ("api".to_string(), "d1".to_string(), make_spec("d1")),
+            ("worker".to_string(), "d2".to_string(), make_spec("d2")),
+        ];
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_start.len(), 2);
@@ -4182,7 +4223,7 @@ mod tests {
     fn diff_empty_desired_stops_all() {
         let current: Vec<(String, String, AppInstanceStatus)> =
             vec![running("d1"), running_with_name("worker", "d2")];
-        let desired = HashMap::new();
+        let desired: Vec<(String, String, AppSpec)> = vec![];
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_stop.len(), 2);
@@ -4196,27 +4237,39 @@ mod tests {
             running_with_name("stop_me", "d2"),
             running_with_name("update_me", "d3"),
         ];
-        let mut desired = HashMap::new();
-        desired.insert("keep".to_string(), make_spec("d1")); // unchanged
-        desired.insert("update_me".to_string(), make_spec("d4")); // changed
-        desired.insert("new_app".to_string(), make_spec("d5")); // new
+        let desired: Vec<(String, String, AppSpec)> = vec![
+            // unchanged
+            ("keep".to_string(), "d1".to_string(), make_spec("d1")),
+            // changed — blue/green replacement on update_me
+            ("update_me".to_string(), "d4".to_string(), make_spec("d4")),
+            // new
+            ("new_app".to_string(), "d5".to_string(), make_spec("d5")),
+        ];
 
         let diff = compute_app_diff(&current, &desired);
+        // update_me d3 is stopped (replaced by d4) + stop_me d2 is gone.
+        let mut stops: Vec<(String, String)> = diff.apps_to_stop.clone();
+        stops.sort();
         assert_eq!(
-            diff.apps_to_stop,
-            vec![("stop_me".to_string(), "d2".to_string())]
+            stops,
+            vec![
+                ("stop_me".to_string(), "d2".to_string()),
+                ("update_me".to_string(), "d3".to_string())
+            ]
         );
-        assert_eq!(diff.apps_to_start.len(), 2);
-        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "update_me"));
-        assert!(diff.apps_to_start.iter().any(|(n, _)| n == "new_app"));
+        // update_me d4 + new_app d5 are started.
+        let mut starts: Vec<(String, String)> = diff
+            .apps_to_start
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.clone()))
+            .collect();
+        starts.sort();
         assert_eq!(
-            diff.apps_to_start
-                .iter()
-                .find(|(n, _)| n == "update_me")
-                .unwrap()
-                .1
-                .deployment_id,
-            "d4"
+            starts,
+            vec![
+                ("new_app".to_string(), "d5".to_string()),
+                ("update_me".to_string(), "d4".to_string())
+            ]
         );
     }
 
@@ -4227,12 +4280,15 @@ mod tests {
             "d1",
             AppInstanceStatus::Crashed { restart_count: 3 },
         )];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d2"));
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d2".to_string(), make_spec("d2"))];
 
-        // Even though crashed, the app exists — changing deployment_id should trigger start.
+        // Even though crashed, the app exists — changing deployment_id should
+        // stop the crashed one and start the new one (blue/green semantics).
         let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
         assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].1, "d2");
     }
 
     #[test]
@@ -4242,13 +4298,14 @@ mod tests {
             "d1",
             AppInstanceStatus::Crashed { restart_count: 5 },
         )];
-        let mut desired = HashMap::new();
-        desired.insert("api".to_string(), make_spec("d1"));
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
 
         // Same deployment_id, crashed — the diff says no-op because the
         // supervisor's restart loop handles the crash. The control plane
         // needs to send a new deployment_id to trigger a restart.
         let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 0);
         assert_eq!(diff.apps_to_start.len(), 0);
     }
 
@@ -4261,17 +4318,119 @@ mod tests {
         ] {
             let current: Vec<(String, String, AppInstanceStatus)> =
                 vec![make_status("api", "d1", status.clone())];
-            let mut desired = HashMap::new();
-            desired.insert("api".to_string(), make_spec("d2"));
+            let desired: Vec<(String, String, AppSpec)> =
+                vec![("api".to_string(), "d2".to_string(), make_spec("d2"))];
 
             let diff = compute_app_diff(&current, &desired);
+            // Blue/green replacement: stop current d1 + start d2.
+            assert_eq!(
+                diff.apps_to_stop.len(),
+                1,
+                "should stop for status {:?}",
+                status
+            );
             assert_eq!(
                 diff.apps_to_start.len(),
                 1,
                 "should restart for status {:?}",
                 status
             );
+            assert_eq!(diff.apps_to_start[0].1, "d2");
         }
+    }
+
+    // ── compute_app_diff canary fan-out tests (issue #290) ──────────
+
+    /// Canary fan-out: current has (api, d1) running, desired adds
+    /// (api, d2). Diff starts ONLY d2 — d1 stays running. This is the
+    /// core canary invariant.
+    #[test]
+    fn diff_canary_two_deployments_no_stop() {
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
+        let desired: Vec<(String, String, AppSpec)> = vec![
+            ("api".to_string(), "d1".to_string(), make_spec("d1")),
+            ("api".to_string(), "d2".to_string(), make_spec("d2")),
+        ];
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(
+            diff.apps_to_stop.len(),
+            0,
+            "d1 must stay running when desired also includes d2"
+        );
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].0, "api");
+        assert_eq!(diff.apps_to_start[0].1, "d2");
+    }
+
+    /// Canary retirement: current has (api, d1) + (api, d2) running,
+    /// desired only has (api, d1). Diff stops ONLY d2 — d1 keeps
+    /// running. This is the symmetric "remove canary" path.
+    #[test]
+    fn diff_canary_clear_stops_canary_only() {
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![
+            running("d1"),
+            running("d2"),
+        ];
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d2".to_string()));
+        assert_eq!(diff.apps_to_start.len(), 0);
+    }
+
+    /// Blue/green replacement (atomic activate path): current has
+    /// (api, d1), desired has only (api, d2). Diff stops d1 AND
+    /// starts d2 — pre-#290 stop-then-start semantics for the legacy
+    /// single-deployment path. Canary fan-out is opt-in via `routes`.
+    #[test]
+    fn diff_single_deployment_replacement_stops_old_starts_new() {
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d2".to_string(), make_spec("d2"))];
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d1".to_string()));
+        assert_eq!(diff.apps_to_start.len(), 1);
+        assert_eq!(diff.apps_to_start[0].1, "d2");
+    }
+
+    /// Canary steady-state: current and desired both have (api, d1).
+    /// Diff is a no-op. Sanity check that adding the canary-aware
+    /// start pass doesn't accidentally re-start existing deployments.
+    #[test]
+    fn diff_no_op_when_desired_matches_current() {
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
+        let desired: Vec<(String, String, AppSpec)> =
+            vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
+
+        let diff = compute_app_diff(&current, &desired);
+        assert!(diff.apps_to_stop.is_empty());
+        assert!(diff.apps_to_start.is_empty());
+    }
+
+    /// Three-way canary: current has (api, d1) running, desired has
+    /// (api, d2, d3) (a fresh split with no overlap). Diff stops d1
+    /// and starts both d2 and d3 — the entire canary fleet is fresh.
+    #[test]
+    fn diff_canary_three_way_no_overlap() {
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
+        let desired: Vec<(String, String, AppSpec)> = vec![
+            ("api".to_string(), "d2".to_string(), make_spec("d2")),
+            ("api".to_string(), "d3".to_string(), make_spec("d3")),
+        ];
+
+        let diff = compute_app_diff(&current, &desired);
+        assert_eq!(diff.apps_to_stop.len(), 1);
+        assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d1".to_string()));
+        assert_eq!(diff.apps_to_start.len(), 2);
+        let mut started: Vec<String> =
+            diff.apps_to_start.iter().map(|(_, d, _)| d.clone()).collect();
+        started.sort();
+        assert_eq!(started, vec!["d2".to_string(), "d3".to_string()]);
     }
 
     // ── StandbyPool tests ───────────────────────────────────────────
