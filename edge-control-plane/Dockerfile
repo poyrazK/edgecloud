@@ -108,11 +108,13 @@ COPY edge-migrate/edge-migrate-bin/Cargo.toml edge-migrate/edge-migrate-bin/Carg
 # every registry entry to the cache mount.
 RUN mkdir -p \
       edge-migrate/edge-migrate-lib/src \
-      edge-migrate/edge-migrate-bin/src && \
+      edge-migrate/edge-migrate-bin/src \
+      edge-runtime/bin/wasm2cwasm/src && \
     echo "" > edge-migrate/edge-migrate-lib/src/lib.rs && \
     echo "" > edge-migrate/edge-migrate-bin/src/lib.rs && \
-    echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs && \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+    echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo generate-lockfile && \
     cargo fetch --locked

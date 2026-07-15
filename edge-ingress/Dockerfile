@@ -62,8 +62,9 @@ RUN mkdir -p \
     echo "" > edge-worker/src/lib.rs && \
     echo "" > edge-worker/src/main.rs && \
     echo "" > edge-ingress/src/lib.rs && \
-    echo "" > edge-ingress/src/main.rs && \
-    --mount=type=cache,target=/usr/local/cargo/registry \
+    echo "" > edge-ingress/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo generate-lockfile && \
     cargo fetch --locked
