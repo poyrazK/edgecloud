@@ -44,8 +44,7 @@ type appCursor struct {
 // the httpx.cursorVersion constant; tracked here so a future reader
 // doesn't need to import httpx just to learn "what version does this
 // service produce?".
-const appCursorVersion = 1
-
+//
 // Errors this codec can return. Chained via %w to the underlying
 // httpx errors so errors.Is(err, service.ErrInvalidAppCursor) matches
 // the same error chain that httpx.EncodeCursor / httpx.DecodeCursor

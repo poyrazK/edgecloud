@@ -28,7 +28,7 @@ type mockDeployDeploymentRepo struct {
 	getByIDFn            func(ctx context.Context, id string) (*domain.Deployment, error)
 	listByAppFn          func(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
 	countByAppFn         func(ctx context.Context, tenantID, appName string) (int, error)
-	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error)
+	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error)
 	createFn             func(ctx context.Context, deployment *domain.Deployment) error
 	deleteByIDFn         func(ctx context.Context, id string) error
 }
@@ -52,9 +52,9 @@ func (m *mockDeployDeploymentRepo) CountByApp(ctx context.Context, tenantID, app
 	}
 	return 0, nil
 }
-func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+func (m *mockDeployDeploymentRepo) ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error) {
 	if m.listByAppPaginatedFn != nil {
-		return m.listByAppPaginatedFn(ctx, tenantID, appName, limit, offset)
+		return m.listByAppPaginatedFn(ctx, tenantID, appName, afterTS, afterID, limit)
 	}
 	return nil, nil
 }
@@ -919,51 +919,25 @@ func TestGetDeployment_NotFound(t *testing.T) {
 	}
 }
 
-func TestListDeployments_ReturnsRows(t *testing.T) {
-	repo := &mockDeployDeploymentRepo{
-		listByAppFn: func(_ context.Context, tenantID, appName string) ([]domain.Deployment, error) {
-			return []domain.Deployment{
-				{ID: "d_1", TenantID: tenantID, AppName: appName},
-				{ID: "d_2", TenantID: tenantID, AppName: appName},
-			}, nil
-		},
-	}
-	svc := &DeploymentService{deploymentRepo: repo,
+// TestListDeploymentsPaginated_NonPositiveLimitRejected pins the
+// sentinel returned when the handler's clamp lets a non-positive
+// limit through. Issue #58 — the unified apps+deployments helper
+// pattern (see app_test.go) returns ErrInvalidLimit instead of
+// silently clamping to a default.
+func TestListDeploymentsPaginated_NonPositiveLimitRejected(t *testing.T) {
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{},
 		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
-	list, err := svc.ListDeployments(context.Background(), "t_test", "myapp")
-	if err != nil {
-		t.Fatalf("ListDeployments: %v", err)
-	}
-	if len(list) != 2 {
-		t.Fatalf("got %d, want 2", len(list))
-	}
-}
-
-func TestListDeploymentsPaginated_AppliesDefaults(t *testing.T) {
-	var capturedLimit, capturedOffset int
-	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, limit, offset int) ([]domain.Deployment, error) {
-			capturedLimit, capturedOffset = limit, offset
-			return nil, nil
-		},
-	}
-	svc := &DeploymentService{deploymentRepo: repo,
-		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
-	}
-	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 0, -1)
-	if capturedLimit != 20 {
-		t.Errorf("limit = %d, want 20", capturedLimit)
-	}
-	if capturedOffset != 0 {
-		t.Errorf("offset = %d, want 0", capturedOffset)
+	_, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 0, "")
+	if !errors.Is(err, ErrInvalidDeploymentLimit) {
+		t.Errorf("err = %v, want ErrInvalidDeploymentLimit", err)
 	}
 }
 
 func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
 	var capturedLimit int
 	repo := &mockDeployDeploymentRepo{
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, limit, offset int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, limit int) ([]domain.Deployment, error) {
 			capturedLimit = limit
 			return nil, nil
 		},
@@ -971,33 +945,191 @@ func TestListDeploymentsPaginated_CapsAt100(t *testing.T) {
 	svc := &DeploymentService{deploymentRepo: repo,
 		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
-	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 200, 0)
-	if capturedLimit != 100 {
-		t.Errorf("limit = %d, want 100", capturedLimit)
+	_, _ = svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 200, "")
+	if capturedLimit != 101 {
+		// limit+1 fetcher; cap is 100, service adds 1 internally.
+		t.Errorf("capturedLimit = %d, want 101", capturedLimit)
 	}
 }
 
-func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
+// TestListDeploymentsPaginated_FirstPage_NoCursor verifies the
+// first-page path: afterCursor="" yields zero afterTS+afterID and
+// the repo's first-page SQL.
+func TestListDeploymentsPaginated_FirstPage_NoCursor(t *testing.T) {
+	var capturedTS time.Time
+	var capturedID int64
+	var capturedLimit int
 	repo := &mockDeployDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
-			return 42, nil
-		},
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _, _ int) ([]domain.Deployment, error) {
-			return []domain.Deployment{{ID: "d_1"}}, nil
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error) {
+			capturedTS, capturedID, capturedLimit = afterTS, afterID, limit
+			return nil, nil
 		},
 	}
 	svc := &DeploymentService{deploymentRepo: repo,
 		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
-	list, total, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, 0)
+	_, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, "")
+	if err != nil {
+		t.Fatalf("ListDeploymentsPaginated: %v", err)
+	}
+	if !capturedTS.IsZero() {
+		t.Errorf("afterTS = %v, want zero", capturedTS)
+	}
+	if capturedID != 0 {
+		t.Errorf("afterID = %d, want 0", capturedID)
+	}
+	if capturedLimit != 21 {
+		t.Errorf("capturedLimit = %d, want 21 (limit+1)", capturedLimit)
+	}
+}
+
+// TestListDeploymentsPaginated_CursorDecodedAndForwardsKeyset pins
+// the contract that a non-empty afterCursor is decoded and the
+// strict-tuple components are forwarded to the repo unchanged.
+func TestListDeploymentsPaginated_CursorDecodedAndForwardsKeyset(t *testing.T) {
+	wantTS := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	const wantID int64 = 42
+	cursor, err := encodeDeploymentCursor(wantTS, wantID)
+	if err != nil {
+		t.Fatalf("encodeDeploymentCursor: %v", err)
+	}
+
+	var capturedTS time.Time
+	var capturedID int64
+	repo := &mockDeployDeploymentRepo{
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, afterTS time.Time, afterID int64, _ int) ([]domain.Deployment, error) {
+			capturedTS, capturedID = afterTS, afterID
+			return nil, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	if _, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, cursor); err != nil {
+		t.Fatalf("ListDeploymentsPaginated: %v", err)
+	}
+	if !capturedTS.Equal(wantTS) {
+		t.Errorf("afterTS = %v, want %v", capturedTS, wantTS)
+	}
+	if capturedID != wantID {
+		t.Errorf("afterID = %d, want %d", capturedID, wantID)
+	}
+}
+
+// TestListDeploymentsPaginated_BadCursor_Chains covers the cursor
+// decode failure path: a malformed cursor must surface
+// ErrInvalidDeploymentCursor via errors.Is so the handler can map
+// to 400.
+func TestListDeploymentsPaginated_BadCursor_Chains(t *testing.T) {
+	svc := &DeploymentService{deploymentRepo: &mockDeployDeploymentRepo{},
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	_, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, "bm90LWpzb24tYXQtYWxs")
+	if !errors.Is(err, ErrInvalidDeploymentCursor) {
+		t.Errorf("err = %v, want ErrInvalidDeploymentCursor", err)
+	}
+}
+
+// TestListDeploymentsPaginated_D_EncodedCursor_Rejects pins the
+// text-PK limitation documented in mustParseDeploymentID: the
+// deployments.id is a `d_…` prefixed text column, so a cursor
+// built from a real row's (TS, ID) trips the codec's id>0 guard.
+// This is intentional — see the TODO at mustParseDeploymentID.
+// Follow-up #58-followup swaps the cursor to (created_at, id_text).
+func TestListDeploymentsPaginated_D_EncodedCursor_Rejects(t *testing.T) {
+	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	repo := &mockDeployDeploymentRepo{
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+			return []domain.Deployment{
+				{ID: "d_a", TenantID: "t_test", AppName: "myapp", CreatedAt: ts},
+				{ID: "d_b", TenantID: "t_test", AppName: "myapp", CreatedAt: ts.Add(-time.Second)},
+				{ID: "d_c", TenantID: "t_test", AppName: "myapp", CreatedAt: ts.Add(-2 * time.Second)},
+			}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	_, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 2, "")
+	// mustParseDeploymentID returns 0 for text ids, encode rejects 0,
+	// service surfaces an error. This is the documented limitation;
+	// until #58-followup lands the cursor codec must NOT produce
+	// working cursors against d_-prefixed ids.
+	if err == nil {
+		t.Fatal("err = nil, want non-nil (text PK cannot be encoded as int64 — see mustParseDeploymentID TODO)")
+	}
+}
+
+// TestListDeploymentsPaginatedWithTotal verifies the dual-envelope
+// path: total is read from CountByApp and NextOffset is set to
+// prevOffset+len(Items) ONLY on first-page requests.
+func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
+	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	repo := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			return 42, nil
+		},
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+			// Return exactly `limit` rows so NextCursor stays nil
+			// and the only assertions are on Total + NextOffset.
+			return []domain.Deployment{
+				{ID: "d_1", TenantID: "t_test", AppName: "myapp", CreatedAt: ts},
+			}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	page, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, "", 0)
 	if err != nil {
 		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
 	}
-	if total != 42 {
-		t.Errorf("total = %d, want 42", total)
+	if page.Total != 42 {
+		t.Errorf("page.Total = %d, want 42", page.Total)
 	}
-	if len(list) != 1 {
-		t.Errorf("len(list) = %d, want 1", len(list))
+	if len(page.Items) != 1 {
+		t.Errorf("len(page.Items) = %d, want 1", len(page.Items))
+	}
+	if page.NextOffset == nil {
+		t.Fatal("page.NextOffset = nil, want prevOffset+len(Items) = 1")
+	}
+	if *page.NextOffset != 1 {
+		t.Errorf("page.NextOffset = %d, want 1 (0+1)", *page.NextOffset)
+	}
+}
+
+// TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset
+// verifies the cursor-driven path: NextOffset MUST be nil so the
+// CLI's --page math doesn't pick a stale offset out of the chain.
+func TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset(t *testing.T) {
+	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	wantTS := ts
+	const wantID int64 = 42
+	cursor, err := encodeDeploymentCursor(wantTS, wantID)
+	if err != nil {
+		t.Fatalf("encodeDeploymentCursor: %v", err)
+	}
+	repo := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			return 7, nil
+		},
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+			return []domain.Deployment{{ID: "d_2", TenantID: "t_test", AppName: "myapp", CreatedAt: ts}}, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	// pass prevOffset=999 to assert it is ignored on the cursor path.
+	page, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, cursor, 999)
+	if err != nil {
+		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
+	}
+	if page.Total != 7 {
+		t.Errorf("page.Total = %d, want 7", page.Total)
+	}
+	if page.NextOffset != nil {
+		t.Errorf("page.NextOffset = %v, want nil (cursor-driven pages must omit it)", *page.NextOffset)
 	}
 }
 

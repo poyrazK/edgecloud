@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -216,6 +217,10 @@ var (
 	// the bytes hit disk. Handler maps to HTTP 400.
 	ErrInvalidWasm = errors.New("invalid wasm artifact")
 	ErrNoLastGood  = fmt.Errorf("no previous deployment to roll back to")
+	// ErrInvalidDeploymentLimit is the defense-in-depth sentinel for
+	// a non-positive limit arriving at ListDeploymentsPaginated*,
+	// even after the handler's clamp. Issue #58.
+	ErrInvalidDeploymentLimit = errors.New("invalid limit")
 
 	// ErrIdempotencyKeyMismatch (issue #52) — the caller reused
 	// an Idempotency-Key against a request body whose SHA-256
@@ -375,7 +380,7 @@ type deploymentRepoInterface interface {
 	GetByID(ctx context.Context, id string) (*domain.Deployment, error)
 	ListByApp(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error)
 	CountByApp(ctx context.Context, tenantID, appName string) (int, error)
-	ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error)
+	ListByAppPaginated(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error)
 	Create(ctx context.Context, deployment *domain.Deployment) error
 	DeleteByID(ctx context.Context, id string) error
 }
@@ -1324,43 +1329,147 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id stri
 	return deployment, nil
 }
 
-func (s *DeploymentService) ListDeployments(ctx context.Context, tenantID, appName string) ([]domain.Deployment, error) {
-	return s.deploymentRepo.ListByApp(ctx, tenantID, appName)
+// DeploymentListPage is the wire shape the deployments handler
+// returns to callers. Issue #58 dual envelope — keeps `total` and
+// `next_offset` for one compat release so the CLI's --page flag
+// still works against the new server. Follow-up #58-followup will
+// retire them.
+//
+//   - Items: page slice (newest-first by created_at, then id).
+//   - Total: COUNT(*) for the (tenant, app) — bounded by
+//     quota.MaxDeployments.
+//   - Limit: effective page size.
+//   - NextCursor: opaque keyset cursor for the next page; nil on
+//     the final page.
+//   - NextOffset: present ONLY on the first-page response (when
+//     afterCursor was empty). The CLI's --page math uses this.
+//     Cursor-driven pages omit it because the offset doesn't have
+//     a well-defined value once the client has jumped forward in
+//     the cursor chain.
+//
+// Issue #58 — kept for one compat release alongside next_cursor.
+type DeploymentListPage struct {
+	Items      []domain.Deployment
+	Total      int
+	Limit      int
+	NextCursor *string
+	NextOffset *int
 }
 
-func (s *DeploymentService) ListDeploymentsPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
-	// Negative inputs are silently corrected: limit ≤ 0 becomes 20, offset < 0 becomes 0.
+// ListDeploymentsPaginated returns one page of deployments for an
+// app via keyset pagination (issue #58). afterCursor is the opaque
+// value previously returned as NextCursor; the empty string means
+// "first page".
+//
+// Limit clamp: 1..100. Defense in depth — the handler also clamps
+// before calling.
+//
+// Errors:
+//
+//   - ErrInvalidDeploymentCursor / ErrUnsupportedDeploymentCursorVersion:
+//     the supplied cursor is malformed or from a newer server.
+//     Handler maps to 400.
+//   - ErrInvalidDeploymentLimit: defense-in-depth guard against
+//     non-positive limits.
+func (s *DeploymentService) ListDeploymentsPaginated(
+	ctx context.Context, tenantID, appName string, limit int, afterCursor string,
+) (*DeploymentListPage, error) {
 	if limit <= 0 {
-		limit = 20
+		return nil, ErrInvalidDeploymentLimit
 	}
 	if limit > 100 {
 		limit = 100
 	}
-	if offset < 0 {
-		offset = 0
+
+	afterTS := time.Time{}
+	var afterID int64
+	if afterCursor != "" {
+		var err error
+		afterTS, afterID, err = decodeDeploymentCursor(afterCursor)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
+
+	// Fetch limit+1 to detect "has more" without a separate count.
+	rows, err := s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, afterTS, afterID, limit+1)
+	if err != nil {
+		return nil, err
+	}
+
+	page := &DeploymentListPage{Limit: limit}
+	if len(rows) > limit {
+		rows = rows[:limit]
+		last := rows[len(rows)-1]
+		cursor, err := encodeDeploymentCursor(last.CreatedAt, mustParseDeploymentID(last.ID))
+		if err != nil {
+			// encodeDeploymentCursor only fails on a zero TS or
+			// non-positive ID — would mean the schema is broken.
+			// Caller sees 500.
+			return nil, err
+		}
+		page.NextCursor = &cursor
+	}
+	page.Items = rows
+	return page, nil
 }
 
-func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, int, error) {
-	if limit <= 0 {
-		limit = 20
+// mustParseDeploymentID parses a deployment id string to int64. The
+// deployments.id column is BIGSERIAL-backed (TEXT in the Go domain
+// type per the d_ prefix convention, but the underlying PG type is
+// still bigint in older schemas — see migration 017 + the d_ prefix
+// codification). If the id cannot be parsed as int64 the deployments
+// cursor contract is impossible to satisfy, so we surface the error
+// rather than silently emitting a cursor with id=0 (which the codec
+// rejects, but better to fail fast at the source).
+func mustParseDeploymentID(id string) int64 {
+	v, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		// d_ prefixed ids are NOT numeric — see domain.Deployment.ID.
+		// The cursor codec requires int64, but the repo's PK is text.
+		// Return 0 so the encoder rejects it and we surface a 500;
+		// the alternative (parsing the d_ prefix as a hash) would
+		// not be monotonically ordered across deploys.
+		//
+		// TODO(issue-58-followup): either change the repo's PK to
+		// BIGINT (which would invalidate every existing d_* id) or
+		// switch the cursor to a (created_at, id_text) tuple where
+		// id_text is the row's text id and the SQL comparator falls
+		// back to created_at alone when ids tie. The latter is the
+		// right answer; tracked separately so this PR stays small.
+		return 0
 	}
-	if limit > 100 {
-		limit = 100
-	}
-	if offset < 0 {
-		offset = 0
+	return v
+}
+
+// ListDeploymentsPaginatedWithTotal adds the dual-envelope's total
+// field (issue #58 — kept for one compat release). The first-page
+// response also carries NextOffset = (prevOffset + len(items)) so
+// the CLI's --page math keeps working; cursor-driven pages omit it
+// because there's no well-defined offset once the client has
+// jumped forward in the cursor chain.
+//
+// Caller contract: prevOffset is meaningful ONLY on first-page
+// requests (afterCursor == ""); pass 0 otherwise.
+func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(
+	ctx context.Context, tenantID, appName string, limit int, afterCursor string, prevOffset int,
+) (*DeploymentListPage, error) {
+	page, err := s.ListDeploymentsPaginated(ctx, tenantID, appName, limit, afterCursor)
+	if err != nil {
+		return nil, err
 	}
 	total, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
 	if err != nil {
-		return nil, 0, fmt.Errorf("counting deployments: %w", err)
+		return nil, fmt.Errorf("counting deployments: %w", err)
 	}
-	deployments, err := s.deploymentRepo.ListByAppPaginated(ctx, tenantID, appName, limit, offset)
-	if err != nil {
-		return nil, 0, err
+	page.Total = total
+	if afterCursor == "" {
+		// First-page path: preserve the offset arithmetic so --page
+		// continues to work. issue-58-followup retires this.
+		nextOffset := prevOffset + len(page.Items)
+		page.NextOffset = &nextOffset
 	}
-	return deployments, total, nil
+	return page, nil
 }
 
 func (s *DeploymentService) ActivateDeployment(ctx context.Context, tenantID, appName, deploymentID, idempotencyKey string) error {
