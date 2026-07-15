@@ -102,8 +102,6 @@ ENV CARGO_BUILD_RUSTC_WRAPPER="" \
 
 WORKDIR /workspace
 
-COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
-
 # Cargo.lock is NOT COPY'd from the build context (the workspace
 # gitignores it); the deps stage above generated one via
 # `cargo generate-lockfile`. `cargo build --release` regenerates it

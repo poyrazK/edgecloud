@@ -110,12 +110,6 @@ ENV CARGO_BUILD_RUSTC_WRAPPER="" \
 
 WORKDIR /workspace
 
-# Copy the (now-resolved) registry cache from the deps stage as a
-# baseline. Cold cache PRs still pay ~10 minutes for wasmtime — the
-# BuildKit `--mount=type=cache` on `/usr/local/cargo/registry` is the
-# reusable counterpart.
-COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
-
 # Source slices the worker needs. Each is its own COPY so a change
 # in `edge-worker/src/` does NOT bust the layer for `edge-runtime/`
 # (which dominates the build time).
