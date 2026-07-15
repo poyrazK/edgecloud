@@ -124,14 +124,18 @@ pub struct AppInstance {
 /// (e.g., status update to Crashed) without replacing the Arc entry.
 #[allow(dead_code)]
 pub struct WorkerState {
-    /// Currently running app instances, keyed by `(tenant_id, app_name)`.
+    /// Currently running app instances, keyed by `(tenant_id, app_name, deployment_id)`.
     ///
-    /// The tuple key prevents collisions when two tenants happen to
+    /// The triple key prevents collisions when two tenants happen to
     /// deploy an app with the same name (e.g. both tenants have a
-    /// service literally called "api"). It also lets `handle_task_message`
-    /// filter to just the current message's tenant without scanning
-    /// every running app.
-    pub apps: HashMap<(String, String), Arc<Mutex<AppInstance>>>,
+    /// service literally called "api") AND when one app is hosted in
+    /// canary/blue-green mode under multiple deployments at once
+    /// (issue #290). `deployment_id` distinguishes the slots so the
+    /// worker can fan out `AppSpec.routes` into N concurrent instances
+    /// of the same `(tenant, app_name)` without one eviction shadowing
+    /// another. Filtering by tenant still works because the tuple
+    /// prefix matches `handle_task_message`'s `(tenant_id, …)` slice.
+    pub apps: HashMap<(String, String, String), Arc<Mutex<AppInstance>>>,
     /// Shared wasmtime Engine (for compilation caching across apps)
     pub engine: Engine,
     /// Last time the worker's main loop observed a TaskMessage from

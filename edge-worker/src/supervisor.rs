@@ -70,7 +70,7 @@ impl StandbyPool {
 
         let mut candidate: Option<(std::time::Instant, Arc<Mutex<AppInstance>>)> = None;
 
-        for ((_tenant_id, _app_name), app_mutex) in apps {
+        for ((_tenant_id, _app_name, _deployment_id), app_mutex) in apps {
             let app = app_mutex.lock().await;
             if app.execution_model == ExecutionModel::Handler {
                 if let Some(ref dispatch) = app.dispatch {
@@ -331,7 +331,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         assert_eq!(hb.apps.len(), 1);
@@ -357,7 +357,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -375,7 +375,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -400,7 +400,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -427,7 +427,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -452,7 +452,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         let s = hb.apps.get("my-app").expect("app present");
@@ -485,7 +485,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         // Query for a different tenant -> empty
         let snap = sup.snapshot_current_apps("t_other").await;
@@ -493,7 +493,8 @@ mod heartbeat_integration_tests {
         // Query for the correct tenant -> found
         let snap = sup.snapshot_current_apps("t_test").await;
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap.get("my-app").unwrap().0, "d1");
+        assert_eq!(snap[0].0, "my-app");
+        assert_eq!(snap[0].1, "d1");
     }
 
     // ── stop_all_apps / reset_meters_after tests ────────────────────
@@ -541,7 +542,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // Send a TaskUpdate with empty apps → should stop the running app
@@ -566,7 +567,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // Send a TaskUpdate with the same app → no-op
@@ -609,7 +610,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // Send a TaskUpdate for a different tenant with empty apps → should NOT stop our app
@@ -634,7 +635,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // FullSync with empty apps should stop running app (same as TaskUpdate)
@@ -672,12 +673,12 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-a".into()), app_a);
+            .insert(("t_test".into(), "app-a".into(), "d1".into()), app_a);
         state
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-b".into()), app_b);
+            .insert(("t_test".into(), "app-b".into(), "d1".into()), app_b);
         let sup = build_supervisor(state);
 
         // task_purge targets app-a only.
@@ -695,7 +696,7 @@ mod heartbeat_integration_tests {
             .read()
             .await
             .apps
-            .contains_key(&("t_test".into(), "app-b".into())));
+            .contains_key(&("t_test".into(), "app-b".into(), "d1".into())));
     }
 
     #[tokio::test]
@@ -709,12 +710,12 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-a".into()), app_a);
+            .insert(("t_test".into(), "app-a".into(), "d1".into()), app_a);
         state
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-b".into()), app_b);
+            .insert(("t_test".into(), "app-b".into(), "d1".into()), app_b);
         let sup = build_supervisor(state);
 
         // task_purge with empty app_name = tenant-wide purge.
@@ -739,7 +740,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // task_purge for an app we don't host — must be a no-op,
@@ -804,7 +805,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-a".into()), app);
+            .insert(("t_test".into(), "app-a".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // TaskUpdate for t_other with empty apps should NOT stop app-a
@@ -827,7 +828,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "app-a".into()), app);
+            .insert(("t_test".into(), "app-a".into(), "d1".into()), app);
         let sup = build_supervisor(state);
 
         // TaskUpdate for same tenant but with a different app
@@ -867,7 +868,7 @@ mod heartbeat_integration_tests {
         let engine = edge_runtime::create_engine().expect("engine");
         let state = Arc::new(RwLock::new(WorkerState::new(engine)));
         let sup = build_supervisor(state);
-        let result = sup.stop_app("nonexistent", "ghost").await;
+        let result = sup.stop_app("nonexistent", "ghost", "d1").await;
         assert!(result.is_ok());
     }
 
@@ -901,9 +902,9 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state.clone());
-        let result = sup.stop_app("t_test", "my-app").await;
+        let result = sup.stop_app("t_test", "my-app", "d1").await;
         assert!(result.is_ok());
         assert!(state.read().await.apps.is_empty());
     }
@@ -958,7 +959,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-ws-app".into()), app);
+            .insert(("t_test".into(), "my-ws-app".into(), "d1".into()), app);
 
         // Inline-construct with a 60s-cooldown pool so the released
         // ports stay observable in `cooling_down` for the duration of
@@ -969,7 +970,7 @@ mod heartbeat_integration_tests {
         // between `stop_app` and our assertion.
         let sup = build_supervisor_with_cooldown_secs(state.clone(), 60);
 
-        sup.stop_app("t_test", "my-ws-app")
+        sup.stop_app("t_test", "my-ws-app", "d1")
             .await
             .expect("stop_app with ws_port must not error");
 
@@ -1192,9 +1193,9 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state.clone());
-        let result = sup.stop_app("t_test", "my-app").await;
+        let result = sup.stop_app("t_test", "my-app", "d1").await;
         assert!(result.is_ok());
         assert!(state.read().await.apps.is_empty());
     }
@@ -1241,7 +1242,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
 
@@ -1340,9 +1341,9 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "panic-app".into()), panic_app);
+            .insert(("t_test".into(), "panic-app".into(), "d_panic".into()), panic_app);
         state.write().await.apps.insert(
-            ("t_test".into(), "survivor-app".into()),
+            ("t_test".into(), "survivor-app".into(), "d_survivor".into()),
             survivor_app.clone(),
         );
 
@@ -1353,7 +1354,7 @@ mod heartbeat_integration_tests {
         // `panic::resume_unwind(panic_payload)` inside `stop_app`
         // unwound out of the test function too, failing the test
         // with a panic message rather than an assertion error.
-        let result = sup.stop_app("t_test", "panic-app").await;
+        let result = sup.stop_app("t_test", "panic-app", "d_panic").await;
         assert!(
             result.is_ok(),
             "stop_app must not propagate the app-task panic: {result:?}"
@@ -1364,18 +1365,18 @@ mod heartbeat_integration_tests {
         assert!(
             !snapshot
                 .apps
-                .contains_key(&("t_test".into(), "panic-app".into())),
+                .contains_key(&("t_test".into(), "panic-app".into(), "d_panic".into())),
             "panic-app should be removed after stop_app"
         );
         assert!(
             snapshot
                 .apps
-                .contains_key(&("t_test".into(), "survivor-app".into())),
+                .contains_key(&("t_test".into(), "survivor-app".into(), "d_survivor".into())),
             "survivor-app must remain running — supervisor must not tear down unrelated apps"
         );
         let survivor_inst = snapshot
             .apps
-            .get(&("t_test".into(), "survivor-app".into()))
+            .get(&("t_test".into(), "survivor-app".into(), "d_survivor".into()))
             .expect("survivor-app present")
             .lock()
             .await;
@@ -1429,7 +1430,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "panic-app".into()), app);
+            .insert(("t_test".into(), "panic-app".into(), "d_panic".into()), app);
 
         let sup = build_supervisor(state.clone());
 
@@ -1493,7 +1494,7 @@ mod heartbeat_integration_tests {
         let snapshot = state.read().await;
         let inst = snapshot
             .apps
-            .get(&("t_test".into(), "panic-app".into()))
+            .get(&("t_test".into(), "panic-app".into(), "d_panic".into()))
             .expect("app present")
             .lock()
             .await;
@@ -1547,7 +1548,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "every-app".into()), app);
+            .insert(("t_test".into(), "every-app".into(), "d_every".into()), app);
 
         let sup = build_supervisor(state.clone());
 
@@ -1574,7 +1575,7 @@ mod heartbeat_integration_tests {
         let snapshot = state.read().await;
         let inst = snapshot
             .apps
-            .get(&("t_test".into(), "every-app".into()))
+            .get(&("t_test".into(), "every-app".into(), "d_every".into()))
             .expect("app present")
             .lock()
             .await;
@@ -1627,7 +1628,7 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "hung-app".into()), app);
+            .insert(("t_test".into(), "hung-app".into(), "d_hung".into()), app);
 
         let sup = build_supervisor(state.clone());
 
@@ -1654,7 +1655,7 @@ mod heartbeat_integration_tests {
         let snapshot = state.read().await;
         let inst = snapshot
             .apps
-            .get(&("t_test".into(), "hung-app".into()))
+            .get(&("t_test".into(), "hung-app".into(), "d_hung".into()))
             .expect("app present")
             .lock()
             .await;
@@ -1920,8 +1921,9 @@ impl Supervisor {
 
         let has_changes = !diff.apps_to_stop.is_empty() || !diff.apps_to_start.is_empty();
 
-        for app_name in &diff.apps_to_stop {
-            self.stop_app(&tenant_id, app_name).await?;
+        for (app_name, deployment_id) in &diff.apps_to_stop {
+            self.stop_app(&tenant_id, app_name.as_str(), deployment_id.as_str())
+                .await?;
         }
 
         for (app_name, spec) in &diff.apps_to_start {
@@ -1948,17 +1950,17 @@ impl Supervisor {
     async fn snapshot_current_apps(
         &self,
         tenant_id: &str,
-    ) -> HashMap<String, (String, AppInstanceStatus)> {
+    ) -> Vec<(String, String, AppInstanceStatus)> {
         let state = self.state.read().await;
-        let mut map = HashMap::new();
-        for ((t, n), inst) in state.apps.iter() {
+        let mut out = Vec::new();
+        for ((t, n, d), inst) in state.apps.iter() {
             if t != tenant_id {
                 continue;
             }
             let inst = inst.lock().await;
-            map.insert(n.clone(), (inst.deployment_id.clone(), inst.status.clone()));
+            out.push((n.clone(), d.clone(), inst.status.clone()));
         }
-        map
+        out
     }
 
     /// Issue #569: handle a `task_purge` tombstone. Stops the
@@ -2003,10 +2005,18 @@ impl Supervisor {
         }
 
         let current = self.snapshot_current_apps(tenant_id).await;
-        let to_stop: Vec<String> = if app_name.is_empty() {
-            current.keys().cloned().collect()
-        } else if current.contains_key(app_name) {
-            vec![app_name.to_string()]
+        let to_stop: Vec<(String, String)> = if app_name.is_empty() {
+            current
+                .iter()
+                .map(|(n, d, _)| (n.clone(), d.clone()))
+                .collect()
+        } else if current.iter().any(|(n, _, _)| n == app_name) {
+            // Per-app purge: stop every deployment_id of that app.
+            current
+                .iter()
+                .filter(|(n, _, _)| n == app_name)
+                .map(|(n, d, _)| (n.clone(), d.clone()))
+                .collect()
         } else {
             tracing::info!(
                 tenant_id = %tenant_id,
@@ -2016,8 +2026,8 @@ impl Supervisor {
             Vec::new()
         };
 
-        for app in &to_stop {
-            self.stop_app(tenant_id, app).await?;
+        for (app, deployment_id) in &to_stop {
+            self.stop_app(tenant_id, app, deployment_id).await?;
         }
 
         // purge_tenant is idempotent and best-effort on dir removal;
@@ -2062,10 +2072,18 @@ impl Supervisor {
             "starting app"
         );
 
-        // Stop existing instance if present (for this tenant + app).
-        let key = (tenant_id.to_string(), app_name.to_string());
-        if self.state.read().await.apps.contains_key(&key) {
-            self.stop_app(tenant_id, app_name).await?;
+        // Stop existing instance if present (for this tenant + app + deployment).
+        // Use the previous deployment_id if there was one for this (tenant, app).
+        let existing_deployment_id = {
+            let state = self.state.read().await;
+            state
+                .apps
+                .keys()
+                .find(|(t, n, _d)| t == tenant_id && n == app_name)
+                .map(|(_, _, d)| d.clone())
+        };
+        if let Some(prev_deployment_id) = existing_deployment_id {
+            self.stop_app(tenant_id, app_name, &prev_deployment_id).await?;
         }
 
         // Acquire an HTTP port. Issue #641: acquire() already returns
@@ -2689,7 +2707,11 @@ impl Supervisor {
         }));
 
         self.state.write().await.apps.insert(
-            (tenant_id_for_instance.clone(), app_name.to_string()),
+            (
+                tenant_id_for_instance.clone(),
+                app_name.to_string(),
+                spec.deployment_id.clone(),
+            ),
             instance,
         );
 
@@ -2720,7 +2742,7 @@ impl Supervisor {
             state.apps.clone()
         };
 
-        for ((tenant_id, app_name), app_mutex) in apps {
+        for ((tenant_id, app_name, _deployment_id), app_mutex) in apps {
             let app = app_mutex.lock().await;
             if app.execution_model == ExecutionModel::Handler {
                 if let Some(ref dispatch) = app.dispatch {
@@ -2754,8 +2776,13 @@ impl Supervisor {
     /// 3. Wait for in-flight requests to complete (up to 30s).
     /// 4. Set status to `Stopping`, remove from state map, free port.
     /// 5. Abort ticker and await/abort the app task.
-    pub async fn stop_app(&self, tenant_id: &str, app_name: &str) -> anyhow::Result<()> {
-        let key = (tenant_id.to_string(), app_name.to_string());
+    pub async fn stop_app(
+        &self,
+        tenant_id: &str,
+        app_name: &str,
+        deployment_id: &str,
+    ) -> anyhow::Result<()> {
+        let key = (tenant_id.to_string(), app_name.to_string(), deployment_id.to_string());
         // Clone the Arc so we can lock it while the instance is still in the map.
         let instance = {
             let state = self.state.read().await;
@@ -3062,15 +3089,28 @@ impl Supervisor {
             // stamp the last error so the heartbeat can carry it
             // (issue #45 — operators see *why* the app reached
             // Crashed without grepping structured logs).
-            {
+            //
+            // Drop `state.write()` before awaiting `inst.lock()` —
+            // holding the worker-wide write lock across an inner
+            // mutex await stalls every other worker task
+            // (`handle_task_message`, `build_heartbeat`,
+            // `evict_idle_apps`, …). The clone-then-release is
+            // safe because `inst` is reference-counted and
+            // outlives the write guard.
+            let inst_arc = {
+                let crash_key = (
+                    tenant_id.to_string(),
+                    app_name.to_string(),
+                    current_deployment_id.to_string(),
+                );
                 let mut s = state.write().await;
-                let crash_key = (tenant_id.to_string(), app_name.to_string());
-                if let Some(inst) = s.apps.get_mut(&crash_key) {
-                    let mut inst = inst.lock().await;
-                    inst.status = terminal_status.clone();
-                    if let Some(err) = err_for_audit {
-                        inst.last_error = Some(err.to_string());
-                    }
+                s.apps.get(&crash_key).cloned()
+            };
+            if let Some(inst_arc) = inst_arc {
+                let mut inst = inst_arc.lock().await;
+                inst.status = terminal_status.clone();
+                if let Some(err) = err_for_audit {
+                    inst.last_error = Some(err.to_string());
                 }
             }
             // Stamp the terminal status onto the Prometheus
@@ -3117,11 +3157,21 @@ impl Supervisor {
             // Stamp last_error on every restart too — operators
             // watching the heartbeat in real time can see the error
             // immediately, before the cap is reached.
+            //
+            // Drop `state.write()` before awaiting `inst.lock()` —
+            // see the matching comment in the cap-reached arm.
             if let Some(err) = err_for_audit {
-                let mut s = state.write().await;
-                let crash_key = (tenant_id.to_string(), app_name.to_string());
-                if let Some(inst) = s.apps.get_mut(&crash_key) {
-                    let mut inst = inst.lock().await;
+                let inst_arc = {
+                    let crash_key = (
+                        tenant_id.to_string(),
+                        app_name.to_string(),
+                        current_deployment_id.to_string(),
+                    );
+                    let mut s = state.write().await;
+                    s.apps.get(&crash_key).cloned()
+                };
+                if let Some(inst_arc) = inst_arc {
+                    let mut inst = inst_arc.lock().await;
                     inst.last_error = Some(err.to_string());
                 }
             }
@@ -3513,7 +3563,7 @@ impl Supervisor {
         // from v0.1 behavior; multi-tenant app-name collisions are a
         // v0.3 routing concern (ingress already disambiguates by
         // (tenant_id, app_name), see edge-ingress::config::ingress_host).
-        for ((_tenant_id, app_name), inst) in &state.apps {
+        for ((_tenant_id, app_name, _deployment_id), inst) in &state.apps {
             let inst = inst.lock().await;
             let status = app_status_to_string(&inst.status);
             let exit_code = app_status_exit_code(&inst.status);
@@ -3665,7 +3715,11 @@ impl Supervisor {
             // tenant_id inside AppStatus, so we can resolve the right
             // instance even if app_name alone is ambiguous on this
             // worker.
-            let key = (status.tenant_id.clone(), app_name.clone());
+            let key = (
+                status.tenant_id.clone(),
+                app_name.clone(),
+                status.deployment_id.clone(),
+            );
             if let Some(inst) = state.apps.get(&key) {
                 let inst = inst.lock().await;
                 // Guard on deployment_id: if the app was stopped and a new
@@ -3701,9 +3755,16 @@ impl Supervisor {
 
     /// Stop all running apps (used during graceful shutdown).
     pub async fn stop_all_apps(&self) {
-        let keys: Vec<(String, String)> = self.state.read().await.apps.keys().cloned().collect();
-        for (tenant_id, app_name) in &keys {
-            if let Err(e) = self.stop_app(tenant_id, app_name).await {
+        let keys: Vec<(String, String, String)> = self
+            .state
+            .read()
+            .await
+            .apps
+            .keys()
+            .cloned()
+            .collect();
+        for (tenant_id, app_name, deployment_id) in &keys {
+            if let Err(e) = self.stop_app(tenant_id, app_name, deployment_id).await {
                 tracing::error!(
                     tenant_id,
                     app_name,
@@ -3816,38 +3877,53 @@ impl Supervisor {
 /// Result of diffing desired apps against current apps.
 #[derive(Debug)]
 pub struct AppDiff {
-    pub apps_to_stop: Vec<String>,
+    pub apps_to_stop: Vec<(String, String)>,
     pub apps_to_start: Vec<(String, AppSpec)>,
 }
 
 /// Compute the set of apps to stop vs start based on current and desired sets.
 /// This is a pure function — no I/O, no state mutation.
 ///
-/// `current_apps` maps app_name → (deployment_id, status) for a single tenant.
-/// `desired_apps` maps app_name → AppSpec for the same tenant.
+/// `current_apps` is a `Vec<(app_name, deployment_id, status)>` for a single
+/// tenant. Multiple `(app_name, deployment_id)` triples for the same app
+/// surface as canary fan-out (issue #290). `desired_apps` maps
+/// `app_name → AppSpec` — the wire shape, before canary expansion in
+/// commit 4 introduces `expand_routes` which converts the wire's
+/// `HashMap<String, AppSpec>` into a `Vec<(app, deployment_id, AppSpec)>`
+/// and feeds commit 5's full per-deployment diff. This commit keeps
+/// today's stop/start semantics for the legacy single-deployment path.
 ///
 /// Tenant filtering is expected to be done by the caller — this function
 /// operates on already-scoped maps.
 pub fn compute_app_diff(
-    current_apps: &HashMap<String, (String, AppInstanceStatus)>,
+    current_apps: &[(String, String, AppInstanceStatus)],
     desired_apps: &HashMap<String, AppSpec>,
 ) -> AppDiff {
     let mut apps_to_stop = Vec::new();
     let mut apps_to_start = Vec::new();
 
-    // Stop apps no longer in the desired set.
-    for app_name in current_apps.keys() {
+    // Index current by app_name for O(1) lookups in the second pass.
+    let mut by_app: HashMap<&str, (&str, &AppInstanceStatus)> = HashMap::new();
+    for (n, d, s) in current_apps {
+        by_app.insert(n.as_str(), (d.as_str(), s));
+    }
+
+    // Stop deployments no longer in the desired set. Each
+    // `(app_name, deployment_id)` triple produces one stop entry —
+    // today's behavior for single-deployment apps; commit 5 will tighten
+    // the canary-retirement path to stop only the removed deployment_id.
+    for (app_name, deployment_id, _) in current_apps {
         if !desired_apps.contains_key(app_name) {
-            apps_to_stop.push(app_name.clone());
+            apps_to_stop.push((app_name.clone(), deployment_id.clone()));
         }
     }
 
     // Start or update apps in the desired set.
     for (app_name, spec) in desired_apps {
-        let is_new = !current_apps.contains_key(app_name);
-        let is_changed = current_apps
-            .get(app_name)
-            .map(|(dep_id, _)| dep_id != &spec.deployment_id)
+        let is_new = !by_app.contains_key(app_name.as_str());
+        let is_changed = by_app
+            .get(app_name.as_str())
+            .map(|(dep_id, _)| *dep_id != spec.deployment_id.as_str())
             .unwrap_or(false);
 
         if is_new || is_changed {
@@ -3953,12 +4029,27 @@ mod tests {
         }
     }
 
-    fn make_status(deployment_id: &str, status: AppInstanceStatus) -> (String, AppInstanceStatus) {
-        (deployment_id.to_string(), status)
+    fn make_status(
+        app_name: &str,
+        deployment_id: &str,
+        status: AppInstanceStatus,
+    ) -> (String, String, AppInstanceStatus) {
+        (
+            app_name.to_string(),
+            deployment_id.to_string(),
+            status,
+        )
     }
 
-    fn running(deployment_id: &str) -> (String, AppInstanceStatus) {
-        make_status(deployment_id, AppInstanceStatus::Running)
+    fn running(deployment_id: &str) -> (String, String, AppInstanceStatus) {
+        make_status("api", deployment_id, AppInstanceStatus::Running)
+    }
+
+    fn running_with_name(
+        app_name: &str,
+        deployment_id: &str,
+    ) -> (String, String, AppInstanceStatus) {
+        make_status(app_name, deployment_id, AppInstanceStatus::Running)
     }
 
     // ── app_status_to_string tests ──────────────────────────────────
@@ -4029,7 +4120,7 @@ mod tests {
 
     #[test]
     fn diff_new_app_is_started() {
-        let current = HashMap::new();
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d1"));
 
@@ -4042,8 +4133,7 @@ mod tests {
 
     #[test]
     fn diff_same_app_same_deployment_is_noop() {
-        let mut current = HashMap::new();
-        current.insert("api".to_string(), running("d1"));
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d1"));
 
@@ -4054,8 +4144,7 @@ mod tests {
 
     #[test]
     fn diff_changed_deployment_triggers_restart() {
-        let mut current = HashMap::new();
-        current.insert("api".to_string(), running("d1"));
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d2"));
 
@@ -4068,19 +4157,18 @@ mod tests {
 
     #[test]
     fn diff_missing_app_is_stopped() {
-        let mut current = HashMap::new();
-        current.insert("api".to_string(), running("d1"));
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1")];
         let desired = HashMap::new();
 
         let diff = compute_app_diff(&current, &desired);
         assert_eq!(diff.apps_to_stop.len(), 1);
-        assert_eq!(diff.apps_to_stop[0], "api");
+        assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d1".to_string()));
         assert_eq!(diff.apps_to_start.len(), 0);
     }
 
     #[test]
     fn diff_empty_current_starts_all() {
-        let current = HashMap::new();
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d1"));
         desired.insert("worker".to_string(), make_spec("d2"));
@@ -4092,9 +4180,8 @@ mod tests {
 
     #[test]
     fn diff_empty_desired_stops_all() {
-        let mut current = HashMap::new();
-        current.insert("api".to_string(), running("d1"));
-        current.insert("worker".to_string(), running("d2"));
+        let current: Vec<(String, String, AppInstanceStatus)> =
+            vec![running("d1"), running_with_name("worker", "d2")];
         let desired = HashMap::new();
 
         let diff = compute_app_diff(&current, &desired);
@@ -4104,17 +4191,21 @@ mod tests {
 
     #[test]
     fn diff_mixed_scenario() {
-        let mut current = HashMap::new();
-        current.insert("keep".to_string(), running("d1"));
-        current.insert("stop_me".to_string(), running("d2"));
-        current.insert("update_me".to_string(), running("d3"));
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![
+            running_with_name("keep", "d1"),
+            running_with_name("stop_me", "d2"),
+            running_with_name("update_me", "d3"),
+        ];
         let mut desired = HashMap::new();
         desired.insert("keep".to_string(), make_spec("d1")); // unchanged
         desired.insert("update_me".to_string(), make_spec("d4")); // changed
         desired.insert("new_app".to_string(), make_spec("d5")); // new
 
         let diff = compute_app_diff(&current, &desired);
-        assert_eq!(diff.apps_to_stop, vec!["stop_me"]);
+        assert_eq!(
+            diff.apps_to_stop,
+            vec![("stop_me".to_string(), "d2".to_string())]
+        );
         assert_eq!(diff.apps_to_start.len(), 2);
         assert!(diff.apps_to_start.iter().any(|(n, _)| n == "update_me"));
         assert!(diff.apps_to_start.iter().any(|(n, _)| n == "new_app"));
@@ -4131,11 +4222,11 @@ mod tests {
 
     #[test]
     fn diff_crashed_app_still_detected_as_running() {
-        let mut current = HashMap::new();
-        current.insert(
-            "api".to_string(),
-            make_status("d1", AppInstanceStatus::Crashed { restart_count: 3 }),
-        );
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![make_status(
+            "api",
+            "d1",
+            AppInstanceStatus::Crashed { restart_count: 3 },
+        )];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d2"));
 
@@ -4146,11 +4237,11 @@ mod tests {
 
     #[test]
     fn diff_self_corrects_on_same_deployment_after_crash() {
-        let mut current = HashMap::new();
-        current.insert(
-            "api".to_string(),
-            make_status("d1", AppInstanceStatus::Crashed { restart_count: 5 }),
-        );
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![make_status(
+            "api",
+            "d1",
+            AppInstanceStatus::Crashed { restart_count: 5 },
+        )];
         let mut desired = HashMap::new();
         desired.insert("api".to_string(), make_spec("d1"));
 
@@ -4168,8 +4259,8 @@ mod tests {
             AppInstanceStatus::Running,
             AppInstanceStatus::Stopping,
         ] {
-            let mut current = HashMap::new();
-            current.insert("api".to_string(), make_status("d1", status.clone()));
+            let current: Vec<(String, String, AppInstanceStatus)> =
+                vec![make_status("api", "d1", status.clone())];
             let mut desired = HashMap::new();
             desired.insert("api".to_string(), make_spec("d2"));
 
@@ -4419,11 +4510,19 @@ mod tests {
         {
             let mut guard = state.write().await;
             guard.apps.insert(
-                ("test-tenant".to_string(), "app-a".to_string()),
+                (
+                    "test-tenant".to_string(),
+                    "app-a".to_string(),
+                    "d1".to_string(),
+                ),
                 Arc::new(Mutex::new(app_a)),
             );
             guard.apps.insert(
-                ("test-tenant".to_string(), "app-b".to_string()),
+                (
+                    "test-tenant".to_string(),
+                    "app-b".to_string(),
+                    "d1".to_string(),
+                ),
                 Arc::new(Mutex::new(app_b)),
             );
         }
@@ -4434,7 +4533,7 @@ mod tests {
                 .read()
                 .await
                 .apps
-                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .get(&("test-tenant".to_string(), "app-a".to_string(), "d1".to_string()))
                 .unwrap()
                 .lock()
                 .await
@@ -4463,7 +4562,7 @@ mod tests {
                 .read()
                 .await
                 .apps
-                .get(&("test-tenant".to_string(), "app-a".to_string()))
+                .get(&("test-tenant".to_string(), "app-a".to_string(), "d1".to_string()))
                 .unwrap()
                 .lock()
                 .await
@@ -4696,7 +4795,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         sup.evict_idle_apps(Duration::from_secs(1)).await;
         assert_eq!(state.read().await.apps.len(), 1);
@@ -4731,7 +4830,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         sup.evict_idle_apps(Duration::from_secs(1)).await;
         assert_eq!(state.read().await.apps.len(), 1);
@@ -4816,7 +4915,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         sup.evict_idle_apps(Duration::from_secs(1)).await;
         assert_eq!(state.read().await.apps.len(), 1);
@@ -4857,7 +4956,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         sup.reset_meters_after(&hb).await;
@@ -4899,7 +4998,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
 
         // Build heartbeat with current state (deployment_id="d1")
         let sup = make_supervisor(state.clone());
@@ -4911,7 +5010,7 @@ mod tests {
             let mut guard = state.write().await;
             let existing = guard
                 .apps
-                .get_mut(&("t_test".into(), "my-app".into()))
+                .get_mut(&("t_test".into(), "my-app".into(), "d1".into()))
                 .unwrap();
             let mut inst = existing.lock().await;
             inst.deployment_id = "d2".into(); // deployment changed!
@@ -4969,7 +5068,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         // Sanity check: build_heartbeat stamped Some(60).
@@ -5027,7 +5126,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
 
         // Build heartbeat with current state (deployment_id="d1")
         let sup = make_supervisor(state.clone());
@@ -5039,7 +5138,7 @@ mod tests {
             let mut guard = state.write().await;
             let existing = guard
                 .apps
-                .get_mut(&("t_test".into(), "my-app".into()))
+                .get_mut(&("t_test".into(), "my-app".into(), "d1".into()))
                 .unwrap();
             let mut inst = existing.lock().await;
             inst.deployment_id = "d2".into(); // deployment changed!
@@ -5103,7 +5202,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         // Sanity check: build_heartbeat stamped 200ms onto the wire.
@@ -5161,7 +5260,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
 
         // Build heartbeat with current state (deployment_id="d1")
         let sup = make_supervisor(state.clone());
@@ -5173,7 +5272,7 @@ mod tests {
             let mut guard = state.write().await;
             let existing = guard
                 .apps
-                .get_mut(&("t_test".into(), "my-app".into()))
+                .get_mut(&("t_test".into(), "my-app".into(), "d1".into()))
                 .unwrap();
             let mut inst = existing.lock().await;
             inst.deployment_id = "d2".into(); // deployment changed!
@@ -5230,7 +5329,7 @@ mod tests {
             .write()
             .await
             .apps
-            .insert(("t_test".into(), "my-app".into()), app);
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app);
         let sup = make_supervisor(state.clone());
         let hb = sup.build_heartbeat().await;
         let stamped = hb.apps.get("my-app").expect("app present");

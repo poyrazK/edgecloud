@@ -315,11 +315,17 @@ async fn wait_for_app_gone(
     app_name: &str,
     timeout_secs: u64,
 ) -> bool {
-    let key = (tenant_id.to_string(), app_name.to_string());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
-        if !state.apps.contains_key(&key) {
+        let mut found = false;
+        for ((t, n, _d), _inst) in state.apps.iter() {
+            if t == tenant_id && n == app_name {
+                found = true;
+                break;
+            }
+        }
+        if !found {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -701,7 +707,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         assert!(
             !state
                 .apps
-                .contains_key(&("t_test".to_string(), "bad-hash-app".to_string())),
+                .contains_key(&("t_test".to_string(), "bad-hash-app".to_string(), "d1".to_string())),
             "tampered-hash app must NOT be registered"
         );
     }
@@ -876,7 +882,7 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "cache-dbl-bad-app".to_string())),
+            .contains_key(&("t_test".to_string(), "cache-dbl-bad-app".to_string(), "d1".to_string())),
         "app must NOT be registered when both cache and fresh download fail verification"
     );
     drop(state);
@@ -931,7 +937,7 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "download-500-app".to_string())),
+            .contains_key(&("t_test".to_string(), "download-500-app".to_string(), "d1".to_string())),
         "app must NOT be registered when the control plane returns 500"
     );
     drop(state);
@@ -1145,7 +1151,7 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
             if state.apps.is_empty() {
                 eprintln!("worker {label}: no apps registered (message never consumed?)");
             }
-            for ((tenant, name), inst) in state.apps.iter() {
+            for ((tenant, name, _deployment_id), inst) in state.apps.iter() {
                 let inst = inst.lock().await;
                 eprintln!(
                     "worker {label}: app ({tenant}, {name}) status={:?} last_error={:?}",
@@ -1190,15 +1196,16 @@ async fn wait_for_either_app_running(
     app_name: &str,
     timeout_secs: u64,
 ) -> Option<usize> {
-    let key = (tenant_id.to_string(), app_name.to_string());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         for (i, sup) in supervisors.iter().enumerate() {
             let state = sup.state.read().await;
-            if let Some(inst) = state.apps.get(&key) {
-                let inst = inst.lock().await;
-                if matches!(inst.status, AppInstanceStatus::Running) {
-                    return Some(i);
+            for ((t, n, _d), inst) in state.apps.iter() {
+                if t == tenant_id && n == app_name {
+                    let inst = inst.lock().await;
+                    if matches!(inst.status, AppInstanceStatus::Running) {
+                        return Some(i);
+                    }
                 }
             }
         }
@@ -2100,7 +2107,7 @@ async fn test_artifact_signature_mismatch_rejects_app() {
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "sig-bad-app".to_string())),
+            .contains_key(&("t_test".to_string(), "sig-bad-app".to_string(), "d1".to_string())),
         "wrong-signature app must NOT be registered"
     );
 }
@@ -2169,7 +2176,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
     // Stop the app so we can re-start it with the tampered sig.
     harness
         .supervisor
-        .stop_app("t_test", "sig-cache-app")
+        .stop_app("t_test", "sig-cache-app", "d1")
         .await
         .expect("stop_app");
 
@@ -2201,7 +2208,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "sig-cache-app".to_string())),
+            .contains_key(&("t_test".to_string(), "sig-cache-app".to_string(), "d1".to_string())),
         "tampered-sig app on cache hit must NOT be re-registered"
     );
 }
@@ -2265,7 +2272,7 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "replay-app".to_string())),
+            .contains_key(&("t_test".to_string(), "replay-app".to_string(), "d1".to_string())),
         "replay across deployment_ids must NOT register the app"
     );
 }
@@ -2334,7 +2341,7 @@ async fn test_artifact_missing_signature_rejects_when_required() {
     assert!(
         !state
             .apps
-            .contains_key(&("t_test".to_string(), "no-sig-app".to_string())),
+            .contains_key(&("t_test".to_string(), "no-sig-app".to_string(), "d1".to_string())),
         "no-signature app with require_signature=true must NOT be registered"
     );
 
