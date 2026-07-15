@@ -1562,6 +1562,9 @@ mod tests {
             l4_max_conns_per_app: 1000,
             l4_max_conns_per_ip: 100,
             l4_port_cooldown_secs: 60,
+            ingress_rate_limit_aggregation: false,
+            global_rps_uds_path: std::path::PathBuf::from("/var/run/edge-ingress/global-rps.sock"),
+            global_rps_tick_interval: std::time::Duration::from_secs(1),
         }
     }
 
