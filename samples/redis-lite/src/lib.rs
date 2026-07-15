@@ -65,8 +65,8 @@ wit_bindgen::generate!({
 // RESP parser lives in its own sibling crate (`samples/redis-lite/resp-parser/`)
 // so the unit tests can run on the host — the parent crate is
 // `#![no_main]` for the WASM cdylib, which prevents `cargo test` from
-// linking a test binary. Implementation is duplicated byte-for-byte
-// across the two files; keep them in sync.
+// linking a test binary. There is no second copy in this crate; edit
+// `resp-parser/src/lib.rs` and the parent picks up the new parser.
 use redis_lite_resp as resp;
 
 use crate::edge::cloud::kv_store;
@@ -95,10 +95,19 @@ const ERR_WRONG_ARITY: &[u8] = b"-ERR wrong number of arguments\r\n";
 /// Desync reply — the wire bytes stopped being valid RESP mid-stream.
 const ERR_BAD_PROTOCOL: &[u8] = b"-ERR bad protocol\r\n";
 
-/// Maximum bytes we'll buffer while waiting for a complete RESP frame.
-/// A SET with a 16 MiB value is plausible; 64 MiB leaves room without
-/// giving a malicious client an unbounded growth vector. Bulk reads
-/// larger than this trigger an error reply and a connection close.
+/// Reply when an ECHO / GET reply would exceed `MAX_BULK_BYTES`.
+/// Defensive symmetry with the read-side cap — without this, a
+/// malicious client can force a 64 MiB allocation on every reply even
+/// though we refuse to *read* more than 64 MiB.
+const ERR_VALUE_TOO_LARGE: &[u8] = b"-ERR value too large\r\n";
+
+/// Maximum bytes we'll buffer while waiting for a complete RESP frame,
+/// OR allocate when constructing a reply. A SET with a 16 MiB value is
+/// plausible; 64 MiB leaves room without giving a malicious client an
+/// unbounded growth vector. Reads larger than this trigger an error
+/// reply and a connection close; replies larger than this (e.g. ECHO
+/// of a 64 MiB value) send `-ERR value too large` and skip the
+/// allocation.
 const MAX_BULK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Convenience wrapper around `observe::emit_log` — the guest doesn't
@@ -253,6 +262,10 @@ fn dispatch_command(args: Vec<resp::Frame>, output: &mut OutputStream) {
             }
             match &args[1] {
                 resp::Frame::Bulk(Some(b)) => {
+                    if b.len() > MAX_BULK_BYTES {
+                        let _ = write_all(output, ERR_VALUE_TOO_LARGE);
+                        return;
+                    }
                     let mut reply = Vec::with_capacity(b.len() + 16);
                     reply.extend_from_slice(format!("${}\r\n", b.len()).as_bytes());
                     reply.extend_from_slice(b);
@@ -310,6 +323,10 @@ fn dispatch_command(args: Vec<resp::Frame>, output: &mut OutputStream) {
             };
             match kv_store::get(key) {
                 Some(v) => {
+                    if v.len() > MAX_BULK_BYTES {
+                        let _ = write_all(output, ERR_VALUE_TOO_LARGE);
+                        return;
+                    }
                     let mut reply = Vec::with_capacity(v.len() + 16);
                     reply.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
                     reply.extend_from_slice(&v);

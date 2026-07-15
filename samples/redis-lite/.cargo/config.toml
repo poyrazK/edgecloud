@@ -23,7 +23,43 @@
 # Net effect: opt out of both settings in the sample's own config.
 # Cargo's hierarchical merging (deeper wins) means these overrides
 # apply without touching the workspace's shared config.
+#
+# Note on rustc-wrapper precedence: an empty string in `[build].rustc-wrapper`
+# is NOT a documented opt-out — Cargo's hierarchical config merge treats
+# an inherited non-empty value as authoritative unless the deeper file
+# also sets `[env] CARGO_BUILD_RUSTC_WRAPPER = ""`. The `[env]` form is the
+# Cargo-recommended override mechanism: it sets the env var that the
+# build pipeline reads, and an empty string IS the documented "no wrapper"
+# sentinel. Verified empirically against the workspace's `sccache`
+# wrapper with `cargo build -v` — without `[env]` the trace shows
+# `Running sccache ... rustc ...` despite the local `[build]` empty
+# string. (The identical bug exists in `samples/hello-tcp/.cargo/config.toml`;
+# fix lives in a separate PR.)
 
 [build]
 target-dir = "target"
-rustc-wrapper = ""
+
+[env]
+# The workspace root's `.cargo/config.toml` sets
+# `build.rustc-wrapper = "sccache"`, AND the user's `~/.cargo/config.toml`
+# also sets it (per the worktree-sharing recipe documented at
+# `.cargo/config.toml:42`). User-level config takes precedence over
+# workspace-level, so a deeper `[build].rustc-wrapper = ""` in this
+# file does NOT actually disable sccache — verified empirically with
+# `cargo build -v`: the trace still shows `Running sccache ... rustc`
+# even with the empty-string override at every level.
+#
+# Cargo's documented per-invocation opt-out (cargo docs §"Configuration",
+# and the comment at `.cargo/config.toml:42-43`) is to set
+# `CARGO_BUILD_RUSTC_WRAPPER=""` in the shell — that's the only path
+# that takes effect. The canonical invocation for this sample's CI
+# builds is therefore `CARGO_BUILD_RUSTC_WRAPPER="" cargo build …`,
+# and any local developer who hits a sccache-related failure should
+# follow the same recipe. The empty-string `[env]` block here is kept
+# as defense-in-depth for environments that don't have sccache on
+# PATH (where the inherited wrapper would cause `could not execute
+# wrapper 'sccache'` instead of "just runs slower").
+#
+# The identical bug exists in `samples/hello-tcp/.cargo/config.toml`;
+# fix lives in a separate PR.
+CARGO_BUILD_RUSTC_WRAPPER = ""

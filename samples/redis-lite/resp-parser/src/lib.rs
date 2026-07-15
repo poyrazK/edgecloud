@@ -3,8 +3,8 @@
 //! Extracted from `samples/redis-lite/src/resp.rs` into its own crate
 //! so the unit tests can run on the host (the parent crate is
 //! `#![no_main]` for the WASM cdylib, which prevents `cargo test`
-//! from linking a test binary). The implementation is duplicated
-//! byte-for-byte — keep both files in sync.
+//! from linking a test binary). There is no second copy in this crate;
+//! edit the parser here and the parent picks up the new logic.
 //!
 //! Handles: simple strings (`+OK\r\n`), errors (`-...\r\n`), integers
 //! (`:N\r\n`), bulk strings (`$N\r\n<bytes>\r\n` or `$-1\r\n` for nil),
@@ -195,5 +195,10 @@ mod tests {
         assert_eq!(parse(b"$3\r\nfo"), Err(Error::Incomplete));
         assert_eq!(parse(b"$3\r\nfooXX"), Err(Error::BadProtocol));
         assert_eq!(parse(b"$-2\r\n"), Err(Error::BadProtocol));
+        // Lone LF (no CR) is rejected as BadProtocol — `parse_line`
+        // returns Incomplete when no \r\n terminator is seen, then
+        // escalates to BadProtocol when a bare \n is present.
+        assert_eq!(parse(b"+OK\n"), Err(Error::BadProtocol));
+        assert_eq!(parse(b"-ERR oops\n"), Err(Error::BadProtocol));
     }
 }
