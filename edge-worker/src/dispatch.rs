@@ -1148,6 +1148,26 @@ fn synthetic_500(
     meter: &Arc<RequestMeter>,
     metrics_handle: Option<&Arc<crate::metrics::MetricsHandle>>,
 ) -> HyperResponse<HyperOutgoingBody> {
+    // Stamp the per-deployment 5xx counter (issue #84 asks 6/7) at
+    // the single chokepoint all three error terminal arms share.
+    // The heartbeat reads `meter.errors` via `MeterSnapshot` and
+    // subtracts the delta on each tick (mirrors `record_request` /
+    // `record_outbound_bytes`). The Prometheus IntCounter on
+    // `metrics_handle.status_5xx` (issue #84 family
+    // `edge_status_5xx_total`) is monotonic, the same way
+    // `requests` / `outbound_bytes` / `resident_seconds` /
+    // `duration_ms` are — see `WorkerMetrics::new` in metrics.rs.
+    //
+    // Not bumped by `synthetic_413` (the body-cap early return) —
+    // 413 is a tenant-config violation, not a guest error, and
+    // the existing `record_request` comment already excludes it
+    // from billing. Mirrors the issue #84 plan: the three error
+    // terminal arms of `handle_request` stamp; the body-cap arm
+    // does not.
+    meter.record_error();
+    if let Some(handle) = metrics_handle {
+        handle.status_5xx.inc();
+    }
     synthetic_response(
         hyper::StatusCode::INTERNAL_SERVER_ERROR,
         diagnostic,
