@@ -159,33 +159,36 @@ impl NatsPublisher {
         Ok(())
     }
 
-    /// Publish one delta for the given replica. Fire-and-forget;
-    /// if the publish fails, the next tick republishes. Mirrors
-    /// `edge_worker::nats::publish_heartbeat` at
-    /// `edge-worker/src/nats.rs:252-261`.
+    /// Publish one delta for the given replica. Best-effort; if the
+    /// publish fails, the next tick republishes.
+    ///
+    /// **Implementation note:** this MUST go through `jetstream.publish`,
+    /// not the bare `client.publish` (core NATS). The subject
+    /// `edgecloud.rate-limit.global.delta.<replica>` lives on the
+    /// `edgecloud-rl-global` JetStream stream (`build_stream_config`),
+    /// and a core-NATS `PUB` on a JS-managed subject is delivered
+    /// directly to subscribers but is NOT persisted to the stream —
+    /// the JS push consumer (`spawn_consumer`) subscribes via the
+    /// stream's deliver subject, so a core-NATS publish never reaches
+    /// it. Mirrors `edge_worker::nats::publish_task_message` at
+    /// `edge-worker/src/nats.rs:220-250` (the worker uses JS for task
+    /// messages for exactly this reason). The `PublishAckFuture`
+    /// returned by `jetstream.publish` is awaited so a stream outage
+    /// surfaces as an `Err` here and the next tick can retry — losing
+    /// a single tick costs at most 1s of measurement accuracy, which
+    /// is the same self-healing shape the heartbeat path uses.
     pub async fn publish_delta(&self, replica_id: &str, msg: &DeltaMsg) -> anyhow::Result<()> {
         let subject = delta_subject(replica_id);
         let payload = serde_json::to_vec(&msg.to_wire()).context("serialize delta")?;
-        self.client
+        jetstream::new(self.client.clone())
             .publish(subject, payload.into())
             .await
             .map_err(nats_err)
-            .context("publish delta")?;
+            .context("publish delta")?
+            .await
+            .map_err(nats_err)
+            .context("await publish ack")?;
         Ok(())
-    }
-
-    /// Flush the underlying client's outbound buffer so any queued
-    /// `publish_delta` calls actually reach the server. Test-only
-    /// helper — production callers stay fire-and-forget because the
-    /// 1s scrape cadence gives the connection ample time to drain
-    /// naturally. async-nats 0.49.1 batches writes via `poll_flush`
-    /// on its own schedule; in a test where we publish-then-poll,
-    /// the bytes can still be sitting in the outbound buffer when
-    /// the consumer's `LastPerSubject` query fires, so the server
-    /// has nothing to deliver. Calling `flush()` forces the bytes
-    /// onto the wire before the test polls the aggregator.
-    pub async fn flush(&self) -> anyhow::Result<()> {
-        self.client.flush().await.map_err(nats_err).context("flush")
     }
 }
 

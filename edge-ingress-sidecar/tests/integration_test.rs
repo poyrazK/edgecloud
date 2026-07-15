@@ -123,21 +123,6 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
     // these on every 1s scrape tick; the test publishes one per
     // replica because the aggregator's window is 1s and the assertion
     // is on the steady-state snapshot (3 distinct replicas seen).
-    //
-    // async-nats 0.49.1's `client.publish()` enqueues the publish
-    // command into the outbound channel and returns; the bytes are
-    // written to the socket on the connection's next `poll_flush`,
-    // which runs at its own cadence. In production the 1s scrape tick
-    // gives the connection time to drain naturally, and the consumer
-    // subscribes long before the first scrape (the sidecar's first
-    // boot has minutes of grace). In the test we publish-then-poll,
-    // so the bytes can still be sitting in the outbound buffer when
-    // the consumer's `LastPerSubject` query fires — which means the
-    // server has nothing to deliver, and the aggregator stays at
-    // `replicas_seen=0`. Explicit `flush()` after each publish forces
-    // the bytes onto the wire before we move on. This is a
-    // test-only concern; production code deliberately stays
-    // fire-and-forget.
     let rps_per_replica = 10_000u32;
     for (i, rid) in replicas.iter().enumerate() {
         let msg = fresh_delta(rid, rps_per_replica);
@@ -145,7 +130,6 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
             .publish_delta(rid, &msg)
             .await
             .expect("publish");
-        publishers[i].flush().await.expect("flush");
     }
 
     // Tick the aggregator until it sees all 3 replicas with the
