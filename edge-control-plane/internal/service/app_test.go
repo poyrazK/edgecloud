@@ -14,6 +14,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
+	"github.com/jmoiron/sqlx"
 )
 
 // mockAppRepo implements appRepoInterface for testing.
@@ -133,6 +134,15 @@ func (m *mockAppRepo) AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}
 		return m.allocatedL4PortsFn(ctx)
 	}
 	return map[uint16]struct{}{}, nil
+}
+
+// WithTx returns a tx-bound *repository.AppRepository so the cascade
+// path (issue #60) can call AtomicDelete inside `repository.Transaction`.
+// Tests that don't drive Delete are free to leave this un-stubbed:
+// they'll never reach WithTx because the closure only calls it on
+// the Delete path.
+func (m *mockAppRepo) WithTx(tx *sqlx.Tx) *repository.AppRepository {
+	return repository.NewAppRepositoryFromDBTX(tx)
 }
 
 // mockQuotaRepoForApps implements quotaRepoInterface for testing.
