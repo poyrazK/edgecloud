@@ -1083,51 +1083,13 @@ func TestListDeploymentsPaginated_TextPKCursorRoundTrips(t *testing.T) {
 	}
 }
 
-// TestListDeploymentsPaginated_TotalEveryPage pins #709's
-// behavior: the dual-envelope compat release is retired —
-// `total` is filled in on EVERY page (including cursor-driven
-// pages) so the CLI's "Showing N deployments" header remains
-// accurate even after the user has walked several pages deep.
-func TestListDeploymentsPaginated_TotalEveryPage(t *testing.T) {
-	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	const wantID = "d_42"
-	cursor, err := encodeDeploymentCursor(ts, wantID)
-	if err != nil {
-		t.Fatalf("encodeDeploymentCursor: %v", err)
-	}
+// TestListDeploymentsPaginated_NoOffsetOrTotalField pins the #709
+// hard-cut wire shape: DeploymentListPage has no `NextOffset` and
+// no `Total` fields. If this test compiles, both fields are gone;
+// if a future change re-introduces either the build will fail at
+// the struct literal below.
+func TestListDeploymentsPaginated_NoOffsetOrTotalField(t *testing.T) {
 	repo := &mockDeployDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
-			return 7, nil
-		},
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
-			return []domain.Deployment{{ID: "d_2", TenantID: "t_test", AppName: "myapp", CreatedAt: ts}}, nil
-		},
-	}
-	svc := &DeploymentService{deploymentRepo: repo,
-		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
-	}
-	page, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, cursor)
-	if err != nil {
-		t.Fatalf("ListDeploymentsPaginated: %v", err)
-	}
-	if page.Total != 7 {
-		t.Errorf("page.Total = %d, want 7 (Total is filled on cursor-driven pages too)", page.Total)
-	}
-	if len(page.Items) != 1 {
-		t.Errorf("len(page.Items) = %d, want 1", len(page.Items))
-	}
-}
-
-// TestListDeploymentsPaginated_NoNextOffsetField pins the #709
-// hard-cut wire shape: DeploymentListPage has no NextOffset field.
-// If this test compiles, the field is gone; if a future change
-// re-introduces it the build will fail at the struct literal
-// below.
-func TestListDeploymentsPaginated_NoNextOffsetField(t *testing.T) {
-	repo := &mockDeployDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
-			return 0, nil
-		},
 		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return nil, nil
 		},
@@ -1140,10 +1102,9 @@ func TestListDeploymentsPaginated_NoNextOffsetField(t *testing.T) {
 		t.Fatalf("ListDeploymentsPaginated: %v", err)
 	}
 	// Struct literal enumerates the post-#709 fields. Adding
-	// NextOffset here would be a wire-shape regression.
+	// NextOffset or Total here would be a wire-shape regression.
 	_ = &DeploymentListPage{
 		Items:      page.Items,
-		Total:      page.Total,
 		Limit:      page.Limit,
 		NextCursor: page.NextCursor,
 	}

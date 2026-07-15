@@ -1329,21 +1329,20 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id stri
 }
 
 // DeploymentListPage is the wire shape the deployments handler
-// returns to callers. Post-#709: `?offset=` / `next_offset` are
-// retired; only `next_cursor` remains on the wire. `total` is kept
-// (the handler emits it on every response) because the deployments
-// list has a small bounded size per (tenant, app) and the field
-// costs one COUNT(*) per request.
+// returns to callers. Post-#709: `?offset=` / `next_offset` / `total`
+// are retired; only `next_cursor` remains on the wire alongside
+// `items` and `limit`. The cursor walker counts locally, so the
+// server no longer needs to compute COUNT(*) per page (the previous
+// `total` field added a round-trip to every cursor-walk request with
+// no consumer — the CLI renders "N deployments" from the walked
+// items, not from `total`).
 //
 //   - Items: page slice (newest-first by created_at, then id).
-//   - Total: COUNT(*) for the (tenant, app) — bounded by
-//     quota.MaxDeployments.
 //   - Limit: effective page size.
 //   - NextCursor: opaque keyset cursor for the next page; nil on
 //     the final page.
 type DeploymentListPage struct {
 	Items      []domain.Deployment
-	Total      int
 	Limit      int
 	NextCursor *string
 }
@@ -1353,11 +1352,9 @@ type DeploymentListPage struct {
 // value previously returned as NextCursor; the empty string means
 // "first page".
 //
-// Issue #709 — `?offset=` / `next_offset` retired. This is the only
-// paginated path; the dual-envelope WithTotal variant from #58 is
-// folded into this method. Total is filled in unconditionally via
-// CountByApp (one extra COUNT(*) per request; deployments is bounded
-// by quota.MaxDeployments so the cost is acceptable).
+// Issue #709 — `?offset=` / `next_offset` / `total` retired. This is
+// the only paginated path; the dual-envelope WithTotal variant from
+// #58 is folded into this method and the per-page COUNT(*) is gone.
 //
 // Limit clamp: 1..100. Defense in depth — the handler also clamps
 // before calling.
@@ -1409,17 +1406,6 @@ func (s *DeploymentService) ListDeploymentsPaginated(
 		page.NextCursor = &cursor
 	}
 	page.Items = rows
-
-	// Total on every page (post-#709): the dual-envelope compat release
-	// is retired; next_offset is gone but total stays because the
-	// CLI's deployments table still renders "N deployments" in the
-	// header. One COUNT(*) per request; bounded by quota.MaxDeployments.
-	total, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
-	if err != nil {
-		return nil, fmt.Errorf("counting deployments: %w", err)
-	}
-	page.Total = total
-
 	return page, nil
 }
 

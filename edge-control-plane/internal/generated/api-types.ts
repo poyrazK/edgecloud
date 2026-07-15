@@ -2082,8 +2082,6 @@ export interface components {
         };
         DeploymentListResponse: {
             items?: components["schemas"]["Deployment"][];
-            /** @example 3 */
-            total?: number;
             /** @example 20 */
             limit?: number;
             /**

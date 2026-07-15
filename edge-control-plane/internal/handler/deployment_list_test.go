@@ -20,10 +20,14 @@ import (
 
 // listableStubDeploymentRepo is a focused stub for the
 // deployments-list path. It implements the deploymentRepoInterface
-// methods that are reachable from DeploymentService.ListDeploymentsPaginated
+// methods reachable from DeploymentService.ListDeploymentsPaginated
 // (issue #58, hard-cut in #709) and panics on every other method —
 // a deliberate tripwire if a future change routes the list path
 // through an unrelated repo method.
+//
+// `CountByApp` is kept here (returning 0 by default) for interface
+// compliance — Deploy's quota check still calls it on its own path;
+// the list path no longer does.
 //
 // Kept here (not in deployment_test.go) to avoid coupling the list
 // tests to the idempotency fixture scaffolding that already lives
@@ -31,7 +35,6 @@ import (
 //
 // Issue #709 — afterID is now a text PK (`d_<uuid>`), not int64.
 type listableStubDeploymentRepo struct {
-	countByAppFn         func(ctx context.Context, tenantID, appName string) (int, error)
 	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error)
 }
 
@@ -41,10 +44,10 @@ func (l *listableStubDeploymentRepo) GetByID(_ context.Context, _ string) (*doma
 func (l *listableStubDeploymentRepo) ListByApp(_ context.Context, _, _ string) ([]domain.Deployment, error) {
 	panic("listableStubDeploymentRepo.ListByApp: list path should not reach here")
 }
-func (l *listableStubDeploymentRepo) CountByApp(ctx context.Context, tenantID, appName string) (int, error) {
-	if l.countByAppFn != nil {
-		return l.countByAppFn(ctx, tenantID, appName)
-	}
+func (l *listableStubDeploymentRepo) CountByApp(_ context.Context, _, _ string) (int, error) {
+	// Interface compliance only — the list path does NOT call this.
+	// The Deploy quota check is its sole consumer; tests that exercise
+	// that path set up a different stub.
 	return 0, nil
 }
 func (l *listableStubDeploymentRepo) ListByAppPaginated(
@@ -93,14 +96,12 @@ func setDeploymentRepoForTest(svc *service.DeploymentService, stub *listableStub
 }
 
 // TestDeploymentHandler_List_FirstPage_HardCut pins the post-#709
-// wire shape: no `next_offset` on any page; `next_cursor` is the
-// only pagination field. `total` is preserved because the CLI
-// renders "N deployments" in the header. `limit` is set even when
-// the query string is absent (default 20).
+// wire shape: no `next_offset` and no `total` on any page;
+// `next_cursor` is the only pagination field. `limit` is set even
+// when the query string is absent (default 20).
 func TestDeploymentHandler_List_FirstPage_HardCut(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 100, nil },
 		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{
 				ID: "d_first", TenantID: "t_test", AppName: "myapp", Status: "deployed",
@@ -122,16 +123,16 @@ func TestDeploymentHandler_List_FirstPage_HardCut(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if v, ok := resp["total"].(float64); !ok || int(v) != 100 {
-		t.Errorf("total = %v, want 100", resp["total"])
-	}
 	if v, ok := resp["limit"].(float64); !ok || int(v) != 20 {
 		t.Errorf("limit = %v, want 20 (default)", resp["limit"])
 	}
-	// #709 — next_offset is GONE from the wire. If a regression
-	// re-introduces it, this assertion fails loudly.
+	// #709 — `next_offset` and `total` are GONE from the wire. If a
+	// regression re-introduces either, this assertion fails loudly.
 	if _, hasOff := resp["next_offset"]; hasOff {
 		t.Errorf("response has 'next_offset' on first page; #709 retired it")
+	}
+	if _, hasTotal := resp["total"]; hasTotal {
+		t.Errorf("response has 'total'; #709 retired it from the wire")
 	}
 	items, ok := resp["items"].([]interface{})
 	if !ok || len(items) != 1 {
@@ -170,7 +171,6 @@ func TestDeploymentHandler_List_Offset_Returns_400(t *testing.T) {
 func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 7, nil },
 		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{
 				ID: "d_after", TenantID: "t_test", AppName: "myapp", CreatedAt: ts,
@@ -204,7 +204,6 @@ func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 // surfaces as 400 with the generic message, never 500.
 func TestDeploymentHandler_List_BadCursor_400(t *testing.T) {
 	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 0, nil },
 		// Repo methods won't be reached — the service decodes the cursor first.
 	}
 	mux := newDeploymentListMux(stub)
@@ -225,7 +224,6 @@ func TestDeploymentHandler_List_BadCursor_400(t *testing.T) {
 func TestDeploymentHandler_List_LimitClampedAt100(t *testing.T) {
 	var seenLimit int
 	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 0, nil },
 		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, limit int) ([]domain.Deployment, error) {
 			seenLimit = limit
 			return nil, nil
@@ -261,7 +259,6 @@ func TestDeploymentHandler_List_LimitClampedAt100(t *testing.T) {
 func TestDeploymentHandler_List_CursorWithLimit_200(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 3, nil },
 		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{
 				ID: "d_after", TenantID: "t_test", AppName: "myapp", CreatedAt: ts,

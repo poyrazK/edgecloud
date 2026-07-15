@@ -148,21 +148,20 @@ type statusResponse struct {
 //
 // Issue #709 hard-cut — the dual envelope from #58 is retired.
 // `?offset=` is rejected with 400. `next_offset` is gone from the
-// wire. `next_cursor` is the only pagination cursor. `total` stays
-// because the deployments list has a small bounded size per
-// (tenant, app) and the CLI renders "N deployments" in the header.
+// wire. `total` is gone from the wire (the previous field added a
+// per-page COUNT(*) round-trip with no consumer — the CLI renders
+// "N deployments" from the walked items, not from the wire field).
+// `next_cursor` is the only pagination cursor.
 //
 // On the wire:
 //
 //	{
 //	  "items":         [...],
-//	  "total":         213,
 //	  "limit":         50,
 //	  "next_cursor":   "eyJ2IjoxLCJwIjp7InRzIjoi..."   // absent on final page
 //	}
 type deploymentListResponse struct {
 	Items      []statusResponse `json:"items"`
-	Total      int              `json:"total"`
 	Limit      int              `json:"limit"`
 	NextCursor *string          `json:"next_cursor,omitempty"`
 }
@@ -751,7 +750,6 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	resp := deploymentListResponse{
 		Items:      items,
-		Total:      page.Total,
 		Limit:      page.Limit,
 		NextCursor: page.NextCursor,
 	}

@@ -738,9 +738,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Deployment'
-        total:
-          type: integer
-          example: 3
         limit:
           type: integer
           example: 20
