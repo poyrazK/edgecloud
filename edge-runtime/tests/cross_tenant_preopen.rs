@@ -57,6 +57,14 @@ fn build_state(tenant_id: &str, app_name: &str) -> RuntimeState {
     )
 }
 
+/// Host-side path-construction check: confirms that two tenants
+/// pointed at the same `EDGE_FS_PATH` base land in disjoint
+/// per-app subdirectories. NOT a guest-side escape check —
+/// proving `wasi:filesystem/types::open-at("/", ...)` cannot
+/// cross the boundary requires loading a real component (covered
+/// for the per-app constructor by `tests/handler_fixture_load.rs`
+/// and `tests/js_fixture_load.rs`); a tenant A → tenant B escape
+/// end-to-end remains a follow-up.
 #[test]
 fn preopen_isolation_two_tenants_get_distinct_subdirs() {
     // `tempfile::tempdir()` gives us a fresh base. We set
@@ -91,6 +99,11 @@ fn preopen_isolation_two_tenants_get_distinct_subdirs() {
     );
 }
 
+/// Host-side check: a file written directly into tenant A's
+/// per-app preopen subdirectory is not visible inside tenant B's
+/// per-app preopen subdirectory (no symlinks, no cross-mount,
+/// no shared parent). NOT a guest-side escape check — see the
+/// module docstring for the follow-up.
 #[test]
 fn preopen_isolation_other_tenants_files_not_visible() {
     // Host-side check that a file written into tenant A's preopen

@@ -31,16 +31,18 @@
 //! new `debug_assert!` at the top of `with_env_and_meter_preview`
 //! (this same issue) would now panic on any unsafe input.
 //!
-//! NOTE: `edge_runtime::is_safe_tenant_id` is the strict regex
-//! version re-exported from `runtime.rs`. A second, looser
-//! `interfaces::is_safe_path_component` (mod.rs:17) lives inside
-//! the runtime crate and is used by the persistence helpers
-//! (kv_store.rs, cache.rs, scheduling.rs) to validate the
-//! `<EDGE_*_PATH>/<tenant_id>/` join — that helper additionally
-//! rejects Windows reserved device names. The two predicates have
-//! different contracts; the re-exported one is what every external
-//! caller (CLI, worker, tests) actually invokes, so the contract
-//! under test here is the strict regex.
+//! NOTE: `edge_runtime::is_safe_tenant_id` is the LOOSER of the two
+//! tenant-id validators in the crate — a pure `[A-Za-z0-9_-]{1,64}`
+//! regex re-exported from `runtime.rs:411`. The persistence helpers
+//! (kv_store.rs:222, cache.rs:256, scheduling.rs:387) use the
+//! STRICTER `interfaces::is_safe_path_component` (mod.rs:17), which
+//! additionally rejects Windows reserved device names (`CON`, `PRN`,
+//! `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`). Both predicates reject the
+//! path-traversal threat surface (`..`, `/`, `\`, NUL, `:`); they
+//! differ only on Windows reserved names, which the runtime regex
+//! allows. Since the worker boundary at supervisor.rs:2074 / :2137
+//! (and the `debug_assert!` in this same issue) call the runtime
+//! regex, this test asserts the runtime regex contract.
 
 use edge_runtime::is_safe_tenant_id;
 
@@ -161,7 +163,7 @@ fn is_safe_tenant_id_accepts_valid_ids() {
         "my-tenant_42",
         "tenant_with_underscores",
         "a1b2c3",
-        "t_01HXYZABCDEFGHJKLMNPQRSTVW",
+        "t_acme01HXYZABCDEFGHJKLM",
         "a",
         "a-b-c",
         "MixedCase123",
@@ -171,4 +173,49 @@ fn is_safe_tenant_id_accepts_valid_ids() {
             "valid tenant id {id:?} must be accepted"
         );
     }
+}
+
+// ── Defense-in-depth: debug_assert! in with_env_and_meter_preview ─────
+
+// The worker boundary at supervisor.rs is the authoritative gate,
+// but the runtime constructor itself asserts `is_safe_tenant_id`
+// in debug builds. A future caller that bypasses the worker must
+// trip the assert loudly in `cargo test`. This test confirms the
+// assert fires for the canonical escape attempt and that the panic
+// message identifies the offending tenant id so the failure is
+// debuggable.
+//
+// NOTE: `debug_assert!` is compiled out in `--release` — this test
+// only proves the assertion runs in `cargo test` (the default debug
+// profile).
+#[test]
+#[should_panic(expected = "unsafe tenant_id")]
+fn with_env_and_meter_preview_panics_on_unsafe_tenant_id() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use edge_runtime::interfaces::observe::{AppLogContext, LogRecord, LogSink};
+    use edge_runtime::{EgressPolicy, RuntimeState};
+
+    struct NoopSink;
+    impl LogSink for NoopSink {
+        fn push(&self, _r: LogRecord, _c: AppLogContext) {}
+    }
+
+    let _ = RuntimeState::with_env_and_meter(
+        HashMap::new(),
+        None,
+        "../etc/passwd".to_string(), // rejected: contains '/'
+        "app",
+        Arc::new(EgressPolicy::allow_all()),
+        Arc::new(NoopSink) as Arc<dyn LogSink>,
+        AppLogContext {
+            app_name: "app".to_string(),
+            tenant_id: "../etc/passwd".to_string(),
+            deployment_id: "isolation-test".to_string(),
+        },
+        None,
+        edge_runtime::socket_egress::SocketEgressPolicy::default(),
+        Arc::new(edge_runtime::socket_egress::HostnamePinning::new()),
+    );
 }

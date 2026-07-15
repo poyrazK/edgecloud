@@ -319,9 +319,18 @@ impl RuntimeState {
         // ad-hoc binary, future HTTP entry point — must not silently
         // escape the per-tenant root via `Path::join`. Panics in
         // `cargo test`; compiles to nothing in `--release`.
+        //
+        // We call the SAME predicate the worker calls — the
+        // runtime-local `is_safe_tenant_id` at line 411 (the
+        // re-exported `[A-Za-z0-9_-]{1,64}` regex). The persistence
+        // helpers at kv_store.rs:222 / cache.rs:256 / scheduling.rs:
+        // 387 use the STRICTER `interfaces::is_safe_path_component`
+        // (also rejects Windows reserved names); asserting against
+        // the stricter one here would falsely panic on tenant ids
+        // the runtime itself accepts (e.g. `CON`).
         debug_assert!(
-            crate::interfaces::is_safe_tenant_id(&tenant_id),
-            "RuntimeState::with_env_and_meter received unsafe tenant_id {tenant_id:?}; \
+            is_safe_tenant_id(&tenant_id),
+            "RuntimeState::with_env_and_meter_preview received unsafe tenant_id {tenant_id:?}; \
              the worker boundary at edge-worker/src/supervisor.rs is the canonical gate"
         );
 

@@ -74,6 +74,16 @@ fn fresh_tenant(label: &str) -> String {
     format!("iso-{}-{}", label, uuid::Uuid::new_v4())
 }
 
+/// `KvStorePersistence::flush` (kv_store.rs:750) and
+/// `CachePersistence::flush` (cache.rs) base64-encode the value
+/// bytes before serializing. Computing the expected encoding
+/// ourselves means a refactor of the encoding function breaks the
+/// on-disk tests loudly, rather than the assertion silently
+/// degrading to "neither substring is present."
+fn b64(v: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v)
+}
+
 // --- KV store: in-memory view isolation ------------------------------
 
 #[test]
@@ -164,15 +174,19 @@ async fn kv_store_isolation_on_disk_paths_disjoint() {
 
     let raw_a = std::fs::read_to_string(&path_a).expect("read A");
     let raw_b = std::fs::read_to_string(&path_b).expect("read B");
-    // Values are base64-encoded by KvStorePersistence::flush. base64
-    // of "v-a" (3 bytes) is "di1h"; base64 of "v-b" is "di1i".
+    // Values are base64-encoded by KvStorePersistence::flush.
+    // Compute the expected encoding via the helper so a refactor
+    // of the persistence layer's encoding breaks this test
+    // loudly — the quoted JSON value pins the wire format.
+    let v_a = format!("\"{}\"", b64(b"v-a"));
+    let v_b = format!("\"{}\"", b64(b"v-b"));
     assert!(
-        raw_a.contains("\"di1h\"") && !raw_a.contains("\"di1i\""),
-        "tenant A's store.json must contain base64(v-a) and not base64(v-b) (got: {raw_a})"
+        raw_a.contains(&v_a) && !raw_a.contains(&v_b),
+        "tenant A's store.json must contain {v_a:?} and not {v_b:?} (got: {raw_a})"
     );
     assert!(
-        raw_b.contains("\"di1i\"") && !raw_b.contains("\"di1h\""),
-        "tenant B's store.json must contain base64(v-b) and not base64(v-a) (got: {raw_b})"
+        raw_b.contains(&v_b) && !raw_b.contains(&v_a),
+        "tenant B's store.json must contain {v_b:?} and not {v_a:?} (got: {raw_b})"
     );
 }
 
@@ -255,39 +269,73 @@ async fn cache_isolation_on_disk_paths_disjoint() {
 
     let raw_a = std::fs::read_to_string(&path_a).expect("read A");
     let raw_b = std::fs::read_to_string(&path_b).expect("read B");
+    // Values are base64-encoded by CachePersistence::flush.
+    // Compute the expected encoding via the helper so a refactor
+    // of the persistence layer's encoding breaks this test
+    // loudly — the quoted JSON value pins the wire format.
+    let v_a = format!("\"{}\"", b64(b"cv-a"));
+    let v_b = format!("\"{}\"", b64(b"cv-b"));
     assert!(
-        raw_a.contains("Y3YtYQ") && !raw_a.contains("Y3YtYg"),
-        "tenant A's cache.json must contain base64(cv-a) and not base64(cv-b) (got: {raw_a})"
+        raw_a.contains(&v_a) && !raw_a.contains(&v_b),
+        "tenant A's cache.json must contain {v_a:?} and not {v_b:?} (got: {raw_a})"
     );
     assert!(
-        raw_b.contains("Y3YtYg") && !raw_b.contains("Y3YtYQ"),
-        "tenant B's cache.json must contain base64(cv-b) and not base64(cv-a) (got: {raw_b})"
+        raw_b.contains(&v_b) && !raw_b.contains(&v_a),
+        "tenant B's cache.json must contain {v_b:?} and not {v_a:?} (got: {raw_b})"
     );
 }
 
 // --- Scheduling isolation --------------------------------------------
 
+// `Scheduler::schedule_once` returns a UUID for each task, so
+// `task_a != task_b` would be true even in a shared-namespace
+// scheduler. The real isolation check is "tenant B's scheduler
+// refuses to cancel a tenant-A task" — `cancel` errors with
+// "task not found" if the id isn't in this scheduler's task
+// map. We schedule under tenant A, then assert tenant B's
+// scheduler rejects the cancel — proof the two task maps are
+// disjoint.
 #[tokio::test(flavor = "current_thread")]
 async fn scheduling_isolation_two_tenants_get_disjoint_views() {
     let sched_dir = tempfile::tempdir().expect("sched tempdir");
     let sched_str = sched_dir.path().to_string_lossy().to_string();
     let tenant_a = fresh_tenant("sched-a");
     let tenant_b = fresh_tenant("sched-b");
+    let tenant_a_in = tenant_a.clone();
+    let tenant_b_in = tenant_b.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         temp_env::with_var("EDGE_SCHEDULING_PATH", Some(&sched_str), || {
-            let state_a = build_state(&tenant_a, "app-a");
+            let state_a = build_state(&tenant_a_in, "app-a");
             let task_a = state_a
                 .scheduling
                 .schedule_once(60_000, b"payload-a".to_vec())
                 .expect("A schedule");
 
-            let state_b = build_state(&tenant_b, "app-b");
+            let state_b = build_state(&tenant_b_in, "app-b");
             let task_b = state_b
                 .scheduling
                 .schedule_once(60_000, b"payload-b".to_vec())
                 .expect("B schedule");
 
+            // Task ids differ — but this would be true even in a
+            // shared scheduler. The real check is below: tenant B
+            // cannot see tenant A's task in its map.
+            assert_ne!(task_a, task_b, "task ids must be distinct UUIDs");
+
+            // Tenant B's scheduler must NOT find tenant A's task.
+            // `cancel` returns `Err("task not found: ...")` if the
+            // id isn't in this scheduler's task map, so a
+            // successful cancel would prove a shared map.
+            let cross_cancel = state_b.scheduling.cancel(&task_a);
+            assert!(
+                cross_cancel.is_err(),
+                "tenant B's scheduler must not see tenant A's task {task_a}; \
+                 got {cross_cancel:?} (issue #620)"
+            );
+
+            // Both schedulers' own tasks must still be cancellable
+            // (sanity check that the cross-cancel didn't disturb them).
             state_a.scheduling.cancel(&task_a).expect("A cancel");
             state_b.scheduling.cancel(&task_b).expect("B cancel");
 
@@ -297,10 +345,14 @@ async fn scheduling_isolation_two_tenants_get_disjoint_views() {
     .await
     .expect("spawn_blocking panicked");
 
-    let (task_a, task_b) = result;
-    assert_ne!(task_a, task_b, "scheduler task ids must be distinct");
+    let (_task_a, _task_b) = result;
 }
 
+// `schedule_once` calls `flush_if_persistent` immediately
+// (scheduling.rs:427), so `schedule.json` is on disk by the time
+// the closure returns — no need to wait for Drop or explicit
+// flush. The wrapping `spawn_blocking` is still required so
+// `flush_if_persistent` has a Tokio runtime handle to `block_on`.
 #[tokio::test(flavor = "current_thread")]
 async fn scheduling_isolation_on_disk_paths_disjoint() {
     let sched_dir = tempfile::tempdir().expect("sched tempdir");
