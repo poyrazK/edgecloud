@@ -486,9 +486,10 @@ func newFirstDeployCP(
 		NATS: config.NATSConfig{URL: "nats://localhost:4222"},
 		App:  config.AppConfig{Host: "0.0.0.0", Port: 8080, Env: "test"},
 		JWT: config.JWTConfig{
-			Secret: firstDeployJWTSecret,
-			Issuer: firstDeployIssuer,
-			TTL:    24,
+			Secret:          firstDeployJWTSecret,
+			Issuer:          firstDeployIssuer,
+			TTL:             24,
+			WorkerTokenTTL:  15 * time.Minute,
 		},
 		Region:          firstDeployRegion,
 		BootstrapSecret: firstDeployBootstrapSec,
