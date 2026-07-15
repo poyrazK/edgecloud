@@ -23,10 +23,24 @@ type TenantRateLimitRequest struct {
 	// falls back to RPS at the ingress renderer.
 	Burst int32 `json:"burst"`
 	// ConcurrentLimit caps in-flight requests per tenant
-	// (sub-feature #2). Render layer deferred.
+	// (sub-feature #2, issue #663). Rendered as a
+	// `tenant_concurrent` HTTP handler invocation by
+	// edge-ingress (see edge-ingress/src/caddy.rs); enforced
+	// inside the custom Caddy image
+	// `edgecloud/caddy-concurrent:latest` by the first-party
+	// module at `caddy-modules/tenant_concurrent/`. Each `key`
+	// keeps a buffered-channel semaphore sized at this value.
 	ConcurrentLimit int32 `json:"concurrent_limit"`
-	// BandwidthBPS caps per-tenant bytes/sec (sub-feature #3).
-	// Render layer deferred — needs Caddy 2.8+ bandwidth field.
+	// BandwidthBPS caps per-tenant bytes/sec (sub-feature #3,
+	// issue #664). Rendered as a `tenant_bandwidth` HTTP
+	// handler invocation by edge-ingress (see
+	// edge-ingress/src/caddy.rs); enforced inside the custom
+	// Caddy image `edgecloud/caddy-concurrent:latest` by the
+	// first-party module at `caddy-modules/tenant_bandwidth/`.
+	// Stock `caddy:2` has no response-payload throttle primitive
+	// (caddyserver/caddy#4476 closed as not-planned), so this
+	// cap is implemented as a token-bucket pacing writer that
+	// wraps the downstream `http.ResponseWriter`.
 	BandwidthBPS int64 `json:"bandwidth_bps"`
 }
 
