@@ -76,6 +76,29 @@ du -sh ../target-cache/edgecloud        # single shared target (one dir up from 
 
 If a build fails with `could not execute wrapper 'sccache'`, install sccache or unset the wrapper locally with `CARGO_BUILD_RUSTC_WRAPPER=""`. CI does not use sccache — `Swatinem/rust-cache@v2` already caches cold builds, and the per-job `RUSTFLAGS` set `-C debuginfo=0` so CI builds stay lean.
 
+### Production-equivalent Docker stack (issue #512)
+
+For a single-host demo deployment, the repo ships multi-stage Dockerfiles
+(`edge-control-plane/Dockerfile`, `edge-worker/Dockerfile`,
+`edge-ingress/Dockerfile`), a production-equivalent compose file
+(`docker-compose.prod.yml`), a committed `.dockerignore`, and an
+operator runbook at `docs/prod-compose.md`. Build-command
+overrides: every Dockerfile sets `CARGO_BUILD_RUSTC_WRAPPER=""` +
+`CARGO_TARGET_DIR=/build/target` in its Rust builder stage to sidestep
+`.cargo/config.toml`'s sccache + config-relative target-dir (which
+would point at the wrong place inside Docker). Caching is BuildKit
+`cache-from: type=gha,mode=max` + `--mount=type=cache` for the cargo
+registry; layer reuse is what makes the second CI build drop from
+~25 min to ~2 min.
+
+Use `make prod-up` / `make prod-smoke` / `make prod-reset` to drive
+the stack. Pre-flight, copy `.env.prod.example` to `.env.prod` and
+substitute every `replace-me-...` placeholder with the operator's
+actual secret. `validateDBPassword` (issue #626) enforces a 16-byte
+minimum length floor on `DATABASE_PASSWORD`, and the worker fails to
+boot without a mounted `secrets/signing-keyring` file when
+`EDGE_REQUIRE_SIGNATURE=true` (the secure-by-default).
+
 ### Vendored WASI Preview 1 reactor adapter
 
 `edge build --lang=js` shells out to `wasm-tools component new --adapt <adapter>` to wrap the `wasm32-wasip1` core module produced by `edge-js-runtime` into a WASI Preview 2 component the host linker accepts. The adapter is committed at `edge-cli/adapters/wasi_snapshot_preview1.reactor.wasm` (52,238 bytes, SHA-256 `49fafbdac877303ac91bd178d8ad6b14041aca5136362fe6864f96c8413b5bea`). Pinned against wasmtime **v45.0.3** — byte-identical to the asset at <https://github.com/bytecodealliance/wasmtime/releases/download/v45.0.3/wasi_snapshot_preview1.reactor.wasm>. SHA-256 is checked by `sha256sum -c SHA256SUMS` (sidecar at `edge-cli/adapters/SHA256SUMS`); that step runs in the `rust-js-build` CI job. Issue #423.
@@ -105,6 +128,8 @@ CI jobs:
 | `typos` | crate-ci/typos across the whole repo |
 | `coverage-rust` | cargo-llvm-cov (informational) |
 | `rust-js-build` | Exercises the JS build pipeline end-to-end (`rustup target add wasm32-wasip1` + esbuild + `wasm-tools component new --adapt <vendored adapter>` against `samples/hello-js-ws/`); also verifies the vendored WASI Preview 1 reactor adapter via `sha256sum -c edge-cli/adapters/SHA256SUMS` (issue #423). |
+| `build-images` | Builds the three service Dockerfiles (`edge-{control-plane,worker,ingress}/Dockerfile`) with `docker/build-push-action@v6` + `cache-from: type=gha,mode=max`. Runs on every PR + push. Layer cache shares compiled Cargo registry across runs (issue #512). |
+| `compose-smoke` | Boots `docker-compose.prod.yml`, polls CP `/ready` (deep readiness per issue #48), uploads failure logs as an artifact. Gated on `push to main` only (skips PRs). Same scope as #577, merged into #512's PR. |
 
 `.github/workflows/preview.yml` is a `deploy-preview` job that runs on every PR `opened`/`synchronize` event (issue #308). The composite action at `.github/actions/deploy-preview/action.yml` builds the CLI via `cargo install --root $CARGO_HOME`, then runs `edge deploy --preview --pr-number=${{ github.event.pull_request.number }}`. The action includes a `Expose edge CLI on PATH` step that appends `$CARGO_HOME/bin` to `$GITHUB_PATH` — without it the next bash step fails with `edge: command not found` (rc=127). The URL is parsed from the CLI's stdout and exposed as the `preview-url` step output; the workflow's `Comment PR` step posts it on the PR when `EDGECLOUD_API_KEY` is set (fork PRs lack the secret and silently no-op).
 

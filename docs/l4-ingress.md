@@ -120,8 +120,14 @@ adds the `mholt/caddy-l4` plugin. The HTTP JSON shape is
 byte-identical to stock, so the same `render_routes` works on
 both — only `render_l4_routes` requires the plugin.
 
-`docker-compose.yml`'s `caddy` service swaps to this image. On
-startup, ingress does a single `GET /config/` and logs (does NOT
+`docker-compose.prod.yml` (issue #512)'s `caddy` service can swap to
+this image (`image: edgecloud/caddy-l4` instead of `caddy:2`). The
+dev `docker-compose.yml` does not currently ship a `caddy` service —
+to exercise the full path locally, use `make prod-up` from
+`docs/prod-compose.md` or follow the manual `docker run` recipe
+preserved below for the dev-only path.
+
+On startup, ingress does a single `GET /config/` and logs (does NOT
 fail) when `apps.layer4` is missing — surface the drift with an
 `ingress.l4.caddy_has_layer4` gauge.
 
