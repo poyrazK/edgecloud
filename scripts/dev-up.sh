@@ -169,14 +169,19 @@ if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^edgecloud-caddy$';
 fi
 
 echo "[dev-up] starting caddy..." >&2
-# Issue #548 — Caddy image must include mholt/caddy-l4 (stock
-# caddy:2 has no apps.layer4). Build the image if missing, then
-# run it with the same mounts the stock image would use.
-if ! docker image inspect edgecloud/caddy-l4:latest >/dev/null 2>&1; then
-  echo "[dev-up] building edgecloud/caddy-l4:latest (first run; adds mholt/caddy-l4 to caddy:2)..." >&2
-  docker build -t edgecloud/caddy-l4:latest \
-    -f "$SCRIPT_DIR/../edge-ingress/Dockerfile.caddy-l4" \
-    "$SCRIPT_DIR/../edge-ingress" >/dev/null
+# Issue #548 + #663 — the Caddy image must include both
+# mholt/caddy-l4 (stock caddy:2 has no apps.layer4) AND the
+# first-party tenant_concurrent HTTP middleware (stock caddy:2
+# has no in-flight concurrency counter primitive). The
+# edgecloud/caddy-concurrent image is a strict superset of
+# edgecloud/caddy-l4; we build that one and use it for the dev
+# container. The L4-only image is still built for environments
+# that don't need concurrent caps (see Dockerfile.caddy-l4).
+if ! docker image inspect edgecloud/caddy-concurrent:latest >/dev/null 2>&1; then
+  echo "[dev-up] building edgecloud/caddy-concurrent:latest (first run; adds mholt/caddy-l4 + tenant_concurrent to caddy:2)..." >&2
+  docker build -t edgecloud/caddy-concurrent:latest \
+    -f "$SCRIPT_DIR/../edge-ingress/Dockerfile.caddy-concurrent" \
+    "$SCRIPT_DIR/.." >/dev/null
 fi
 docker run -d \
   --name edgecloud-caddy \
@@ -184,7 +189,7 @@ docker run -d \
   -v "$SCRIPT_DIR/lib/caddy.json:/etc/caddy/caddy.json:ro" \
   -v "$EDGECLOUD_HOME/caddy/data:/data" \
   -v "$EDGECLOUD_HOME/caddy/config:/config" \
-  edgecloud/caddy-l4:latest \
+  edgecloud/caddy-concurrent:latest \
   caddy run --config /etc/caddy/caddy.json --adapter "" \
   >/dev/null
 

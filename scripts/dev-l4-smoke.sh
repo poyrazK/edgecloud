@@ -45,15 +45,26 @@ fail() {
     exit 1
 }
 
-# 1. xcaddy image. Build once per machine; the `docker image inspect`
+# 1. xcaddy images. Build once per machine; the `docker image inspect`
 #    short-circuits subsequent runs the same way `scripts/dev-up.sh`
-#    does.
+#    does. Two images: the L4-only one (used by this L4 smoke test
+#    and by the docker-compose caddy service in environments that
+#    don't need concurrent caps), and the concurrent-cap superset
+#    (used by `scripts/dev-up.sh` for dev work that exercises the
+#    per-tenant concurrent-request cap, issue #663).
 if ! docker image inspect edgecloud/caddy-l4:latest >/dev/null 2>&1; then
     docker build \
         -t edgecloud/caddy-l4:latest \
         -f "$REPO_ROOT/edge-ingress/Dockerfile.caddy-l4" \
         "$REPO_ROOT" \
         || fail "xcaddy build (edgecloud/caddy-l4) failed"
+fi
+if ! docker image inspect edgecloud/caddy-concurrent:latest >/dev/null 2>&1; then
+    docker build \
+        -t edgecloud/caddy-concurrent:latest \
+        -f "$REPO_ROOT/edge-ingress/Dockerfile.caddy-concurrent" \
+        "$REPO_ROOT" \
+        || fail "xcaddy build (edgecloud/caddy-concurrent) failed"
 fi
 
 # 2. Caddy up against the plugin-enabled image. `docker compose up -d caddy`

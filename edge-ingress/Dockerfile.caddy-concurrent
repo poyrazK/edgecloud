@@ -1,0 +1,46 @@
+# Dockerfile.caddy-concurrent — xcaddy-built Caddy with the
+# edgecloud/tenant_concurrent HTTP middleware (issue #663) layered
+# on top of stock `caddy:2` + mholt/caddy-l4 (issue #548).
+#
+# Stock `caddy:2` does not ship a concurrency limiter primitive for
+# HTTP routes; we add the first-party module at
+# ./caddy-modules/tenant_concurrent via xcaddy's local-path form.
+# Once the repo publishes tagged releases, switch the `--with`
+# argument to the GitHub ref (issue #663 follow-up).
+#
+# The L4 plugin is layered in alongside tenant_concurrent so the
+# same Caddy process can serve both L4 (issue #548) and HTTP — the
+# upstream image is a strict superset of `edgecloud/caddy-l4:latest`.
+#
+# Build:
+#   docker build -t edgecloud/caddy-concurrent:latest \
+#     -f edge-ingress/Dockerfile.caddy-concurrent .
+#
+# Note: the build context is the repo root (`.`), not `edge-ingress/`,
+# because the local-path form `--with ...=./caddy-modules/tenant_concurrent`
+# resolves relative to the build context.
+#
+# Operator note: when bumping Caddy upstream (caddy:2 / caddy:2-builder
+# tags), rebuild this image and republish so the ingress fleet and
+# Caddy fleet stay in lockstep. The plugin ABI is stable across
+# Caddy's `2.x` line; only major bumps (3.x) would require a
+# reverification.
+
+FROM caddy:2-builder AS builder
+# Copy the module source into the builder image. xcaddy's
+# `--with <module>=<local-path>` form expects the source at the
+# path resolved against xcaddy's CWD (which is `/usr/bin/` inside
+# this image); without this COPY the local-path form resolves to
+# `/usr/bin/caddy-modules/tenant_concurrent` and the build fails
+# with `replacement directory does not exist`. The published
+# GitHub ref form (`--with <module>@<version>`) would not need
+# this COPY; we keep the local-path form during the bootstrap
+# period until the repo publishes tagged releases of
+# edgecloud-caddy-modules/tenant_concurrent.
+COPY caddy-modules/ /usr/bin/caddy-modules/
+RUN xcaddy build \
+        --with github.com/mholt/caddy-l4 \
+        --with github.com/poyrazK/edgecloud-caddy-modules/tenant_concurrent=./caddy-modules/tenant_concurrent
+
+FROM caddy:2
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
