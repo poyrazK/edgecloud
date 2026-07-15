@@ -307,9 +307,21 @@ jobs:
       # healthchecks, bad anchor usage. Skipped if `docker compose`
       # is not on PATH (extremely unlikely on ubuntu-latest but
       # guards against a future self-hosted runner).
+      #
+      # `docker compose config` resolves `${VAR:?msg}` strict-fails
+      # against the host environment, so we pass stubs of every
+      # required var inline (16-byte minimum per validateDBPassword;
+      # JWT secret per the 32-byte recommendation). The values are
+      # throwaway — the lint step never starts any service.
       - name: Validate docker-compose.prod.yml
         run: |
           if command -v docker >/dev/null 2>&1; then
+            POSTGRES_PASSWORD=stubstubstubstubstub \
+            JWT_SECRET=stub-jwt-secret-stub-jwt-secret-stub \
+            EDGE_INTERNAL_TOKEN=stub-internal-token-stub-internal-token \
+            BOOTSTRAP_SECRET=stub-bootstrap-secret-stub-bootstrap-secret \
+            EDGE_WORKER_ADDR=stub-host:12345 \
+            CADDY_ADMIN_TOKEN=stub-caddy-admin-token \
             docker compose -f docker-compose.prod.yml config > /dev/null
           else
             echo "docker not available; skipping compose config validation"
