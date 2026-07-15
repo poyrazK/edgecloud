@@ -61,7 +61,6 @@ async fn list_returns_empty_message() {
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [],
-            "total": 0,
             "limit": 20,
             "next_cursor": null
         })))
@@ -106,7 +105,6 @@ async fn list_renders_envelope_items_table() {
                     "url": "https://t_test-myapp.edgecloud.dev"
                 }
             ],
-            "total": 2,
             "limit": 20,
             "next_cursor": null
         })))
@@ -205,7 +203,6 @@ async fn omits_query_params_when_no_flags() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 20,
             "next_cursor": null
         })))
@@ -250,7 +247,6 @@ async fn forwards_limit_query_param() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 10,
             "next_cursor": null
         })))
@@ -291,7 +287,6 @@ async fn silent_when_single_page() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 20,
             "next_cursor": null
         })))
@@ -335,7 +330,6 @@ async fn renders_total_header_singular() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 20,
             "next_cursor": null
         })))
@@ -386,7 +380,6 @@ async fn list_walks_cursor_chain() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 2,
             "limit": 20,
             "next_cursor": "page2cursor"
         })))
@@ -406,7 +399,6 @@ async fn list_walks_cursor_chain() {
                 "created_at": "2026-07-02T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 2,
             "limit": 20,
             "next_cursor": null
         })))

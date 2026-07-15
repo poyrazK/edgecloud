@@ -811,7 +811,6 @@ async fn logs_stale_cursor_returns_empty_page_exits_cleanly() {
             "limit": 100,
             "since": "2026-06-24T11:55:00Z",
             "next_cursor": null,
-            "next_offset": null,
         })))
         .expect(1)
         .mount(&server)

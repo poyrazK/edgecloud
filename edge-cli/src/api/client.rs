@@ -398,12 +398,8 @@ pub struct LogEntry {
 /// * `next_cursor` is the only pager; it is `Some` whenever another
 ///   page exists and `None` on the final page.
 ///
-/// `next_offset` was the deprecated offset-paging mirror. The
-/// `?offset=` parameter is retired in #709; the field is preserved
-/// with `#[serde(default)]` so a stale server response
-/// (pre-#709 with `next_offset` still emitted) decodes cleanly, but
-/// the CLI never reads it. New code treats cursor as the only
-/// pager.
+/// `?offset=` is retired in #709; the CLI never reads `next_offset`
+/// and the field is no longer on the wire.
 #[derive(Debug, Deserialize)]
 pub struct LogListResponse {
     pub items: Vec<LogEntry>,
@@ -414,11 +410,6 @@ pub struct LogListResponse {
     /// concurrent inserts.
     #[serde(default)]
     pub next_cursor: Option<String>,
-    /// `#[serde(default)]` so a stale pre-#709 server response
-    /// (with `next_offset` still emitted on the wire) decodes
-    /// cleanly. The CLI never reads this field after #709.
-    #[serde(default)]
-    pub next_offset: Option<u32>,
 }
 
 /// Worker-reported status of one app, returned by
@@ -494,46 +485,28 @@ pub struct AppListResponse {
 }
 
 /// Wrapper for the paginated deployments response:
-/// `{"items": [...], "total": N, "limit": 20, "next_cursor": "...", "next_offset": M}`
+/// `{"items": [...], "limit": 20, "next_cursor": "..."}`
 /// returned by `GET /api/v1/list/{appName}`.
 ///
-/// Field types mirror the server (Go) side: `total` is signed so a
-/// future "unknown" sentinel can travel as `-1`, while `limit`,
-/// `offset`, and `next_offset` are unsigned because pagination
-/// offsets are always non-negative. `next_cursor` is opaque so the
-/// CLI never decodes it — only round-trips it back as `?cursor=`.
+/// `next_cursor` is opaque so the CLI never decodes it — only
+/// round-trips it back as `?cursor=`. `limit` is unsigned because
+/// pagination limits are always non-negative.
 ///
-/// Field types mirror the server (Go) side: `total` is signed so a
-/// future "unknown" sentinel can travel as `-1`, while `limit` is
-/// unsigned. `next_cursor` is opaque so the CLI never decodes it —
-/// only round-trips it back as `?cursor=`.
+/// Hard-cut (issue #709): `next_cursor` is the only pager.
+/// `commands::deployments` walks the cursor chain to exhaustion (no
+/// `--page` flag; the cursor walker is the only path).
 ///
-/// Hard-cut (issue #709):
-///
-///   - `next_cursor` is the only pager. `commands::deployments`
-///     walks the cursor chain to exhaustion (no `--page` flag; the
-///     cursor walker is the only path).
-///   - `next_offset` was the legacy offset arithmetic, retired in
-///     #709. The field is preserved with `#[serde(default)]` so a
-///     stale server response (pre-#709 with `next_offset` still
-///     emitted) decodes cleanly, but the CLI never reads it.
-///
-/// `total` is consumed by `commands::deployments::run` to render the
-/// "N deployments" header; `items` is the only field read by
-/// callers that don't paginate (currently none — see
-/// [`ApiClient::list_deployments`]).
+/// `items` is the only field read by callers; `limit` is consumed
+/// by the walker to render the "N deployments" header (counted
+/// locally across pages — the wire no longer carries a `total`
+/// because the previous field added a per-page COUNT(*) round-trip
+/// with no consumer).
 #[derive(Debug, Deserialize)]
 pub struct DeploymentListEnvelope {
     pub items: Vec<DeploymentSummary>,
-    pub total: i64,
     pub limit: u32,
     #[serde(default)]
     pub next_cursor: Option<String>,
-    /// `#[serde(default)]` so a stale pre-#709 server response
-    /// (with `next_offset` still emitted on the wire) decodes
-    /// cleanly. The CLI never reads this field after #709.
-    #[serde(default)]
-    pub next_offset: Option<u32>,
 }
 
 /// Quota and usage returned by `GET /api/v1/quotas`.
@@ -1554,10 +1527,7 @@ pub struct Logs<'a> {
 /// suppress the query key, leaving the server's defaults untouched.
 ///
 /// `?offset=` is gone from the wire (issue #709 / #682 hard-cut).
-/// Only `?cursor=` carries forward — pre-#709 servers that still
-/// emit `next_offset` decode cleanly into the
-/// `#[serde(default)] next_offset` field on [`LogListResponse`], but
-/// the CLI never reads it.
+/// Only `?cursor=` carries forward.
 #[derive(Debug, Default, Clone)]
 pub struct LogListQuery<'a> {
     /// Absolute RFC3339 lower bound. Callers convert relative
