@@ -418,7 +418,18 @@ async fn collect_next_transition(
         };
         let hb: HeartbeatMessage =
             serde_json::from_slice(&msg.payload).context("parse heartbeat")?;
-        let Some(app) = hb.apps.get(TEST_APP_NAME) else {
+        // Heartbeat keys are "{app_name}:{deployment_id}" post-#290
+        // (issue #290 canary fan-out); the deployment_id half
+        // varies per heartbeat, so match by app_name prefix.
+        // Legacy bare-key heartbeats (worker v <this PR>) still
+        // match the second arm — pure forward-compat.
+        let prefix = format!("{}:", TEST_APP_NAME);
+        let Some(app) = hb
+            .apps
+            .iter()
+            .find(|(k, _)| k.starts_with(&prefix) || k.as_str() == TEST_APP_NAME)
+            .map(|(_, v)| v)
+        else {
             continue; // heartbeat before our app appeared; skip
         };
         let new_id = app.deployment_id.clone();

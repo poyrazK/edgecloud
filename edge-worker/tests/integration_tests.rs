@@ -328,7 +328,7 @@ async fn wait_for_app_gone(
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
         let mut found = false;
-        for ((t, n, d), _inst) in state.apps.iter() {
+        for (t, n, d) in state.apps.keys() {
             if t == tenant_id && n == app_name && d == deployment_id {
                 found = true;
                 break;
