@@ -74,10 +74,17 @@ pub fn build_stream_config(replicas: usize) -> StreamConfig {
 ///
 ///   - `filter_subject = RATE_LIMIT_SUBJECT_WILDCARD` — every
 ///     per-replica delta leaf.
-///   - `deliver_policy = DeliverPolicy::LastPerSubject` — on
-///     reconnect we want the FRESHEST per-replica delta, not the
-///     full backlog. The aggregator's window rebuilds from one
-///     message per `<replica_id>`; older messages are noise.
+///   - `deliver_policy = DeliverPolicy::All` — deliver every
+///     message that survives `Interest` retention. The aggregator's
+///     sliding window is 1s; older messages are pruned client-side
+///     in `WindowState::prune`. `LastPerSubject` was the prior
+///     choice but its replay-window semantics interact poorly with
+///     `Interest` retention + a slow consumer-attach on CI (the
+///     integration test surfaced this — pre-attach messages can be
+///     GC'd before `LastPerSubject` has any baseline to replay
+///     from). `All` is the safer choice: we trust the stream's
+///     `MaxAge=60s` to bound the worst case, and the aggregator
+///     prunes anything older than the 1s window.
 ///   - `ack_policy = Explicit`, `max_deliver = 5` — bounded retries
 ///     on transient failures; unlike `edgecloud-tasks` (which is
 ///     best-effort fire-and-forget on the publish side), the rate-
@@ -93,7 +100,7 @@ pub fn build_consumer_config(durable_name: &str) -> async_nats::jetstream::consu
         deliver_subject: format!("_INBOX.rate-limit.{}", durable_name),
         deliver_group: None,
         ack_policy: AckPolicy::Explicit,
-        deliver_policy: DeliverPolicy::LastPerSubject,
+        deliver_policy: DeliverPolicy::All,
         filter_subject: RATE_LIMIT_SUBJECT_WILDCARD.to_string(),
         max_deliver: 5,
         ..Default::default()
@@ -277,10 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn consumer_config_deliver_policy_is_last_per_subject() {
+    fn consumer_config_deliver_policy_is_all() {
+        // Pin the deliver-policy choice — see the doc-comment on
+        // `build_consumer_config` for why we moved away from
+        // `LastPerSubject`. The unit test's name used to be
+        // `..._is_last_per_subject`; this test now asserts the
+        // corrected choice and the prior name is intentionally
+        // changed to make the breaking-policy visible.
         use async_nats::jetstream::consumer::DeliverPolicy;
         let cfg = build_consumer_config("sidecar-pod-1");
-        assert_eq!(cfg.deliver_policy, DeliverPolicy::LastPerSubject);
+        assert_eq!(cfg.deliver_policy, DeliverPolicy::All);
     }
 
     #[test]
