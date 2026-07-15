@@ -92,3 +92,31 @@ pub fn seed_api_key(home: &TempDir, key: &str) {
     let mut f = std::fs::File::create(&cfg_path).unwrap();
     writeln!(f, "[default]\napi_key = \"{key}\"\n").unwrap();
 }
+
+/// Assert that running `cmd` against a wiremock that mounted a single
+/// `expect(0)` fence mock surfaces a pre-flight path-component
+/// validation error containing `expected_stderr_substr`.
+///
+/// Used by the issue #671 tests: every call site that interpolates an
+/// identifier into a URL path must bail BEFORE the round-trip, so the
+/// caller mounts a verb-matching fence with `.expect(0)` and passes
+/// the resulting `Command` here. The caller has already `.arg(...)`'d
+/// the offending identifier onto `cmd`.
+///
+/// The test asserts `.failure()` and that stderr contains the
+/// substring — the precise substring depends on which validator arm
+/// fires (`cannot be empty`, `'..'`, `invalid character`).
+///
+/// `#[allow(dead_code)]`: each integration test binary is compiled
+/// separately, and binaries that don't use this helper (e.g.
+/// `tests/auto_rollback.rs`, `tests/auth.rs`) would otherwise flag it
+/// as dead. The helper is intentionally shared; the allow is scoped
+/// to one line.
+#[allow(dead_code)]
+pub fn assert_invalid_path_component(mut cmd: Command, expected_stderr_substr: &str) {
+    cmd.assert()
+        .failure()
+        .stderr(predicates::prelude::predicate::str::contains(
+            expected_stderr_substr,
+        ));
+}

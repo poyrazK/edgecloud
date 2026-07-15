@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod domains;
+pub mod path;
 pub mod webhooks;
 
 pub use client::{
@@ -10,4 +11,5 @@ pub use client::{
     QuotaResponse,
 };
 pub use domains::Domain;
+pub use path::validate_path_component;
 pub use webhooks::Webhook;

@@ -895,3 +895,44 @@ async fn logs_stale_cursor_returns_empty_page_exits_cleanly() {
 
     cmd.assert().success().stdout(predicate::str::is_empty());
 }
+
+/// Pre-flight path-component validation on `edge logs`.
+/// The `app_name` interpolates into `GET /api/v1/apps/{app}/logs`
+/// and is sourced from `.edge/state.json` (the only path). We seed
+/// state.json with a hostile app_name so the validator surfaces the
+/// bad id. Issue #671.
+#[tokio::test]
+async fn logs_rejects_invalid_app_name() {
+    for (bad_name, expected_substr) in [("my../api", "'..'"), ("my%2Fapi", "invalid character")] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // edge.toml + state.json are required by `edge logs`.
+        // `seed_project` writes both; the hostile app_name lives
+        // in state.json so the validator (which runs AFTER the
+        // state load) actually gets to fire. Empty app_name never
+        // reaches the validator because `resolve_app_name`
+        // rejects it first.
+        seed_project(&project, bad_name);
+
+        // Fence: NO GET on /api/v1/apps/<id>/logs may ever land.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"logs": [], "next_cursor": null})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.arg("logs");
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

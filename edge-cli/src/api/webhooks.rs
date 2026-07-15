@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::client::check_response;
+use super::path::validate_path_component;
 
 /// One row of the `webhooks` table as seen by the tenant. Mirrors
 /// the Go `domain.Webhook` struct field-for-field minus `Secret`
@@ -189,6 +190,7 @@ impl<'a> WebhookClient<'a> {
         enabled: Option<bool>,
         secret: Option<&str>,
     ) -> Result<Webhook> {
+        validate_path_component("webhook_id", id)?;
         let endpoint = format!("{}/api/v1/webhooks/{}", self.client.base_url(), id);
         let mut body = serde_json::Map::new();
         if let Some(u) = url {
@@ -224,6 +226,7 @@ impl<'a> WebhookClient<'a> {
     /// status — `check_response` returns an `ApiError::Rejected`
     /// on 404 that the CLI surfaces.
     pub fn remove(&self, id: &str) -> Result<()> {
+        validate_path_component("webhook_id", id)?;
         let endpoint = format!("{}/api/v1/webhooks/{}", self.client.base_url(), id);
         let resp = self
             .client
@@ -247,6 +250,7 @@ impl<'a> WebhookClient<'a> {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<WebhookDeliveriesResponse> {
+        validate_path_component("webhook_id", id)?;
         let mut endpoint = format!(
             "{}/api/v1/webhooks/{}/deliveries",
             self.client.base_url(),

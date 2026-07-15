@@ -220,3 +220,149 @@ async fn remove_retries_503_then_succeeds() {
         "expected 503 + 200 = 2 DELETE attempts on /api/v1/apps/api/domains/api.example.com"
     );
 }
+
+/// Pre-flight path-component validation: malformed `app_name` or
+/// `fqdn` values must bail with an actionable error before any DELETE
+/// round-trip lands. Sub-cases cover both identifiers, since
+/// `DomainClient::remove` validates them separately. Issue #671.
+#[tokio::test]
+async fn domains_remove_rejects_invalid_app_or_fqdn() {
+    for (app, fqdn, expected_substr) in [
+        ("my../api", "api.example.com", "'..'"),
+        ("api", "evil%2Ffqdn", "invalid character"),
+        ("api", "", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO DELETE may ever land. The validator must fire
+        // before any round-trip to /api/v1/apps/{}/domains/{fqdn}.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.arg("domains").arg("remove").arg(app).arg(fqdn);
+
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_substr));
+    }
+}
+
+/// Pre-flight path-component validation on `edge domains check <app>
+/// <fqdn>`. Both `app_name` and `fqdn` interpolate into
+/// `GET /api/v1/apps/{app}/domains/{fqdn}`. Issue #671.
+#[tokio::test]
+async fn domains_check_rejects_invalid_app_or_fqdn() {
+    for (app, fqdn, expected_substr) in [
+        ("my../api", "api.example.com", "'..'"),
+        ("api", "evil%2Ffqdn", "invalid character"),
+        ("api", "", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO GET on the domains path may ever land.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.arg("domains").arg("check").arg(app).arg(fqdn);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}
+
+/// Pre-flight path-component validation on `edge domains add <app>
+/// <fqdn>`. The `app_name` interpolates into the URL path; `fqdn`
+/// currently goes in the body but we still validate it (defense in
+/// depth). Issue #671.
+#[tokio::test]
+async fn domains_add_rejects_invalid_app_name() {
+    for (bad_app, expected_substr) in [
+        ("my../api", "'..'"),
+        ("my%2Fapi", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO POST on the domains path may ever land.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.arg("domains")
+            .arg("add")
+            .arg(bad_app)
+            .arg("api.example.com");
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}
+
+/// Pre-flight path-component validation on `edge domains list <app>`.
+/// The `app_name` interpolates into
+/// `GET /api/v1/apps/{app}/domains`. Issue #671.
+#[tokio::test]
+async fn domains_list_rejects_invalid_app_name() {
+    for (bad_app, expected_substr) in [
+        ("my../api", "'..'"),
+        ("my%2Fapi", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO GET on the domains path may ever land.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"domains": []})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.arg("domains").arg("list").arg(bad_app);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}
