@@ -160,12 +160,12 @@ func TestDeploymentRepository_ListByAppPaginated_FirstPage(t *testing.T) {
 	}).AddRow("d_1", "t_1", "hello", "deployed", "hash1", pq.StringArray{}, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil)
 
 	// Issue #58 — first-page path: afterTS/afterID are zero so the
-	// repo emits the SQL without the (created_at, id) < (...) clause.
+	// repo emits the SQL without the strict-tuple predicate.
 	mock.ExpectQuery(`SELECT.*FROM deployments WHERE tenant_id = \$1 AND app_name = \$2 ORDER BY created_at DESC, id DESC LIMIT \$3`).
 		WithArgs("t_1", "hello", 10).
 		WillReturnRows(rows)
 
-	deps, err := repo.ListByAppPaginated(context.Background(), "t_1", "hello", time.Time{}, 0, 10)
+	deps, err := repo.ListByAppPaginated(context.Background(), "t_1", "hello", time.Time{}, "", 10)
 	if err != nil {
 		t.Fatalf("ListByAppPaginated: %v", err)
 	}
@@ -175,9 +175,14 @@ func TestDeploymentRepository_ListByAppPaginated_FirstPage(t *testing.T) {
 }
 
 // TestDeploymentRepository_ListByAppPaginated_Keyset covers the
-// second-page path: the repo appends the (created_at, id) < ($3, $4)
-// strict-tuple predicate so the planner walks
+// second-page path: the repo appends the disjunctive strict-tuple
+// predicate `created_at < $3 OR (created_at = $3 AND id < $4)` so
+// the planner walks
 // idx_deployments_tenant_app_created_at_id_desc in cursor order.
+// The `id` column is TEXT (e.g., `d_<uuid>`), so the row-comparison
+// tuple `(created_at, id) < (...)` from #708 is replaced with the
+// equivalent disjunctive form — postgres can't row-compare a
+// timestamptz/text heterogeneous tuple. See issue #709.
 func TestDeploymentRepository_ListByAppPaginated_Keyset(t *testing.T) {
 	repo, mock, cleanup := newDeploymentMockRepo(t)
 	defer cleanup()
@@ -188,9 +193,9 @@ func TestDeploymentRepository_ListByAppPaginated_Keyset(t *testing.T) {
 	}).AddRow("d_2", "t_1", "hello", "active", "hash2", pq.StringArray{}, time.Now(), false, "", "", []byte{}, 0, nil, nil, nil)
 
 	cursorTS := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	const cursorID int64 = 42
+	const cursorID = "d_42"
 
-	mock.ExpectQuery(`SELECT.*FROM deployments WHERE tenant_id = \$1 AND app_name = \$2 AND \(created_at, id\) < \(\$3, \$4\).*ORDER BY created_at DESC, id DESC LIMIT \$5`).
+	mock.ExpectQuery(`SELECT.*FROM deployments WHERE tenant_id = \$1 AND app_name = \$2 AND \(created_at < \$3 OR \(created_at = \$3 AND id < \$4\)\).*ORDER BY created_at DESC, id DESC LIMIT \$5`).
 		WithArgs("t_1", "hello", cursorTS, cursorID, 10).
 		WillReturnRows(rows)
 
