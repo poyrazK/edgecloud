@@ -196,7 +196,7 @@ func New(
 	tenantSvc := service.NewTenantService(db, tenantRepo, quotaRepo, apiKeyRepo, appRepo, outboxRepo, cfg.Region)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	appSvc := service.NewAppService(
-		db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, artifactStore, quotaRepo,
+		db, appRepo, deploymentRepo, activeDeploymentRepo, appEnvRepo, trafficSplitRepo, artifactStore, quotaRepo,
 		outboxRepo, cfg.Region,
 		uint16(cfg.L4.PortRangeStart), uint16(cfg.L4.PortRangeEnd),
 	)

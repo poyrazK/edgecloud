@@ -40,19 +40,24 @@ type appRepoInterface interface {
 	AllocateL4Port(ctx context.Context, tenantID, appName string, port uint16) (uint16, error)
 	ReleaseL4Port(ctx context.Context, tenantID, appName string) error
 	AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}, error)
+	// WithTx returns a tx-bound repository so the cascade delete
+	// (issue #60) can run inside `repository.Transaction` — the parent
+	// delete, child deletes, and outbox enqueue share one transaction.
+	WithTx(tx *sqlx.Tx) *repository.AppRepository
 }
 
 // AppService handles app business logic.
 type AppService struct {
-	db            *sqlx.DB
-	appRepo       appRepoInterface
-	appEnvRepo    *repository.AppEnvRepository
-	activeRepo    *repository.ActiveDeploymentRepository
-	deployRepo    *repository.DeploymentRepository
-	artifactStore storage.ArtifactStore
-	quotaRepo     quotaRepoInterface
-	outboxRepo    *repository.OutboxRepository
-	defaultRegion string
+	db               *sqlx.DB
+	appRepo          appRepoInterface
+	appEnvRepo       *repository.AppEnvRepository
+	activeRepo       *repository.ActiveDeploymentRepository
+	deployRepo       *repository.DeploymentRepository
+	trafficSplitRepo *repository.TrafficSplitRepository
+	artifactStore    storage.ArtifactStore
+	quotaRepo        quotaRepoInterface
+	outboxRepo       *repository.OutboxRepository
+	defaultRegion    string
 	// l4PortRangeStart and l4PortRangeEnd bound the L4/TCP port
 	// range used by AllocateL4Port (issue #548). Configured via
 	// cfg.L4.PortRangeStart / cfg.L4.PortRangeEnd and threaded into
@@ -68,6 +73,7 @@ func NewAppService(
 	deploymentRepo *repository.DeploymentRepository,
 	activeRepo *repository.ActiveDeploymentRepository,
 	appEnvRepo *repository.AppEnvRepository,
+	trafficSplitRepo *repository.TrafficSplitRepository,
 	artifactStore storage.ArtifactStore,
 	quotaRepo *repository.QuotaRepository,
 	outboxRepo *repository.OutboxRepository,
@@ -84,6 +90,7 @@ func NewAppService(
 		activeRepo:       activeRepo,
 		appEnvRepo:       appEnvRepo,
 		deployRepo:       deploymentRepo,
+		trafficSplitRepo: trafficSplitRepo,
 		artifactStore:    artifactStore,
 		quotaRepo:        quotaRepo,
 		outboxRepo:       outboxRepo,
@@ -302,62 +309,79 @@ func (s *AppService) Update(ctx context.Context, tenantID, appName string, req *
 
 // Delete deletes an app and all its associated data atomically.
 // Returns ErrAppNotFound if the app does not exist.
+//
+// Atomicity: the parent apps row delete, the child deletes
+// (app_env, active_deployments, app_traffic_splits, deployments),
+// and the task_purge outbox enqueue all run inside one PostgreSQL
+// transaction. Either everything commits or everything rolls back
+// — so the invariant "a task_purge row was enqueued iff the parent
+// apps row was removed" is preserved. Compare with the previous
+// shape, which committed the parent delete first and only ran the
+// child work in a second transaction; a cascade failure there
+// silently orphaned env/active/deployment rows and never enqueued
+// the worker's purge tombstone. See issue #60.
+//
+// Artifact cleanup (.wasm and .cwasm) runs only after a successful
+// DB commit. External object storage cannot participate in a
+// PostgreSQL transaction, so the artifact pass is best-effort and
+// post-commit errors are aggregated with errors.Join and returned
+// to the caller; the HTTP handler maps non-ErrAppNotFound errors to
+// 500. See issue #60.
 var ErrAppNotFound = fmt.Errorf("app not found")
 
 func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error {
-	deleted, err := s.appRepo.AtomicDelete(ctx, tenantID, appName)
-	if err != nil {
-		return fmt.Errorf("deleting app: %w", err)
-	}
-	if !deleted {
-		return ErrAppNotFound
-	}
+	var deployments []domain.Deployment
 
-	// Delete artifact files before cascade — os.Remove is idempotent (no error if absent).
-	// Collect errors so caller knows if cleanup failed.
-	var delErr error
-	if s.artifactStore != nil {
-		deployments, err := s.deployRepo.ListByApp(ctx, tenantID, appName)
-		if err != nil {
-			log.Printf("warning: failed to list deployments for artifact cleanup: %v", err)
-		} else {
-			for _, d := range deployments {
-				if err := s.artifactStore.Delete(ctx, tenantID, appName, d.ID); err != nil {
-					delErr = fmt.Errorf("artifact cleanup failed for %s: %w", d.ID, err)
-				}
-			}
-		}
-	}
-
-	// Cascade deletes run in a transaction so they either all succeed or all fail.
-	err = repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+	err := repository.Transaction(ctx, s.db, func(tx *sqlx.Tx) error {
+		appRepo := s.appRepo.WithTx(tx)
 		appEnvRepo := s.appEnvRepo.WithTx(tx)
 		activeRepo := s.activeRepo.WithTx(tx)
+		trafficSplitRepo := s.trafficSplitRepo.WithTx(tx)
 		deployRepo := s.deployRepo.WithTx(tx)
 		outboxRepo := s.outboxRepo.WithTx(tx)
 
+		// 1. Delete parent. Returning `false` (no rows matched) is
+		//    ErrAppNotFound — the closure returns it and Transaction
+		//    rolls back without touching anything else.
+		deleted, err := appRepo.AtomicDelete(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("deleting app: %w", err)
+		}
+		if !deleted {
+			return ErrAppNotFound
+		}
+
+		// 2. Capture deployment IDs before deleting the rows so the
+		//    post-commit artifact cleanup can target each .wasm and
+		//    .cwasm file. Runs inside the tx for a consistent
+		//    snapshot — if a concurrent insert lands between here
+		//    and step 6, the tx's row snapshot excludes it.
+		deployments, err = deployRepo.ListByApp(ctx, tenantID, appName)
+		if err != nil {
+			return fmt.Errorf("listing deployments for artifact cleanup: %w", err)
+		}
+
+		// 3. Child deletes in dependency order:
+		//    - app_traffic_splits MUST run before deployments because
+		//      traffic_splits.deployment_id has no ON DELETE CASCADE.
 		if err := appEnvRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting app env: %w", err)
 		}
 		if err := activeRepo.Delete(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting active deployment: %w", err)
 		}
+		if err := trafficSplitRepo.DeleteAllForApp(ctx, tenantID, appName); err != nil {
+			return fmt.Errorf("deleting traffic splits: %w", err)
+		}
 		if err := deployRepo.DeleteByApp(ctx, tenantID, appName); err != nil {
 			return fmt.Errorf("deleting deployments: %w", err)
 		}
 
-		// Issue #569: enqueue a task_purge tombstone inside the
-		// same tx as the cascade deletes — the worker must learn
-		// to drop the per-tenant KV/cache/scheduling state for
-		// this app, atomically with the CP-side row deletes. If
-		// any cascade step fails the tx rolls back and no row is
-		// enqueued, so the worker never receives a phantom purge.
-		//
-		// Forward-compat (NOT implemented in this PR): when #475
-		// / #476 ship the CP-side durable `tenant_kv` Postgres
-		// tier, the same block enqueues a sibling
-		// `tenant_kv BatchDelete` row here. Today we publish
-		// exclusively via the worker KV/cache/scheduling purge.
+		// 4. Enqueue the worker task_purge tombstone inside the same
+		//    tx. Issue #569: the worker drops per-app KV / cache /
+		//    scheduling state when it receives this. If any step above
+		//    errors and rolls back, no row is enqueued — the worker
+		//    never receives a phantom purge for a still-existing app.
 		payload, err := json.Marshal(nats.PurgePayload{
 			Type:      nats.TaskMessageKindTaskPurge,
 			Timestamp: time.Now().UTC(),
@@ -381,15 +405,30 @@ func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error
 		return nil
 	})
 	if err != nil {
-		// Log but don't fail — app row already deleted above.
-		// In production, consider a background reconciler to clean orphaned rows.
-		log.Printf("warning: cascade delete partially failed after app deletion: %v", err)
+		return err
 	}
-	// Surface artifact deletion errors to the caller. DB deletion has already committed.
-	if delErr != nil {
-		return delErr
+
+	// 5. Post-commit artifact cleanup. Failure here leaves the DB
+	//    deletion intact but orphan files in storage — the caller is
+	//    told via 500 so a follow-up `edge apps delete` can retry
+	//    (the second attempt finds no deployments to clean and returns
+	//    nil). errors.Join aggregates per-deployment failures so a
+	//    caller sees every problematic deployment, not just the last.
+	if s.artifactStore == nil {
+		return nil
 	}
-	return nil
+	var delErr error
+	for _, d := range deployments {
+		if err := s.artifactStore.Delete(ctx, tenantID, appName, d.ID); err != nil {
+			delErr = errors.Join(delErr,
+				fmt.Errorf("wasm artifact cleanup failed for %s: %w", d.ID, err))
+		}
+		if err := s.artifactStore.DeleteFormat(ctx, tenantID, appName, d.ID, "cwasm"); err != nil {
+			delErr = errors.Join(delErr,
+				fmt.Errorf("cwasm artifact cleanup failed for %s: %w", d.ID, err))
+		}
+	}
+	return delErr
 }
 
 // CreateIfNotExists creates an app if it doesn't already exist.

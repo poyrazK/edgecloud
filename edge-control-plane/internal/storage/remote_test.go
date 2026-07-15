@@ -186,6 +186,52 @@ func TestRemoteArtifactStore_Delete_LocalCacheOnly(t *testing.T) {
 	}
 }
 
+// TestRemoteArtifactStore_DeleteFormat_LocalCacheOnly pins the
+// cross-CP GC contract for issue #60: DeleteFormat (mirroring
+// Delete) only touches the local cache. The .cwasm companion is
+// removed from disk alongside the .wasm on every local-cache GC
+// event; the peer is intentionally left alone because a stale
+// companion blob on a peer is harmless (the worker re-verifies the
+// artifact hash on download, see edge-worker/src/downloader.rs).
+func TestRemoteArtifactStore_DeleteFormat_LocalCacheOnly(t *testing.T) {
+	var peerHits int32
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&peerHits, 1)
+	})
+	s := mustNewRemote(t, peer, "tok", t.TempDir())
+
+	// Seed the .cwasm pair via SaveFormat.
+	if err := s.SaveFormat(t.Context(), "t_x", "a", "d_z", "cwasm", bytes.NewReader([]byte("native"))); err != nil {
+		t.Fatalf("SaveFormat cwasm: %v", err)
+	}
+
+	if err := s.DeleteFormat(t.Context(), "t_x", "a", "d_z", "cwasm"); err != nil {
+		t.Fatalf("DeleteFormat cwasm: %v", err)
+	}
+	if got := atomic.LoadInt32(&peerHits); got != 0 {
+		t.Errorf("DeleteFormat triggered %d peer calls; want 0 (local-only)", got)
+	}
+}
+
+// TestRemoteArtifactStore_DeleteFormat_RejectsUnsupportedFormat
+// confirms the local cache rejects unknown formats before touching
+// the FS — symmetric with FSArtifactStore.DeleteFormat so the
+// cross-CP contract stays narrow and the caller's error surface is
+// the same regardless of which storage backend is wired in.
+func TestRemoteArtifactStore_DeleteFormat_RejectsUnsupportedFormat(t *testing.T) {
+	peer := newTLSPeer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("peer should not be hit for unsupported format: %s", r.Method)
+	})
+	s := mustNewRemote(t, peer, "tok", t.TempDir())
+	err := s.DeleteFormat(t.Context(), "t_x", "a", "d_z", "wat")
+	if err == nil {
+		t.Fatal("DeleteFormat(\"wat\"): expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported format") {
+		t.Errorf("err = %v, want unsupported-format message", err)
+	}
+}
+
 // TestNewRemoteArtifactStore_RejectsInsecureURL pins the contract that
 // http:// peer URLs are rejected at startup. The X-Internal-Token would
 // be sent in cleartext over an http:// connection.

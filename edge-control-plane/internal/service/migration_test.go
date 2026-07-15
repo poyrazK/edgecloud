@@ -97,6 +97,11 @@ type mockArtifactStore struct {
 	// Used by short-circuit regression tests to assert the
 	// artifact-store write never happened.
 	saveCalls []string
+	// deleteFormatCalls records each DeleteFormat invocation with the
+	// format appended (key: "tenantID/appName/depID|format"). Used by
+	// AppService.Delete regression tests (issue #60) to assert both
+	// the .wasm and the .cwasm cleanup ran for every deployment.
+	deleteFormatCalls []string
 }
 
 func newMockArtifactStore() *mockArtifactStore {
@@ -183,6 +188,27 @@ func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deplo
 		return m.deleteErr
 	}
 	delete(m.artifacts, key)
+	return nil
+}
+
+// DeleteFormat records the call and removes the corresponding entry
+// from the in-memory map. Honors deleteErr (or, if unset, the
+// per-format err) so cascade-failure regression tests can simulate
+// a partial artifact-cleanup. Issue #60.
+func (m *mockArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	key := tenantID + "/" + appName + "/" + deploymentID
+	m.deleteFormatCalls = append(m.deleteFormatCalls, key+"|"+format)
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	switch format {
+	case "", "wasm":
+		delete(m.artifacts, key)
+	case "cwasm":
+		delete(m.artifacts, key+".cwasm")
+	default:
+		return fmt.Errorf("unsupported format %q", format)
+	}
 	return nil
 }
 

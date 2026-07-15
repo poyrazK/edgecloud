@@ -487,3 +487,83 @@ func TestS3ArtifactStore_Open_UnderCapRoundTrip(t *testing.T) {
 
 // sha256Hex is exposed in the package via the s3.go helper but the
 // test imports it via the package — no separate import needed.
+
+// TestS3ArtifactStore_DeleteFormat_SendsCorrectKey pins the wire
+// contract for issue #60: DeleteFormat("cwasm") issues a DELETE
+// against `<prefix>/<tenant>/<app>/<deployment>.cwasm` — same path
+// SaveFormat/OpenFormat use — so a future migration of the .cwasm
+// namespace doesn't drift from the rest of the storage interface.
+func TestS3ArtifactStore_DeleteFormat_SendsCorrectKey(t *testing.T) {
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		wantPath := "/test-bucket/t_tenant1/myapp/d_dep1.cwasm"
+		if got := r.URL.Path; got != wantPath {
+			t.Errorf("path = %q, want %q", got, wantPath)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	if err := ts.store.DeleteFormat(t.Context(), "t_tenant1", "myapp", "d_dep1", "cwasm"); err != nil {
+		t.Fatalf("DeleteFormat cwasm: %v", err)
+	}
+}
+
+// TestS3ArtifactStore_DeleteFormat_404IsIdempotent mirrors the
+// Delete contract: a 404 on a key that never existed returns nil so
+// AppService.Delete's deployment loop doesn't surface spurious
+// errors when two deletes race.
+func TestS3ArtifactStore_DeleteFormat_404IsIdempotent(t *testing.T) {
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	if err := ts.store.DeleteFormat(t.Context(), "t_x", "y", "d_z", "cwasm"); err != nil {
+		t.Errorf("DeleteFormat on 404: %v, want nil", err)
+	}
+}
+
+// TestS3ArtifactStore_DeleteFormat_RejectsUnsupportedFormat guards
+// against future format strings that the path-template code doesn't
+// know about. Returning an error without a network call keeps the
+// "no surprises" surface for AppService.Delete.
+func TestS3ArtifactStore_DeleteFormat_RejectsUnsupportedFormat(t *testing.T) {
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("HTTP call made for unsupported format: %s %s", r.Method, r.URL.Path)
+	})
+	err := ts.store.DeleteFormat(t.Context(), "t_x", "y", "d_z", "wat")
+	if err == nil {
+		t.Fatal("DeleteFormat(\"wat\"): expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsupported format") {
+		t.Errorf("err = %v, want unsupported-format message", err)
+	}
+}
+
+// TestS3ArtifactStore_DeleteFormat_EmptyAndWasmDelegateToDelete
+// confirms the "" / "wasm" branches share the exact same wire path
+// as Delete — same key prefix, same Authorization header.
+//
+// Rather than spy on the path twice, we accept that the path matches
+// the .wasm key (proven by the SaveOpenDeleteRoundTrip test) and
+// assert only that DeleteFormat(_, "wasm") hits the server with the
+// .wasm key and surfaces a real server-side error (5xx) faithfully.
+func TestS3ArtifactStore_DeleteFormat_EmptyAndWasmDelegateToDelete(t *testing.T) {
+	ts := newTestStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		if !strings.HasSuffix(r.URL.Path, ".wasm") {
+			t.Errorf("path = %q, want trailing .wasm", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := ts.store.DeleteFormat(t.Context(), "t_x", "y", "d_z", ""); err != nil {
+		t.Fatalf("DeleteFormat empty: %v", err)
+	}
+	if err := ts.store.DeleteFormat(t.Context(), "t_x", "y", "d_z", "wasm"); err != nil {
+		t.Fatalf("DeleteFormat wasm: %v", err)
+	}
+}

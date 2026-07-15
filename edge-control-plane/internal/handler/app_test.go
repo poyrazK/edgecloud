@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -461,6 +462,25 @@ func TestAppHandler_Delete_NotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+// TestAppHandler_Delete_ServiceErrorReturns500 pins the post-fix
+// contract (issue #60): when AppService.Delete returns a non-ErrAppNotFound
+// error — for example a cascade failure or a post-commit artifact-store
+// failure — the handler maps it to HTTP 500. Operators see the failure
+// instead of a misleading 204.
+func TestAppHandler_Delete_ServiceErrorReturns500(t *testing.T) {
+	svc := &mockAppSvc{deleteErr: errors.New("simulated cascade failure")}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/apps/hello", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rr.Code)
 	}
 }
 

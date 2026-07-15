@@ -297,6 +297,58 @@ func (s *S3ArtifactStore) Delete(ctx context.Context, tenantID, appName, deploym
 	return nil
 }
 
+// DeleteFormat removes a companion artifact at the given format. The ""
+// and "wasm" forms delegate to Delete so the default-extension path is
+// the same single code path. "cwasm" issues a DELETE against the
+// `<prefix>/<tenant>/<app>/<deployment>.cwasm` object with the same
+// idempotent 404 handling as Delete.
+//
+// Other formats return an error without issuing a request.
+func (s *S3ArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	if format == "" || format == "wasm" {
+		return s.Delete(ctx, tenantID, appName, deploymentID)
+	}
+	if format != "cwasm" {
+		return fmt.Errorf("unsupported format %q", format)
+	}
+
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return fmt.Errorf("invalid artifact key: %w", err)
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return fmt.Errorf("invalid artifact key: %w", err)
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return fmt.Errorf("invalid artifact key: %w", err)
+	}
+	key := s.keyPrefix + tenantID + "/" + appName + "/" + deploymentID + ".cwasm"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.objectURL(key), nil)
+	if err != nil {
+		return fmt.Errorf("S3ArtifactStore.DeleteFormat: building request: %w", err)
+	}
+	signRequest(req, s.accessKey, s.secretKey, s.region, nil, "UNSIGNED-PAYLOAD")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("S3ArtifactStore.DeleteFormat: DELETE %s: %w", key, err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("S3.DeleteFormat: failed to close response body: %v", err)
+		}
+	}()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // idempotent
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return fmt.Errorf("S3ArtifactStore.DeleteFormat: draining body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("S3ArtifactStore.DeleteFormat: DELETE %s: status %d", key, resp.StatusCode)
+	}
+	return nil
+}
+
 // key constructs the S3 object key for a deployment artifact. Path
 // components are validated the same way FSArtifactStore does — a
 // malicious caller passing ".." or "/" gets a 400-equivalent error

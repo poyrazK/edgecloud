@@ -99,6 +99,10 @@ func (m *mockArtifactStore) Delete(ctx context.Context, tenantID, appName, deplo
 	return nil
 }
 
+func (m *mockArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	return nil
+}
+
 // skipIfNoEdgeMigrate skips the test if edge-migrate is not in PATH.
 func skipIfNoEdgeMigrate(t *testing.T) {
 	if _, err := exec.LookPath("edge-migrate"); err != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/domain"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/repository"
 	"github.com/edgeclouderz/edge-cloud/edge-control-plane/internal/storage"
+	"github.com/jmoiron/sqlx"
 )
 
 // mockAppRepo implements appRepoInterface for testing.
@@ -135,6 +137,15 @@ func (m *mockAppRepo) AllocatedL4Ports(ctx context.Context) (map[uint16]struct{}
 	return map[uint16]struct{}{}, nil
 }
 
+// WithTx returns a tx-bound *repository.AppRepository so the cascade
+// path (issue #60) can call AtomicDelete inside `repository.Transaction`.
+// Tests that don't drive Delete are free to leave this un-stubbed:
+// they'll never reach WithTx because the closure only calls it on
+// the Delete path.
+func (m *mockAppRepo) WithTx(tx *sqlx.Tx) *repository.AppRepository {
+	return repository.NewAppRepositoryFromDBTX(tx)
+}
+
 // mockQuotaRepoForApps implements quotaRepoInterface for testing.
 type mockQuotaRepoForApps struct {
 	getByTenantIDFunc func(ctx context.Context, tenantID string) (*domain.Quota, error)
@@ -183,6 +194,32 @@ func appSvcForTest(repo appRepoInterface, quotaRepo quotaRepoInterface) *AppServ
 		quotaRepo:        quotaRepo,
 		l4PortRangeStart: 31000,
 		l4PortRangeEnd:   31999,
+	}
+}
+
+// deleteSvcForTest builds an AppService with mockable per-repo wrappers
+// suitable for exercising Delete. Pass-through repos point at the
+// sqlmock-backed *sqlx.DB so the cascade tx flows through sqlmock's
+// expectation chain; artifactStore and trafficSplitRepo are mock
+// objects the test can inspect for call counts (issue #60).
+func deleteSvcForTest(
+	t *testing.T,
+	db *sqlx.DB,
+	mockAppRepo appRepoInterface,
+	artifactStore storage.ArtifactStore,
+) *AppService {
+	t.Helper()
+	return &AppService{
+		db:               db,
+		appRepo:          mockAppRepo,
+		quotaRepo:        &mockQuotaRepoForApps{},
+		appEnvRepo:       repository.NewAppEnvRepository(db),
+		activeRepo:       repository.NewActiveDeploymentRepository(db),
+		deployRepo:       repository.NewDeploymentRepository(db),
+		trafficSplitRepo: repository.NewTrafficSplitRepository(db),
+		artifactStore:    artifactStore,
+		outboxRepo:       repository.NewOutboxRepository(db),
+		defaultRegion:    "global",
 	}
 }
 
@@ -771,10 +808,28 @@ func TestAppService_Delete_HappyPath(t *testing.T) {
 	defer cleanup()
 
 	mock.ExpectBegin()
+	// AtomicDelete (parent). Returning `true` means the apps row was
+	// deleted — the tx continues to the cascade deletes below.
+	// AtomicDelete uses GetContext (DELETE … RETURNING) which sqlmock
+	// routes through ExpectQuery, not ExpectExec.
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	// Capture deployment IDs for post-commit artifact cleanup.
+	mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}).
+			AddRow("d_dep1", "t_test", "myapp", time.Now()).
+			AddRow("d_dep2", "t_test", "myapp", time.Now()))
+	// Child deletes in dependency order: app_env, active_deployments,
+	// app_traffic_splits (before deployments because no FK CASCADE),
+	// deployments.
 	mock.ExpectExec(`DELETE FROM app_env`).
 		WillReturnResult(sqlmock.NewResult(0, 2))
 	mock.ExpectExec(`DELETE FROM active_deployments`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM app_traffic_splits`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM deployments`).
 		WillReturnResult(sqlmock.NewResult(0, 3))
 	// Issue #569: the cascade tx enqueues a task_purge tombstone
@@ -787,21 +842,12 @@ func TestAppService_Delete_HappyPath(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	repo := &mockAppRepo{
-		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
-			return true, nil
-		},
-	}
-	svc := &AppService{
-		db:            db,
-		appRepo:       repo,
-		quotaRepo:     &mockQuotaRepoForApps{},
-		appEnvRepo:    repository.NewAppEnvRepository(db),
-		activeRepo:    repository.NewActiveDeploymentRepository(db),
-		deployRepo:    repository.NewDeploymentRepository(db),
-		outboxRepo:    repository.NewOutboxRepository(db),
-		defaultRegion: "global",
-	}
+	repo := &mockAppRepo{}
+	// appRepo.WithTx is called inside repository.Transaction and is
+	// stubbed in mockAppRepo to return repository.NewAppRepositoryFromDBTX(tx).
+	// AtomicDelete via that tx-scoped repo hits the sqlmock chain above.
+
+	svc := deleteSvcForTest(t, db, repo, &mockArtifactStore{})
 	if err := svc.Delete(context.Background(), "t_test", "myapp"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -811,58 +857,63 @@ func TestAppService_Delete_HappyPath(t *testing.T) {
 }
 
 func TestAppService_Delete_NotFound(t *testing.T) {
-	repo := &mockAppRepo{
-		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
-			return false, nil
-		},
-	}
-	svc := &AppService{
-		appRepo:   repo,
-		quotaRepo: &mockQuotaRepoForApps{},
-	}
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	// AtomicDelete returns no rows (sql.ErrNoRows → false from
+	// sqlmock's RETURNING zero-row).
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "missing").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"})) // empty → ErrNoRows → deleted=false
+	mock.ExpectRollback()
+
+	// deleteErr = nil on the artifact mock — but the closure exits
+	// on ErrAppNotFound before reaching artifact cleanup.
+	svc := deleteSvcForTest(t, db, &mockAppRepo{}, &mockArtifactStore{})
 	err := svc.Delete(context.Background(), "t_test", "missing")
 	if !errors.Is(err, ErrAppNotFound) {
 		t.Errorf("Delete() error = %v, want ErrAppNotFound", err)
 	}
+	if sqlErr := mock.ExpectationsWereMet(); sqlErr != nil {
+		t.Errorf("sqlmock expectations not met: %v", sqlErr)
+	}
 }
 
-// TestAppService_Delete_EnqueuesTaskPurge (issue #569) verifies
-// that Delete enqueues a task_purge row inside the same tx as
-// the cascade deletes, with the correct kind, reason, and
-// app_name. This is the worker-side cleanup contract:
-// receiving the purge causes the worker to drop per-tenant
-// KV / cache / scheduling state for the app.
+// TestAppService_Delete_EnqueuesTaskPurge (issue #569 / #60) verifies
+// that Delete enqueues a task_purge row inside the same tx as the
+// cascade deletes, with the correct kind, reason, and app_name. This
+// is the worker-side cleanup contract: receiving the purge causes the
+// worker to drop per-tenant KV / cache / scheduling state for the app.
 func TestAppService_Delete_EnqueuesTaskPurge(t *testing.T) {
 	db, mock, cleanup := newDeploymentMockDB(t)
 	defer cleanup()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}))
 	mock.ExpectExec(`DELETE FROM app_env`).
+		WithArgs("t_test", "myapp").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM active_deployments`).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM app_traffic_splits`).
+		WithArgs("t_test", "myapp").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM deployments`).
+		WithArgs("t_test", "myapp").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	// Capture the actual INSERT statement to assert payload shape.
 	mock.ExpectExec(`INSERT INTO outbox`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	repo := &mockAppRepo{
-		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
-			return true, nil
-		},
-	}
-	svc := &AppService{
-		db:            db,
-		appRepo:       repo,
-		quotaRepo:     &mockQuotaRepoForApps{},
-		appEnvRepo:    repository.NewAppEnvRepository(db),
-		activeRepo:    repository.NewActiveDeploymentRepository(db),
-		deployRepo:    repository.NewDeploymentRepository(db),
-		outboxRepo:    repository.NewOutboxRepository(db),
-		defaultRegion: "global",
-	}
+	svc := deleteSvcForTest(t, db, &mockAppRepo{}, &mockArtifactStore{})
 	if err := svc.Delete(context.Background(), "t_test", "myapp"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -871,60 +922,241 @@ func TestAppService_Delete_EnqueuesTaskPurge(t *testing.T) {
 	}
 }
 
-// TestAppService_Delete_NoPurgeOnCascadeFailure (issue #569)
-// verifies that a failing cascade step rolls back the tx and
-// no outbox row is written. Without this guard, a partially
-// deleted state could publish a phantom task_purge and the
-// worker would purge state for an app whose CP-side rows are
-// still present — leading to a confused worker.
+// TestAppService_Delete_TrafficSplitsDeletedBeforeDeployments
+// (issue #60) pins the ordering: app_traffic_splits MUST run before
+// deployments because traffic_splits.deployment_id has no
+// ON DELETE CASCADE (migration 009_traffic_splits). Reverse order
+// would let a FKEY violation slip through from DELETE FROM deployments
+// when the app ever had a traffic-split configured.
 //
-// Note: `Delete` currently logs-and-continues on a cascade
-// failure (the apps row has already been deleted above by
-// AtomicDelete and can't be re-created atomically), so we
-// don't assert on the return value. The invariant we DO
-// assert is that the tx rolled back (sqlmock.ExpectRollback)
-// and that no INSERT INTO outbox was issued (sqlmock would
-// fail ExpectationsWereMet if the enqueue fired after the
-// rollback — we leave a missing expectation on purpose).
-func TestAppService_Delete_NoPurgeOnCascadeFailure(t *testing.T) {
+// sqlmock's QueryMatcherRegexp matches substrings — providing the
+// expectations in the right call order proves the SQL is issued
+// in that order. (If they were reversed, the DELETE FROM
+// deployments would be issued before DELETE FROM app_traffic_splits
+// and the mock expectations wouldn't match in sequence.)
+func TestAppService_Delete_TrafficSplitsDeletedBeforeDeployments(t *testing.T) {
 	db, mock, cleanup := newDeploymentMockDB(t)
 	defer cleanup()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}))
 	mock.ExpectExec(`DELETE FROM app_env`).
-		WillReturnResult(sqlmock.NewResult(0, 2))
-	// activeRepo.Delete fails — tx must roll back, no
-	// INSERT INTO outbox is allowed (the enqueue call sits
-	// AFTER the cascade deletes inside the same tx closure,
-	// so a rollback discards it).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM active_deployments`).
-		WillReturnError(fmt.Errorf("simulated DB error"))
-	mock.ExpectRollback()
-	// Note: NO ExpectExec(`INSERT INTO outbox`) — if the
-	// enqueue fires after rollback, sqlmock sees an
-	// unexpected Exec and fails ExpectationsWereMet.
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// Traffic splits BEFORE deployments:
+	mock.ExpectExec(`DELETE FROM app_traffic_splits`).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(`DELETE FROM deployments`).
+		WithArgs("t_test", "myapp").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO outbox`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
-	repo := &mockAppRepo{
-		atomicDeleteFunc: func(_ context.Context, tenantID, appName string) (bool, error) {
-			return true, nil
-		},
+	svc := deleteSvcForTest(t, db, &mockAppRepo{}, &mockArtifactStore{})
+	if err := svc.Delete(context.Background(), "t_test", "myapp"); err != nil {
+		t.Fatalf("Delete: %v", err)
 	}
-	svc := &AppService{
-		db:            db,
-		appRepo:       repo,
-		quotaRepo:     &mockQuotaRepoForApps{},
-		appEnvRepo:    repository.NewAppEnvRepository(db),
-		activeRepo:    repository.NewActiveDeploymentRepository(db),
-		deployRepo:    repository.NewDeploymentRepository(db),
-		outboxRepo:    repository.NewOutboxRepository(db),
-		defaultRegion: "global",
-	}
-	// We don't assert on the return value — see the docstring
-	// above. The key invariant is enforced by the sqlmock
-	// expectation chain below.
-	_ = svc.Delete(context.Background(), "t_test", "myapp")
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("sqlmock expectations not met (likely unexpected outbox INSERT after rollback): %v", err)
+		t.Errorf("sqlmock expectations not met (cascading order may be wrong): %v", err)
+	}
+}
+
+// TestAppService_Delete_CascadeFailsReturnsError (issue #60) pins
+// the post-fix contract: a failing cascade step rolls the tx back,
+// no outbox row is written, AND the caller sees the error.
+// Compare with the previous behavior, which logged and returned
+// nil even when the cascade partially failed (orphan rows + no
+// worker tombstone).
+//
+// The sub-tests cover each cascade step in turn: every step's
+// failure triggers the same rollback + no-enqueue contract.
+func TestAppService_Delete_CascadeFailsReturnsError(t *testing.T) {
+	cases := []struct {
+		name        string
+		failingStep string // sql pattern substring for the failing Exec
+	}{
+		{"app_env", "DELETE FROM app_env"},
+		{"active_deployments", "DELETE FROM active_deployments"},
+		{"traffic_splits", "DELETE FROM app_traffic_splits"},
+		{"deployments", "DELETE FROM deployments"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, cleanup := newDeploymentMockDB(t)
+			defer cleanup()
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+				WithArgs("t_test", "myapp").
+				WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+			if tc.failingStep != "deployments" {
+				// ListByApp runs only when the failures happen AFTER
+				// the deployments list; for app_env/active/traffic_splits
+				// the deployment listing still fires before the failure.
+				mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+					WithArgs("t_test", "myapp").
+					WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}))
+			}
+			// Walk through cascade ordering, failing at the named
+			// step. Steps before the failure expect Result; steps
+			// after the failure must NOT fire (sqlmock fails
+			// ExpectationsWereMet if extra SQL shows up).
+			steps := []string{
+				"DELETE FROM app_env",
+				"DELETE FROM active_deployments",
+				"DELETE FROM app_traffic_splits",
+				"DELETE FROM deployments",
+			}
+			failed := false
+			for _, step := range steps {
+				if step == tc.failingStep {
+					mock.ExpectExec(step).
+						WithArgs("t_test", "myapp").
+						WillReturnError(fmt.Errorf("simulated DB error"))
+					failed = true
+					continue
+				}
+				if failed {
+					continue // no expectations for later steps
+				}
+				mock.ExpectExec(step).
+					WithArgs("t_test", "myapp").
+					WillReturnResult(sqlmock.NewResult(0, 0))
+			}
+			mock.ExpectRollback()
+			// NO ExpectExec(`INSERT INTO outbox`) — closure exits
+			// before reaching the enqueue step on any cascade
+			// failure, and a stray INSERT would be caught by
+			// ExpectationsWereMet.
+
+			svc := deleteSvcForTest(t, db, &mockAppRepo{}, &mockArtifactStore{})
+			err := svc.Delete(context.Background(), "t_test", "myapp")
+			if err == nil {
+				t.Fatalf("Delete(%s): expected error, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), "simulated DB error") {
+				t.Errorf("Delete(%s) err = %v, want it to wrap the simulated error", tc.name, err)
+			}
+			if sqlErr := mock.ExpectationsWereMet(); sqlErr != nil {
+				t.Errorf("sqlmock expectations not met (likely unexpected INSERT INTO outbox after rollback): %v", sqlErr)
+			}
+		})
+	}
+}
+
+// TestAppService_Delete_ArtifactFailureSurfacesAfterCommit (issue
+// #60) pins the post-commit artifact-cleanup contract: a successful
+// DB commit followed by an artifact-store failure returns a
+// non-nil error with the deployment ID in the message. The
+// pre-fix behavior would have logged the error and returned nil —
+// the caller had no idea storage was inconsistent with the DB.
+//
+// errors.Join aggregates per-deployment failures so a multi-deployment
+// app surfaces every problematic deployment, not just the last.
+func TestAppService_Delete_ArtifactFailureSurfacesAfterCommit(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}).
+			AddRow("d_dep1", "t_test", "myapp", time.Now()).
+			AddRow("d_dep2", "t_test", "myapp", time.Now()))
+	mock.ExpectExec(`DELETE FROM app_env`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM active_deployments`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM app_traffic_splits`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM deployments`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO outbox`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	// Every artifact delete fails — both .wasm (per dep) and
+	// .cwasm (per dep) errors. errors.Join collects them.
+	store := &mockArtifactStore{deleteErr: fmt.Errorf("simulated S3 5xx")}
+	svc := deleteSvcForTest(t, db, &mockAppRepo{}, store)
+
+	err := svc.Delete(context.Background(), "t_test", "myapp")
+	if err == nil {
+		t.Fatalf("Delete: expected error from artifact cleanup, got nil")
+	}
+	// errors.Join produces a message containing both wrapped
+	// errors: at least one wasm + one cwasm mention.
+	if !strings.Contains(err.Error(), "d_dep1") {
+		t.Errorf("err = %v, want it to mention d_dep1", err)
+	}
+	if !strings.Contains(err.Error(), "simulated S3 5xx") {
+		t.Errorf("err = %v, want it to wrap simulated S3 5xx", err)
+	}
+	if sqlErr := mock.ExpectationsWereMet(); sqlErr != nil {
+		t.Errorf("sqlmock expectations not met: %v", sqlErr)
+	}
+}
+
+// TestAppService_Delete_CleansCwasmArtifact (issue #60) confirms
+// the post-commit artifact pass issues both Delete (.wasm) and
+// DeleteFormat ("cwasm") for every deployment. The mocked
+// mockArtifactStore records every call into deleteCalls and
+// deleteFormatCalls — we assert both happen for both deployments.
+func TestAppService_Delete_CleansCwasmArtifact(t *testing.T) {
+	db, mock, cleanup := newDeploymentMockDB(t)
+	defer cleanup()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`DELETE FROM apps WHERE tenant_id = .+ AND name = .+ RETURNING true`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"deleted"}).AddRow(true))
+	mock.ExpectQuery(`SELECT .* FROM deployments .* tenant_id = .+ AND app_name = .+`).
+		WithArgs("t_test", "myapp").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "app_name", "created_at"}).
+			AddRow("d_a", "t_test", "myapp", time.Now()).
+			AddRow("d_b", "t_test", "myapp", time.Now()))
+	mock.ExpectExec(`DELETE FROM app_env`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM active_deployments`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM app_traffic_splits`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM deployments`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO outbox`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	store := &mockArtifactStore{}
+	svc := deleteSvcForTest(t, db, &mockAppRepo{}, store)
+
+	if err := svc.Delete(context.Background(), "t_test", "myapp"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Two deployments × two formats (.wasm + .cwasm) = 4 calls.
+	if got, want := len(store.deleteCalls), 2; got != want {
+		t.Errorf("Delete calls = %d, want %d", got, want)
+	}
+	if got, want := len(store.deleteFormatCalls), 2; got != want {
+		t.Errorf("DeleteFormat calls = %d, want %d", got, want)
+	}
+	// Every cwasm call should use the "cwasm" format.
+	for _, call := range store.deleteFormatCalls {
+		if !strings.HasSuffix(call, "|cwasm") {
+			t.Errorf("DeleteFormat call %q does not target cwasm", call)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("sqlmock expectations not met: %v", err)
 	}
 }
 
