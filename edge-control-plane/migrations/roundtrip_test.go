@@ -73,14 +73,19 @@ import (
 // (029_quotas_resident_seconds + 030_billing_usage_events), PR #439
 // (031_active_deployment_idempotency_keys), issue #574 retention
 // GCs (additional (created_at) indexes landed on existing migrations),
-// and PR #661 (issue #305, 032_tenant_rate_limits) + PR #641
+// PR #661 (issue #305, 032_tenant_rate_limits), PR #430
+// (033_workers_public_key_length), PR #641
 // (034_worker_status_capacity — PR #641 originally claimed 032 but
-// PR #661 won the number when it shipped first on main):
-// 48 .up.sql + 48 .down.sql = 96 split files. Some numeric prefixes
+// PR #661 won the number when it shipped first on main), PR #548
+// (035_l4_public_port — renumbered from 032 to dodge the 3-way
+// 031/032 collision in rubenv/sql-migrate v1.8.1's Less() comparator),
+// and issue #58 (036_deployments_tenant_app_created_at_id_desc — keyset
+// pagination composite index for /api/v1/list/{appName}):
+// 51 .up.sql + 51 .down.sql = 102 split files. Some numeric prefixes
 // collide (005_*, 009_*, 010_*, 017_*, 018_*, 025_*, 026_*, 027_*,
 // 028_*, 029_*, 030_*, 031_*, 032_*, 033_*), so this is the on-disk
 // file count, not a strict 2× the migration number.
-const splitFileCount = 100 // 50 .up.sql + 50 .down.sql after issue #305 + #430 (workers.public_key + length-cap) + #641 (renumbered 032 → 034) + #548 (035_l4_public_port adds 1 .up + 1 .down — renumbered from 032 to dodge the 3-way 031/032 collision in rubenv/sql-migrate v1.8.1's Less() comparator)
+const splitFileCount = 102 // 51 .up.sql + 51 .down.sql after issue #58 (keyset cursor pagination for deployments)
 
 // wantTables is the post-015 expected set of public-schema tables.
 // Update when adding a migration that creates a new table. The
@@ -901,6 +906,7 @@ var wantIndexes = []IndexExpectation{
 	{Table: "webhook_deliveries", Name: "idx_webhook_deliveries_created_at"},                    // 031_gc_retention_indexes (issue #574)
 	{Table: "autoscale_events", Name: "idx_autoscale_events_created_at"},                        // 031_gc_retention_indexes (issue #574)
 	{Table: "worker_status", Name: "idx_worker_status_region_free_slots"},                       // 034_worker_status_capacity (issue #641, partial)
+	{Table: "deployments", Name: "idx_deployments_tenant_app_created_at_id_desc"},               // 036_deployments_tenant_app_created_at_id_desc (issue #58, keyset pagination)
 }
 
 // ForeignKeyExpectation describes one FOREIGN KEY constraint that
