@@ -130,8 +130,14 @@ type InternalHandler struct {
 // today — AutoRollback is worker-driven, never carries an
 // Idempotency-Key header; the parameter exists only so the contract
 // matches the one in deployment.go).
+// Issue #84 ask 7: trailing `isAutoTriggered` is always `true` for
+// `autoRollbacker` — this interface is only used by
+// `AutoRollback` (the worker-driven handler). The contract carries
+// the flag so the service-side can emit `auto_rollback` vs `rollback`
+// webhook events. `deploymentRollbacker` (handler/deployment.go)
+// passes `false`.
 type autoRollbacker interface {
-	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error)
+	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string, isAutoTriggered bool) (string, error)
 	GetDeployment(ctx context.Context, tenantID, deploymentID string) (*domain.Deployment, error)
 	GetArtifact(ctx context.Context, tenantID, appName, deploymentID string, format string) (io.ReadCloser, error)
 }
@@ -588,7 +594,12 @@ func (h *InternalHandler) AutoRollback(w http.ResponseWriter, r *http.Request) {
 	//
 	// Note (issue #42): the previous 502 case for service.ErrPublishFailed
 	// is removed — the post-commit publish is now durable via the outbox.
-	newID, err := h.deploymentSvc.RollbackDeployment(r.Context(), req.TenantID, appName, "")
+	//
+	// Issue #84 ask 7: `isAutoTriggered = true` — the worker drove the
+	// rollback (POST /api/internal/apps/{appName}/auto-rollback); the
+	// service emits the `auto_rollback` webhook event instead of the
+	// operator-path `rollback` event.
+	newID, err := h.deploymentSvc.RollbackDeployment(r.Context(), req.TenantID, appName, "", true)
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrNoLastGood):
