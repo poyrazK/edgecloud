@@ -2135,9 +2135,7 @@ mod tests {
         assert_eq!(global["handle"][0]["handler"], "rate_limit");
         assert_eq!(global["handle"][0]["rates"]["rps"], 7_500);
         assert_eq!(global["handle"][0]["rates"]["burst"], 7_500);
-        assert_eq!(
-            global["handle"][0]["key"], "global-platform-cross-replica"
-        );
+        assert_eq!(global["handle"][0]["key"], "global-platform-cross-replica");
         // `match: [{}]` is the empty catch-all — Caddy treats it as
         // "match every request." The single empty object inside the
         // matcher list is what makes it a catch-all (vs e.g. an

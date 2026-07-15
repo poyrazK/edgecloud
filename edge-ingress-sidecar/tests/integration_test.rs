@@ -69,8 +69,10 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
         "ingress-pod-fra-3",
     ];
     let mut publishers = Vec::new();
-    for rid in &replicas {
-        let p = NatsPublisher::connect(&nats_url, 1).await.expect("nats connect");
+    for _rid in &replicas {
+        let p = NatsPublisher::connect(&nats_url, 1)
+            .await
+            .expect("nats connect");
         p.ensure_stream().await.expect("ensure_stream");
         publishers.push(p);
     }
@@ -84,7 +86,10 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
     let consumer_publisher = NatsPublisher::connect(&nats_url, 1)
         .await
         .expect("nats connect for consumer");
-    consumer_publisher.ensure_stream().await.expect("ensure_stream");
+    consumer_publisher
+        .ensure_stream()
+        .await
+        .expect("ensure_stream");
 
     let (agg_tx, mut agg_rx) = mpsc::channel::<DeltaMsg>(256);
     let shutdown = CancellationToken::new();
@@ -104,7 +109,10 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
     let rps_per_replica = 10_000u32;
     for (i, rid) in replicas.iter().enumerate() {
         let msg = fresh_delta(rid, rps_per_replica);
-        publishers[i].publish_delta(rid, &msg).await.expect("publish");
+        publishers[i]
+            .publish_delta(rid, &msg)
+            .await
+            .expect("publish");
     }
 
     // Tick the aggregator until it sees all 3 replicas with the
@@ -159,11 +167,18 @@ async fn stale_scraped_at_is_dropped_by_consumer() {
     let (_nats, nats_url) = start_nats().await;
     let shutdown = CancellationToken::new();
 
-    let publisher = NatsPublisher::connect(&nats_url, 1).await.expect("nats connect");
+    let publisher = NatsPublisher::connect(&nats_url, 1)
+        .await
+        .expect("nats connect");
     publisher.ensure_stream().await.expect("ensure_stream");
 
-    let consumer_publisher = NatsPublisher::connect(&nats_url, 1).await.expect("nats connect");
-    consumer_publisher.ensure_stream().await.expect("ensure_stream");
+    let consumer_publisher = NatsPublisher::connect(&nats_url, 1)
+        .await
+        .expect("nats connect");
+    consumer_publisher
+        .ensure_stream()
+        .await
+        .expect("ensure_stream");
 
     // Build a stale delta: scraped 60s ago, well beyond MAX_MESSAGE_AGE=2s.
     let stale_msg = {

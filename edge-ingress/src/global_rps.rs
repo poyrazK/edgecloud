@@ -14,10 +14,10 @@
 //! `GlobalRpsCache::current_local_cap(stale_after)` returns `None` when:
 //!   - (a) cache is empty (cold start — no sidecar datagram yet),
 //!   - (b) `local_cap` is `None` on the wire (operator disabled
-//!         enforcement via `configured_cap == 0`, or no traffic has been
-//!         seen in the aggregator's window),
+//!     enforcement via `configured_cap == 0`, or no traffic has been
+//!     seen in the aggregator's window),
 //!   - (c) `received_at.elapsed() > 2 × tick_interval` (sidecar stale —
-//!         crashed, network partition, or simply not running).
+//!     crashed, network partition, or simply not running).
 //!
 //! The renderer reads this and emits **no global route** on `None`. This
 //! matches the broader ingress contract — caches that haven't seen their
@@ -268,7 +268,13 @@ async fn run_recv_loop(
 mod tests {
     use super::*;
 
-    fn entry(cap: Option<u32>, configured: u32, total: u64, replicas: u32, age: Duration) -> GlobalRpsEntry {
+    fn entry(
+        cap: Option<u32>,
+        configured: u32,
+        total: u64,
+        replicas: u32,
+        age: Duration,
+    ) -> GlobalRpsEntry {
         GlobalRpsEntry {
             local_cap: cap,
             configured,
@@ -288,10 +294,7 @@ mod tests {
     fn fresh_cap_returns_value() {
         let mut cache = GlobalRpsCache::default();
         cache.update(entry(Some(7_500), 10_000, 30_000, 3, Duration::ZERO));
-        assert_eq!(
-            cache.current_local_cap(Duration::from_secs(2)),
-            Some(7_500)
-        );
+        assert_eq!(cache.current_local_cap(Duration::from_secs(2)), Some(7_500));
     }
 
     #[test]
@@ -312,7 +315,13 @@ mod tests {
         // arriving → after 2 × tick_interval the ingress drops the
         // route, freeing the platform from the last-known cap.
         let mut cache = GlobalRpsCache::default();
-        cache.update(entry(Some(7_500), 10_000, 30_000, 3, Duration::from_secs(10)));
+        cache.update(entry(
+            Some(7_500),
+            10_000,
+            30_000,
+            3,
+            Duration::from_secs(10),
+        ));
         assert_eq!(cache.current_local_cap(Duration::from_secs(2)), None);
     }
 
@@ -321,11 +330,14 @@ mod tests {
         // Slightly aged entry that's still inside the window — must
         // NOT trip the staleness guard.
         let mut cache = GlobalRpsCache::default();
-        cache.update(entry(Some(7_500), 10_000, 30_000, 3, Duration::from_millis(500)));
-        assert_eq!(
-            cache.current_local_cap(Duration::from_secs(2)),
-            Some(7_500)
-        );
+        cache.update(entry(
+            Some(7_500),
+            10_000,
+            30_000,
+            3,
+            Duration::from_millis(500),
+        ));
+        assert_eq!(cache.current_local_cap(Duration::from_secs(2)), Some(7_500));
     }
 
     #[tokio::test]
@@ -381,7 +393,8 @@ mod tests {
 
         // Sender: unbound + send_to (no connect — matches sidecar).
         let sender = UnixDatagram::unbound().expect("unbound sender");
-        let json = r#"{"configured":10000,"platform_total":25000,"replicas_seen":2,"local_cap":5000}"#;
+        let json =
+            r#"{"configured":10000,"platform_total":25000,"replicas_seen":2,"local_cap":5000}"#;
         sender
             .send_to(json.as_bytes(), &path)
             .await
@@ -430,7 +443,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let sender = UnixDatagram::unbound().expect("unbound sender");
-        sender.send_to(b"not json {", &path).await.expect("send garbage");
+        sender
+            .send_to(b"not json {", &path)
+            .await
+            .expect("send garbage");
         sender
             .send_to(
                 br#"{"configured":10000,"platform_total":5000,"replicas_seen":1,"local_cap":5000}"#,

@@ -203,8 +203,12 @@ async fn main() -> ExitCode {
     let aggregator = Aggregator::new(cfg.replica_id.clone(), cfg.global_rate_limit_rps);
     let uds_path = Arc::<std::path::Path>::from(std::path::PathBuf::from(&cfg.uds_path));
     let on_snapshot: Arc<dyn Fn(Snapshot) + Send + Sync> = Arc::new(snapshot_to_writer(uds_path));
-    let aggregator_handle =
-        edge_ingress_sidecar::aggregate::spawn_aggregator(aggregator, agg_rx, on_snapshot, shutdown.clone());
+    let aggregator_handle = edge_ingress_sidecar::aggregate::spawn_aggregator(
+        aggregator,
+        agg_rx,
+        on_snapshot,
+        shutdown.clone(),
+    );
 
     // ── Signal handlers (mirror edge-ingress/src/main.rs:180-211) ──
     let mut sigterm =

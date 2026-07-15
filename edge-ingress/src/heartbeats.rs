@@ -202,9 +202,7 @@ pub async fn run(
             }
         }
     } else {
-        debug!(
-            "global_rps: INGRESS_RATE_LIMIT_AGGREGATION=false; cross-replica route disabled"
-        );
+        debug!("global_rps: INGRESS_RATE_LIMIT_AGGREGATION=false; cross-replica route disabled");
     }
     let renderer_shutdown = shutdown.clone();
     spawn_renderer(
