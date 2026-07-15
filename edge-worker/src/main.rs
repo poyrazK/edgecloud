@@ -8,6 +8,7 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use tokio::sync::broadcast;
 use tokio::time::{interval, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -73,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             config.region.clone(),
             config.worker_tenant_id.clone(),
         );
-        signer.set_secret(jwt_secret.clone(), Some(kid));
+        signer.install_snapshot(jwt_secret.clone(), Some(kid));
         signer
     } else {
         WorkerJwtSigner::new(
@@ -283,6 +284,17 @@ async fn main() -> anyhow::Result<()> {
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // Issue #504: dedicated `CancellationToken` for the proactive
+    // JWT refresh task. We deliberately don't reuse the existing
+    // `broadcast::Sender<()>` here — the refresh task is a
+    // single-purpose worker, and `CancellationToken::cancelled()`
+    // matches its "select on either tick-or-shutdown" shape better
+    // than a broadcast receiver (which forces a `recv().await` even
+    // for a task that doesn't otherwise need a `&mut` borrow). The
+    // root token is cancelled by `graceful_shutdown` alongside
+    // `shutdown_tx.send(())` so both signals fire in lockstep.
+    let refresh_shutdown = CancellationToken::new();
+
     // Build the WorkerMetrics surface (issue #49). Per-app
     // MetricsHandles are registered/unregistered from
     // Supervisor::start_app / stop_app; the supervisor stores an
@@ -334,6 +346,60 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     tracing::info!(addr = %metrics_addr, "metrics server started");
+
+    // Issue #504: spawn the proactive JWT refresh task. The `Static`
+    // arm is the legacy `WORKER_JWT_SECRET` mode — the secret is
+    // immutable, so the loop only re-signs with the same key (no
+    // network). The `Enrolled` arm re-runs the two-phase bootstrap
+    // handshake so the per-worker HS256 secret tracks CP-side
+    // rotation. We only spawn when there is something to refresh —
+    // `WORKER_JWT_SECRET` not set means we went through the post-#430
+    // path; the legacy static-secret path is intentionally not refreshed.
+    let refresh_metrics = worker_metrics.clone();
+    let refresh_signer = jwt_signer.clone();
+    let refresh_shutdown_token = refresh_shutdown.clone();
+    let refresh_source: edge_worker::jwt_refresh::RefreshSource =
+        if config.worker_jwt_secret.is_empty() {
+            use edge_worker::bootstrap::{BootstrapClient, BootstrapRefreshClient};
+            let client = BootstrapClient::new(
+                config.control_plane_url.clone(),
+                config.worker_bootstrap_secret.as_bytes().to_vec(),
+                config.worker_id.clone(),
+                config.region.clone(),
+                config.worker_tenant_id.clone(),
+            );
+            // `identity` was loaded earlier (line 44) — replant it for
+            // the refresher adapter. (BootstrapClient::new internally
+            // builds its own 15s-timeout reqwest::Client — the worker's
+            // HTTP client, with its 10s timeout, is reserved for
+            // supervisor-level fetches.)
+            let refresher = BootstrapRefreshClient::new(client, std::sync::Arc::new(identity));
+            let enrolled =
+                edge_worker::jwt_refresh::EnrolledSource::new(std::sync::Arc::new(refresher));
+            edge_worker::jwt_refresh::RefreshSource::Enrolled(std::sync::Arc::new(enrolled))
+        } else {
+            edge_worker::jwt_refresh::RefreshSource::Static
+        };
+    let refresh_tick = std::time::Duration::from_secs(60);
+    let refresh_lead = std::time::Duration::from_secs(300); // 5min
+                                                            // Stamp the initial expiry on the gauge BEFORE spawning the
+                                                            // loop so `/metrics` reflects the current snapshot even if the
+                                                            // loop's first tick lands at the deadline boundary (where the
+                                                            // gauge would otherwise stay at the default 0.0 until the
+                                                            // first refresh). Issue #504. Done on the local handles so we
+                                                            // don't need a wrapping `tokio::spawn` (which would expose a
+                                                            // `JoinHandle<Result<(), JoinError>>` mismatch at the call site
+                                                            // for `graceful_shutdown`, which expects `JoinHandle<()>`).
+    refresh_metrics.set_jwt_expires_at(refresh_signer.snapshot().expires_at);
+    let refresh_task = edge_worker::jwt_refresh::spawn_jwt_refresh_loop(
+        refresh_signer,
+        refresh_source,
+        refresh_tick,
+        refresh_lead,
+        refresh_shutdown_token,
+        refresh_metrics,
+    );
+    tracing::info!("jwt refresh task started");
 
     let heartbeat_supervisor = supervisor.clone();
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
@@ -422,6 +488,14 @@ async fn main() -> anyhow::Result<()> {
     // broadcast::Sender is Clone + Send + Sync, so no Arc is needed.
     let shutdown_tx_s = shutdown_tx.clone();
     let metrics_task_for_shutdown = metrics_task;
+    // Issue #504 (review-fix): the JWT refresh task's JoinHandle is now
+    // moved into the signal-handler closure and drained inside
+    // `graceful_shutdown` with a 2-second grace — mirroring the metrics
+    // task pattern. Dropping the handle silently at end of `fn main`
+    // would fire-and-forget the loop body (panic + in-flight refreshes
+    // invisible to operators).
+    let refresh_task_for_shutdown = refresh_task;
+    let refresh_shutdown_for_shutdown = refresh_shutdown.clone();
     tokio::spawn(async move {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => Some(s),
@@ -456,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
             shutdown_supervisor,
             logs_task,
             metrics_task_for_shutdown,
+            refresh_task_for_shutdown,
+            refresh_shutdown_for_shutdown,
         )
         .await;
     });
@@ -639,11 +715,16 @@ async fn resolve_jwt_secret(
             .await
             .context("bootstrap enrollment handshake")?;
 
-        // Persist for next restart.
+        // Persist for next restart. `public_key_hex` comes from the
+        // worker's own `WorkerIdentity`, not the CP-derived response —
+        // the CP now returns only `{kid, secret, expires_at}` (issue
+        // #504), but `PersistedIdentity` still needs the pubkey so a
+        // subsequent restart can prove possession in the bootstrap
+        // handshake.
         let persisted = PersistedIdentity {
             kid: derived.kid.clone(),
             secret: derived.secret.clone(),
-            public_key_hex: derived.public_key_hex.clone(),
+            public_key_hex: identity.public_key_hex().to_string(),
         };
         persist_identity(&config.worker_identity_path, &persisted)
             .context("persisting worker identity after enrollment")?;
@@ -709,15 +790,25 @@ async fn drain_logs_task(
 
 /// Perform graceful shutdown: signal the heartbeat + log-forwarder to stop,
 /// stop all apps, publish a final heartbeat, wait for the log forwarder to
-/// drain its final flush, then exit the process.
+/// drain its final flush, then exit the process. The JWT refresh task
+/// observes `refresh_shutdown` directly (cancellation token); its
+/// `JoinHandle` is awaited at the very end of `fn main()` so the
+/// consume-loop / signal-handler boundary stays clean.
 async fn graceful_shutdown(
     shutdown_tx: broadcast::Sender<()>,
     supervisor: Arc<Supervisor>,
     logs_task: tokio::task::JoinHandle<()>,
     metrics_task: tokio::task::JoinHandle<()>,
+    refresh_task: tokio::task::JoinHandle<()>,
+    refresh_shutdown: CancellationToken,
 ) {
     // Signal the heartbeat + log-forwarder + metrics tasks to stop.
     let _ = shutdown_tx.send(());
+
+    // Issue #504: signal the proactive JWT refresh task to exit at its
+    // next loop iteration. The handle is awaited below with a 2-second
+    // grace (mirror of the metrics task pattern).
+    refresh_shutdown.cancel();
 
     tracing::info!("graceful shutdown: stopping all apps");
     supervisor.stop_all_apps().await;
@@ -751,6 +842,24 @@ async fn graceful_shutdown(
         Err(_) => tracing::warn!(
             timeout_secs = metrics_grace.as_secs(),
             "metrics server drain timed out; connections may be cut",
+        ),
+    }
+
+    // Wait for the JWT refresh loop to exit at the next select! boundary.
+    // The cancellation token is already cancelled; the loop observes it,
+    // drops the join-error if any, and the wrapper task completes.
+    // 2-second grace matches `metrics_task` and the public runbook.
+    let refresh_grace = Duration::from_secs(2);
+    match tokio::time::timeout(refresh_grace, refresh_task).await {
+        Ok(Ok(())) => tracing::info!("jwt refresh task drained cleanly"),
+        Ok(Err(join_err)) => tracing::warn!(
+            err = %join_err,
+            panicked = join_err.is_panic(),
+            "jwt refresh task ended (panic or abort)"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = refresh_grace.as_secs(),
+            "jwt refresh task drain timed out; loop may be killed mid-handshake"
         ),
     }
 

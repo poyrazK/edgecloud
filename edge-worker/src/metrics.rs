@@ -46,7 +46,8 @@ use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
 use prometheus::{
-    core::Collector, Encoder, Gauge, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder,
+    core::Collector, Encoder, Gauge, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use tokio::sync::RwLock;
 
@@ -122,6 +123,20 @@ pub struct WorkerMetrics {
     pub registry: Registry,
     pub worker_uptime_seconds: Gauge,
     pub worker_active_apps: Gauge,
+    /// Seconds remaining until the current JWT snapshot expires.
+    /// Updated by the proactive refresh loop
+    /// (`jwt_refresh::spawn_jwt_refresh_loop`) on every successful
+    /// refresh. The gauge rises back to ~TTL on each successful
+    /// refresh and trends toward zero between refreshes; alert when
+    /// it crosses zero or stops decreasing (a stuck loop). The
+    /// value is monotonic-stable — no wall-clock translation is
+    /// required. Issue #504.
+    pub worker_jwt_expires_at_seconds: Gauge,
+    /// Per-outcome counter for proactive + reactive JWT refresh
+    /// attempts. `outcome = "ok" | "err"`. Bumped by both
+    /// `jwt_refresh` and the reactive `with_token_refresh` helper
+    /// so a single counter is the source of truth. Issue #504.
+    pub worker_jwt_refresh_total: IntCounterVec,
     pub app_status: IntGaugeVec,
     /// Audit-style terminal status. Stamped once per
     /// `(deployment_id, app_name)` from `unregister_app` AFTER
@@ -143,6 +158,15 @@ pub struct WorkerMetrics {
     /// Worker-process boot instant — anchored at construction so
     /// `tick_worker_gauges` can compute uptime by `start.elapsed()`.
     pub started_at: Instant,
+}
+
+/// Lightweight handle to the JWT refresh gauge + outcome counter,
+/// carried by the refresh loop and the reactive 401 helper.
+/// Cloned cheaply (all fields are `Arc`-backed by prometheus).
+#[derive(Clone)]
+pub struct RefreshMetrics {
+    pub expires_at: Gauge,
+    pub refresh_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -209,10 +233,52 @@ impl WorkerMetrics {
         )?;
         registry.register(Box::new(app_terminal_status.clone()))?;
 
+        // JWT refresh: wall-clock expiry + per-outcome counter.
+        // Both are process-global (one worker → one signer → one
+        // refresh loop), so they live as a single-series Gauge /
+        // labeled IntCounterVec on the private registry.
+        //
+        // Why "seconds remaining" rather than "Unix epoch seconds":
+        // the JWT's `exp` claim and the worker's `expires_at` Instant
+        // live on different clocks (wall vs monotonic). Translating
+        // between them requires a boot-time anchor that drifts under
+        // NTP step adjustments. The remaining-seconds gauge is
+        // monotonic-stable: it goes up after each successful refresh
+        // and trends down between refreshes, alerting on a stuck
+        // loop without any clock arithmetic.
+        let worker_jwt_expires_at_seconds = Gauge::with_opts(Opts::new(
+            "edge_worker_jwt_expires_at_seconds",
+            "Seconds remaining until the current JWT snapshot expires. \
+             Updated by the proactive refresh loop \
+             (`jwt_refresh::spawn_jwt_refresh_loop`, issue #504) on \
+             every successful refresh. The gauge goes UP after each \
+             refresh and trends DOWN between refreshes; alert when it \
+             crosses zero or stops decreasing (a stuck loop or a \
+             refresh failure that kept the previous snapshot). The \
+             value is monotonic-stable — no wall-clock translation \
+             required.",
+        ))?;
+        registry.register(Box::new(worker_jwt_expires_at_seconds.clone()))?;
+        let worker_jwt_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "edge_worker_jwt_refresh_total",
+                "Outcome counter for proactive + reactive JWT refresh \
+                 attempts (issue #504). `outcome=\"ok\"` for a successful \
+                 install; `outcome=\"err\"` for any failure (previous \
+                 snapshot remains in service). Reactive 401-triggered \
+                 refreshes share the same counter so the operator sees \
+                 a single source of truth.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(worker_jwt_refresh_total.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
             worker_uptime_seconds,
             worker_active_apps,
+            worker_jwt_expires_at_seconds,
+            worker_jwt_refresh_total,
             app_status,
             app_terminal_status,
             apps: RwLock::new(HashMap::new()),
@@ -518,6 +584,15 @@ impl WorkerMetrics {
     /// delta. The active-apps gauge is set to the current map size
     /// so a `remove_app` that races with the tick lands at a
     /// consistent value.
+    ///
+    /// `edge_worker_jwt_expires_at_seconds` is NOT touched here —
+    /// it's set explicitly by the proactive refresh loop
+    /// (`jwt_refresh::spawn_jwt_refresh_loop`) on every successful
+    /// install. Tick-worker-gauges knows nothing about the signer;
+    /// threading the signer in would force the metrics module to
+    /// take a circular dependency on `auth`. The 1s ticker is short
+    /// enough that the gauge stays live between installs — a stalled
+    /// gauge is the intended "loop is stuck" alert signal.
     pub fn tick_worker_gauges(&self) {
         self.worker_uptime_seconds
             .set(self.started_at.elapsed().as_secs() as f64);
@@ -529,6 +604,50 @@ impl WorkerMetrics {
         if let Ok(apps) = self.apps.try_read() {
             self.worker_active_apps.set(apps.len() as f64);
         }
+    }
+
+    /// Convenience for `jwt_refresh::spawn_jwt_refresh_loop` and the
+    /// reactive `with_token_refresh` helper. Bumps
+    /// `edge_worker_jwt_refresh_total{outcome="ok"|"err"}` once per
+    /// refresh attempt — both the proactive loop and the reactive
+    /// helper share this counter so an operator sees a single source
+    /// of truth.
+    pub fn refresh_outcome_inc(&self, outcome: &str) {
+        self.worker_jwt_refresh_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    /// Stamp `edge_worker_jwt_expires_at_seconds` from the
+    /// monotonic `Instant` the signer holds in its `TokenSnapshot`.
+    /// We publish **seconds remaining** rather than the wall-clock
+    /// Unix-epoch second at which the token expires. The remaining-
+    /// seconds gauge has two advantages:
+    ///
+    /// 1. **No clock translation.** The Instants live entirely on
+    ///    the monotonic clock; subtracting two Instants gives a
+    ///    duration immune to NTP step adjustments. The pre-#504
+    ///    review fix attempted a `SystemTime::now() + (deadline −
+    ///    Instant::now())` translation that mixed two clocks and
+    ///    could drift across NTP step events. The remaining-seconds
+    ///    gauge eliminates the translation.
+    /// 2. **Operator alert band is "crosses zero / stops decreasing".**
+    ///    The post-#504 loop refreshes the snapshot when
+    ///    `now > expires_at − REFRESH_LEAD`. After a successful
+    ///    refresh the remaining-seconds gauge jumps back up to
+    ///    ~TTL; between refreshes it trends toward zero. An alert
+    ///    on `edge_worker_jwt_expires_at_seconds <= 0` or
+    ///    `decrease > 2 * REFRESH_LEAD` flags a stuck loop without
+    ///    requiring a wall-clock anchor at boot.
+    ///
+    /// Saturating arithmetic: if the cached `expires_at` is in the
+    /// past (stale snapshot with no refresh), the gauge saturates
+    /// at 0 rather than going negative.
+    pub fn set_jwt_expires_at(&self, expires_at: std::time::Instant) {
+        let now = std::time::Instant::now();
+        let remaining_secs = expires_at.saturating_duration_since(now).as_secs();
+        self.worker_jwt_expires_at_seconds
+            .set(remaining_secs as f64);
     }
 }
 
@@ -824,5 +943,53 @@ mod tests {
                     .unwrap_or(false),
             "uptime not >=1s: {body}"
         );
+    }
+
+    /// `set_jwt_expires_at(now() + 90s)` should publish a remaining
+    /// gauge of ~90s, NOT a wall-clock Unix-epoch second. Issue
+    /// #504 review-fix #5. Two assertions:
+    /// - the value is in [89, 90] (the sub-second resolution is
+    ///   fine for an alert gauge)
+    /// - the value is far smaller than the wall-clock Unix-epoch
+    ///   right now (~2026), confirming we publish seconds-remaining
+    ///   not absolute time
+    #[tokio::test]
+    async fn set_jwt_expires_at_publishes_remaining_seconds() {
+        let m = WorkerMetrics::new().unwrap();
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        m.set_jwt_expires_at(expires_at);
+        let body = m.gather().unwrap();
+        let gauge_value: f64 = body
+            .lines()
+            .find(|l| l.starts_with("edge_worker_jwt_expires_at_seconds "))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .expect("gauge value must parse");
+        assert!(
+            (89.0..=90.0).contains(&gauge_value),
+            "expected remaining-seconds gauge in [89, 90], got {gauge_value}"
+        );
+        assert!(
+            gauge_value < 100_000.0,
+            "gauge must publish seconds-remaining, not Unix-epoch seconds (got {gauge_value})"
+        );
+    }
+
+    /// A stale `expires_at` (in the past) saturates to 0 — the
+    /// operator alert band is "expires_at_seconds <= 0" / "stops
+    /// decreasing." Going negative would be misleading.
+    #[tokio::test]
+    async fn set_jwt_expires_at_stale_saturates_to_zero() {
+        let m = WorkerMetrics::new().unwrap();
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        m.set_jwt_expires_at(expired);
+        let body = m.gather().unwrap();
+        let gauge_value: f64 = body
+            .lines()
+            .find(|l| l.starts_with("edge_worker_jwt_expires_at_seconds "))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|v| v.parse().ok())
+            .expect("gauge value must parse");
+        assert_eq!(gauge_value, 0.0, "stale expires_at must saturate to 0");
     }
 }

@@ -71,6 +71,11 @@ hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 # traits. Promoted from a dev-only dep (issue #451) to a regular dep
 # so the production metrics_server.rs can use it.
 hyper-util = { version = "0.1", features = ["tokio"] }
+# `CancellationToken` for the proactive JWT refresh loop (issue #504).
+# The token lives in `main` alongside the existing `broadcast::Sender<()>`
+# shutdown signal; the refresh task awaits `cancelled()` and exits cleanly
+# on graceful shutdown. `tokio-util` was previously only a transitive dev-dep.
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # TLS support for HandlerDispatch FaaS endpoint (issue #209).
 # PEM parsing uses the in-tree `rustls::pki_types::pem::PemObject` API
