@@ -542,10 +542,6 @@ pub fn render_routes(
     // N × `concurrent_limit` in-flight requests across the fleet.
     // Same shape as the per-replica RPS caveat (see #665 for
     // cross-replica RPS aggregation, the parallel follow-up).
-    //
-    // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
-    // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
-    // The cache carries bandwidth_bps for that follow-up.
     let mut tenant_concurrent_routes: Vec<Value> = Vec::new();
     for (tenant_id, state) in tenant_rate_limit_cache.concurrent_caps() {
         tenant_concurrent_routes.push(json!({
@@ -566,6 +562,58 @@ pub fn render_routes(
         }));
     }
 
+    // Issue #305 sub-feature #3 — per-tenant data-plane bandwidth cap.
+    // For every tenant the TenantRateLimitCache reports as having a
+    // configured cap (state.bandwidth_bps > 0), insert a `tenant_bandwidth`
+    // route keyed by host_regexp matching the `<tenant>-<app>.edgecloud.dev`
+    // synthetic-host pattern. `terminal: false` so per-app handlers layered
+    // below still apply when a request passes through. The cache treats
+    // `None` (unknown tenant) and `bandwidth_bps == 0` as "no cap" —
+    // fail-open, same shape as the quota 402 cache.
+    //
+    // The bandwidth cap is enforced by the first-party
+    // `tenant_bandwidth` Caddy middleware (issue #664, see
+    // `caddy-modules/tenant_bandwidth/` and the
+    // `edgecloud/caddy-concurrent:latest` image). Stock `caddy:2` has no
+    // response-payload byte-rate throttle primitive — stock `rate_limit`
+    // is RPS-only, and caddyserver/caddy#4476 ("Feature Request:
+    // Bandwidth Limiting") was closed as not-planned. The handler wraps
+    // the downstream `http.ResponseWriter` in a token-bucket pacing
+    // writer; a response body whose `key` already has `bytes_per_sec`
+    // tokens consumed is paced at that rate — the bytes are still
+    // delivered, just stretched across time.
+    //
+    // Insertion order: AFTER quota_402_routes + tenant_concurrent_routes
+    // (so 402 short-circuits first when the tenant is over cap, then the
+    // concurrent cap is the first in-flight signal) and BEFORE
+    // tenant_rl_routes (so RPS throttling doesn't short-circuit before
+    // the bandwidth wrapper is installed — bandwidth is response-side and
+    // must wrap the response writer before the per-app handler chain).
+    //
+    // Multi-replica caveat: each Caddy process enforces its own copy of
+    // the cap. With N replicas a tenant can sustain N × `bandwidth_bps`
+    // throughput across the fleet. Same shape of follow-up as the
+    // per-replica RPS cap (#665).
+    let mut tenant_bandwidth_routes: Vec<Value> = Vec::new();
+    for (tenant_id, state) in tenant_rate_limit_cache.bandwidth_caps() {
+        tenant_bandwidth_routes.push(json!({
+            "@id": format!("tenant-bandwidth:{}", tenant_id),
+            "match": [{
+                "host_regexp": format!(
+                    "^{}-[^.]+\\.{}$",
+                    tenant_id,
+                    crate::config::INGRESS_HOST_SUFFIX,
+                )
+            }],
+            "handle": [{
+                "handler": "tenant_bandwidth",
+                "key": format!("tenant-{}", tenant_id),
+                "bytes_per_sec": state.bandwidth_bps as i64,
+            }],
+            "terminal": false,
+        }));
+    }
+
     // Issue #305 sub-feature #1 — per-tenant data-plane rate limit.
     // For every tenant the TenantRateLimitCache reports as having a
     // configured cap (state.rps > 0), insert a `rate_limit` route keyed
@@ -576,14 +624,12 @@ pub fn render_routes(
     // "no cap" — fail-open, same shape as the quota 402 cache.
     //
     // Insertion order: AFTER quota_402_routes + tenant_concurrent_routes
-    // (so 402 short-circuits first when the tenant is over cap, then
-    // the concurrent cap is the first rate-limit signal) and BEFORE
-    // per-app routes (so per-tenant caps apply before the per-app cap
-    // chain inside the handle).
-    //
-    // TODO(issue #NNN sub-feature #3): render bandwidth_bps via
-    // Caddy 2.8+ `rate_limit.bandwidth` once the deployment upgrades.
-    // The cache carries bandwidth_bps for that follow-up.
+    // + tenant_bandwidth_routes (so 402 short-circuits first, then
+    // the concurrent cap, then the bandwidth wrapper installs BEFORE
+    // the RPS handler — otherwise RPS rejection short-circuits before
+    // we install the bandwidth wrapper) and BEFORE per-app routes (so
+    // per-tenant caps apply before the per-app cap chain inside the
+    // handle).
     let mut tenant_rl_routes: Vec<Value> = Vec::new();
     for (tenant_id, state) in tenant_rate_limit_cache.active_caps() {
         let burst = if state.burst > 0 {
@@ -611,13 +657,17 @@ pub fn render_routes(
             "terminal": false,
         }));
     }
-    if !tenant_concurrent_routes.is_empty() || !tenant_rl_routes.is_empty() {
+    if !tenant_concurrent_routes.is_empty()
+        || !tenant_bandwidth_routes.is_empty()
+        || !tenant_rl_routes.is_empty()
+    {
         // Splice: keep the first `quota_402_route_count` entries,
-        // then the tenant_concurrent_routes, then the tenant_rl_routes,
-        // then the rest (per-app routes).
+        // then tenant_concurrent_routes, then tenant_bandwidth_routes,
+        // then tenant_rl_routes, then the rest (per-app routes).
         let per_app_start = quota_402_route_count;
         let per_app = routes.split_off(per_app_start);
         routes.extend(tenant_concurrent_routes);
+        routes.extend(tenant_bandwidth_routes);
         routes.extend(tenant_rl_routes);
         routes.extend(per_app);
     }
@@ -2222,6 +2272,149 @@ mod tests {
             concurrent_idx < rl_idx,
             "concurrent-cap route (idx {}) must precede tenant-rl route (idx {})",
             concurrent_idx,
+            rl_idx,
+        );
+    }
+
+    /// Issue #305 sub-feature #3 — the renderer emits a
+    /// `tenant_bandwidth` HTTP handler invocation per bandwidth-cap
+    /// tenant when the cache has `bandwidth_bps > 0`. The
+    /// `handle[0]` is a `tenant_bandwidth` invocation that the
+    /// custom Caddy image (`edgecloud/caddy-concurrent:latest`, see
+    /// `edge-ingress/Dockerfile.caddy-concurrent`) enforces via the
+    /// first-party module at `caddy-modules/tenant_bandwidth/`.
+    /// Pin the JSON shape so a renderer change can't silently
+    /// misconfigure the handler (e.g. emit `bytes_per_sec` as a
+    /// string or drop `terminal: false`).
+    #[test]
+    fn tenant_bandwidth_cache_injects_handler_invocation() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                bandwidth_bps: 1_000_000,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let bandwidth = routes
+            .iter()
+            .find(|r| r["@id"] == "tenant-bandwidth:t_acme")
+            .expect("bandwidth-cap handler route must exist");
+        assert_eq!(
+            bandwidth["handle"][0]["handler"], "tenant_bandwidth",
+            "handler module id must match the Go module's CaddyModule ID"
+        );
+        assert_eq!(
+            bandwidth["handle"][0]["key"], "tenant-t_acme",
+            "key must be tenant-<tenant_id> so the Go module scopes the bucket per tenant"
+        );
+        assert_eq!(
+            bandwidth["handle"][0]["bytes_per_sec"], 1_000_000i64,
+            "bytes_per_sec must mirror state.bandwidth_bps (cast to i64 for JSON)"
+        );
+        let re = bandwidth["match"][0]["host_regexp"].as_str().unwrap();
+        assert_eq!(re, "^t_acme-[^.]+\\.edgecloud.dev$");
+        assert_eq!(
+            bandwidth["terminal"], false,
+            "bandwidth-cap route must NOT be terminal — Caddy must fall through to per-app routes"
+        );
+    }
+
+    /// Bandwidth-cap route is omitted when the cache has
+    /// `bandwidth_bps == 0` (fail-open: no cap → no route).
+    /// Mirrors `tenant_concurrent_zero_no_route_emitted`.
+    #[test]
+    fn tenant_bandwidth_zero_no_route_emitted() {
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState::default(),
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &test_cfg(),
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            routes
+                .iter()
+                .all(|r| r["@id"].as_str().unwrap_or("") != "tenant-bandwidth:t_acme"),
+            "bandwidth_bps=0 must NOT emit a bandwidth-cap route"
+        );
+    }
+
+    /// When a tenant has both `bandwidth_bps > 0` AND `rps > 0`, the
+    /// bandwidth-cap route must appear BEFORE the tenant-rl
+    /// rate_limit route in the rendered routes list. Bandwidth is
+    /// response-side — it wraps the downstream `http.ResponseWriter`
+    /// in a pacing writer — so the wrapper must install BEFORE the
+    /// RPS handler chain runs. Otherwise RPS rejection (429)
+    /// short-circuits before the bandwidth wrapper is installed,
+    /// and pacing never applies. Mirrors
+    /// `tenant_concurrent_route_precedes_tenant_rl_route`'s
+    /// ordering-assert pattern.
+    #[test]
+    fn tenant_bandwidth_route_precedes_tenant_rl_route() {
+        let mut cfg = test_cfg();
+        cfg.global_rate_limit_rps = 0;
+        let entries = vec![entry("t_acme", "api", "1.2.3.4", 8081)];
+        let mut tenant_rl_cache = TenantRateLimitCache::default();
+        tenant_rl_cache.update(
+            "t_acme".into(),
+            crate::tenant_ratelimit::TenantRateLimitState {
+                rps: 50,
+                burst: 100,
+                bandwidth_bps: 100_000,
+                ..Default::default()
+            },
+        );
+        let cfg_json = render_routes(
+            &entries,
+            &[],
+            &cfg,
+            &Default::default(),
+            &test_rate_limit_cache(),
+            &test_quota_cache(),
+            &tenant_rl_cache,
+        );
+        let routes = cfg_json["apps"]["http"]["servers"][SERVER_NAME_HTTPS]["routes"]
+            .as_array()
+            .unwrap();
+        let bandwidth_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-bandwidth:t_acme")
+            .expect("bandwidth route must exist");
+        let rl_idx = routes
+            .iter()
+            .position(|r| r["@id"] == "tenant-rl:t_acme")
+            .expect("tenant-rl route must exist");
+        assert!(
+            bandwidth_idx < rl_idx,
+            "bandwidth-cap route (idx {}) must precede tenant-rl route (idx {})",
+            bandwidth_idx,
             rl_idx,
         );
     }

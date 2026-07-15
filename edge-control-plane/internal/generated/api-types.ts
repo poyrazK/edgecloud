@@ -2661,13 +2661,28 @@ export interface components {
              */
             burst?: number;
             /**
-             * @description Concurrent-request cap per tenant (sub-feature
+             * @description Concurrent-request cap per tenant (issue #305 sub-feature #2,
+             *     issue #663). Rendered by edge-ingress as a `tenant_concurrent`
+             *     HTTP handler invocation; enforced inside the custom Caddy
+             *     image `edgecloud/caddy-concurrent:latest` by the first-party
+             *     module at `caddy-modules/tenant_concurrent/`. Stock `caddy:2`
+             *     has no concurrency limiter primitive, so this cap is enforced
+             *     by a custom first-party module built into the custom image.
              * @example 50
              */
             concurrent_limit?: number;
             /**
              * Format: int64
-             * @description Per-tenant bytes-per-second cap (sub-feature
+             * @description Per-tenant bytes-per-second cap on response payload (issue #305
+             *     sub-feature #3, issue #664). Rendered by edge-ingress as a
+             *     `tenant_bandwidth` HTTP handler invocation; enforced inside
+             *     the custom Caddy image `edgecloud/caddy-concurrent:latest` by
+             *     the first-party module at `caddy-modules/tenant_bandwidth/`.
+             *     Stock `caddy:2` has no response-payload throttle primitive
+             *     (caddyserver/caddy#4476 closed as not-planned), so this cap
+             *     is enforced by a custom first-party module that wraps the
+             *     downstream `http.ResponseWriter` in a token-bucket pacing
+             *     writer.
              * @example 5000000
              */
             bandwidth_bps?: number;

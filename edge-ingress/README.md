@@ -54,17 +54,19 @@ cert. Generate one with `caddy trust` or
 # 1. Caddy — the reverse-proxy this binary controls. Exposes the JSON
 #    admin API on :2019 and binds the public ports :80/:443.
 #
-#    Issue #548 + #663: stock `caddy:2` has no `apps.layer4` AND
-#    no in-flight concurrency counter primitive for HTTP routes.
-#    Use the xcaddy-built image `edgecloud/caddy-concurrent:latest`
-#    (built from `edge-ingress/Dockerfile.caddy-concurrent`) which
-#    is a strict superset: includes both the `mholt/caddy-l4`
-#    plugin (for #548) AND the first-party `tenant_concurrent`
-#    HTTP middleware (for #663, sub-feature #2 of #305). The HTTP
-#    path is byte-identical to stock for unconfigured routes. The
-#    L4-only `edgecloud/caddy-l4:latest` image is still built (see
-#    `Dockerfile.caddy-l4`) for environments that do not need
-#    concurrent caps.
+#    Issues #548 + #663 + #664: stock `caddy:2` has no `apps.layer4`,
+#    no in-flight concurrency counter primitive for HTTP routes,
+#    and no response-payload byte-rate throttle. Use the
+#    xcaddy-built image `edgecloud/caddy-concurrent:latest` (built
+#    from `edge-ingress/Dockerfile.caddy-concurrent`) which is a
+#    strict superset: includes the `mholt/caddy-l4` plugin (for
+#    #548), the first-party `tenant_concurrent` HTTP middleware
+#    (for #663, sub-feature #2 of #305), AND the first-party
+#    `tenant_bandwidth` HTTP middleware (for #664, sub-feature #3
+#    of #305). The HTTP path is byte-identical to stock for
+#    unconfigured routes. The L4-only `edgecloud/caddy-l4:latest`
+#    image is still built (see `Dockerfile.caddy-l4`) for
+#    environments that do not need concurrent / bandwidth caps.
 docker run --rm -p 2019:2019 -p 80:80 -p 443:443 \
   -v ~/.edgecloud/tls:/etc/caddy/tls:ro \
   -e CADDY_ADMIN_TOKEN=dev-token \
@@ -256,17 +258,29 @@ global `rate_limit` route when `GLOBAL_RATE_LIMIT_RPS > 0`.
   copy of the cap. With N ingress replicas, the effective cap is
   `N × concurrent_limit`. Cross-replica NATS aggregation is the
   same shape of follow-up as the per-replica RPS cap (issue #665).
+- #3 Per-tenant bandwidth throttling (issue #664) — emits a
+  `tenant_bandwidth` HTTP handler invocation keyed by
+  `tenant-<tenant_id>`. Enforced inside the custom Caddy image
+  (`edgecloud/caddy-concurrent:latest`, see
+  `edge-ingress/Dockerfile.caddy-concurrent`) by the first-party
+  module at `caddy-modules/tenant_bandwidth/`. The handler wraps
+  the downstream `http.ResponseWriter` in a token-bucket pacing
+  writer; a response body whose `key` already has `bytes_per_sec`
+  tokens consumed is paced at that rate — the bytes are still
+  delivered, just stretched across time. Stock `caddy:2` has no
+  response-payload throttle primitive — stock `rate_limit` is
+  RPS-only, and caddyserver/caddy#4476 ("Feature Request:
+  Bandwidth Limiting") was closed as not-planned — so this cap
+  is implemented as a first-party module built into the image
+  alongside #2.
+  **Multi-replica caveat:** each Caddy process enforces its own
+  copy of the cap. With N ingress replicas, the effective cap is
+  `N × bandwidth_bps`. Cross-replica NATS aggregation is the
+  same shape of follow-up as the per-replica RPS cap (issue #665).
 - #4 Global platform RPS — single route keyed on
   `0.0.0.0/0`, capped at `GLOBAL_RATE_LIMIT_RPS`.
 - #5 `RateLimit-*` headers — emitted natively by Caddy's
   `rate_limit` handler.
-
-**Sub-features cached but not rendered in this PR** (follow-ups
-filed):
-- #3 Per-tenant bandwidth throttling — needs Caddy 2.8+ for
-  the `rate_limit.bandwidth` field; the `caddy:2` Docker tag is
-  a floating tag so this is verification-deferred until the
-  production deployment pins a minimum version.
 
 **Per-replica semantics.** `GLOBAL_RATE_LIMIT_RPS` is enforced
 per Caddy process. With N ingress replicas, the effective cap is
