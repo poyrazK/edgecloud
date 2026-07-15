@@ -30,14 +30,14 @@ func NewLogHandler(logSvc *service.LogService) *LogHandler {
 	return &LogHandler{logSvc: logSvc}
 }
 
-// LogListResponse is the JSON envelope returned by GET .../logs. Cursor
-// pagination is preferred; next_offset remains for one compatibility release.
+// LogListResponse is the JSON envelope returned by GET .../logs. Issue
+// #682 follow-up (same shape as #709): `?offset=` is retired; cursor
+// is the only pagination input.
 type LogListResponse struct {
 	Items      []domain.LogEntry `json:"items"`
 	Limit      int               `json:"limit"`
 	Since      string            `json:"since"`
-	NextOffset *int              `json:"next_offset"`
-	NextCursor *string           `json:"next_cursor"`
+	NextCursor *string           `json:"next_cursor,omitempty"`
 }
 
 // List handles GET /api/v1/apps/{appName}/logs.
@@ -64,8 +64,12 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	if q.Has("cursor") && q.Has("offset") {
-		httperror.BadRequestCtx(w, r, "cursor and offset are mutually exclusive")
+	// #709 / #682-style hard-cut: any non-empty `?offset=` returns
+	// 400. The compat release from #77/#681 is retired; stale
+	// callers fail loudly instead of silently restarting the page
+	// from zero.
+	if offsetStr := q.Get("offset"); offsetStr != "" {
+		httperror.BadRequestCtx(w, r, "offset is not supported; use cursor")
 		return
 	}
 
@@ -94,18 +98,12 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 		httperror.BadRequestCtx(w, r, "invalid limit: "+err.Error())
 		return
 	}
-	offset, err := parseOffsetParam(q.Get("offset"))
-	if err != nil {
-		httperror.BadRequestCtx(w, r, "invalid offset: "+err.Error())
-		return
-	}
 
 	result, err := h.logSvc.ListByTenantApp(r.Context(), tenantID, appName, service.LogQuery{
 		Since:  since,
 		Until:  until,
 		MinLvl: minLvl,
 		Limit:  limit,
-		Offset: offset,
 		Cursor: q.Get("cursor"),
 	})
 	if err != nil {
@@ -130,7 +128,6 @@ func (h *LogHandler) List(w http.ResponseWriter, r *http.Request) {
 		Items:      result.Entries,
 		Limit:      result.Limit,
 		Since:      effectiveSinceRFC3339(result.Since, now),
-		NextOffset: result.NextOffset,
 		NextCursor: result.NextCursor,
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -175,23 +172,6 @@ func parseUntilParam(raw string, now time.Time) (time.Time, error) {
 // the upper bound — the handler only validates that the string parses
 // as a non-negative integer (the service treats ≤0 as "use default").
 func parseLimitParam(raw string) (int, error) {
-	if raw == "" {
-		return 0, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, errors.New("expected integer")
-	}
-	if n < 0 {
-		return 0, errors.New("must be non-negative")
-	}
-	return n, nil
-}
-
-// parseOffsetParam returns the user-supplied offset, or 0 when absent.
-// Accepts non-negative integers only; negative values are rejected with
-// a 400 (the service doesn't silently clamp).
-func parseOffsetParam(raw string) (int, error) {
 	if raw == "" {
 		return 0, nil
 	}

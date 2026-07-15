@@ -193,7 +193,6 @@ type LogListFilter struct {
 	Until    time.Time
 	Levels   []string
 	Limit    int
-	Offset   int
 	CursorTS time.Time
 	CursorID int64
 }
@@ -261,12 +260,6 @@ WHERE tenant_id = $1 AND app_name = $2`)
 	sb.WriteString(" ORDER BY ts DESC, id DESC LIMIT ")
 	sb.WriteString(nextPlaceholder())
 	args = append(args, filter.Limit)
-
-	if filter.CursorTS.IsZero() && filter.Offset > 0 {
-		sb.WriteString(" OFFSET ")
-		sb.WriteString(nextPlaceholder())
-		args = append(args, filter.Offset)
-	}
 
 	out := make([]domain.LogEntry, 0, filter.Limit)
 	if err := r.db.SelectContext(ctx, &out, sb.String(), args...); err != nil {
