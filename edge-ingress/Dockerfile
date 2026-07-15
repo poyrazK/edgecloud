@@ -108,11 +108,12 @@ WORKDIR /workspace
 # on the fly from the manifests + cached registry, which is fine
 # because the registry is already deterministic.
 COPY Cargo.toml ./
-COPY edge-runtime/   edge-runtime/
-COPY edge-config/    edge-config/
-COPY edge-spool/     edge-spool/
-COPY edge-worker/    edge-worker/
-COPY edge-ingress/   edge-ingress/
+COPY edge-runtime/         edge-runtime/
+COPY edge-config/          edge-config/
+COPY edge-spool/           edge-spool/
+COPY edge-worker/          edge-worker/
+COPY edge-ingress/         edge-ingress/
+COPY edge-test-helpers/    edge-test-helpers/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \

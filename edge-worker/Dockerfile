@@ -116,16 +116,22 @@ WORKDIR /workspace
 #
 # Cargo.lock is intentionally NOT COPY'd from the build context (the
 # workspace gitignores it). The deps stage above generated one via
-# `cargo generate-lockfile` and the registry cache mount preserves it
-# in /usr/local/cargo/registry; `cargo build --release` regenerates
+# `cargo generate-lockfile`; `cargo build --release` regenerates
 # /workspace/Cargo.lock on the fly from the manifests and the cached
 # registry index, which is fine because the registry is already
 # deterministic.
+#
+# edge-ingress/ and edge-test-helpers/ are dev-dependencies of
+# edge-worker (ingress wire tests + supervisor test helpers);
+# cargo's manifest walk reads every path-dep target, including
+# dev-only ones, so we COPY their sources too.
 COPY Cargo.toml ./
-COPY edge-runtime/   edge-runtime/
-COPY edge-config/    edge-config/
-COPY edge-spool/     edge-spool/
-COPY edge-worker/    edge-worker/
+COPY edge-runtime/         edge-runtime/
+COPY edge-config/          edge-config/
+COPY edge-spool/           edge-spool/
+COPY edge-worker/          edge-worker/
+COPY edge-ingress/         edge-ingress/
+COPY edge-test-helpers/    edge-test-helpers/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
