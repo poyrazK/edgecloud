@@ -54,7 +54,6 @@ func (a stubListerAdapter) ListByTenantApp(
 		Until:  filter.Until,
 		Levels: filter.Levels,
 		Limit:  filter.Limit,
-		Offset: filter.Offset,
 	}
 	if !filter.CursorTS.IsZero() {
 		a.svc.lastQuery.Cursor = "stub-cursor"
@@ -139,19 +138,28 @@ func TestLogsList_EnvelopeShape(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"items", "limit", "since", "next_offset", "next_cursor"} {
+	for _, key := range []string{"items", "limit", "since"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("response missing top-level key %q (got %v)", key, raw)
 		}
 	}
+	// #709 / #682-style hard-cut: next_offset is GONE from the wire.
+	// If a regression re-introduces it, this assertion fails loudly.
+	if _, hasOff := raw["next_offset"]; hasOff {
+		t.Errorf("response has 'next_offset'; #709 retired it from the logs wire")
+	}
+	// next_cursor is omitempty — present only when the page is full
+	// (probe row trimmed away). With a single-entry stub it's absent.
+	if _, hasCur := raw["next_cursor"]; hasCur {
+		t.Logf("note: next_cursor present on a partial-page response (entry count %d)", len(stub.entries))
+	}
 }
 
 // ---------------------------------------------------------------------------
-// List — 200 (next_offset + next_cursor appear when probe row detects
-// another page on the offset/first-page path)
+// List — 200 (next_cursor appears when probe row detects another page)
 // ---------------------------------------------------------------------------
 
-func TestLogsList_NextOffsetAndCursorInResponse(t *testing.T) {
+func TestLogsList_NextCursorInResponse(t *testing.T) {
 	stub := &stubLogService{
 		entries: makeLogTestEntries(4, "2026-07-14T12:00:00Z"),
 	}
@@ -172,18 +180,13 @@ func TestLogsList_NextOffsetAndCursorInResponse(t *testing.T) {
 	if len(got.Items) != 3 {
 		t.Errorf("len(items) = %d, want 3 (probe trimmed)", len(got.Items))
 	}
-	if got.NextOffset == nil {
-		t.Fatal("expected next_offset set when probe detects another page")
-	} else if *got.NextOffset != 3 {
-		t.Errorf("next_offset = %d, want 3", *got.NextOffset)
-	}
 	if got.NextCursor == nil {
 		t.Fatal("expected next_cursor set when probe detects another page")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// List — 200 (final page exactly equal to limit omits both hints)
+// List — 200 (final page exactly equal to limit omits next_cursor)
 // ---------------------------------------------------------------------------
 
 func TestLogsList_NoNextOnFinalFullPage(t *testing.T) {
@@ -204,16 +207,13 @@ func TestLogsList_NoNextOnFinalFullPage(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.NextOffset != nil {
-		t.Errorf("next_offset = %d, want nil (final page)", *got.NextOffset)
-	}
 	if got.NextCursor != nil {
 		t.Errorf("next_cursor = %q, want nil (final page)", *got.NextCursor)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// List — 200 (partial page omits both hints)
+// List — 200 (partial page omits next_cursor)
 // ---------------------------------------------------------------------------
 
 func TestLogsList_NoNextOnPartialPage(t *testing.T) {
@@ -234,9 +234,6 @@ func TestLogsList_NoNextOnPartialPage(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.NextOffset != nil {
-		t.Errorf("next_offset = %d, want nil (partial page)", *got.NextOffset)
-	}
 	if got.NextCursor != nil {
 		t.Errorf("next_cursor = %q, want nil (partial page)", *got.NextCursor)
 	}
@@ -253,7 +250,7 @@ func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	sinceRFC := "2020-01-01T00:00:00Z"
 	untilRFC := "2026-01-01T00:00:00Z"
 	url := "/api/v1/apps/myapp/logs?level=warn&limit=50&since=" + sinceRFC +
-		"&until=" + untilRFC + "&offset=100"
+		"&until=" + untilRFC
 	req := httptest.NewRequest("GET", url, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
@@ -280,9 +277,6 @@ func TestLogsList_ForwardsQueryParams(t *testing.T) {
 	}
 	if stub.lastQuery.Since <= 0 {
 		t.Errorf("Since = %s, want > 0 (parsed from RFC3339)", stub.lastQuery.Since)
-	}
-	if stub.lastQuery.Offset != 100 {
-		t.Errorf("Offset = %d, want 100", stub.lastQuery.Offset)
 	}
 	wantUntil, _ := time.Parse(time.RFC3339, untilRFC)
 	if !stub.lastQuery.Until.Equal(wantUntil) {
@@ -331,19 +325,21 @@ func TestLogsList_ExplicitSinceProducesPositiveLookback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// List — 400 (cursor + offset mutually exclusive — including offset=0)
+// List — 400 (?offset= is retired; rejected unconditionally, including
+// offset=0 — issue #709 / #682-style hard-cut)
 // ---------------------------------------------------------------------------
 
-func TestLogsList_RejectsCursorAndOffsetTogether(t *testing.T) {
+func TestLogsList_RejectsOffset(t *testing.T) {
 	cases := []string{
 		"offset=100",
 		"offset=0",
+		"offset=1&cursor=abc", // cursor+offset also 400 (was already)
 	}
 	for _, off := range cases {
 		t.Run(off, func(t *testing.T) {
 			stub := &stubLogService{}
 			mux := newLogsMux(stub)
-			url := "/api/v1/apps/myapp/logs?cursor=abc&" + off
+			url := "/api/v1/apps/myapp/logs?" + off
 			req := httptest.NewRequest("GET", url, nil)
 			req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 			rr := httptest.NewRecorder()
@@ -352,7 +348,7 @@ func TestLogsList_RejectsCursorAndOffsetTogether(t *testing.T) {
 				t.Errorf("status = %d, want 400", rr.Code)
 			}
 			if stub.called {
-				t.Error("service should not have been called for cursor+offset")
+				t.Error("service should not have been called when ?offset= is present")
 			}
 		})
 	}
@@ -517,18 +513,36 @@ func TestLogsList_RejectsInvalidLimit(t *testing.T) {
 	}
 }
 
-func TestLogsList_RejectsInvalidOffset(t *testing.T) {
-	stub := &stubLogService{}
-	mux := newLogsMux(stub)
-	req := httptest.NewRequest("GET", "/api/v1/apps/myapp/logs?offset=notanumber", nil)
-	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rr.Code)
+// TestLogsList_RejectsAnyOffset pins the #709 / #682-style hard-cut:
+// any non-empty `?offset=` (regardless of value) returns 400. The
+// service must NOT be called. The message "offset is not supported;
+// use cursor" is the canonical one-liner — keeps it grep-able in
+// the logs.
+func TestLogsList_RejectsAnyOffset(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"numeric", "/api/v1/apps/myapp/logs?offset=100"},
+		{"zero", "/api/v1/apps/myapp/logs?offset=0"},
+		{"non-numeric", "/api/v1/apps/myapp/logs?offset=notanumber"},
+		{"with-cursor", "/api/v1/apps/myapp/logs?cursor=abc&offset=0"},
 	}
-	if stub.called {
-		t.Error("service should not have been called for invalid offset")
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stub := &stubLogService{}
+			mux := newLogsMux(stub)
+			req := httptest.NewRequest("GET", c.url, nil)
+			req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", rr.Code)
+			}
+			if stub.called {
+				t.Error("service should not have been called when ?offset= is present")
+			}
+		})
 	}
 }
 

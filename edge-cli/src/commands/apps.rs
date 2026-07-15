@@ -18,12 +18,20 @@ use crate::api::{ApiClient, ApiError};
 use crate::config::EdgeToml;
 use crate::output;
 
-/// List all apps for the authenticated tenant.
+/// List all apps for the authenticated tenant. Walks the cursor
+/// chain to exhaustion so tenants with >50 apps see the complete
+/// list (issue #58). Pre-#58 the CLI only fetched one page; the new
+/// walker terminates when the server returns a `null` (or absent)
+/// `next_cursor` field.
+///
+/// Page size is fixed at the server's default (50) — the CLI doesn't
+/// expose a `--limit` flag for this command. Operators scripting
+/// bulk reads can wire `ApiClient::list_all_apps(N)` directly.
 #[cfg(feature = "network")]
 pub fn list(path: &Path) -> Result<()> {
     let edge_toml = EdgeToml::from_path(path)?;
     let client = ApiClient::new(edge_toml.api_url("https://api.edgecloud.dev"))?;
-    let apps = client.list_apps()?;
+    let apps = client.list_all_apps(0)?;
 
     if apps.is_empty() {
         println!("No apps found.");

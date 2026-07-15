@@ -418,62 +418,29 @@ func TestLogEntryRepository_ListByTenantApp_AppliesCursorTuplePredicate(t *testi
 	}
 }
 
-// TestLogEntryRepository_ListByTenantApp_CursorModeOmitsOffset pins
-// the cursor-mode contract: when a cursor is set, OFFSET must NOT
-// appear in the SQL even if Offset > 0, because the keyset predicate
-// is the page boundary. (A regression that emitted both would still
-// return correct rows, but it's wasted budget and hides intent.)
-func TestLogEntryRepository_ListByTenantApp_CursorModeOmitsOffset(t *testing.T) {
+// TestLogEntryRepository_ListByTenantApp_DefaultNoCursor omits the
+// keyset predicate and OFFSET entirely when no cursor is supplied.
+// Post-#709 the Offset field is gone from LogListFilter; this test
+// pins the simpler SQL shape that the cursor-only contract implies.
+func TestLogEntryRepository_ListByTenantApp_DefaultNoCursor(t *testing.T) {
 	repo, mock, cleanup := newLogEntryMockRepo(t)
 	defer cleanup()
 
-	ts := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
-	// The regex prohibits the literal `OFFSET` keyword only on the
-	// cursor-mode query, so any regression that re-emits OFFSET fails.
-	mock.ExpectQuery(`SELECT .* ORDER BY ts DESC, id DESC LIMIT \$5`).
-		WithArgs("t_test", "myapp", ts, int64(7), int64(10)).
+	mock.ExpectQuery(`SELECT .* FROM logs WHERE tenant_id = \$1 AND app_name = \$2 ORDER BY ts DESC, id DESC LIMIT \$3`).
+		WithArgs("t_test", "myapp", 10).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "tenant_id", "deployment_id", "app_name",
 			"worker_id", "region", "level", "message", "labels", "ts",
 		}))
 
 	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
-		Limit:    10,
-		Offset:   100, // Intentionally set; must be ignored in cursor mode.
-		CursorTS: ts,
-		CursorID: 7,
+		Limit: 10,
 	})
 	if err != nil {
 		t.Fatalf("ListByTenantApp: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet mock expectations (OFFSET leaked into cursor mode): %v", err)
-	}
-}
-
-// TestLogEntryRepository_ListByTenantApp_OffsetModeEmitsOffset pins
-// the offset-mode contract: when no cursor is set, OFFSET must reach
-// the SQL unchanged.
-func TestLogEntryRepository_ListByTenantApp_OffsetModeEmitsOffset(t *testing.T) {
-	repo, mock, cleanup := newLogEntryMockRepo(t)
-	defer cleanup()
-
-	mock.ExpectQuery(`SELECT .* LIMIT \$3 OFFSET \$4`).
-		WithArgs("t_test", "myapp", int64(10), int64(150)).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "tenant_id", "deployment_id", "app_name",
-			"worker_id", "region", "level", "message", "labels", "ts",
-		}))
-
-	_, err := repo.ListByTenantApp(context.Background(), "t_test", "myapp", LogListFilter{
-		Limit:  10,
-		Offset: 150,
-	})
-	if err != nil {
-		t.Fatalf("ListByTenantApp: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet mock expectations (OFFSET missing on offset mode): %v", err)
+		t.Errorf("unmet mock expectations: %v", err)
 	}
 }
 

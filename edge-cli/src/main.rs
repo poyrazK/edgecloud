@@ -617,18 +617,12 @@ enum Command {
     /// List all deployments for the app.
     ///
     /// Calls `GET /api/v1/list/{appName}` and prints a 4-column
-    /// table (ID / STATUS / CREATED / URL). When the tenant has
-    /// more deployments than fit on one page, renders a
-    /// `page X of N` footer with `prev:` / `next:` hints; small
-    /// lists render silently.
+    /// table (ID / STATUS / CREATED / URL). Page-walks the cursor
+    /// chain to exhaustion (issue #709 — `?offset=` is gone from
+    /// the wire, so the legacy `--page` flag is gone too). The
+    /// `total` count from the server is rendered as a trailing
+    /// "N deployments" header; small lists render silently.
     Deployments {
-        /// 1-indexed page number. Defaults to 1. Page numbers are
-        /// validated to be `>= 1`; `edge deployments --page 0`
-        /// exits non-zero with a clear error rather than
-        /// silently rendering the first page.
-        #[arg(long, default_value_t = 1, value_name = "N")]
-        page: u32,
-
         /// Page size forwarded as `?limit=` on the request. The
         /// server's default (20) is used when this flag is absent
         /// (the CLI sends 0 to mean "server default" — the wire
@@ -656,17 +650,18 @@ enum Command {
     /// window. Pipe mode (`edge logs myapp | jq`) emits one JSON
     /// object per line.
     ///
-    /// Pagination (issue #644): the server prefers opaque keyset
-    /// cursors. `edge logs` re-emits the server's `next_cursor`
-    /// in its follow-up hint when present. `--cursor <CURSOR>`
-    /// lets the user feed a cursor back manually. `--offset` is
-    /// DEPRECATED and only kept for one release; new workflows
-    /// should use `--cursor`. `--until <RFC3339>` adds an optional
-    /// upper bound.
+    /// Pagination (issue #644 / #709 / #682): the wire shape is
+    /// cursor-only now. A one-shot `edge logs myapp` page-walks
+    /// the cursor chain to exhaustion (mirrors `edge apps` /
+    /// `edge deployments`). `--cursor <CURSOR>` lets the user
+    /// feed a cursor back manually for a single page; the walker
+    /// stays off that path so it doesn't surprise a user who
+    /// explicitly opted into manual pagination. `--until <RFC3339>`
+    /// adds an optional upper bound.
     ///
-    /// `--follow` is mutually exclusive with `--until`, `--cursor`,
-    /// and `--offset`: follow keeps a moving watermark, so a fixed
-    /// cursor/offset would silently drop every entry past the page
+    /// `--follow` is mutually exclusive with `--until` and
+    /// `--cursor`: follow keeps a moving watermark, so a fixed
+    /// cursor would silently drop every entry past the page
     /// boundary.
     Logs {
         /// App name. Defaults to the app in `.edge/state.json`.
@@ -692,9 +687,9 @@ enum Command {
 
         /// Poll for new entries instead of printing once and
         /// exiting. Stops on Ctrl-C, after 30 minutes, or when
-        /// the process is killed. Incompatible with `--until`,
-        /// `--cursor`, and `--offset`.
-        #[arg(short, long, conflicts_with_all = ["until", "cursor", "offset"])]
+        /// the process is killed. Incompatible with `--until`
+        /// and `--cursor`.
+        #[arg(short, long, conflicts_with_all = ["until", "cursor"])]
         follow: bool,
 
         /// Maximum entries to return per request. Server clamps
@@ -704,15 +699,10 @@ enum Command {
 
         /// Opaque keyset cursor from a previous response's
         /// `next_cursor`. Stable across concurrent inserts;
-        /// preferred over `--offset`.
+        /// causes `edge logs` to return ONE page rather than
+        /// walking to exhaustion (opt-in manual pagination).
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
-
-        /// DEPRECATED. Offset for pagination. The server returns
-        /// `next_offset` for one release only; switch to
-        /// `--cursor`.
-        #[arg(long, value_name = "N")]
-        offset: Option<u32>,
     },
 
     /// Manage authentication (signup, login, whoami, logout).
@@ -964,7 +954,7 @@ fn main() -> Result<()> {
         Command::Migrate { path, auto } => commands::migrate::run(&path, auto),
         Command::Dev { lang } => commands::dev::run(&cli.path, lang),
         Command::Open { force } => commands::open::run(&cli.path, force),
-        Command::Deployments { page, limit } => commands::deployments::run(&cli.path, page, limit),
+        Command::Deployments { limit } => commands::deployments::run(&cli.path, limit),
         Command::Quota => commands::quota::run(&cli.path),
         Command::Ingress { app } => commands::ingress::run(&cli.path, &app),
         Command::Logs {
@@ -975,7 +965,6 @@ fn main() -> Result<()> {
             follow,
             limit,
             cursor,
-            offset,
         } => {
             let since_dur = parse_since(&since)?;
             commands::logs::run(
@@ -987,7 +976,6 @@ fn main() -> Result<()> {
                 follow,
                 limit,
                 cursor.as_deref(),
-                offset,
             )
         }
         Command::Auth { action } => action.run(),

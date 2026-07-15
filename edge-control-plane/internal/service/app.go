@@ -22,7 +22,7 @@ import (
 type appRepoInterface interface {
 	Create(ctx context.Context, app *domain.App) error
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
-	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	List(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error)
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
@@ -96,6 +96,14 @@ func NewAppService(
 // Sentinel errors.
 var ErrAppAlreadyExists = fmt.Errorf("app already exists")
 var ErrMaxAppsQuotaExceeded = fmt.Errorf("max apps reached for tenant")
+
+// ErrInvalidLimit is returned by AppService.List when the handler
+// forwards a non-positive limit. The handler is expected to clamp
+// before calling; this is a defense-in-depth guard so a future
+// handler regression can't silently trigger a SELECT with LIMIT 0
+// (which would return zero rows and look like "no apps" to a
+// caller). Issue #58.
+var ErrInvalidLimit = fmt.Errorf("invalid limit")
 
 // Create creates a new app. Returns ErrAppAlreadyExists if it already exists.
 // Returns ErrMaxAppsQuotaExceeded if the tenant has reached their MaxApps limit.
@@ -200,9 +208,73 @@ func (s *AppService) GetForUpdate(ctx context.Context, tenantID, appName string)
 	return s.appRepo.GetForUpdate(ctx, tenantID, appName)
 }
 
-// List returns apps for a tenant with pagination.
-func (s *AppService) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
-	return s.appRepo.List(ctx, tenantID, limit, offset)
+// AppListPage is the wire shape the apps handler returns to callers.
+// Issue #58 hard-cut to cursor pagination: no offset, no total — just
+// the page slice, the limit, and an opaque next_cursor (nil on the
+// final page). The handler turns this into JSON.
+type AppListPage struct {
+	Apps       []domain.App
+	Limit      int
+	NextCursor *string
+}
+
+// List returns one page of apps for a tenant via keyset pagination
+// (issue #58). The handler passes the previously-returned NextCursor
+// back in via afterCursor; the empty string means "first page".
+//
+// Limit/offset semantics:
+//
+//   - limit is the page size requested by the caller.
+//   - The service fetches limit+1 rows internally to detect whether
+//     a next page exists without a separate COUNT(*) query. If the
+//     repository returns exactly limit+1 rows, the trailing row is
+//     dropped from the response and a NextCursor is encoded from the
+//     last visible row's name (the row at index limit-1).
+//   - The handler caps limit at 500 (appsLimitCap); this service
+//     trusts the handler's cap.
+//
+// Errors:
+//
+//   - ErrInvalidAppCursor / ErrUnsupportedAppCursorVersion: the
+//     supplied cursor is malformed or from a newer server. Handler
+//     maps to 400.
+//   - repository errors bubble up unchanged.
+func (s *AppService) List(ctx context.Context, tenantID string, limit int, afterCursor string) (*AppListPage, error) {
+	if limit <= 0 {
+		return nil, ErrInvalidLimit
+	}
+	afterName := ""
+	if afterCursor != "" {
+		var err error
+		afterName, err = decodeAppCursor(afterCursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch limit+1 to detect "has more" without a separate count.
+	rows, err := s.appRepo.List(ctx, tenantID, limit+1, afterName)
+	if err != nil {
+		return nil, err
+	}
+
+	page := &AppListPage{
+		Limit: limit,
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
+		cursor, err := encodeAppCursor(rows[len(rows)-1].Name)
+		if err != nil {
+			// encodeAppCursor only fails on an empty name — which
+			// would mean the repo returned an empty Name, a schema
+			// violation we cannot recover from at this layer. The
+			// caller will see a 500.
+			return nil, err
+		}
+		page.NextCursor = &cursor
+	}
+	page.Apps = rows
+	return page, nil
 }
 
 // Update updates mutable fields of an existing app.

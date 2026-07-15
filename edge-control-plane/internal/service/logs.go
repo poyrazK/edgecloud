@@ -84,24 +84,24 @@ func LevelsAtOrAbove(minLevel string) []string {
 // repository consumes (level = ANY($N::text[])). Exposed here so callers
 // that need to inspect the post-translation filter (tests, observability)
 // can do so without re-implementing LevelsAtOrAbove.
+//
+// #709 / #682 follow-up — `Offset` retired. Cursor is the only pagination
+// input.
 type LogQuery struct {
 	Since  time.Duration
 	Until  time.Time
 	MinLvl string // canonical level string; "" = no filter
 	Levels []string
 	Limit  int
-	Offset int
 	Cursor string
 }
 
-// LogListResult wraps the visible entries, effective limit, and compatibility
-// pagination hints. Cursor pagination is preferred; offset remains available
-// for one release so existing clients continue to work.
+// LogListResult wraps the visible entries, effective limit, and the
+// single cursor hint. Post-#709 there is no `NextOffset` field.
 type LogListResult struct {
 	Entries    []domain.LogEntry
 	Limit      int
 	Since      time.Duration
-	NextOffset *int
 	NextCursor *string
 }
 
@@ -192,7 +192,6 @@ func (s *LogService) ListByTenantApp(
 		Until:    q.Until,
 		Levels:   levels,
 		Limit:    limit + 1,
-		Offset:   q.Offset,
 		CursorTS: cursorTS,
 		CursorID: cursorID,
 	})
@@ -205,7 +204,6 @@ func (s *LogService) ListByTenantApp(
 		entries = entries[:limit]
 	}
 
-	var nextOffset *int
 	var nextCursor *string
 	if hasMore {
 		last := entries[len(entries)-1]
@@ -214,17 +212,12 @@ func (s *LogService) ListByTenantApp(
 			return nil, err
 		}
 		nextCursor = &cursor
-		if q.Cursor == "" {
-			no := q.Offset + len(entries)
-			nextOffset = &no
-		}
 	}
 
 	return &LogListResult{
 		Entries:    entries,
 		Limit:      limit,
 		Since:      since,
-		NextOffset: nextOffset,
 		NextCursor: nextCursor,
 	}, nil
 }

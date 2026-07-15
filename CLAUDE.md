@@ -207,6 +207,20 @@ IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<reg
 5. Wasm stored at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`; a `deployments` row is written with status `migrated` (no `active_deployments` row yet). Ed25519 signature over `(sha256_raw_32_bytes || deployment_id)` is persisted on the row.
 6. Response is returned: single-file mode returns `MigrationReport`; tree mode returns `TreeMigrationReport` with a per-file `FileReport` array (`{path, status, patterns_detected, transformations, manual_review, errors, preprocessor}`). The developer activates via `edge activate <id>`.
 
+### User-facing list pagination (issue #58, issue #709, issue #682)
+
+All three user-facing list endpoints paginate via opaque keyset cursors that round-trip as `?cursor=`. Wire format: base64url `{RawURLEncoding}` of `{"v":1,"p":<payload>}` envelopes, with per-resource payloads differing only in the `p` field's shape:
+
+- **`apps`** keyset on `name` — backed by `UNIQUE(tenant_id, name)` for strict total order (migration 004).
+- **`deployments`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_deployments_tenant_app_created_at_id_desc` (migration 036). Strict because deployments can share a second-precision `created_at` under load. The `id` cursor is TEXT (`d_<uuid>` convention); the SQL comparator is the disjunctive form `(created_at < $3 OR (created_at = $3 AND id < $4))` because heterogeneous-type tuples `(timestamptz, text)` are not row-comparable. The composite index covers both branches — see `internal/repository/deployment.go::ListByAppPaginated`.
+- **`logs`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_logs_*` migration 025.
+
+Per-resource codec lives at `internal/service/{app,deployment}_pagination.go` plus the `logs_cursor.go` / `webhook_delivery_cursor.go` resource wrappers; every codec delegates wire-format primitives (encode/decode/version/URL encoding) to `internal/httpx/pagination.go` so all four list endpoints share one envelope. Adding a new list endpoint: write the resource wrapper, the SQL comparator, the composite index migration; the wire envelope is already done.
+
+**Hard-cut window (issue #709, issue #682):** `?offset=` returns 400 on `/api/v1/list/{appName}` and `/api/v1/apps/{appName}/logs`; the response envelope contains only `{items, total, limit, next_cursor}` (deployments) or `{items, limit, next_cursor}` (logs). There is no `next_offset` field and no compat layer. `?cursor=` is the only accepted pagination knob. `GET /api/v1/apps` was already a hard-cut at issue #58. The CLI dropped `--page` and `--offset`; `edge apps`, `edge deployments`, and `edge logs` all walk the cursor chain to exhaustion (mirroring `list_all_apps`).
+
+**Batch GC paths retain `LIMIT … OFFSET` as non-user-facing optimization** — these are tightly-bounded batch operations keyed on retention cutoffs (`DeleteOlderThanBatched`, `LogGC`, `AuditGC`, `PreviewGC`, `CacheRetrySweep`), not user-facing lists. Offset is fine here because the loop is server-internal and the row set doesn't shift under concurrent inserts the way a user-facing `LIMIT … OFFSET` page does.
+
 ## edge-runtime Deep Dive
 
 The runtime library is structured around the WIT world in `src/wit/edge-cloud.wit` (loaded at `src/lib.rs` via the bindgen! macro — two worlds, two submodules: `edge_runtime_long` and `edge_runtime_handler`). The macro generates Rust bindings at compile time.

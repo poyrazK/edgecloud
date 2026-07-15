@@ -17,7 +17,12 @@ import (
 // AppServiceInterface is the subset of *service.AppService used by AppHandler.
 type AppServiceInterface interface {
 	Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error)
-	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	// List is the keyset-paginated apps endpoint (issue #58). The
+	// afterCursor is the opaque value previously returned as
+	// NextCursor; empty means "first page". Returns an AppListPage
+	// with the page slice, the effective limit, and NextCursor
+	// (nil on the final page).
+	List(ctx context.Context, tenantID string, limit int, afterCursor string) (*service.AppListPage, error)
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
 	Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error)
 	Delete(ctx context.Context, tenantID, appName string) error
@@ -79,32 +84,100 @@ func (h *AppHandler) Create(w http.ResponseWriter, r *http.Request) {
 	auditRecord(r, "create", "app", appName, "app "+appName+" created", "success")
 }
 
-// List handles GET /api/apps — list all apps for the tenant with pagination.
+// appListResponse is the JSON envelope for GET /api/v1/apps.
+// Issue #58 — hard-cut to cursor pagination: no `offset` and no
+// `total`. `next_cursor` is omitted on the final page (the field's
+// `omitempty` tag handles that). Mirrors the cursor-only shape at
+// internal/handler/webhook.go::webhookDeliveriesResponse.
+type appListResponse struct {
+	Apps       []domain.App `json:"apps"`
+	Limit      int          `json:"limit"`
+	NextCursor *string      `json:"next_cursor,omitempty"`
+}
+
+// appsLimitCap is the maximum `?limit=` value the handler accepts
+// (issue #58). Mirrors the handler/webhook.go precedent (200 there,
+// 500 here) — apps surface is broader so a higher cap is reasonable.
+// A request that asks for more is silently clamped, NOT rejected —
+// the response `limit` field reports the effective value.
+const appsLimitCap = 500
+
+// appsDefaultLimit is the implicit page size when the client does
+// not supply `?limit=`. Matches the previous default (50).
+const appsDefaultLimit = 50
+
+// List handles GET /api/v1/apps — list apps for the tenant with
+// cursor pagination. Issue #58.
+//
+// Query parameters:
+//
+//	?limit=<int>   page size; default 50, max 500. Clamped silently
+//	               (the response `limit` field reports the effective value).
+//	?cursor=<str>  opaque keyset cursor; pass back the previous page's
+//	               next_cursor to fetch the next page. Absent/empty = first page.
+//
+// The legacy `?offset=` parameter is intentionally NOT accepted:
+// issue #58 hard-cuts apps to cursor pagination, so any request
+// that supplies both `?cursor=` and `?offset=` returns 400 (the
+// "mutually exclusive" gate below). A request that supplies ONLY
+// `?offset=` silently ignores it — that's a deliberate compat
+// choice for clients that haven't migrated yet (no error, but they
+// always get page 1).
+//
+// Status codes:
+//
+//	200  envelope {apps, limit, next_cursor?}
+//	400  invalid cursor / unsupported cursor version / cursor+offset supplied
+//	500  unexpected
 func (h *AppHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil && v > 0 {
-			limit = min(v, 500)
-		}
-	}
-	offset := 0
-	if o := r.URL.Query().Get("offset"); o != "" {
-		if v, err := strconv.Atoi(o); err == nil && v >= 0 {
-			offset = v
-		}
+	q := r.URL.Query()
+	// Defensive: the endpoint does not advertise `offset`, but reject
+	// any request that supplies one alongside a cursor so a confused
+	// client cannot trigger ambiguous SQL branches. Mirrors the
+	// handler/webhook.go:179-185 idiom.
+	if q.Has("cursor") && q.Has("offset") {
+		httperror.BadRequestCtx(w, r, "cursor and offset are mutually exclusive")
+		return
 	}
 
-	apps, err := h.appSvc.List(r.Context(), tenantID, limit, offset)
+	limit := appsDefaultLimit
+	if l := q.Get("limit"); l != "" {
+		v, err := strconv.Atoi(l)
+		if err != nil || v <= 0 {
+			httperror.BadRequestCtx(w, r, "invalid limit")
+			return
+		}
+		limit = min(v, appsLimitCap)
+	}
+
+	page, err := h.appSvc.List(r.Context(), tenantID, limit, q.Get("cursor"))
 	if err != nil {
-		log.Printf("internal error: %v", err)
+		// Typed cursor errors → 400 with a generic message; a
+		// structured log.Printf preserves the operator signal.
+		// Mirrors handler/webhook.go:199-207.
+		if errors.Is(err, service.ErrInvalidAppCursor) || errors.Is(err, service.ErrUnsupportedAppCursorVersion) {
+			log.Printf("invalid app cursor (tenant=%s): %v", tenantID, err)
+			httperror.BadRequestCtx(w, r, "invalid cursor")
+			return
+		}
+		if errors.Is(err, service.ErrInvalidLimit) {
+			httperror.BadRequestCtx(w, r, "invalid limit")
+			return
+		}
+		log.Printf("internal error listing apps (tenant=%s): %v", tenantID, err)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
+	resp := appListResponse{
+		Apps:       page.Apps,
+		Limit:      page.Limit,
+		NextCursor: page.NextCursor,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]interface{}{"apps": apps, "limit": limit, "offset": offset}); err != nil {
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("List apps: failed to encode response: %v", err)
 	}
 }

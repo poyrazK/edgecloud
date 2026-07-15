@@ -1,0 +1,23 @@
+-- +migrate Up notransaction
+-- Issue #58 (keyset cursor pagination for GET /api/v1/list/{appName}):
+-- the deployment list orders by (created_at DESC, id DESC) and the
+-- keyset predicate is (created_at, id) < ($cursor_ts, $cursor_id) to
+-- break ties when multiple deployments share a second.
+--
+-- The existing idx_deployments_tenant_app (tenant_id, app_name) alone
+-- is not enough: Postgres can use it for the WHERE filter but cannot
+-- satisfy an ORDER BY created_at DESC, id DESC from that index without
+-- an in-memory sort. This composite (tenant_id, app_name, created_at
+-- DESC, id DESC) matches both the WHERE filter and the ORDER BY so
+-- the planner walks the index in cursor order and stops at LIMIT.
+--
+-- The DESC direction matches the wire contract (newest first). Mirrors
+-- the precedent at migration 015 for webhook deliveries
+-- (idx_webhook_deliveries_webhook (webhook_id, created_at DESC)).
+--
+-- The `notransaction` directive is required by rubenv/sql-migrate for
+-- any migration that uses CREATE INDEX CONCURRENTLY — see
+-- migrations/027_active_deployments_regions_cache_failed_index.up.sql
+-- for the prior precedent.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_deployments_tenant_app_created_at_id_desc
+    ON deployments (tenant_id, app_name, created_at DESC, id DESC);

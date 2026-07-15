@@ -70,10 +70,50 @@ func (r *DeploymentRepository) ListByApp(ctx context.Context, tenantID, appName 
 	return deployments, err
 }
 
-func (r *DeploymentRepository) ListByAppPaginated(ctx context.Context, tenantID, appName string, limit, offset int) ([]domain.Deployment, error) {
+// ListByAppPaginated returns up to limit deployments for an app via
+// keyset pagination on (created_at DESC, id DESC). Issue #58.
+//
+// The afterTS / afterID pair is the cursor: pass the time.Time and
+// id of the previous page's last visible row. The zero time.Time +
+// empty id (`""`) means "first page" (no lower-bound predicate).
+// Issue #709 swapped the PK from int64 to TEXT, so the sentinel
+// for the id column is now the empty string.
+//
+// Backed by idx_deployments_tenant_app_created_at_id_desc (migration
+// 036). The composite matches both the WHERE filter and the ORDER BY
+// so the planner walks the index in cursor order and stops at LIMIT.
+// The strict-tuple tiebreaker (id) is required because deployments
+// can share a second-precision created_at under load.
+//
+// Issue #709: `id` is TEXT (e.g., `d_<uuid>`) — the row-comparison
+// `(created_at, id) < ($3, $4)` is not valid over a heterogeneous
+// tuple (timestamptz vs text), so we expand to the equivalent
+// disjunctive form `created_at < $3 OR (created_at = $3 AND id <
+// $4)`. The composite index covers BOTH the equality on
+// `created_at` AND the lexicographic `id < $4` tiebreaker, so the
+// planner still walks the index without a sort. The text PK
+// guarantees `id` is unique per row, so the comparator is
+// deterministic.
+//
+// Note: a zero time.Time is the "first page" sentinel — passing it
+// after the first page would no-op the predicate (every row's
+// created_at > 0001-01-01) and return zero rows. Service-layer
+// validation guarantees this; the repo trusts its inputs.
+func (r *DeploymentRepository) ListByAppPaginated(
+	ctx context.Context, tenantID, appName string,
+	afterTS time.Time, afterID string, limit int,
+) ([]domain.Deployment, error) {
 	var deployments []domain.Deployment
-	query := `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`
-	err := r.db.SelectContext(ctx, &deployments, query, tenantID, appName, limit, offset)
+	const baseQ = `SELECT id, tenant_id, app_name, status, hash, regions, created_at, auto_rollback_enabled, signature, signing_key_id, build_attestation, desired_replicas, preview_id, preview_pr_number, preview_expires_at FROM deployments WHERE tenant_id = $1 AND app_name = $2`
+	if afterTS.IsZero() && afterID == "" {
+		err := r.db.SelectContext(ctx, &deployments,
+			baseQ+` ORDER BY created_at DESC, id DESC LIMIT $3`,
+			tenantID, appName, limit)
+		return deployments, err
+	}
+	err := r.db.SelectContext(ctx, &deployments,
+		baseQ+` AND (created_at < $3 OR (created_at = $3 AND id < $4)) ORDER BY created_at DESC, id DESC LIMIT $5`,
+		tenantID, appName, afterTS, afterID, limit)
 	return deployments, err
 }
 

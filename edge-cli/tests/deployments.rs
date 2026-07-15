@@ -1,11 +1,11 @@
 //! Integration tests for `edge deployments`.
 //!
-//! The server returns a `{items, total, limit, offset}` envelope
+//! The server returns a `{items, total, limit, next_cursor}` envelope
 //! (see `deploymentListResponse` in
-//! `edge-control-plane/internal/handler/deployment.go`). Prior to
-//! the wire-mismatch fix, the CLI tried to deserialize the envelope
-//! as a bare array and failed at runtime — these tests pin the new
-//! shape so it can't regress.
+//! `edge-control-plane/internal/handler/deployment.go`). Post-#709
+//! the wire shape is cursor-only — `?offset=` returns 400 and
+//! `next_offset` is no longer emitted. `edge deployments` walks the
+//! cursor chain to exhaustion (mirrors `edge apps` / `edge logs`).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -61,9 +61,8 @@ async fn list_returns_empty_message() {
         .and(header("Authorization", "Bearer k_seed"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [],
-            "total": 0,
             "limit": 20,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -106,9 +105,8 @@ async fn list_renders_envelope_items_table() {
                     "url": "https://t_test-myapp.edgecloud.dev"
                 }
             ],
-            "total": 2,
             "limit": 20,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -132,9 +130,9 @@ async fn list_renders_envelope_items_table() {
 
 /// Pinned regression test for the wire-mismatch fix: the CLI must
 /// NOT silently succeed against the pre-fix envelope shape (bare
-/// array of objects, no top-level items/total/limit/offset). The
-/// server shape changed to a typed envelope in commit 1 of the
-/// wire-mismatch fix; this test would fail if the CLI started
+/// array of objects, no top-level items/total/limit/next_cursor).
+/// The server shape changed to a typed envelope in commit 1 of
+/// the wire-mismatch fix; this test would fail if the CLI started
 /// parsing the envelope as an array again.
 #[tokio::test]
 async fn list_rejects_pre_fix_bare_array_shape() {
@@ -167,66 +165,21 @@ async fn list_rejects_pre_fix_bare_array_shape() {
 
     // Expect a non-zero exit: serde_json fails to deserialize the
     // bare array into DeploymentListEnvelope { items, total, limit,
-    // offset } and the CLI surfaces "invalid response body".
+    // next_cursor } and the CLI surfaces "invalid response body".
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("invalid response body"));
 }
 
 // ---------------------------------------------------------------------------
-// Pagination tests (issue: deferred CLI gap from PR #457).
+// Pagination tests (issue: deferred CLI gap from PR #457; hard-cut in #709).
 // ---------------------------------------------------------------------------
 
-/// Pin that `--page N --limit N` both forward onto the wire as
-/// `?limit=` and `?offset=` query params. offset = (page-1) * limit,
-/// so `--page 2 --limit 10` -> `?limit=10&offset=10`. If either
-/// query param goes missing the route work is broken; future
-/// renames will surface as a test failure here.
-#[tokio::test]
-async fn forwards_limit_and_offset_query_params() {
-    let home = common::isolated_home();
-    let project = common::isolated_home();
-    write_minimal_edge_toml(&project);
-    write_state_with_app(&project, "myapp");
-    let server = MockServer::start().await;
-
-    common::seed_api_key(&home, "k_seed");
-    Mock::given(method("GET"))
-        .and(path("/api/v1/list/myapp"))
-        .and(header("Authorization", "Bearer k_seed"))
-        .and(query_param("limit", "10"))
-        .and(query_param("offset", "10"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "items": [{
-                "id": "d_eighth",
-                "status": "active",
-                "created_at": "2026-07-09T00:00:00Z",
-                "url": "https://t_test-myapp.edgecloud.dev"
-            }],
-            "total": 30,
-            "limit": 10,
-            "offset": 10
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut cmd = Command::cargo_bin("edge").unwrap();
-    common::set_platform_env(&mut cmd, &home);
-    cmd.current_dir(project.path());
-    cmd.env("EDGE_API_URL", server.uri())
-        .args(["deployments", "--page", "2", "--limit", "10"]);
-
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("d_eighth"));
-}
-
-/// Pin the default passthrough: with neither `--page` nor `--limit`
-/// the CLI does NOT add `?limit=` or `?offset=` to the wire
-/// request. wiremock's `path` matcher alone accepts (and this
-/// test fails) any extra query params, so the absence of a
-/// `query_param` matcher here is the assertion.
+/// Pin the default passthrough: with no `--limit` the CLI sends
+/// `?limit=` to mean "server default" — the wire request omits the
+/// query param entirely. wiremock's `path` matcher alone accepts
+/// (and this test fails) any extra query params, so the absence of
+/// a `query_param` matcher here is the assertion.
 #[tokio::test]
 async fn omits_query_params_when_no_flags() {
     let home = common::isolated_home();
@@ -250,9 +203,8 @@ async fn omits_query_params_when_no_flags() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 20,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -268,10 +220,11 @@ async fn omits_query_params_when_no_flags() {
         .stdout(predicate::str::contains("d_only"));
 }
 
-/// Pin that the page-of-N footer renders when `total > limit`.
-/// total=30 + limit=10 -> page 1 of 3, with a `next:` hint.
+/// Pin `--limit N` forwarding as `?limit=N` on the wire. Post-#709
+/// the cursor walker is the only pager; `--limit` is still honored
+/// as the per-page size.
 #[tokio::test]
-async fn renders_footer_when_total_exceeds_limit() {
+async fn forwards_limit_query_param() {
     let home = common::isolated_home();
     let project = common::isolated_home();
     write_minimal_edge_toml(&project);
@@ -283,12 +236,10 @@ async fn renders_footer_when_total_exceeds_limit() {
         .and(path("/api/v1/list/myapp"))
         .and(header("Authorization", "Bearer k_seed"))
         .and(query_param("limit", "10"))
-        // No `offset=` matcher: this CLI call uses
-        // `--limit=10` with no `--page` (page defaults to 1,
-        // so offset=(1-1)*10=0 and the wire request omits
-        // `?offset=`). An `offset=0` matcher would be passed
-        // here but is intentionally absent because the
-        // pagination contract is "omit zero-valued params".
+        // No `?offset=` matcher: post-#709 the wire shape is
+        // cursor-only, and the CLI never emits `?offset=`. If a
+        // future commit regresses and re-adds the offset param,
+        // this mock stops matching and the test fails.
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "items": [{
                 "id": "d_first",
@@ -296,9 +247,8 @@ async fn renders_footer_when_total_exceeds_limit() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 30,
             "limit": 10,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -312,21 +262,14 @@ async fn renders_footer_when_total_exceeds_limit() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("d_first"))
-        .stdout(predicate::str::contains("page 1 of 3"))
-        .stdout(predicate::str::contains("30 deployments"))
-        .stdout(predicate::str::contains("next: --page 2"))
-        // No `prev:` on the first page.
-        .stdout(predicate::str::contains("prev:").not());
+        .stdout(predicate::str::contains("d_first"));
 }
 
-/// Pin the silent-first-page UX: when `total <= limit` the
-/// footer does not render at all. Searching for the literal
-/// "page " in the output catches anything that mentions
-/// "page-of-N" but does not match the table itself (the
-/// table prints deployment IDs, not the word "page").
+/// Pin the silent-single-page UX: when the walker terminates on
+/// the first page (no `next_cursor`), the CLI renders the table
+/// silently with no footer.
 #[tokio::test]
-async fn silent_when_total_within_one_page() {
+async fn silent_when_single_page() {
     let home = common::isolated_home();
     let project = common::isolated_home();
     write_minimal_edge_toml(&project);
@@ -344,9 +287,8 @@ async fn silent_when_total_within_one_page() {
                 "created_at": "2026-07-01T00:00:00Z",
                 "url": "https://t_test-myapp.edgecloud.dev"
             }],
-            "total": 1,
             "limit": 20,
-            "offset": 0
+            "next_cursor": null
         })))
         .expect(1)
         .mount(&server)
@@ -360,46 +302,122 @@ async fn silent_when_total_within_one_page() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("d_only"))
-        // The footer text starts with "page " (with a space).
-        // Searching the bare word "page" would false-positive
-        // against the docs/help text in some shells; the
-        // trailing space pins the footer specifically.
+        // Post-#709 there's no "page X of N" footer at all; the
+        // total-count header ("N deployments") replaces it.
         .stdout(predicate::str::contains("page ").not())
         .stdout(predicate::str::contains("next:").not())
         .stdout(predicate::str::contains("prev:").not());
 }
 
-/// Pin the explicit `--page 0` rejection. clap accepts
-/// `--page 0` (the field type is u32), and a silent
-/// `--page 0 -> page 1` fallback would be a footgun;
-/// instead the CLI exits non-zero with a clear error
-/// before any wire request is made.
+/// Pin that a single-deployment result renders the singular
+/// "1 deployment" header (no trailing 's').
 #[tokio::test]
-async fn rejects_zero_page_with_exit_one() {
+async fn renders_total_header_singular() {
     let home = common::isolated_home();
     let project = common::isolated_home();
     write_minimal_edge_toml(&project);
     write_state_with_app(&project, "myapp");
     let server = MockServer::start().await;
 
-    // No MockServer mount: any wire request would error with
-    // a connection-refused failure, distinct from the
-    // --page=0 bail we want to pin.
+    common::seed_api_key(&home, "k_seed");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/list/myapp"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "id": "d_first",
+                "status": "deployed",
+                "created_at": "2026-07-01T00:00:00Z",
+                "url": "https://t_test-myapp.edgecloud.dev"
+            }],
+            "limit": 20,
+            "next_cursor": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let mut cmd = Command::cargo_bin("edge").unwrap();
     common::set_platform_env(&mut cmd, &home);
     cmd.current_dir(project.path());
-    // Point at the mock so the test stays portable even if a
-    // future commit moves the validation to AFTER the wire
-    // request — the mock returns 404 for any unmounted path,
-    // which would still be a connection-style error rather
-    // than our "--page must be >= 1" validation error.
-    cmd.env("EDGE_API_URL", server.uri())
-        .args(["deployments", "--page", "0"]);
+    cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
 
     cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("--page must be >= 1"));
+        .success()
+        .stdout(predicate::str::contains("1 deployment\n"))
+        // Pluralization: must NOT render "1 deployments".
+        .stdout(predicate::str::contains("1 deployments").not());
+}
+
+/// Pin that the cursor walker follows `next_cursor` through
+/// multiple pages. The mock returns page 1 with a cursor, then
+/// page 2 with no cursor — the walker should make exactly 2
+/// requests and concatenate the items.
+#[tokio::test]
+async fn list_walks_cursor_chain() {
+    use wiremock::matchers::query_param_is_missing;
+
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    write_state_with_app(&project, "myapp");
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    // First page: returns 1 item + cursor for page 2. The
+    // `query_param_is_missing("cursor")` matcher pins that the
+    // initial request carries no `?cursor=` (the walker only
+    // sends a cursor on the SECOND-and-later pages).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/list/myapp"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .and(query_param_is_missing("cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "id": "d_first",
+                "status": "deployed",
+                "created_at": "2026-07-01T00:00:00Z",
+                "url": "https://t_test-myapp.edgecloud.dev"
+            }],
+            "limit": 20,
+            "next_cursor": "page2cursor"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Second page: returns the second item, no further cursor.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/list/myapp"))
+        .and(query_param("cursor", "page2cursor"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "id": "d_second",
+                "status": "active",
+                "created_at": "2026-07-02T00:00:00Z",
+                "url": "https://t_test-myapp.edgecloud.dev"
+            }],
+            "limit": 20,
+            "next_cursor": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri()).arg("deployments");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("d_first"))
+        .stdout(predicate::str::contains("d_second"))
+        // Cursor value must not leak into stdout — the CLI treats
+        // it as opaque and the user gets only the items.
+        .stdout(predicate::str::contains("page2cursor").not());
 }
 
 /// Pre-flight path-component validation on `edge deployments`.

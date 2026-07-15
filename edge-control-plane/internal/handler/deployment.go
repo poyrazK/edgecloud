@@ -145,11 +145,25 @@ type statusResponse struct {
 // deploymentListResponse is the envelope returned by
 // `GET /api/v1/list/{appName}`. Mirrors the `DeploymentListResponse`
 // schema in `openapi.yaml`.
+//
+// Issue #709 hard-cut — the dual envelope from #58 is retired.
+// `?offset=` is rejected with 400. `next_offset` is gone from the
+// wire. `total` is gone from the wire (the previous field added a
+// per-page COUNT(*) round-trip with no consumer — the CLI renders
+// "N deployments" from the walked items, not from the wire field).
+// `next_cursor` is the only pagination cursor.
+//
+// On the wire:
+//
+//	{
+//	  "items":         [...],
+//	  "limit":         50,
+//	  "next_cursor":   "eyJ2IjoxLCJwIjp7InRzIjoi..."   // absent on final page
+//	}
 type deploymentListResponse struct {
-	Items  []statusResponse `json:"items"`
-	Total  int              `json:"total"`
-	Limit  int              `json:"limit"`
-	Offset int              `json:"offset"`
+	Items      []statusResponse `json:"items"`
+	Limit      int              `json:"limit"`
+	NextCursor *string          `json:"next_cursor,omitempty"`
 }
 
 // newStatusResponse maps a DB row to the typed wire DTO. The same
@@ -673,42 +687,75 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// List handles GET /api/v1/list/{appName}. Issue #709 hard-cut:
+// `?cursor=` is the only pagination input. `?offset=` is rejected
+// with 400 unconditionally (no compat release).
+//
+// Cursor-walk contract:
+//   - `?cursor=<opaque>` walks forward in the (created_at, id) chain
+//     emitted as `next_cursor` on the previous page. `next_cursor`
+//     is absent on the final page.
+//   - `?limit=<n>` clamps to 1..100 (defense in depth — the service
+//     also clamps). Values <=0 silently become 20 (back-compat with
+//     the pre-#58 default).
+//
+// Limits: 1..100. Values <=0 silently become 20; values >100 are
+// clamped to 100.
 func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 
+	// Issue #709 — `?offset=` is retired. Any non-empty value returns
+	// 400 so a stale CLI invocation fails loudly instead of silently
+	// restarting the page from zero. Mirrors the equivalent gate
+	// landed in commit 4 of #708 for /api/v1/apps and the patterns
+	// at apps.go + webhook.go + logs.go.
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		httperror.BadRequestCtx(w, r, "offset is not supported; use cursor")
+		return
+	}
+
+	cursor := r.URL.Query().Get("cursor")
+
 	limit := 20
-	offset := 0
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
 			limit = parsed
 		}
 	}
-	if o := r.URL.Query().Get("offset"); o != "" {
-		if parsed, err := strconv.Atoi(o); err == nil && parsed >= 0 {
-			offset = parsed
-		}
+	if limit > 100 {
+		limit = 100
 	}
 
-	deployments, total, err := h.deploymentSvc.ListDeploymentsPaginatedWithTotal(r.Context(), tenantID, appName, limit, offset)
+	page, err := h.deploymentSvc.ListDeploymentsPaginated(r.Context(), tenantID, appName, limit, cursor)
 	if err != nil {
-		log.Printf("internal error: %v", err)
+		// Map typed cursor errors to 400 with a generic message
+		// (matches webhook.go:201-206 and the apps handler added in
+		// issue #58 commit 4). Always log the typed reason for ops.
+		if errors.Is(err, service.ErrInvalidDeploymentCursor) ||
+			errors.Is(err, service.ErrUnsupportedDeploymentCursorVersion) {
+			log.Printf("List deployments: %v (tenant=%s app=%s)", err, tenantID, appName)
+			httperror.BadRequestCtx(w, r, "invalid cursor")
+			return
+		}
+		log.Printf("List deployments: %v (tenant=%s app=%s)", err, tenantID, appName)
 		httperror.InternalErrorCtx(w, r)
 		return
 	}
 
-	items := make([]statusResponse, len(deployments))
-	for i := range deployments {
-		items[i] = newStatusResponse(&deployments[i], tenantID, appName)
+	items := make([]statusResponse, len(page.Items))
+	for i := range page.Items {
+		items[i] = newStatusResponse(&page.Items[i], tenantID, appName)
+	}
+
+	resp := deploymentListResponse{
+		Items:      items,
+		Limit:      page.Limit,
+		NextCursor: page.NextCursor,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(deploymentListResponse{
-		Items:  items,
-		Total:  total,
-		Limit:  limit,
-		Offset: offset,
-	}); err != nil {
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("List deployments: failed to encode response: %v", err)
 	}
 }

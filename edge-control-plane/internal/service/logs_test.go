@@ -231,12 +231,14 @@ func TestLogService_PropagatesRepoError(t *testing.T) {
 	}
 }
 
-// TestLogService_FirstPageWithProbeRowReturnsBothHints pins the
-// first/offset cursor compatibility: a probe row (limit+1 entries)
-// yields BOTH next_cursor and next_offset so clients on a current
-// server can use either. The cursor is built from the LAST VISIBLE
+// TestLogService_FirstPageWithProbeRowYieldsCursor pins the
+// post-#709 cursor-only contract: a probe row (limit+1 entries)
+// yields ONLY next_cursor. The cursor is built from the LAST VISIBLE
 // entry, not from the probe row, because the probe row is trimmed.
-func TestLogService_FirstPageWithProbeRowReturnsBothHints(t *testing.T) {
+//
+// Pre-#709 this test was named `…ReturnsBothHints` and also asserted
+// on next_offset — that branch is gone.
+func TestLogService_FirstPageWithProbeRowYieldsCursor(t *testing.T) {
 	const visible = 50
 	repo := &stubLister{
 		entries: makeLogEntries(visible+1, "2026-07-14T12:00:00Z"),
@@ -254,11 +256,6 @@ func TestLogService_FirstPageWithProbeRowReturnsBothHints(t *testing.T) {
 	if result.NextCursor == nil {
 		t.Fatal("expected NextCursor set when probe row detected another page")
 	}
-	if result.NextOffset == nil {
-		t.Fatal("expected NextOffset set on first/offset path when probe row detected")
-	} else if *result.NextOffset != visible {
-		t.Errorf("NextOffset = %d, want %d", *result.NextOffset, visible)
-	}
 	// Cursor should encode the LAST visible row's (ts, id) — not the
 	// probe row, which was trimmed.
 	last := result.Entries[visible-1]
@@ -274,8 +271,8 @@ func TestLogService_FirstPageWithProbeRowReturnsBothHints(t *testing.T) {
 
 // TestLogService_NoNextHintWhenFinalPageExactlyFull fixes the
 // phantom-next-page regression: a final page of EXACTLY limit rows
-// must NOT emit next_cursor or next_offset. The previous len==limit
-// assertion conflated "full" with "another page exists".
+// must NOT emit next_cursor. The previous len==limit assertion
+// conflated "full" with "another page exists".
 func TestLogService_NoNextHintWhenFinalPageExactlyFull(t *testing.T) {
 	const visible = 100
 	repo := &stubLister{
@@ -294,14 +291,11 @@ func TestLogService_NoNextHintWhenFinalPageExactlyFull(t *testing.T) {
 	if result.NextCursor != nil {
 		t.Errorf("NextCursor = %q, want nil (final page)", *result.NextCursor)
 	}
-	if result.NextOffset != nil {
-		t.Errorf("NextOffset = %d, want nil (final page)", *result.NextOffset)
-	}
 }
 
-// TestLogService_NoNextOffsetWhenPartialPage omits both hints when
+// TestLogService_NoNextCursorWhenPartialPage omits next_cursor when
 // the result has fewer than limit entries (last page).
-func TestLogService_NoNextOffsetWhenPartialPage(t *testing.T) {
+func TestLogService_NoNextCursorWhenPartialPage(t *testing.T) {
 	repo := &stubLister{
 		entries: makeLogEntries(3, "2026-07-14T12:00:00Z"),
 	}
@@ -315,15 +309,12 @@ func TestLogService_NoNextOffsetWhenPartialPage(t *testing.T) {
 	if result.NextCursor != nil {
 		t.Errorf("NextCursor = %q, want nil (partial page)", *result.NextCursor)
 	}
-	if result.NextOffset != nil {
-		t.Errorf("NextOffset = %d, want nil (partial page)", *result.NextOffset)
-	}
 }
 
-// TestLogService_CursorModeSuppressesNextOffset pins the cursor-only
-// contract: when the caller supplies a cursor, the service emits only
-// next_cursor; next_offset stays null even if another page exists.
-func TestLogService_CursorModeSuppressesNextOffset(t *testing.T) {
+// TestLogService_CursorModeYieldsCursor pins that when the caller
+// supplies a cursor, the service emits only next_cursor on the
+// following page; no separate "next_offset" branch to suppress.
+func TestLogService_CursorModeYieldsCursor(t *testing.T) {
 	// First request populates a real cursor from the probe row.
 	probe := &stubLister{
 		entries: makeLogEntries(11, "2026-07-14T12:00:00Z"),
@@ -339,8 +330,8 @@ func TestLogService_CursorModeSuppressesNextOffset(t *testing.T) {
 	}
 
 	// Second page receives the cursor; the (limit+1) probe row shows
-	// another page is available. The contract says next_offset must
-	// stay nil in cursor mode.
+	// another page is available. The cursor-only contract says the
+	// service emits next_cursor on this page too.
 	probe2 := &stubLister{
 		entries: makeLogEntries(11, "2026-07-14T12:00:00Z"),
 	}
@@ -353,21 +344,16 @@ func TestLogService_CursorModeSuppressesNextOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByTenantApp with cursor: %v", err)
 	}
-	if result.NextOffset != nil {
-		t.Errorf("NextOffset = %d, want nil in cursor mode", *result.NextOffset)
-	}
 	if result.NextCursor == nil {
 		t.Fatal("NextCursor must be set when probe row detects another page")
 	}
-	// Repository must see the cursor, not an offset.
+	// Repository must see the cursor (and zero offset — no offset on
+	// the wire post-#709).
 	if probe2.lastFilter.CursorTS.IsZero() {
 		t.Error("expected repository CursorTS to be populated")
 	}
 	if probe2.lastFilter.CursorID == 0 {
 		t.Error("expected repository CursorID to be populated")
-	}
-	if probe2.lastFilter.Offset != 0 {
-		t.Errorf("expected repository Offset = 0 in cursor mode, got %d", probe2.lastFilter.Offset)
 	}
 }
 
@@ -382,23 +368,6 @@ func TestLogService_CursorModeRejectsMalformedCursor(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidLogCursor) {
 		t.Errorf("err = %v, want ErrInvalidLogCursor", err)
-	}
-}
-
-// TestLogService_OffsetPropagatesToRepo pins that offset reaches the
-// repository filter unchanged (only on offset mode, not cursor mode).
-func TestLogService_OffsetPropagatesToRepo(t *testing.T) {
-	repo := &stubLister{}
-	svc := NewLogService(repo)
-	_, err := svc.ListByTenantApp(context.Background(), "t_test", "myapp", LogQuery{
-		Limit:  50,
-		Offset: 150,
-	})
-	if err != nil {
-		t.Fatalf("ListByTenantApp: %v", err)
-	}
-	if repo.lastFilter.Offset != 150 {
-		t.Errorf("repo offset = %d, want 150", repo.lastFilter.Offset)
 	}
 }
 

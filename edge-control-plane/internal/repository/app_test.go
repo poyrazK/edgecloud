@@ -127,16 +127,48 @@ func TestAppRepository_List(t *testing.T) {
 	defer cleanup()
 
 	rows := sqlmock.NewRows([]string{"id", "tenant_id", "name", "description", "created_at"})
-	mock.ExpectQuery(`SELECT id.*FROM apps WHERE.*ORDER BY name LIMIT.*OFFSET`).
-		WithArgs("t_1", 50, 0).
+	// Issue #58 — keyset pagination on `name`. First page uses
+	// afterName="" so the planner walks idx_apps_tenant_id from the
+	// smallest name. The `LIMIT $3` arg is 50.
+	mock.ExpectQuery(`SELECT id.*FROM apps WHERE.*name > \$2.*ORDER BY name LIMIT`).
+		WithArgs("t_1", "", 50).
 		WillReturnRows(rows)
 
-	apps, err := repo.List(context.Background(), "t_1", 50, 0)
+	apps, err := repo.List(context.Background(), "t_1", 50, "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if len(apps) != 0 {
 		t.Errorf("expected empty slice, got %d elements", len(apps))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet mock expectations: %v", err)
+	}
+}
+
+// TestAppRepository_List_AfterName covers the second-page path: the
+// caller passes the previous page's last visible name as afterName
+// and the repo appends a `name > $2` lower-bound predicate so the
+// planner walks the index from there.
+func TestAppRepository_List_AfterName(t *testing.T) {
+	repo, mock, cleanup := newAppMockRepo(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows([]string{"id", "tenant_id", "name", "description", "created_at"}).
+		AddRow("a_2", "t_1", "nextapp", nil, time.Now())
+	mock.ExpectQuery(`SELECT id.*FROM apps WHERE.*name > \$2.*ORDER BY name LIMIT`).
+		WithArgs("t_1", "hello", 50).
+		WillReturnRows(rows)
+
+	apps, err := repo.List(context.Background(), "t_1", 50, "hello")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(apps) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(apps))
+	}
+	if apps[0].Name != "nextapp" {
+		t.Errorf("Name = %q, want %q", apps[0].Name, "nextapp")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet mock expectations: %v", err)
