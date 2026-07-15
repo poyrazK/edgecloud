@@ -94,8 +94,15 @@ COPY Cargo.toml ./
 COPY edge-runtime/Cargo.toml                  edge-runtime/Cargo.toml
 COPY edge-runtime/bin/wasm2cwasm/Cargo.toml   edge-runtime/bin/wasm2cwasm/Cargo.toml
 COPY edge-config/Cargo.toml                   edge-config/Cargo.toml
+COPY edge-spool/Cargo.toml                    edge-spool/Cargo.toml
+COPY edge-worker/Cargo.toml                   edge-worker/Cargo.toml
+COPY edge-ingress/Cargo.toml                  edge-ingress/Cargo.toml
+COPY edge-ingress-sidecar/Cargo.toml          edge-ingress-sidecar/Cargo.toml
+COPY edge-cli/Cargo.toml                      edge-cli/Cargo.toml
 COPY edge-migrate/edge-migrate-lib/Cargo.toml edge-migrate/edge-migrate-lib/Cargo.toml
 COPY edge-migrate/edge-migrate-bin/Cargo.toml edge-migrate/edge-migrate-bin/Cargo.toml
+COPY edge-js-runtime/Cargo.toml               edge-js-runtime/Cargo.toml
+COPY edge-js-runtime-long/Cargo.toml          edge-js-runtime-long/Cargo.toml
 
 # Pre-fetch deps (separate RUN so the cache layer is keyed off Cargo.lock
 # only). The empty-stub src/lib.rs files let cargo resolve the package
@@ -107,12 +114,33 @@ COPY edge-migrate/edge-migrate-bin/Cargo.toml edge-migrate/edge-migrate-bin/Carg
 # freshly-generated lockfile against the manifest set and pre-fetches
 # every registry entry to the cache mount.
 RUN mkdir -p \
+      edge-runtime/src \
+      edge-runtime/bin/wasm2cwasm/src \
+      edge-config/src \
+      edge-spool/src \
+      edge-worker/src \
+      edge-ingress/src \
+      edge-ingress-sidecar/src \
+      edge-cli/src \
       edge-migrate/edge-migrate-lib/src \
       edge-migrate/edge-migrate-bin/src \
-      edge-runtime/bin/wasm2cwasm/src && \
+      edge-js-runtime/src \
+      edge-js-runtime-long/src && \
+    echo "" > edge-runtime/src/lib.rs && \
+    echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs && \
+    echo "" > edge-config/src/lib.rs && \
+    echo "" > edge-spool/src/lib.rs && \
+    echo "" > edge-worker/src/lib.rs && \
+    echo "" > edge-worker/src/main.rs && \
+    echo "" > edge-ingress/src/lib.rs && \
+    echo "" > edge-ingress/src/main.rs && \
+    echo "" > edge-ingress-sidecar/src/lib.rs && \
+    echo "" > edge-cli/src/lib.rs && \
+    echo "" > edge-cli/src/main.rs && \
     echo "" > edge-migrate/edge-migrate-lib/src/lib.rs && \
-    echo "" > edge-migrate/edge-migrate-bin/src/lib.rs && \
-    echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs
+    echo "" > edge-migrate/edge-migrate-bin/src/main.rs && \
+    echo "" > edge-js-runtime/src/lib.rs && \
+    echo "" > edge-js-runtime-long/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
