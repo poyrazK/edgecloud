@@ -2034,7 +2034,7 @@ func TestRollbackDeployment_DecrementsMemoryCounter(t *testing.T) {
 	mock.ExpectCommit()
 
 	svc := newMinimalDeploymentServiceForRollback(t, db)
-	if _, err := svc.RollbackDeployment(context.Background(), tenantID, appName, ""); err != nil {
+	if _, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "", false); err != nil {
 		t.Fatalf("RollbackDeployment: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -2467,7 +2467,7 @@ func TestRollbackDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
 	expectDrainerTickSuccess(t, mock, tenantID, appName, lastGoodDepID,
 		[]string{"us-east"}, 256)
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey)
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey, false)
 	if err != nil {
 		t.Fatalf("first RollbackDeployment: %v", err)
 	}
@@ -2486,7 +2486,7 @@ func TestRollbackDeployment_IdempotencyReplay_NoOutboxRow(t *testing.T) {
 			AddRow(tenantID, idemKey, appName, lastGoodDepID, now))
 	mock.ExpectCommit() // empty tx commits; no Set, no ClearStableSince, no outbox INSERT.
 
-	replayID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey)
+	replayID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, idemKey, false)
 	if err != nil {
 		t.Fatalf("replay RollbackDeployment: %v", err)
 	}
@@ -2541,7 +2541,7 @@ func TestRollbackDeployment_IdempotencyKeyMismatch_DifferentApp_ReturnsSentinel(
 
 	mock.ExpectRollback()
 
-	_, err := svc.RollbackDeployment(context.Background(), tenantID, incomingApp, idemKey)
+	_, err := svc.RollbackDeployment(context.Background(), tenantID, incomingApp, idemKey, false)
 	if !errors.Is(err, ErrIdempotencyKeyMismatch) {
 		t.Fatalf("RollbackDeployment err = %v, want ErrIdempotencyKeyMismatch", err)
 	}

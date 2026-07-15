@@ -668,7 +668,7 @@ func TestRollbackDeployment_DisabledTenant_ReturnsErrTenantDisabled(t *testing.T
 			AddRow("t_disabled", "Disabled", "free", pq.Array([]string{}), time.Now().Add(-24*time.Hour), disabledAt, nil))
 	mock.ExpectRollback()
 
-	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp", "")
+	_, err = svc.RollbackDeployment(context.Background(), "t_disabled", "myapp", "", false)
 	if err == nil {
 		t.Fatalf("RollbackDeployment on disabled tenant returned nil; want ErrTenantDisabled")
 	}
