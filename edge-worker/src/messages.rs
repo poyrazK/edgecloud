@@ -144,9 +144,15 @@ pub enum PurgeReason {
 }
 
 /// DeploymentRoute: a single destination in a weighted traffic split.
+///
+/// Each route carries its own `(deployment_id, deployment_hash,
+/// deployment_signature)` so the worker downloads the route's artifact
+/// separately and verifies it against the right hash + signature. A
+/// single `AppSpec.routes: [d1, d2]` is therefore sufficient to start
+/// two independently-instantiated deployments of the same `(tenant,
+/// app_name)` concurrently — see `expand_routes` and issue #290.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeploymentRoute {
-    #[allow(dead_code)]
     pub deployment_id: String,
     /// SHA-256 of this deployment's wasm artifact. Each route carries its
     /// own hash — the top-level `AppSpec::deployment_hash` only describes
@@ -154,7 +160,6 @@ pub struct DeploymentRoute {
     /// download the primary's binary for every canary route (and verify it
     /// against the wrong hash, failing for any deployment whose artifact
     /// differs from the primary's).
-    #[allow(dead_code)]
     pub deployment_hash: String,
     /// Ed25519 signature over `(sha256(artifact) || deployment_id)` for
     /// this route, base64url no-pad (issue #307). Each route carries its
@@ -164,7 +169,6 @@ pub struct DeploymentRoute {
     /// Absent (or `None`) for pre-PR2 control planes — workers running
     /// with `EDGE_REQUIRE_SIGNATURE=false` accept unsigned routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)]
     pub deployment_signature: Option<String>,
     /// Logical key id (`"k1"`, `"k2"`, ...) identifying which key in the
     /// worker's keyring signed this route's signature (issue #307 PR1
@@ -172,13 +176,11 @@ pub struct DeploymentRoute {
     /// legacy CP), the worker uses its keyring's default key.
     /// `#[serde(default)]` keeps pre-keying messages parseable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)]
     pub signing_key_id: Option<String>,
     /// Reserved for canary weight propagation; the worker currently uses 100%
     /// for every route and applies the weight at the ingress layer. Held on the
     /// struct so the wire format stays in sync with `edge-ingress` and the
     /// Go control plane, both of which already read it.
-    #[allow(dead_code)]
     pub weight: u8,
 }
 
@@ -210,9 +212,10 @@ pub struct AppSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key_id: Option<String>,
     /// listed (not just the primary one) concurrently. None = legacy mode
-    /// (single deployment_id only).
+    /// (single deployment_id only). Issue #290 — `expand_routes` fans
+    /// `Some(routes)` into N per-deployment `AppSpec` clones, each with
+    /// its own hash + signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)]
     pub routes: Option<Vec<DeploymentRoute>>,
     pub env: HashMap<String, String>,
     /// Per-deployment egress allowlist. `None` means allow-all outbound (field
@@ -252,6 +255,64 @@ pub struct AppSpec {
     /// the same as the pre-#308 behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_pr_number: Option<u32>,
+}
+
+/// Expand a `TaskUpdate::apps` map into one `(app_name, deployment_id,
+/// spec)` tuple per deployment the worker should actually run.
+///
+/// **Legacy mode** (`spec.routes == None`): returns one tuple using the
+/// primary `deployment_id` / `deployment_hash` / `deployment_signature`
+/// — preserves pre-#290 wire shape.
+///
+/// **Canary / blue-green mode** (`spec.routes == Some(routes)`):
+/// returns one tuple per `DeploymentRoute`, each carrying its own
+/// per-deployment hash + signature + signing key id. The primary
+/// `(deployment_id, deployment_hash, ...)` fields are ignored — the
+/// primary's role is now "control fields" only (e.g., `env`,
+/// `max_memory_mb`, `allowlist`), and every route inherits those
+/// values via the cloned `AppSpec`.
+///
+/// The diff path (`handle_task_message` → `compute_app_diff`) keys off
+/// `(app_name, deployment_id)` pairs, so fanning a 2-route spec into 2
+/// tuples lets the worker host both deployments concurrently under the
+/// same `(tenant_id, app_name)` (issue #290).
+///
+/// The `routes` field is left on the expanded spec so a follow-up
+/// debug/log site can still inspect the canary weight shape — the diff
+/// path only reads `deployment_id` / `deployment_hash` /
+/// `deployment_signature` / `signing_key_id`.
+///
+/// # Order
+///
+/// Routes are emitted in the order the CP sent them. Canary weights
+/// arrive in the same order, so this function preserves the
+/// ingress-side weight render order without resorting.
+pub fn expand_routes(apps: HashMap<String, AppSpec>) -> Vec<(String, String, AppSpec)> {
+    let mut out = Vec::new();
+    for (app_name, spec) in apps {
+        match spec.routes.clone() {
+            None => {
+                // Legacy single-deployment shape: one tuple per app.
+                out.push((app_name, spec.deployment_id.clone(), spec));
+            }
+            Some(routes) => {
+                // Canary/blue-green: one tuple per route. Inherit the
+                // top-level control fields (env, max_memory_mb,
+                // allowlist, socket_mode, etc.) from the parent spec;
+                // override the per-deployment identity fields with
+                // each route's own hash/signature/key.
+                for route in routes {
+                    let mut child = spec.clone();
+                    child.deployment_id = route.deployment_id.clone();
+                    child.deployment_hash = route.deployment_hash.clone();
+                    child.deployment_signature = route.deployment_signature.clone();
+                    child.signing_key_id = route.signing_key_id.clone();
+                    out.push((app_name.clone(), route.deployment_id, child));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// ClusterHeadroom carries capacity info for the autoscaler (issue #85).
@@ -1473,5 +1534,170 @@ mod tests {
             }
             _ => panic!("task_update parsed as wrong variant after adding TaskPurge"),
         }
+    }
+
+    // ── expand_routes (issue #290 canary fan-out) ───────────────────
+
+    fn make_legacy_spec(deployment_id: &str, hash: &str) -> AppSpec {
+        AppSpec {
+            deployment_id: deployment_id.to_string(),
+            deployment_hash: hash.to_string(),
+            deployment_signature: None,
+            signing_key_id: None,
+            routes: None,
+            env: HashMap::new(),
+            allowlist: None,
+            socket_mode: None,
+            max_memory_mb: 256,
+            cpu_budget_ms: None,
+            preview_id: None,
+            preview_pr_number: None,
+        }
+    }
+
+    fn make_canary_spec(
+        primary_id: &str,
+        primary_hash: &str,
+        routes: Vec<DeploymentRoute>,
+    ) -> AppSpec {
+        let mut s = make_legacy_spec(primary_id, primary_hash);
+        s.routes = Some(routes);
+        s
+    }
+
+    fn make_route(
+        deployment_id: &str,
+        hash: &str,
+        signature: Option<&str>,
+        kid: Option<&str>,
+        weight: u8,
+    ) -> DeploymentRoute {
+        DeploymentRoute {
+            deployment_id: deployment_id.to_string(),
+            deployment_hash: hash.to_string(),
+            deployment_signature: signature.map(|s| s.to_string()),
+            signing_key_id: kid.map(|s| s.to_string()),
+            weight,
+        }
+    }
+
+    /// Legacy single-deployment shape: `routes == None` passes through
+    /// unchanged. The diff sees one `(app_name, deployment_id)` per
+    /// app — exactly the pre-#290 behavior.
+    #[test]
+    fn expand_routes_single_deployment_passthrough() {
+        let mut apps = HashMap::new();
+        apps.insert("myapp".to_string(), make_legacy_spec("d_1", "hash-for-d1"));
+        let out = expand_routes(apps);
+        assert_eq!(out.len(), 1, "legacy single-deployment must yield 1 tuple");
+        let (app_name, deployment_id, spec) = &out[0];
+        assert_eq!(app_name, "myapp");
+        assert_eq!(deployment_id, "d_1");
+        assert_eq!(spec.deployment_hash, "hash-for-d1");
+        assert!(spec.routes.is_none(), "passthrough leaves routes == None");
+    }
+
+    /// `routes == Some([d1, d2])` fans out into two tuples. The diff
+    /// sees two `(app_name, deployment_id)` pairs under one app_name —
+    /// canary fan-out. Primary identity fields (hash/sig on the parent
+    /// spec) are ignored — every tuple carries its route's own.
+    #[test]
+    fn expand_routes_two_routes_yields_two_specs() {
+        let routes = vec![
+            make_route("d_1", "hash-for-d1", Some("sig-d1"), Some("k1"), 80),
+            make_route("d_2", "hash-for-d2", Some("sig-d2"), Some("k2"), 20),
+        ];
+        let mut apps = HashMap::new();
+        apps.insert(
+            "myapp".to_string(),
+            make_canary_spec("d_PRIMARY", "hash-for-PRIMARY-IGNORED", routes),
+        );
+        let out = expand_routes(apps);
+        assert_eq!(out.len(), 2, "two-route canary must yield 2 tuples");
+        let (app_name_0, dep_0, spec_0) = &out[0];
+        assert_eq!(app_name_0, "myapp");
+        assert_eq!(dep_0, "d_1");
+        assert_eq!(spec_0.deployment_id, "d_1");
+        assert_eq!(spec_0.deployment_hash, "hash-for-d1");
+        let (app_name_1, dep_1, spec_1) = &out[1];
+        assert_eq!(app_name_1, "myapp");
+        assert_eq!(dep_1, "d_2");
+        assert_eq!(spec_1.deployment_id, "d_2");
+        assert_eq!(spec_1.deployment_hash, "hash-for-d2");
+    }
+
+    /// Per-route signature + key id propagate to each expanded
+    /// `AppSpec`. The diff path threads these into
+    /// `Downloader::download` — losing them would make the worker
+    /// download the right artifact and verify against the wrong key.
+    #[test]
+    fn expand_routes_signature_per_route() {
+        let routes = vec![
+            make_route("d_1", "h1", Some("sig-d1-base64url"), Some("k1"), 100),
+            make_route("d_2", "h2", None, None, 0),
+        ];
+        let mut apps = HashMap::new();
+        apps.insert(
+            "myapp".to_string(),
+            make_canary_spec("d_PRIMARY", "h-PRIMARY", routes),
+        );
+        let out = expand_routes(apps);
+        assert_eq!(out.len(), 2);
+
+        let (_, _, spec_0) = &out[0];
+        assert_eq!(
+            spec_0.deployment_signature.as_deref(),
+            Some("sig-d1-base64url"),
+            "route 0 signature must propagate"
+        );
+        assert_eq!(
+            spec_0.signing_key_id.as_deref(),
+            Some("k1"),
+            "route 0 signing_key_id must propagate"
+        );
+
+        let (_, _, spec_1) = &out[1];
+        assert!(
+            spec_1.deployment_signature.is_none(),
+            "route 1 has no signature; expanded spec must mirror that"
+        );
+        assert!(
+            spec_1.signing_key_id.is_none(),
+            "route 1 has no key id; expanded spec must mirror that"
+        );
+    }
+
+    /// `routes == Some([])` — empty canary array is a wire oddity but
+    /// must not panic and must not synthesize a deployment from the
+    /// primary. Result: zero tuples for that app. (The CP doesn't emit
+    /// this shape today; the guard exists so a future CP bug can't
+    /// accidentally instantiate the primary under a canary message.)
+    #[test]
+    fn expand_routes_empty_routes_yields_no_tuples() {
+        let mut apps = HashMap::new();
+        apps.insert("myapp".to_string(), make_canary_spec("d_1", "h1", vec![]));
+        let out = expand_routes(apps);
+        assert!(out.is_empty(), "empty routes array must not yield tuples");
+    }
+
+    /// Order preservation: routes are emitted in the order the CP sent
+    /// them. Canary weights travel in the same order, so this keeps
+    /// the ingress render order stable end-to-end without resorting.
+    #[test]
+    fn expand_routes_preserves_route_order() {
+        let routes = vec![
+            make_route("d_c", "hc", None, None, 50),
+            make_route("d_a", "ha", None, None, 30),
+            make_route("d_b", "hb", None, None, 20),
+        ];
+        let mut apps = HashMap::new();
+        apps.insert(
+            "myapp".to_string(),
+            make_canary_spec("d_PRIMARY", "h-primary", routes),
+        );
+        let out = expand_routes(apps);
+        assert_eq!(out.len(), 3);
+        let deps: Vec<&str> = out.iter().map(|(_, d, _)| d.as_str()).collect();
+        assert_eq!(deps, vec!["d_c", "d_a", "d_b"]);
     }
 }
