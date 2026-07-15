@@ -126,6 +126,7 @@ RUN mkdir -p \
       edge-migrate/edge-migrate-lib/src \
       edge-migrate/edge-migrate-bin/src \
       edge-js-runtime/src \
+      edge-js-runtime/benches \
       edge-js-runtime-long/src \
       edge-test-helpers/src && \
     echo "" > edge-runtime/src/lib.rs && \
@@ -142,6 +143,7 @@ RUN mkdir -p \
     echo "" > edge-migrate/edge-migrate-lib/src/lib.rs && \
     echo "" > edge-migrate/edge-migrate-bin/src/main.rs && \
     echo "" > edge-js-runtime/src/lib.rs && \
+    echo "" > edge-js-runtime/benches/warm_vs_cold.rs && \
     echo "" > edge-js-runtime-long/src/lib.rs && \
     echo "" > edge-test-helpers/src/lib.rs
 
